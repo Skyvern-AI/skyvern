@@ -1,9 +1,24 @@
 // @vitest-environment jsdom
 
 import type { ReactNode } from "react";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
-import { beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  ReactFlow,
+  ReactFlowProvider,
+  useEdgesState,
+  useNodesState,
+  useReactFlow,
+  type Edge,
+} from "@xyflow/react";
 
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
@@ -17,18 +32,21 @@ import {
 const startNode = {
   id: "start-node",
   type: "start",
+  position: { x: 0, y: 0 },
   data: { label: "__start_block__" },
 } as AppNode;
 
 const loginNode = {
   id: "login-node",
   type: "task",
+  position: { x: 0, y: 100 },
   data: { label: "Login" },
 } as AppNode;
 
 const checkoutNode = {
   id: "checkout-node",
   type: "codeBlock",
+  position: { x: 0, y: 200 },
   data: { label: "Checkout step" },
 } as AppNode;
 
@@ -50,8 +68,72 @@ function useTestHarnessWithNavigate(enabled = true) {
   return { location: useLocation(), navigate: useNavigate() };
 }
 
+// jsdom has no ResizeObserver; React Flow's resize handler needs one to mount.
+class ResizeObserverStub {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+type PendingAdd = { nodes: Array<AppNode>; id: string } | null;
+
+// Mirrors the real add-a-block path end to end: WorkflowNodeLibraryPanel's
+// onClick calls addNode() (doLayout's setNodes, then setSelectedBlockId) and
+// closeWorkflowPanel(), all inside one React synthetic event. That matters:
+// an imperative act(() => ...) call doesn't reproduce the same batching, so
+// this drives it through a real <button onClick> and fireEvent.click.
+function AddViaRealFlow({
+  initialNodes,
+  pendingAddRef,
+}: {
+  initialNodes: Array<AppNode>;
+  pendingAddRef: { current: PendingAdd };
+}) {
+  const [nodes, setNodes, onNodesChange] = useNodesState<AppNode>(initialNodes);
+  const [edges, , onEdgesChange] = useEdgesState<Edge>([]);
+  const { getNodes } = useReactFlow();
+  useSelectedBlockUrlSync({
+    enabled: true,
+    nodes,
+    getNodes: getNodes as () => Array<AppNode>,
+  });
+  const location = useLocation();
+
+  return (
+    <div>
+      <div data-testid="search">{location.search}</div>
+      <div data-testid="store">
+        {useWorkflowPanelStore((s) => s.selectedBlockId)}
+      </div>
+      <button
+        data-testid="add-button"
+        onClick={() => {
+          const pendingAdd = pendingAddRef.current;
+          if (!pendingAdd) return;
+          setNodes(pendingAdd.nodes);
+          useWorkflowPanelStore.getState().setSelectedBlockId(pendingAdd.id);
+          useWorkflowPanelStore.getState().closeWorkflowPanel();
+        }}
+      >
+        add
+      </button>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+      />
+    </div>
+  );
+}
+
 beforeEach(() => {
+  vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   useWorkflowPanelStore.getState().setSelectedBlockId(null);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe("getInitialSelectedBlockId", () => {
@@ -196,5 +278,41 @@ describe("useSelectedBlockUrlSync", () => {
     await waitFor(() => {
       expect(result.current.search).toBe("");
     });
+  });
+
+  test("keeps focus on the newest block across consecutive adds", async () => {
+    const pendingAddRef: { current: PendingAdd } = { current: null };
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/studio"]}>
+        <ReactFlowProvider>
+          <AddViaRealFlow
+            initialNodes={[startNode]}
+            pendingAddRef={pendingAddRef}
+          />
+        </ReactFlowProvider>
+      </MemoryRouter>,
+    );
+
+    pendingAddRef.current = { nodes: [startNode, loginNode], id: "login-node" };
+    fireEvent.click(screen.getByTestId("add-button"));
+    await waitFor(() => {
+      expect(screen.getByTestId("search").textContent).toBe(
+        "?selected-block=Login",
+      );
+    });
+    expect(screen.getByTestId("store").textContent).toBe("login-node");
+
+    pendingAddRef.current = {
+      nodes: [startNode, loginNode, checkoutNode],
+      id: "checkout-node",
+    };
+    fireEvent.click(screen.getByTestId("add-button"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("store").textContent).toBe("checkout-node");
+    });
+    expect(screen.getByTestId("search").textContent).toBe(
+      "?selected-block=Checkout+step",
+    );
   });
 });

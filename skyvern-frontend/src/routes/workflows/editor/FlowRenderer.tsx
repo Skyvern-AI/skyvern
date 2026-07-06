@@ -108,6 +108,7 @@ import {
 } from "./paneFit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
+import { FlowJumpControls } from "./controls/FlowJumpControls";
 import { RedoControl } from "./controls/RedoControl";
 import { ToggleInteractivityControl } from "./controls/ToggleInteractivityControl";
 import { UndoControl } from "./controls/UndoControl";
@@ -182,6 +183,13 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
 import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
+import {
+  blockJumpDuration,
+  collectBlockSearchTargets,
+  focusBlockTarget,
+  waitForNodeSettle,
+} from "../studio/blockSearch";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { duplicateBlockBelow } from "./workflowDuplicate";
 
 // Grace period after nodesInitialized before we start tracking changes.
@@ -1712,6 +1720,102 @@ function FlowRenderer({
     [reactFlowInstance],
   );
 
+  const blockSearchFitTimerRef = useRef<number | null>(null);
+  const blockSearchBranchGuardTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (blockSearchFitTimerRef.current !== null) {
+        window.clearTimeout(blockSearchFitTimerRef.current);
+        blockSearchFitTimerRef.current = null;
+      }
+      // Mirrors BranchesEditor's unmount cleanup: a leaked begin without its
+      // delayed end would suppress dirty-detection for the whole session.
+      if (blockSearchBranchGuardTimerRef.current !== null) {
+        window.clearTimeout(blockSearchBranchGuardTimerRef.current);
+        blockSearchBranchGuardTimerRef.current = null;
+        useWorkflowHasChangesStore.getState().endInternalUpdate();
+      }
+    };
+  }, []);
+
+  const focusBlockForSearch = useCallback(
+    (nodeId: string) => {
+      const duration = blockJumpDuration();
+      const getNodes = () => reactFlowInstance.getNodes() as Array<AppNode>;
+      void focusBlockTarget(nodeId, {
+        getNodes,
+        getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
+        getPaneWidth: () =>
+          editorElementRef.current?.getBoundingClientRect().width ?? 0,
+        viewportZoom: reactFlowInstance.getViewport().zoom,
+        duration,
+        setViewport: (viewport, options) => {
+          // An explicit jump outranks any pending pane-layout recenter and,
+          // like runFitView, must not be clamped by constrainPan mid-flight.
+          lastCanvasInteractionAtRef.current = Date.now();
+          fitViewInProgressRef.current = true;
+          void reactFlowInstance.setViewport(viewport, options);
+          if (blockSearchFitTimerRef.current !== null) {
+            window.clearTimeout(blockSearchFitTimerRef.current);
+          }
+          blockSearchFitTimerRef.current = window.setTimeout(() => {
+            blockSearchFitTimerRef.current = null;
+            fitViewInProgressRef.current = false;
+          }, options.duration + 50);
+        },
+        selectBlock: setSelectedBlockId,
+        expandBlock: (label) =>
+          useNodeCollapseStore
+            .getState()
+            .expandBlock(workflow.workflow_permanent_id ?? "__global__", label),
+        switchBranch: (conditionalId, branchId) => {
+          // Same write and dirty-state guard as the branch tab click
+          // (BranchesEditor.handleSelectBranch): switching branches is UI
+          // state, so the `replace` change must not mark the workflow dirty.
+          const changesStore = useWorkflowHasChangesStore.getState();
+          if (blockSearchBranchGuardTimerRef.current !== null) {
+            window.clearTimeout(blockSearchBranchGuardTimerRef.current);
+            changesStore.endInternalUpdate();
+          }
+          changesStore.beginInternalUpdate();
+          reactFlowInstance.updateNodeData(conditionalId, {
+            activeBranchId: branchId,
+          });
+          blockSearchBranchGuardTimerRef.current = window.setTimeout(() => {
+            blockSearchBranchGuardTimerRef.current = null;
+            changesStore.endInternalUpdate();
+          }, 50);
+        },
+        waitForSettle: (settleNodeId) =>
+          waitForNodeSettle(settleNodeId, {
+            getNodes,
+            getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
+          }),
+      });
+    },
+    [reactFlowInstance, setSelectedBlockId, workflow.workflow_permanent_id],
+  );
+
+  // Registered here (not in shell chrome) because the jump needs this
+  // canvas's React Flow instance. Read-only canvases (comparison view)
+  // never register, so the pane header's search only drives the live
+  // editable canvas.
+  useEffect(() => {
+    if (!embedded || readOnly) {
+      return;
+    }
+    useWorkflowBlockSearchStore.getState().registerHandle({
+      getTargets: () =>
+        collectBlockSearchTargets(
+          reactFlowInstance.getNodes() as Array<AppNode>,
+        ),
+      focusBlock: focusBlockForSearch,
+    });
+    return () => {
+      useWorkflowBlockSearchStore.getState().registerHandle(null);
+    };
+  }, [embedded, readOnly, reactFlowInstance, focusBlockForSearch]);
+
   // "initial-load" lands one frame after Dagre positions commit (mid fade-in),
   // so fitting here can't read pre-layout node positions. layoutPhase only
   // advances once nodesInitialized flips, but guard explicitly so a future
@@ -2212,6 +2316,18 @@ function FlowRenderer({
                     <GlobalCollapseControl />
                   </Controls>
                 )}
+                {/*
+                  Studio-only: the jumps land on the pane-fit anchor
+                  viewports, which are the embedded pane's policy; the legacy
+                  editors keep whole-graph fitView and the debugger pins the
+                  viewport (constrainPan), so both are excluded. Mounted only
+                  once the initial layout settled so pre-layout bounds can't
+                  flash the buttons.
+                */}
+                {embedded &&
+                  !readOnly &&
+                  !flowIsConstrained &&
+                  layoutPhase === "ready" && <FlowJumpControls nodes={nodes} />}
               </ReactFlow>
             </SortableBlockScope>
             {/*

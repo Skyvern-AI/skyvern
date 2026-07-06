@@ -85,6 +85,10 @@ export function useSelectedBlockUrlSync({
   const selectedBlockLabelParam = searchParams.get(SELECTED_BLOCK_SEARCH_PARAM);
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
+  // Skip reconciling from the URL when its value hasn't changed: a
+  // `nodes`-only re-run of the effect below would otherwise revert a
+  // same-commit fresher store selection back to the stale URL target.
+  const lastAppliedLabelParamRef = useRef<string | null>(null);
 
   const getCurrentNodes = useCallback(() => {
     const latestNodes = getNodes?.();
@@ -105,9 +109,17 @@ export function useSelectedBlockUrlSync({
   );
 
   useEffect(() => {
-    if (!enabled || !selectedBlockLabelParam) {
+    if (!enabled) {
       return;
     }
+    if (!selectedBlockLabelParam) {
+      lastAppliedLabelParamRef.current = null;
+      return;
+    }
+    if (selectedBlockLabelParam === lastAppliedLabelParamRef.current) {
+      return;
+    }
+    lastAppliedLabelParamRef.current = selectedBlockLabelParam;
 
     const currentNodes = getCurrentNodes();
     const matchedNodeId = getWorkflowBlockNodeIdByLabel(

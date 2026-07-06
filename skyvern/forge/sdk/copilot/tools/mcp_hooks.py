@@ -673,6 +673,12 @@ async def _type_text_post_hook(
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        value_landed = (
+            isinstance(typed_length, int)
+            and typed_length > 0
+            and isinstance(pending_typed_value, str)
+            and len(pending_typed_value) == typed_length
+        )
         typed_value = (
             safe_typed_default_value(
                 pending_typed_value,
@@ -680,12 +686,10 @@ async def _type_text_post_hook(
                 role=role,
                 accessible_name=accessible_name,
             )
-            if isinstance(typed_length, int)
-            and typed_length > 0
-            and isinstance(pending_typed_value, str)
-            and len(pending_typed_value) == typed_length
+            if value_landed
             else None
         )
+        raw_typed_value = pending_typed_value if value_landed and isinstance(pending_typed_value, str) else ""
         _record_scouted_interaction(
             ctx,
             tool_name="type_text",
@@ -693,6 +697,7 @@ async def _type_text_post_hook(
             source_url=source_url,
             typed_length=typed_length,
             typed_value=typed_value or "",
+            raw_typed_value=raw_typed_value,
             role=role,
             accessible_name=accessible_name,
         )
