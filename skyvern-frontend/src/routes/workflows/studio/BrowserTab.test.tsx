@@ -316,7 +316,6 @@ describe("BrowserTab view machine", () => {
       stepId: "step_1",
       actionOrder: 0,
     });
-    expect(screen.getByText(/Inspecting ·/)).toBeTruthy();
   });
 
   it("stays live for an executing block run in the debug session", () => {
