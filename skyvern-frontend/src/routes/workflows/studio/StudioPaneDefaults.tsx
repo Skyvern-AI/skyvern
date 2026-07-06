@@ -67,8 +67,16 @@ export function StudioPaneDefaultsProvider({
     return learnedEdit ?? defaultPanesForWorkflowState({ hasBlocks });
   });
 
+  const [learnedRunPanes] = useState<readonly StudioPaneId[] | null>(() =>
+    sanitizeLearnedPanes(useStudioShellStore.getState().paneLayouts.run),
+  );
+
   const [initialPanes] = useState<readonly StudioPaneId[]>(() =>
-    resolveOpenPanes(liveSearch(location.search), defaultPanes),
+    resolveOpenPanes(
+      liveSearch(location.search),
+      defaultPanes,
+      learnedRunPanes,
+    ),
   );
 
   const [clamp, setClamp] = useState<PaneClamp | null>(null);
@@ -122,8 +130,14 @@ export function StudioPaneDefaultsProvider({
   }, []);
 
   const value = useMemo(
-    () => ({ defaultPanes, clamp, notePaneWrite, registerStageElement }),
-    [defaultPanes, clamp, notePaneWrite, registerStageElement],
+    () => ({
+      defaultPanes,
+      clamp,
+      notePaneWrite,
+      registerStageElement,
+      learnedRunPanes,
+    }),
+    [defaultPanes, clamp, notePaneWrite, registerStageElement, learnedRunPanes],
   );
 
   return (
