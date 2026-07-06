@@ -31,14 +31,12 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
+import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useStudioPaneCompact } from "./StudioShellContext";
 import { ViewToggle } from "./ViewToggle";
-
-const ICON_BUTTON =
-  "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40";
 
 const RECORDING_ARCHIVED_LABEL =
   "Recording archived — contact support@skyvern.com to request restoration";
@@ -216,7 +214,7 @@ export function BrowserPaneActions() {
           aria-label="Reconnect browser stream"
           onClick={reload}
           disabled={!browserSessionId || debugHidden}
-          className={ICON_BUTTON}
+          className={PANE_HEADER_ICON_BUTTON_CLASS}
         >
           <ReloadIcon className="h-3.5 w-3.5" />
         </button>
@@ -230,7 +228,7 @@ export function BrowserPaneActions() {
           aria-label="Open browser in new tab"
           onClick={openInNewTab}
           disabled={!browserSessionId || debugHidden}
-          className={ICON_BUTTON}
+          className={PANE_HEADER_ICON_BUTTON_CLASS}
         >
           <OpenInNewWindowIcon className="h-3.5 w-3.5" />
         </button>
@@ -255,7 +253,7 @@ export function BrowserPaneActions() {
               disabled={
                 !workflowPermanentId || !browserSessionId || debugHidden
               }
-              className={ICON_BUTTON}
+              className={PANE_HEADER_ICON_BUTTON_CLASS}
             >
               <PowerIcon className="h-3.5 w-3.5" />
             </button>
