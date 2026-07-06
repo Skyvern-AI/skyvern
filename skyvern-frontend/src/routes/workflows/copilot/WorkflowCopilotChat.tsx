@@ -21,6 +21,7 @@ import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -509,6 +510,7 @@ export function WorkflowCopilotChat({
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
+  const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
@@ -2382,10 +2384,11 @@ export function WorkflowCopilotChat({
                   ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
-                    : "Message Skyvern Copilot…"
+                    : "Message Skyvern Copilot, or paste recorded steps…"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
+            onPaste={() => dismissPasteSkillHint()}
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}

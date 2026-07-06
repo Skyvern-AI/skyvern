@@ -4,6 +4,9 @@ import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
 
+import { PasteRecordedStepsHint } from "@/routes/workflows/copilot/PasteRecordedStepsHint";
+import { useRecordingStore } from "@/store/useRecordingStore";
+
 import { HeroRecording } from "./runview/HeroRecording";
 import { HeroScreenshot } from "./runview/HeroScreenshot";
 import { RunLiveStream } from "./runview/RunLiveStream";
@@ -28,6 +31,7 @@ export function BrowserTab() {
     liveSurface,
   } = useBrowserPaneView();
   const postHog = usePostHog();
+  const isRecording = useRecordingStore((s) => s.isRecording);
 
   const {
     workflowRun,
@@ -61,7 +65,9 @@ export function BrowserTab() {
   const showRunStream = liveSurface === "run" && runId != null;
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col p-3">
+    <div className="flex h-full min-h-0 w-full flex-col gap-3 p-3">
+      {!isRecording ? <PasteRecordedStepsHint /> : null}
+
       <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-border bg-slate-950">
         {view === "live" ? (
           showRunStream ? (
