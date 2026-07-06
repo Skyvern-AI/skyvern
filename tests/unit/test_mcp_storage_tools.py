@@ -2,40 +2,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import storage as mcp_storage
-
-# ═══════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════
-
-
-def _make_mock_page(url: str = "https://example.com") -> MagicMock:
-    page = MagicMock()
-    page.url = url
-    page.evaluate = AsyncMock(return_value={})
-    return page
-
-
-def _make_skyvern_page(page: MagicMock) -> MagicMock:
-    """Mimic SkyvernBrowserPage which delegates attribute access to the raw page."""
-    wrapper = MagicMock()
-    wrapper.page = page
-    wrapper.evaluate = page.evaluate
-    wrapper.url = page.url
-    return wrapper
-
-
-def _patch_get_page(monkeypatch: pytest.MonkeyPatch, page: MagicMock, ctx: BrowserContext) -> AsyncMock:
-    skyvern_page = _make_skyvern_page(page)
-    mock = AsyncMock(return_value=(skyvern_page, ctx))
-    monkeypatch.setattr(mcp_storage, "get_page", mock)
-    return mock
-
+from tests.unit._mcp_browser_fakes import make_mock_page as _make_mock_page
+from tests.unit._mcp_browser_fakes import patch_get_page
 
 # ═══════════════════════════════════════════════════
 # skyvern_get_session_storage
@@ -47,7 +21,7 @@ async def test_get_session_storage_all(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value={"token": "abc", "lang": "en"})
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_get_session_storage()
 
@@ -61,7 +35,7 @@ async def test_get_session_storage_specific_keys(monkeypatch: pytest.MonkeyPatch
     page = _make_mock_page()
     page.evaluate = AsyncMock(side_effect=["abc", None])
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_get_session_storage(keys=["token", "missing"])
 
@@ -75,7 +49,7 @@ async def test_get_session_storage_empty(monkeypatch: pytest.MonkeyPatch) -> Non
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value={})
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_get_session_storage()
 
@@ -97,7 +71,7 @@ async def test_get_session_storage_evaluate_error(monkeypatch: pytest.MonkeyPatc
     page = _make_mock_page()
     page.evaluate = AsyncMock(side_effect=RuntimeError("page crashed"))
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_get_session_storage()
 
@@ -115,7 +89,7 @@ async def test_set_session_storage(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value=None)
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_set_session_storage(key="theme", value="dark")
 
@@ -144,7 +118,7 @@ async def test_clear_session_storage(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value=3)
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_clear_session_storage()
 
@@ -171,7 +145,7 @@ async def test_clear_local_storage(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _make_mock_page()
     page.evaluate = AsyncMock(return_value=5)
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_clear_local_storage()
 
@@ -193,7 +167,7 @@ async def test_clear_local_storage_error(monkeypatch: pytest.MonkeyPatch) -> Non
     page = _make_mock_page()
     page.evaluate = AsyncMock(side_effect=RuntimeError("security error"))
     ctx = BrowserContext(mode="local")
-    _patch_get_page(monkeypatch, page, ctx)
+    patch_get_page(monkeypatch, mcp_storage, page, ctx)
 
     result = await mcp_storage.skyvern_clear_local_storage()
 
