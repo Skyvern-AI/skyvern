@@ -144,7 +144,8 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
 }
 
 // Deep-link → panes mapping when ?panes= is absent: a block-run link lands on
-// iterate (Editor leads); any other run reference lands on watch-and-review.
+// iterate (Editor leads); a bare run reference restores the learned run layout
+// (or falls back to watch-and-review); ?active= alone always opens watch-and-review.
 export function panesFromDeepLink(
   params: {
     runId: string | null;
@@ -152,11 +153,17 @@ export function panesFromDeepLink(
     blockLabel: string | null;
   },
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+  learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
     return ["editor", "browser", "overview"];
   }
-  if (params.runId || params.active) {
+  if (params.runId) {
+    return learnedRunPanes
+      ? [...learnedRunPanes]
+      : ["copilot", "browser", "overview"];
+  }
+  if (params.active) {
     return ["copilot", "browser", "overview"];
   }
   return [...defaultPanes];
@@ -167,6 +174,7 @@ export function panesFromDeepLink(
 export function resolveOpenPanes(
   search: string,
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+  learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   const params = new URLSearchParams(search);
   const explicit = parsePanesParam(params.get(STUDIO_PANES_PARAM));
@@ -180,6 +188,7 @@ export function resolveOpenPanes(
       blockLabel: params.get("bl"),
     },
     defaultPanes,
+    learnedRunPanes,
   );
 }
 

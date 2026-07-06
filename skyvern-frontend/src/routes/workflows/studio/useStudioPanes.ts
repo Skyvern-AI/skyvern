@@ -38,7 +38,8 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
 export function useStudioPanes() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { defaultPanes, clamp, notePaneWrite } = useStudioPaneDefaults();
+  const { defaultPanes, clamp, notePaneWrite, learnedRunPanes } =
+    useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   const setPaneLayout = useStudioShellStore((s) => s.setPaneLayout);
 
@@ -61,8 +62,9 @@ export function useStudioPanes() {
   );
 
   const panes = useMemo(
-    () => present(resolveOpenPanes(location.search, defaultPanes)),
-    [location.search, defaultPanes, present],
+    () =>
+      present(resolveOpenPanes(location.search, defaultPanes, learnedRunPanes)),
+    [location.search, defaultPanes, present, learnedRunPanes],
   );
 
   // The open list as the live URL resolves it right now — what cross-route
@@ -70,8 +72,14 @@ export function useStudioPanes() {
   // continuity rule: in-app actions append, never rearrange or close.
   const resolveLivePanes = useCallback(
     (): StudioPaneId[] =>
-      present(resolveOpenPanes(liveSearch(location.search), defaultPanes)),
-    [location.search, defaultPanes, present],
+      present(
+        resolveOpenPanes(
+          liveSearch(location.search),
+          defaultPanes,
+          learnedRunPanes,
+        ),
+      ),
+    [location.search, defaultPanes, present, learnedRunPanes],
   );
 
   const applyPanes = useCallback(
