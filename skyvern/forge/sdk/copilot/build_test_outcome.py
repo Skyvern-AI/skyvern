@@ -56,6 +56,8 @@ BuildTestOutcomeReasonCode = Literal[
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
     "fallback_floor_turn_unsatisfiable",
+    "output_source_unobservable",
+    "actuation_exhausted",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
