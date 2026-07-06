@@ -878,6 +878,37 @@ def _copilot_ctx() -> Any:
     )
 
 
+class TestGenuineAttemptScoutStamp:
+    def test_run_blocks_scout_stamp_does_not_count_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "run_blocks_and_collect_debug", {"ok": True})
+        assert ctx.test_after_update_done is True
+        assert ctx.has_genuine_workflow_attempt() is False
+
+    def test_failed_run_blocks_scout_stamp_does_not_count_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "run_blocks_and_collect_debug", {"ok": False})
+        assert ctx.test_after_update_done is True
+        assert ctx.has_genuine_workflow_attempt() is False
+
+    def test_persisted_update_counts_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 2}})
+        assert ctx.update_workflow_called is True
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_update_and_run_blocks_counts_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_and_run_blocks", {"ok": True, "data": {"block_count": 2}})
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_update_without_blocks_is_not_a_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 0}})
+        assert ctx.update_workflow_called is False
+        assert ctx.has_genuine_workflow_attempt() is False
+
+
 class TestCodeRepairProgressStreaming:
     @pytest.mark.asyncio
     async def test_repeated_classified_rejects_collapse_to_one_progress_frame(self) -> None:
