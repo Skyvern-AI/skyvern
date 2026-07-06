@@ -19,17 +19,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_run_blocks_result,
     _tool_loop_error,
 )
-
-
-def _fresh_context() -> CopilotContext:
-    return CopilotContext(
-        organization_id="o",
-        workflow_id="w",
-        workflow_permanent_id="wp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
+from tests.unit.conftest import make_copilot_context as _fresh_context
 
 
 def _ctx_after_failure_with_verified_prefix(*, elapsed_seconds: float) -> CopilotContext:

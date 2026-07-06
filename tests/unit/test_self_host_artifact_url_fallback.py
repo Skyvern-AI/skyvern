@@ -17,7 +17,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge.sdk.artifact.manager import ArtifactManager, _bundling_enabled
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.artifact.storage.test_helpers import create_fake_step
+from tests.unit.forge.sdk.artifact.storage.test_helpers import create_fake_step
 
 _DUMMY_KEYRING_JSON = '{"current_kid":"k1","keys":{"k1":{"secret":"deadbeef"}}}'
 

@@ -3,6 +3,7 @@ import { useLocation } from "react-router-dom";
 
 import { toast } from "@/components/ui/use-toast";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
+import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { liveSearch } from "./liveSearch";
 import {
@@ -10,6 +11,7 @@ import {
   fitPanesToWidth,
   panesFitWidth,
   resolveOpenPanes,
+  STUDIO_PANE_IDS,
   type StudioPaneId,
 } from "./panes";
 import {
@@ -17,13 +19,34 @@ import {
   type PaneClamp,
   type PaneWrite,
 } from "./StudioPaneDefaultsContext";
-import { useStudioRunSignals } from "./useStudioRunSignals";
+
+// Drop unknown ids and duplicates; return null when the result is empty/invalid.
+function sanitizeLearnedPanes(
+  raw: StudioPaneId[] | undefined,
+): readonly StudioPaneId[] | null {
+  // Guard the localStorage boundary: corrupted/foreign values may not be arrays.
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const seen = new Set<string>();
+  const result: StudioPaneId[] = [];
+  for (const id of raw) {
+    if ((STUDIO_PANE_IDS as readonly string[]).includes(id) && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+  return result.length > 0 ? result : null;
+}
 
 /**
  * First-visit pane policy for one studio mount. The state-aware default and
  * the narrow-viewport clamp are both latched exactly once (the shell remounts
- * per workflow via its key), so panes never reshuffle after first paint: a
- * runs signal that arrives later changes nothing until the next visit.
+ * per workflow via its key), so panes never reshuffle after first paint. The
+ * blocks signal is synchronous — the shell only mounts with the workflow
+ * loaded — so the latch decides from real data, never a placeholder.
+ *
+ * Built agents restore the user's last edit-class pane arrangement; empty
+ * agents always start on the factory prompt-and-watch default (deliberate
+ * first-run experience).
  */
 export function StudioPaneDefaultsProvider({
   hasBlocks,
@@ -33,16 +56,27 @@ export function StudioPaneDefaultsProvider({
   children: ReactNode;
 }) {
   const location = useLocation();
-  const { knownHasRuns } = useStudioRunSignals();
 
-  // Latched: cached runs data decides; on a cold cache an agent with blocks
-  // keeps today's watch default while an empty agent starts on the editor.
-  const [defaultPanes] = useState<readonly StudioPaneId[]>(() =>
-    defaultPanesForWorkflowState({ hasRuns: knownHasRuns, hasBlocks }),
+  const [defaultPanes] = useState<readonly StudioPaneId[]>(() => {
+    if (!hasBlocks) {
+      return defaultPanesForWorkflowState({ hasBlocks });
+    }
+    const learnedEdit = sanitizeLearnedPanes(
+      useStudioShellStore.getState().paneLayouts["edit"],
+    );
+    return learnedEdit ?? defaultPanesForWorkflowState({ hasBlocks });
+  });
+
+  const [learnedRunPanes] = useState<readonly StudioPaneId[] | null>(() =>
+    sanitizeLearnedPanes(useStudioShellStore.getState().paneLayouts.run),
   );
 
   const [initialPanes] = useState<readonly StudioPaneId[]>(() =>
-    resolveOpenPanes(liveSearch(location.search), defaultPanes),
+    resolveOpenPanes(
+      liveSearch(location.search),
+      defaultPanes,
+      learnedRunPanes,
+    ),
   );
 
   const [clamp, setClamp] = useState<PaneClamp | null>(null);
@@ -96,8 +130,14 @@ export function StudioPaneDefaultsProvider({
   }, []);
 
   const value = useMemo(
-    () => ({ defaultPanes, clamp, notePaneWrite, registerStageElement }),
-    [defaultPanes, clamp, notePaneWrite, registerStageElement],
+    () => ({
+      defaultPanes,
+      clamp,
+      notePaneWrite,
+      registerStageElement,
+      learnedRunPanes,
+    }),
+    [defaultPanes, clamp, notePaneWrite, registerStageElement, learnedRunPanes],
   );
 
   return (

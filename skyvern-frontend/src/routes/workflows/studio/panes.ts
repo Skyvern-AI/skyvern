@@ -1,30 +1,72 @@
-export type StudioPaneId = "copilot" | "editor" | "browser" | "run";
+export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
+
+// "edit" = no run in URL; "run" = run present, no block label; null = block-iterate (never learned).
+export type StudioLayoutClass = "edit" | "run";
+
+export function layoutClassForSearch(search: string): StudioLayoutClass | null {
+  const params = new URLSearchParams(search);
+  if (params.get("bl") !== null) return null;
+  // Same run test as panesFromDeepLink: ?active= is a run reference too.
+  if (params.get("wr") !== null || params.get("active") !== null) {
+    return "run";
+  }
+  return "edit";
+}
 
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "copilot",
   "editor",
   "browser",
-  "run",
+  "overview",
 ];
 
 export const STUDIO_PANES_PARAM = "panes";
+
+// Accepted forever on parse so pre-rename ?panes= links keep working; the
+// canonical id ("overview") is what serializes back out.
+const STUDIO_PANE_ID_ALIASES: Record<string, StudioPaneId> = {
+  run: "overview",
+  timeline: "overview",
+};
 
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
   "copilot",
   "browser",
 ];
 
-// Width floors from the approved mock; the stage clamps shared links and nudges
-// on over-tight opens against these same numbers (fitPanesToWidth below).
+// In-app run starts (full run or block ▶) append the run surfaces to whatever
+// is already open — they never rearrange or close panes.
+export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
+  "browser",
+  "overview",
+];
+
+// Panes that mutate the workflow (Copilot builds, Editor saves) are blocked
+// while the shell shows a run of a deleted agent; run viewing stays.
+export const DELETED_WORKFLOW_BLOCKED_PANES: readonly StudioPaneId[] = [
+  "copilot",
+  "editor",
+];
+
+export function panesWithoutDeletedBlocked(
+  panes: readonly StudioPaneId[],
+): StudioPaneId[] {
+  return panes.filter((id) => !DELETED_WORKFLOW_BLOCKED_PANES.includes(id));
+}
+
+// Copilot / Editor / Overview share one narrow floor; the browser viewport
+// keeps a little more room. The stage clamps shared links and nudges on
+// over-tight opens against these numbers (fitPanesToWidth below), and divider
+// resizes clamp against them too.
 export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
   copilot: 260,
-  editor: 220,
-  browser: 260,
-  run: 220,
+  editor: 260,
+  browser: 300,
+  overview: 260,
 };
 
-// Stage chrome for the fit math; must match the p-3 + gap-3 on the stage div
-// in StudioShell.tsx.
+// Stage chrome for the fit math; must match the stage p-3 and the divider
+// width (the resize dividers are the inter-pane gap) in StudioShell.tsx.
 export const STUDIO_STAGE_PADDING_PX = 24;
 export const STUDIO_STAGE_GAP_PX = 12;
 
@@ -32,16 +74,15 @@ function isStudioPaneId(value: string): value is StudioPaneId {
   return (STUDIO_PANE_IDS as readonly string[]).includes(value);
 }
 
-// First-visit defaults: someone who never ran the agent (or has nothing built)
-// starts on the familiar build surface; an agent with history starts on watch.
+// Cold-entry defaults when no deep link decides: an empty agent starts on
+// prompt-and-watch (Copilot builds, the Browser shows it work — the Editor
+// auto-appends once a build lands); a built agent adds the Editor.
 export function defaultPanesForWorkflowState(state: {
-  hasRuns: boolean | undefined;
   hasBlocks: boolean;
 }): StudioPaneId[] {
-  if (state.hasRuns !== undefined) {
-    return state.hasRuns ? ["copilot", "browser"] : ["copilot", "editor"];
-  }
-  return state.hasBlocks ? [...DEFAULT_STUDIO_PANES] : ["copilot", "editor"];
+  return state.hasBlocks
+    ? ["copilot", "browser", "editor"]
+    : [...DEFAULT_STUDIO_PANES];
 }
 
 export function panesListEqual(
@@ -93,7 +134,8 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
   }
   const result: StudioPaneId[] = [];
   for (const token of raw.split(",")) {
-    const id = token.trim();
+    const name = token.trim();
+    const id = STUDIO_PANE_ID_ALIASES[name] ?? name;
     if (isStudioPaneId(id) && !result.includes(id)) {
       result.push(id);
     }
@@ -101,8 +143,9 @@ export function parsePanesParam(raw: string | null): StudioPaneId[] | null {
   return result;
 }
 
-// Deep-link → panes mapping when ?panes= is absent: a block run shows its
-// timeline beside the live debug stream; any other run reference lands on Run.
+// Deep-link → panes mapping when ?panes= is absent: a block-run link lands on
+// iterate (Editor leads); a bare run reference restores the learned run layout
+// (or falls back to watch-and-review); ?active= alone always opens watch-and-review.
 export function panesFromDeepLink(
   params: {
     runId: string | null;
@@ -110,12 +153,18 @@ export function panesFromDeepLink(
     blockLabel: string | null;
   },
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+  learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
-    return ["run", "browser"];
+    return ["editor", "browser", "overview"];
   }
-  if (params.runId || params.active) {
-    return ["run"];
+  if (params.runId) {
+    return learnedRunPanes
+      ? [...learnedRunPanes]
+      : ["copilot", "browser", "overview"];
+  }
+  if (params.active) {
+    return ["copilot", "browser", "overview"];
   }
   return [...defaultPanes];
 }
@@ -125,6 +174,7 @@ export function panesFromDeepLink(
 export function resolveOpenPanes(
   search: string,
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
+  learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   const params = new URLSearchParams(search);
   const explicit = parsePanesParam(params.get(STUDIO_PANES_PARAM));
@@ -138,6 +188,7 @@ export function resolveOpenPanes(
       blockLabel: params.get("bl"),
     },
     defaultPanes,
+    learnedRunPanes,
   );
 }
 
@@ -173,6 +224,13 @@ export function withPaneClosed(
   return panes.filter((p) => p !== id);
 }
 
+// Commas are legal unencoded in query values and parse back identically; keep
+// ?panes=copilot,browser readable no matter which writer serialized last.
+export function toReadableSearch(params: URLSearchParams): string {
+  const raw = params.toString().replace(/%2C/g, ",");
+  return raw ? `?${raw}` : "";
+}
+
 // Serialize the open list into a search string, preserving unrelated params.
 export function searchWithPanes(
   search: string,
@@ -180,7 +238,5 @@ export function searchWithPanes(
 ): string {
   const params = new URLSearchParams(search);
   params.set(STUDIO_PANES_PARAM, panes.join(","));
-  // Commas are legal unencoded in query values and parse back identically;
-  // keep them readable (?panes=copilot,browser).
-  return `?${params.toString().replace(/%2C/g, ",")}`;
+  return toReadableSearch(params);
 }

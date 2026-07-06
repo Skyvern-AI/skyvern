@@ -37,7 +37,7 @@ class CredentialResponse(UniversalBaseModel):
 
     vault_type: typing.Optional[CredentialVaultType] = pydantic.Field(default=None)
     """
-    Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')
+    Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')
     """
 
     browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)

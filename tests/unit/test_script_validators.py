@@ -107,6 +107,21 @@ async def block_fn(page, context):
         assert error is not None
         assert "page.fill()" in error
 
+    def test_comments_ignored(self) -> None:
+        code = """
+async def block_fn(page, context):
+    # await page.click(ai='fallback', prompt='old code')
+    await page.click(selector='button', ai='fallback', prompt='submit')
+"""
+        assert validate_missing_selectors(code) is None
+
+    def test_non_interaction_methods_ignored(self) -> None:
+        code = """
+async def block_fn(page, context):
+    await page.wait(ai='fallback', prompt='wait for page')
+"""
+        assert validate_missing_selectors(code) is None
+
     def test_multiple_methods_flagged(self) -> None:
         code = """
 async def block_fn(page, context):

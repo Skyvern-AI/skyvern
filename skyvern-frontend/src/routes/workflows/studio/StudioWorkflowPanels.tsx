@@ -5,7 +5,7 @@ import { WorkflowSchedulePanel } from "../editor/panels/schedulePanel/WorkflowSc
 
 /**
  * Inputs / Schedule panels rendered at shell level so they open over any tab —
- * the editor canvas is display:none on Browser/Run tabs and would hide them.
+ * the editor canvas is display:none on Browser/Overview tabs and would hide them.
  */
 export function StudioWorkflowPanels() {
   const state = useWorkflowPanelStore((s) => s.workflowPanelState);

@@ -428,6 +428,11 @@ class TestMCPFailedStepLoopDetection:
             pending_browser_interaction_observation=initial_pending_observation,
             pending_scout_source_url="https://source",
             pending_scout_typed_value="typed",
+            completion_criteria_turn_state=None,
+            synthesized_block_reopened_for_output_coverage=False,
+            last_code_authoring_repair_context=None,
+            scouted_output_covered_paths=set(),
+            reached_download_target=None,
         )
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),

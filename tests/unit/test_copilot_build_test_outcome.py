@@ -4,12 +4,18 @@ from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
+    _binding_frontier_facet,
+    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
+    latest_recorded_build_test_outcome_repeated,
+    observed_value_extraction_scaffold_lines,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_run_blocks_result,
+    recorded_outcome_from_scout_act_observe_hollow,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -111,6 +117,152 @@ def test_structural_key_does_not_require_fixture_slug_or_raw_transcript_text() -
     assert "synthetic transcript excerpt" not in str(key_payload)
 
 
+def test_scout_act_observe_hollow_outcome_is_structural_and_privacy_bounded() -> None:
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#search",
+        current_url="https://example.com/customers/acme-inc/results?token=secret",
+        source_url="https://example.com/accounts/claim-123/search?name=customer",
+        page_evidence={
+            "page_title": "Private Account Search",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "clickable_controls": [],
+            "visible_text": "Customer name should not persist",
+            "body": "<main></main>",
+            "schema_empty_page": True,
+        },
+        recapture_attempted=True,
+        recapture_result="timeout",
+    )
+
+    key_payload = outcome.structural_key_payload
+
+    assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+    assert outcome.structural_key is not None
+    assert outcome.is_authoritative is True
+    assert "recapture_attempted:true" in outcome.page_evidence_refs
+    assert "recapture_result:timeout" in outcome.page_evidence_refs
+    for sensitive in ("token=secret", "name=customer", "acme-inc", "claim-123", "Customer name", "Private Account"):
+        assert sensitive not in str(key_payload)
+
+
+def test_hollow_outcome_carries_observed_value_excerpt_off_the_structural_key() -> None:
+    def _outcome(visible_text: str) -> RecordedBuildTestOutcome:
+        return recorded_outcome_from_scout_act_observe_hollow(
+            interaction_tool="click",
+            selector="#submit",
+            current_url="https://example.com/confirmation",
+            source_url="https://example.com/form",
+            page_evidence={
+                "page_title": "Confirmation",
+                "forms": [],
+                "visible_text_excerpt": visible_text,
+            },
+            recapture_attempted=True,
+            recapture_result="hollow",
+        )
+
+    confirmation = _outcome("Request WTR-1842-DEMO for account 100245 confirmed")
+    other = _outcome("A completely different confirmation body")
+
+    assert "WTR-1842-DEMO" in confirmation.observed_page_value_excerpt
+    assert "100245" in confirmation.observed_page_value_excerpt
+    assert confirmation.structural_key == other.structural_key
+    assert "WTR-1842-DEMO" not in str(confirmation.structural_key_payload)
+
+
+def test_hollow_outcome_value_excerpt_falls_back_to_legacy_text_keys() -> None:
+    from_visible_text = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"visible_text": "Legacy visible text body"},
+        recapture_attempted=False,
+        recapture_result="not_attempted_no_budget",
+    )
+    from_body_text = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"bodyText": "Legacy body text body"},
+        recapture_attempted=False,
+        recapture_result="not_attempted_no_budget",
+    )
+
+    assert from_visible_text.observed_page_value_excerpt == "Legacy visible text body"
+    assert from_body_text.observed_page_value_excerpt == "Legacy body text body"
+
+
+def test_hollow_outcome_value_excerpt_is_bounded_and_key_independent() -> None:
+    long_text = "X" * 5000
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"visible_text_excerpt": long_text},
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+    baseline = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#submit",
+        current_url="https://example.com/confirmation",
+        source_url=None,
+        page_evidence={"visible_text_excerpt": ""},
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+
+    assert 0 < len(outcome.observed_page_value_excerpt) <= 700
+    assert baseline.observed_page_value_excerpt == ""
+    assert outcome.structural_key == baseline.structural_key
+
+
+def test_author_time_reject_carries_value_excerpt_off_the_convergence_key() -> None:
+    carried = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={"version": "metadata_reject_output_contract:v1", "signature": "abc"},
+        observed_page_value_excerpt="  Request WTR-1842-DEMO for account 100245  " + "detail " * 400,
+        missing_requested_output_facts=[{"output_path": "output.confirmation_number"}],
+    )
+    baseline = recorded_outcome_from_author_time_reject(
+        reason_code="metadata_reject",
+        structural_payload={"version": "metadata_reject_output_contract:v1", "signature": "abc"},
+        missing_requested_output_facts=[{"output_path": "output.confirmation_number"}],
+    )
+
+    assert "WTR-1842-DEMO" in carried.observed_page_value_excerpt
+    assert 0 < len(carried.observed_page_value_excerpt) <= 700
+    assert "WTR-1842-DEMO" not in str(carried.structural_key_payload)
+    assert carried.structural_key == baseline.structural_key
+
+
+def test_observed_value_extraction_scaffold_binds_output_paths() -> None:
+    scaffold = observed_value_extraction_scaffold_lines(
+        "Request WTR-1842-DEMO for account 100245",
+        ["output.confirmation_number", "output.account_number", "output.confirmation_number"],
+    )
+
+    assert scaffold[0].startswith("OBSERVED PAGE VALUES CONTRACT")
+    assert "observed_values: Request WTR-1842-DEMO for account 100245" in scaffold
+    assert "bind_output_paths:" in scaffold
+    assert "- output.confirmation_number: <observed value>" in scaffold
+    assert "- output.account_number: <observed value>" in scaffold
+    assert sum(1 for line in scaffold if line.startswith("- output.confirmation_number")) == 1
+
+
+def test_observed_value_extraction_scaffold_without_paths_surfaces_values_only() -> None:
+    assert observed_value_extraction_scaffold_lines("Confirmed WTR-1842-DEMO", []) == [
+        "observed_page_values: Confirmed WTR-1842-DEMO"
+    ]
+    assert observed_value_extraction_scaffold_lines("   ", ["output.x"]) == []
+
+
 def test_prose_or_label_only_typed_outcome_is_not_authoritative() -> None:
     outcome = RecordedBuildTestOutcome(
         phase="author_time_reject",
@@ -144,6 +296,51 @@ def test_record_none_clears_stale_latest_outcome() -> None:
     record_build_test_outcome(ctx, None)
 
     assert ctx.latest_recorded_build_test_outcome is None
+
+
+def test_repeated_outcome_ignores_intervening_scout_evaluate_history() -> None:
+    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    author_reject = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        structural_failure_identity="author:missing-output",
+    )
+    scout_hollow = RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout:hollow",
+    )
+
+    record_build_test_outcome(ctx, author_reject)
+    record_build_test_outcome(ctx, scout_hollow)
+    record_build_test_outcome(ctx, author_reject)
+
+    assert latest_recorded_build_test_outcome_repeated(ctx) is True
+
+
+def test_repeated_outcome_still_detects_different_author_reject_after_scout_evaluate() -> None:
+    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    first_reject = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        structural_failure_identity="author:missing-output",
+    )
+    scout_hollow = RecordedBuildTestOutcome(
+        phase="scout_evaluate",
+        verdict="repairable_failure",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        structural_failure_identity="scout:hollow",
+    )
+    second_reject = first_reject.model_copy(update={"structural_failure_identity": "author:different-output"})
+
+    record_build_test_outcome(ctx, first_reject)
+    record_build_test_outcome(ctx, scout_hollow)
+    record_build_test_outcome(ctx, second_reject)
+
+    assert latest_recorded_build_test_outcome_repeated(ctx) is False
 
 
 def test_authored_structure_signature_is_stable_and_excludes_raw_code_or_prose() -> None:
@@ -203,6 +400,119 @@ def test_authored_structure_signature_is_stable_and_excludes_raw_code_or_prose()
     assert signature == same_structure
     assert "page.goto" not in str(dumped)
     assert "Find the exact provider" not in str(dumped)
+
+
+def test_binding_frontier_facet_derivation_per_reason_code() -> None:
+    def _outcome(**updates: object) -> RecordedBuildTestOutcome:
+        base: dict[str, object] = {
+            "phase": "persisted_block_run",
+            "verdict": "repairable_failure",
+            "reason_code": "runtime_block_failure",
+            "structural_failure_identity": "runtime:x",
+        }
+        base.update(updates)
+        return RecordedBuildTestOutcome(**base)  # type: ignore[arg-type]
+
+    assert _binding_frontier_facet(_outcome()) == "selector_frontier"
+    assert _binding_frontier_facet(_outcome(reason_code="sandbox_unresolved_name")) == "amend_in_place"
+    assert _binding_frontier_facet(_outcome(reason_code="synthesized_parameter_binding_ambiguous")) == "amend_in_place"
+    assert _binding_frontier_facet(_outcome(reason_code="outcome_not_demonstrated")) == "value_shape"
+    assert (
+        _binding_frontier_facet(_outcome(reason_code="scout_act_observe_hollow_after_interaction"))
+        == "unexecuted_submit"
+    )
+    assert (
+        _binding_frontier_facet(_outcome(missing_requested_output_facts=[{"output_path": "records[].npi"}]))
+        == "value_shape"
+    )
+    assert (
+        _binding_frontier_facet(_outcome(runtime_output_repair_facts=[{"output_path": "records[].npi"}]))
+        == "amend_in_place"
+    )
+
+
+def test_authored_block_signatures_track_only_owning_block_frontier_movement() -> None:
+    base = """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        parameter_keys:
+        - provider_query
+        code: |
+          return {"records": [{"npi": "123"}]}
+      - block_type: code
+        label: format_output
+        code: |
+          return {"formatted": True}
+    """
+    changed_owning = base.replace('"123"', '"456"')
+    changed_other = base.replace('"formatted": True', '"formatted": False')
+
+    baseline = authored_block_signatures_from_workflow(base, None)
+    assert set(baseline) == {"search_registry", "format_output"}
+
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key="k",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_registry"],
+        recorded_block_signatures={"search_registry": baseline["search_registry"]},
+    )
+
+    assert constraint.owning_block_frontier_moved(baseline) is False
+    assert constraint.owning_block_frontier_moved(authored_block_signatures_from_workflow(changed_other, None)) is False
+    assert constraint.owning_block_frontier_moved(authored_block_signatures_from_workflow(changed_owning, None)) is True
+    assert constraint.owning_block_frontier_moved({}) is True
+
+
+def test_authored_block_signatures_ignore_cosmetic_block_fields() -> None:
+    base = """
+    title: Registry lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        parameter_keys:
+        - provider_query
+        code: |
+          return {"records": [{"npi": "123"}]}
+    """
+    described = base.replace(
+        "        label: search_registry\n",
+        "        label: search_registry\n        description: look up the provider by name\n",
+    )
+    continue_on_failure = base.replace(
+        "        label: search_registry\n",
+        "        label: search_registry\n        continue_on_failure: true\n",
+    )
+    renamed = base.replace("search_registry", "lookup_registry")
+
+    baseline = authored_block_signatures_from_workflow(base, None)
+    assert authored_block_signatures_from_workflow(described, None) == baseline
+    assert authored_block_signatures_from_workflow(continue_on_failure, None) == baseline
+
+    renamed_signatures = authored_block_signatures_from_workflow(renamed, None)
+    assert set(renamed_signatures) == {"lookup_registry"}
+    assert renamed_signatures["lookup_registry"] == baseline["search_registry"]
+
+
+def test_binding_constraint_uncrossable_reflects_diagnostic_reason() -> None:
+    def _constraint(reason: str) -> RecordedOutcomeBindingConstraint:
+        return RecordedOutcomeBindingConstraint(
+            repeated_structural_key="k",
+            phase="persisted_block_run",
+            reason_code="runtime_block_failure",
+            frontier_facet="selector_frontier",
+            diagnostic_reason=reason,  # type: ignore[arg-type]
+        )
+
+    assert _constraint("none").frontier_uncrossable is False
+    assert _constraint("empty_page").frontier_uncrossable is True
+    assert _constraint("challenge_gated").frontier_uncrossable is True
+    assert _constraint("capture_degraded").frontier_uncrossable is True
 
 
 def test_authored_structure_signature_changes_on_code_parameter_or_output_structure() -> None:
@@ -466,6 +776,8 @@ def test_outcome_not_demonstrated_keeps_missing_fact_for_absent_requested_output
             "grounding_mode": "missing",
         }
     ]
+    assert outcome.structural_key_payload is not None
+    assert "output.top_post" in str(outcome.structural_key_payload)
 
 
 def test_authoring_repair_context_produces_structural_recorded_outcome() -> None:

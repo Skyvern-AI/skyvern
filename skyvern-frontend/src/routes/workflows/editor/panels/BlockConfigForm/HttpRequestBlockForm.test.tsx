@@ -286,6 +286,7 @@ function setHttpRequestNode(
       model: null,
       downloadFilename: "",
       saveResponseAsFile: false,
+      secretResponsePaths: [],
       ...overrides,
     },
   });
@@ -454,6 +455,33 @@ describe("HttpRequestBlockForm (SKY-9361)", () => {
     rerender(<HttpRequestBlockForm blockId="h1" />);
 
     expect(screen.getByText("Download Filename")).toBeDefined();
+  });
+
+  test("editing secret response paths propagates one path per line", () => {
+    setHttpRequestNode("h1", {
+      secretResponsePaths: ["data.ssn", "data.token"],
+    });
+    render(<HttpRequestBlockForm blockId="h1" />);
+
+    expect(screen.getByText("Secret Response Paths")).toBeDefined();
+    const pathsInput = screen.getByTestId(
+      "wbi-ph-data.ssn",
+    ) as HTMLTextAreaElement;
+    expect(pathsInput.value).toBe("data.ssn\ndata.token");
+
+    fireEvent.change(pathsInput, {
+      target: { value: "data.ssn\n\n data.token " },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("h1", {
+      secretResponsePaths: ["data.ssn", "", " data.token "],
+    });
+
+    updateNodeData.mockReset();
+    fireEvent.change(pathsInput, { target: { value: "" } });
+    expect(updateNodeData).toHaveBeenCalledWith("h1", {
+      secretResponsePaths: [],
+    });
   });
 
   test("editing timeout coerces to int with fallback to 30", () => {

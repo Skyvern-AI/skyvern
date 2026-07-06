@@ -151,7 +151,7 @@ function WorkflowScriptDetailPage() {
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button asChild variant="ghost" size="icon">
-            <Link to={`/workflows/${workflowPermanentId}/scripts`}>
+            <Link to={`/agents/${workflowPermanentId}/scripts`}>
               <ArrowLeftIcon className="size-5" />
             </Link>
           </Button>
@@ -343,7 +343,7 @@ function WorkflowScriptDetailPage() {
           <p className="text-sm text-muted-foreground">
             Revision #{activeVersion} created on run{" "}
             <Link
-              to={`/workflows/${workflowPermanentId}/${activeVersionInfo.run_id}/code`}
+              to={`/agents/${workflowPermanentId}/${activeVersionInfo.run_id}/code`}
               className="font-mono text-blue-400 hover:underline"
             >
               {activeVersionInfo.run_id}
@@ -404,7 +404,7 @@ function WorkflowScriptDetailPage() {
                   <TableRow key={run.workflow_run_id}>
                     <TableCell>
                       <Link
-                        to={`/workflows/${workflowPermanentId}/${run.workflow_run_id}/overview`}
+                        to={`/agents/${workflowPermanentId}/${run.workflow_run_id}/overview`}
                         className="font-mono text-sm text-blue-400 hover:underline"
                       >
                         {run.workflow_run_id}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import io
 import json
 import keyword
@@ -11,6 +12,7 @@ import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from dataclasses import replace
 from typing import Annotated, Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 
@@ -30,11 +32,14 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
+    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
+    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
@@ -49,6 +54,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _BARE_TAG_RE,
     _SYNTHESIZED_BLOCK_LABEL,
     SynthesisDiagnostics,
+    SynthesizedCodeBlock,
     _get_by_role_expr_strict,
     _is_positional_selector,
     _parse_role_name,
@@ -63,13 +69,18 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
+    CodeAuthoringRepairContext,
+    CopilotContext,
+)
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
     code_authoring_churn_stop_signal,
     credential_priority_authoring_churn_stop_signal,
+    synthesized_persistence_reopened_after_failed_run,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
@@ -91,6 +102,10 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
     code_is_download_intent,
 )
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestedOutputEvidenceSource,
+    _coerce_requested_output_evidence_source,
+)
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
@@ -103,9 +118,14 @@ from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, may
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     blocker_signal_is_genuinely_terminal,
+    stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    credential_param_ids,
+    parse_workflow_yaml,
+    workflow_blocks,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -216,6 +236,8 @@ class CodeArtifactCompletionCriterion(BaseModel):
     level: Literal["terminal", "outcome", "prefix", "method"] = "terminal"
     outcome: str | None = None
     terminal: bool | None = None
+    output_path: str | None = None
+    requested_output_evidence_source: RequestedOutputEvidenceSource | None = None
 
 
 class CodeArtifactScopedRef(BaseModel):
@@ -421,6 +443,7 @@ def _normalize_code_artifact_metadata_detailed(
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
     verified_runtime_output_paths_by_label: Mapping[str, set[str]] | None = None,
+    advisory_declared_output_return_shape_labels: set[str] | None = None,
 ) -> CodeArtifactNormalization:
     """Normalize submitted artifact metadata at the persist seam.
 
@@ -434,6 +457,7 @@ def _normalize_code_artifact_metadata_detailed(
     items = _code_artifact_metadata_items(raw_metadata)
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     trajectory: list[ScoutedInteraction] = scout_trajectory or []
+    advisory_return_shape_labels = advisory_declared_output_return_shape_labels or set()
     violations: list[str] = []
     offending_labels: list[str] = []
     schema_incompatibilities: list[SchemaIncompatibility] = []
@@ -528,7 +552,7 @@ def _normalize_code_artifact_metadata_detailed(
             block_code,
             require_declared_output=require_declared_output,
         )
-        if return_shape_error is not None:
+        if return_shape_error is not None and label not in advisory_return_shape_labels:
             item_violations.append(return_shape_error)
         schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
         if schema_conformance_error is not None:
@@ -572,6 +596,61 @@ def _artifact_label_fragment(label: str) -> str:
 
 def _artifact_mutable_rows(value: Any) -> list[dict[str, Any]]:
     return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _requested_output_path_key(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if not path or path == "$":
+        return None
+    if path.startswith("$."):
+        path = path[2:]
+    elif path.startswith("$["):
+        path = path[1:]
+    if not path.startswith("output."):
+        path = f"output.{path}"
+    return path
+
+
+def _metadata_requested_output_evidence_sources(
+    code_artifact_metadata: object,
+) -> dict[str, RequestedOutputEvidenceSource]:
+    metadata = code_artifact_metadata if isinstance(code_artifact_metadata, Mapping) else {}
+    sources: dict[str, RequestedOutputEvidenceSource] = {}
+    for artifact in metadata.values():
+        if not isinstance(artifact, Mapping):
+            continue
+        for criterion in _artifact_rows(artifact.get("completion_criteria")):
+            if "requested_output_evidence_source" not in criterion:
+                continue
+            source = _coerce_requested_output_evidence_source(criterion.get("requested_output_evidence_source"))
+            if source == "runtime_output":
+                continue
+            output_path = _requested_output_path_key(criterion.get("output_path"))
+            if output_path:
+                sources.setdefault(output_path, source)
+    return sources
+
+
+def _apply_code_artifact_requested_output_evidence_sources(ctx: AgentContext, code_artifact_metadata: object) -> None:
+    sources = _metadata_requested_output_evidence_sources(code_artifact_metadata)
+    if not sources:
+        return
+    policy = getattr(ctx, "request_policy", None)
+    if policy is None:
+        return
+    criteria = getattr(policy, "completion_criteria", None)
+    if not isinstance(criteria, list):
+        return
+    updated_criteria = []
+    for criterion in criteria:
+        output_path = _requested_output_path_key(getattr(criterion, "output_path", None))
+        if output_path in sources:
+            updated_criteria.append(replace(criterion, requested_output_evidence_source=sources[output_path]))
+        else:
+            updated_criteria.append(criterion)
+    policy.completion_criteria = updated_criteria
 
 
 def _drop_contradictory_checkpoint_mode(ref: dict[str, Any]) -> None:
@@ -1103,10 +1182,14 @@ def _is_unresolved_symbol_repair_context(repair_context: CodeAuthoringRepairCont
 _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
 
 
-def _record_code_authoring_guardrail_reject(ctx: AgentContext, *, defer_churn_stop: bool = False) -> None:
+def _record_code_authoring_guardrail_reject(
+    ctx: AgentContext, *, defer_churn_stop: bool = False, frontier_unchanged: bool = False
+) -> None:
     # Callers record the current build-test outcome first so repeat detection compares that key to history.
     repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    if repeated_outcome is False:
+    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
+    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
+    if repeated_outcome is False and not frontier_unchanged:
         ctx.code_authoring_guardrail_reject_count = 0
     ctx.code_authoring_guardrail_reject_count += 1
     ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
@@ -1141,6 +1224,10 @@ def _record_author_time_reject_outcome(
     block_labels: list[str] | None = None,
     missing_requested_output_facts: list[dict[str, object]] | None = None,
 ) -> None:
+    prior_outcome = ctx.latest_recorded_build_test_outcome
+    observed_page_value_excerpt = (
+        prior_outcome.observed_page_value_excerpt if isinstance(prior_outcome, RecordedBuildTestOutcome) else ""
+    )
     record_build_test_outcome(
         ctx,
         recorded_outcome_from_author_time_reject(
@@ -1149,6 +1236,7 @@ def _record_author_time_reject_outcome(
             structural_payload=structural_payload,
             authored_structure_signature=authored_structure_signature,
             observed_evidence_summary=summary,
+            observed_page_value_excerpt=observed_page_value_excerpt,
             missing_requested_output_facts=missing_requested_output_facts or [],
         ),
     )
@@ -1280,8 +1368,37 @@ def _metadata_output_path_roots(raw_metadata: object) -> list[str]:
     return sorted(roots)
 
 
+def _metadata_output_paths(raw_metadata: object) -> set[str]:
+    paths: set[str] = set()
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is not None:
+            paths.update(_metadata_item_output_paths(item))
+    return paths
+
+
+def _metadata_extraction_schema_paths(raw_metadata: object) -> set[str]:
+    paths: set[str] = set()
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is not None:
+            paths.update(_metadata_item_extraction_schema_paths(item))
+    return paths
+
+
 def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list[str]]:
     roots_by_label: dict[str, set[str]] = {}
+    for label, paths in _metadata_output_paths_by_label(raw_metadata).items():
+        roots = roots_by_label.setdefault(label, set())
+        for path in paths:
+            root = _top_level_path_segment(path)
+            if root:
+                roots.add(root)
+    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+
+
+def _metadata_output_paths_by_label(raw_metadata: object) -> dict[str, list[str]]:
+    paths_by_label: dict[str, set[str]] = {}
     unlabeled_index = 0
     for raw_item in _code_artifact_metadata_items(raw_metadata):
         item = _raw_metadata_item_mapping(raw_item)
@@ -1291,23 +1408,36 @@ def _metadata_output_path_roots_by_label(raw_metadata: object) -> dict[str, list
         if not label:
             unlabeled_index += 1
             label = f"<unlabeled:{unlabeled_index}>"
-        roots = roots_by_label.setdefault(label, set())
-        roots.update(_metadata_item_output_path_roots(item))
-    return {label: sorted(roots) for label, roots in sorted(roots_by_label.items()) if roots}
+        paths = paths_by_label.setdefault(label, set())
+        paths.update(_metadata_item_output_paths(item))
+    return {label: sorted(paths) for label, paths in sorted(paths_by_label.items()) if paths}
 
 
 def _metadata_item_output_path_roots(item: Mapping[str, Any]) -> set[str]:
     roots: set[str] = set()
+    for path in _metadata_item_output_paths(item):
+        root = _top_level_path_segment(path)
+        if root:
+            roots.add(root)
+    return roots
+
+
+def _metadata_item_output_paths(item: Mapping[str, Any]) -> set[str]:
+    paths: set[str] = set()
     for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
         for row in _artifact_rows(item.get(field_name)):
-            for path in _artifact_string_list(row.get("goal_value_paths")):
-                root = path.split(".", 1)[0].split("[", 1)[0].strip()
-                if root:
-                    roots.add(root)
+            paths.update(_artifact_goal_value_paths(row.get("goal_value_paths")))
+    paths.update(_metadata_item_extraction_schema_paths(item))
+    return paths
+
+
+def _metadata_item_extraction_schema_paths(item: Mapping[str, Any]) -> set[str]:
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(item.get(field_name)):
             schema = _parse_extraction_schema(row.get("extraction_schema"))
             if schema is not None:
-                roots.update(_schema_property_roots(schema))
-    return roots
+                return _schema_property_paths(schema)
+    return set()
 
 
 def _metadata_reject_code_block_output_status(
@@ -1353,6 +1483,26 @@ def _schema_property_roots(schema: Mapping[str, object]) -> set[str]:
     return set()
 
 
+def _schema_property_paths(schema: Mapping[str, object], *, prefix: str = "") -> set[str]:
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping):
+        paths: set[str] = set()
+        for raw_key, child in properties.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            paths.add(path)
+            if isinstance(child, Mapping):
+                paths.update(_schema_property_paths(child, prefix=path))
+        return paths
+    items = schema.get("items")
+    if isinstance(items, Mapping):
+        array_prefix = f"{prefix}[]" if prefix else ""
+        return _schema_property_paths(items, prefix=array_prefix)
+    return set()
+
+
 def _metadata_violation_categories(violations: list[str]) -> list[str]:
     categories: list[str] = []
     for violation in violations:
@@ -1375,19 +1525,63 @@ def _metadata_violation_categories(violations: list[str]) -> list[str]:
     return categories
 
 
-def _unchanged_after_recorded_outcome_signature(
+class _ConvergenceReject(NamedTuple):
+    authored_structure_signature: str
+    reason: Literal["identical_authored_structure", "frontier_unchanged"]
+    commit_early_terminal: bool
+
+
+def _recorded_outcome_convergence_reject(
     ctx: AgentContext,
     *,
     workflow_yaml: str,
     code_artifact_metadata: object,
-) -> str | None:
+) -> _ConvergenceReject | None:
     latest = ctx.latest_recorded_build_test_outcome
     if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
         return None
     candidate_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
-    if candidate_signature is None or candidate_signature != latest.authored_structure_signature:
+    if candidate_signature is None:
         return None
-    return candidate_signature
+    if candidate_signature == latest.authored_structure_signature:
+        return _ConvergenceReject(candidate_signature, "identical_authored_structure", False)
+    constraint = ctx.recorded_outcome_binding_constraint
+    if not isinstance(constraint, RecordedOutcomeBindingConstraint):
+        return None
+    # An author-time reject re-keys `latest` without an executed run, so keep the binding
+    # anchored to its run-outcome key across consecutive frontier-unchanged rejects until a
+    # real run legitimately re-keys it.
+    if latest.phase != "author_time_reject" and constraint.repeated_structural_key != latest.structural_key:
+        return None
+    candidate_block_signatures = authored_block_signatures_from_workflow(workflow_yaml, code_artifact_metadata)
+    if constraint.owning_block_frontier_moved(candidate_block_signatures):
+        return None
+    return _ConvergenceReject(candidate_signature, "frontier_unchanged", constraint.frontier_uncrossable)
+
+
+def _commit_recorded_outcome_early_terminal(ctx: AgentContext) -> None:
+    constraint = ctx.recorded_outcome_binding_constraint
+    diagnostic_reason = (
+        constraint.diagnostic_reason if isinstance(constraint, RecordedOutcomeBindingConstraint) else "none"
+    )
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=(
+            f"The recorded build-test outcome names an uncrossable page frontier ({diagnostic_reason}) and the "
+            "frontier block is unchanged; stop retrying and report the recorded blocker from the preserved draft."
+        ),
+        user_facing_reason="I can't get past this page, so I'll stop here and report what I found.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="repair_ceiling_reached",
+        blocked_tool="update_workflow",
+    )
+    stash_blocker_signal(ctx, signal)
+    stash_repair_ceiling_turn_halt(
+        ctx, signal, consecutive_identical_repair_count=ctx.consecutive_non_converging_repair_count
+    )
 
 
 def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
@@ -1404,16 +1598,20 @@ def _recorded_outcome_requires_output_candidate(ctx: AgentContext) -> bool:
     return not verification.is_fully_satisfied()
 
 
-def _recorded_outcome_missing_output_roots(ctx: AgentContext) -> set[str]:
+def _recorded_outcome_missing_output_paths(ctx: AgentContext) -> set[str]:
     latest = ctx.latest_recorded_build_test_outcome
-    roots: set[str] = set()
+    paths: set[str] = set()
     if isinstance(latest, RecordedBuildTestOutcome) and latest.reason_code == "outcome_not_demonstrated":
         for fact in latest.missing_requested_output_facts:
+            path = str(fact.get("output_path") or "").strip()
+            if path:
+                paths.add(path)
+                continue
             root = str(fact.get("output_root") or "").strip()
             if root:
-                roots.add(root)
-    if roots:
-        return roots
+                paths.add(root)
+    if paths:
+        return paths
     verification = getattr(ctx, "completion_verification_result", None)
     if verification is None or getattr(verification, "status", None) != "evaluated":
         return set()
@@ -1421,37 +1619,1650 @@ def _recorded_outcome_missing_output_roots(ctx: AgentContext) -> set[str]:
         if getattr(verdict, "satisfied", False):
             continue
         output_path = str(getattr(verdict, "output_path", "") or "").strip()
-        root = output_path.split(".", 1)[0].split("[", 1)[0].strip()
-        if root:
-            roots.add(root)
-    return roots
+        if output_path:
+            paths.add(output_path)
+    return paths
 
 
-def _candidate_missing_required_output_roots(
+def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return set()
+    request_policy = getattr(ctx, "request_policy", None)
+    criteria_source = getattr(request_policy, "graded_completion_criteria", None)
+    criteria = criteria_source() if callable(criteria_source) else getattr(request_policy, "completion_criteria", [])
+    if not isinstance(criteria, list):
+        return set()
+    paths: set[str] = set()
+    for criterion in criteria:
+        if getattr(criterion, "level", None) == "definition":
+            continue
+        if getattr(criterion, "method_mandated", False):
+            continue
+        if getattr(criterion, "kind", None) == "validation_classification":
+            continue
+        path = _canonical_requested_output_path(getattr(criterion, "output_path", None))
+        if path and _output_path_has_child(path):
+            paths.add(path)
+    return paths
+
+
+def _canonical_requested_output_path(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    path = value.strip()
+    if path == "$":
+        return ""
+    if path.startswith("$."):
+        path = path[2:]
+    elif path.startswith("$["):
+        path = path[1:]
+    path = path.replace("[*]", "[]")
+    path = re.sub(r"\[\d+\]", "[]", path)
+    return ".".join(part for part in path.split(".") if part)
+
+
+def _required_child_output_paths_for_authoring(ctx: AgentContext) -> tuple[set[str], str, str]:
+    if _recorded_outcome_requires_output_candidate(ctx):
+        return (
+            {path for path in _recorded_outcome_missing_output_paths(ctx) if _output_path_has_child(path)},
+            "recorded_outcome",
+            "recorded_outcome_missing_output_coverage",
+        )
+    return (
+        _requested_output_child_paths(ctx),
+        "requested_output_contract",
+        "requested_output_contract_missing_output_coverage",
+    )
+
+
+def _missing_requested_output_facts(paths: Iterable[str], *, reason_code: str) -> list[dict[str, object]]:
+    return [
+        {
+            "output_path": path,
+            "output_root": _output_path_root(path),
+            "reason_code": reason_code,
+            "value_status": "no_typed_value",
+        }
+        for path in sorted(paths)
+    ]
+
+
+def _single_repair_block_label(block_labels: list[str]) -> str:
+    labels = [str(label).strip() for label in block_labels if str(label).strip()]
+    return labels[0] if len(labels) == 1 else ""
+
+
+def _metadata_repair_contract(
+    *,
+    block_labels: list[str],
+    required_paths: Iterable[str],
+    source: str,
+    reason_code: str,
+) -> dict[str, object] | None:
+    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    block_label = _single_repair_block_label(block_labels)
+    if not paths or not block_label:
+        return None
+    return {
+        "block_label": block_label,
+        "required_goal_value_paths": paths,
+        "required_extraction_schema_paths": paths,
+        "required_code_return_paths": paths,
+        "source": source,
+        "reason_code": reason_code,
+    }
+
+
+def _metadata_output_repair_context(
+    *,
+    block_labels: list[str],
+    required_paths: Iterable[str],
+    coverage_reason_code: str,
+    source: str,
+    summary: str,
+) -> CodeAuthoringRepairContext | None:
+    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    block_label = _single_repair_block_label(block_labels)
+    if not paths or not block_label:
+        return None
+    path_text = ", ".join(paths)
+    return CodeAuthoringRepairContext(
+        block_label=block_label,
+        reason_code="metadata_reject",
+        runtime_failure_class=coverage_reason_code,
+        runtime_failure_reason=summary,
+        required_goal_value_paths=paths,
+        required_extraction_schema_paths=paths,
+        required_code_return_paths=paths,
+        metadata_contract_source=source,
+        metadata_contract_reason_code=coverage_reason_code,
+        repair_instruction=(
+            "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths "
+            f"{path_text}, make the code return those paths, then rerun update_and_run_blocks."
+        ),
+    )
+
+
+_METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE = "metadata_contract_required_before_run"
+_SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE = "separated_spine_shape_required"
+_SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE = "separated_browser_spine_plus_extraction"
+_OUTPUT_CONTRACT_REJECT_REASON_CODE = "output_contract_required"
+_OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE = "output_contract_reject_budget_exhausted"
+_MAX_OUTPUT_CONTRACT_STEERING_REJECTS = 2
+_MAX_OUTPUT_CONTRACT_REJECTS = 4
+_MAX_OUTPUT_CONTRACT_DEFERRALS = 3
+
+
+@dataclass(frozen=True)
+class _OutputContractEvaluation:
+    block_label: str
+    artifact_id: str
+    required_paths: set[str]
+    source: str
+    reason_code: str
+    missing_metadata_paths: list[str]
+    missing_schema_paths: list[str]
+    missing_return_paths: list[str]
+    shape_violations: list[str]
+    canonical_signature: str
+    payload: dict[str, Any]
+    repair_context: CodeAuthoringRepairContext | None
+    can_attempt_run: bool = False
+
+    @property
+    def has_deficiencies(self) -> bool:
+        return bool(
+            self.missing_metadata_paths
+            or self.missing_schema_paths
+            or self.missing_return_paths
+            or self.shape_violations
+        )
+
+
+@dataclass(frozen=True)
+class _RuntimeOutputRepairContract:
+    required_paths: set[str]
+    facts: list[dict[str, Any]]
+    workflow_run_id: str
+    source: str = "runtime_output_repair"
+    reason_code: str = "runtime_output_repair_required"
+
+
+def _metadata_contract_required_paths(paths: Iterable[str]) -> set[str]:
+    return {
+        path
+        for raw_path in paths
+        for path in [_canonical_requested_output_path(str(raw_path))]
+        if path and _output_path_has_child(path)
+    }
+
+
+def _path_segments(path: str) -> list[tuple[str, bool]]:
+    segments: list[tuple[str, bool]] = []
+    for raw_part in path.split("."):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if part.endswith("[]"):
+            segments.append((part[:-2], True))
+            continue
+        if "[]" in part:
+            name = part.replace("[]", "")
+            if name:
+                segments.append((name, True))
+            continue
+        segments.append((part, False))
+    return segments
+
+
+def _schema_template_for_required_paths(required_paths: Iterable[str]) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+
+    def ensure_required(container: dict[str, Any], key: str) -> None:
+        required = container.setdefault("required", [])
+        if isinstance(required, list) and key not in required:
+            required.append(key)
+
+    for path in sorted(_metadata_contract_required_paths(required_paths)):
+        segments = _path_segments(path)
+        container = schema
+        for index, (key, is_array) in enumerate(segments):
+            if not key:
+                break
+            properties = container.setdefault("properties", {})
+            if not isinstance(properties, dict):
+                break
+            ensure_required(container, key)
+            is_leaf = index == len(segments) - 1
+            if is_array:
+                child = properties.setdefault(
+                    key,
+                    {"type": "array", "items": {"type": "object", "properties": {}, "required": []}},
+                )
+                if isinstance(child, dict):
+                    child["type"] = "array"
+                    items = child.setdefault("items", {"type": "object", "properties": {}, "required": []})
+                    if isinstance(items, dict):
+                        items.setdefault("type", "object")
+                        items.setdefault("properties", {})
+                        items.setdefault("required", [])
+                        container = items
+                continue
+            child = properties.setdefault(key, {} if is_leaf else {"type": "object", "properties": {}, "required": []})
+            if isinstance(child, dict) and not is_leaf:
+                child.setdefault("type", "object")
+                child.setdefault("properties", {})
+                child.setdefault("required", [])
+                container = child
+    return schema
+
+
+def _schema_template_text_for_required_paths(required_paths: Iterable[str]) -> str:
+    return json.dumps(_schema_template_for_required_paths(required_paths), sort_keys=True)
+
+
+def _metadata_contract_template(
+    *,
+    block_label: str,
+    required_paths: set[str],
+    source: str,
+    reason_code: str,
+) -> dict[str, Any]:
+    artifact_id = _artifact_id_for_block_label(block_label)
+    schema_text = _schema_template_text_for_required_paths(required_paths)
+    paths = sorted(required_paths)
+    return {
+        "block_label": block_label,
+        "artifact_id": artifact_id,
+        "declared_goal": "Return the requested structured output paths.",
+        "claimed_outcomes": [
+            {
+                "id": f"claim:{artifact_id}",
+                "scope": "outcome",
+                "status": "observed_not_verified",
+                "goal_value_paths": paths,
+                "extraction_schema": schema_text,
+            }
+        ],
+        "terminal_verifier_expectations": [
+            {
+                "id": f"expectation:{artifact_id}",
+                "goal_value_paths": paths,
+                "extraction_schema": schema_text,
+                "source": source,
+                "reason_code": reason_code,
+            }
+        ],
+    }
+
+
+def _return_skeleton_for_required_paths(required_paths: Iterable[str]) -> str:
+    paths = sorted(_metadata_contract_required_paths(required_paths))
+    roots = sorted({_output_path_root(path) for path in paths if _output_path_root(path)})
+    if not roots:
+        return ""
+    if roots == ["output"]:
+        child_names = sorted(
+            {
+                child
+                for path in paths
+                if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
+            }
+        )
+        if child_names:
+            pairs = ", ".join(f'"{name}": {name}' for name in child_names)
+            return f'return {{"output": {{{pairs}}}}}'
+        return "return output"
+    if len(roots) == 1 and _return_scaffold_name_is_safe(roots[0]):
+        root = roots[0]
+        return f'return {{"{root}": {root}}}'
+    pairs = ", ".join(f'"{root}": {root}' for root in roots if _return_scaffold_name_is_safe(root))
+    return f"return {{{pairs}}}" if pairs else ""
+
+
+def _metadata_item_for_block_label(raw_metadata: object, block_label: str) -> Mapping[str, Any] | None:
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        if str(item.get("block_label") or "").strip() == block_label:
+            return item
+    return None
+
+
+def _metadata_has_mapping_item(raw_metadata: object) -> bool:
+    return any(_raw_metadata_item_mapping(item) is not None for item in _code_artifact_metadata_items(raw_metadata))
+
+
+def _metadata_item_goal_value_paths(item: Mapping[str, Any] | None) -> set[str]:
+    if item is None:
+        return set()
+    paths: set[str] = set()
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(item.get(field_name)):
+            paths.update(
+                path
+                for raw_path in _artifact_goal_value_paths(row.get("goal_value_paths"))
+                for path in [_canonical_requested_output_path(raw_path)]
+                if path
+            )
+    return paths
+
+
+def _metadata_item_effective_schema_text(item: Mapping[str, Any] | None, required_paths: set[str]) -> str:
+    if item is None or not required_paths:
+        return ""
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(item.get(field_name)):
+            schema_text = row.get("extraction_schema")
+            schema = _parse_extraction_schema(schema_text)
+            if schema is not None:
+                return str(schema_text or "").strip() if required_paths <= _schema_property_paths(schema) else ""
+    return ""
+
+
+def _active_metadata_repair_block_label(ctx: AgentContext) -> str:
+    repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
+    if not isinstance(repair_context, CodeAuthoringRepairContext):
+        return ""
+    if repair_context.reason_code != "metadata_reject":
+        return ""
+    return str(repair_context.block_label or "").strip()
+
+
+def _output_metadata_owner_labels(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    required_paths: set[str],
+) -> list[str]:
+    if not required_paths:
+        return []
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    owners: set[str] = set()
+    for raw_item in _code_artifact_metadata_items(raw_code_artifact_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if label in code_blocks and required_paths <= _metadata_item_goal_value_paths(item):
+            owners.add(label)
+    repair_label = _active_metadata_repair_block_label(ctx)
+    if repair_label in code_blocks:
+        owners.add(repair_label)
+    for label, block in code_blocks.items():
+        if required_paths <= _code_block_produced_output_paths(str(block.get("code") or "")):
+            owners.add(label)
+    return sorted(owners)
+
+
+def _scout_spine_requires_separated_blocks(ctx: AgentContext) -> bool:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return False
+    scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(scout_trajectory, list) or len(scout_trajectory) < 2:
+        return False
+    synthesized = synthesize_code_block(
+        scout_trajectory,
+        strict_selectors=True,
+        reached_download_target=getattr(ctx, "reached_download_target", None),
+    )
+    if synthesized is None or synthesized.diagnostics.truncated:
+        return False
+    mutations, _, ambiguous = _browser_surface_for_code(synthesized.code)
+    return not ambiguous and len(mutations) >= 2
+
+
+def _output_contract_scope_key(ctx: AgentContext | None) -> str:
+    if ctx is None:
+        return ""
+    turn_id = str(getattr(ctx, "turn_id", "") or "").strip()
+    if turn_id:
+        return f"turn:{turn_id}"
+    workflow_permanent_id = str(getattr(ctx, "workflow_permanent_id", "") or "").strip()
+    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    active_set_id = str(getattr(turn_state, "active_set_id", "") or "").strip()
+    if workflow_permanent_id and active_set_id:
+        return f"workflow:{workflow_permanent_id}:criteria_set:{active_set_id}"
+    decision = getattr(turn_state, "decision", None)
+    epoch = getattr(decision, "epoch", None)
+    if workflow_permanent_id and epoch is not None:
+        return f"workflow:{workflow_permanent_id}:criteria_epoch:{epoch}"
+    return ""
+
+
+def _stable_output_contract_key(scope_key: str, required_paths: set[str]) -> str:
+    scope_key = scope_key.strip()
+    if not scope_key:
+        return ""
+    payload = {
+        "scope": scope_key,
+        "required_paths": sorted(required_paths),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _output_contract_author_time_structural_payload(
+    ctx: AgentContext,
+    required_paths: set[str],
+    *,
+    block_label: str = "",
+    deficiency_family: str = "output_contract_unsatisfied",
+) -> Mapping[str, object] | None:
+    signature = _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+    if not signature:
+        return None
+    payload: dict[str, object] = {
+        "version": "metadata_reject_output_contract:v1",
+        "canonical_output_contract_signature": signature,
+        "canonical_required_child_paths": sorted(required_paths),
+        "deficiency_family": deficiency_family,
+    }
+    if block_label.strip():
+        payload["block_label"] = block_label.strip()
+    return payload
+
+
+def _output_contract_signature(
+    *,
+    ctx: AgentContext | None = None,
+    scope_key: str = "",
+    workflow_yaml: str,
+    source: str,
+    reason_code: str,
+    required_paths: set[str],
+) -> str:
+    return _stable_output_contract_key(scope_key or _output_contract_scope_key(ctx), required_paths)
+
+
+def _runtime_output_contract_signature(runtime_contract: _RuntimeOutputRepairContract | None) -> str:
+    if runtime_contract is None:
+        return ""
+    payload = {
+        "workflow_run_id": runtime_contract.workflow_run_id,
+        "required_paths": sorted(runtime_contract.required_paths),
+        "facts": runtime_contract.facts,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _default_output_contract_block_label(workflow_yaml: str) -> str:
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    return next(iter(code_blocks)) if len(code_blocks) == 1 else ""
+
+
+def _output_contract_pin_key(ctx: AgentContext, workflow_yaml: str, required_paths: set[str]) -> str:
+    return _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+
+
+def _pinned_output_contract_block_label(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    required_paths: set[str],
+) -> str:
+    pinned_by_contract = getattr(ctx, "output_contract_pinned_block_label_by_signature", None)
+    if not isinstance(pinned_by_contract, Mapping):
+        return ""
+    pin_key = _output_contract_pin_key(ctx, workflow_yaml, required_paths)
+    if not pin_key:
+        return ""
+    label = str(pinned_by_contract.get(pin_key) or "").strip()
+    return label if label in _workflow_yaml_code_blocks_by_label(workflow_yaml) else ""
+
+
+def _pin_output_contract_block_label(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    required_paths: set[str],
+    label: str,
+) -> None:
+    label = label.strip()
+    if not label:
+        return
+    pinned_by_contract = getattr(ctx, "output_contract_pinned_block_label_by_signature", None)
+    if not isinstance(pinned_by_contract, dict):
+        pinned_by_contract = {}
+    pin_key = _output_contract_pin_key(ctx, workflow_yaml, required_paths)
+    if not pin_key:
+        return
+    pinned_by_contract.setdefault(pin_key, label)
+    ctx.output_contract_pinned_block_label_by_signature = pinned_by_contract
+
+
+def _target_output_contract_block_label(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    required_paths: set[str],
+) -> tuple[str, list[str]]:
+    pinned_label = _pinned_output_contract_block_label(ctx, workflow_yaml, required_paths)
+    if pinned_label:
+        return pinned_label, [pinned_label]
+    owner_labels = _output_metadata_owner_labels(ctx, workflow_yaml, raw_code_artifact_metadata, required_paths)
+    if len(owner_labels) == 1:
+        _pin_output_contract_block_label(ctx, workflow_yaml, required_paths, owner_labels[0])
+        return owner_labels[0], owner_labels
+    default_label = _default_output_contract_block_label(workflow_yaml)
+    if default_label and not owner_labels:
+        _pin_output_contract_block_label(ctx, workflow_yaml, required_paths, default_label)
+        return default_label, [default_label]
+    return "", owner_labels
+
+
+def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> _RuntimeOutputRepairContract | None:
+    outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if not isinstance(outcome, RecordedBuildTestOutcome):
+        return None
+    if not (
+        outcome.is_authoritative
+        and outcome.phase == "persisted_block_run"
+        and outcome.reason_code == "outcome_not_demonstrated"
+        and outcome.workflow_run_id
+    ):
+        return None
+    facts: list[dict[str, Any]] = []
+    required_paths: set[str] = set()
+    block_labels: set[str] = set()
+    for raw_fact in outcome.runtime_output_repair_facts:
+        if not isinstance(raw_fact, Mapping):
+            return None
+        if str(raw_fact.get("workflow_run_id") or "").strip() != outcome.workflow_run_id:
+            return None
+        path = _canonical_requested_output_path(str(raw_fact.get("output_path") or ""))
+        if not path or not _output_path_has_child(path):
+            return None
+        fact = dict(raw_fact)
+        fact["output_path"] = path
+        fact["output_root"] = _output_path_root(path)
+        label = str(fact.get("block_label") or "").strip()
+        if label:
+            block_labels.add(label)
+        required_paths.add(path)
+        facts.append(fact)
+    if not facts or not required_paths or len(block_labels) > 1:
+        return None
+    return _RuntimeOutputRepairContract(
+        required_paths=required_paths,
+        facts=sorted(facts, key=lambda item: str(item.get("output_path") or "")),
+        workflow_run_id=outcome.workflow_run_id,
+    )
+
+
+def _output_contract_required_paths_source(ctx: AgentContext) -> tuple[set[str], str, str]:
+    runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
+    if runtime_contract is not None:
+        return runtime_contract.required_paths, runtime_contract.source, runtime_contract.reason_code
+    required_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
+    repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
+    if required_paths or not isinstance(repair_context, CodeAuthoringRepairContext):
+        return required_paths, source, reason_code
+    if repair_context.reason_code != "metadata_reject":
+        return required_paths, source, reason_code
+    required_paths = _metadata_contract_required_paths(
+        [
+            *repair_context.required_goal_value_paths,
+            *repair_context.required_extraction_schema_paths,
+            *repair_context.required_code_return_paths,
+        ]
+    )
+    source = str(repair_context.metadata_contract_source or "").strip() or "metadata_reject"
+    reason_code = (
+        str(repair_context.metadata_contract_reason_code or "").strip()
+        or str(repair_context.runtime_failure_class or "").strip()
+        or "metadata_reject"
+    )
+    return required_paths, source, reason_code
+
+
+def _code_return_is_static_advisory_candidate(code: str, required_paths: set[str]) -> bool:
+    if not required_paths:
+        return False
+    produced = _code_block_produced_output_roots(code)
+    if not produced.abstained:
+        return False
+    if _code_block_produced_output_paths(code):
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+    for node in _iter_top_level_scope(tree.body):
+        if isinstance(node, ast.Return) and node.value is not None and _expr_is_flat_string(node.value, set()):
+            return False
+    return True
+
+
+def _evaluate_output_contract_for_code_block(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    *,
+    allow_static_return_advisory: bool = False,
+) -> _OutputContractEvaluation | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
+    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    if not required_paths:
+        return None
+    effective_metadata = raw_code_artifact_metadata
+    if not _metadata_has_mapping_item(effective_metadata):
+        existing_metadata = getattr(ctx, "code_artifact_metadata", None)
+        if _metadata_has_mapping_item(existing_metadata):
+            effective_metadata = existing_metadata
+    block_label, owner_labels = _target_output_contract_block_label(
+        ctx,
+        workflow_yaml,
+        effective_metadata,
+        required_paths,
+    )
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    target_block = code_blocks.get(block_label) if block_label else None
+    target_metadata = _metadata_item_for_block_label(effective_metadata, block_label) if block_label else None
+    submitted_goal_paths = _metadata_item_goal_value_paths(target_metadata)
+    submitted_schema_paths = _metadata_item_extraction_schema_paths(target_metadata) if target_metadata else set()
+    submitted_code_paths = (
+        _code_block_produced_output_paths(str(target_block.get("code") or "")) if target_block is not None else set()
+    )
+    missing_metadata_paths = sorted(required_paths - submitted_goal_paths)
+    missing_schema_paths = sorted(required_paths - submitted_schema_paths)
+    missing_return_paths = sorted(required_paths - submitted_code_paths)
+    shape_violations: list[str] = []
+    if not block_label:
+        shape_violations.append("ambiguous_output_owner" if owner_labels else "missing_output_owner")
+    elif target_block is None:
+        shape_violations.append("missing_output_block")
+    elif required_paths and _scout_spine_requires_separated_blocks(ctx):
+        synthesized = synthesize_code_block(
+            ctx.scout_trajectory,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if synthesized is not None and _browser_surface_contains_full_action_spine(
+            str(target_block.get("code") or ""), synthesized.code
+        ):
+            shape_violations.append(_SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE)
+
+    signature = _output_contract_signature(
+        ctx=ctx,
+        workflow_yaml=workflow_yaml,
+        source=source,
+        reason_code=reason_code,
+        required_paths=required_paths,
+    )
+    post_steering_static_return_advisory = (
+        allow_static_return_advisory
+        and bool(missing_return_paths)
+        and not missing_metadata_paths
+        and not missing_schema_paths
+        and not shape_violations
+        and target_block is not None
+        and _output_contract_reject_count(ctx, signature) >= _MAX_OUTPUT_CONTRACT_STEERING_REJECTS
+    )
+    static_return_advisory = (
+        allow_static_return_advisory
+        and bool(missing_return_paths)
+        and not missing_metadata_paths
+        and not missing_schema_paths
+        and not shape_violations
+        and target_block is not None
+        and (
+            post_steering_static_return_advisory
+            or _code_return_is_static_advisory_candidate(str(target_block.get("code") or ""), required_paths)
+        )
+    )
+    effective_missing_return_paths = [] if static_return_advisory else missing_return_paths
+    runtime_signature = _runtime_output_contract_signature(runtime_contract)
+    artifact_id = _artifact_id_for_block_label(block_label) if block_label else ""
+    metadata_repair_contract = (
+        _metadata_repair_contract(
+            block_labels=[block_label],
+            required_paths=required_paths,
+            source=source,
+            reason_code=reason_code,
+        )
+        if block_label
+        else None
+    )
+    repair = _metadata_output_repair_context(
+        block_labels=[block_label] if block_label else [],
+        required_paths=required_paths,
+        coverage_reason_code=reason_code,
+        source=source,
+        summary="Submitted workflow does not satisfy the requested output contract.",
+    )
+    missing_paths = sorted(
+        set(missing_metadata_paths)
+        | set(missing_schema_paths)
+        | set(effective_missing_return_paths)
+        | (required_paths if shape_violations else set())
+    )
+    payload: dict[str, Any] = {
+        "reason_code": _OUTPUT_CONTRACT_REJECT_REASON_CODE,
+        "block_label": block_label,
+        "artifact_id": artifact_id,
+        "canonical_required_child_paths": sorted(required_paths),
+        "source": source,
+        "metadata_contract_source": source,
+        "metadata_contract_reason_code": reason_code,
+        "missing_goal_value_paths": missing_metadata_paths,
+        "missing_extraction_schema_paths": missing_schema_paths,
+        "missing_code_return_paths": effective_missing_return_paths,
+        "static_return_advisory_paths": missing_return_paths if static_return_advisory else [],
+        "post_steering_static_return_advisory": post_steering_static_return_advisory,
+        "shape_violations": shape_violations,
+        "can_attempt_run": static_return_advisory,
+        "reject_reason": "" if static_return_advisory else _OUTPUT_CONTRACT_REJECT_REASON_CODE,
+        "canonical_output_contract_signature": signature,
+        "canonical_runtime_output_contract_signature": runtime_signature,
+        "runtime_output_workflow_run_id": runtime_contract.workflow_run_id if runtime_contract is not None else "",
+        "runtime_output_repair_facts": runtime_contract.facts if runtime_contract is not None else [],
+        "output_owner_labels": owner_labels,
+        "metadata_repair_contract": metadata_repair_contract,
+        "satisfying_templates": {
+            "code_artifact_metadata": (
+                _metadata_contract_template(
+                    block_label=block_label,
+                    required_paths=required_paths,
+                    source=source,
+                    reason_code=reason_code,
+                )
+                if block_label
+                else None
+            ),
+            "extraction_schema": _schema_template_for_required_paths(required_paths),
+            "return_skeleton": _return_skeleton_for_required_paths(required_paths),
+        },
+        "missing_requested_output_facts": _missing_requested_output_facts(
+            missing_paths,
+            reason_code=reason_code,
+        ),
+    }
+    if _SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE in shape_violations and block_label:
+        attempt_key = _output_contract_spine_directive_attempt_key(
+            signature=signature, block_label=block_label, workflow_yaml=workflow_yaml
+        )
+        if attempt_key in ctx.output_contract_spine_directive_blockers_by_attempt_key:
+            blockers = ctx.output_contract_spine_directive_blockers_by_attempt_key[attempt_key]
+            stage_count = ctx.output_contract_spine_directive_stage_count_by_attempt_key.get(attempt_key)
+            payload["spine_structure_directive"] = {
+                "required_block_structure": _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE,
+                "spine_stage_count": stage_count,
+                "spine_split_blockers": blockers,
+            }
+            if repair is not None:
+                repair.required_block_structure = _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE
+                repair.spine_stage_count = stage_count
+                repair.spine_split_blockers = list(blockers)
+    if not block_label and signature in ctx.output_contract_output_owner_directive_candidates_by_signature:
+        repair = _output_owner_ambiguity_repair_context(
+            required_paths=required_paths,
+            owner_labels=owner_labels,
+            source=source,
+            reason_code=reason_code,
+        )
+        payload["output_owner_directive"] = {"output_owner_candidate_labels": repair.output_owner_candidate_labels}
+    progress_data = _code_repair_progress_data(
+        repair,
+        missing_requested_output_facts=payload["missing_requested_output_facts"],
+        metadata_repair_contract=metadata_repair_contract,
+    )
+    progress_data.update(payload)
+    return _OutputContractEvaluation(
+        block_label=block_label,
+        artifact_id=artifact_id,
+        required_paths=required_paths,
+        source=source,
+        reason_code=reason_code,
+        missing_metadata_paths=missing_metadata_paths,
+        missing_schema_paths=missing_schema_paths,
+        missing_return_paths=effective_missing_return_paths,
+        shape_violations=shape_violations,
+        canonical_signature=signature,
+        payload=progress_data,
+        repair_context=repair,
+        can_attempt_run=static_return_advisory,
+    )
+
+
+def _record_output_contract_reject(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    summary: str,
+) -> dict[str, Any]:
+    count = _record_output_contract_family_reject(
+        ctx,
+        evaluation.required_paths,
+        reject_family=str(evaluation.payload.get("reason_code") or _OUTPUT_CONTRACT_REJECT_REASON_CODE),
+    )
+    payload = dict(evaluation.payload)
+    payload["output_contract_reject_count"] = count
+    payload["output_contract_reject_budget"] = _MAX_OUTPUT_CONTRACT_REJECTS
+    if count >= _MAX_OUTPUT_CONTRACT_REJECTS:
+        if run_backed_repair_evidence_exists(ctx):
+            payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+            payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+        else:
+            deferral_count = _record_output_contract_deferral(ctx, evaluation.required_paths)
+            if deferral_count >= _MAX_OUTPUT_CONTRACT_DEFERRALS:
+                payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+                payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+                LOG.info(
+                    "copilot_output_contract_budget_deferral_cap_reached",
+                    block_label=evaluation.block_label,
+                    canonical_output_contract_signature=evaluation.canonical_signature,
+                    output_contract_reject_count=count,
+                    output_contract_deferral_count=deferral_count,
+                )
+            else:
+                LOG.info(
+                    "copilot_output_contract_budget_rewrite_deferred_no_run",
+                    block_label=evaluation.block_label,
+                    canonical_output_contract_signature=evaluation.canonical_signature,
+                    output_contract_reject_count=count,
+                    output_contract_deferral_count=deferral_count,
+                )
+    structural_payload = _output_contract_author_time_structural_payload(
+        ctx,
+        evaluation.required_paths,
+        block_label=evaluation.block_label,
+    )
+    _record_author_time_reject_outcome(
+        ctx,
+        reason_code="metadata_reject",
+        summary=summary,
+        structural_payload=structural_payload or payload,
+        block_labels=[evaluation.block_label] if evaluation.block_label else [],
+        missing_requested_output_facts=payload.get("missing_requested_output_facts")
+        if isinstance(payload.get("missing_requested_output_facts"), list)
+        else None,
+    )
+    _record_code_authoring_guardrail_reject(ctx)
+    return payload
+
+
+def _record_output_contract_family_reject(
+    ctx: AgentContext,
+    required_paths: set[str],
+    *,
+    reject_family: str,
+) -> int:
+    if not required_paths:
+        return 0
+    scope_key = _output_contract_scope_key(ctx)
+    signature = _stable_output_contract_key(scope_key, required_paths)
+    if not signature:
+        LOG.info(
+            "copilot_output_contract_reject_count_unscoped",
+            reject_family=reject_family,
+            canonical_required_child_paths=sorted(required_paths),
+        )
+        return 0
+    count_by_signature = getattr(ctx, "output_contract_reject_count_by_signature", None)
+    if not isinstance(count_by_signature, dict):
+        count_by_signature = {}
+    count = int(count_by_signature.get(signature, 0) or 0) + 1
+    count_by_signature[signature] = count
+    ctx.output_contract_reject_count_by_signature = count_by_signature
+    LOG.info(
+        "copilot_output_contract_reject_counted",
+        output_contract_scope_key=scope_key,
+        canonical_output_contract_signature=signature,
+        output_contract_reject_count=count,
+        output_contract_reject_budget=_MAX_OUTPUT_CONTRACT_REJECTS,
+        reject_family=reject_family,
+        canonical_required_child_paths=sorted(required_paths),
+    )
+    return count
+
+
+def _record_output_contract_deferral(ctx: AgentContext, required_paths: set[str]) -> int:
+    if not required_paths:
+        return 0
+    signature = _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+    if not signature:
+        return 0
+    count = int(ctx.output_contract_deferral_count_by_signature.get(signature, 0) or 0) + 1
+    ctx.output_contract_deferral_count_by_signature[signature] = count
+    return count
+
+
+def _output_contract_reject_result(
+    evaluation: _OutputContractEvaluation,
+    *,
+    payload: dict[str, Any] | None = None,
+    tool_name: str = "update_workflow",
+) -> dict[str, Any]:
+    data = payload or evaluation.payload
+    if data.get("reason_code") == _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE:
+        error = (
+            "The workflow output contract repair budget is exhausted for this canonical requested-output contract. "
+            "Return with the typed output-contract payload instead of trying another variant."
+        )
+    else:
+        path_text = ", ".join(str(path) for path in data.get("canonical_required_child_paths", []) or [])
+        path_suffix = f" Required requested output paths: {path_text}." if path_text else ""
+        error = (
+            f"{tool_name} cannot proceed until the submitted workflow satisfies the requested output contract. "
+            "Use the returned code_artifact_metadata, extraction_schema, and return skeleton templates exactly for "
+            "the canonical required child paths." + path_suffix
+        )
+    return {
+        "ok": False,
+        "error": error,
+        "user_facing_summary": _compiled_authoring_user_summary(),
+        "data": data,
+    }
+
+
+def _ensure_metadata_contract_rows(
+    item: dict[str, Any],
+    *,
+    required_paths: set[str],
+    schema_text: str,
+) -> None:
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        rows = _artifact_mutable_rows(item.get(field_name))
+        if not rows:
+            item[field_name] = [{"goal_value_paths": sorted(required_paths)}]
+            rows = _artifact_mutable_rows(item.get(field_name))
+        for row in rows:
+            if not _artifact_goal_value_paths(row.get("goal_value_paths")):
+                row["goal_value_paths"] = sorted(required_paths)
+            if schema_text and not str(row.get("extraction_schema") or "").strip():
+                row["extraction_schema"] = schema_text
+
+
+def _metadata_item_declares_extraction_schema(item: Mapping[str, Any] | None) -> bool:
+    if item is None:
+        return False
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(item.get(field_name)):
+            if str(row.get("extraction_schema") or "").strip():
+                return True
+    return False
+
+
+def _output_contract_scaffold_target_label(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    required_paths: set[str],
+    *,
+    allow_missing_static_return: bool = False,
+) -> str:
+    label, owner_labels = _target_output_contract_block_label(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        required_paths,
+    )
+    if not label or owner_labels != [label]:
+        return ""
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    target_block = code_blocks.get(label)
+    if target_block is None:
+        return ""
+    target_code = str(target_block.get("code") or "")
+    if not allow_missing_static_return and not required_paths <= _code_block_produced_output_paths(target_code):
+        return ""
+    if _scout_spine_requires_separated_blocks(ctx):
+        synthesized = synthesize_code_block(
+            ctx.scout_trajectory,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if synthesized is not None and _browser_surface_contains_full_action_spine(target_code, synthesized.code):
+            return ""
+    return label
+
+
+def _apply_metadata_contract_scaffold(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    *,
+    required_paths: set[str],
+    source: str,
+    reason_code: str,
+    allow_missing_static_return: bool = False,
+) -> object:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return raw_code_artifact_metadata
+    if not required_paths:
+        return raw_code_artifact_metadata
+    label = _output_contract_scaffold_target_label(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        required_paths,
+        allow_missing_static_return=allow_missing_static_return,
+    )
+    if not label:
+        return raw_code_artifact_metadata
+    existing_item = _metadata_item_for_block_label(raw_code_artifact_metadata, label)
+    prior_item = _metadata_item_for_block_label(getattr(ctx, "code_artifact_metadata", None), label)
+    if _metadata_item_declares_extraction_schema(existing_item) and not _metadata_item_effective_schema_text(
+        existing_item, required_paths
+    ):
+        return raw_code_artifact_metadata
+    if _metadata_item_declares_extraction_schema(prior_item) and not _metadata_item_effective_schema_text(
+        prior_item, required_paths
+    ):
+        return raw_code_artifact_metadata
+    schema_text = (
+        _metadata_item_effective_schema_text(existing_item, required_paths)
+        or _metadata_item_effective_schema_text(
+            prior_item,
+            required_paths,
+        )
+        or _schema_template_text_for_required_paths(required_paths)
+    )
+    items = [
+        copy.deepcopy(item)
+        for item in _code_artifact_metadata_items(raw_code_artifact_metadata)
+        if _raw_metadata_item_mapping(item) is not None
+    ]
+    target_index: int | None = None
+    for index, raw_item in enumerate(items):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is not None and str(item.get("block_label") or "").strip() == label:
+            target_index = index
+            break
+    if target_index is None:
+        target: dict[str, Any] = {"block_label": label}
+        items.append(target)
+    else:
+        target = dict(items[target_index])
+        items[target_index] = target
+    target["block_label"] = label
+    target["artifact_id"] = _artifact_id_for_block_label(label)
+    _ensure_metadata_contract_rows(target, required_paths=required_paths, schema_text=schema_text)
+    return items
+
+
+def _scaffold_metadata_contract_for_update(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> tuple[object, bool]:
+    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    if not required_paths:
+        return raw_code_artifact_metadata, False
+    signature = _output_contract_signature(
+        ctx=ctx,
+        workflow_yaml=workflow_yaml,
+        source=source,
+        reason_code=reason_code,
+        required_paths=required_paths,
+    )
+    scaffolded = _apply_metadata_contract_scaffold(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        required_paths=required_paths,
+        source=source,
+        reason_code=reason_code,
+        allow_missing_static_return=_output_contract_reject_count(ctx, signature)
+        >= _MAX_OUTPUT_CONTRACT_STEERING_REJECTS,
+    )
+    return scaffolded, scaffolded is not raw_code_artifact_metadata
+
+
+def _apply_metadata_contract_schema_to_workflow_yaml(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> str:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return workflow_yaml
+    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    if not required_paths:
+        return workflow_yaml
+    label, owner_labels = _target_output_contract_block_label(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        required_paths,
+    )
+    if not label or owner_labels != [label]:
+        return workflow_yaml
+    metadata_item = _metadata_item_for_block_label(raw_code_artifact_metadata, label)
+    schema_text = _metadata_item_effective_schema_text(metadata_item, required_paths)
+    if not schema_text:
+        return workflow_yaml
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml
+    applied = False
+    for block in _workflow_code_blocks(parsed):
+        if str(block.get("label") or "").strip() != label:
+            continue
+        if str(block.get("extraction_schema") or "").strip():
+            return workflow_yaml
+        block["extraction_schema"] = schema_text
+        applied = True
+        break
+    if not applied:
+        return workflow_yaml
+    LOG.info(
+        "copilot_output_contract_schema_projected_to_workflow",
+        block_label=label,
+        canonical_required_child_paths=sorted(required_paths),
+        source=source,
+        reason_code=reason_code,
+    )
+    return yaml.safe_dump(parsed, sort_keys=False)
+
+
+def _workflow_needs_contract_readback_persist(
+    ctx: AgentContext,
+    prior_workflow: Workflow | None,
+    workflow: Workflow,
+    *,
+    allow_static_output_uncertainty: bool,
+) -> bool:
+    if not allow_static_output_uncertainty:
+        return False
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return False
+    if prior_workflow is None:
+        return False
+    definition = getattr(workflow, "workflow_definition", None)
+    if not getattr(definition, "blocks", None):
+        return False
+    prior_definition = getattr(prior_workflow, "workflow_definition", None)
+    if getattr(prior_definition, "blocks", None):
+        return False
+    return True
+
+
+def _output_contract_reject_count(ctx: AgentContext, signature: str) -> int:
+    count_by_signature = getattr(ctx, "output_contract_reject_count_by_signature", None)
+    if not isinstance(count_by_signature, Mapping):
+        return 0
+    try:
+        return int(count_by_signature.get(signature, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _runtime_output_repair_attempt_key(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    required_paths: set[str],
+    source: str,
+    reason_code: str,
+) -> str:
+    runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
+    outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if runtime_contract is None or not isinstance(outcome, RecordedBuildTestOutcome):
+        return ""
+    payload = {
+        "output_contract_signature": _output_contract_signature(
+            ctx=ctx,
+            workflow_yaml=workflow_yaml,
+            source=source,
+            reason_code=reason_code,
+            required_paths=required_paths,
+        ),
+        "runtime_output_contract_signature": _runtime_output_contract_signature(runtime_contract),
+        "recorded_structural_key": outcome.structural_key,
+        "authored_structure_signature": outcome.authored_structure_signature,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _runtime_output_repair_attempt_recorded(ctx: AgentContext, attempt_key: str) -> bool:
+    if not attempt_key:
+        return True
+    attempts = getattr(ctx, "runtime_output_repair_attempt_by_signature", None)
+    return isinstance(attempts, Mapping) and bool(attempts.get(attempt_key))
+
+
+def _record_runtime_output_repair_attempt(ctx: AgentContext, attempt_key: str) -> None:
+    if not attempt_key:
+        return
+    attempts = getattr(ctx, "runtime_output_repair_attempt_by_signature", None)
+    if not isinstance(attempts, dict):
+        attempts = {}
+    attempts[attempt_key] = True
+    ctx.runtime_output_repair_attempt_by_signature = attempts
+
+
+def _output_contract_spine_directive_attempt_key(*, signature: str, block_label: str, workflow_yaml: str) -> str:
+    payload = {
+        "signature": signature,
+        "block_label": block_label,
+        "workflow_yaml_hash": hashlib.sha256(workflow_yaml.encode("utf-8")).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _referenced_parameter_keys_in_code(code: str, parameter_keys: list[str]) -> list[str]:
+    protected = {key for key in parameter_keys if key}
+    if not protected:
+        return []
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return []
+    referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    return sorted(referenced & protected)
+
+
+class _SpineSplitOutcome(NamedTuple):
+    imposed_yaml: str | None
+    blockers: list[str]
+    stage_count: int | None
+
+
+def _attempt_separated_spine_split(
+    *,
+    ctx: AgentContext,
+    parsed: dict[str, Any],
+    label: str,
+    target_code: str,
+    synthesized: SynthesizedCodeBlock,
+    required_paths: set[str],
+) -> _SpineSplitOutcome:
+    code_block = next(
+        (block for block in _workflow_code_blocks(parsed) if str(block.get("label") or "").strip() == label),
+        None,
+    )
+    if code_block is None:
+        return _SpineSplitOutcome(None, ["target_block_not_resolved_in_parsed"], None)
+
+    reconciliation = _reconcile_synthesized_parameters(
+        ctx=ctx,
+        parsed=parsed,
+        code_block=code_block,
+        submitted_code=target_code,
+        synthesized_parameters=synthesized.parameters,
+        scout_trajectory=ctx.scout_trajectory,
+    )
+    if reconciliation.violations:
+        return _SpineSplitOutcome(None, ["parameter_reconciliation_failed"], None)
+
+    reconciled_submitted = _apply_parameter_reconciliation_to_code(textwrap.dedent(target_code), reconciliation)
+    reconciled_synthesized = _apply_parameter_reconciliation_to_code(textwrap.dedent(synthesized.code), reconciliation)
+    extraction_suffix = _submitted_suffix_after_synthesized_code(reconciled_submitted, reconciled_synthesized)
+    if not extraction_suffix:
+        return _SpineSplitOutcome(None, ["extraction_boundary_ambiguous"], None)
+    suffix_mutations, _, suffix_ambiguous = _browser_surface_for_code(extraction_suffix)
+    if suffix_mutations or suffix_ambiguous:
+        return _SpineSplitOutcome(None, ["extraction_suffix_contains_browser_actions"], None)
+
+    keyed_extraction, static_violations = _extraction_code_with_required_static_return(
+        extraction_suffix, required_paths=required_paths
+    )
+    if static_violations:
+        return _SpineSplitOutcome(None, ["static_return_envelope_unavailable"], None)
+    if _browser_surface_contains_full_action_spine(keyed_extraction, reconciled_synthesized):
+        return _SpineSplitOutcome(None, ["extraction_retains_full_spine"], None)
+
+    stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=reconciled_synthesized)
+    if len(stage_codes) < 2:
+        return _SpineSplitOutcome(None, ["insufficient_durable_stages"], len(stage_codes))
+
+    split_violations = _split_selected_output_owner_into_browser_stages(
+        parsed=parsed,
+        code_block=code_block,
+        synthesized=synthesized,
+        synthesized_code=reconciled_synthesized,
+        extraction_code=keyed_extraction,
+        parameter_keys=reconciliation.parameter_keys,
+    )
+    if split_violations:
+        return _SpineSplitOutcome(None, split_violations, len(stage_codes))
+
+    referenced_keys = _referenced_parameter_keys_in_code(keyed_extraction, reconciliation.parameter_keys)
+    if referenced_keys:
+        code_block["parameter_keys"] = referenced_keys
+
+    return _SpineSplitOutcome(yaml.safe_dump(parsed, sort_keys=False), [], len(stage_codes))
+
+
+def _arm_output_contract_spine_directive(
+    ctx: AgentContext,
+    *,
+    attempt_key: str,
+    blockers: list[str],
+    stage_count: int | None,
+    block_label: str,
+    signature: str,
+) -> None:
+    already_armed = attempt_key in ctx.output_contract_spine_directive_blockers_by_attempt_key
+    ctx.output_contract_spine_directive_blockers_by_attempt_key[attempt_key] = list(blockers)
+    if stage_count is not None:
+        ctx.output_contract_spine_directive_stage_count_by_attempt_key[attempt_key] = stage_count
+    if already_armed:
+        return
+    LOG.info(
+        "copilot_output_contract_spine_structure_directive_emitted",
+        block_label=block_label,
+        canonical_output_contract_signature=signature,
+        spine_split_blockers=blockers,
+        spine_stage_count=stage_count,
+    )
+
+
+def _arm_output_contract_output_owner_directive(
+    ctx: AgentContext,
+    *,
+    signature: str,
+    owner_labels: list[str],
+) -> None:
+    already_armed = signature in ctx.output_contract_output_owner_directive_candidates_by_signature
+    ctx.output_contract_output_owner_directive_candidates_by_signature[signature] = list(owner_labels)
+    if already_armed:
+        return
+    LOG.info(
+        "copilot_output_contract_output_owner_directive_emitted",
+        canonical_output_contract_signature=signature,
+        output_owner_candidate_labels=owner_labels,
+    )
+
+
+def _output_owner_ambiguity_repair_context(
+    *,
+    required_paths: set[str],
+    owner_labels: list[str],
+    source: str,
+    reason_code: str,
+) -> CodeAuthoringRepairContext:
+    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    candidates = sorted(dict.fromkeys(str(label).strip() for label in owner_labels if str(label).strip()))
+    path_text = ", ".join(paths)
+    return CodeAuthoringRepairContext(
+        block_label="",
+        reason_code=OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
+        runtime_failure_class=reason_code,
+        required_goal_value_paths=paths,
+        required_extraction_schema_paths=paths,
+        required_code_return_paths=paths,
+        metadata_contract_source=source,
+        metadata_contract_reason_code=reason_code,
+        output_owner_candidate_labels=candidates,
+        repair_instruction=(
+            "Designate exactly one code block as the sole output owner for required paths "
+            f"{path_text}; declare code_artifact_metadata on that single block and remove competing output owners."
+        ),
+    )
+
+
+def _impose_output_contract_envelope_after_steering(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> tuple[str, object, bool]:
+    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    if not required_paths:
+        return workflow_yaml, raw_code_artifact_metadata, False
+    signature = _output_contract_signature(
+        ctx=ctx,
+        workflow_yaml=workflow_yaml,
+        source=source,
+        reason_code=reason_code,
+        required_paths=required_paths,
+    )
+    runtime_attempt_key = _runtime_output_repair_attempt_key(ctx, workflow_yaml, required_paths, source, reason_code)
+    if _output_contract_reject_count(
+        ctx, signature
+    ) < _MAX_OUTPUT_CONTRACT_STEERING_REJECTS and _runtime_output_repair_attempt_recorded(ctx, runtime_attempt_key):
+        return workflow_yaml, raw_code_artifact_metadata, False
+    label, owner_labels = _target_output_contract_block_label(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        required_paths,
+    )
+    if not label or owner_labels != [label]:
+        _arm_output_contract_output_owner_directive(ctx, signature=signature, owner_labels=owner_labels)
+        return workflow_yaml, raw_code_artifact_metadata, False
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml, raw_code_artifact_metadata, False
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    target_block = code_blocks.get(label)
+    if target_block is None:
+        return workflow_yaml, raw_code_artifact_metadata, False
+    target_code = str(target_block.get("code") or "")
+    if _scout_spine_requires_separated_blocks(ctx):
+        synthesized = synthesize_code_block(
+            ctx.scout_trajectory,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if synthesized is not None and _browser_surface_contains_full_action_spine(target_code, synthesized.code):
+            split = _attempt_separated_spine_split(
+                ctx=ctx,
+                parsed=parse_workflow_yaml(workflow_yaml),
+                label=label,
+                target_code=target_code,
+                synthesized=synthesized,
+                required_paths=required_paths,
+            )
+            if split.imposed_yaml is not None:
+                scaffolded_metadata = _apply_metadata_contract_scaffold(
+                    ctx,
+                    split.imposed_yaml,
+                    raw_code_artifact_metadata,
+                    required_paths=required_paths,
+                    source=source,
+                    reason_code=reason_code,
+                )
+                _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
+                LOG.info(
+                    "copilot_output_contract_spine_split_imposed",
+                    block_label=label,
+                    stage_count=split.stage_count,
+                    canonical_output_contract_signature=signature,
+                )
+                return split.imposed_yaml, scaffolded_metadata, True
+            attempt_key = _output_contract_spine_directive_attempt_key(
+                signature=signature, block_label=label, workflow_yaml=workflow_yaml
+            )
+            _arm_output_contract_spine_directive(
+                ctx,
+                attempt_key=attempt_key,
+                blockers=split.blockers,
+                stage_count=split.stage_count,
+                block_label=label,
+                signature=signature,
+            )
+            return workflow_yaml, raw_code_artifact_metadata, False
+    keyed_code, violations = _extraction_code_with_required_static_return(target_code, required_paths=required_paths)
+    if violations:
+        scaffolded_metadata = _apply_metadata_contract_scaffold(
+            ctx,
+            workflow_yaml,
+            raw_code_artifact_metadata,
+            required_paths=required_paths,
+            source=source,
+            reason_code=reason_code,
+            allow_missing_static_return=True,
+        )
+        scaffolded = scaffolded_metadata is not raw_code_artifact_metadata
+        if scaffolded:
+            _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
+            LOG.info(
+                "copilot_output_contract_envelope_imposed_after_steering",
+                block_label=label,
+                canonical_output_contract_signature=signature,
+                steering_reject_count=_output_contract_reject_count(ctx, signature),
+                return_envelope_applied=False,
+                metadata_scaffold_applied=True,
+            )
+        LOG.info(
+            "copilot_output_contract_envelope_scaffold_bailed",
+            reason="static_return_envelope_unavailable",
+            block_label=label,
+            canonical_output_contract_signature=signature,
+            violations=violations,
+        )
+        return workflow_yaml, scaffolded_metadata, scaffolded
+    changed_code = keyed_code != textwrap.dedent(target_code).strip()
+    if changed_code:
+        for block in _workflow_code_blocks(parsed):
+            if str(block.get("label") or "").strip() == label:
+                block["code"] = keyed_code.rstrip() + "\n"
+                break
+        workflow_yaml = yaml.safe_dump(parsed, sort_keys=False)
+    scaffolded_metadata = _apply_metadata_contract_scaffold(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        required_paths=required_paths,
+        source=source,
+        reason_code=reason_code,
+    )
+    scaffolded = scaffolded_metadata is not raw_code_artifact_metadata
+    applied = changed_code or scaffolded
+    if applied:
+        _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
+        LOG.info(
+            "copilot_output_contract_envelope_imposed_after_steering",
+            block_label=label,
+            canonical_output_contract_signature=signature,
+            steering_reject_count=_output_contract_reject_count(ctx, signature),
+            return_envelope_applied=changed_code,
+            metadata_scaffold_applied=scaffolded,
+        )
+    return workflow_yaml, scaffolded_metadata, applied
+
+
+def _metadata_contract_run_preflight_reject(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> dict[str, Any] | None:
+    workflow_yaml, raw_code_artifact_metadata, _ = _impose_output_contract_envelope_after_steering(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+    )
+    raw_code_artifact_metadata, _ = _scaffold_metadata_contract_for_update(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+    )
+    evaluation = _evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        allow_static_return_advisory=True,
+    )
+    if evaluation is None or not evaluation.has_deficiencies or evaluation.can_attempt_run:
+        return None
+    payload = _record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="Submitted workflow does not satisfy the requested output contract before run.",
+    )
+    if evaluation.repair_context is not None and (
+        evaluation.repair_context.required_block_structure
+        or evaluation.repair_context.reason_code == OUTPUT_OWNER_AMBIGUITY_REASON_CODE
+    ):
+        ctx.last_code_authoring_repair_context = evaluation.repair_context
+    payload = dict(payload)
+    payload["output_contract_reason_code"] = payload.get("reason_code")
+    payload["reason_code"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
+    payload["reject_reason"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
+    block_label = evaluation.block_label or "the target output block"
+    return {
+        "ok": False,
+        "error": (
+            "update_and_run_blocks cannot attempt a run until structurally complete "
+            f"`code_artifact_metadata` is submitted for `{block_label}`."
+        ),
+        "user_facing_summary": _compiled_authoring_user_summary(),
+        "data": payload,
+    }
+
+
+def _output_path_root(path: str) -> str:
+    return path.split(".", 1)[0].split("[", 1)[0].strip()
+
+
+def _output_path_has_child(path: str) -> bool:
+    return "." in path or "[" in path
+
+
+def _candidate_missing_required_output_paths(
     workflow_yaml: str,
     code_artifact_metadata: object,
     *,
-    required_roots: set[str],
+    required_paths: set[str],
 ) -> list[str]:
-    if not required_roots:
+    if not required_paths:
         return []
-    declared_roots_by_label = {
-        label: set(roots) for label, roots in _metadata_output_path_roots_by_label(code_artifact_metadata).items()
+    required_paths = {path for path in (str(item).strip() for item in required_paths) if path}
+    declared_paths_by_label = {
+        label: set(paths) for label, paths in _metadata_output_paths_by_label(code_artifact_metadata).items()
     }
     produced_by_label = _workflow_yaml_produced_output_roots_by_label(workflow_yaml)
-    covered_roots: set[str] = set()
-    abstained_declared_roots: set[str] = set()
-    for label, declared_roots in declared_roots_by_label.items():
+    covered_paths: set[str] = set()
+    abstained_declared_paths: set[str] = set()
+    for label, declared_paths in declared_paths_by_label.items():
         produced = produced_by_label.get(label)
         if produced is None:
             continue
-        covered_roots.update(declared_roots & produced.roots)
+        for required_path in required_paths & declared_paths:
+            if _top_level_path_segment(required_path) in produced.roots:
+                covered_paths.add(required_path)
         if produced.abstained:
-            abstained_declared_roots.update(declared_roots)
-    missing_roots = required_roots - covered_roots
-    if missing_roots:
-        missing_roots -= abstained_declared_roots
-    return sorted(missing_roots)
+            abstained_declared_paths.update(required_paths & declared_paths)
+    missing_paths = required_paths - covered_paths
+    if missing_paths:
+        missing_paths -= abstained_declared_paths
+    return sorted(missing_paths)
+
+
+def _recorded_runtime_produced_output_roots(ctx: AgentContext, workflow_yaml: str) -> set[str]:
+    verified_outputs = getattr(ctx, "verified_block_outputs", None)
+    if not isinstance(verified_outputs, Mapping):
+        return set()
+    code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+    roots: set[str] = set()
+    for label, output in verified_outputs.items():
+        if not isinstance(label, str) or label not in code_block_labels:
+            continue
+        roots.update(_meaningful_runtime_output_roots(output))
+    return roots
+
+
+def _meaningful_runtime_output_roots(value: object, *, prefix: str = "") -> set[str]:
+    roots: set[str] = set()
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip()
+            if not key or key == "evidence_text" or not _is_structural_runtime_output_key(key):
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            if _runtime_output_value_is_meaningful(child):
+                roots.add(path.split(".", 1)[0])
+                roots.update(_meaningful_runtime_output_roots(child, prefix=path))
+        return roots
+    if isinstance(value, list):
+        for item in value:
+            roots.update(_meaningful_runtime_output_roots(item, prefix=prefix))
+    return roots
+
+
+def _runtime_output_value_is_meaningful(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return any(_runtime_output_value_is_meaningful(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_runtime_output_value_is_meaningful(item) for item in value)
+    return True
 
 
 class _ProducedOutputRoots(NamedTuple):
@@ -1464,6 +3275,20 @@ def _workflow_yaml_produced_output_roots_by_label(workflow_yaml: str) -> dict[st
         label: _code_block_produced_output_roots(str(block.get("code") or ""))
         for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items()
     }
+
+
+def _workflow_yaml_produced_output_roots(workflow_yaml: str) -> set[str]:
+    roots: set[str] = set()
+    for produced in _workflow_yaml_produced_output_roots_by_label(workflow_yaml).values():
+        roots.update(produced.roots)
+    return roots
+
+
+def _workflow_yaml_produced_output_paths(workflow_yaml: str) -> set[str]:
+    paths: set[str] = set()
+    for block in _workflow_yaml_code_blocks_by_label(workflow_yaml).values():
+        paths.update(_code_block_produced_output_paths(str(block.get("code") or "")))
+    return paths
 
 
 def _code_block_produced_output_roots(code: str) -> _ProducedOutputRoots:
@@ -1512,11 +3337,169 @@ def _code_block_produced_output_roots(code: str) -> _ProducedOutputRoots:
     return _ProducedOutputRoots(roots, abstained)
 
 
+def _code_block_produced_output_paths(code: str) -> set[str]:
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return set()
+    scope_statements = list(_iter_top_level_scope(tree.body))
+    dict_assignments: dict[str, set[str]] = {}
+    helper_return_paths = _helper_function_literal_return_paths(tree.body)
+    returned_paths: set[str] = set()
+    for node in scope_statements:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            dict_paths = _dict_literal_string_key_paths(node.value, dict_assignments)
+            if dict_paths:
+                dict_assignments[node.targets[0].id] = dict_paths
+        elif isinstance(node, ast.Assign):
+            _apply_literal_dict_key_assignment(dict_assignments, node)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                dict_assignments[node.target.id] = _dict_literal_string_key_paths(node.value, dict_assignments)
+            _apply_literal_dict_key_assignment(dict_assignments, node)
+        elif isinstance(node, ast.AugAssign):
+            _apply_literal_dict_key_assignment(dict_assignments, node)
+        elif isinstance(node, ast.Return) and node.value is not None:
+            returned_paths.update(_return_output_paths(node.value, dict_assignments, helper_return_paths))
+    return returned_paths
+
+
+def _top_level_simple_assignment_names(code: str) -> set[str]:
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _output_path_direct_child(path: str, root: str) -> str:
+    if not path.startswith(root + "."):
+        return ""
+    child = path[len(root) + 1 :]
+    return re.split(r"[.\[]", child, maxsplit=1)[0].strip()
+
+
+def _return_scaffold_name_is_safe(name: str) -> bool:
+    return name.isidentifier() and not keyword.iskeyword(name)
+
+
+def _extraction_code_with_required_static_return(
+    code: str,
+    *,
+    required_paths: set[str],
+) -> tuple[str, list[str]]:
+    stripped_code = textwrap.dedent(code).strip()
+    if not stripped_code or not required_paths:
+        return stripped_code, []
+    if required_paths <= _code_block_produced_output_paths(stripped_code):
+        return stripped_code, []
+    try:
+        tree = ast.parse(stripped_code)
+    except SyntaxError:
+        return stripped_code, []
+    if any(isinstance(node, ast.Return) for node in _iter_top_level_scope(tree.body)):
+        replacement = _replace_direct_child_local_return(stripped_code, tree, required_paths)
+        if replacement and required_paths <= _code_block_produced_output_paths(replacement):
+            return replacement, []
+        missing = sorted(required_paths - _code_block_produced_output_paths(stripped_code))
+        return stripped_code, [
+            "Unable to impose synthesized code block: selected output extraction does not return a keyed "
+            f"structure covering required output path(s): {', '.join(missing)}."
+        ]
+    assigned_names = _top_level_simple_assignment_names(stripped_code)
+    roots = {_output_path_root(path) for path in required_paths if _output_path_root(path)}
+    candidate = ""
+    if len(roots) == 1:
+        root = next(iter(roots))
+        if _return_scaffold_name_is_safe(root) and root in assigned_names:
+            candidate = stripped_code + f'\nreturn {{"{root}": {root}}}'
+        elif root == "output" and "output" in assigned_names:
+            candidate = stripped_code + "\nreturn output"
+        elif root == "output":
+            child_names = sorted(
+                {
+                    child
+                    for path in required_paths
+                    if (child := _output_path_direct_child(path, "output"))
+                    and _return_scaffold_name_is_safe(child)
+                    and child in assigned_names
+                }
+            )
+            required_child_names = {
+                child
+                for path in required_paths
+                if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
+            }
+            if child_names and set(child_names) == required_child_names:
+                child_pairs = ", ".join(f'"{name}": {name}' for name in child_names)
+                candidate = stripped_code + f'\nreturn {{"output": {{{child_pairs}}}}}'
+    if candidate and required_paths <= _code_block_produced_output_paths(candidate):
+        return candidate, []
+    missing = sorted(required_paths - _code_block_produced_output_paths(candidate or stripped_code))
+    return stripped_code, [
+        "Unable to impose synthesized code block: selected output extraction does not return a keyed "
+        f"structure covering required output path(s): {', '.join(missing)}."
+    ]
+
+
+def _replace_direct_child_local_return(code: str, tree: ast.Module, required_paths: set[str]) -> str:
+    roots = {_output_path_root(path) for path in required_paths if _output_path_root(path)}
+    if roots != {"output"}:
+        return ""
+    child_names = sorted(
+        {
+            child
+            for path in required_paths
+            if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
+        }
+    )
+    if len(child_names) != 1:
+        return ""
+    child_name = child_names[0]
+    returns = [node for node in tree.body if isinstance(node, ast.Return)]
+    if len(returns) != 1:
+        return ""
+    return_node = returns[0]
+    if not isinstance(return_node.value, ast.Name) or return_node.value.id != child_name:
+        return ""
+    if return_node.end_lineno is None:
+        return ""
+    lines = code.splitlines()
+    if return_node.lineno < 1 or return_node.lineno > len(lines):
+        return ""
+    indent_match = re.match(r"\s*", lines[return_node.lineno - 1])
+    if indent_match is None:
+        return ""
+    indent = indent_match.group(0)
+    replacement = f'{indent}return {{"output": {{"{child_name}": {child_name}}}}}'
+    return "\n".join(
+        [
+            *lines[: return_node.lineno - 1],
+            replacement,
+            *lines[return_node.end_lineno :],
+        ]
+    )
+
+
 def _apply_literal_dict_key_assignment(
     dict_assignments: dict[str, set[str]],
-    dynamic_dict_assignment_names: set[str],
-    node: ast.Assign | ast.AnnAssign | ast.AugAssign,
+    dynamic_dict_assignment_names_or_node: set[str] | ast.Assign | ast.AnnAssign | ast.AugAssign,
+    node: ast.Assign | ast.AnnAssign | ast.AugAssign | None = None,
 ) -> None:
+    dynamic_dict_assignment_names: set[str] | None
+    if node is None:
+        dynamic_dict_assignment_names = None
+        node = cast(ast.Assign | ast.AnnAssign | ast.AugAssign, dynamic_dict_assignment_names_or_node)
+    else:
+        dynamic_dict_assignment_names = cast(set[str], dynamic_dict_assignment_names_or_node)
     targets: list[ast.expr] = []
     if isinstance(node, ast.Assign):
         targets = list(node.targets)
@@ -1526,7 +3509,7 @@ def _apply_literal_dict_key_assignment(
         assignment = _literal_dict_key_assignment(target)
         target_name = _dict_subscript_target_name(target)
         if assignment is None:
-            if target_name in dict_assignments:
+            if dynamic_dict_assignment_names is not None and target_name in dict_assignments:
                 dynamic_dict_assignment_names.add(target_name)
             continue
         name, key = assignment
@@ -1572,6 +3555,20 @@ def _return_output_roots(
     if isinstance(node, (ast.Constant, ast.Tuple, ast.Set)):
         return _ProducedOutputRoots(set(), False)
     return _ProducedOutputRoots(set(), True)
+
+
+def _return_output_paths(
+    node: ast.expr,
+    dict_assignments: Mapping[str, set[str]],
+    helper_return_paths: Mapping[str, set[str]],
+) -> set[str]:
+    if isinstance(node, ast.Await):
+        return _return_output_paths(node.value, dict_assignments, helper_return_paths)
+    if isinstance(node, ast.Name):
+        return set(dict_assignments.get(node.id, set()))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return set(helper_return_paths.get(node.func.id, set()))
+    return _dict_literal_string_key_paths(node, dict_assignments)
 
 
 def _list_literal_output_roots(node: ast.List) -> _ProducedOutputRoots:
@@ -1638,6 +3635,39 @@ def _helper_function_literal_return_roots(statements: list[ast.stmt]) -> dict[st
     return helpers
 
 
+def _helper_function_literal_return_paths(statements: list[ast.stmt]) -> dict[str, set[str]]:
+    helpers: dict[str, set[str]] = {}
+    for statement in statements:
+        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        dict_assignments: dict[str, set[str]] = {}
+        paths: set[str] = set()
+        for helper_statement in _iter_top_level_scope(statement.body):
+            if (
+                isinstance(helper_statement, ast.Assign)
+                and len(helper_statement.targets) == 1
+                and isinstance(helper_statement.targets[0], ast.Name)
+            ):
+                dict_paths = _dict_literal_string_key_paths(helper_statement.value, dict_assignments)
+                if isinstance(helper_statement.value, ast.Dict):
+                    dict_assignments[helper_statement.targets[0].id] = dict_paths
+            elif isinstance(helper_statement, ast.Assign):
+                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+            elif isinstance(helper_statement, ast.AnnAssign):
+                if isinstance(helper_statement.target, ast.Name) and isinstance(helper_statement.value, ast.Dict):
+                    dict_assignments[helper_statement.target.id] = _dict_literal_string_key_paths(
+                        helper_statement.value, dict_assignments
+                    )
+                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+            elif isinstance(helper_statement, ast.AugAssign):
+                _apply_literal_dict_key_assignment(dict_assignments, helper_statement)
+            elif isinstance(helper_statement, ast.Return) and helper_statement.value is not None:
+                paths.update(_return_output_paths(helper_statement.value, dict_assignments, {}))
+        if paths:
+            helpers[statement.name] = paths
+    return helpers
+
+
 def _dict_literal_output_roots(node: ast.Dict) -> _ProducedOutputRoots:
     roots: set[str] = set()
     abstained = False
@@ -1657,6 +3687,38 @@ def _dict_literal_string_key_roots(node: ast.expr) -> set[str]:
         if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
             roots.add(key.value.strip())
     return roots
+
+
+def _dict_literal_string_key_paths(
+    node: ast.expr,
+    dict_assignments: Mapping[str, set[str]],
+    *,
+    prefix: str = "",
+) -> set[str]:
+    if isinstance(node, ast.List):
+        array_prefix = f"{prefix}[]" if prefix else "[]"
+        array_paths: set[str] = set()
+        for item in node.elts:
+            array_paths.update(_dict_literal_string_key_paths(item, dict_assignments, prefix=array_prefix))
+        return array_paths
+    if not isinstance(node, ast.Dict):
+        return set()
+    paths: set[str] = set()
+    for key_node, value_node in zip(node.keys, node.values):
+        if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str) and key_node.value.strip()):
+            continue
+        path = f"{prefix}.{key_node.value.strip()}" if prefix else key_node.value.strip()
+        paths.add(path)
+        if isinstance(value_node, ast.Dict):
+            paths.update(_dict_literal_string_key_paths(value_node, dict_assignments, prefix=path))
+        elif isinstance(value_node, ast.List):
+            array_prefix = f"{path}[]"
+            for item in value_node.elts:
+                paths.update(_dict_literal_string_key_paths(item, dict_assignments, prefix=array_prefix))
+        elif isinstance(value_node, ast.Name):
+            for child_path in dict_assignments.get(value_node.id, set()):
+                paths.add(f"{path}{child_path}" if child_path.startswith("[]") else f"{path}.{child_path}")
+    return paths
 
 
 def _output_empty_code_block_labels(workflow_yaml: str, code_artifact_metadata: object) -> list[str]:
@@ -2075,6 +4137,9 @@ def _code_block_parameter_contract_error(workflow_yaml: str) -> str | None:
 
 def _code_repair_progress_data(
     repair_context: CodeAuthoringRepairContext | None = None,
+    *,
+    missing_requested_output_facts: list[dict[str, object]] | None = None,
+    metadata_repair_contract: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     """Tag a code-authoring reject so the streaming adapter renders it as quiet de-duplicated progress."""
     data: dict[str, Any] = {
@@ -2083,6 +4148,10 @@ def _code_repair_progress_data(
     }
     if repair_context is not None:
         data["authoring_repair_context"] = repair_context.model_dump(mode="json")
+    if missing_requested_output_facts:
+        data["missing_requested_output_facts"] = missing_requested_output_facts
+    if metadata_repair_contract:
+        data["metadata_repair_contract"] = metadata_repair_contract
     return data
 
 
@@ -2321,7 +4390,21 @@ def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | No
 
 def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
     target = ctx.reached_download_target
-    return isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip())
+    return (
+        (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
+        or synthesized_persistence_reopened_after_failed_run(ctx)
+        or _author_time_reject_reopens_synthesized_imposition(ctx)
+    )
+
+
+def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> bool:
+    latest = ctx.latest_recorded_build_test_outcome
+    return (
+        isinstance(latest, RecordedBuildTestOutcome)
+        and latest.is_authoritative
+        and latest.phase == "author_time_reject"
+        and latest.reason_code in {"metadata_reject", "synthesized_parameter_binding_ambiguous"}
+    )
 
 
 def _select_synthesized_imposition_code_block(
@@ -2675,14 +4758,19 @@ def _whole_trajectory_browser_surface_violations(
     synthesized_code: str,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
+    scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
+    scouted_signatures = set(scouted_mutations)
     for block in code_blocks:
         if block is selected_code_block:
             continue
         label = _code_block_label(block)
         block_code = str(block.get("code") or "")
         block_mutations, _, block_ambiguous = _browser_surface_for_code(block_code)
-        if block_mutations:
-            action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(block_mutations))
+        unscouted_mutations = [mutation for mutation in block_mutations if mutation not in scouted_signatures]
+        if unscouted_mutations:
+            action_text = ", ".join(
+                f"{mutation.receiver}.{mutation.method}" for mutation in sorted(unscouted_mutations)
+            )
             violations.append(
                 f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): {action_text}."
             )
@@ -2695,12 +4783,35 @@ def _whole_trajectory_browser_surface_violations(
     return _BrowserSurfaceValidation(violations)
 
 
+def _separated_spine_already_imposed(
+    code_blocks: list[dict[str, Any]],
+    selected_code_block: dict[str, Any],
+    synthesized_code: str,
+) -> bool:
+    scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
+    if not scouted_mutations:
+        return False
+    selected_mutations, _, _ = _browser_surface_for_code(str(selected_code_block.get("code") or ""))
+    if selected_mutations:
+        return False
+    sibling_signatures: set[_BrowserMutationSignature] = set()
+    for block in code_blocks:
+        if block is selected_code_block:
+            continue
+        block_mutations, _, _ = _browser_surface_for_code(str(block.get("code") or ""))
+        sibling_signatures.update(block_mutations)
+    return sibling_signatures == set(scouted_mutations)
+
+
 def _browser_surface_contains_full_action_spine(submitted_code: str, synthesized_code: str) -> bool:
     synthesized_mutations, _, _ = _browser_surface_for_code(synthesized_code)
     submitted_mutations, _, submitted_ambiguous = _browser_surface_for_code(submitted_code)
     if submitted_ambiguous:
         return False
-    return bool(synthesized_mutations) and submitted_mutations == synthesized_mutations
+    if not synthesized_mutations:
+        return False
+    submitted_iter = iter(submitted_mutations)
+    return all(any(candidate == synthesized for candidate in submitted_iter) for synthesized in synthesized_mutations)
 
 
 _IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
@@ -3409,12 +5520,102 @@ def _matching_string_parameter_key_by_default(
     return matches[0] if len(matches) == 1 else None
 
 
+def _fill_type_argument_parameter_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "str"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+    ):
+        return node.args[0].id
+    return ""
+
+
+def _selector_join_parameter_alias_by_authored_fill(
+    *,
+    parameters: list[Any],
+    submitted_code: str,
+    synthesized_key: str,
+    selector: str,
+) -> str | None:
+    selector = selector.strip()
+    if not selector:
+        return None
+    available = {
+        str(parameter.get("key") or "").strip()
+        for parameter in parameters
+        if isinstance(parameter, dict)
+        and str(parameter.get("key") or "").strip()
+        and not _is_credential_parameter(parameter)
+    }
+    available.discard(synthesized_key)
+    if not available:
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(submitted_code).strip() or "pass")
+    except SyntaxError:
+        return None
+    locator_aliases = _locator_alias_selectors(tree)
+    matches: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in {"fill", "type"} or not node.args:
+            continue
+        selectors = _locator_receiver_selectors(node.func.value, locator_aliases)
+        if selectors != {selector}:
+            continue
+        parameter_name = _fill_type_argument_parameter_name(node.args[0])
+        if parameter_name in available:
+            matches.add(parameter_name)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _synthesized_parameter_binding_reject_count(ctx: AgentContext | None) -> int:
+    if ctx is None:
+        return 0
+    required_paths, _, _ = _output_contract_required_paths_source(ctx)
+    if required_paths:
+        contract_count = _output_contract_reject_count(
+            ctx,
+            _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths),
+        )
+        if contract_count:
+            return contract_count
+    history = getattr(ctx, "recorded_build_test_outcome_history", None)
+    if isinstance(history, list):
+        count = 0
+        for item in history:
+            if (
+                isinstance(item, Mapping)
+                and item.get("reason_code") == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
+            ):
+                count += 1
+        if count:
+            return count
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    if (
+        isinstance(latest, RecordedBuildTestOutcome)
+        and latest.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
+    ):
+        return 1
+    return 0
+
+
 def _drop_parameter_key(parameters: list[Any], key: str) -> None:
     parameters[:] = [
         parameter
         for parameter in parameters
         if not (isinstance(parameter, dict) and str(parameter.get("key") or "").strip() == key)
     ]
+
+
+def _impose_required_string_parameter(parameters: list[Any], key: str) -> None:
+    _drop_parameter_key(parameters, key)
+    parameters.append(_required_string_parameter_row(key))
 
 
 def _coerce_positive_int(value: Any) -> int | None:
@@ -3521,6 +5722,7 @@ def _scout_interaction_for_synthesized_parameter(
 
 def _reconcile_synthesized_parameters(
     *,
+    ctx: AgentContext | None = None,
     parsed: dict[str, Any],
     code_block: dict[str, Any],
     submitted_code: str,
@@ -3544,10 +5746,11 @@ def _reconcile_synthesized_parameters(
     existing_by_key = {
         str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
     }
-    existing_credentials = credential_params(parameters)
+    existing_credentials = credential_param_ids(parameters)
     parameter_keys: list[str] = []
     violations: list[str] = []
     aliases: dict[str, str] = {}
+    used_selector_join_aliases: set[str] = set()
     repair_context: CodeAuthoringRepairContext | None = None
     non_credential_synthesized = [param for param in synthesized_parameters if not param.get("credential_id")]
     typed_lengths = [
@@ -3555,6 +5758,9 @@ def _reconcile_synthesized_parameters(
         for interaction in scout_trajectory
         if str(interaction.get("tool_name") or "") == "type_text"
     ]
+    binding_steering_exhausted = (
+        _synthesized_parameter_binding_reject_count(ctx) >= _MAX_OUTPUT_CONTRACT_STEERING_REJECTS
+    )
 
     def add_binding_violation(key: str, message: str) -> None:
         nonlocal repair_context
@@ -3588,13 +5794,34 @@ def _reconcile_synthesized_parameters(
             scout_trajectory=scout_trajectory,
             synthesized_parameters=synthesized_parameters,
         )
+        matched_selector = str(matched_scout.get("selector") or "").strip() if matched_scout is not None else ""
+        selector_join_alias = _selector_join_parameter_alias_by_authored_fill(
+            parameters=parameters,
+            submitted_code=submitted_code,
+            synthesized_key=key,
+            selector=matched_selector,
+        )
+        if selector_join_alias is not None:
+            if selector_join_alias in used_selector_join_aliases:
+                if binding_steering_exhausted:
+                    _impose_required_string_parameter(parameters, key)
+                else:
+                    add_binding_violation(
+                        key,
+                        f"Unable to bind synthesized parameter `{key}`: authored selector-join alias is reused by another synthesized input.",
+                    )
+                continue
+            aliases[key] = selector_join_alias
+            used_selector_join_aliases.add(selector_join_alias)
+            parameter_keys[-1] = selector_join_alias
+            continue
         scout_typed_length = (
             _coerce_positive_int(matched_scout.get("typed_length")) if matched_scout is not None else None
         )
         typed_length = typed_length or scout_typed_length
         if credential_id:
             if existing is not None:
-                if existing_credentials.get(key) != credential_id:
+                if credential_id not in existing_credentials.get(key, set()):
                     violations.append(
                         f"Unable to bind synthesized credential parameter `{key}`: submitted credential binding does not match scout metadata."
                     )
@@ -3621,18 +5848,24 @@ def _reconcile_synthesized_parameters(
                 _drop_parameter_key(parameters, key)
                 continue
             if _is_credential_parameter(existing):
-                add_binding_violation(
-                    key,
-                    f"Unable to bind synthesized parameter `{key}`: submitted parameter is credential-typed.",
-                )
+                if binding_steering_exhausted:
+                    _impose_required_string_parameter(parameters, key)
+                else:
+                    add_binding_violation(
+                        key,
+                        f"Unable to bind synthesized parameter `{key}`: submitted parameter is credential-typed.",
+                    )
             elif synthesized_default:
                 existing_default = _string_parameter_default_value(existing)
                 if existing_default != synthesized_default:
-                    add_binding_violation(
-                        key,
-                        f"Unable to bind synthesized parameter `{key}`: "
-                        "submitted parameter default does not match the scout record.",
-                    )
+                    if binding_steering_exhausted:
+                        _impose_required_string_parameter(parameters, key)
+                    else:
+                        add_binding_violation(
+                            key,
+                            f"Unable to bind synthesized parameter `{key}`: "
+                            "submitted parameter default does not match the scout record.",
+                        )
             continue
 
         if synthesized_default:
@@ -3658,21 +5891,27 @@ def _reconcile_synthesized_parameters(
             continue
 
         if len(non_credential_synthesized) != 1:
-            add_binding_violation(
-                key,
-                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
-            )
+            if binding_steering_exhausted:
+                parameters.append(_required_string_parameter_row(key))
+            else:
+                add_binding_violation(
+                    key,
+                    f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
+                )
             continue
 
         typed_length = typed_length or scout_typed_length or (typed_lengths[0] if len(typed_lengths) == 1 else None)
         direct_fill_usage = _submitted_direct_fill_type_usage(submitted_code, key)
         if direct_fill_usage.matched and direct_fill_usage.mismatched:
-            add_binding_violation(
-                key,
-                f"Unable to bind synthesized parameter `{key}`: submitted code mixes direct fills using `{key}` "
-                "with other browser-locator fill/type values. Use the synthesized parameter for every scout-input "
-                "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values.",
-            )
+            if binding_steering_exhausted:
+                parameters.append(_required_string_parameter_row(key))
+            else:
+                add_binding_violation(
+                    key,
+                    f"Unable to bind synthesized parameter `{key}`: submitted code mixes direct fills using `{key}` "
+                    "with other browser-locator fill/type values. Use the synthesized parameter for every scout-input "
+                    "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values.",
+                )
             continue
         if direct_fill_usage.matched:
             parameters.append(_required_string_parameter_row(key))
@@ -3680,7 +5919,10 @@ def _reconcile_synthesized_parameters(
 
         literal, error = _safe_singleton_literal_for_parameter(submitted_code, key, typed_length)
         if error:
-            add_binding_violation(key, error)
+            if binding_steering_exhausted:
+                parameters.append(_required_string_parameter_row(key))
+            else:
+                add_binding_violation(key, error)
             continue
         parameters.append(
             {
@@ -3695,6 +5937,93 @@ def _reconcile_synthesized_parameters(
     # Submitted synthesized parameter rows are re-derived from scout evidence before persistence.
     code_block.pop("parameters", None)
     return _SynthesizedParameterReconciliation(parameter_keys, violations, aliases, repair_context)
+
+
+def _synthesized_durable_stage_codes(synthesized: SynthesizedCodeBlock, *, source_code: str | None = None) -> list[str]:
+    steps = getattr(synthesized, "steps", None)
+    if not isinstance(steps, list) or len(steps) < 2:
+        return []
+    lines = textwrap.dedent(source_code if source_code is not None else synthesized.code).strip("\n").splitlines()
+    if not lines:
+        return []
+    ranges: list[tuple[int, int]] = []
+    for step in steps:
+        if not isinstance(step, Mapping):
+            return []
+        start = _coerce_positive_int(step.get("line_start"))
+        end = _coerce_positive_int(step.get("line_end"))
+        if start is None or end is None or end < start or end > len(lines):
+            return []
+        ranges.append((start, end))
+    if ranges != sorted(ranges):
+        return []
+    stage_codes = ["\n".join(lines[start - 1 : end]).strip() for start, end in ranges]
+    return [code for code in stage_codes if code]
+
+
+def _top_level_block_list_for_selected_code_block(
+    parsed: Mapping[str, Any],
+    code_block: Mapping[str, Any],
+) -> tuple[list[Any], int] | None:
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+    matches = [index for index, block in enumerate(blocks) if block is code_block]
+    if len(matches) != 1:
+        return None
+    return blocks, matches[0]
+
+
+def _browser_stage_label(base_label: str, index: int) -> str:
+    safe_base = re.sub(r"[^0-9A-Za-z_]+", "_", base_label).strip("_") or "browser"
+    return f"{safe_base}_browser_stage_{index}"
+
+
+def _split_selected_output_owner_into_browser_stages(
+    *,
+    parsed: Mapping[str, Any],
+    code_block: dict[str, Any],
+    synthesized: SynthesizedCodeBlock,
+    synthesized_code: str,
+    extraction_code: str,
+    parameter_keys: list[str],
+) -> list[str]:
+    block_position = _top_level_block_list_for_selected_code_block(parsed, code_block)
+    if block_position is None:
+        return ["Unable to impose synthesized code block: selected output block insertion point is ambiguous."]
+    blocks, selected_index = block_position
+    stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=synthesized_code)
+    if len(stage_codes) < 2:
+        return ["Unable to impose synthesized code block: synthesized browser stage boundaries are ambiguous."]
+    output_label = str(code_block.get("label") or "").strip()
+    if not output_label:
+        return ["Unable to impose synthesized code block: output owner block label is missing."]
+    parsed_blocks = _workflow_code_blocks(parsed) if isinstance(parsed, dict) else []
+    existing_labels = {
+        str(block.get("label") or "").strip()
+        for block in parsed_blocks
+        if isinstance(block, Mapping) and block is not code_block
+    }
+    stage_labels = [_browser_stage_label(output_label, index) for index in range(1, len(stage_codes) + 1)]
+    if len(set(stage_labels)) != len(stage_labels) or any(label in existing_labels for label in stage_labels):
+        return ["Unable to impose synthesized code block: synthesized browser stage label would collide."]
+    stage_blocks: list[dict[str, Any]] = []
+    for label, code in zip(stage_labels, stage_codes):
+        stage_block: dict[str, Any] = {
+            "block_type": "code",
+            "label": label,
+            "code": code.rstrip() + "\n",
+        }
+        if parameter_keys:
+            stage_block["parameter_keys"] = list(parameter_keys)
+        stage_blocks.append(stage_block)
+    code_block["code"] = textwrap.dedent(extraction_code).strip() + "\n"
+    code_block.pop("parameter_keys", None)
+    blocks[selected_index : selected_index + 1] = [*stage_blocks, code_block]
+    return []
 
 
 def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
@@ -3735,6 +6064,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
         )
+
+    if _separated_spine_already_imposed(code_blocks, code_block, synthesized.code):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
     diagnostics = synthesized.diagnostics
     violations: list[str] = []
@@ -3794,6 +6126,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             )
 
     parameter_reconciliation = _reconcile_synthesized_parameters(
+        ctx=ctx,
         parsed=parsed,
         code_block=code_block,
         submitted_code=submitted_code,
@@ -3858,13 +6191,6 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         and not append_selected_extraction
         else None
     )
-    imposed_code = textwrap.dedent(submitted_code if preserve_submitted_extraction else synthesized.code).lstrip("\n")
-    if extraction_suffix:
-        imposed_code = imposed_code.rstrip() + "\n" + extraction_suffix.rstrip() + "\n"
-    elif append_selected_extraction:
-        imposed_code = imposed_code.rstrip() + "\n" + textwrap.dedent(submitted_code).strip() + "\n"
-    imposed_code = _apply_parameter_reconciliation_to_code(imposed_code, parameter_reconciliation)
-    code_block["code"] = imposed_code
     credential_parameter_keys = [
         str(param.get("key") or "") for param in synthesized.parameters if str(param.get("credential_id") or "").strip()
     ]
@@ -3876,6 +6202,72 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         "selector_provenance": diagnostics.locator_provenance,
         "prior_source": prior_source,
     }
+    reconciled_extraction_suffix = (
+        _submitted_suffix_after_synthesized_code(reconciled_submitted_code, reconciled_synthesized_code)
+        if preserve_submitted_extraction
+        else ""
+    )
+    split_extraction_code = ""
+    if extraction_suffix:
+        split_extraction_code = extraction_suffix
+    elif append_selected_extraction:
+        split_extraction_code = textwrap.dedent(submitted_code).strip()
+    elif preserve_submitted_extraction and reconciled_extraction_suffix:
+        split_extraction_code = reconciled_extraction_suffix
+    durable_stage_codes = _synthesized_durable_stage_codes(synthesized, source_code=reconciled_synthesized_code)
+    should_split_output_owner = (
+        metadata_declares_goal_values
+        and len(durable_stage_codes) >= 2
+        and (bool(extraction_suffix) or append_selected_extraction or preserve_submitted_extraction)
+    )
+    if should_split_output_owner:
+        if not split_extraction_code:
+            return _SynthesizedCodeImpositionResult(
+                workflow_yaml=workflow_yaml,
+                violations=[
+                    "Unable to impose synthesized code block: selected output extraction boundary is ambiguous."
+                ],
+                repair_context=repair_context,
+            )
+        split_extraction_code = _apply_parameter_reconciliation_to_code(split_extraction_code, parameter_reconciliation)
+        target_metadata = _metadata_item_for_block_label(raw_metadata, str(code_block.get("label") or ""))
+        required_split_paths = _metadata_item_goal_value_paths(target_metadata)
+        if required_split_paths:
+            split_extraction_code, static_return_violations = _extraction_code_with_required_static_return(
+                split_extraction_code,
+                required_paths=required_split_paths,
+            )
+            if static_return_violations:
+                return _SynthesizedCodeImpositionResult(
+                    workflow_yaml=workflow_yaml,
+                    violations=static_return_violations,
+                    repair_context=repair_context,
+                )
+        split_violations = _split_selected_output_owner_into_browser_stages(
+            parsed=parsed,
+            code_block=code_block,
+            synthesized=synthesized,
+            synthesized_code=reconciled_synthesized_code,
+            extraction_code=split_extraction_code,
+            parameter_keys=parameter_reconciliation.parameter_keys,
+        )
+        if split_violations:
+            return _SynthesizedCodeImpositionResult(
+                workflow_yaml=workflow_yaml,
+                violations=split_violations,
+                repair_context=repair_context,
+            )
+        substitutions["separated_browser_stage_count"] = len(durable_stage_codes)
+    else:
+        imposed_code = textwrap.dedent(submitted_code if preserve_submitted_extraction else synthesized.code).lstrip(
+            "\n"
+        )
+        if extraction_suffix:
+            imposed_code = imposed_code.rstrip() + "\n" + extraction_suffix.rstrip() + "\n"
+        elif append_selected_extraction:
+            imposed_code = imposed_code.rstrip() + "\n" + textwrap.dedent(submitted_code).strip() + "\n"
+        imposed_code = _apply_parameter_reconciliation_to_code(imposed_code, parameter_reconciliation)
+        code_block["code"] = imposed_code
     if parameter_reconciliation.aliases:
         substitutions["parameter_aliases"] = parameter_reconciliation.aliases
     if extraction_suffix:
@@ -4774,7 +7166,7 @@ def _credentialed_code_block_scout_gate_errors(
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return []
-    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return []
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
@@ -4788,25 +7180,28 @@ def _credentialed_code_block_scout_gate_errors(
         code = str(block.get("code") or "")
         if not code.strip():
             continue
-        required_fields_by_credential: dict[str, set[str]] = {}
+        required_fields_by_parameter: dict[str, tuple[set[str], set[str]]] = {}
         for access in _credential_field_accesses(code):
             if not access.requires_live_scout:
                 continue
-            credential_id = credential_params_by_key.get(access.parameter_key)
-            if credential_id:
-                required_fields_by_credential.setdefault(credential_id, set()).add(access.field)
-        if not required_fields_by_credential:
+            credential_ids = credential_params_by_key.get(access.parameter_key)
+            if credential_ids:
+                allowed_credential_ids, required_fields = required_fields_by_parameter.setdefault(
+                    access.parameter_key, (credential_ids, set())
+                )
+                required_fields.add(access.field)
+        if not required_fields_by_parameter:
             continue
 
         matched_fill_indexes: list[int] = []
         matched_source_urls: set[str] = set()
         missing_fields: list[str] = []
-        for credential_id, required_fields in required_fields_by_credential.items():
+        for allowed_credential_ids, required_fields in required_fields_by_parameter.values():
             matched_fields: set[str] = set()
             for index, interaction in enumerate(scout_trajectory):
                 if str(interaction.get("tool_name") or "").strip() != "fill_credential_field":
                     continue
-                if str(interaction.get("credential_id") or "").strip() != credential_id:
+                if str(interaction.get("credential_id") or "").strip() not in allowed_credential_ids:
                     continue
                 field = str(interaction.get("credential_field") or "").strip()
                 if field not in required_fields:
@@ -4893,6 +7288,7 @@ async def _update_workflow(
     ctx: AgentContext,
     *,
     allow_missing_credentials: bool | None = None,
+    allow_static_output_uncertainty: bool = False,
 ) -> dict[str, Any]:
     def reject(
         *,
@@ -4900,11 +7296,14 @@ async def _update_workflow(
         user_facing_summary: str | None = None,
         data: dict[str, Any] | None = None,
         repair_context: CodeAuthoringRepairContext | None = None,
+        record_repair_context_outcome: bool = True,
     ) -> dict[str, Any]:
         if repair_context is None:
             _clear_code_authoring_repair_context(ctx)
-        else:
+        elif record_repair_context_outcome:
             _set_code_authoring_repair_context(ctx, repair_context)
+        else:
+            ctx.last_code_authoring_repair_context = repair_context
         result: dict[str, Any] = {"ok": False, "error": error}
         if user_facing_summary is not None:
             result["user_facing_summary"] = user_facing_summary
@@ -4932,6 +7331,16 @@ async def _update_workflow(
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
     if imposition.violations:
+        if (
+            imposition.repair_context is not None
+            and imposition.repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
+        ):
+            required_paths, _, _ = _output_contract_required_paths_source(ctx)
+            _record_output_contract_family_reject(
+                ctx,
+                required_paths,
+                reject_family=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+            )
         return reject(
             error="\n".join(imposition.violations),
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -4969,6 +7378,61 @@ async def _update_workflow(
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
         )
+    workflow_yaml, imposed_metadata, envelope_imposed = _impose_output_contract_envelope_after_steering(
+        ctx,
+        workflow_yaml,
+        params.get("code_artifact_metadata"),
+    )
+    if envelope_imposed:
+        params["workflow_yaml"] = workflow_yaml
+        params["code_artifact_metadata"] = imposed_metadata
+        params["raw_code_artifact_metadata"] = imposed_metadata
+        ctx.raw_code_artifact_metadata = imposed_metadata
+    scaffolded_metadata, scaffold_applied = _scaffold_metadata_contract_for_update(
+        ctx,
+        workflow_yaml,
+        params.get("code_artifact_metadata"),
+    )
+    if scaffold_applied:
+        params["code_artifact_metadata"] = scaffolded_metadata
+        params["raw_code_artifact_metadata"] = scaffolded_metadata
+        ctx.raw_code_artifact_metadata = scaffolded_metadata
+    (
+        required_child_output_paths,
+        output_path_coverage_source,
+        output_path_coverage_reason_code,
+    ) = _required_child_output_paths_for_authoring(ctx)
+    output_contract_evaluation = _evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        params.get("code_artifact_metadata"),
+        allow_static_return_advisory=allow_static_output_uncertainty,
+    )
+    output_contract_static_advisory_allowed = (
+        output_contract_evaluation is not None and output_contract_evaluation.can_attempt_run
+    )
+    if (
+        output_contract_evaluation is not None
+        and output_contract_evaluation.has_deficiencies
+        and not output_contract_static_advisory_allowed
+    ):
+        payload = _record_output_contract_reject(
+            ctx,
+            output_contract_evaluation,
+            summary="Submitted workflow does not satisfy the requested output contract.",
+        )
+        reject_result = _output_contract_reject_result(
+            output_contract_evaluation,
+            payload=payload,
+            tool_name="update_workflow",
+        )
+        return reject(
+            error=str(reject_result["error"]),
+            user_facing_summary=str(reject_result.get("user_facing_summary") or _compiled_authoring_user_summary()),
+            data=reject_result.get("data") if isinstance(reject_result.get("data"), dict) else None,
+            repair_context=output_contract_evaluation.repair_context,
+            record_repair_context_outcome=False,
+        )
     missing_metadata_error = _missing_code_artifact_metadata_error(
         workflow_yaml,
         ctx,
@@ -4978,11 +7442,43 @@ async def _update_workflow(
         missing_labels = _missing_code_artifact_metadata_labels(
             workflow_yaml, ctx, params.get("code_artifact_metadata")
         )
+        missing_metadata_output_facts = _missing_requested_output_facts(
+            required_child_output_paths,
+            reason_code=output_path_coverage_reason_code,
+        )
+        if required_child_output_paths:
+            missing_metadata_error = (
+                f"{missing_metadata_error}\nRequired requested output paths: "
+                f"{', '.join(sorted(required_child_output_paths))}"
+            )
+        metadata_repair_context = _metadata_output_repair_context(
+            block_labels=missing_labels,
+            required_paths=required_child_output_paths,
+            coverage_reason_code=output_path_coverage_reason_code,
+            source=output_path_coverage_source,
+            summary=missing_metadata_error,
+        )
+        metadata_repair_contract = _metadata_repair_contract(
+            block_labels=missing_labels,
+            required_paths=required_child_output_paths,
+            source=output_path_coverage_source,
+            reason_code=output_path_coverage_reason_code,
+        )
+        _record_output_contract_family_reject(
+            ctx,
+            required_child_output_paths,
+            reject_family="missing_code_artifact_metadata",
+        )
         _record_author_time_reject_outcome(
             ctx,
             reason_code="metadata_reject",
             summary=missing_metadata_error,
-            structural_payload=_code_artifact_metadata_reject_payload(
+            structural_payload=_output_contract_author_time_structural_payload(
+                ctx,
+                required_child_output_paths,
+                block_label=missing_labels[0] if len(missing_labels) == 1 else "",
+            )
+            or _code_artifact_metadata_reject_payload(
                 workflow_yaml=workflow_yaml,
                 raw_metadata=params.get("code_artifact_metadata"),
                 offending_labels=[],
@@ -4990,11 +7486,18 @@ async def _update_workflow(
                 violation_categories=["missing_code_artifact_metadata"],
             ),
             block_labels=missing_labels,
+            missing_requested_output_facts=missing_metadata_output_facts,
         )
         return reject(
             error=missing_metadata_error,
             user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(),
+            data=_code_repair_progress_data(
+                metadata_repair_context,
+                missing_requested_output_facts=missing_metadata_output_facts,
+                metadata_repair_contract=metadata_repair_contract,
+            ),
+            repair_context=metadata_repair_context,
+            record_repair_context_outcome=False,
         )
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     normalization = _normalize_code_artifact_metadata_detailed(
@@ -5003,16 +7506,31 @@ async def _update_workflow(
         impose_defaults=_copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         scout_trajectory=scout_trajectory if isinstance(scout_trajectory, list) else None,
         verified_runtime_output_paths_by_label=_verified_runtime_output_contract_paths_by_label(ctx, workflow_yaml),
+        advisory_declared_output_return_shape_labels=(
+            {output_contract_evaluation.block_label}
+            if output_contract_static_advisory_allowed and output_contract_evaluation is not None
+            else None
+        ),
     )
     code_artifact_metadata = normalization.normalized
     code_artifact_metadata_error = normalization.error
     if code_artifact_metadata_error is not None:
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
+        _record_output_contract_family_reject(
+            ctx,
+            required_child_output_paths,
+            reject_family="metadata_normalization",
+        )
         _record_author_time_reject_outcome(
             ctx,
             reason_code="metadata_reject",
             summary=code_artifact_metadata_error,
-            structural_payload=_code_artifact_metadata_reject_payload(
+            structural_payload=_output_contract_author_time_structural_payload(
+                ctx,
+                required_child_output_paths,
+                block_label=normalization.offending_labels[0] if len(normalization.offending_labels) == 1 else "",
+            )
+            or _code_artifact_metadata_reject_payload(
                 workflow_yaml=workflow_yaml,
                 raw_metadata=params.get("code_artifact_metadata"),
                 offending_labels=normalization.offending_labels,
@@ -5066,7 +7584,10 @@ async def _update_workflow(
         merged_metadata = {block: row for block, row in merged_metadata.items() if block in retained_labels}
         ctx.code_artifact_metadata = merged_metadata
         ctx.workflow_verification_evidence.code_artifact_metadata = merged_metadata
+        _apply_code_artifact_requested_output_evidence_sources(ctx, merged_metadata)
         params["code_artifact_metadata"] = merged_metadata
+        workflow_yaml = _apply_metadata_contract_schema_to_workflow_yaml(ctx, workflow_yaml, merged_metadata)
+        params["workflow_yaml"] = workflow_yaml
     if (
         credential_scout_errors
         and code_safety_errors
@@ -5221,12 +7742,12 @@ async def _update_workflow(
     # New data-write blocks default to surfacing failures rather than swallowing them.
     workflow_yaml = default_data_write_continue_on_failure(workflow_yaml, ctx.workflow_yaml)
 
-    authored_structure_signature = _unchanged_after_recorded_outcome_signature(
+    convergence_reject = _recorded_outcome_convergence_reject(
         ctx,
         workflow_yaml=workflow_yaml,
         code_artifact_metadata=getattr(ctx, "code_artifact_metadata", None),
     )
-    if authored_structure_signature is not None:
+    if convergence_reject is not None:
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
         _record_author_time_reject_outcome(
             ctx,
@@ -5234,31 +7755,41 @@ async def _update_workflow(
             summary="The authored code and output structure are unchanged after the last recorded test outcome.",
             structural_payload={
                 "reason_code": "unchanged_after_recorded_outcome",
-                "authored_structure_signature": authored_structure_signature,
+                "authored_structure_signature": convergence_reject.authored_structure_signature,
                 "block_labels": block_labels,
             },
-            authored_structure_signature=authored_structure_signature,
+            authored_structure_signature=convergence_reject.authored_structure_signature,
             block_labels=block_labels,
         )
-        _record_code_authoring_guardrail_reject(ctx)
+        _record_code_authoring_guardrail_reject(
+            ctx, frontier_unchanged=convergence_reject.reason == "frontier_unchanged"
+        )
+        LOG.info(
+            "copilot recorded outcome convergence behavior",
+            convergence_reason=convergence_reject.reason,
+            commit_early_terminal=convergence_reject.commit_early_terminal,
+            block_labels=block_labels,
+        )
+        if convergence_reject.commit_early_terminal:
+            _commit_recorded_outcome_early_terminal(ctx)
         return reject(
             error=(
-                "Submitted workflow is unchanged after the last recorded test outcome. "
-                "Revise the code block or output metadata before testing again."
+                "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
+                "Revise the code block or output metadata that owns that frontier before testing again."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
         )
 
-    recorded_output_roots_required = _recorded_outcome_requires_output_candidate(ctx)
-    recorded_missing_output_roots = (
-        _recorded_outcome_missing_output_roots(ctx) if recorded_output_roots_required else set()
+    recorded_output_paths_required = output_path_coverage_source == "recorded_outcome"
+    recorded_missing_output_paths = (
+        _recorded_outcome_missing_output_paths(ctx) if recorded_output_paths_required else set()
     )
-    unresolved_recorded_output_roots = recorded_missing_output_roots
+    unresolved_recorded_output_paths = recorded_missing_output_paths
 
     output_empty_labels = (
         _output_empty_code_block_labels(workflow_yaml, getattr(ctx, "code_artifact_metadata", None))
-        if recorded_output_roots_required and (not recorded_missing_output_roots or unresolved_recorded_output_roots)
+        if recorded_output_paths_required and (not recorded_missing_output_paths or unresolved_recorded_output_paths)
         else []
     )
     if output_empty_labels:
@@ -5289,28 +7820,35 @@ async def _update_workflow(
             data=_code_repair_progress_data(),
         )
 
-    missing_output_roots = (
-        _candidate_missing_required_output_roots(
+    missing_output_paths = (
+        _candidate_missing_required_output_paths(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
-            required_roots=unresolved_recorded_output_roots,
+            required_paths=unresolved_recorded_output_paths,
         )
-        if recorded_output_roots_required
+        if recorded_output_paths_required
         else []
     )
-    if missing_output_roots:
+    if missing_output_paths:
         authored_structure_signature = authored_structure_signature_from_workflow(
             workflow_yaml,
             getattr(ctx, "code_artifact_metadata", None),
         )
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+        missing_output_roots = sorted(
+            {root for path in missing_output_paths if (root := _top_level_path_segment(path))}
+        )
         _record_author_time_reject_outcome(
             ctx,
             reason_code="metadata_reject",
-            summary="Submitted workflow does not cover the missing requested output roots from the last recorded test outcome.",
+            summary=(
+                "Submitted workflow does not cover the missing requested output paths "
+                "from the last recorded test outcome."
+            ),
             structural_payload={
                 "reason_code": "recorded_outcome_missing_output_coverage",
                 "authored_structure_signature": authored_structure_signature,
+                "missing_output_paths": missing_output_paths,
                 "missing_output_roots": missing_output_roots,
                 "block_labels": block_labels,
                 "recorded_reason_code": "outcome_not_demonstrated",
@@ -5319,19 +7857,21 @@ async def _update_workflow(
             block_labels=block_labels,
             missing_requested_output_facts=[
                 {
-                    "output_path": root,
-                    "output_root": root,
+                    "output_path": path,
+                    "output_root": _top_level_path_segment(path),
                     "reason_code": "recorded_outcome_missing_output_coverage",
                     "value_status": "no_typed_value",
                 }
-                for root in missing_output_roots
+                for path in missing_output_paths
             ],
         )
         _record_code_authoring_guardrail_reject(ctx)
+        missing_path_text = ", ".join(missing_output_paths[:8])
         return reject(
             error=(
-                "Submitted workflow does not cover the missing requested output roots from the last recorded test "
-                "outcome. Declare and produce structured output for those roots before testing again."
+                "Submitted workflow does not cover the missing requested output paths from the last recorded test "
+                f"outcome: {missing_path_text}. Declare those exact output_path values in goal_value_paths and "
+                "produce matching structured output before testing again; output_root is diagnostic only."
             ),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
@@ -5367,11 +7907,12 @@ async def _update_workflow(
         # Derive plain-language steps from each code block's code so the editor timeline
         # mirrors the actual code (deterministic action_type + line ranges).
         workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml)
-        workflow = _process_workflow_yaml(
+        workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
             workflow_yaml=workflow_yaml_with_steps,
+            settings_fallback_yaml=prior_yaml,
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
@@ -5379,7 +7920,14 @@ async def _update_workflow(
         # prepare_workflow and the runtime parameter-row read consume canonical
         # values; terminal handlers roll back on non-auto-accept.
         prior_workflow = await _get_prior_workflow(ctx)
-        requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
+        requires_canonical_persist = _workflow_requires_canonical_persist(
+            prior_workflow, workflow
+        ) or _workflow_needs_contract_readback_persist(
+            ctx,
+            prior_workflow,
+            workflow,
+            allow_static_output_uncertainty=allow_static_output_uncertainty,
+        )
         if requires_canonical_persist:
             created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
             await app.WORKFLOW_SERVICE.update_workflow_definition(
@@ -5403,6 +7951,7 @@ async def _update_workflow(
                 ai_fallback=workflow.ai_fallback,
                 cache_key=workflow.cache_key,
                 adaptive_caching=workflow.adaptive_caching,
+                enable_self_healing=workflow.enable_self_healing,
                 code_version=workflow.code_version,
                 run_sequentially=workflow.run_sequentially,
                 sequential_key=workflow.sequential_key,
@@ -5512,6 +8061,8 @@ def _record_workflow_update_result(
             copilot_ctx.last_update_block_count = block_count
     copilot_ctx.update_workflow_called = True
     copilot_ctx.synthesized_block_reopened_after_failed_run = False
+    copilot_ctx.synthesized_block_reopened_for_output_coverage = False
+    copilot_ctx.uncovered_output_rescout_steer_key = None
     copilot_ctx.test_after_update_done = False
     copilot_ctx.post_update_nudge_count = 0
     copilot_ctx.last_test_ok = None

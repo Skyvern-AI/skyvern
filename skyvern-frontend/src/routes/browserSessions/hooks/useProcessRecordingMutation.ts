@@ -5,7 +5,10 @@ import { useRef } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useRecordingStore } from "@/store/useRecordingStore";
+import {
+  useRecordingStore,
+  type RecordingDraftStep,
+} from "@/store/useRecordingStore";
 import {
   type WorkflowBlock,
   type WorkflowParameter,
@@ -33,7 +36,18 @@ const useProcessRecordingMutation = ({
   const mutationStartedAtRef = useRef<number | null>(null);
 
   const processRecordingMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (
+      variables: {
+        /**
+         * Live-interpreted draft steps (with user edits/deletes applied).
+         * When provided the backend converts them deterministically instead
+         * of re-processing the raw event stream.
+         */
+        draftSteps?: Array<RecordingDraftStep> | null;
+      } | void,
+    ) => {
+      const draftSteps = variables?.draftSteps ?? null;
+
       if (!browserSessionId) {
         throw new Error(
           "Cannot process recording without a valid browser session ID.",
@@ -49,8 +63,9 @@ const useProcessRecordingMutation = ({
       mutationStartedAtRef.current = Date.now();
 
       const eventCount = recordingStore.getEventCount();
+      const hasDraftSteps = (draftSteps?.length ?? 0) > 0;
 
-      if (eventCount === 0) {
+      if (eventCount === 0 && !hasDraftSteps) {
         captureRecordBrowser("record_browser.empty_blocked", {
           seconds_recording: recordingStore.getSecondsRecording(),
         });
@@ -62,12 +77,16 @@ const useProcessRecordingMutation = ({
       captureRecordBrowser("record_browser.process_attempted", {
         event_count: recordingStore.getEventCount(),
         compressed_chunk_count: compressedChunks.length,
+        draft_step_count: draftSteps?.length,
       });
 
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client
         .post<
-          { compressed_chunks: string[] },
+          {
+            compressed_chunks: string[];
+            draft_steps?: Array<RecordingDraftStep>;
+          },
           {
             data: {
               blocks: Array<WorkflowBlock>;
@@ -77,6 +96,7 @@ const useProcessRecordingMutation = ({
         >(`/browser_sessions/${browserSessionId}/process_recording`, {
           compressed_chunks: compressedChunks,
           workflow_permanent_id: workflowPermanentId,
+          ...(draftSteps !== null ? { draft_steps: draftSteps } : {}),
         })
         .then((response) => ({
           blocks: response.data.blocks,
@@ -112,6 +132,11 @@ const useProcessRecordingMutation = ({
         return;
       }
 
+      // A zero-block commit still ends the session: the caller's onSuccess (which
+      // normally exits recording after landing blocks) is skipped, and without
+      // this the user is stranded in the recording panel with a dead Done button.
+      recordingStore.setIsRecording(false);
+
       toast({
         variant: "warning",
         title: "Recording Processed (No Blocks)",
@@ -140,6 +165,8 @@ const useProcessRecordingMutation = ({
         error_message: error instanceof Error ? error.message : String(error),
         latency_ms: latencyMs,
       });
+
+      useRecordingStore.setState({ finishRequested: false });
 
       toast({
         variant: "destructive",

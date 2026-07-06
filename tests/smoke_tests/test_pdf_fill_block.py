@@ -62,6 +62,16 @@ def _build_pdf_fill_block(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **yam
     return block
 
 
+def _run_local_pdf_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, run_id: str, name: str) -> Path:
+    # Local source paths must resolve inside the run's download directory, or _resolve_source_pdf's
+    # path-containment check rejects them.
+    download_root = tmp_path / "downloads"
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.settings.DOWNLOAD_PATH", str(download_root))
+    run_dir = download_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir / name
+
+
 def _install_context(monkeypatch: pytest.MonkeyPatch, values: dict[str, Any]) -> SmokePdfFillContext:
     context = SmokePdfFillContext(values=values)
     monkeypatch.setattr(PdfFillBlock, "get_workflow_run_context", staticmethod(lambda _wr_id: context))
@@ -75,7 +85,7 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, values: dict[str, Any]) ->
 
 @pytest.mark.asyncio
 async def test_acroform_fill_end_to_end_through_converter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    source_pdf = tmp_path / "form.pdf"
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, "wr_smoke_acroform", "form.pdf")
     _write_fillable_pdf(source_pdf)
 
     async def _llm_response(**_: Any) -> dict[str, Any]:
@@ -99,7 +109,7 @@ async def test_acroform_fill_end_to_end_through_converter(monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 async def test_flat_fill_end_to_end_with_fake_tesseract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    source_pdf = tmp_path / "flat.pdf"
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, "wr_smoke_flat", "flat.pdf")
     _write_flat_pdf(source_pdf)
 
     # The 300x200pt flat fixture renders to 625x417px at 150dpi; the TSV mirrors a real tesseract run.
@@ -149,7 +159,7 @@ async def test_flat_fill_end_to_end_with_fake_tesseract(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 async def test_file_url_unwraps_upstream_block_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    source_pdf = tmp_path / "form.pdf"
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, "wr_smoke_chained", "form.pdf")
     _write_fillable_pdf(source_pdf)
 
     async def _llm_response(**_: Any) -> dict[str, Any]:

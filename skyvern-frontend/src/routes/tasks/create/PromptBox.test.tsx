@@ -194,7 +194,7 @@ describe("PromptBox", () => {
     expect(yaml).toContain("run_with: agent");
     expect(yaml).not.toContain("run_with: code");
     expect(mockNavigate).toHaveBeenCalledWith(
-      "/workflows/wpid_copilot/build?via=discover",
+      "/agents/wpid_copilot/build?via=discover",
       {
         state: { copilotMessage: "Build this workflow" },
       },

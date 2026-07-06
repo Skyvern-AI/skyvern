@@ -80,26 +80,26 @@ async def test_create_workflow_run_parameters_persists_all_values(agent_db: Agen
         workflow_definition={"parameters": [], "blocks": []},
         organization_id=organization.organization_id,
     )
-    workflow_run = await agent_db.create_workflow_run(
+    workflow_run = await agent_db.workflow_runs.create_workflow_run(
         workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_id=workflow.workflow_id,
         organization_id=organization.organization_id,
     )
 
-    url_parameter = await agent_db.create_workflow_parameter(
+    url_parameter = await agent_db.workflow_params.create_workflow_parameter(
         workflow_id=workflow.workflow_id,
         workflow_parameter_type=WorkflowParameterType.STRING,
         key="url",
         default_value=None,
     )
-    count_parameter = await agent_db.create_workflow_parameter(
+    count_parameter = await agent_db.workflow_params.create_workflow_parameter(
         workflow_id=workflow.workflow_id,
         workflow_parameter_type=WorkflowParameterType.INTEGER,
         key="count",
         default_value=None,
     )
 
-    created_parameters = await agent_db.create_workflow_run_parameters(
+    created_parameters = await agent_db.workflow_runs.create_workflow_run_parameters(
         workflow_run_id=workflow_run.workflow_run_id,
         workflow_parameter_values=[
             (url_parameter, "https://example.com"),
@@ -110,7 +110,7 @@ async def test_create_workflow_run_parameters_persists_all_values(agent_db: Agen
     assert [parameter.value for parameter in created_parameters] == ["https://example.com", 7]
     assert all(parameter.created_at is not None for parameter in created_parameters)
 
-    stored_parameters = await agent_db.get_workflow_run_parameters(workflow_run.workflow_run_id)
+    stored_parameters = await agent_db.workflow_runs.get_workflow_run_parameters(workflow_run.workflow_run_id)
     assert len(stored_parameters) == 2
     assert {parameter.key: run_parameter.value for parameter, run_parameter in stored_parameters} == {
         "url": "https://example.com",

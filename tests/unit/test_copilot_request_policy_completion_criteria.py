@@ -9,6 +9,7 @@ import pytest
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
+    _criterion_reconcile_key,
     criteria_from_json,
     criteria_to_json,
     reconcile_completion_criteria,
@@ -18,13 +19,16 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
     _apply_requested_output_completion_criteria,
+    _apply_validation_classification_completion_criteria,
     _classify_request,
+    _criterion_grounding_mode,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
     build_classifier_fallback_floor,
     is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
 )
+from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
 
 
 async def _policy_for_message(
@@ -53,39 +57,6 @@ async def _policy_for_message(
 
 def _stored(*criteria: CompletionCriterion) -> StoredCriteriaSet:
     return StoredCriteriaSet(set_id="wccs_existing", goal_epoch=1, criteria=tuple(criteria))
-
-
-def _criterion(
-    cid: str,
-    outcome: str,
-    *,
-    level: str = "run",
-    output_path: str | None = None,
-    method_mandated: bool = False,
-    contingent_on: str | None = None,
-    contingent_antecedent_output_path: str | None = None,
-    deliverable_kind: str | None = None,
-    expected_output_value: str | None = None,
-    expected_output_shape: str | None = None,
-    kind: str = "outcome",
-    classification_output_key: str | None = None,
-    expected_classification: str | bool | None = None,
-) -> CompletionCriterion:
-    return CompletionCriterion(
-        id=cid,
-        outcome=outcome,
-        level=level,  # type: ignore[arg-type]
-        output_path=output_path,
-        method_mandated=method_mandated,
-        contingent_on=contingent_on,
-        contingent_antecedent_output_path=contingent_antecedent_output_path,
-        deliverable_kind=deliverable_kind,  # type: ignore[arg-type]
-        expected_output_value=expected_output_value,
-        expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
-        kind=kind,  # type: ignore[arg-type]
-        classification_output_key=classification_output_key,
-        expected_classification=expected_classification,
-    )
 
 
 def _outcomes(policy: RequestPolicy) -> list[str]:
@@ -141,6 +112,150 @@ def test_present_completion_contract_helper_rejects_absent_policy() -> None:
     policy = RequestPolicy(completion_contract_status="absent", completion_criteria=[])
 
     assert request_policy_has_present_completion_contract(policy) is False
+
+
+def test_completion_criteria_preserve_requested_output_evidence_source() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record selects the best option.",
+                "output_path": "output.best_option_selected",
+                "expected_output_value": "true",
+                "requested_output_evidence_source": "independent_run_evidence",
+            },
+            {
+                "outcome": "The returned record includes status.",
+                "output_path": "output.status",
+                "expected_output_value": "Active",
+            },
+            {
+                "outcome": "The registered output parameter includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_value": "WTR-1842-DEMO",
+                "requested_output_evidence_source": "registered_output_parameter",
+            },
+            {
+                "outcome": "The registered artifact content includes the statement total.",
+                "output_path": "output.statement_total",
+                "expected_output_value": "$41.00",
+                "requested_output_evidence_source": "registered_artifact_content",
+            },
+            {
+                "outcome": "The classifier drifted.",
+                "output_path": "output.drifted",
+                "requested_output_evidence_source": "output_path_name_heuristic",
+            },
+        ]
+    )
+
+    assert [criterion.requested_output_evidence_source for criterion in criteria] == [
+        "independent_run_evidence",
+        "runtime_output",
+        "registered_output_parameter",
+        "registered_artifact_content",
+        "runtime_output",
+    ]
+
+    round_tripped = criteria_from_json(criteria_to_json(criteria))
+    assert [criterion.requested_output_evidence_source for criterion in round_tripped] == [
+        "independent_run_evidence",
+        "runtime_output",
+        "registered_output_parameter",
+        "registered_artifact_content",
+        "runtime_output",
+    ]
+
+    policy = RequestPolicy(completion_criteria=list(round_tripped))
+    trace = policy.to_trace_data()
+    assert trace["requested_output_criterion_0_evidence_source"] == "independent_run_evidence"
+    assert trace["requested_output_criterion_1_evidence_source"] == "runtime_output"
+    assert trace["requested_output_criterion_2_evidence_source"] == "registered_output_parameter"
+    assert trace["requested_output_criterion_3_evidence_source"] == "registered_artifact_content"
+
+
+def test_requested_output_canonicalization_preserves_independent_evidence_source() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record selects the best option.",
+                output_path="output.best_option",
+                expected_output_value="true",
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with best option.")
+
+    requested = _criteria_for_path(policy, "output.best_option")
+    assert requested
+    assert requested[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+def test_requested_output_canonicalization_inherits_single_independent_selection_source() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The highest-priority returned record is selected.",
+                expected_output_value="true",
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return a final record with document name.")
+
+    requested = _criteria_for_path(policy, "output.document_name")
+    assert requested
+    assert requested[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+@pytest.mark.asyncio
+async def test_classifier_requested_output_selection_source_survives_canonicalization() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with document name.",
+        [
+            {
+                "outcome": "The highest-priority returned document is selected.",
+                "expected_output_value": "true",
+                "requested_output_evidence_source": "independent_run_evidence",
+            }
+        ],
+    )
+
+    requested = _criteria_for_path(policy, "output.document_name")
+    trace = policy.to_trace_data()
+
+    assert requested
+    assert requested[0].requested_output_evidence_source == "independent_run_evidence"
+    assert trace["classifier_non_runtime_requested_output_evidence_source_count"] == 1
+    assert trace["classifier_non_runtime_requested_output_evidence_sources"] == ["independent_run_evidence"]
+
+
+def test_request_policy_trace_exposes_classifier_fallback_status() -> None:
+    policy = RequestPolicy(
+        classifier_status="fallback",
+        classifier_failure_kind="timeout",
+        classifier_retry_count=2,
+        completion_criteria=[
+            _criterion(
+                "c0",
+                "The returned record includes status.",
+                output_path="output.status",
+            )
+        ],
+    )
+
+    trace = policy.to_trace_data()
+
+    assert trace["classifier_status"] == "fallback"
+    assert trace["classifier_failure_kind"] == "timeout"
+    assert trace["classifier_retry_count"] == 2
+    assert trace["classifier_non_runtime_requested_output_evidence_source_count"] == 0
+    assert trace["classifier_non_runtime_requested_output_evidence_sources"] == []
+    assert trace["requested_output_criterion_0_evidence_source"] == "runtime_output"
 
 
 @pytest.mark.asyncio
@@ -1171,215 +1286,173 @@ def test_requested_output_canonicalization_preserves_marker_for_approved_downloa
     assert criteria[0].deliverable_kind == "registered_download"
 
 
-def test_active_criteria_rendering_includes_contingent_on() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "A provider blocker is reported to the user.",
-                contingent_on="the provider site blocks online submission",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "A provider blocker is reported to the user.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "contingent_on": "the provider site blocks online submission",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_contingent_antecedent_output_path() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "A provider blocker is reported to the user.",
-                contingent_on="the provider site blocks online submission",
-                contingent_antecedent_output_path="output.blocker",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "A provider blocker is reported to the user.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "contingent_on": "the provider site blocks online submission",
-            "contingent_antecedent_output_path": "output.blocker",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_deliverable_kind() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The requested download is returned.",
-                output_path="output.output_id",
-                deliverable_kind="registered_download",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The requested download is returned.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "deliverable_kind": "registered_download",
-            "output_path": "output.output_id",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_expected_output_value_as_structured_data() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The returned record includes service address.",
-                output_path="output.service_address",
-                expected_output_value="1234 Sample Utility Way",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The returned record includes service address.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "output_path": "output.service_address",
-            "expected_output_value": "1234 Sample Utility Way",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_expected_output_shape_as_structured_data() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The returned record includes confirmation number.",
-                output_path="output.confirmation_number",
-                expected_output_shape="reference_code",
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The returned record includes confirmation number.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "outcome",
-            "terminal_action_family": None,
-            "output_path": "output.confirmation_number",
-            "expected_output_shape": "reference_code",
-        }
-    ]
-
-
-def test_active_criteria_rendering_includes_validation_classification_contract() -> None:
-    rendered = _render_active_criteria_for_prompt(
-        [
-            _criterion(
-                "c0",
-                "The run classifies whether the path is login gated.",
-                kind="validation_classification",
-                classification_output_key="login_gated",
-                expected_classification=True,
-            )
-        ]
-    )
-
-    assert json.loads(rendered) == [
-        {
-            "outcome": "The run classifies whether the path is login gated.",
-            "implicit": False,
-            "method_mandated": False,
-            "level": "run",
-            "kind": "validation_classification",
-            "terminal_action_family": None,
-            "classification_output_key": "login_gated",
-            "expected_classification": True,
-        }
-    ]
-
-
-def test_criteria_json_round_trips_contingent_on() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
+@pytest.mark.parametrize(
+    ("criterion_kwargs", "expected"),
+    [
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+            },
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "contingent_on": "the provider site blocks online submission",
+            },
+            id="contingent_on",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_criteria_json_round_trips_expected_output_value() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The returned record includes service address.",
-            output_path="output.service_address",
-            expected_output_value="1234 Sample Utility Way",
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            id="contingent_antecedent_output_path",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_criteria_json_round_trips_expected_output_shape() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The returned record includes confirmation number.",
-            output_path="output.confirmation_number",
-            expected_output_shape="reference_code",
+        pytest.param(
+            {
+                "outcome": "The requested download is returned.",
+                "output_path": "output.output_id",
+                "deliverable_kind": "registered_download",
+            },
+            {
+                "outcome": "The requested download is returned.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "deliverable_kind": "registered_download",
+                "output_path": "output.output_id",
+            },
+            id="deliverable_kind",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_criteria_json_round_trips_validation_classification_contract() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "The run classifies whether the path is login gated.",
-            kind="validation_classification",
-            classification_output_key="path_classification",
-            expected_classification="login_gated",
+        pytest.param(
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            },
+            {
+                "outcome": "The returned record includes service address.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            },
+            id="expected_output_value",
         ),
-    )
+        pytest.param(
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            id="expected_output_shape",
+        ),
+        pytest.param(
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "validation_classification",
+                "terminal_action_family": None,
+                "classification_output_key": "login_gated",
+                "expected_classification": True,
+            },
+            id="validation_classification_contract",
+        ),
+    ],
+)
+def test_active_criteria_rendering_includes_optional_fields(
+    criterion_kwargs: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    rendered = _render_active_criteria_for_prompt([_criterion("c0", **criterion_kwargs)])
+
+    assert json.loads(rendered) == [expected]
+
+
+@pytest.mark.parametrize(
+    "criterion_kwargs",
+    [
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+            },
+            id="contingent_on",
+        ),
+        pytest.param(
+            {
+                "outcome": "The returned record includes service address.",
+                "output_path": "output.service_address",
+                "expected_output_value": "1234 Sample Utility Way",
+            },
+            id="expected_output_value",
+        ),
+        pytest.param(
+            {
+                "outcome": "The returned record includes confirmation number.",
+                "output_path": "output.confirmation_number",
+                "expected_output_shape": "reference_code",
+            },
+            id="expected_output_shape",
+        ),
+        pytest.param(
+            {
+                "outcome": "The run classifies whether the path is login gated.",
+                "kind": "validation_classification",
+                "classification_output_key": "path_classification",
+                "expected_classification": "login_gated",
+            },
+            id="validation_classification_contract",
+        ),
+        pytest.param(
+            {
+                "outcome": "A provider blocker is reported to the user.",
+                "contingent_on": "the provider site blocks online submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+            id="contingent_antecedent_output_path",
+        ),
+    ],
+)
+def test_criteria_json_round_trips(criterion_kwargs: dict[str, Any]) -> None:
+    criteria = (_criterion("c0", **criterion_kwargs),)
 
     restored = criteria_from_json(criteria_to_json(criteria))
 
@@ -1446,137 +1519,82 @@ def test_request_policy_trace_exposes_requested_output_grounding_contract_withou
     assert "1234 Sample Utility Way" not in repr(trace)
 
 
-def test_reconcile_supersedes_same_output_path_with_different_expected_output_value() -> None:
-    stored = _stored(
-        _criterion(
-            "s0",
-            "The returned record includes service address.",
-            output_path="output.service_address",
-            expected_output_value="1234 Sample Utility Way",
-        )
-    )
-    fresh = [
-        _criterion(
-            "c0",
-            "The returned record includes service address.",
-            output_path="output.service_address",
-            expected_output_value="7890 Changed Ave",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_reconcile_supersedes_same_output_path_with_different_expected_output_shape() -> None:
-    stored = _stored(
-        _criterion(
-            "s0",
-            "The returned record includes confirmation number.",
-            output_path="output.confirmation_number",
-            expected_output_shape="reference_code",
-        )
-    )
-    fresh = [
-        _criterion(
-            "c0",
-            "The returned record includes confirmation number.",
-            output_path="output.confirmation_number",
-            expected_output_shape="numeric_identifier",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_reconcile_supersedes_validation_classification_with_different_target() -> None:
-    stored = _stored(
-        _criterion(
-            "s0",
-            "The run classifies whether the path is login gated.",
-            kind="validation_classification",
-            classification_output_key="path_classification",
-            expected_classification="login_gated",
-        )
-    )
-    fresh = [
-        _criterion(
-            "c0",
-            "The run classifies whether the path is public.",
-            kind="validation_classification",
-            classification_output_key="path_classification",
-            expected_classification="public",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_criteria_json_round_trips_contingent_antecedent_output_path() -> None:
-    criteria = (
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
-            contingent_antecedent_output_path="output.blocker",
+@pytest.mark.parametrize(
+    ("stored_criterion", "fresh_criterion"),
+    [
+        pytest.param(
+            _criterion(
+                "s0",
+                "The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="1234 Sample Utility Way",
+            ),
+            _criterion(
+                "c0",
+                "The returned record includes service address.",
+                output_path="output.service_address",
+                expected_output_value="7890 Changed Ave",
+            ),
+            id="changed-expected-output-value",
         ),
-    )
-
-    restored = criteria_from_json(criteria_to_json(criteria))
-
-    assert restored == criteria
-
-
-def test_reconcile_keeps_conditional_and_unconditional_same_outcome_distinct() -> None:
-    stored = _stored(_criterion("s0", "A provider blocker is reported to the user."))
-    fresh = [
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
-        )
-    ]
-
-    decision = reconcile_completion_criteria(
-        StoredCriteriaSnapshot(active=stored, next_epoch=2),
-        fresh,
-        actionable=True,
-    )
-
-    assert decision.action == "create"
-    assert decision.criteria == tuple(fresh)
-
-
-def test_reconcile_keeps_structural_conditional_and_unconditional_same_outcome_distinct() -> None:
-    stored = _stored(_criterion("s0", "A provider blocker is reported to the user."))
-    fresh = [
-        _criterion(
-            "c0",
-            "A provider blocker is reported to the user.",
-            contingent_on="the provider site blocks online submission",
-            contingent_antecedent_output_path="output.blocker",
-        )
-    ]
+        pytest.param(
+            _criterion(
+                "s0",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="reference_code",
+            ),
+            _criterion(
+                "c0",
+                "The returned record includes confirmation number.",
+                output_path="output.confirmation_number",
+                expected_output_shape="numeric_identifier",
+            ),
+            id="changed-expected-output-shape",
+        ),
+        pytest.param(
+            _criterion(
+                "s0",
+                "The run classifies whether the path is login gated.",
+                kind="validation_classification",
+                classification_output_key="path_classification",
+                expected_classification="login_gated",
+            ),
+            _criterion(
+                "c0",
+                "The run classifies whether the path is public.",
+                kind="validation_classification",
+                classification_output_key="path_classification",
+                expected_classification="public",
+            ),
+            id="changed-classification-target",
+        ),
+        pytest.param(
+            _criterion("s0", "A provider blocker is reported to the user."),
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+            ),
+            id="added-contingent-on",
+        ),
+        pytest.param(
+            _criterion("s0", "A provider blocker is reported to the user."),
+            _criterion(
+                "c0",
+                "A provider blocker is reported to the user.",
+                contingent_on="the provider site blocks online submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            id="added-structural-contingent-on",
+        ),
+    ],
+)
+def test_reconcile_supersedes_or_keeps_distinct(
+    stored_criterion: CompletionCriterion, fresh_criterion: CompletionCriterion
+) -> None:
+    stored = _stored(stored_criterion)
+    fresh = [fresh_criterion]
 
     decision = reconcile_completion_criteria(
         StoredCriteriaSnapshot(active=stored, next_epoch=2),
@@ -1665,3 +1683,202 @@ def test_requested_output_criteria_can_exceed_cap_without_dropping_requested_fie
         "output.specialty",
         "output.date",
     }
+
+
+def test_parser_preserves_boolean_expected_value_and_promotes_independent_source() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record selects the highest-priority document.",
+                "output_path": "output.selected_highest_priority",
+                "expected_output_value": True,
+            }
+        ]
+    )
+
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_value is True
+    assert criteria[0].requested_output_evidence_source == "independent_run_evidence"
+    assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
+
+
+def test_parser_promotes_goal_judgment_boolean_shape_without_explicit_value() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports whether the highest-priority item was selected.",
+                "output_path": "output.selected_highest_priority",
+                "expected_output_shape": "goal_judgment_boolean",
+            }
+        ]
+    )
+
+    assert criteria[0].expected_output_shape == "goal_judgment_boolean"
+    assert criteria[0].requested_output_evidence_source == "independent_run_evidence"
+    assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
+
+
+def test_parser_dedup_keeps_runtime_string_and_judgment_boolean_on_same_path() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes the selection label.",
+                "output_path": "output.selection",
+                "expected_output_value": "true",
+            },
+            {
+                "outcome": "The returned record reports the selection judgment.",
+                "output_path": "output.selection",
+                "expected_output_value": True,
+            },
+        ]
+    )
+
+    assert len(criteria) == 2
+    modes = {_criterion_grounding_mode(criterion) for criterion in criteria}
+    assert modes == {"exact_value", "judgment_boolean"}
+
+
+def test_declared_judgment_coerces_stringy_boolean_to_typed_bool() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports the highest-priority selection judgment.",
+                "output_path": "output.selected_highest_priority",
+                "expected_output_value": "true",
+                "requested_output_evidence_source": "independent_run_evidence",
+            }
+        ]
+    )
+
+    assert criteria[0].expected_output_value is True
+    assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
+
+
+def test_bare_stringy_boolean_without_judgment_signal_stays_exact_value() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes the selection label.",
+                "output_path": "output.selection",
+                "expected_output_value": "true",
+            }
+        ]
+    )
+
+    assert criteria[0].expected_output_value == "true"
+    assert _criterion_grounding_mode(criteria[0]) == "exact_value"
+
+
+def test_store_round_trip_preserves_boolean_expected_value_and_source() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports the false judgment.",
+                "output_path": "output.is_duplicate",
+                "expected_output_value": False,
+            }
+        ]
+    )
+
+    round_tripped = criteria_from_json(criteria_to_json(list(criteria)))
+
+    assert round_tripped[0].expected_output_value is False
+    assert round_tripped[0].requested_output_evidence_source == "independent_run_evidence"
+    assert _criterion_grounding_mode(round_tripped[0]) == "judgment_boolean"
+
+
+def test_expected_false_survives_active_criteria_rendering() -> None:
+    criterion = _criterion(
+        "c_bool",
+        "The returned record reports the false judgment.",
+        output_path="output.is_duplicate",
+        expected_output_value=False,
+        requested_output_evidence_source="independent_run_evidence",
+    )
+
+    rendered = json.loads(_render_active_criteria_for_prompt([criterion]))
+
+    assert rendered[0]["expected_output_value"] is False
+
+
+def test_reconcile_key_distinguishes_false_from_absent_and_string_false() -> None:
+    false_bool = _criterion(
+        "c_false_bool",
+        "outcome",
+        output_path="output.flag",
+        expected_output_value=False,
+        requested_output_evidence_source="independent_run_evidence",
+    )
+    absent = _criterion("c_absent", "outcome", output_path="output.flag")
+    string_false = _criterion(
+        "c_string_false",
+        "outcome",
+        output_path="output.flag",
+        expected_output_value="false",
+    )
+
+    keys = {
+        _criterion_reconcile_key(false_bool),
+        _criterion_reconcile_key(absent),
+        _criterion_reconcile_key(string_false),
+    }
+    assert len(keys) == 3
+
+
+def test_criteria_from_json_coerces_stored_stringy_judgment_boolean_to_typed_bool() -> None:
+    raw_outcome = "The returned record reports the highest-priority selection judgment."
+    raw_criterion = {
+        "outcome": raw_outcome,
+        "output_path": "output.selected_highest_priority",
+        "expected_output_value": "true",
+        "requested_output_evidence_source": "independent_run_evidence",
+    }
+    restored = criteria_from_json([{"id": "c0", **raw_criterion}])
+    parsed = _parse_completion_criteria([raw_criterion])
+
+    assert restored[0].expected_output_value is True
+    assert _criterion_reconcile_key(restored[0]) == _criterion_reconcile_key(parsed[0])
+
+
+def test_scope_boundary_boolean_on_login_only_rekinds_and_drops_judgment_invariant() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_login_only",
+                "The workflow only reaches the login page.",
+                output_path="output.login_only",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_validation_classification_completion_criteria(policy)
+
+    promoted = policy.completion_criteria[0]
+    assert promoted.kind == "validation_classification"
+    assert promoted.classification_output_key == "login_only"
+    assert promoted.expected_output_value is None
+    assert promoted.requested_output_evidence_source == "runtime_output"
+
+
+def test_scope_boundary_boolean_on_non_enumerated_path_keeps_judgment_invariant() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_judgment",
+                "The returned record reports the selection judgment.",
+                output_path="output.selected_highest_priority",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_validation_classification_completion_criteria(policy)
+
+    kept = policy.completion_criteria[0]
+    assert kept.kind == "outcome"
+    assert kept.expected_output_value is True
+    assert kept.requested_output_evidence_source == "independent_run_evidence"

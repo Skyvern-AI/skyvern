@@ -3645,10 +3645,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
               "title": "Vault Type"
             },
-            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+            "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')"
           },
           {
             "name": "credential_type",
@@ -5808,6 +5808,44 @@
               "title": "Error Code"
             },
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "created_at_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created at or after this UTC timestamp (ISO 8601).",
+              "title": "Created At Start"
+            },
+            "description": "Only include runs created at or after this UTC timestamp (ISO 8601)."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this UTC timestamp (ISO 8601).",
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
             "name": "x-api-key",
@@ -10229,6 +10267,7 @@
             ],
             "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
             "examples": [
+              "skyvern",
               "custom",
               "azure_vault",
               "bitwarden"
@@ -10550,7 +10589,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')"
+            "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
           "browser_profile_id": {
             "anyOf": [
@@ -10670,6 +10709,7 @@
       "CredentialVaultType": {
         "type": "string",
         "enum": [
+          "skyvern",
           "bitwarden",
           "azure_vault",
           "gcp",
@@ -24058,6 +24098,11 @@
             "title": "Adaptive Caching",
             "default": false
           },
+          "enable_self_healing": {
+            "type": "boolean",
+            "title": "Enable Self Healing",
+            "default": false
+          },
           "code_version": {
             "anyOf": [
               {
@@ -24139,6 +24184,11 @@
               }
             ],
             "title": "Edited By"
+          },
+          "copilot_authored": {
+            "type": "boolean",
+            "title": "Copilot Authored",
+            "default": false
           },
           "created_at": {
             "type": "string",
@@ -24381,6 +24431,17 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "enable_self_healing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Self Healing"
           },
           "code_version": {
             "anyOf": [

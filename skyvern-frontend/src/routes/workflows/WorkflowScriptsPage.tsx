@@ -368,7 +368,7 @@ function ScriptRow({
             setExpanded(!expanded);
           } else {
             navigate(
-              `/workflows/${workflowPermanentId}/scripts/${script.script_id}`,
+              `/agents/${workflowPermanentId}/scripts/${script.script_id}`,
             );
           }
         }}
@@ -390,7 +390,7 @@ function ScriptRow({
             />
             <div className="flex flex-col gap-0.5">
               <Link
-                to={`/workflows/${workflowPermanentId}/scripts/${script.script_id}`}
+                to={`/agents/${workflowPermanentId}/scripts/${script.script_id}`}
                 className="font-mono text-sm text-blue-400 hover:underline"
                 onClick={(e) => e.stopPropagation()}
               >
@@ -429,7 +429,7 @@ function ScriptRow({
                 className="cursor-pointer bg-muted/30 hover:bg-muted/50"
                 onClick={() =>
                   navigate(
-                    `/workflows/${workflowPermanentId}/scripts/${script.script_id}?version=${group.latest_version}`,
+                    `/agents/${workflowPermanentId}/scripts/${script.script_id}?version=${group.latest_version}`,
                   )
                 }
               >
@@ -437,7 +437,7 @@ function ScriptRow({
                 <TableCell className="pl-8 text-sm">
                   {group.run_id ? (
                     <Link
-                      to={`/workflows/${workflowPermanentId}/${group.run_id}/code`}
+                      to={`/agents/${workflowPermanentId}/${group.run_id}/code`}
                       className="font-mono text-xs text-blue-400 hover:underline"
                       onClick={(e) => e.stopPropagation()}
                     >
@@ -513,7 +513,7 @@ function WorkflowScriptsPage() {
           ) : (
             <>
               <Link
-                to={`/workflows/${workflowPermanentId}/runs`}
+                to={`/agents/${workflowPermanentId}/runs`}
                 className="text-lg font-semibold hover:text-blue-400 hover:underline"
               >
                 {workflow?.title}
@@ -528,7 +528,7 @@ function WorkflowScriptsPage() {
           {workflow && (
             <WorkflowActions
               workflow={workflow}
-              onSuccessfullyDeleted={() => navigate("/workflows")}
+              onSuccessfullyDeleted={() => navigate("/agents")}
             />
           )}
           <Button asChild variant="secondary">
@@ -540,7 +540,7 @@ function WorkflowScriptsPage() {
             </Link>
           </Button>
           <Button asChild>
-            <Link to={`/workflows/${workflowPermanentId}/run`}>
+            <Link to={`/agents/${workflowPermanentId}/run`}>
               <PlayIcon className="mr-2 size-4" />
               Run
             </Link>
@@ -556,9 +556,7 @@ function WorkflowScriptsPage() {
               disabled={scripts.length === 0}
             />
             <Button asChild variant="outline" size="sm">
-              <Link to={`/workflows/${workflowPermanentId}/runs`}>
-                View Runs
-              </Link>
+              <Link to={`/agents/${workflowPermanentId}/runs`}>View Runs</Link>
             </Button>
           </div>
         </header>

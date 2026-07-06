@@ -57,32 +57,26 @@ def _fresh_context() -> CopilotContext:
 # ---------------------------------------------------------------------------
 
 
-def test_detect_matches_dns_error_in_block_failure_reason() -> None:
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": _DNS_FAILURE_REASON}]}}
-    assert _detect_non_retriable_nav_error(result) == _DNS_FAILURE_REASON
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(_DNS_FAILURE_REASON, id="dns_standard_format"),
+        pytest.param(
+            "Failed to navigate to url not-a-url. Error message: net::ERR_INVALID_URL",
+            id="invalid_url_standard_format",
+        ),
+        pytest.param("net::ERR_NAME_RESOLUTION_FAILED happened mid-flight", id="name_resolution_mid_string"),
+        pytest.param("SSL error: net::ERR_SSL_PROTOCOL_ERROR", id="ssl_prefixed"),
+    ],
+)
+def test_detect_matches_error_in_block_failure_reason(reason: str) -> None:
+    result = {"ok": False, "data": {"blocks": [{"failure_reason": reason}]}}
+    assert _detect_non_retriable_nav_error(result) == reason
 
 
 def test_detect_matches_cert_error_in_run_level_failure_reason() -> None:
     result = {"ok": False, "data": {"failure_reason": _CERT_FAILURE_REASON, "blocks": []}}
     assert _detect_non_retriable_nav_error(result) == _CERT_FAILURE_REASON
-
-
-def test_detect_matches_invalid_url_error() -> None:
-    invalid_url = "Failed to navigate to url not-a-url. Error message: net::ERR_INVALID_URL"
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": invalid_url}]}}
-    assert _detect_non_retriable_nav_error(result) == invalid_url
-
-
-def test_detect_matches_name_resolution_failed() -> None:
-    reason = "net::ERR_NAME_RESOLUTION_FAILED happened mid-flight"
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": reason}]}}
-    assert _detect_non_retriable_nav_error(result) == reason
-
-
-def test_detect_matches_ssl_error() -> None:
-    reason = "SSL error: net::ERR_SSL_PROTOCOL_ERROR"
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": reason}]}}
-    assert _detect_non_retriable_nav_error(result) == reason
 
 
 def test_detect_returns_none_for_generic_failure() -> None:
@@ -364,33 +358,11 @@ def test_check_enforcement_pre_empts_post_update_nudge() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_needs_failed_test_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.test_after_update_done = True
-    ctx.last_test_ok = False
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_failed_test_nudge(ctx) is False
-
-
 def test_needs_failed_test_nudge_still_fires_without_flag() -> None:
     ctx = _fresh_context()
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     assert _needs_failed_test_nudge(ctx) is True
-
-
-def test_needs_suspicious_success_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_suspicious_success = True
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_suspicious_success_nudge(ctx) is False
-
-
-def test_repeated_frontier_failure_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.repeated_failure_streak_count = 5
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _repeated_frontier_failure_nudge(ctx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -494,14 +466,6 @@ def test_all_competing_branches_silent_after_latch() -> None:
     assert _needs_failed_test_nudge(ctx) is False
     assert _needs_suspicious_success_nudge(ctx) is False
     assert _repeated_frontier_failure_nudge(ctx) is None
-
-
-def test_without_flag_competing_branches_still_active() -> None:
-    # Inverse: same setup but without the flag — all relevant branches fire.
-    ctx = _fresh_context()
-    ctx.test_after_update_done = True
-    ctx.last_test_ok = False
-    assert _needs_failed_test_nudge(ctx) is True
 
 
 # ---------------------------------------------------------------------------

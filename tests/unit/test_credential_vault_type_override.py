@@ -1,11 +1,16 @@
 """Tests for per-credential vault_type override in CreateCredentialRequest and vault service routing."""
 
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
-from skyvern.forge.sdk.routes.credentials import _get_credential_vault_service
+from skyvern.config import Settings
+from skyvern.forge.sdk.routes.credentials import (
+    _delete_temporary_test_login_credential,
+    _get_credential_vault_service,
+)
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     CredentialResponse,
@@ -17,6 +22,22 @@ from skyvern.forge.sdk.schemas.credentials import (
     SecretCredentialResponse,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+
+
+class TestLocalCredentialVaultSettings:
+    """Verify the local filesystem vault is enabled only in local envs by default."""
+
+    def test_local_credential_vault_defaults_enabled_for_local_env(self) -> None:
+        settings = Settings(_env_file=None, ENV="local", ENABLE_LOCAL_CREDENTIAL_VAULT=None)
+        assert settings.is_local_credential_vault_enabled()
+
+    def test_local_credential_vault_defaults_disabled_for_non_local_env(self) -> None:
+        settings = Settings(_env_file=None, ENV="prod", ENABLE_LOCAL_CREDENTIAL_VAULT=None)
+        assert not settings.is_local_credential_vault_enabled()
+
+    def test_local_credential_vault_can_be_explicitly_enabled_for_non_local_env(self) -> None:
+        settings = Settings(_env_file=None, ENV="prod", ENABLE_LOCAL_CREDENTIAL_VAULT=True)
+        assert settings.is_local_credential_vault_enabled()
 
 
 class TestCreateCredentialRequestVaultType:
@@ -56,6 +77,15 @@ class TestCreateCredentialRequestVaultType:
             vault_type=CredentialVaultType.BITWARDEN,
         )
         assert req.vault_type == CredentialVaultType.BITWARDEN
+
+    def test_vault_type_can_be_set_to_skyvern(self) -> None:
+        req = CreateCredentialRequest(
+            name="Test",
+            credential_type=CredentialType.PASSWORD,
+            credential=NonEmptyPasswordCredential(username="u", password="p"),
+            vault_type=CredentialVaultType.SKYVERN,
+        )
+        assert req.vault_type == CredentialVaultType.SKYVERN
 
     def test_vault_type_serializes_in_json(self) -> None:
         req = CreateCredentialRequest(
@@ -146,6 +176,69 @@ class TestGetCredentialVaultServiceRouting:
             assert result is mock_bw
 
     @pytest.mark.asyncio
+    async def test_no_override_uses_global_skyvern(self) -> None:
+        mock_skyvern = MagicMock(spec=CredentialVaultService)
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.CREDENTIAL_VAULT_TYPE = CredentialVaultType.SKYVERN
+            mock_settings.is_local_credential_vault_enabled.return_value = True
+            mock_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = mock_skyvern
+            result = await _get_credential_vault_service()
+            assert result is mock_skyvern
+
+    @pytest.mark.asyncio
+    async def test_no_override_skyvern_raises_when_local_vault_disabled(self) -> None:
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.CREDENTIAL_VAULT_TYPE = CredentialVaultType.SKYVERN
+            mock_settings.is_local_credential_vault_enabled.return_value = False
+            mock_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = MagicMock(spec=CredentialVaultService)
+            with pytest.raises(HTTPException) as exc_info:
+                await _get_credential_vault_service()
+            assert exc_info.value.status_code == 400
+            assert "local credential vault is not enabled" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_override_skyvern_ignores_global(self) -> None:
+        mock_bw = MagicMock(spec=CredentialVaultService)
+        mock_skyvern = MagicMock(spec=CredentialVaultService)
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.CREDENTIAL_VAULT_TYPE = CredentialVaultType.BITWARDEN
+            mock_settings.is_local_credential_vault_enabled.return_value = True
+            mock_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_bw
+            mock_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = mock_skyvern
+            result = await _get_credential_vault_service(
+                vault_type_override=CredentialVaultType.SKYVERN,
+            )
+            assert result is mock_skyvern
+
+    @pytest.mark.asyncio
+    async def test_override_skyvern_raises_when_local_vault_disabled(self) -> None:
+        mock_bw = MagicMock(spec=CredentialVaultService)
+        mock_skyvern = MagicMock(spec=CredentialVaultService)
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.CREDENTIAL_VAULT_TYPE = CredentialVaultType.BITWARDEN
+            mock_settings.is_local_credential_vault_enabled.return_value = False
+            mock_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_bw
+            mock_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = mock_skyvern
+            with pytest.raises(HTTPException) as exc_info:
+                await _get_credential_vault_service(
+                    vault_type_override=CredentialVaultType.SKYVERN,
+                )
+            assert exc_info.value.status_code == 400
+            assert "local credential vault is not enabled" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
     async def test_override_custom_ignores_global(self) -> None:
         mock_bw = MagicMock(spec=CredentialVaultService)
         mock_custom = MagicMock(spec=CredentialVaultService)
@@ -234,3 +327,88 @@ class TestGetCredentialVaultServiceRouting:
             mock_app.CUSTOM_CREDENTIAL_VAULT_SERVICE = mock_custom
             result = await _get_credential_vault_service(vault_type_override=None)
             assert result is mock_custom
+
+
+class TestTemporaryTestLoginCredentialCleanup:
+    """Verify temporary login-test credentials are deleted through the owning vault service."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_temporary_skyvern_credential_through_vault_service(self) -> None:
+        credential = SimpleNamespace(
+            credential_id="cred_temp",
+            organization_id="org_test",
+            name="_test_login_example",
+            vault_type=CredentialVaultType.SKYVERN,
+        )
+        mock_repository = MagicMock()
+        mock_repository.get_credential = AsyncMock(return_value=credential)
+        mock_service = MagicMock(spec=CredentialVaultService)
+        mock_service.delete_credential = AsyncMock()
+
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings") as mock_settings,
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_settings.is_local_credential_vault_enabled.return_value = True
+            mock_app.DATABASE.credentials = mock_repository
+            mock_app.SKYVERN_CREDENTIAL_VAULT_SERVICE = mock_service
+
+            await _delete_temporary_test_login_credential(
+                credential_id="cred_temp",
+                organization_id="org_test",
+                reason="test",
+            )
+
+        mock_service.delete_credential.assert_awaited_once_with(credential)
+
+    @pytest.mark.asyncio
+    async def test_defaults_missing_vault_type_to_bitwarden_for_legacy_credentials(self) -> None:
+        credential = SimpleNamespace(
+            credential_id="cred_temp",
+            organization_id="org_test",
+            name="_test_login_example",
+            vault_type=None,
+        )
+        mock_repository = MagicMock()
+        mock_repository.get_credential = AsyncMock(return_value=credential)
+        mock_service = MagicMock(spec=CredentialVaultService)
+        mock_service.delete_credential = AsyncMock()
+
+        with (
+            patch("skyvern.forge.sdk.routes.credentials.settings"),
+            patch("skyvern.forge.sdk.routes.credentials.app") as mock_app,
+        ):
+            mock_app.DATABASE.credentials = mock_repository
+            mock_app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = mock_service
+
+            await _delete_temporary_test_login_credential(
+                credential_id="cred_temp",
+                organization_id="org_test",
+                reason="test",
+            )
+
+        mock_service.delete_credential.assert_awaited_once_with(credential)
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_temporary_credentials(self) -> None:
+        credential = SimpleNamespace(
+            credential_id="cred_regular",
+            organization_id="org_test",
+            name="regular credential",
+            vault_type=CredentialVaultType.SKYVERN,
+        )
+        mock_repository = MagicMock()
+        mock_repository.get_credential = AsyncMock(return_value=credential)
+        mock_service = MagicMock(spec=CredentialVaultService)
+        mock_service.delete_credential = AsyncMock()
+
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.DATABASE.credentials = mock_repository
+
+            await _delete_temporary_test_login_credential(
+                credential_id="cred_regular",
+                organization_id="org_test",
+                reason="test",
+            )
+
+        mock_service.delete_credential.assert_not_awaited()

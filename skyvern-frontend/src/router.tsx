@@ -5,6 +5,7 @@ import {
   EditRoute,
   StudioRoute,
 } from "@/routes/workflows/StudioRouteGates";
+import { LegacyWorkflowsRedirect } from "@/routes/workflows/LegacyWorkflowsRedirect";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { BrowserSessions } from "@/routes/browserSessions/BrowserSessions";
 import { PageLayout } from "./components/PageLayout";
@@ -216,7 +217,11 @@ const router = createBrowserRouter([
         ],
       },
       {
-        path: "workflows",
+        path: "workflows/*",
+        element: <LegacyWorkflowsRedirect />,
+      },
+      {
+        path: "agents",
         element: <WorkflowsPageLayout />,
         children: [
           {

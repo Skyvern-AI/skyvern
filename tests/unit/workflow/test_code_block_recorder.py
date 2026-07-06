@@ -359,6 +359,7 @@ class FakeWorkflowRunContext:
     workflow_permanent_id = "wpid_test"
     workflow_run_id = "wr_test"
     browser_session_id = None
+    workflow = None
 
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}

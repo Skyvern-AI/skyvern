@@ -724,6 +724,22 @@ class TestEnforcementStateUpdates:
         assert ctx.update_workflow_called is False
 
 
+def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
+    from skyvern.forge.sdk.copilot.streaming_adapter import _tool_result_workflow_run_id
+
+    payload = {"ok": True, "data": {"workflow_run_id": "wr_42"}}
+    # Block-running tools created the run -> surface it (pass or fail).
+    assert _tool_result_workflow_run_id("update_and_run_blocks", payload) == "wr_42"
+    assert _tool_result_workflow_run_id("run_blocks_and_collect_debug", payload) == "wr_42"
+    # get_run_results echoes a prior run id; attributing it to this turn would grade a stale run.
+    assert _tool_result_workflow_run_id("get_run_results", payload) is None
+    assert _tool_result_workflow_run_id("update_workflow", payload) is None
+    # Malformed / missing data payloads yield None rather than raising.
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {}) is None
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": "string"}) is None
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
+
+
 class TestFlushGoalSatisfiedToolResult:
     @staticmethod
     def _ctx(**overrides: Any) -> SimpleNamespace:
@@ -860,6 +876,37 @@ def _copilot_ctx() -> Any:
         api_key=None,
         user_message="",
     )
+
+
+class TestGenuineAttemptScoutStamp:
+    def test_run_blocks_scout_stamp_does_not_count_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "run_blocks_and_collect_debug", {"ok": True})
+        assert ctx.test_after_update_done is True
+        assert ctx.has_genuine_workflow_attempt() is False
+
+    def test_failed_run_blocks_scout_stamp_does_not_count_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "run_blocks_and_collect_debug", {"ok": False})
+        assert ctx.test_after_update_done is True
+        assert ctx.has_genuine_workflow_attempt() is False
+
+    def test_persisted_update_counts_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 2}})
+        assert ctx.update_workflow_called is True
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_update_and_run_blocks_counts_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_and_run_blocks", {"ok": True, "data": {"block_count": 2}})
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_update_without_blocks_is_not_a_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 0}})
+        assert ctx.update_workflow_called is False
+        assert ctx.has_genuine_workflow_attempt() is False
 
 
 class TestCodeRepairProgressStreaming:
@@ -1001,3 +1048,71 @@ class TestCodeRepairProgressStreaming:
         assert tool_results[0].success is False
         narrations = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
         assert narrations == []
+
+
+async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) -> Any:
+    """Drive `stream_to_sse` over a single tool round-trip and return the
+    emitted ``WorkflowCopilotToolResultUpdate``."""
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": tool_name, "arguments": "{}"}
+    tool_call = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": tool_name}
+    out_item.output = [{"type": "text", "text": json.dumps(parsed_output)}]
+    tool_output = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    async def _events() -> Any:
+        yield tool_call
+        yield tool_output
+
+    result = MagicMock()
+    result.stream_events = lambda: _events()
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(
+        result,
+        stream,
+        SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None),
+    )
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    return tool_results[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_detail_for_failure() -> None:
+    long_error = "Workflow validation failed: " + (
+        "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
+    )
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": False, "error": long_error},
+    )
+    assert payload.success is False
+    assert payload.detail is not None
+    assert len(payload.detail) > 120
+    # `summary` is the visible bullet, capped tighter than `detail` (the
+    # tooltip-grade text) — strictly longer detail is the contract.
+    assert len(payload.detail) > len(payload.summary)
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_no_detail_for_success() -> None:
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": True, "data": {"block_count": 3}},
+    )
+    assert payload.success is True
+    assert payload.detail is None
