@@ -636,7 +636,7 @@ function StudioStage(props: StudioWorkspaceProps) {
 
   // The ✕ unmounts with its pane, so hand focus back to the pane's toggle.
   const closeWithFocus = (id: StudioPaneId) => {
-    closePane(id);
+    closePane(id, { learn: true });
     document.getElementById(studioTabId(id))?.focus();
   };
 
@@ -647,7 +647,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     if (panesListEqual(next, panes)) {
       return;
     }
-    setPanesOrder(next);
+    setPanesOrder(next, { learn: true });
     setReorderAnnouncement(
       `${STUDIO_PANE_META[movedId].label} pane moved to position ${
         next.indexOf(movedId) + 1
