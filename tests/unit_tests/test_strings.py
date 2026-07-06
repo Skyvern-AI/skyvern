@@ -1,5 +1,6 @@
 """Tests for string utility functions."""
 
+import random
 import string
 
 from skyvern.utils.strings import RANDOM_STRING_POOL, generate_random_string
@@ -58,6 +59,15 @@ class TestGenerateRandomString:
         results = [generate_random_string(20) for _ in range(10)]
         # All results should be unique (statistically extremely likely with length 20)
         assert len(set(results)) == 10
+
+    def test_does_not_mutate_global_random_state(self):
+        """Should not perturb callers using the module-level random PRNG."""
+        random.seed(12345)
+        state_before = random.getstate()
+
+        generate_random_string()
+
+        assert random.getstate() == state_before
 
     def test_distribution(self):
         """Characters should be reasonably distributed."""
