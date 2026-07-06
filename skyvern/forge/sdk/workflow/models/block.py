@@ -4837,7 +4837,6 @@ class TextPromptBlock(Block):
     async def send_prompt(
         self,
         prompt: str,
-        parameter_values: dict[str, Any],
         workflow_run_id: str,
         organization_id: str | None = None,
         workflow_run_block_id: str | None = None,
@@ -4850,7 +4849,9 @@ class TextPromptBlock(Block):
         )
         schema_to_use = json_schema or self.json_schema or _default_text_prompt_schema()
 
-        prompt = prompt_engine.load_prompt_from_string(prompt, **parameter_values)
+        # `prompt` is already fully rendered by format_potential_template_parameters().
+        # Keep send_prompt focused on delivery/retry formatting so parameter values
+        # stay literal after that render.
         if schema_validation_failure:
             prompt = _build_schema_validation_retry_prompt(prompt, schema_validation_failure)
         prompt += (
@@ -4950,8 +4951,6 @@ class TextPromptBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        # get all parameters into a dictionary
-        parameter_values = {}
         for parameter in self.parameters:
             if not workflow_run_context.has_value(parameter.key):
                 LOG.warning(
@@ -4971,12 +4970,6 @@ class TextPromptBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
-            value = workflow_run_context.get_value(parameter.key)
-            secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-            if secret_value:
-                continue
-            else:
-                parameter_values[parameter.key] = value
 
         response: dict[str, Any] | list | str | None = None
         schema_to_use = self.json_schema or _default_text_prompt_schema()
@@ -4995,7 +4988,6 @@ class TextPromptBlock(Block):
             try:
                 response = await self.send_prompt(
                     self.prompt,
-                    parameter_values,
                     workflow_run_id,
                     organization_id,
                     workflow_run_block_id=workflow_run_block_id,

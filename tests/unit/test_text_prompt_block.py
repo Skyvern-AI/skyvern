@@ -124,7 +124,7 @@ async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name):
         lambda template, **kwargs: template,
     )
 
-    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+    response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
 
     assert captured["llm_key"] == expected_llm_key
     assert captured["prompt_name"] == "text-prompt"
@@ -188,7 +188,7 @@ async def test_text_prompt_block_uses_workflow_handler_when_no_override(monkeypa
         lambda template, **kwargs: template,
     )
 
-    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+    response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
 
     assert captured["llm_key"] == "default"
     assert captured["default_handler"] == fake_secondary_handler
@@ -251,7 +251,7 @@ async def test_text_prompt_block_prefers_prompt_type_config_over_secondary(monke
         lambda template, **kwargs: template,
     )
 
-    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+    response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
 
     assert captured["default_handler"] == prompt_config_handler
     prompt_config_handler.assert_awaited_once()
@@ -330,7 +330,7 @@ async def test_text_prompt_block_bad_llm_key_uses_same_runtime_path_as_no_overri
     )
 
     for block in blocks:
-        response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+        response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
         assert response == {"llm_response": "secondary"}
 
     assert captured == [
@@ -395,7 +395,7 @@ async def test_text_prompt_block_uses_explicit_internal_llm_key_override(monkeyp
         lambda template, **kwargs: template,
     )
 
-    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+    response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
 
     assert captured["llm_key"] == "SPECIAL_INTERNAL_KEY"
     assert captured["default_handler"] == fake_default_handler
@@ -451,7 +451,7 @@ async def test_text_prompt_block_array_schema_does_not_force_dict(monkeypatch):
         lambda template, **kwargs: template,
     )
 
-    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+    response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
 
     assert captured["prompt_name"] == "text-prompt"
     assert captured["force_dict"] is False
@@ -500,7 +500,7 @@ async def test_text_prompt_block_object_schema_does_not_force_dict_before_valida
         lambda template, **kwargs: template,
     )
 
-    response = await block.send_prompt(block.prompt, {}, workflow_run_id="workflow-run", organization_id="org-1")
+    response = await block.send_prompt(block.prompt, workflow_run_id="workflow-run", organization_id="org-1")
 
     assert captured["force_dict"] is False
     assert response == {"invoice_search_string": "062026"}
@@ -508,8 +508,10 @@ async def test_text_prompt_block_object_schema_does_not_force_dict_before_valida
 
 @pytest.mark.asyncio
 async def test_text_prompt_block_retry_feedback_is_not_rendered_as_template(monkeypatch):
+    # send_prompt receives the already-rendered prompt and must not render it again, so
+    # schema-validation retry feedback (which may contain `{{ }}`) reaches the model verbatim.
     block = _make_text_prompt_block(
-        prompt="Hello {{ name }}",
+        prompt="Hello Alice",
         json_schema={
             "type": "object",
             "properties": {"answer": {"type": "string"}},
@@ -517,7 +519,6 @@ async def test_text_prompt_block_retry_feedback_is_not_rendered_as_template(monk
         },
     )
     captured: dict[str, object] = {}
-    rendered_templates: list[str] = []
 
     async def fake_handler(*, prompt: str, prompt_name: str, force_dict: bool, **kwargs):
         captured["prompt"] = prompt
@@ -528,11 +529,6 @@ async def test_text_prompt_block_retry_feedback_is_not_rendered_as_template(monk
 
     def fake_get_override_handler(llm_key: str | None, *, default):
         return default
-
-    def fake_load_prompt_from_string(template: str, **kwargs: str) -> str:
-        rendered_templates.append(template)
-        assert "previous response failed JSON schema validation" not in template
-        return template.replace("{{ name }}", kwargs["name"])
 
     monkeypatch.setattr(
         block_module.LLMAPIHandlerFactory,
@@ -546,13 +542,12 @@ async def test_text_prompt_block_retry_feedback_is_not_rendered_as_template(monk
         fake_resolve_default_llm_handler,
         raising=False,
     )
-    monkeypatch.setattr(prompt_engine, "load_prompt_from_string", fake_load_prompt_from_string)
 
     await block.send_prompt(
         block.prompt,
-        {"name": "Alice"},
         workflow_run_id="workflow-run",
         organization_id="org-1",
+        workflow_run_block_id=None,
         schema_validation_failure="root: has 1 unexpected properties {{ dangerous_lookup }}",
     )
 
@@ -953,3 +948,64 @@ def test_format_potential_template_parameters_no_json_schema():
 
     assert block.json_schema is None
     assert block.prompt == "simple prompt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,forbidden",
+    [
+        ("{{ 7*7 }}", "49"),
+        ("{{ (1).__class__.__name__ }}", "int"),
+    ],
+)
+async def test_text_prompt_block_does_not_evaluate_template_in_parameter_value(monkeypatch, payload, forbidden):
+    """A template expression delivered as a parameter *value* must reach the model as a
+    literal and must never be evaluated by a second render.
+
+    The prompt is rendered once (sandboxed) to substitute parameter values as inert text;
+    it must not be rendered a second time, or the substituted value would be interpreted as
+    a live Jinja template (server-side template injection).
+    """
+    block = _make_text_prompt_block(prompt="{{ payload }}")
+    ctx = _make_workflow_run_context({"payload": payload})
+
+    captured: dict[str, str] = {}
+
+    async def fake_handler(*, prompt: str, prompt_name: str, **kwargs):
+        captured["prompt"] = prompt
+        return {"answer": "ok"}
+
+    async def fake_resolve_default_llm_handler(*args, **kwargs):
+        return fake_handler
+
+    def fake_get_override_handler(llm_key: str | None, *, default):
+        return default
+
+    monkeypatch.setattr(
+        block_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        fake_get_override_handler,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "_resolve_default_llm_handler",
+        fake_resolve_default_llm_handler,
+        raising=False,
+    )
+
+    # Real render #1 (sandboxed): the parameter value is substituted as inert text.
+    block.format_potential_template_parameters(ctx)
+    assert block.prompt == payload
+
+    # Real send path, no monkeypatching of the render sink: the literal must survive.
+    await block.send_prompt(
+        block.prompt,
+        workflow_run_id="wr_test",
+        organization_id="org-1",
+        workflow_run_block_id=None,
+    )
+
+    sent_prompt = captured["prompt"]
+    assert payload in sent_prompt
+    assert forbidden not in sent_prompt
