@@ -101,13 +101,13 @@ def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
     agent.execute_step = AsyncMock()
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.task_blocks.app") as mock_app,
         patch(
             "skyvern.forge.sdk.workflow.models.block.Block.get_workflow_run_context",
             return_value=_workflow_run_context(),
         ),
         patch(
-            "skyvern.forge.sdk.workflow.models.block.capture_block_download_baseline",
+            "skyvern.forge.sdk.workflow.models.task_blocks.capture_block_download_baseline",
             new=AsyncMock(),
         ),
     ):
@@ -366,12 +366,12 @@ async def test_execute_does_not_raise_when_profile_loaded_a_page() -> None:
         # enough of them to let execute() return without crashing.
         with (
             patch(
-                "skyvern.forge.sdk.workflow.models.block.app.STORAGE",
+                "skyvern.forge.sdk.workflow.models.task_blocks.app.STORAGE",
                 new=MagicMock(get_downloaded_files=AsyncMock(return_value=[])),
                 create=True,
             ),
             patch(
-                "skyvern.forge.sdk.workflow.models.block.app.ARTIFACT_MANAGER",
+                "skyvern.forge.sdk.workflow.models.task_blocks.app.ARTIFACT_MANAGER",
                 new=MagicMock(create_workflow_run_block_artifact=AsyncMock()),
                 create=True,
             ),
