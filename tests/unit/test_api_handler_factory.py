@@ -879,9 +879,23 @@ def test_get_api_parameters_injects_safety_settings_for_gemini_direct_config() -
     assert all(setting["threshold"] == "BLOCK_NONE" for setting in params["safety_settings"])
 
 
-def test_get_api_parameters_injects_safety_settings_for_gemini_router_config() -> None:
+def test_get_api_parameters_omits_safety_settings_for_gemini_router_config() -> None:
+    # Router configs must NOT carry safety_settings at the request level — it would ride along
+    # to the non-Gemini fallback deployment and 400. Injection happens per-deployment instead.
     params = LLMAPIHandlerFactory.get_api_parameters(_gemini_2_5_flash_router())
-    assert params["safety_settings"] == GEMINI_SAFETY_SETTINGS
+    assert "safety_settings" not in params
+
+
+def test_inject_gemini_safety_settings_targets_only_gemini_deployments() -> None:
+    # Reproduces incident #646: a Gemini primary + Azure fallback in one router. safety_settings
+    # must land on the Gemini deployment and stay off the Azure one so the fallback hop survives.
+    model_list = [
+        {"model_name": "vertex-gemini-2.5-flash-lite", "litellm_params": {"model": "vertex_ai/gemini-2.5-flash-lite"}},
+        {"model_name": "gpt-5-mini-fallback", "litellm_params": {"model": "azure/gpt-5-mini"}},
+    ]
+    result = api_handler_factory._inject_gemini_safety_settings(model_list)
+    assert result[0]["litellm_params"]["safety_settings"] == GEMINI_SAFETY_SETTINGS
+    assert "safety_settings" not in result[1]["litellm_params"]
 
 
 def test_get_api_parameters_omits_safety_settings_for_non_gemini_config() -> None:
