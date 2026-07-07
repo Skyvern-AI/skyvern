@@ -26,6 +26,7 @@ from skyvern.schemas.scripts import (
     WorkflowScript,
 )
 from skyvern.services.workflow_script_service import CacheKeyResolutionError, resolve_cache_key_value
+from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
 
 _CODE_VERSION_STATIC = 1
 _CODE_VERSION_ADAPTIVE = 2
@@ -87,12 +88,13 @@ def _decode_script_file_bytes(file: ScriptFileCreate) -> bytes:
 
 
 def _validate_script_file_path(file_path: str) -> None:
-    parts = file_path.split("/")
-    if file_path.startswith("/") or "\\" in file_path or any(part in ("", ".", "..") for part in parts):
+    try:
+        normalize_script_file_path(file_path)
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"File path {file_path!r} must be a relative POSIX path without empty, '.', or '..' segments",
-        )
+            detail=f"File path {file_path!r} is invalid: {SCRIPT_FILE_PATH_ERROR}",
+        ) from exc
 
 
 def _validate_script_files(files: list[ScriptFileCreate]) -> list[_ValidatedScriptFile]:
