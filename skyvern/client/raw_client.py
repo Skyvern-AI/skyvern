@@ -22,8 +22,10 @@ from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
+from .types.create_browser_profile_request_proxy_location import CreateBrowserProfileRequestProxyLocation
 from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
+from .types.create_credential_request_proxy_location import CreateCredentialRequestProxyLocation
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.credential_vault_type import CredentialVaultType
@@ -54,6 +56,7 @@ from .types.task_run_request_input_data_extraction_schema import TaskRunRequestI
 from .types.task_run_request_input_proxy_location import TaskRunRequestInputProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
+from .types.update_browser_profile_request_proxy_location import UpdateBrowserProfileRequestProxyLocation
 from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
@@ -2070,6 +2073,8 @@ class RawSkyvern:
         description: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[BrowserProfile]:
         """
@@ -2089,6 +2094,12 @@ class RawSkyvern:
         workflow_run_id : typing.Optional[str]
             Workflow run whose persisted session should be captured. Omit for a blank profile.
 
+        proxy_location : typing.Optional[CreateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Explicit sticky-session id for this profile's pinned proxy identity.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2105,6 +2116,10 @@ class RawSkyvern:
                 "description": description,
                 "browser_session_id": browser_session_id,
                 "workflow_run_id": workflow_run_id,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateBrowserProfileRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -2280,6 +2295,9 @@ class RawSkyvern:
         *,
         name: typing.Optional[str] = OMIT,
         description: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[UpdateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[BrowserProfile]:
         """
@@ -2296,6 +2314,15 @@ class RawSkyvern:
         description : typing.Optional[str]
             New description for the browser profile
 
+        proxy_location : typing.Optional[UpdateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Opaque Skyvern-managed proxy sticky-session id.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id for this profile.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2310,6 +2337,11 @@ class RawSkyvern:
             json={
                 "name": name,
                 "description": description,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=UpdateBrowserProfileRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
+                "rotate_proxy_session_id": rotate_proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -2976,6 +3008,9 @@ class RawSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[CredentialResponse]:
         """
@@ -2995,6 +3030,15 @@ class RawSkyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3013,6 +3057,11 @@ class RawSkyvern:
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
                 "vault_type": vault_type,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateCredentialRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
+                "rotate_proxy_session_id": rotate_proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -3054,6 +3103,9 @@ class RawSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[CredentialResponse]:
         """
@@ -3076,6 +3128,15 @@ class RawSkyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3094,6 +3155,11 @@ class RawSkyvern:
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
                 "vault_type": vault_type,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateCredentialRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
+                "rotate_proxy_session_id": rotate_proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -6626,6 +6692,8 @@ class AsyncRawSkyvern:
         description: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[BrowserProfile]:
         """
@@ -6645,6 +6713,12 @@ class AsyncRawSkyvern:
         workflow_run_id : typing.Optional[str]
             Workflow run whose persisted session should be captured. Omit for a blank profile.
 
+        proxy_location : typing.Optional[CreateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Explicit sticky-session id for this profile's pinned proxy identity.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -6661,6 +6735,10 @@ class AsyncRawSkyvern:
                 "description": description,
                 "browser_session_id": browser_session_id,
                 "workflow_run_id": workflow_run_id,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateBrowserProfileRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -6836,6 +6914,9 @@ class AsyncRawSkyvern:
         *,
         name: typing.Optional[str] = OMIT,
         description: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[UpdateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[BrowserProfile]:
         """
@@ -6852,6 +6933,15 @@ class AsyncRawSkyvern:
         description : typing.Optional[str]
             New description for the browser profile
 
+        proxy_location : typing.Optional[UpdateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Opaque Skyvern-managed proxy sticky-session id.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id for this profile.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -6866,6 +6956,11 @@ class AsyncRawSkyvern:
             json={
                 "name": name,
                 "description": description,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=UpdateBrowserProfileRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
+                "rotate_proxy_session_id": rotate_proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -7532,6 +7627,9 @@ class AsyncRawSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[CredentialResponse]:
         """
@@ -7551,6 +7649,15 @@ class AsyncRawSkyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -7569,6 +7676,11 @@ class AsyncRawSkyvern:
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
                 "vault_type": vault_type,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateCredentialRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
+                "rotate_proxy_session_id": rotate_proxy_session_id,
             },
             headers={
                 "content-type": "application/json",
@@ -7610,6 +7722,9 @@ class AsyncRawSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[CredentialResponse]:
         """
@@ -7632,6 +7747,15 @@ class AsyncRawSkyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -7650,6 +7774,11 @@ class AsyncRawSkyvern:
                     object_=credential, annotation=CreateCredentialRequestCredential, direction="write"
                 ),
                 "vault_type": vault_type,
+                "proxy_location": convert_and_respect_annotation_metadata(
+                    object_=proxy_location, annotation=CreateCredentialRequestProxyLocation, direction="write"
+                ),
+                "proxy_session_id": proxy_session_id,
+                "rotate_proxy_session_id": rotate_proxy_session_id,
             },
             headers={
                 "content-type": "application/json",

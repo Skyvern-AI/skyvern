@@ -54,6 +54,7 @@ if typing.TYPE_CHECKING:
     from .branch_criteria_yaml import BranchCriteriaYaml
     from .branch_criteria_yaml_criteria_type import BranchCriteriaYamlCriteriaType
     from .browser_profile import BrowserProfile
+    from .browser_profile_proxy_location import BrowserProfileProxyLocation
     from .browser_session_response import BrowserSessionResponse
     from .bulk_cancel_runs_response import BulkCancelRunsResponse
     from .click_action import ClickAction
@@ -94,9 +95,11 @@ if typing.TYPE_CHECKING:
     )
     from .context_parameter_value import ContextParameterValue
     from .context_parameter_yaml import ContextParameterYaml
+    from .create_browser_profile_request_proxy_location import CreateBrowserProfileRequestProxyLocation
     from .create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
     from .create_credential_request import CreateCredentialRequest
     from .create_credential_request_credential import CreateCredentialRequestCredential
+    from .create_credential_request_proxy_location import CreateCredentialRequestProxyLocation
     from .create_script_response import CreateScriptResponse
     from .credential_parameter import CredentialParameter
     from .credential_parameter_yaml import CredentialParameterYaml
@@ -473,6 +476,7 @@ if typing.TYPE_CHECKING:
     from .thought_type import ThoughtType
     from .totp_code import TotpCode
     from .totp_type import TotpType
+    from .update_browser_profile_request_proxy_location import UpdateBrowserProfileRequestProxyLocation
     from .upload_file_action import UploadFileAction
     from .upload_file_action_data import UploadFileActionData
     from .upload_file_response import UploadFileResponse
@@ -780,6 +784,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BranchCriteriaYaml": ".branch_criteria_yaml",
     "BranchCriteriaYamlCriteriaType": ".branch_criteria_yaml_criteria_type",
     "BrowserProfile": ".browser_profile",
+    "BrowserProfileProxyLocation": ".browser_profile_proxy_location",
     "BrowserSessionResponse": ".browser_session_response",
     "BulkCancelRunsResponse": ".bulk_cancel_runs_response",
     "ClickAction": ".click_action",
@@ -816,9 +821,11 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ContextParameterSource_Workflow": ".context_parameter_source",
     "ContextParameterValue": ".context_parameter_value",
     "ContextParameterYaml": ".context_parameter_yaml",
+    "CreateBrowserProfileRequestProxyLocation": ".create_browser_profile_request_proxy_location",
     "CreateBrowserSessionRequestProxyLocation": ".create_browser_session_request_proxy_location",
     "CreateCredentialRequest": ".create_credential_request",
     "CreateCredentialRequestCredential": ".create_credential_request_credential",
+    "CreateCredentialRequestProxyLocation": ".create_credential_request_proxy_location",
     "CreateScriptResponse": ".create_script_response",
     "CredentialParameter": ".credential_parameter",
     "CredentialParameterYaml": ".credential_parameter_yaml",
@@ -1163,6 +1170,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ThoughtType": ".thought_type",
     "TotpCode": ".totp_code",
     "TotpType": ".totp_type",
+    "UpdateBrowserProfileRequestProxyLocation": ".update_browser_profile_request_proxy_location",
     "UploadFileAction": ".upload_file_action",
     "UploadFileActionData": ".upload_file_action_data",
     "UploadFileResponse": ".upload_file_response",
@@ -1472,6 +1480,7 @@ __all__ = [
     "BranchCriteriaYaml",
     "BranchCriteriaYamlCriteriaType",
     "BrowserProfile",
+    "BrowserProfileProxyLocation",
     "BrowserSessionResponse",
     "BulkCancelRunsResponse",
     "ClickAction",
@@ -1508,9 +1517,11 @@ __all__ = [
     "ContextParameterSource_Workflow",
     "ContextParameterValue",
     "ContextParameterYaml",
+    "CreateBrowserProfileRequestProxyLocation",
     "CreateBrowserSessionRequestProxyLocation",
     "CreateCredentialRequest",
     "CreateCredentialRequestCredential",
+    "CreateCredentialRequestProxyLocation",
     "CreateScriptResponse",
     "CredentialParameter",
     "CredentialParameterYaml",
@@ -1855,6 +1866,7 @@ __all__ = [
     "ThoughtType",
     "TotpCode",
     "TotpType",
+    "UpdateBrowserProfileRequestProxyLocation",
     "UploadFileAction",
     "UploadFileActionData",
     "UploadFileResponse",

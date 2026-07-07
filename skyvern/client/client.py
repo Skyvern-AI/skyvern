@@ -15,8 +15,10 @@ from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
+from .types.create_browser_profile_request_proxy_location import CreateBrowserProfileRequestProxyLocation
 from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
+from .types.create_credential_request_proxy_location import CreateCredentialRequestProxyLocation
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.credential_vault_type import CredentialVaultType
@@ -47,6 +49,7 @@ from .types.task_run_request_input_data_extraction_schema import TaskRunRequestI
 from .types.task_run_request_input_proxy_location import TaskRunRequestInputProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
+from .types.update_browser_profile_request_proxy_location import UpdateBrowserProfileRequestProxyLocation
 from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
@@ -1488,6 +1491,8 @@ class Skyvern:
         description: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
@@ -1506,6 +1511,12 @@ class Skyvern:
 
         workflow_run_id : typing.Optional[str]
             Workflow run whose persisted session should be captured. Omit for a blank profile.
+
+        proxy_location : typing.Optional[CreateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Explicit sticky-session id for this profile's pinned proxy identity.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1531,6 +1542,8 @@ class Skyvern:
             description=description,
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
             request_options=request_options,
         )
         return _response.data
@@ -1606,6 +1619,9 @@ class Skyvern:
         *,
         name: typing.Optional[str] = OMIT,
         description: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[UpdateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
@@ -1621,6 +1637,15 @@ class Skyvern:
 
         description : typing.Optional[str]
             New description for the browser profile
+
+        proxy_location : typing.Optional[UpdateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Opaque Skyvern-managed proxy sticky-session id.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id for this profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1642,7 +1667,13 @@ class Skyvern:
         )
         """
         _response = self._raw_client.update_browser_profile(
-            profile_id, name=name, description=description, request_options=request_options
+            profile_id,
+            name=name,
+            description=description,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            rotate_proxy_session_id=rotate_proxy_session_id,
+            request_options=request_options,
         )
         return _response.data
 
@@ -2024,6 +2055,9 @@ class Skyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -2042,6 +2076,15 @@ class Skyvern:
 
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2072,6 +2115,9 @@ class Skyvern:
             credential_type=credential_type,
             credential=credential,
             vault_type=vault_type,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            rotate_proxy_session_id=rotate_proxy_session_id,
             request_options=request_options,
         )
         return _response.data
@@ -2084,6 +2130,9 @@ class Skyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -2105,6 +2154,15 @@ class Skyvern:
 
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2137,6 +2195,9 @@ class Skyvern:
             credential_type=credential_type,
             credential=credential,
             vault_type=vault_type,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            rotate_proxy_session_id=rotate_proxy_session_id,
             request_options=request_options,
         )
         return _response.data
@@ -4867,6 +4928,8 @@ class AsyncSkyvern:
         description: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
@@ -4885,6 +4948,12 @@ class AsyncSkyvern:
 
         workflow_run_id : typing.Optional[str]
             Workflow run whose persisted session should be captured. Omit for a blank profile.
+
+        proxy_location : typing.Optional[CreateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Explicit sticky-session id for this profile's pinned proxy identity.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4918,6 +4987,8 @@ class AsyncSkyvern:
             description=description,
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
             request_options=request_options,
         )
         return _response.data
@@ -5009,6 +5080,9 @@ class AsyncSkyvern:
         *,
         name: typing.Optional[str] = OMIT,
         description: typing.Optional[str] = OMIT,
+        proxy_location: typing.Optional[UpdateBrowserProfileRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
         """
@@ -5024,6 +5098,15 @@ class AsyncSkyvern:
 
         description : typing.Optional[str]
             New description for the browser profile
+
+        proxy_location : typing.Optional[UpdateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Opaque Skyvern-managed proxy sticky-session id.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id for this profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5053,7 +5136,13 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.update_browser_profile(
-            profile_id, name=name, description=description, request_options=request_options
+            profile_id,
+            name=name,
+            description=description,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            rotate_proxy_session_id=rotate_proxy_session_id,
+            request_options=request_options,
         )
         return _response.data
 
@@ -5491,6 +5580,9 @@ class AsyncSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -5509,6 +5601,15 @@ class AsyncSkyvern:
 
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5547,6 +5648,9 @@ class AsyncSkyvern:
             credential_type=credential_type,
             credential=credential,
             vault_type=vault_type,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            rotate_proxy_session_id=rotate_proxy_session_id,
             request_options=request_options,
         )
         return _response.data
@@ -5559,6 +5663,9 @@ class AsyncSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
+        proxy_session_id: typing.Optional[str] = OMIT,
+        rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -5580,6 +5687,15 @@ class AsyncSkyvern:
 
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
+        rotate_proxy_session_id : typing.Optional[bool]
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5620,6 +5736,9 @@ class AsyncSkyvern:
             credential_type=credential_type,
             credential=credential,
             vault_type=vault_type,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            rotate_proxy_session_id=rotate_proxy_session_id,
             request_options=request_options,
         )
         return _response.data
