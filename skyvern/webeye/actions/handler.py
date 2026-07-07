@@ -126,6 +126,7 @@ from skyvern.webeye.browser_factory import initialize_download_dir
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
+    download_filename_from_suffix,
     extract_filename,
     is_download_response,
     normalize_download_filename,
@@ -615,6 +616,13 @@ def _log_select_shadow_match(
 def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
     filename = Path(suggested_filename or "download").name
     stem, suffix = os.path.splitext(filename)
+    context = skyvern_context.current()
+    download_suffix = context.download_suffix if context else None
+    if download_suffix:
+        # Name the file by the block-configured download_suffix so the watcher syncs the
+        # request-based name instead of the site's suggested name.
+        existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
+        return download_dir / download_filename_from_suffix(download_suffix, suffix, existing)
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 

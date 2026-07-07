@@ -183,6 +183,24 @@ def normalize_download_filename(filename: str, content_type: str = "") -> str:
     return filename
 
 
+def download_filename_from_suffix(download_suffix: str, source_extension: str, existing_names: set[str]) -> str:
+    """Filename for a download whose block configured ``download_suffix``"""
+    existing_names = {Path(n).name for n in existing_names}  # contract: dedup on basenames, never full paths
+    name = Path(download_suffix).name  # defensive: never let a suffix escape the dir
+    suffix_ext = Path(name).suffix
+    if suffix_ext:
+        stem, ext = name[: -len(suffix_ext)], suffix_ext
+    else:
+        stem, ext = name, source_extension or ""
+    stem = stem or "download"
+    candidate = f"{stem}{ext}"
+    counter = 1
+    while candidate in existing_names:
+        candidate = f"{stem}_{counter}{ext}"
+        counter += 1
+    return candidate
+
+
 def is_download_response(headers: dict[str, str], status_code: int, resource_type: str = "") -> bool:
     """
     Determine if a response is a file download.
@@ -333,6 +351,9 @@ class CDPDownloadInterceptor:
         if not filename:
             filename = f"download_{uuid.uuid4().hex[:8]}{_download_extension_for_content_type(content_type)}"
 
+        # download_suffix is NOT applied here: this runs inside CDP callbacks that don't carry the
+        # step's SkyvernContext, so the suffix could be stale. Run-dir files are renamed to
+        # download_suffix by _finalize_downloaded_files_for_task instead.
         save_path = self._output_dir / filename
         # TODO: implement proper filename dedup (e.g., content hash or UUID suffix)
         if save_path.exists():
