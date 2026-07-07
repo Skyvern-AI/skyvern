@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_go
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     _canonical_block_config,
@@ -693,10 +695,11 @@ def _plan_frontier(
     verified_outputs: dict[str, Any] = dict(ctx.verified_block_outputs or {})
     verified_prefix: list[str] = list(ctx.verified_prefix_labels or [])
     verified_prefix_set = set(verified_prefix)
+    failed_frontier_label = _recorded_failed_frontier_label(ctx, requested_labels, new_definition)
 
     # No old definition (cold start or parse failure) OR no diff signal → plain path.
     if old_definition is None:
-        frontier = requested_labels[0]
+        frontier = failed_frontier_label or requested_labels[0]
         return _seed_for_frontier(requested_labels, frontier, verified_outputs, new_definition)
 
     try:
@@ -707,6 +710,13 @@ def _plan_frontier(
 
     earliest = _earliest_invalidated(requested_labels, invalidated)
     if earliest is None:
+        if failed_frontier_label is not None:
+            return _seed_for_frontier(
+                requested_labels,
+                failed_frontier_label,
+                verified_outputs,
+                new_definition,
+            )
         # No invalidation at all — unchanged request. Continue from the
         # first unverified requested label so a model may keep passing the
         # complete chain while the tool advances the browser in small
@@ -730,6 +740,22 @@ def _plan_frontier(
             )
 
         return _seed_for_frontier(requested_labels, requested_labels[0], verified_outputs, new_definition)
+
+    earliest_idx = requested_labels.index(earliest)
+    failed_frontier_idx = (
+        requested_labels.index(failed_frontier_label) if failed_frontier_label in requested_labels else None
+    )
+    if (
+        failed_frontier_label is not None
+        and failed_frontier_idx is not None
+        and (failed_frontier_idx < earliest_idx or failed_frontier_label != _recorded_failed_attempted_label(ctx))
+    ):
+        return _seed_for_frontier(
+            requested_labels,
+            failed_frontier_label,
+            verified_outputs,
+            new_definition,
+        )
 
     # Ensure the prefix before the earliest invalidated label is all in the
     # verified prefix from a successful prior run. Otherwise we have no
@@ -775,6 +801,60 @@ def _first_unverified_requested_label(requested_labels: list[str], verified_pref
         if label not in verified_prefix_set:
             return label
     return None
+
+
+def _frontier_label_shape_hashes(labels: list[str], workflow_definition: object | None) -> dict[str, str] | None:
+    by_label = _blocks_by_label(workflow_definition)
+    hashes: dict[str, str] = {}
+    for label in labels:
+        block = by_label.get(label)
+        if block is None:
+            return None
+        shape = _canonical_block_config(block)
+        shape.pop("label", None)
+        serialized = json.dumps(shape, sort_keys=True, default=str, separators=(",", ":"))
+        hashes[label] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return hashes
+
+
+def _recorded_failed_attempted_label(ctx: AgentContext) -> str | None:
+    outcome = ctx.latest_recorded_build_test_outcome
+    if not isinstance(outcome, RecordedBuildTestOutcome) or not outcome.attempted_block_label:
+        return None
+    return outcome.attempted_block_label
+
+
+def _recorded_failed_frontier_label(
+    ctx: AgentContext,
+    requested_labels: list[str],
+    new_definition: object | None = None,
+) -> str | None:
+    outcome = ctx.latest_recorded_build_test_outcome
+    if not isinstance(outcome, RecordedBuildTestOutcome):
+        return None
+    if outcome.phase != "persisted_block_run" or outcome.verdict != "repairable_failure":
+        return None
+    if not outcome.attempted_block_label:
+        return None
+    recorded_requested_labels = outcome.requested_block_labels or outcome.block_labels
+    if len(recorded_requested_labels) != len(requested_labels):
+        return None
+    if recorded_requested_labels == requested_labels:
+        return outcome.attempted_block_label if outcome.attempted_block_label in requested_labels else None
+
+    recorded_shape_hashes = outcome.block_shape_hashes
+    attempted_shape = recorded_shape_hashes.get(outcome.attempted_block_label)
+    if not attempted_shape:
+        return None
+    current_shape_hashes = _frontier_label_shape_hashes(requested_labels, new_definition)
+    if current_shape_hashes is None:
+        return None
+    recorded_chain_shapes = [recorded_shape_hashes.get(label) for label in recorded_requested_labels]
+    current_chain_shapes = [current_shape_hashes.get(label) for label in requested_labels]
+    if any(shape is None for shape in recorded_chain_shapes) or recorded_chain_shapes != current_chain_shapes:
+        return None
+    candidates = [label for label in requested_labels if current_shape_hashes.get(label) == attempted_shape]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _seed_for_frontier(
@@ -962,6 +1042,7 @@ def _frontier_runtime_anchor_url(ctx: CopilotContext, block_outputs_to_seed: dic
     for value in (
         ctx.verified_prefix_current_url,
         getattr(ctx, "composition_page_evidence", None),
+        _recorded_failed_run_anchor_url(ctx),
     ):
         candidate = _frontier_anchor_url_from_value(value)
         if candidate is not None:
@@ -1001,7 +1082,36 @@ def _has_verified_prefix_before_frontier(
     if not prefix_labels:
         return False
     verified = set(ctx.verified_prefix_labels or [])
-    return all(label in verified for label in prefix_labels)
+    return all(label in verified for label in prefix_labels) or _has_recorded_failed_prefix_before_frontier(
+        ctx,
+        workflow_definition,
+        frontier_label,
+    )
+
+
+def _has_recorded_failed_prefix_before_frontier(
+    ctx: CopilotContext, workflow_definition: object | None, frontier_label: str | None
+) -> bool:
+    if not frontier_label:
+        return False
+    workflow_labels = _workflow_definition_block_labels(workflow_definition)
+    try:
+        frontier_idx = workflow_labels.index(frontier_label)
+    except ValueError:
+        return False
+    if frontier_idx == 0:
+        return False
+    return _recorded_failed_frontier_label(ctx, workflow_labels, workflow_definition) == frontier_label
+
+
+def _recorded_failed_run_anchor_url(ctx: CopilotContext) -> str | None:
+    outcome = ctx.latest_recorded_build_test_outcome
+    if not isinstance(outcome, RecordedBuildTestOutcome) or not outcome.workflow_run_id:
+        return None
+    evidence = ctx.workflow_verification_evidence
+    if evidence.workflow_run_id != outcome.workflow_run_id:
+        return None
+    return evidence.current_url
 
 
 def _workflow_with_runtime_frontier_anchor(
@@ -1063,8 +1173,10 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
     *,
     labels_to_execute: list[str],
     runtime_frontier_anchor_url: str | None,
+    session_id_override: str | None = None,
 ) -> Workflow:
-    if not labels_to_execute or runtime_frontier_anchor_url is None or not ctx.browser_session_id:
+    session_id = session_id_override or ctx.browser_session_id
+    if not labels_to_execute or runtime_frontier_anchor_url is None or not session_id:
         return workflow
 
     first_label = labels_to_execute[0]
@@ -1080,7 +1192,7 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
     current_page_url: str | None = None
     try:
         browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
+            session_id=session_id,
             organization_id=ctx.organization_id,
         )
         if browser_state is not None:
@@ -1090,7 +1202,7 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
     except Exception:
         LOG.debug(
             "Failed to inspect runtime frontier browser page before starter URL seed",
-            browser_session_id=ctx.browser_session_id,
+            browser_session_id=session_id,
             frontier_start_label=first_label,
             exc_info=True,
         )
@@ -1098,7 +1210,7 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
     if not _blank_runtime_page_url(current_page_url):
         LOG.info(
             "Preserved attached runtime frontier browser page",
-            browser_session_id=ctx.browser_session_id,
+            browser_session_id=session_id,
             frontier_start_label=first_label,
             current_url=current_page_url,
             continuation_url=runtime_frontier_anchor_url,
@@ -1113,7 +1225,7 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
     seeded_block.url = runtime_frontier_anchor_url
     LOG.info(
         "Seeded runtime frontier starter URL because attached browser page was blank",
-        browser_session_id=ctx.browser_session_id,
+        browser_session_id=session_id,
         frontier_start_label=first_label,
         current_url=current_page_url,
         continuation_url=runtime_frontier_anchor_url,

@@ -589,15 +589,23 @@ def _download_file_name(value: Any) -> str | None:
 
 
 def _completion_evidence_payload(output: Any) -> Any:
-    if not isinstance(output, dict) or not any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS):
+    if not isinstance(output, dict):
         return output
+    nested_output = output.get("output")
+    has_download_output = any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+    has_nested_download_output = isinstance(nested_output, dict) and any(
+        nested_output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
+    )
+    if not has_download_output and not has_nested_download_output:
+        return output
+    download_output = output if has_download_output or not isinstance(nested_output, dict) else nested_output
     names: list[str] = []
-    if name := _download_file_name(output.get("downloaded_file_name")):
+    if name := _download_file_name(download_output.get("downloaded_file_name")):
         names.append(name)
-    files = output.get("downloaded_files")
+    files = download_output.get("downloaded_files")
     if isinstance(files, list):
         names.extend(name for item in files[:_MAX_EVIDENCE_FILE_NAMES] if (name := _download_file_name(item)))
-    urls = output.get("downloaded_file_urls")
+    urls = download_output.get("downloaded_file_urls")
     if isinstance(urls, list):
         names.extend(name for item in urls[:_MAX_EVIDENCE_FILE_NAMES] if (name := _download_file_name(item)))
     payload: dict[str, Any] = {"download_registered": True}
@@ -605,11 +613,19 @@ def _completion_evidence_payload(output: Any) -> Any:
         payload["downloaded_file_count"] = len(files)
     if isinstance(urls, list):
         payload["downloaded_file_url_count"] = len(urls)
-    artifacts = output.get("downloaded_file_artifact_ids")
+    artifacts = download_output.get("downloaded_file_artifact_ids")
     if isinstance(artifacts, list):
         payload["downloaded_file_artifact_count"] = len(artifacts)
     if names:
         payload["downloaded_file_names"] = list(dict.fromkeys(names))[:_MAX_EVIDENCE_FILE_NAMES]
+    if has_nested_download_output and not has_download_output and isinstance(nested_output, dict):
+        preserved_output = {
+            key: value
+            for key, value in nested_output.items()
+            if key not in REGISTERED_DOWNLOAD_OUTPUT_KEYS and key not in {"page", "download"}
+        }
+        if preserved_output:
+            payload["output"] = preserved_output
     return payload
 
 

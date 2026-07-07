@@ -1113,7 +1113,18 @@ def _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml: str
     if not isinstance(parsed, dict):
         return workflow_yaml
     declared_string_keys = _declared_string_workflow_parameter_keys(parsed)
-    if not declared_string_keys:
+    workflow_definition = parsed.get("workflow_definition")
+    parameters = workflow_definition.get("parameters") if isinstance(workflow_definition, dict) else None
+    declared_credential_keys: set[str] = set()
+    if isinstance(parameters, list):
+        declared_credential_keys = {
+            str(parameter.get("key") or "").strip()
+            for parameter in parameters
+            if isinstance(parameter, dict)
+            if str(parameter.get("key") or "").strip() and _is_credential_parameter(parameter)
+        }
+    declared_adoptable_keys = declared_string_keys | declared_credential_keys
+    if not declared_adoptable_keys:
         return workflow_yaml
     available_binding_keys_by_label = _code_block_available_binding_keys_by_label(workflow_yaml)
     adopted_by_label: dict[str, list[str]] = {}
@@ -1125,7 +1136,9 @@ def _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml: str
         if not code.strip():
             continue
         parameter_keys = _code_block_parameter_keys(block)
-        available_declared_keys = set(available_binding_keys_by_label.get(label, [])) & declared_string_keys
+        available_declared_keys = (
+            set(available_binding_keys_by_label.get(label, [])) & declared_string_keys
+        ) | declared_credential_keys
         if not available_declared_keys:
             continue
         diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
@@ -5023,13 +5036,31 @@ def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> boo
     )
 
 
+def _recorded_outcome_imposition_block_labels(ctx: AgentContext) -> frozenset[str]:
+    constraint = ctx.recorded_outcome_binding_constraint
+    if isinstance(constraint, RecordedOutcomeBindingConstraint):
+        return frozenset(label.strip() for label in constraint.owning_block_labels if label.strip())
+    latest = ctx.latest_recorded_build_test_outcome
+    if isinstance(latest, RecordedBuildTestOutcome) and latest.is_authoritative:
+        return frozenset(label.strip() for label in latest.block_labels if label.strip())
+    return frozenset()
+
+
 def _select_synthesized_imposition_code_block(
     code_blocks: list[dict[str, Any]],
     *,
     prior_yaml: str | None,
+    preferred_labels: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     if len(code_blocks) == 1:
         return code_blocks[0]
+
+    if preferred_labels:
+        preferred_matches = [
+            block for block in code_blocks if str(block.get("label") or "").strip() in preferred_labels
+        ]
+        if len(preferred_matches) == 1:
+            return preferred_matches[0]
 
     synthesized_label_matches = [
         block for block in code_blocks if str(block.get("label") or "").strip() == _SYNTHESIZED_BLOCK_LABEL
@@ -5384,12 +5415,15 @@ def _whole_trajectory_browser_surface_violations(
     selected_code_block: dict[str, Any],
     submitted_selected_code: str,
     synthesized_code: str,
+    prior_yaml: str | None = None,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
     scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
     scouted_signatures = set(scouted_mutations)
     for block in code_blocks:
         if block is selected_code_block:
+            continue
+        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
             continue
         label = _code_block_label(block)
         block_code = str(block.get("code") or "")
@@ -6674,7 +6708,11 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     code_blocks = _workflow_code_blocks(parsed)
     prior_source, prior_yaml = _prior_yaml_source(ctx)
-    code_block = _select_synthesized_imposition_code_block(code_blocks, prior_yaml=prior_yaml)
+    code_block = _select_synthesized_imposition_code_block(
+        code_blocks,
+        prior_yaml=prior_yaml,
+        preferred_labels=_recorded_outcome_imposition_block_labels(ctx),
+    )
     if code_block is None:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     submitted_code = str(code_block.get("code") or "")
@@ -6734,6 +6772,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         selected_code_block=code_block,
         submitted_selected_code=submitted_code,
         synthesized_code=synthesized.code,
+        prior_yaml=prior_yaml,
     )
     violations.extend(surface_validation.violations)
     extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
@@ -7783,6 +7822,8 @@ def _artifact_string_list(value: Any) -> list[str]:
 def _credentialed_code_block_scout_gate_errors(
     workflow_yaml: str | None,
     ctx: AgentContext,
+    *,
+    block_labels: Iterable[str] | None = None,
 ) -> list[str]:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return []
@@ -7797,9 +7838,25 @@ def _credentialed_code_block_scout_gate_errors(
     credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return []
+    prior_blocks_by_label = {}
+    prior_credential_params_by_key = {}
+    prior_workflow_yaml = ctx.workflow_yaml
+    if isinstance(prior_workflow_yaml, str) and prior_workflow_yaml.strip():
+        prior_parsed = parse_workflow_yaml(prior_workflow_yaml)
+        if isinstance(prior_parsed, dict):
+            prior_workflow_definition = prior_parsed.get("workflow_definition")
+            if isinstance(prior_workflow_definition, dict):
+                prior_credential_params_by_key = credential_param_ids(prior_workflow_definition.get("parameters"))
+                for prior_block in workflow_blocks(prior_parsed):
+                    if _enum_or_string_name(prior_block.get("block_type")) != BlockType.CODE.value:
+                        continue
+                    prior_label = str(prior_block.get("label") or "").strip()
+                    if prior_label:
+                        prior_blocks_by_label[prior_label] = prior_block
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     if not isinstance(scout_trajectory, list):
         scout_trajectory = []
+    selected_block_labels = {label.strip() for label in block_labels or [] if label.strip()}
 
     errors: list[str] = []
     for block in workflow_blocks(parsed):
@@ -7808,6 +7865,23 @@ def _credentialed_code_block_scout_gate_errors(
         code = str(block.get("code") or "")
         if not code.strip():
             continue
+        block_label = str(block.get("label") or "").strip()
+        if selected_block_labels and block_label not in selected_block_labels:
+            continue
+        matching_prior_block = prior_blocks_by_label.get(block_label) if block_label else None
+        if (
+            isinstance(matching_prior_block, dict)
+            and str(matching_prior_block.get("code") or "") == code
+            and _code_block_parameter_keys(matching_prior_block) == _code_block_parameter_keys(block)
+        ):
+            accessed_parameter_keys = {
+                access.parameter_key for access in _credential_field_accesses(code) if access.requires_live_scout
+            }
+            if accessed_parameter_keys and all(
+                prior_credential_params_by_key.get(parameter_key) == credential_params_by_key.get(parameter_key)
+                for parameter_key in accessed_parameter_keys
+            ):
+                continue
         required_fields_by_parameter: dict[str, tuple[set[str], set[str]]] = {}
         for access in _credential_field_accesses(code):
             if not access.requires_live_scout:
@@ -7864,7 +7938,7 @@ def _credentialed_code_block_scout_gate_errors(
         if not missing_fields and not missing_submit:
             continue
 
-        block_label = str(block.get("label") or "").strip() or "this code block"
+        block_label = block_label or "this code block"
         requirements: list[str] = []
         if missing_fields:
             joined_fields = ", ".join(f"`{field}`" for field in missing_fields)
@@ -8184,7 +8258,7 @@ async def _update_workflow(
     credential_scout_errors = (
         []
         if _request_policy_allows_untested_code_block_draft(ctx)
-        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx, block_labels=params.get("block_labels"))
     )
     unresolved_symbol_priority_reject = _is_unresolved_symbol_repair_context(code_authoring_repair_context)
     credential_priority_reject = (

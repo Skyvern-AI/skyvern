@@ -202,11 +202,6 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
-    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
-    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
-    # already-authenticated session (the first run and every login-replaying repair re-run alike).
-    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
-    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000

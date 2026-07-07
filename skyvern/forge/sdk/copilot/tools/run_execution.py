@@ -178,6 +178,7 @@ from .credentials import (
 from .frontier import (
     _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS,
     _blocks_by_label,
+    _frontier_label_shape_hashes,
     _workflow_with_runtime_block_goal_context,
     _workflow_with_runtime_frontier_anchor,
     _workflow_with_runtime_frontier_starter_url_seed,
@@ -813,22 +814,22 @@ def _should_use_fresh_session_for_login_first_replay(
     """Fresh session when this run replays a login fill into the scout's authenticated session.
 
     Keyed on two planes the agent cannot edit between runs — the scout trajectory authenticated
-    via a credential fill and this run's leading block fills one; frontier re-runs seeded past
-    login carry no leading credential fill and keep reusing the scout session.
+    via a credential fill and any executed block in this run fills one; frontier re-runs seeded
+    past login carry no credential fill and keep reusing the scout session.
     """
-    if not SettingsManager.get_settings().COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN:
-        return False
     if not trajectory_has_credential_fill(ctx.scout_trajectory):
         return False
     return _labels_replay_login_fill(labels_to_execute, workflow)
 
 
 def _labels_replay_login_fill(labels_to_execute: list[str], workflow: Workflow | None) -> bool:
-    if not labels_to_execute:
+    if not labels_to_execute or workflow is None:
         return False
-    by_label = _blocks_by_label(workflow.workflow_definition if workflow else None)
-    code = getattr(by_label.get(labels_to_execute[0]), "code", None)
-    return isinstance(code, str) and code_contains_credential_fill(code)
+    code_inputs = _selected_code_security_inputs(
+        _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+        selected_labels=set(labels_to_execute),
+    )
+    return any(code_contains_credential_fill(code_input.code) for code_input in code_inputs)
 
 
 def _runtime_code_security_failure_for_selected_labels(
@@ -1525,6 +1526,13 @@ async def _run_blocks_and_collect_debug(
         run_session_id = ctx.browser_session_id
         ctx.browser_session_id = debug_session_id
         used_fresh_run_session = True
+        LOG.info(
+            "copilot_login_replay_fresh_session_minted",
+            labels_to_execute=labels_to_execute,
+            frontier_start_label=frontier_start_label,
+            run_session_id=run_session_id,
+            debug_session_id=debug_session_id,
+        )
     else:
         session_err = await ensure_browser_session(ctx)
         if session_err is not None:
@@ -1536,6 +1544,7 @@ async def _run_blocks_and_collect_debug(
         ctx,
         labels_to_execute=labels_to_execute,
         runtime_frontier_anchor_url=runtime_frontier_anchor_url,
+        session_id_override=run_session_id,
     )
     runtime_frontier_starter_url_seeded = seeded_runtime_workflow is not runtime_workflow
     runtime_workflow = seeded_runtime_workflow
@@ -2832,6 +2841,19 @@ def _record_adjudicated_build_test_outcome(
     )
     workflow_yaml = copilot_ctx.workflow_yaml
     code_artifact_metadata = copilot_ctx.code_artifact_metadata
+    workflow_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
+    raw_requested_block_labels = getattr(copilot_ctx, "last_requested_block_labels", None)
+    result_requested_block_labels = result_data.get("requested_block_labels") if isinstance(result_data, dict) else None
+    raw_requested_values: list[Any] = (
+        raw_requested_block_labels
+        if isinstance(raw_requested_block_labels, list)
+        else (result_requested_block_labels if isinstance(result_requested_block_labels, list) else [])
+    )
+    requested_block_labels = [label for label in raw_requested_values if isinstance(label, str)]
+    block_shape_hashes = _frontier_label_shape_hashes(
+        requested_block_labels,
+        workflow_definition,
+    )
     record_build_test_outcome(
         copilot_ctx,
         recorded_outcome_from_run_blocks_result(
@@ -2849,6 +2871,7 @@ def _record_adjudicated_build_test_outcome(
                 workflow_yaml,
                 code_artifact_metadata,
             ),
+            block_shape_hashes=block_shape_hashes or {},
         ),
     )
 
