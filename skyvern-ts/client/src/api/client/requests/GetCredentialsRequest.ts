@@ -7,7 +7,9 @@ import type * as Skyvern from "../../index.js";
  *     {
  *         page: 1,
  *         page_size: 10,
- *         vault_type: "bitwarden"
+ *         vault_type: "skyvern",
+ *         credential_type: "password",
+ *         search: "search"
  *     }
  */
 export interface GetCredentialsRequest {
@@ -17,4 +19,8 @@ export interface GetCredentialsRequest {
     page_size?: number;
     /** Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault') */
     vault_type?: Skyvern.CredentialVaultType;
+    /** Filter credentials by type (e.g. 'password', 'credit_card', 'secret') */
+    credential_type?: Skyvern.SkyvernForgeSdkSchemasCredentialsCredentialType;
+    /** Case-insensitive search across credential name, username, secret label, and card details */
+    search?: string;
 }

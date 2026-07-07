@@ -4,21 +4,21 @@ import typing
 
 from ..core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from ..core.request_options import RequestOptions
-from .raw_client import AsyncRawWorkflowsClient, RawWorkflowsClient
+from .raw_client import AsyncRawAgentsClient, RawAgentsClient
 
 
-class WorkflowsClient:
+class AgentsClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
-        self._raw_client = RawWorkflowsClient(client_wrapper=client_wrapper)
+        self._raw_client = RawAgentsClient(client_wrapper=client_wrapper)
 
     @property
-    def with_raw_response(self) -> RawWorkflowsClient:
+    def with_raw_response(self) -> RawAgentsClient:
         """
         Retrieves a raw implementation of this client that returns raw responses.
 
         Returns
         -------
-        RawWorkflowsClient
+        RawAgentsClient
         """
         return self._raw_client
 
@@ -47,7 +47,7 @@ class WorkflowsClient:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        client.workflows.reset_workflow_browser_profile(
+        client.agents.reset_workflow_browser_profile(
             workflow_permanent_id="wpid_123",
         )
         """
@@ -57,18 +57,18 @@ class WorkflowsClient:
         return _response.data
 
 
-class AsyncWorkflowsClient:
+class AsyncAgentsClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
-        self._raw_client = AsyncRawWorkflowsClient(client_wrapper=client_wrapper)
+        self._raw_client = AsyncRawAgentsClient(client_wrapper=client_wrapper)
 
     @property
-    def with_raw_response(self) -> AsyncRawWorkflowsClient:
+    def with_raw_response(self) -> AsyncRawAgentsClient:
         """
         Retrieves a raw implementation of this client that returns raw responses.
 
         Returns
         -------
-        AsyncRawWorkflowsClient
+        AsyncRawAgentsClient
         """
         return self._raw_client
 
@@ -102,7 +102,7 @@ class AsyncWorkflowsClient:
 
 
         async def main() -> None:
-            await client.workflows.reset_workflow_browser_profile(
+            await client.agents.reset_workflow_browser_profile(
                 workflow_permanent_id="wpid_123",
             )
 

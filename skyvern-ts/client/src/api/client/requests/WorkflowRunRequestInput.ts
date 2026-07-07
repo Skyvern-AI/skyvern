@@ -8,15 +8,15 @@ import type * as Skyvern from "../../index.js";
  *         "x-max-steps-override": 1,
  *         "x-user-agent": "x-user-agent",
  *         template: true,
- *         workflow_id: "wpid_123"
+ *         agent_id: "wpid_123"
  *     }
  */
 export interface WorkflowRunRequestInput {
     template?: boolean;
     "x-max-steps-override"?: number;
     "x-user-agent"?: string;
-    /** ID of the workflow to run. Workflow ID starts with `wpid_`. */
-    workflow_id: string;
+    /** ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias. */
+    agent_id: string;
     /** Parameters to pass to the workflow */
     parameters?: Record<string, unknown>;
     /** The title for this workflow run */
@@ -74,7 +74,7 @@ export interface WorkflowRunRequestInput {
     browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. */
     max_screenshot_scrolls?: number;
-    /** Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours. */
+    /** Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes. */
     max_elapsed_time_minutes?: number;
     /** The extra HTTP headers for the requests in browser. */
     extra_http_headers?: Record<string, string | undefined>;
