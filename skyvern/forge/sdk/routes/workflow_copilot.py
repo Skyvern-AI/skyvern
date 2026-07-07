@@ -932,6 +932,7 @@ async def _commit_staged_workflow(
         totp_verification_url=staged_workflow.totp_verification_url,
         totp_identifier=staged_workflow.totp_identifier,
         persist_browser_session=staged_workflow.persist_browser_session,
+        pin_saved_session_ip=staged_workflow.pin_saved_session_ip,
         browser_profile_id=staged_workflow.browser_profile_id,
         browser_profile_key=staged_workflow.browser_profile_key,
         model=staged_workflow.model,
@@ -970,6 +971,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         totp_verification_url=original_workflow.totp_verification_url,
         totp_identifier=original_workflow.totp_identifier,
         persist_browser_session=original_workflow.persist_browser_session,
+        pin_saved_session_ip=original_workflow.pin_saved_session_ip,
         browser_profile_id=original_workflow.browser_profile_id,
         browser_profile_key=original_workflow.browser_profile_key,
         model=original_workflow.model,
@@ -1567,7 +1569,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
     return workflow_yaml_request
 
 
-def _yaml_enable_self_healing(workflow_yaml: str | None) -> bool | None:
+def _yaml_bool_setting(workflow_yaml: str | None, setting_name: str) -> bool | None:
     if not workflow_yaml:
         return None
     try:
@@ -1576,8 +1578,16 @@ def _yaml_enable_self_healing(workflow_yaml: str | None) -> bool | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    value = parsed.get("enable_self_healing")
+    value = parsed.get(setting_name)
     return value if isinstance(value, bool) else None
+
+
+def _yaml_enable_self_healing(workflow_yaml: str | None) -> bool | None:
+    return _yaml_bool_setting(workflow_yaml, "enable_self_healing")
+
+
+def _yaml_pin_saved_session_ip(workflow_yaml: str | None) -> bool | None:
+    return _yaml_bool_setting(workflow_yaml, "pin_saved_session_ip")
 
 
 async def _process_workflow_yaml(
@@ -1607,7 +1617,13 @@ async def _process_workflow_yaml(
         # unsaved editor toggle survives an unrelated copilot edit. A persisted-lookup
         # failure propagates: failing the save is safer than writing an implicit disable.
         enable_self_healing = _yaml_enable_self_healing(settings_fallback_yaml)
-    if enable_self_healing is None:
+
+    pin_saved_session_ip = _yaml_pin_saved_session_ip(workflow_yaml)
+    if pin_saved_session_ip is None:
+        pin_saved_session_ip = _yaml_pin_saved_session_ip(settings_fallback_yaml)
+
+    current_workflow: Workflow | None = None
+    if enable_self_healing is None or pin_saved_session_ip is None:
         try:
             current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
                 workflow_permanent_id=workflow_permanent_id,
@@ -1615,7 +1631,10 @@ async def _process_workflow_yaml(
             )
         except WorkflowNotFound:
             current_workflow = None
-        enable_self_healing = bool(current_workflow and current_workflow.enable_self_healing)
+    if enable_self_healing is None:
+        enable_self_healing = bool(current_workflow and getattr(current_workflow, "enable_self_healing", False))
+    if pin_saved_session_ip is None:
+        pin_saved_session_ip = bool(current_workflow and getattr(current_workflow, "pin_saved_session_ip", False))
 
     now = datetime.now(timezone.utc)
     return Workflow(
@@ -1632,6 +1651,7 @@ async def _process_workflow_yaml(
         totp_verification_url=workflow_yaml_request.totp_verification_url,
         totp_identifier=workflow_yaml_request.totp_identifier,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        pin_saved_session_ip=pin_saved_session_ip,
         browser_profile_id=workflow_yaml_request.browser_profile_id,
         browser_profile_key=workflow_yaml_request.browser_profile_key,
         model=workflow_yaml_request.model,

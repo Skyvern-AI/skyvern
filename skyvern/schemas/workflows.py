@@ -1315,6 +1315,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
     browser_profile_key: str | None = None
     model: dict[str, Any] | None = None

@@ -48,6 +48,7 @@ export function workflowVersionFromSaveData(
     extra_http_headers: headers.extraHttpHeaders,
     cdp_connect_headers: headers.cdpConnectHeaders,
     persist_browser_session: settings.persistBrowserSession,
+    pin_saved_session_ip: settings.pinSavedSessionIp,
     browser_profile_id: settings.browserProfileId,
     browser_profile_key: settings.browserProfileKey,
     model: settings.model,
