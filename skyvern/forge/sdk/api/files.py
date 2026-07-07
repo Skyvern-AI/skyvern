@@ -44,7 +44,7 @@ def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[
     # retrieve the suffix from Content-Type
     content_type = headers.get("Content-Type")
     if content_type:
-        if file_suffix := mimetypes.guess_extension(content_type):
+        if file_suffix := mimetypes.guess_extension(content_type.split(";")[0].strip()):
             return file_stem, file_suffix
 
     return file_stem, file_suffix or ""
@@ -66,7 +66,7 @@ def is_valid_mime_type(file_path: str) -> bool:
 
 def _determine_download_filename(
     filename: str | None,
-    response_headers: dict,
+    response_headers: CIMultiDictProxy[str] | dict[str, str],
     url: str,
 ) -> str:
     """Determine the filename for a downloaded file."""
@@ -226,6 +226,16 @@ async def download_file(
                     download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
                 download_dir_resolved = download_dir_path.resolve()
+                # response.headers stays a CIMultiDictProxy: dict() would make header
+                # lookups case-sensitive and miss lowercase wire headers.
+                file_name = _determine_download_filename(filename, response.headers, url)
+                final_path = (download_dir_resolved / file_name).resolve()
+                # sanitize_filename strips separators but keeps dots, so a dots-only name can
+                # still resolve outside the download dir; require a direct child. Checked
+                # before streaming so a rejected name downloads zero bytes.
+                if not final_path.is_relative_to(download_dir_resolved) or final_path.parent != download_dir_resolved:
+                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+
                 temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
                 file_path = Path(temp_file.name).resolve()
                 if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
@@ -233,17 +243,25 @@ async def download_file(
                     raise ValueError("Unsafe temporary file path created for download")
 
                 LOG.info("Downloading file to temporary path", file_path=str(file_path))
-                with temp_file as f:
-                    # Write the content of the request into the file
-                    total_bytes_downloaded = 0
-                    async for chunk in response.content.iter_chunked(1024):
-                        f.write(chunk)
-                        total_bytes_downloaded += len(chunk)
-                        if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
-                            raise DownloadFileMaxSizeExceeded(max_size_mb)
+                try:
+                    with temp_file as f:
+                        # Write the content of the request into the file
+                        total_bytes_downloaded = 0
+                        async for chunk in response.content.iter_chunked(1024):
+                            f.write(chunk)
+                            total_bytes_downloaded += len(chunk)
+                            if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
+                                raise DownloadFileMaxSizeExceeded(max_size_mb)
 
-                LOG.info(f"File downloaded successfully to {file_path}")
-                return str(file_path)
+                    file_path.replace(final_path)
+                except BaseException:
+                    # An orphaned temp file in a run download dir would get synced to storage
+                    # under the tmpXXXX name; drop it on any failure (incl. cancellation).
+                    file_path.unlink(missing_ok=True)
+                    raise
+
+                LOG.info(f"File downloaded successfully to {final_path}")
+                return str(final_path)
     except aiohttp.ClientResponseError as e:
         LOG.exception(f"Failed to download file, status code: {e.status}")
         raise
