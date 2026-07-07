@@ -2793,6 +2793,19 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
+    # Guard: clear/fill actions must target an editable element (input, textarea,
+    # select, or contenteditable). The planner occasionally selects a non-editable
+    # element such as an iframe (e.g. an hCaptcha iframe), which would otherwise
+    # cause Locator.clear/fill to fail mid-execution. Reject early with a clear error.
+    if not await skyvern_element.supports_text_input():
+        LOG.warning(
+            "Target element does not support text input, skipping input text action",
+            action_type=action.action_type,
+            element_id=skyvern_element.get_id(),
+            tag_name=tag_name,
+        )
+        return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
+
     select_action = SelectOptionAction(
         reasoning=action.reasoning,
         element_id=skyvern_element.get_id(),

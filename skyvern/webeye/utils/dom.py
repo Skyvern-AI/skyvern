@@ -366,6 +366,24 @@ class SkyvernElement:
             )
             return False
 
+    async def supports_text_input(self) -> bool:
+        """
+        Whether this element is a valid target for text input (clear/fill).
+
+        Editable inputs, textareas, selects, and contenteditable elements are
+        supported. Non-editable elements such as iframes (e.g. an hCaptcha
+        iframe) must never be targeted by clear/fill actions, otherwise
+        `Locator.clear`/`Locator.fill` fails.
+        """
+        if self.get_tag_name().lower() in COMMON_INPUT_TAGS:
+            return True
+        if await self.is_editable():
+            return True
+        contenteditable = await self.get_attr("contenteditable")
+        if contenteditable is not None and str(contenteditable).lower() != "false":
+            return True
+        return False
+
     async def is_child_of_pdf_object(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         parent_locator = self.get_locator().locator("..")
         tag_name: str | None = await parent_locator.evaluate("el => el.tagName", timeout=timeout)
