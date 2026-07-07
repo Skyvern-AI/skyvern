@@ -1019,12 +1019,14 @@ function CredentialsModal({
         return;
       }
 
-      // Edit mode: the inline test's profile is tied to the throwaway temp
-      // credential, so we must overwrite the real credential's secret (below) and
-      // re-run the test against it to attach a fresh profile. Delete the orphaned
-      // temp credential — onSuccess resets the refs before the dialog close
-      // handler would otherwise clean it up.
-      if (isEditMode && hasCompletedInlineTest && testCredentialId) {
+      // Any remaining temp credential is an orphan we're not reusing — either
+      // we're in edit mode (the real credential gets updated below instead),
+      // or "Save browser session" got unchecked after a completed test. Key
+      // this on testCredentialId alone, not hasCompletedInlineTest: the
+      // checkbox is togglable post-test with no side effect on testStatus, so
+      // gating on testAndSave here silently leaked the temp credential (and
+      // the secret it holds) whenever the box was unchecked before saving.
+      if (testCredentialId) {
         const tempCredentialId = testCredentialId;
         getClient(credentialGetter)
           .then((client) => client.delete(`/credentials/${tempCredentialId}`))
