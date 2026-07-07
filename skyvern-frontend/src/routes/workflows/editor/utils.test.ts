@@ -27,6 +27,7 @@ const baseWorkflow = {
   extra_http_headers: null,
   cdp_connect_headers: null,
   persist_browser_session: false,
+  pin_saved_session_ip: false,
   browser_profile_id: null,
   browser_profile_key: null,
   model: null,

@@ -1357,7 +1357,7 @@ async def skyvern_workflow_create(
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
-    applies to workflow-level fields (persist_browser_session, extra_http_headers,
+    applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
     totp_verification_url, totp_identifier, etc.) AND block-level overrides (max_retries,
     max_steps_per_run, totp_identifier, complete_criterion, error_code_mapping,
     continue_on_failure, engine, model, etc.). The schema defaults are intentional; silently

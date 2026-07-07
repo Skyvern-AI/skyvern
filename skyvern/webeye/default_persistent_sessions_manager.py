@@ -349,6 +349,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
+        inherit_profile_proxy: bool = False,
         wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
@@ -367,6 +368,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
             generate_browser_profile=generate_browser_profile,
+            inherit_profile_proxy=inherit_profile_proxy,
         )
 
         # Launch the browser immediately for standalone sessions so the
