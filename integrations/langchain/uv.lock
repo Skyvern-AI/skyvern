@@ -13,7 +13,7 @@ overrides = [
     { name = "cryptography", specifier = ">=48.0.1" },
     { name = "fastmcp", specifier = ">=3.2.0" },
     { name = "jsonschema", specifier = ">=4.23.0" },
-    { name = "langsmith", specifier = ">=0.8.0" },
+    { name = "langsmith", specifier = ">=0.8.18" },
     { name = "litellm", specifier = ">=1.84.0" },
     { name = "mako", specifier = ">=1.3.11" },
     { name = "mcp", specifier = ">=1.23.0" },
@@ -212,6 +212,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/70/2ba3769dd0ae167e2f33dfa9592d45db6ff9a61d62ca1a5b3d1bdd09068f/cryptography-49.0.0-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:b39efa323140595abd3ecca8529d321ae50f55f3aa3ba9cc81ea56a6011953d5", size = 4715584, upload-time = "2026-06-12T20:01:27.495Z" },
     { url = "https://files.pythonhosted.org/packages/94/64/2923570ac1c0bd3a737aa366ac3abbbbde273042308b8cde95e2364a6e6a/cryptography-49.0.0-pp311-pypy311_pp73-manylinux_2_34_aarch64.whl", hash = "sha256:b47db11c2c3525083296069b98ac5221907455e989ae0c2e3008bde851921615", size = 4675885, upload-time = "2026-06-12T20:01:55.49Z" },
     { url = "https://files.pythonhosted.org/packages/ab/f8/614dc7e051418cfe53d55173c1e24c6b0085e89996fe90508c2fdf769aef/cryptography-49.0.0-pp311-pypy311_pp73-manylinux_2_34_x86_64.whl", hash = "sha256:084ef1af862eb07ec46d25f68689f2102a9fc0e05ce7b80f14f5fe51e4eef0f6", size = 4715449, upload-time = "2026-06-12T20:02:05.469Z" },
+]
+
+[[package]]
+name = "distro"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/f8/98eea607f65de6527f8a2e8885fc8015d3e6f5775df186e443e0964a11c3/distro-1.9.0.tar.gz", hash = "sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed", size = 60722, upload-time = "2023-12-24T09:54:32.31Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl", hash = "sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2", size = 20277, upload-time = "2023-12-24T09:54:30.421Z" },
 ]
 
 [[package]]
@@ -486,23 +495,27 @@ wheels = [
 
 [[package]]
 name = "langsmith"
-version = "0.8.8"
+version = "0.9.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
     { name = "httpx" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
     { name = "packaging" },
     { name = "pydantic" },
     { name = "requests" },
     { name = "requests-toolbelt" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
     { name = "uuid-utils" },
     { name = "websockets" },
     { name = "xxhash" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2f/93/28df12b3b3c776077983b92f1299c623592b5999695af2a755fb90ff048b/langsmith-0.8.8.tar.gz", hash = "sha256:9d00e54f54d833c1914003527ff03ad0364741034330da72f0adbeaba852b6cf", size = 4468035, upload-time = "2026-05-31T22:14:57.698Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/68/8d8471233ee0cd82c2af946d76f80a01aeb8bb04160c392c1229fddf5d3d/langsmith-0.9.8.tar.gz", hash = "sha256:8c3d6a6d5246a3ea6d439b726d59edefba31dfb251de9eedb256119bbea4439e", size = 4710812, upload-time = "2026-07-06T19:06:10.866Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/71/94a8f2b573278a0b0b7dfd37663c0ddd36867f9e2bba69addd183de0cd56/langsmith-0.8.8-py3-none-any.whl", hash = "sha256:9d60d724c0d187c036e184b3ffdf9fa5c6822aa0bb88144a5fb898e79be645af", size = 402712, upload-time = "2026-05-31T22:14:55.908Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/67/a85caaa99117bbc988a0df7faa39e7f68344361854638d86bcce0ffe3619/langsmith-0.9.8-py3-none-any.whl", hash = "sha256:098da9fc6c184284f17913cb813a41e28c5ab1508e90bd50db40c28166681017", size = 671148, upload-time = "2026-07-06T19:06:08.911Z" },
 ]
 
 [[package]]
@@ -1157,6 +1170,15 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "twine", specifier = ">=6.1.0,<7" }]
+
+[[package]]
+name = "sniffio"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
+]
 
 [[package]]
 name = "socksio"
