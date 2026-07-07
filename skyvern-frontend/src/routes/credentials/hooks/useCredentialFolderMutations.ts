@@ -75,6 +75,11 @@ function useDeleteCredentialFolderMutation() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["credential-folders"] });
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
+      toast({
+        variant: "success",
+        title: "Folder deleted",
+        description: "The folder has been deleted.",
+      });
     },
     onError: (error: Error) => {
       toast({
