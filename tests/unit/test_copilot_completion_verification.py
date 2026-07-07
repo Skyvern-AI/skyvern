@@ -8493,6 +8493,69 @@ async def test_download_registered_output_parameter_injects_and_verifies_without
 
 
 @pytest.mark.asyncio
+async def test_download_registered_nested_output_corroborates_requested_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: str) -> str:
+        raise AssertionError("nested registered download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("account_number")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_account_number",
+                "The returned record includes account number.",
+                output_path="output.account_number",
+            ),
+            registered_download_completion_criterion(),
+        ]
+    )
+
+    run_result = _download_result(
+        {
+            "output": {
+                "account_number": "100245",
+                "downloaded_files": [{"filename": "statement.pdf"}],
+                "downloaded_file_urls": [],
+                "downloaded_file_artifact_ids": [],
+            }
+        }
+    )
+    run_result["data"]["executed_block_labels"] = ["extract_profile"]
+    run_result["data"]["blocks"] = [
+        {
+            "label": "extract_profile",
+            "block_type": "CODE",
+            "status": "completed",
+            "extracted_data": {
+                "output": {
+                    "account_number": "100245",
+                    "downloaded_files": [{"filename": "statement.pdf"}],
+                    "downloaded_file_urls": [],
+                    "downloaded_file_artifact_ids": [],
+                }
+            },
+        }
+    ]
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        run_result,
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    verdicts = {verdict.criterion_id: verdict for verdict in verification.verdicts}
+    assert verdicts["c_account_number"].reason_code == "structurally_abstained"
+    assert verdicts["c_account_number"].evidence_ref == "block_outputs:extract_profile.output.account_number"
+    assert verdicts[REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID].reason_code == "evidence_confirms"
+
+
+@pytest.mark.asyncio
 async def test_marked_requested_output_id_without_expected_value_is_no_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

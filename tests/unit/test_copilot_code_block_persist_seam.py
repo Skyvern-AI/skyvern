@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
     recorded_outcome_from_author_time_reject,
@@ -6362,6 +6363,30 @@ class TestOutputContractBudgetRunGuard:
 
 
 class TestCodeBlockParameterPersistSeam:
+    def test_declared_credential_key_is_adopted_for_unresolved_name(self) -> None:
+        workflow_yaml = _yaml(
+            """
+            title: Portal login
+            workflow_definition:
+              parameters:
+              - parameter_type: workflow
+                workflow_parameter_type: credential_id
+                key: portal_credentials
+                default_value: cred_123
+              blocks:
+              - block_type: code
+                label: sign_in
+                code: |
+                  await page.locator("#user").fill(portal_credentials.username)
+            """
+        )
+
+        adopted = workflow_update_module._adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml)
+
+        parsed = parse_workflow_yaml(adopted)
+        blocks = workflow_blocks(parsed)
+        assert blocks[0]["parameter_keys"] == ["portal_credentials"]
+
     @pytest.mark.asyncio
     async def test_undeclared_parameter_key_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
@@ -7211,6 +7236,92 @@ class TestCompiledAuthoringImposition:
         blocks = {str(block.get("label")): block for block in workflow_blocks(parsed)}
         assert blocks["summarize_statement"]["code"].strip() == 'return {"status": "ready"}'
         assert "async with page.expect_download()" in blocks["scout_synthesized_browser_steps"]["code"]
+
+    def test_imposition_targets_recorded_outcome_owner_in_multi_code_workflow(self) -> None:
+        ctx = self._download_ctx()
+        ctx.recorded_outcome_binding_constraint = RecordedOutcomeBindingConstraint(
+            repeated_structural_key="recorded-download",
+            phase="persisted_block_run",
+            reason_code="outcome_not_demonstrated",
+            frontier_facet="value_shape",
+            owning_block_labels=["download_matching_invoice_pdf"],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: login_to_apex_business
+                code: |
+                  return {"logged_in": True}
+              - block_type: code
+                label: download_matching_invoice_pdf
+                code: |
+                  async with page.expect_download() as download_info:
+                      await page.locator("a[href='/billing/statement.pdf']").click()
+                  download = await download_info.value
+                  return {"downloaded_files": [download.suggested_filename]}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        blocks = {str(block.get("label")): block for block in workflow_blocks(parsed)}
+        assert blocks["login_to_apex_business"]["code"].strip() == 'return {"logged_in": True}'
+        assert "async with page.expect_download()" in blocks["download_matching_invoice_pdf"]["code"]
+
+    def test_imposition_ignores_unchanged_persisted_browser_sibling(self) -> None:
+        ctx = self._download_ctx()
+        prior_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: login_to_apex_business
+                code: |
+                  await page.locator("#email").fill(str(login_credentials["username"]))
+                  await page.locator("#password").fill(str(login_credentials["password"]))
+                  await page.locator("#sign-in").click()
+              - block_type: code
+                label: download_matching_invoice_pdf
+                code: |
+                  return {"status": "ready"}
+            """
+        )
+        submitted_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: login_to_apex_business
+                code: |
+                  await page.locator("#email").fill(str(login_credentials["username"]))
+                  await page.locator("#password").fill(str(login_credentials["password"]))
+                  await page.locator("#sign-in").click()
+              - block_type: code
+                label: download_matching_invoice_pdf
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+        ctx.workflow_yaml = prior_yaml
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted_yaml, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        blocks = {str(block.get("label")): block for block in workflow_blocks(parsed)}
+        assert "#sign-in" in str(blocks["login_to_apex_business"]["code"])
+        assert "async with page.expect_download()" in str(blocks["download_matching_invoice_pdf"]["code"])
 
     def test_prior_synthesized_label_prevents_unrelated_multi_code_imposition(self) -> None:
         ctx = self._download_ctx()
@@ -8673,6 +8784,35 @@ class TestStaleLabelSeamFlow:
 
 
 class TestCredentialScoutPersistGate:
+    _MULTI_BLOCK_TARGETED_CREDENTIAL_YAML = _yaml(
+        """
+        title: Saved credential login
+        workflow_definition:
+          parameters:
+          - parameter_type: workflow
+            workflow_parameter_type: credential_id
+            key: login_credential
+            default_value: cred_missing
+          blocks:
+          - block_type: code
+            label: enter_username
+            parameter_keys: [login_credential]
+            code: |
+              await page.locator("#email").fill(login_credential.username)
+              await page.locator("#continue").click()
+          - block_type: code
+            label: sign_in_to_business_center
+            parameter_keys: [login_credential]
+            code: |
+              await page.locator("input[type='password']").fill(login_credential.password)
+              await page.locator("#sign-in").click()
+          - block_type: code
+            label: open_matching_statement
+            code: |
+              text = await page.locator("table").inner_text()
+              print(text)
+        """
+    )
     _SUBMIT_CODE_YAML = _credential_code_yaml(
         code="""
         await page.locator("#email").fill(login_credential.username)
@@ -8872,6 +9012,137 @@ class TestCredentialScoutPersistGate:
         error_text = str(result.get("error") or "")
         assert "fill_credential_field" not in error_text
         assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_targeted_run_labels_scope_credential_scout_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        accepted = await _update_workflow(
+            {
+                "workflow_yaml": self._MULTI_BLOCK_TARGETED_CREDENTIAL_YAML,
+                "block_labels": ["open_matching_statement"],
+            },
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert accepted["ok"] is True
+
+        selected_credential_ctx = _code_only_ctx()
+        selected_credential_ctx.scout_trajectory = []
+        rejected = await _update_workflow(
+            {
+                "workflow_yaml": self._MULTI_BLOCK_TARGETED_CREDENTIAL_YAML,
+                "block_labels": ["sign_in_to_business_center"],
+            },
+            selected_credential_ctx,
+        )
+
+        assert rejected["ok"] is False
+        assert rejected["data"]["failure_type"] == "missing_credential_or_init"
+        assert "sign_in_to_business_center" in rejected["error"]
+        assert rejected["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
+
+    @pytest.mark.asyncio
+    async def test_persisted_parameter_shape_does_not_rescout_unchanged_selected_credential_block(self) -> None:
+        sign_in_code = """
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#sign-in").click()
+        """
+        sign_in_code = textwrap.dedent(sign_in_code).strip()
+        login_parameter = {
+            "parameter_type": "workflow",
+            "workflow_parameter_type": "credential_id",
+            "key": "login_credential",
+            "default_value": "cred_missing",
+        }
+        prior_yaml = yaml.safe_dump(
+            {
+                "title": "Saved credential login",
+                "workflow_definition": {
+                    "parameters": [login_parameter],
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "sign_in_to_business_center",
+                            "parameters": [login_parameter],
+                            "code": sign_in_code,
+                        }
+                    ],
+                },
+            },
+            sort_keys=False,
+        )
+        submitted_yaml = yaml.safe_dump(
+            {
+                "title": "Saved credential login",
+                "workflow_definition": {
+                    "parameters": [
+                        login_parameter,
+                        {
+                            "parameter_type": "workflow",
+                            "workflow_parameter_type": "string",
+                            "key": "account_number",
+                            "default_value": "100245",
+                        },
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "code",
+                            "label": "sign_in_to_business_center",
+                            "parameter_keys": ["login_credential"],
+                            "code": sign_in_code,
+                        },
+                        {
+                            "block_type": "code",
+                            "label": "open_matching_statement",
+                            "parameter_keys": ["account_number"],
+                            "code": 'await page.get_by_text("View Printable Statement").wait_for(timeout=5000)',
+                        },
+                    ],
+                },
+            },
+            sort_keys=False,
+        )
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = prior_yaml
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow(
+            {
+                "workflow_yaml": submitted_yaml,
+                "block_labels": ["sign_in_to_business_center", "open_matching_statement"],
+            },
+            ctx,
+        )
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "open_matching_statement" in error_text
+        assert "fill_credential_field" not in error_text
+
+        changed_yaml = submitted_yaml.replace(
+            'await page.locator("#sign-in").click()',
+            'await page.locator("#sign-in").click()\n      await page.locator("#post-login").click()',
+        )
+        changed_ctx = _code_only_ctx()
+        changed_ctx.workflow_yaml = prior_yaml
+        changed_ctx.scout_trajectory = []
+
+        changed_result = await _update_workflow(
+            {
+                "workflow_yaml": changed_yaml,
+                "block_labels": ["sign_in_to_business_center"],
+            },
+            changed_ctx,
+        )
+
+        assert changed_result["ok"] is False
+        assert changed_result["data"]["failure_type"] == "missing_credential_or_init"
+        assert changed_result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
 
 
 def test_run_id_leak_check_covers_non_numeric_ids() -> None:
@@ -9353,6 +9624,34 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
         assert ctx.blocker_signal is None
         assert ctx.latest_tool_blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_unchanged_persisted_credential_block_does_not_require_new_scout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        prior_yaml = _safe_credential_collision_yaml(0)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = prior_yaml
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": prior_yaml}, ctx, allow_missing_credentials=True)
+
+        assert result["ok"] is True
+        assert result.get("user_facing_summary") != CREDENTIAL_SCOUT_VERIFY_REPLY
+        assert ctx.code_authoring_guardrail_reject_count == 0
+
+    @pytest.mark.asyncio
+    async def test_changed_persisted_credential_block_still_requires_new_scout(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _safe_credential_collision_yaml(0)
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": _safe_credential_collision_yaml(1)}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert result["user_facing_summary"] == CREDENTIAL_SCOUT_VERIFY_REPLY
 
     @pytest.mark.asyncio
     async def test_pure_credential_priority_churn_climbs_and_halts(self) -> None:
