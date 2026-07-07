@@ -155,6 +155,11 @@ class Settings(BaseSettings):
     DISABLE_CONNECTION_POOL: bool = False
     DATABASE_POOL_SIZE: int = 5
     DATABASE_POOL_MAX_OVERFLOW: int = 10
+    # Timeout/recycle defaults mirror SQLAlchemy's QueuePool. Size pools per service
+    # via env vars: raising defaults here multiplies across every engine and replica
+    # and can exhaust pgbouncer client connections.
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_RECYCLE: int = -1
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
