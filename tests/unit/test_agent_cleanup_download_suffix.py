@@ -54,6 +54,108 @@ async def test_finalize_downloaded_files_renames_with_download_suffix(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_finalize_skips_rename_for_session_file_already_named_by_suffix(tmp_path) -> None:
+    # A session download is named at download time by download_suffix, so the watcher syncs it as
+    # ``s3://.../req-123.pdf``. Finalize must NOT re-suffix it (which would bump it to req-123_1.pdf).
+    agent = ForgeAgent()
+    task = _make_task()
+    task.browser_session_id = "pbs-1"
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(return_value=b"data")
+    rename_mock = MagicMock()
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(
+            return_value=["s3://bucket/o/pbs-1/req-123.pdf"]
+        )
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    rename_mock.assert_not_called()
+    assert (download_dir / "req-123.pdf").exists()
+    assert not (download_dir / "req-123_1.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_dedupes_two_session_files_sharing_one_suffix(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.browser_session_id = "pbs-1"
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(side_effect=[b"a", b"b"])
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(
+            return_value=[
+                "s3://bucket/o/pbs-1/aaaa.pdf",
+                "s3://bucket/o/pbs-1/bbbb.pdf",
+            ]
+        )
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    assert {path.name for path in download_dir.iterdir()} == {"req-123.pdf", "req-123_1.pdf"}
+    assert not (download_dir / "aaaa.pdf").exists()
+    assert not (download_dir / "bbbb.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_skips_rename_for_local_file_already_named_by_suffix(tmp_path) -> None:
+    # A run-directory download named at download time by download_suffix arrives as an absolute path
+    # from list_files_in_directory; finalize must not re-suffix it to req-123_1.pdf.
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "req-123.pdf").write_bytes(b"x")
+
+    rename_mock = MagicMock()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    rename_mock.assert_not_called()
+    assert (download_dir / "req-123.pdf").exists()
+    assert not (download_dir / "req-123_1.pdf").exists()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
     agent = ForgeAgent()
     task = _make_task()
