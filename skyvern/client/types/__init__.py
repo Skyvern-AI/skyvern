@@ -29,6 +29,7 @@ if typing.TYPE_CHECKING:
     from .action_output import ActionOutput
     from .action_status import ActionStatus
     from .action_type import ActionType
+    from .ai_fallback_mode import AiFallbackMode
     from .artifact import Artifact
     from .artifact_type import ArtifactType
     from .aws_secret_parameter import AwsSecretParameter
@@ -414,6 +415,15 @@ if typing.TYPE_CHECKING:
     from .send_email_block_yaml import SendEmailBlockYaml
     from .skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
     from .skyvern_schemas_credential_type_credential_type import SkyvernSchemasCredentialTypeCredentialType
+    from .tag_delete_input import TagDeleteInput
+    from .tag_history_item import TagHistoryItem
+    from .tag_history_response import TagHistoryResponse
+    from .tag_input import TagInput
+    from .tag_item import TagItem
+    from .tag_key import TagKey
+    from .tag_key_delete_response import TagKeyDeleteResponse
+    from .tag_response import TagResponse
+    from .tags_response import TagsResponse
     from .task_block import TaskBlock
     from .task_block_data_schema import TaskBlockDataSchema
     from .task_block_parameters_item import (
@@ -708,6 +718,7 @@ if typing.TYPE_CHECKING:
     from .workflow_schedule_response import WorkflowScheduleResponse
     from .workflow_schedule_upsert_request import WorkflowScheduleUpsertRequest
     from .workflow_status import WorkflowStatus
+    from .workflow_tags_batch_response import WorkflowTagsBatchResponse
     from .workflow_trigger_block import WorkflowTriggerBlock
     from .workflow_trigger_block_parameters_item import (
         WorkflowTriggerBlockParametersItem,
@@ -746,6 +757,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ActionOutput": ".action_output",
     "ActionStatus": ".action_status",
     "ActionType": ".action_type",
+    "AiFallbackMode": ".ai_fallback_mode",
     "Artifact": ".artifact",
     "ArtifactType": ".artifact_type",
     "AwsSecretParameter": ".aws_secret_parameter",
@@ -1097,6 +1109,15 @@ _dynamic_imports: typing.Dict[str, str] = {
     "SendEmailBlockYaml": ".send_email_block_yaml",
     "SkyvernForgeSdkSchemasCredentialsCredentialType": ".skyvern_forge_sdk_schemas_credentials_credential_type",
     "SkyvernSchemasCredentialTypeCredentialType": ".skyvern_schemas_credential_type_credential_type",
+    "TagDeleteInput": ".tag_delete_input",
+    "TagHistoryItem": ".tag_history_item",
+    "TagHistoryResponse": ".tag_history_response",
+    "TagInput": ".tag_input",
+    "TagItem": ".tag_item",
+    "TagKey": ".tag_key",
+    "TagKeyDeleteResponse": ".tag_key_delete_response",
+    "TagResponse": ".tag_response",
+    "TagsResponse": ".tags_response",
     "TaskBlock": ".task_block",
     "TaskBlockDataSchema": ".task_block_data_schema",
     "TaskBlockParametersItem": ".task_block_parameters_item",
@@ -1367,6 +1388,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowScheduleResponse": ".workflow_schedule_response",
     "WorkflowScheduleUpsertRequest": ".workflow_schedule_upsert_request",
     "WorkflowStatus": ".workflow_status",
+    "WorkflowTagsBatchResponse": ".workflow_tags_batch_response",
     "WorkflowTriggerBlock": ".workflow_trigger_block",
     "WorkflowTriggerBlockParametersItem": ".workflow_trigger_block_parameters_item",
     "WorkflowTriggerBlockParametersItem_AwsSecret": ".workflow_trigger_block_parameters_item",
@@ -1427,6 +1449,7 @@ __all__ = [
     "ActionOutput",
     "ActionStatus",
     "ActionType",
+    "AiFallbackMode",
     "Artifact",
     "ArtifactType",
     "AwsSecretParameter",
@@ -1778,6 +1801,15 @@ __all__ = [
     "SendEmailBlockYaml",
     "SkyvernForgeSdkSchemasCredentialsCredentialType",
     "SkyvernSchemasCredentialTypeCredentialType",
+    "TagDeleteInput",
+    "TagHistoryItem",
+    "TagHistoryResponse",
+    "TagInput",
+    "TagItem",
+    "TagKey",
+    "TagKeyDeleteResponse",
+    "TagResponse",
+    "TagsResponse",
     "TaskBlock",
     "TaskBlockDataSchema",
     "TaskBlockParametersItem",
@@ -2048,6 +2080,7 @@ __all__ = [
     "WorkflowScheduleResponse",
     "WorkflowScheduleUpsertRequest",
     "WorkflowStatus",
+    "WorkflowTagsBatchResponse",
     "WorkflowTriggerBlock",
     "WorkflowTriggerBlockParametersItem",
     "WorkflowTriggerBlockParametersItem_AwsSecret",

@@ -14,7 +14,7 @@ from ..errors.not_found_error import NotFoundError
 from ..errors.unprocessable_entity_error import UnprocessableEntityError
 
 
-class RawWorkflowsClient:
+class RawAgentsClient:
     def __init__(self, *, client_wrapper: SyncClientWrapper):
         self._client_wrapper = client_wrapper
 
@@ -37,7 +37,7 @@ class RawWorkflowsClient:
         HttpResponse[None]
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/browser_session/reset_profile",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/browser_session/reset_profile",
             method="POST",
             request_options=request_options,
         )
@@ -83,7 +83,7 @@ class RawWorkflowsClient:
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
 
-class AsyncRawWorkflowsClient:
+class AsyncRawAgentsClient:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
         self._client_wrapper = client_wrapper
 
@@ -106,7 +106,7 @@ class AsyncRawWorkflowsClient:
         AsyncHttpResponse[None]
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/browser_session/reset_profile",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/browser_session/reset_profile",
             method="POST",
             request_options=request_options,
         )

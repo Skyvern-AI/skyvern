@@ -28,7 +28,6 @@ class Workflow(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     persist_browser_session: typing.Optional[bool] = None
     browser_profile_id: typing.Optional[str] = None
-    browser_profile_key: typing.Optional[str] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     status: typing.Optional[WorkflowStatus] = None
     max_screenshot_scrolls: typing.Optional[int] = None
@@ -50,6 +49,10 @@ class Workflow(UniversalBaseModel):
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None
+    agent_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`).
+    """
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

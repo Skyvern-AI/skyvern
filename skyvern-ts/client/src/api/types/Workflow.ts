@@ -39,6 +39,8 @@ export interface Workflow {
     created_at: string;
     modified_at: string;
     deleted_at?: string;
+    /** Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). */
+    agent_id?: string;
 }
 
 export namespace Workflow {

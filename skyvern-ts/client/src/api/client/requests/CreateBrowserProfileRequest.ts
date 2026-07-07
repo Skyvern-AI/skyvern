@@ -11,8 +11,8 @@ export interface CreateBrowserProfileRequest {
     name: string;
     /** Optional profile description */
     description?: string;
-    /** Persistent browser session to convert into a profile */
+    /** Persistent browser session to convert into a profile. Omit for a blank profile. */
     browser_session_id?: string;
-    /** Workflow run whose persisted session should be captured */
+    /** Workflow run whose persisted session should be captured. Omit for a blank profile. */
     workflow_run_id?: string;
 }
