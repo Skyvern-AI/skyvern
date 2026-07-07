@@ -559,6 +559,7 @@ def convert_to_workflow(
         totp_verification_url=workflow_model.totp_verification_url,
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
+        pin_saved_session_ip=workflow_model.pin_saved_session_ip,
         browser_profile_id=workflow_model.browser_profile_id,
         browser_profile_key=workflow_model.browser_profile_key,
         model=workflow_model.model,

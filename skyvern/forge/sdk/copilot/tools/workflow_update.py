@@ -8647,6 +8647,7 @@ async def _update_workflow(
                 totp_verification_url=workflow.totp_verification_url,
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
+                pin_saved_session_ip=workflow.pin_saved_session_ip,
                 browser_profile_id=workflow.browser_profile_id,
                 browser_profile_key=workflow.browser_profile_key,
                 model=workflow.model,
