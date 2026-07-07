@@ -1243,8 +1243,8 @@ class BrowserProfileModel(Base):
             "organization_id",
             "name",
             unique=True,
-            postgresql_where=text("is_managed = false"),
-            sqlite_where=text("is_managed = false"),
+            postgresql_where=text("is_managed = false AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = false AND deleted_at IS NULL"),
         ),
         Index(
             "uq_browser_profiles_managed_segment",
