@@ -87,6 +87,8 @@ class RecordedBuildTestOutcome(BaseModel):
     observed_evidence_summary: str = ""
     workflow_run_id: str | None = None
     block_labels: list[str] = Field(default_factory=list)
+    requested_block_labels: list[str] = Field(default_factory=list)
+    block_shape_hashes: dict[str, str] = Field(default_factory=dict)
     structural_failure_identity: str = ""
     verified_progress_marker: str = ""
     page_evidence_refs: list[str] = Field(default_factory=list)
@@ -851,6 +853,8 @@ def _required_input_unbound_identity(
 def _required_input_unbound_outcome(
     failed_block: Mapping[str, object] | None,
     block_labels: list[str],
+    requested_block_labels: list[str],
+    block_shape_hashes: Mapping[str, str],
     workflow_run_id: str | None,
     authored_structure_signature: str | None,
     referenced_unbound_keys: Sequence[str],
@@ -863,6 +867,8 @@ def _required_input_unbound_outcome(
         reason_code="required_input_unbound",
         workflow_run_id=workflow_run_id or None,
         block_labels=block_labels,
+        requested_block_labels=requested_block_labels,
+        block_shape_hashes=dict(block_shape_hashes),
         structural_failure_identity=_required_input_unbound_identity(failed_block, referenced_unbound_keys),
         authored_structure_signature=authored_structure_signature,
         observed_evidence_summary=_bounded_text(
@@ -886,12 +892,18 @@ def recorded_outcome_from_run_blocks_result(
     registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
     unbound_required_parameter_keys: Sequence[str] | None = None,
     block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
+    block_shape_hashes: Mapping[str, str] | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
     failed_block = _first_failed_block(blocks)
     block_labels = [_safe_str(block.get("label")) for block in blocks if _safe_str(block.get("label"))]
+    requested = data.get("requested_block_labels")
+    requested_block_labels = (
+        _clean_list([label for label in requested if isinstance(label, str)]) if isinstance(requested, list) else []
+    )
+    block_shape_hashes = dict(block_shape_hashes or {})
     referenced_unbound_keys = _referenced_unbound_input_keys(
         result,
         failed_block,
@@ -921,6 +933,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "terminal blocker precedence suppresses repair prompt"},
@@ -933,6 +947,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code="verified_success",
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 verified_progress_marker=verification_identity or "run_completed_verified",
                 evidence_refs=output_refs,
                 authored_structure_signature=authored_structure_signature,
@@ -950,6 +966,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
@@ -958,6 +976,8 @@ def recorded_outcome_from_run_blocks_result(
             return _required_input_unbound_outcome(
                 failed_block,
                 block_labels,
+                requested_block_labels,
+                block_shape_hashes,
                 recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 authored_structure_signature,
                 referenced_unbound_keys,
@@ -972,6 +992,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "no typed verification/page/output identity available"},
@@ -988,6 +1010,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code="fallback_floor_turn_unsatisfiable",
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "turn-unsatisfiable fallback floor, no reachable route"},
@@ -999,6 +1023,8 @@ def recorded_outcome_from_run_blocks_result(
             reason_code=reason_code,
             workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
             block_labels=block_labels,
+            requested_block_labels=requested_block_labels,
+            block_shape_hashes=block_shape_hashes,
             structural_failure_identity=structural_identity,
             page_evidence_refs=page_refs,
             evidence_refs=evidence_refs,
@@ -1023,6 +1049,8 @@ def recorded_outcome_from_run_blocks_result(
         return _required_input_unbound_outcome(
             failed_block,
             block_labels,
+            requested_block_labels,
+            block_shape_hashes,
             workflow_run_id or None,
             authored_structure_signature,
             referenced_unbound_keys,
@@ -1062,6 +1090,8 @@ def recorded_outcome_from_run_blocks_result(
         reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
         block_labels=block_labels,
+        requested_block_labels=requested_block_labels,
+        block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,
         evidence_refs=output_refs,

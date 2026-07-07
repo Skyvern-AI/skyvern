@@ -1464,7 +1464,10 @@ class ScopedXhrDownloadCapture:
                 headers = response.headers
                 if not self._is_xhr_download(headers, response.status):
                     return
-                raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+                response_url = response.url
+                raw_filename = extract_filename(
+                    {"content-disposition": headers.get("content-disposition", "")}, response_url
+                )
                 filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
                 if not filename or filename in self._saved:
                     return

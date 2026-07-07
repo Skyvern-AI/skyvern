@@ -26,6 +26,7 @@ from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
 from skyvern.config import _ensure_sqlite_dir, settings
+from skyvern.cors import credentialed_cors_allow_origins
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
@@ -54,6 +55,16 @@ from skyvern.services.workflow_schedule_service import (
 )
 
 LOG = structlog.get_logger()
+
+
+def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
+    fastapi_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=credentialed_cors_allow_origins(settings.ALLOWED_ORIGINS),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def format_validation_errors(exc: ValidationError) -> str:
@@ -344,14 +355,7 @@ def create_api_app() -> FastAPI:
 
     fastapi_app = FastAPI(lifespan=lifespan)
 
-    # Add CORS middleware
-    fastapi_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    add_credentialed_cors_middleware(fastapi_app)
 
     fastapi_app.include_router(base_router, prefix="/v1")
     fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
