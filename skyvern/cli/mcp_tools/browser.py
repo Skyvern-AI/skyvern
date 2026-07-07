@@ -27,6 +27,7 @@ from skyvern.cli.core.browser_ops import (
     do_screenshot,
     parse_extract_schema,
     ref_to_selector,
+    select_native_option_if_targeted,
     serialize_elements,
 )
 from skyvern.cli.core.guards import (
@@ -57,12 +58,64 @@ LOG = structlog.get_logger(__name__)
 # Matches `await` as a keyword, not inside single-line comments or strings.
 _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_ERROR_MESSAGE_MAX_CHARS = 500
+_ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
 
 
 def _blank_to_none(value: str | None) -> str | None:
     """Treat a blank/whitespace string as omitted: MCP clients serialize an omitted optional
     selector/intent as "", and a "" target would route a deterministic action onto nothing."""
     return value if value is None or value.strip() else None
+
+
+def _truncate_error_message(message: str) -> str:
+    message = message.strip()
+    if len(message) <= _ERROR_MESSAGE_MAX_CHARS:
+        return message
+    return f"{message[:_ERROR_MESSAGE_MAX_CHARS]}..."
+
+
+def _message_from_error_body(body: Any) -> str | None:
+    if isinstance(body, dict):
+        for key in _ERROR_BODY_MESSAGE_KEYS:
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return _truncate_error_message(value)
+            if isinstance(value, dict):
+                nested = _message_from_error_body(value)
+                if nested:
+                    return nested
+    # Only whitelisted dict keys are surfaced. A raw string body (or any unrecognized shape)
+    # from an SDK ApiError can carry secrets/tokens, so it is never surfaced verbatim.
+    return None
+
+
+def _exception_details(exc: Exception) -> dict[str, Any]:
+    details: dict[str, Any] = {"exception_type": type(exc).__name__}
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        details["status_code"] = status_code
+    return details
+
+
+def _exception_message(exc: Exception) -> str:
+    status_code = getattr(exc, "status_code", None)
+    # 5xx bodies carry the backend's wrapped internal exception text (see
+    # get_user_facing_exception_message's "Unexpected error: {exception}" fallback in
+    # skyvern/exceptions.py) — never surface them. 4xx bodies are the API's intended
+    # client-facing feedback (typed BadRequest/NotFound/UnprocessableEntity errors).
+    surface_body = not (isinstance(status_code, int) and status_code >= 500)
+    body_message = _message_from_error_body(getattr(exc, "body", None)) if surface_body else None
+    if body_message:
+        return f"HTTP {status_code}: {body_message}" if status_code is not None else body_message
+    # API-error-shaped exceptions (SDK ApiError) have a leaky __str__ that renders headers
+    # and the raw body; never fall back to str(exc) for them — surface only status + type.
+    if status_code is not None or hasattr(exc, "body"):
+        return f"HTTP {status_code}: {type(exc).__name__}" if status_code is not None else type(exc).__name__
+    message = str(exc).strip()
+    if message:
+        return _truncate_error_message(message)
+    return type(exc).__name__
 
 
 def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
@@ -224,6 +277,9 @@ async def skyvern_click(
         return make_result("skyvern_click", ok=False, error=no_browser_error())
 
     deterministic = selector is not None and selector_mode == "direct"
+    used_ai_path = False
+    native_option_selection = None
+    resolved: str | None = None
     with Timer() as timer:
         try:
             kwargs: dict[str, Any] = {"timeout": timeout}
@@ -232,11 +288,17 @@ async def skyvern_click(
             if click_count is not None:
                 kwargs["click_count"] = click_count
 
-            if deterministic:
+            if selector is not None and (deterministic or ai_mode is None or ai_mode == "fallback"):
+                native_option_selection = await select_native_option_if_targeted(page, selector, timeout=timeout)
+
+            if native_option_selection is not None:
+                resolved = native_option_selection.select_selector
+            elif deterministic:
                 # selector_mode="direct": pin the selector, no overlay-dismiss or AI re-target, so a
                 # missed target fails fast and the agent re-derives it instead of AI scout-scrolling.
                 resolved = await page.click(selector=selector, mode="direct", **kwargs)
             elif ai_mode is not None:
+                used_ai_path = True
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
@@ -255,7 +317,7 @@ async def skyvern_click(
                 ),
             )
         except Exception as e:
-            code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
+            code = ErrorCode.AI_FALLBACK_FAILED if used_ai_path else ErrorCode.ACTION_FAILED
             return make_result(
                 "skyvern_click",
                 ok=False,
@@ -263,19 +325,47 @@ async def skyvern_click(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    str(e),
+                    _exception_message(e),
                     "The element may be hidden, disabled, or intercepted by another element",
+                    details=_exception_details(e),
                 ),
             )
 
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+    if native_option_selection is not None:
+        data["selected_option"] = {
+            "select_selector": native_option_selection.select_selector,
+            "selected_by": native_option_selection.selected_by,
+        }
+        if native_option_selection.index is not None:
+            data["selected_option"]["index"] = native_option_selection.index
+        if native_option_selection.value is not None:
+            data["selected_option"]["value"] = native_option_selection.value
+        if native_option_selection.label is not None:
+            data["selected_option"]["label"] = native_option_selection.label
     if resolved and resolved != selector:
         data["resolved_selector"] = resolved
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts.
     # resolved_selector already contains the "xpath=" prefix (e.g. "xpath=//button[@id='x']"),
     # so pass it directly as the selector positional arg.
     resolved_sel = resolved if resolved and resolved != selector else selector
-    if resolved_sel and intent:
+    if native_option_selection is not None:
+        if native_option_selection.selected_by == "label":
+            data["sdk_equivalent"] = (
+                f'await page.select_option("{native_option_selection.select_selector}", '
+                f'label="{native_option_selection.label}")'
+            )
+        elif native_option_selection.selected_by == "index":
+            data["sdk_equivalent"] = (
+                f'await page.select_option("{native_option_selection.select_selector}", '
+                f"index={native_option_selection.index})"
+            )
+        else:
+            data["sdk_equivalent"] = (
+                f'await page.select_option("{native_option_selection.select_selector}", '
+                f'value="{native_option_selection.value}")'
+            )
+    elif resolved_sel and intent:
         data["sdk_equivalent"] = f'await page.click("{resolved_sel}", prompt="{intent}")'
     elif ai_mode:
         data["sdk_equivalent"] = f'await page.click(prompt="{intent}")'
@@ -542,7 +632,7 @@ async def skyvern_file_upload(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(code, str(e), "File upload failed"),
+                error=make_error(code, _exception_message(e), "File upload failed", details=_exception_details(e)),
             )
 
     return make_result(
@@ -622,8 +712,9 @@ async def skyvern_hover(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    str(e),
+                    _exception_message(e),
                     "The element may be hidden or not interactable",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -775,8 +866,9 @@ async def skyvern_type(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    str(e),
+                    _exception_message(e),
                     "The element may not be editable or may be hidden",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -903,7 +995,12 @@ async def skyvern_scroll(
                     ok=False,
                     browser_context=ctx,
                     timing_ms=timer.timing_ms,
-                    error=make_error(code, str(e), "Could not find element to scroll into view"),
+                    error=make_error(
+                        code,
+                        _exception_message(e),
+                        "Could not find element to scroll into view",
+                        details=_exception_details(e),
+                    ),
                 )
 
         return make_result(
@@ -1018,7 +1115,12 @@ async def skyvern_select_option(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(code, str(e), "Check selector and available options"),
+                error=make_error(
+                    code,
+                    _exception_message(e),
+                    "Check selector and available options",
+                    details=_exception_details(e),
+                ),
             )
 
     # NOTE: The SDK select_option() returns the selected value, not a resolved
@@ -1320,7 +1422,12 @@ async def skyvern_extract(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Check that the page has loaded and the prompt is clear"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    _exception_message(e),
+                    "Check that the page has loaded and the prompt is clear",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1357,7 +1464,12 @@ async def skyvern_validate(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Check that the page has loaded and the prompt is clear"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    _exception_message(e),
+                    "Check that the page has loaded and the prompt is clear",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1409,7 +1521,12 @@ async def skyvern_act(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Simplify the prompt or break the task into steps"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    _exception_message(e),
+                    "Simplify the prompt or break the task into steps",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1519,8 +1636,9 @@ async def skyvern_run_task(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    str(e) or type(e).__name__,
+                    _exception_message(e),
                     "Check the prompt, URL, and timeout settings",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -1682,8 +1800,9 @@ async def skyvern_login(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    str(e) or type(e).__name__,
+                    _exception_message(e),
                     "Check credential_type and required fields for your credential provider",
+                    details=_exception_details(e),
                 ),
             )
 
