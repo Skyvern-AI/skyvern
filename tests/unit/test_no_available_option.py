@@ -10,6 +10,7 @@ import pytest
 
 from skyvern.exceptions import (
     NoAvailableOptionFoundForCustomSelection,
+    NoElementMatchedForTargetOption,
     NoIncrementalElementFoundForCustomSelection,
 )
 from skyvern.forge.agent_functions import AgentFunction
@@ -18,6 +19,7 @@ from skyvern.webeye.actions.actions import InputOrSelectContext, SelectOption, S
 from skyvern.webeye.actions.handler import (
     _collect_option_texts,
     _custom_select_candidates_from_elements,
+    _log_custom_select_failure,
     _no_match_exception_for_dropdown,
     _select_deterministic_custom_option,
     _verify_custom_select_option,
@@ -1203,3 +1205,48 @@ class TestNoMatchExceptionForDropdown:
         )
         assert isinstance(exc, NoAvailableOptionFoundForCustomSelection)
         assert exc.observed_options_count == 2
+
+
+class TestLogCustomSelectFailure:
+    """The missing-option outcomes are expected business results, not code faults,
+    so they must be logged as warnings (no stack trace) to keep error tracking quiet,
+    while genuine faults keep their full exception traceback."""
+
+    def test_no_available_option_is_logged_as_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        warnings: list[str] = []
+        exceptions: list[str] = []
+        monkeypatch.setattr(handler.LOG, "warning", lambda msg, **kw: warnings.append(msg))
+        monkeypatch.setattr(handler.LOG, "exception", lambda msg, **kw: exceptions.append(msg))
+
+        handler._log_custom_select_failure(
+            "Custom select error",
+            NoAvailableOptionFoundForCustomSelection(reason="not present", observed_options=["Alpha"]),
+        )
+
+        assert warnings == ["Custom select error"]
+        assert exceptions == []
+
+    def test_no_element_matched_is_logged_as_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        warnings: list[str] = []
+        exceptions: list[str] = []
+        monkeypatch.setattr(handler.LOG, "warning", lambda msg, **kw: warnings.append(msg))
+        monkeypatch.setattr(handler.LOG, "exception", lambda msg, **kw: exceptions.append(msg))
+
+        handler._log_custom_select_failure(
+            "Custom select by value error",
+            NoElementMatchedForTargetOption(target="Target", reason="No value matched after scrolling"),
+        )
+
+        assert warnings == ["Custom select by value error"]
+        assert exceptions == []
+
+    def test_unexpected_error_keeps_exception_traceback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        warnings: list[str] = []
+        exceptions: list[str] = []
+        monkeypatch.setattr(handler.LOG, "warning", lambda msg, **kw: warnings.append(msg))
+        monkeypatch.setattr(handler.LOG, "exception", lambda msg, **kw: exceptions.append(msg))
+
+        handler._log_custom_select_failure("Custom select error", RuntimeError("boom"))
+
+        assert exceptions == ["Custom select error"]
+        assert warnings == []

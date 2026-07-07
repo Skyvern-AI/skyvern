@@ -3489,6 +3489,25 @@ async def handle_null_action(
     return [ActionSuccess(data=action.output)]
 
 
+# Terminal, expected outcomes of custom-select: the requested target option does
+# not exist on the page even after searching and scrolling. These are business
+# outcomes, not code faults, so we surface them as a clean ActionFailure without
+# emitting a stack trace to error tracking (which would otherwise create noisy,
+# unactionable error-tracking issues for missing options).
+EXPECTED_NO_OPTION_EXCEPTIONS = (
+    NoAvailableOptionFoundForCustomSelection,
+    NoElementMatchedForTargetOption,
+)
+
+
+def _log_custom_select_failure(message: str, exc: Exception) -> None:
+    """Log a custom-select failure, downgrading expected "option not available" outcomes to a warning."""
+    if isinstance(exc, EXPECTED_NO_OPTION_EXCEPTIONS):
+        LOG.warning(message, reason=str(exc))
+    else:
+        LOG.exception(message)
+
+
 @traced(name="skyvern.agent.action.select_option")
 async def handle_select_option_action(
     action: actions.SelectOptionAction,
@@ -3741,7 +3760,7 @@ async def handle_select_option_action(
         suggested_value = result.value
 
     except Exception as e:
-        LOG.exception("Custom select error")
+        _log_custom_select_failure("Custom select error", e)
         results.append(ActionFailure(exception=e))
         return results
     finally:
@@ -3796,7 +3815,7 @@ async def handle_select_option_action(
         return results
 
     except Exception as e:
-        LOG.exception("Custom select by value error")
+        _log_custom_select_failure("Custom select by value error", e)
         results.append(ActionFailure(exception=e))
         return results
 
