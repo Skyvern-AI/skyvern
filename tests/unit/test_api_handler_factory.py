@@ -770,6 +770,106 @@ async def test_router_acompletion_does_not_pass_timeout_kwarg(monkeypatch: pytes
         )
 
 
+@pytest.mark.asyncio
+async def test_router_retries_content_filter_on_first_non_gemini_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gemini's non-configurable content filter blocks a PII-heavy prompt, returning a *valid*
+    empty ModelResponse that litellm's exception-driven router fallback never recovers. Retrying
+    on another Gemini tier hits the same block, so the handler must skip the Gemini
+    standard-fallback and jump to the first NON-Gemini fallback group (SKY-11766)."""
+
+    calls: list[str] = []
+    fallback_kwargs: dict[str, Any] = {}
+
+    class _FilterThenSucceedRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            calls.append(model)
+            if len(calls) == 1:
+                return FakeLLMResponse("gemini-3.1-flash-lite-preview", content=None, finish_reason="content_filter")
+            fallback_kwargs.update(kwargs)
+            return FakeLLMResponse("gpt-5-fallback", content='{"actions": []}')
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _FilterThenSucceedRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["vertex-gemini-standard-fallback", "gpt-5-fallback"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_CONTENT_FILTER_FALLBACK", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_CONTENT_FILTER_FALLBACK")
+    result = await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert calls == ["primary-group", "gpt-5-fallback"], (
+        "handler must skip the Gemini standard-fallback tier and retry the first non-Gemini "
+        f"fallback after a content_filter response; got calls={calls}"
+    )
+    assert result == {"actions": []}
+    # The non-Gemini fallback call must not carry Gemini's safety_settings param — Azure 400s on
+    # it and the fallback dies. get_api_parameters keeps it off router configs (per-deployment
+    # injection instead), so **parameters stays clean here. Regression guard for incident #646.
+    assert "safety_settings" not in fallback_kwargs, (
+        f"non-Gemini fallback call must not carry safety_settings; got {fallback_kwargs}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_retry_content_filter_without_non_gemini_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every fallback group is also Gemini there is no filter-free tier to escape to — the
+    content_filter must surface as a parse failure, not loop or retry another Gemini (SKY-11766)."""
+    from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
+
+    calls: list[str] = []
+
+    class _AlwaysFilterRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            calls.append(model)
+            return FakeLLMResponse("gemini-3.1-flash-lite-preview", content=None, finish_reason="content_filter")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _AlwaysFilterRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["vertex-gemini-standard-fallback"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_CONTENT_FILTER_NO_NON_GEMINI", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_CONTENT_FILTER_NO_NON_GEMINI")
+    with pytest.raises((EmptyLLMResponseError, InvalidLLMResponseFormat)):
+        await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert calls == ["primary-group"], f"must not retry when there is no non-Gemini fallback; got calls={calls}"
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_retry_content_filter_for_non_gemini_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The escape hatch is scoped to Gemini's non-configurable filter. A content_filter from a
+    non-Gemini model must not trigger the Gemini-specific fallback retry (SKY-11766)."""
+    from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
+
+    calls: list[str] = []
+
+    class _FilterRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            calls.append(model)
+            return FakeLLMResponse("gpt-5", content=None, finish_reason="content_filter")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _FilterRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["gpt-5-mini-fallback"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_CONTENT_FILTER_NON_GEMINI_MODEL", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_CONTENT_FILTER_NON_GEMINI_MODEL")
+    with pytest.raises((EmptyLLMResponseError, InvalidLLMResponseFormat)):
+        await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert calls == ["primary-group"], f"non-Gemini content_filter must not trigger Gemini fallback; got calls={calls}"
+
+
 def test_router_fallback_chain_no_duplicate_keys_or_overlapping_chains(monkeypatch: pytest.MonkeyPatch) -> None:
     """Per-hop fallback expansion is constructed as strict suffixes — each
     non-terminal hop appears as a key at most once and each entry's chain
