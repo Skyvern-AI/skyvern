@@ -702,6 +702,7 @@ async def update_and_run_blocks_tool(
                 "raw_code_artifact_metadata": serialized_code_artifact_metadata
                 if scaffold_applied or envelope_imposed
                 else code_artifact_metadata,
+                "block_labels": block_labels,
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
