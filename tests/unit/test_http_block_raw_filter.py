@@ -8,10 +8,10 @@ import pytest
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.models._jinja import _json_type_filter
 from skyvern.forge.sdk.workflow.models.block import (
     _JSON_TYPE_MARKER,
     HttpRequestBlock,
-    _json_type_filter,
     jinja_sandbox_env,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType

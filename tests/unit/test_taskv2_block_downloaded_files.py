@@ -12,6 +12,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
 from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models import block_base as block_base_module
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
@@ -133,6 +134,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
         STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(side_effect=[[a_zip], [a_zip, b_zip]])),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(block_base_module, "app", fake_app)
 
     from skyvern.services import task_v2_service
 

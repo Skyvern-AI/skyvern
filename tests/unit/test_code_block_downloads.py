@@ -20,6 +20,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models import block_base as block_base_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -102,6 +103,7 @@ def _fake_storage_app(monkeypatch: pytest.MonkeyPatch, *, save, get) -> None:
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(block_base_module, "app", fake_app)
 
 
 @pytest.mark.asyncio

@@ -65,7 +65,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -81,7 +81,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -97,7 +97,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -113,7 +113,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
