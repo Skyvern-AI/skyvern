@@ -787,7 +787,7 @@ async def test_router_retries_content_filter_on_first_non_gemini_fallback(monkey
         async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
             calls.append(model)
             if len(calls) == 1:
-                return FakeLLMResponse("gemini-3.1-flash-lite-preview", content=None, finish_reason="content_filter")
+                return FakeLLMResponse("gemini-3.1-flash-lite", content=None, finish_reason="content_filter")
             fallback_kwargs.update(kwargs)
             return FakeLLMResponse("gpt-5-fallback", content='{"actions": []}')
 
@@ -828,7 +828,7 @@ async def test_router_does_not_retry_content_filter_without_non_gemini_fallback(
 
         async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
             calls.append(model)
-            return FakeLLMResponse("gemini-3.1-flash-lite-preview", content=None, finish_reason="content_filter")
+            return FakeLLMResponse("gemini-3.1-flash-lite", content=None, finish_reason="content_filter")
 
     monkeypatch.setattr(api_handler_factory.litellm, "Router", _AlwaysFilterRouter)
 
