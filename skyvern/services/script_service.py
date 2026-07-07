@@ -92,6 +92,7 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileS
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
+from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -2114,14 +2115,15 @@ async def download(
                     # Skip incomplete downloads
                     if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
-                    final_file_name = download_suffix
-                    target_path = local_download_dir / (final_file_name + file_extension)
-                    counter = 1
-                    while target_path.exists():
-                        final_file_name = f"{download_suffix}_{counter}"
-                        target_path = local_download_dir / (final_file_name + file_extension)
-                        counter += 1
-                    rename_file(file_path, final_file_name + file_extension)
+                    local_basename = Path(file_path).name
+                    existing_names = {
+                        Path(f).name
+                        for f in list_files_in_directory(local_download_dir)
+                        if Path(f).name != local_basename
+                    }
+                    desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    if local_basename != desired_name:
+                        rename_file(file_path, desired_name)
 
             # Upload downloaded files from local filesystem to remote storage
             # so that get_downloaded_files() can find them for verification.
