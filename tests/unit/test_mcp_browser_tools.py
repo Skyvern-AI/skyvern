@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.client.errors import InternalServerError, UnprocessableEntityError
 
 
 @pytest.mark.asyncio
@@ -193,6 +194,35 @@ async def test_skyvern_click_selector_plus_intent_falls_back_by_default(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_skyvern_click_selector_plus_intent_runs_native_option_precheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, select_option = _native_option_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#region > option:nth-of-type(4)", intent="pick the region")
+
+    assert result["ok"] is True
+    page.click.assert_not_awaited()
+    select_option.assert_awaited_once_with(value="east", timeout=30000)
+    assert result["data"]["selected_option"]["select_selector"] == "#region"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_plus_intent_probe_miss_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click = _click_page(monkeypatch)
+    probe = AsyncMock(return_value=None)
+    monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", probe)
+
+    result = await mcp_browser.skyvern_click(selector="#possibly-stale", intent="the blue submit button")
+
+    assert result["ok"] is True
+    probe.assert_awaited_once()
+    assert click.await_args.kwargs.get("ai") == "fallback"
+
+
+@pytest.mark.asyncio
 async def test_skyvern_click_selector_mode_direct_ignores_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     click = _click_page(monkeypatch)
 
@@ -220,6 +250,33 @@ def _action_page(monkeypatch: pytest.MonkeyPatch, **methods: AsyncMock) -> None:
     page = SimpleNamespace(**methods)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+
+def _native_option_page(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    option_selector: str = "#region > option:nth-of-type(4)",
+    option_info: dict[str, str] | None = None,
+    select_side_effect: object | None = None,
+) -> tuple[SimpleNamespace, AsyncMock]:
+    option_info = option_info or {
+        "select_selector": "#region",
+        "value": "east",
+        "label": "East",
+    }
+    option_locator = SimpleNamespace(evaluate=AsyncMock(return_value=option_info))
+    option_locator.first = option_locator
+    select_option = AsyncMock(side_effect=select_side_effect)
+    select_locator = SimpleNamespace(select_option=select_option)
+    raw_page = SimpleNamespace(
+        locator=MagicMock(
+            side_effect=lambda selector: option_locator if selector == option_selector else select_locator
+        )
+    )
+    page = SimpleNamespace(page=raw_page, click=AsyncMock(return_value="#unexpected-click"))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return page, select_option
 
 
 @pytest.mark.asyncio
@@ -267,6 +324,175 @@ async def test_skyvern_type_intent_only_uses_proactive_ai(monkeypatch: pytest.Mo
     assert result["ok"] is True
     assert fill.await_args.kwargs["ai"] == "proactive"
     assert fill.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_native_option_selector_uses_parent_select(monkeypatch: pytest.MonkeyPatch) -> None:
+    page, select_option = _native_option_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#region > option:nth-of-type(4)")
+
+    assert result["ok"] is True
+    page.click.assert_not_awaited()
+    select_option.assert_awaited_once_with(value="east", timeout=30000)
+    assert result["data"]["resolved_selector"] == "#region"
+    assert result["data"]["selected_option"] == {
+        "select_selector": "#region",
+        "selected_by": "value",
+        "value": "east",
+        "label": "East",
+    }
+    assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", value="east")'
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_native_option_selector_can_fall_back_to_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, select_option = _native_option_page(monkeypatch, select_side_effect=[Exception("bad value"), None])
+
+    result = await mcp_browser.skyvern_click(selector="#region > option:nth-of-type(4)", timeout=5000)
+
+    assert result["ok"] is True
+    page.click.assert_not_awaited()
+    assert select_option.await_args_list[0].kwargs == {"value": "east", "timeout": 5000}
+    assert select_option.await_args_list[1].kwargs == {"label": "East", "timeout": 5000}
+    assert result["data"]["selected_option"]["selected_by"] == "label"
+    assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", label="East")'
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The ref identifies ONE specific <option>; a duplicate/empty value must not resolve to the
+    # wrong option. Selection must use the probe's index, not the value.
+    page, select_option = _native_option_page(
+        monkeypatch,
+        option_info={"select_selector": "#region", "index": 3, "value": "", "label": "East"},
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#region > option:nth-of-type(4)")
+
+    assert result["ok"] is True
+    page.click.assert_not_awaited()
+    select_option.assert_awaited_once_with(index=3, timeout=30000)
+    assert result["data"]["selected_option"]["selected_by"] == "index"
+    assert result["data"]["selected_option"]["index"] == 3
+    assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", index=3)'
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_ai_error_surfaces_http_status_and_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 4xx bodies are the API's intended client-facing feedback — surfaced for self-correction.
+    fill = AsyncMock(
+        side_effect=UnprocessableEntityError(
+            body={"detail": "Element locator did not match any element"},
+            headers={"authorization": "redacted"},
+        )
+    )
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(intent="the first name field", text="Noor")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.AI_FALLBACK_FAILED
+    assert result["error"]["message"] == "HTTP 422: Element locator did not match any element"
+    assert "headers" not in result["error"]["message"].lower()
+    assert "authorization" not in result["error"]["message"].lower()
+    assert result["error"]["details"] == {
+        "exception_type": "UnprocessableEntityError",
+        "status_code": 422,
+    }
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_ai_error_5xx_body_text_is_suppressed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 5xx bodies carry the backend's wrapped internal exception text
+    # ("Unexpected error: {exception}"); only status + exception type may surface.
+    fill = AsyncMock(side_effect=InternalServerError(body={"error": "Unexpected error: KeyError('internal-host')"}))
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(intent="the first name field", text="Noor")
+
+    assert result["ok"] is False
+    assert result["error"]["message"] == "HTTP 500: InternalServerError"
+    assert "internal-host" not in result["error"]["message"]
+    assert "Unexpected error" not in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_ai_error_empty_body_does_not_leak_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An ApiError whose body carries no recognized message key must not fall back to str(exc),
+    # which renders headers + raw body via the SDK ApiError.__str__. Surface only status + type.
+    fill = AsyncMock(
+        side_effect=InternalServerError(
+            body=None,
+            headers={"authorization": "Bearer sk-SECRET", "set-cookie": "sess=abc"},
+        )
+    )
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(intent="the first name field", text="Noor")
+
+    assert result["ok"] is False
+    message = result["error"]["message"]
+    assert message == "HTTP 500: InternalServerError"
+    for leaked in ("authorization", "bearer", "sk-secret", "set-cookie", "sess=abc", "headers"):
+        assert leaked not in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_ai_error_string_body_does_not_leak_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A raw string body (not a recognized dict shape) can carry tokens/secrets; it must never
+    # be surfaced verbatim — only status + exception type.
+    fill = AsyncMock(side_effect=InternalServerError(body="upstream said: token=sk-LEAKED-1234 is invalid"))
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(intent="the first name field", text="Noor")
+
+    assert result["ok"] is False
+    message = result["error"]["message"]
+    assert message == "HTTP 500: InternalServerError"
+    assert "sk-LEAKED-1234" not in message
+    assert "token=" not in message
+
+
+@pytest.mark.asyncio
+async def test_skyvern_act_sdk_error_does_not_leak_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The SDK/agent handlers (act/extract/validate/run_task/login) must also route ApiError
+    # through _exception_message, not str(e) — otherwise ApiError.__str__ leaks headers/body.
+    _action_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_act",
+        AsyncMock(side_effect=InternalServerError(body=None, headers={"authorization": "Bearer sk-SECRET"})),
+    )
+
+    result = await mcp_browser.skyvern_act(prompt="close the banner")
+
+    assert result["ok"] is False
+    message = result["error"]["message"]
+    assert message == "HTTP 500: InternalServerError"
+    for leaked in ("authorization", "bearer", "sk-secret", "headers"):
+        assert leaked not in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_ai_error_uses_exception_type_for_empty_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SilentFailure(Exception):
+        def __str__(self) -> str:
+            return ""
+
+    fill = AsyncMock(side_effect=SilentFailure())
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(intent="the first name field", text="Noor")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.AI_FALLBACK_FAILED
+    assert result["error"]["message"] == "SilentFailure"
+    assert result["error"]["details"] == {"exception_type": "SilentFailure"}
 
 
 @pytest.mark.asyncio
