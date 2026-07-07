@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List
+from typing import Any, Awaitable, Callable, List, NotRequired, TypedDict
 
 import structlog
 from fuzzysearch import find_near_matches
@@ -159,6 +159,7 @@ UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the uplo
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
+COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
@@ -1112,6 +1113,30 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
     except Exception:
         LOG.warning(
             "Failed to evaluate collapse-select-fanout flag; defaulting to disabled",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _is_collapse_custom_select_fanout_enabled(task: Task) -> bool:
+    organization_id = task.organization_id
+    if not organization_id:
+        return False
+    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
+    if not experimentation_provider:
+        return False
+    try:
+        return bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate collapse-custom-select-fanout flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
@@ -3706,6 +3731,8 @@ async def handle_select_option_action(
         assert result is not None
         assert result.action_result is not None
         results.append(result.action_result)
+        if result.action_result.skip_remaining_actions:
+            return results
         if isinstance(result.action_result, ActionSuccess) or result.value is None:
             return results
         suggested_value = result.value
@@ -5749,6 +5776,591 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
     return out
 
 
+def _custom_select_choice_input_ids(node: dict) -> set[str]:
+    input_ids: set[str] = set()
+    queue: deque[dict] = deque(node.get("children") or [])
+    while queue:
+        child = queue.popleft()
+        if not isinstance(child, dict):
+            continue
+        tag = str(child.get("tagName") or "").lower()
+        attrs = child.get("attributes") or {}
+        input_type = str(attrs.get("type") or "").lower()
+        element_id = str(child.get("id") or "")
+        if tag == "input" and input_type in ("checkbox", "radio") and element_id:
+            input_ids.add(element_id)
+        for grandchild in child.get("children") or []:
+            queue.append(grandchild)
+    return input_ids
+
+
+def _custom_select_choice_value(node: dict) -> str | None:
+    attrs = node.get("attributes") or {}
+    value = " ".join(str(attrs.get("value") or "").split())
+    if value:
+        return value
+    queue: deque[dict] = deque(node.get("children") or [])
+    while queue:
+        child = queue.popleft()
+        if not isinstance(child, dict):
+            continue
+        child_attrs = child.get("attributes") or {}
+        child_value = " ".join(str(child_attrs.get("value") or "").split())
+        if child_value:
+            return child_value
+        for grandchild in child.get("children") or []:
+            queue.append(grandchild)
+    return None
+
+
+_CUSTOM_SELECT_CONTAINER_ROLES = frozenset({"combobox", "listbox", "menu", "radiogroup", "tree"})
+_CUSTOM_SELECT_CHOICE_ROLES = frozenset({"menuitem", "menuitemcheckbox", "menuitemradio", "option", "treeitem"})
+_CUSTOM_SELECT_CHOICE_INPUT_ROLES = frozenset({"checkbox", "radio", "menuitemcheckbox", "menuitemradio"})
+
+
+def _is_custom_select_choice_surface(role: str) -> bool:
+    return role in {"listbox", "menu", "radiogroup", "tree"}
+
+
+class _CustomSelectCandidate(TypedDict):
+    label: str | None
+    element_id: str | None
+    value: str | None
+    is_choice_input: NotRequired[bool]
+
+
+def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_CustomSelectCandidate]:
+    queue: deque[tuple[dict, bool]] = deque((element, False) for element in elements)
+    candidates: list[_CustomSelectCandidate] = []
+    seen: set[tuple[str | None, str | None, str | None]] = set()
+    covered_choice_input_ids: set[str] = set()
+
+    while queue:
+        node, in_choice_surface = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+
+        attrs = node.get("attributes") or {}
+        role = str(attrs.get("role") or "").lower()
+        tag = str(node.get("tagName") or "").lower()
+        input_type = str(attrs.get("type") or "").lower()
+        element_id = str(node.get("id") or "") or None
+        value = _custom_select_choice_value(node)
+        label = _select_shadow_label_from_node(node) or value
+        choice_input_ids = _custom_select_choice_input_ids(node)
+        is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
+        is_option_node = role in _CUSTOM_SELECT_CHOICE_ROLES or tag == "option" or (tag == "li" and in_choice_surface)
+        is_label_choice = tag == "label" and bool(choice_input_ids)
+        # Whether the candidate is checkbox/radio-shaped, computed here (rather than re-derived
+        # from the resolved element later) because only the full tree walk sees an option/label
+        # wrapper around a checkbox/radio: the emitted candidate is the wrapper, not the covered
+        # <input> itself.
+        is_choice_input_shape = is_choice_input or bool(choice_input_ids) or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES
+        has_choice_state = "aria-selected" in attrs or "aria-checked" in attrs
+        is_clickable_choice = (
+            bool(node.get("interactable"))
+            and label
+            and (
+                role not in _CUSTOM_SELECT_CONTAINER_ROLES
+                and tag not in {"input", "select", "textarea"}
+                and not (tag == "a" and bool(attrs.get("href")))
+                and (in_choice_surface or has_choice_state)
+            )
+        )
+
+        if is_choice_input and element_id in covered_choice_input_ids:
+            pass
+        elif element_id and label and (is_option_node or is_choice_input or is_label_choice or is_clickable_choice):
+            candidate = _select_shadow_candidate(label, element_id=element_id, value=value)
+            if candidate is not None:
+                key = (candidate.get("element_id"), candidate.get("label"), candidate.get("value"))
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(
+                        _CustomSelectCandidate(
+                            label=candidate.get("label"),
+                            element_id=candidate.get("element_id"),
+                            value=candidate.get("value"),
+                            is_choice_input=is_choice_input_shape,
+                        )
+                    )
+                    if is_label_choice:
+                        covered_choice_input_ids.update(choice_input_ids)
+
+        child_in_choice_surface = in_choice_surface or _is_custom_select_choice_surface(role)
+        for child in node.get("children") or []:
+            queue.append((child, child_in_choice_surface))
+
+    return candidates
+
+
+def _split_selected_label_values(value: str) -> set[str]:
+    normalized = _normalize_select_shadow_text(value)
+    if not normalized:
+        return set()
+    parts = {part.strip() for part in normalized.split(",") if part.strip()} | {normalized}
+    # Widgets that reflect a committed pick by relabelling a trigger/wrapper (e.g. aria-label
+    # flips from "Search sources" to "Selected WAKE") should still match the bare option label.
+    for prefix in _SELECTED_LABEL_PREFIXES:
+        if normalized.startswith(prefix):
+            parts.add(normalized[len(prefix) :].strip())
+    return {part for part in parts if part}
+
+
+_SELECTED_LABEL_PREFIXES = ("selected ", "selected:")
+
+_CUSTOM_SELECT_MATCHED_STATE_JS = r"""
+(el) => {
+    const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const label = [
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("value"),
+        el.value
+    ].map(normalize).find(Boolean) || "";
+    const role = normalize(el.getAttribute("role"));
+    const nestedChoice = el.querySelector?.("input[type='checkbox'], input[type='radio']");
+    const ariaSelected = el.getAttribute("aria-selected") === "true";
+    const ariaChecked = el.getAttribute("aria-checked") === "true";
+    const selectedAttr = el.hasAttribute("selected") || el.selected === true;
+    const checked = Boolean(
+        (el.matches?.("input[type='checkbox'], input[type='radio']") && el.checked)
+        || nestedChoice?.checked
+    );
+    return { label, role, ariaSelected, ariaChecked, selectedAttr, checked };
+}
+"""
+
+_CUSTOM_SELECT_COMMITTED_STATE_JS = r"""
+([anchor, args]) => {
+    const expectedLabel = args.expectedLabel;
+    const anchorIsComboboxInput = args.anchorIsComboboxInput;
+    const allowAriaSelectedOptionTokens = args.allowAriaSelectedOptionTokens !== false;
+    const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    const splitValues = (value) => {
+        const normalized = normalize(value);
+        if (!normalized) return [];
+        const parts = [normalized, ...normalized.split(",").map((part) => part.trim()).filter(Boolean)];
+        for (const prefix of ["selected ", "selected:"]) {
+            if (normalized.startsWith(prefix)) parts.push(normalized.slice(prefix.length).trim());
+        }
+        return parts.filter(Boolean);
+    };
+    const matchesExpected = (value) => splitValues(value).includes(expectedLabel);
+    const triggerSelector = [
+        "[role='combobox']",
+        "[aria-haspopup='listbox']",
+        "[aria-haspopup='menu']",
+        "[aria-haspopup='true']",
+        "button[aria-expanded]",
+        "input[role='combobox']",
+        "select"
+    ].join(",");
+    const scopeSelectors = [
+        "[data-uxi-widget-type]",
+        "[data-automation-id*='formField']",
+        "[role='group']",
+        "fieldset",
+        ".field"
+    ];
+    // Nearest matching ancestor wins; never scope to the whole form or a bare
+    // parent container — sibling fields showing the target label must not
+    // pre-confirm this one. With no recognized field wrapper, fall back to the
+    // anchor itself (a miss routes to the LLM path, never a cross-field match).
+    const scopeCandidates = scopeSelectors
+        .map((selector) => anchor.closest?.(selector))
+        .filter(Boolean);
+    const scopeRoot = (
+        scopeCandidates.reduce((closest, el) => (!closest || closest.contains(el) ? el : closest), null)
+        || anchor
+    );
+    const tokenSelectors = [
+        ...(allowAriaSelectedOptionTokens ? ["[role='option'][aria-selected='true']"] : []),
+        "[data-automation-id='selectedItem']",
+        ".pill",
+        ".chip",
+        "[class*='token']"
+    ].join(",");
+    for (const token of scopeRoot.querySelectorAll(tokenSelectors)) {
+        if (matchesExpected(token.textContent) || matchesExpected(token.getAttribute("aria-label"))) return true;
+    }
+    for (const hidden of scopeRoot.querySelectorAll("input[type='hidden']")) {
+        if (matchesExpected(hidden.value)) return true;
+    }
+    const activeId = anchor.getAttribute?.("aria-activedescendant");
+    if (allowAriaSelectedOptionTokens && activeId) {
+        const active = scopeRoot.querySelector(`#${CSS.escape(activeId)}`);
+        if (active && active.getAttribute("aria-selected") === "true") {
+            if (matchesExpected(active.textContent) || matchesExpected(active.getAttribute("aria-label"))) {
+                return true;
+            }
+        }
+    }
+    const reflectedValues = (el) => [
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("aria-valuetext"),
+        el.getAttribute("title"),
+    ];
+    const seen = new Set();
+    const triggerCandidates = [
+        anchor,
+        anchor.closest?.(triggerSelector),
+        ...(scopeRoot.matches?.(triggerSelector) ? [scopeRoot] : []),
+        ...scopeRoot.querySelectorAll(triggerSelector)
+    ];
+    for (const el of triggerCandidates) {
+        if (!el || seen.has(el) || !scopeRoot.contains(el)) continue;
+        seen.add(el);
+        if (reflectedValues(el).some(matchesExpected)) return true;
+    }
+    // A combobox <input> may still hold the user-typed filter text; raw value equality alone is not
+    // a committed signal. Only trust it when the dropdown has closed (aria-expanded=false).
+    if (anchorIsComboboxInput) {
+        const valueMatches = matchesExpected(anchor.value) || matchesExpected(anchor.getAttribute("value"));
+        if (valueMatches) {
+            const expanded = anchor.getAttribute("aria-expanded")
+                || anchor.closest?.("[aria-expanded]")?.getAttribute("aria-expanded");
+            if (expanded === "false") return true;
+        }
+        return false;
+    }
+    for (const el of seen) {
+        if (reflectedValues(el).some((value) => normalize(value))) return false;
+    }
+    return false;
+}
+"""
+
+
+async def _evaluate_element_scoped(
+    element: SkyvernElement,
+    expression: str,
+    arg: Any | None = None,
+) -> Any:
+    handler = await element.get_element_handler()
+    payload = handler if arg is None else [handler, arg]
+    return await SkyvernFrame.evaluate(frame=element.get_frame(), expression=expression, arg=payload)
+
+
+async def _read_custom_select_matched_state(element: SkyvernElement) -> dict | None:
+    try:
+        if await element.get_locator().count() != 1:
+            return None
+        state = await _evaluate_element_scoped(element, _CUSTOM_SELECT_MATCHED_STATE_JS)
+    except Exception:
+        LOG.info(
+            "Failed to read custom-select matched element state",
+            exc_info=True,
+        )
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _custom_select_matched_state_confirms(state: dict | None, expected_label: str) -> bool:
+    if not isinstance(state, dict):
+        return False
+    label_matches = expected_label in _split_selected_label_values(str(state.get("label") or ""))
+    return label_matches and any(
+        bool(state.get(field)) for field in ("ariaSelected", "ariaChecked", "selectedAttr", "checked")
+    )
+
+
+def _custom_select_matched_state_confirms_pre_click(state: dict | None, expected_label: str) -> bool:
+    if not isinstance(state, dict):
+        return False
+    label_matches = expected_label in _split_selected_label_values(str(state.get("label") or ""))
+    if not label_matches:
+        return False
+    if any(bool(state.get(field)) for field in ("ariaChecked", "selectedAttr", "checked")):
+        return True
+    if str(state.get("role") or "").lower() == "option":
+        return False
+    return bool(state.get("ariaSelected"))
+
+
+async def _custom_select_scope_confirms_committed(
+    *,
+    readback_scope_element: SkyvernElement | None,
+    anchor_is_combobox_input: bool,
+    matched_element_id: str,
+    matched_label: str | None,
+    expected_label: str,
+    allow_aria_selected_option_tokens: bool,
+) -> bool:
+    if readback_scope_element is None:
+        return False
+
+    try:
+        committed = await _evaluate_element_scoped(
+            readback_scope_element,
+            _CUSTOM_SELECT_COMMITTED_STATE_JS,
+            {
+                "expectedLabel": expected_label,
+                "anchorIsComboboxInput": anchor_is_combobox_input,
+                "allowAriaSelectedOptionTokens": allow_aria_selected_option_tokens,
+            },
+        )
+    except Exception:
+        LOG.info(
+            "Failed to read custom-select committed label",
+            matched_element_id=matched_element_id,
+            matched_label=matched_label,
+            exc_info=True,
+        )
+        return False
+
+    return committed is True
+
+
+async def _verify_custom_select_option(
+    *,
+    matched_element: SkyvernElement,
+    readback_scope_element: SkyvernElement | None,
+    anchor_is_combobox_input: bool,
+    matched_element_id: str,
+    matched_label: str | None,
+) -> bool:
+    expected_label = _normalize_select_shadow_text(matched_label)
+    if not expected_label:
+        return False
+
+    if _custom_select_matched_state_confirms(await _read_custom_select_matched_state(matched_element), expected_label):
+        return True
+
+    return await _custom_select_scope_confirms_committed(
+        readback_scope_element=readback_scope_element,
+        anchor_is_combobox_input=anchor_is_combobox_input,
+        matched_element_id=matched_element_id,
+        matched_label=matched_label,
+        expected_label=expected_label,
+        allow_aria_selected_option_tokens=True,
+    )
+
+
+_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS = (0.15, 0.15)
+
+
+async def _verify_custom_select_option_with_settle(
+    *,
+    matched_element: SkyvernElement,
+    readback_scope_element: SkyvernElement | None,
+    anchor_is_combobox_input: bool,
+    matched_element_id: str,
+    matched_label: str | None,
+) -> bool:
+    """Retry the read-back a couple of times before giving up.
+
+    Some frameworks commit ``aria-selected``/trigger-text reflection on the next render tick
+    rather than synchronously on click, so an immediate read-back can read stale state. Retries
+    only fire on the failure path; a confirmed read-back returns immediately with no added delay.
+    """
+    for delay_seconds in (0.0, *_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS):
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+        if await _verify_custom_select_option(
+            matched_element=matched_element,
+            readback_scope_element=readback_scope_element,
+            anchor_is_combobox_input=anchor_is_combobox_input,
+            matched_element_id=matched_element_id,
+            matched_label=matched_label,
+        ):
+            return True
+    return False
+
+
+async def _resolve_custom_select_readback_scope_element(
+    *,
+    get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None,
+    target_value: str,
+    matched_element_id: str,
+    matched_label: str | None,
+) -> SkyvernElement | None:
+    if get_readback_scope_element is None:
+        return None
+
+    try:
+        return await get_readback_scope_element()
+    except Exception:
+        LOG.info(
+            "Failed to resolve custom-select read-back scope element; continuing with matched-element read-back",
+            target_value=target_value,
+            matched_element_id=matched_element_id,
+            matched_label=matched_label,
+            exc_info=True,
+        )
+        return None
+
+
+def _readback_scope_element_provider(
+    element: SkyvernElement,
+) -> Callable[[], Awaitable[SkyvernElement | None]]:
+    async def _provide() -> SkyvernElement | None:
+        return element
+
+    return _provide
+
+
+async def _anchor_is_combobox_input(element: SkyvernElement | None) -> bool:
+    if element is None:
+        return False
+    try:
+        return str(element.get_tag_name() or "").lower() == "input"
+    except Exception:
+        return False
+
+
+async def _select_deterministic_custom_option(
+    *,
+    target_value: str | None,
+    get_option_candidates: Callable[[], list[_CustomSelectCandidate]],
+    field_context: Any,
+    page: Page,
+    get_skyvern_element: Callable[[str], Awaitable[SkyvernElement]],
+    get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None = None,
+    task: Task,
+) -> tuple[ActionResult, str | None] | None:
+    if not target_value:
+        return None
+    if isinstance(field_context, dict) and field_context.get("is_date_related") is True:
+        return None
+    if not await _is_collapse_custom_select_fanout_enabled(task):
+        return None
+
+    option_candidates = get_option_candidates()
+    if not option_candidates:
+        return None
+
+    option_labels = [str(candidate.get("label") or "") for candidate in option_candidates]
+    option_values = [candidate.get("value") for candidate in option_candidates]
+    resolution = await app.AGENT_FUNCTION.resolve_field_option(
+        target_value=target_value,
+        option_labels=option_labels,
+        option_values=option_values,
+        field_context=field_context,
+        url=task.url,
+        organization_id=task.organization_id,
+    )
+    if resolution.fallback_to_llm or resolution.matched_index is None:
+        return None
+    if resolution.matched_index >= len(option_candidates):
+        return None
+
+    matched_candidate = option_candidates[resolution.matched_index]
+    element_id = matched_candidate.get("element_id")
+    matched_label = resolution.matched_label
+    # Computed by the tree walk in _custom_select_candidates_from_elements, which sees the
+    # label-wraps-checkbox case; the resolved element below may just be the <label>.
+    matched_option_is_choice_input = bool(matched_candidate.get("is_choice_input"))
+    if not element_id:
+        return None
+
+    readback_scope_element: SkyvernElement | None = None
+    anchor_is_combobox_input = False
+    try:
+        selected_element = await get_skyvern_element(element_id)
+        if await selected_element.get_attr("role") == "listbox":
+            return None
+
+        readback_scope_element = await _resolve_custom_select_readback_scope_element(
+            get_readback_scope_element=get_readback_scope_element,
+            target_value=target_value,
+            matched_element_id=element_id,
+            matched_label=matched_label,
+        )
+        anchor_is_combobox_input = await _anchor_is_combobox_input(readback_scope_element)
+
+        expected_label = _normalize_select_shadow_text(matched_label)
+        if expected_label:
+            matched_state = await _read_custom_select_matched_state(selected_element)
+            if _custom_select_matched_state_confirms_pre_click(matched_state, expected_label):
+                return ActionSuccess(), matched_label
+            if await _custom_select_scope_confirms_committed(
+                readback_scope_element=readback_scope_element,
+                anchor_is_combobox_input=anchor_is_combobox_input,
+                matched_element_id=element_id,
+                matched_label=matched_label,
+                expected_label=expected_label,
+                allow_aria_selected_option_tokens=False,
+            ):
+                return ActionSuccess(), matched_label
+
+        await selected_element.scroll_into_view()
+        await selected_element.click(page=page)
+        verified = await _verify_custom_select_option_with_settle(
+            matched_element=selected_element,
+            readback_scope_element=readback_scope_element,
+            anchor_is_combobox_input=anchor_is_combobox_input,
+            matched_element_id=element_id,
+            matched_label=matched_label,
+        )
+        if verified:
+            return ActionSuccess(), matched_label
+    except Exception:
+        LOG.info(
+            "Deterministic custom-select failed; falling back to LLM path",
+            target_value=target_value,
+            matched_element_id=element_id,
+            matched_label=matched_label,
+            exc_info=True,
+        )
+        return None
+
+    if anchor_is_combobox_input:
+        # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
+        # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
+        await _reset_custom_select_combobox_input(readback_scope_element, page)
+        LOG.info(
+            "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
+            target_value=target_value,
+            matched_element_id=element_id,
+            matched_label=matched_label,
+        )
+        return None
+
+    if not matched_option_is_choice_input:
+        # A non-checkbox/radio option (e.g. a button/div-anchored single-select listbox) can be
+        # safely replayed by the LLM mini-agent; only checkbox/radio panels risk toggling into an
+        # unintended state on a retry, so only those hard-fail below.
+        LOG.info(
+            "Deterministic custom-select read-back inconclusive on non-choice-input option; routing to LLM fallback",
+            target_value=target_value,
+            matched_element_id=element_id,
+            matched_label=matched_label,
+        )
+        return None
+
+    LOG.info(
+        "Deterministic custom-select read-back failed after click; returning failure to avoid replaying over mutated widget",
+        target_value=target_value,
+        matched_element_id=element_id,
+        matched_label=matched_label,
+    )
+    action_failure = ActionFailure(
+        NoElementMatchedForTargetOption(
+            target=target_value,
+            reason="Deterministic custom-select click could not be verified by matched element read-back",
+        )
+    )
+    action_failure.skip_remaining_actions = True
+    return action_failure, matched_label
+
+
+async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> None:
+    if element is None:
+        return
+    try:
+        locator = element.get_locator()
+        await locator.fill("")
+        await element.click(page=page)
+    except Exception:
+        LOG.info(
+            "Failed to reset custom-select combobox input before LLM fallback",
+            exc_info=True,
+        )
+
+
 def _no_match_exception_for_dropdown(
     *,
     reasoning: str | None,
@@ -5862,6 +6474,22 @@ async def select_from_emerging_elements(
         subtree_count=len(new_element_subtrees),
         html_length=len(incremental_html),
     )
+
+    async def get_readback_scope_element() -> SkyvernElement | None:
+        return await dom_after_open.get_skyvern_element_by_id(current_element_id)
+
+    deterministic_result = await _select_deterministic_custom_option(
+        target_value=options.target_value,
+        get_option_candidates=lambda: _custom_select_candidates_from_elements(shadow_candidate_elements),
+        field_context=options.model_dump(),
+        page=page,
+        get_skyvern_element=dom_after_open.get_skyvern_element_by_id,
+        get_readback_scope_element=get_readback_scope_element,
+        task=task,
+    )
+    if deterministic_result is not None:
+        action_result, _matched_label = deterministic_result
+        return action_result
 
     prompt = prompt_engine.load_prompt(
         "custom-select",
@@ -6014,6 +6642,25 @@ async def select_from_dropdown(
     )
     incremental_scraped.set_element_tree_trimmed(trimmed_element_tree)
     html = incremental_scraped.build_element_tree(html_need_skyvern_attrs=True)
+
+    deterministic_result = await _select_deterministic_custom_option(
+        target_value=target_value,
+        get_option_candidates=lambda: _custom_select_candidates_from_elements(trimmed_element_tree),
+        field_context=context.model_dump(),
+        page=page,
+        get_skyvern_element=lambda element_id: SkyvernElement.create_from_incremental(incremental_scraped, element_id),
+        get_readback_scope_element=_readback_scope_element_provider(skyvern_element),
+        task=task,
+    )
+    if deterministic_result is not None:
+        action_result, matched_label = deterministic_result
+        single_select_result.reasoning = "Deterministic exact/stem custom-select match"
+        single_select_result.value = matched_label or target_value
+        single_select_result.action_type = ActionType.CLICK
+        single_select_result.action_result = action_result
+        if isinstance(action_result, ActionSuccess):
+            single_select_result.dropdown_menu = None
+        return single_select_result
 
     skyvern_context = ensure_context()
     prompt = prompt_engine.load_prompt(

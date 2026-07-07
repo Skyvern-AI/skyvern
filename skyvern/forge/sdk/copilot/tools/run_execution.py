@@ -187,6 +187,7 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_page_inspected, _mark_post_run_page_observed
+from .workflow_update import record_output_contract_run_output_evidence
 
 LOG = structlog.get_logger()
 
@@ -2345,9 +2346,8 @@ def _terminal_challenge_completion_verification(
     criterion_ids = list(completion_verification.criterion_ids)
     if not criterion_ids:
         return completion_verification
-    return CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=criterion_ids,
+    return replace(
+        completion_verification,
         verdicts=[
             CriterionVerdict(
                 criterion_id=criterion_id,
@@ -2476,6 +2476,7 @@ def _record_run_blocks_result(
 ) -> RecordedRunOutcome | None:
     """Record the run adjudication on ctx; for an ok run, return the typed
     per-run outcome verdict mirroring exactly what was recorded."""
+    record_output_contract_run_output_evidence(copilot_ctx, result)
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None

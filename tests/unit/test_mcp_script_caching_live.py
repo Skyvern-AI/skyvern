@@ -336,6 +336,27 @@ async def test_deploy_script_via_mcp(monkeypatch):
     assert called_files[0].path == "main.py"
 
 
+@pytest.mark.asyncio
+async def test_deploy_script_rejects_unsafe_file_path_via_mcp(monkeypatch):
+    fake_client = SimpleNamespace(deploy_script=AsyncMock())
+    monkeypatch.setattr(script_tools, "get_skyvern", lambda: fake_client)
+
+    files = json.dumps([{"path": "%2e%2e/main.py", "content": "ZA==", "encoding": "base64"}])
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "skyvern_script_deploy",
+            {
+                "script_id": "s_abc",
+                "files": files,
+            },
+        )
+
+    assert result.data["ok"] is False
+    assert "relative POSIX path" in result.data["error"]["message"]
+    fake_client.deploy_script.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Scenario 6: Workflow create surfaces caching fields when caller opts in
 # ---------------------------------------------------------------------------

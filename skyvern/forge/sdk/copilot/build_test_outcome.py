@@ -13,12 +13,16 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    only_degraded_blocking,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeReasonCode
 
 LOG = structlog.get_logger()
 
@@ -51,6 +55,9 @@ BuildTestOutcomeReasonCode = Literal[
     "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
+    "fallback_floor_turn_unsatisfiable",
+    "output_source_unobservable",
+    "actuation_exhausted",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
@@ -175,6 +182,19 @@ BindingFrontierFacet = Literal[
     "selector_frontier",
 ]
 _UNCROSSABLE_DIAGNOSTIC_REASONS = frozenset({"empty_page", "challenge_gated", "capture_degraded"})
+_AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES: frozenset[RunOutcomeReasonCode] = frozenset(
+    {"outcome_not_demonstrated", "no_meaningful_output"}
+)
+
+
+def _recorded_outcome_degrade_eligible(
+    recorded_run_outcome: RecordedRunOutcome,
+    failed_block: Mapping[str, object] | None,
+) -> bool:
+    if failed_block is not None:
+        return False
+    reason_code = recorded_run_outcome.reason_code
+    return reason_code is None or reason_code in _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES
 
 
 class RecordedOutcomeBindingConstraint(BaseModel):
@@ -956,6 +976,22 @@ def recorded_outcome_from_run_blocks_result(
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "no typed verification/page/output identity available"},
             )
+        if (
+            completion_verification is not None
+            and only_degraded_blocking(completion_verification)
+            and _recorded_outcome_degrade_eligible(recorded_run_outcome, failed_block)
+        ):
+            return RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="fallback_floor_turn_unsatisfiable",
+                workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
+                block_labels=block_labels,
+                authored_structure_signature=authored_structure_signature,
+                observed_evidence_summary=recorded_run_outcome.display_reason or "",
+                key_provenance={"structural_failure_identity": "turn-unsatisfiable fallback floor, no reachable route"},
+            )
         return RecordedBuildTestOutcome(
             phase="persisted_block_run",
             attempted_tool="update_and_run_blocks",
@@ -1008,12 +1044,22 @@ def recorded_outcome_from_run_blocks_result(
     verdict: BuildTestOutcomeVerdict = "repairable_failure" if bool(result.get("ok")) is False else "progress_observed"
     if not structural_identity and not page_refs and not output_refs:
         verdict = "not_authoritative"
+    reason_code = "runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run"
+    has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
+    if (
+        verdict == "repairable_failure"
+        and not has_runtime_failure_evidence
+        and completion_verification is not None
+        and only_degraded_blocking(completion_verification)
+    ):
+        verdict = "not_authoritative"
+        reason_code = "fallback_floor_turn_unsatisfiable"
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
         attempted_block_label=_safe_str(failed_block.get("label")) if failed_block is not None else "",
         verdict=verdict,
-        reason_code="runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run",
+        reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
         block_labels=block_labels,
         structural_failure_identity=structural_identity,

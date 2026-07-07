@@ -249,6 +249,10 @@ def _guard_ctx(pending_run_id: str | None = None) -> _NS:
         last_test_non_retriable_nav_error=None,
         pending_reconciliation_run_id=pending_run_id,
         synthesized_block_reopened_for_output_coverage=False,
+        output_contract_actuation_by_signature={},
+        output_contract_reject_count_by_signature={},
+        output_contract_actuation_count_by_signature={},
+        output_contract_armed_directive_fingerprint_by_signature={},
     )
 
 

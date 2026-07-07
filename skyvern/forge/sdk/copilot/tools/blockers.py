@@ -39,7 +39,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import AgentContext, output_contract_ladder_unresolved
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
@@ -72,6 +72,7 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
     | PAGE_INSPECTION_TOOLS
     | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
 )
+_OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
 _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
     {
         "update_workflow",
@@ -1497,12 +1498,20 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
             return _emit_tool_blocker_signal(ctx, grounding_signal)
         return _emit_tool_blocker_signal(ctx, persistence_signal)
 
-    detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
-    if detected is not None:
-        return _emit_tool_blocker_signal(
-            ctx,
-            _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
-        )
+    # While a typed output-contract actuation ladder is still unresolved for the authoring tools, the
+    # bounded ladder (not a generic loop backstop) owns the turn's outcome; the guards re-engage the moment
+    # the ladder reaches an advisory-consumed run or a typed terminal.
+    output_contract_owns_turn = (
+        tool_name in _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS and output_contract_ladder_unresolved(ctx)
+    )
+
+    if not output_contract_owns_turn:
+        detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
+        if detected is not None:
+            return _emit_tool_blocker_signal(
+                ctx,
+                _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
+            )
 
     # Consecutive same-name guard: false-positives on the intended iterative
     # build (one new block per update_and_run_blocks). Block-running tools
@@ -1510,7 +1519,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     # exempt because a username+password+TOTP form legitimately needs three
     # consecutive calls; its failed-step guard above stays argument-aware.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list) and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS:
+    if (
+        isinstance(tracker, list)
+        and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
+        and not output_contract_owns_turn
+    ):
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
             return _emit_tool_blocker_signal(
