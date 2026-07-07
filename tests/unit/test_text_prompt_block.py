@@ -6,7 +6,7 @@ import pytest
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 
-import skyvern.forge.sdk.workflow.models.block as _block_mod
+import skyvern.forge.sdk.workflow.models.misc_blocks as _block_mod
 from skyvern.config import settings as base_settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
@@ -16,7 +16,7 @@ from skyvern.forge.sdk.workflow.models.block import TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockStatus, TextPromptBlockYAML, WorkflowRequest
 
-block_module = sys.modules["skyvern.forge.sdk.workflow.models.block"]
+block_module = sys.modules["skyvern.forge.sdk.workflow.models.misc_blocks"]
 
 
 def _make_workflow_run_context(values: dict | None = None) -> WorkflowRunContext:
