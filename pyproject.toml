@@ -135,7 +135,9 @@ server = [
     "json-repair>=0.59.5,<0.60",
     "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
-    "fastmcp>=3.2.0,<4",
+    # <3.4: 3.4.3 enables HostOriginGuardMiddleware by default (421 on public hosts, SKY-12003).
+    # cloud_app passes allowed_hosts/allowed_origins when supported; validate against 3.4.x before raising.
+    "fastmcp>=3.2.0,<3.4",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
     "anthropic>=0.97.0,<0.98",
