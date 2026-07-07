@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List
+from typing import Any, Awaitable, Callable, List, NotRequired, TypedDict
 
 import structlog
 from fuzzysearch import find_near_matches
@@ -5815,15 +5815,23 @@ def _custom_select_choice_value(node: dict) -> str | None:
 
 _CUSTOM_SELECT_CONTAINER_ROLES = frozenset({"combobox", "listbox", "menu", "radiogroup", "tree"})
 _CUSTOM_SELECT_CHOICE_ROLES = frozenset({"menuitem", "menuitemcheckbox", "menuitemradio", "option", "treeitem"})
+_CUSTOM_SELECT_CHOICE_INPUT_ROLES = frozenset({"checkbox", "radio", "menuitemcheckbox", "menuitemradio"})
 
 
 def _is_custom_select_choice_surface(role: str) -> bool:
     return role in {"listbox", "menu", "radiogroup", "tree"}
 
 
-def _custom_select_candidates_from_elements(elements: list[dict]) -> list[dict[str, str | None]]:
+class _CustomSelectCandidate(TypedDict):
+    label: str | None
+    element_id: str | None
+    value: str | None
+    is_choice_input: NotRequired[bool]
+
+
+def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_CustomSelectCandidate]:
     queue: deque[tuple[dict, bool]] = deque((element, False) for element in elements)
-    candidates: list[dict[str, str | None]] = []
+    candidates: list[_CustomSelectCandidate] = []
     seen: set[tuple[str | None, str | None, str | None]] = set()
     covered_choice_input_ids: set[str] = set()
 
@@ -5843,6 +5851,11 @@ def _custom_select_candidates_from_elements(elements: list[dict]) -> list[dict[s
         is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
         is_option_node = role in _CUSTOM_SELECT_CHOICE_ROLES or tag == "option" or (tag == "li" and in_choice_surface)
         is_label_choice = tag == "label" and bool(choice_input_ids)
+        # Whether the candidate is checkbox/radio-shaped, computed here (rather than re-derived
+        # from the resolved element later) because only the full tree walk sees an option/label
+        # wrapper around a checkbox/radio: the emitted candidate is the wrapper, not the covered
+        # <input> itself.
+        is_choice_input_shape = is_choice_input or bool(choice_input_ids) or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES
         has_choice_state = "aria-selected" in attrs or "aria-checked" in attrs
         is_clickable_choice = (
             bool(node.get("interactable"))
@@ -5863,7 +5876,14 @@ def _custom_select_candidates_from_elements(elements: list[dict]) -> list[dict[s
                 key = (candidate.get("element_id"), candidate.get("label"), candidate.get("value"))
                 if key not in seen:
                     seen.add(key)
-                    candidates.append(candidate)
+                    candidates.append(
+                        _CustomSelectCandidate(
+                            label=candidate.get("label"),
+                            element_id=candidate.get("element_id"),
+                            value=candidate.get("value"),
+                            is_choice_input=is_choice_input_shape,
+                        )
+                    )
                     if is_label_choice:
                         covered_choice_input_ids.update(choice_input_ids)
 
@@ -6119,6 +6139,37 @@ async def _verify_custom_select_option(
     )
 
 
+_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS = (0.15, 0.15)
+
+
+async def _verify_custom_select_option_with_settle(
+    *,
+    matched_element: SkyvernElement,
+    readback_scope_element: SkyvernElement | None,
+    anchor_is_combobox_input: bool,
+    matched_element_id: str,
+    matched_label: str | None,
+) -> bool:
+    """Retry the read-back a couple of times before giving up.
+
+    Some frameworks commit ``aria-selected``/trigger-text reflection on the next render tick
+    rather than synchronously on click, so an immediate read-back can read stale state. Retries
+    only fire on the failure path; a confirmed read-back returns immediately with no added delay.
+    """
+    for delay_seconds in (0.0, *_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS):
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+        if await _verify_custom_select_option(
+            matched_element=matched_element,
+            readback_scope_element=readback_scope_element,
+            anchor_is_combobox_input=anchor_is_combobox_input,
+            matched_element_id=matched_element_id,
+            matched_label=matched_label,
+        ):
+            return True
+    return False
+
+
 async def _resolve_custom_select_readback_scope_element(
     *,
     get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None,
@@ -6163,7 +6214,7 @@ async def _anchor_is_combobox_input(element: SkyvernElement | None) -> bool:
 async def _select_deterministic_custom_option(
     *,
     target_value: str | None,
-    get_option_candidates: Callable[[], list[dict[str, str | None]]],
+    get_option_candidates: Callable[[], list[_CustomSelectCandidate]],
     field_context: Any,
     page: Page,
     get_skyvern_element: Callable[[str], Awaitable[SkyvernElement]],
@@ -6181,7 +6232,7 @@ async def _select_deterministic_custom_option(
     if not option_candidates:
         return None
 
-    option_labels = [candidate.get("label") or "" for candidate in option_candidates]
+    option_labels = [str(candidate.get("label") or "") for candidate in option_candidates]
     option_values = [candidate.get("value") for candidate in option_candidates]
     resolution = await app.AGENT_FUNCTION.resolve_field_option(
         target_value=target_value,
@@ -6199,6 +6250,9 @@ async def _select_deterministic_custom_option(
     matched_candidate = option_candidates[resolution.matched_index]
     element_id = matched_candidate.get("element_id")
     matched_label = resolution.matched_label
+    # Computed by the tree walk in _custom_select_candidates_from_elements, which sees the
+    # label-wraps-checkbox case; the resolved element below may just be the <label>.
+    matched_option_is_choice_input = bool(matched_candidate.get("is_choice_input"))
     if not element_id:
         return None
 
@@ -6234,7 +6288,7 @@ async def _select_deterministic_custom_option(
 
         await selected_element.scroll_into_view()
         await selected_element.click(page=page)
-        verified = await _verify_custom_select_option(
+        verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
             readback_scope_element=readback_scope_element,
             anchor_is_combobox_input=anchor_is_combobox_input,
@@ -6259,6 +6313,18 @@ async def _select_deterministic_custom_option(
         await _reset_custom_select_combobox_input(readback_scope_element, page)
         LOG.info(
             "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
+            target_value=target_value,
+            matched_element_id=element_id,
+            matched_label=matched_label,
+        )
+        return None
+
+    if not matched_option_is_choice_input:
+        # A non-checkbox/radio option (e.g. a button/div-anchored single-select listbox) can be
+        # safely replayed by the LLM mini-agent; only checkbox/radio panels risk toggling into an
+        # unintended state on a retry, so only those hard-fail below.
+        LOG.info(
+            "Deterministic custom-select read-back inconclusive on non-choice-input option; routing to LLM fallback",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
