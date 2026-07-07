@@ -4,19 +4,19 @@ import * as Skyvern from "../../src/api/index";
 import { SkyvernClient } from "../../src/Client";
 import { mockServerPool } from "../mock-server/MockServerPool";
 
-describe("Workflows", () => {
+describe("Agents", () => {
     test("reset_workflow_browser_profile (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         server
             .mockEndpoint()
-            .post("/v1/workflows/wpid_123/browser_session/reset_profile")
+            .post("/v1/agents/wpid_123/browser_session/reset_profile")
             .respondWith()
             .statusCode(200)
             .build();
 
-        const response = await client.workflows.resetWorkflowBrowserProfile("wpid_123");
+        const response = await client.agents.resetWorkflowBrowserProfile("wpid_123");
         expect(response).toEqual(undefined);
     });
 
@@ -27,14 +27,14 @@ describe("Workflows", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/browser_session/reset_profile")
+            .post("/v1/agents/workflow_permanent_id/browser_session/reset_profile")
             .respondWith()
             .statusCode(404)
             .jsonBody(rawResponseBody)
             .build();
 
         await expect(async () => {
-            return await client.workflows.resetWorkflowBrowserProfile("workflow_permanent_id");
+            return await client.agents.resetWorkflowBrowserProfile("workflow_permanent_id");
         }).rejects.toThrow(Skyvern.NotFoundError);
     });
 
@@ -45,14 +45,14 @@ describe("Workflows", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/browser_session/reset_profile")
+            .post("/v1/agents/workflow_permanent_id/browser_session/reset_profile")
             .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)
             .build();
 
         await expect(async () => {
-            return await client.workflows.resetWorkflowBrowserProfile("workflow_permanent_id");
+            return await client.agents.resetWorkflowBrowserProfile("workflow_permanent_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -63,14 +63,14 @@ describe("Workflows", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/browser_session/reset_profile")
+            .post("/v1/agents/workflow_permanent_id/browser_session/reset_profile")
             .respondWith()
             .statusCode(500)
             .jsonBody(rawResponseBody)
             .build();
 
         await expect(async () => {
-            return await client.workflows.resetWorkflowBrowserProfile("workflow_permanent_id");
+            return await client.agents.resetWorkflowBrowserProfile("workflow_permanent_id");
         }).rejects.toThrow(Skyvern.InternalServerError);
     });
 });

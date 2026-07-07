@@ -1,6 +1,6 @@
 {
     "name": "@skyvern/client",
-    "version": "1.0.44",
+    "version": "1.0.45",
     "private": false,
     "repository": {
         "type": "git",
@@ -52,7 +52,7 @@
     "devDependencies": {
         "webpack": "^5.97.1",
         "ts-loader": "^9.5.1",
-        "vitest": "^3.2.6",
+        "vitest": "^3.2.4",
         "msw": "2.11.2",
         "@types/node": "^18.19.70",
         "typescript": "~5.7.2",
@@ -73,13 +73,5 @@
     "publishConfig": {
         "access": "public",
         "provenance": true
-    },
-    "pnpm": {
-        "overrides": {
-            "fast-uri": ">=3.1.2",
-            "rollup": ">=4.59.0",
-            "serialize-javascript": ">=7.0.3",
-            "vite": ">=7.3.5"
-        }
     }
 }

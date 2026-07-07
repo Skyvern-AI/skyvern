@@ -7,16 +7,16 @@ import * as environments from "../../../../environments.js";
 import * as errors from "../../../../errors/index.js";
 import * as Skyvern from "../../../index.js";
 
-export declare namespace Workflows {
+export declare namespace Agents {
     export interface Options extends BaseClientOptions {}
 
     export interface RequestOptions extends BaseRequestOptions {}
 }
 
-export class Workflows {
-    protected readonly _options: Workflows.Options;
+export class Agents {
+    protected readonly _options: Agents.Options;
 
-    constructor(_options: Workflows.Options = {}) {
+    constructor(_options: Agents.Options = {}) {
         this._options = _options;
     }
 
@@ -24,18 +24,18 @@ export class Workflows {
      * Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.
      *
      * @param {string} workflowPermanentId - The permanent ID of the workflow. Starts with `wpid_`.
-     * @param {Workflows.RequestOptions} requestOptions - Request-specific configuration.
+     * @param {Agents.RequestOptions} requestOptions - Request-specific configuration.
      *
      * @throws {@link Skyvern.NotFoundError}
      * @throws {@link Skyvern.UnprocessableEntityError}
      * @throws {@link Skyvern.InternalServerError}
      *
      * @example
-     *     await client.workflows.resetWorkflowBrowserProfile("wpid_123")
+     *     await client.agents.resetWorkflowBrowserProfile("wpid_123")
      */
     public resetWorkflowBrowserProfile(
         workflowPermanentId: string,
-        requestOptions?: Workflows.RequestOptions,
+        requestOptions?: Agents.RequestOptions,
     ): core.HttpResponsePromise<void> {
         return core.HttpResponsePromise.fromPromise(
             this.__resetWorkflowBrowserProfile(workflowPermanentId, requestOptions),
@@ -44,7 +44,7 @@ export class Workflows {
 
     private async __resetWorkflowBrowserProfile(
         workflowPermanentId: string,
-        requestOptions?: Workflows.RequestOptions,
+        requestOptions?: Agents.RequestOptions,
     ): Promise<core.WithRawResponse<void>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
@@ -56,7 +56,7 @@ export class Workflows {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/browser_session/reset_profile`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/browser_session/reset_profile`,
             ),
             method: "POST",
             headers: _headers,
@@ -95,7 +95,7 @@ export class Workflows {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling POST /v1/workflows/{workflow_permanent_id}/browser_session/reset_profile.",
+                    "Timeout exceeded when calling POST /v1/agents/{workflow_permanent_id}/browser_session/reset_profile.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
