@@ -321,8 +321,8 @@ class TestCustomSelectCandidates:
         ]
 
         assert _custom_select_candidates_from_elements(tree) == [
-            {"label": "Job Board", "element_id": "source-job-board", "value": "job-board"},
-            {"label": "County A", "element_id": "county-a-label", "value": "County A"},
+            {"label": "Job Board", "element_id": "source-job-board", "value": "job-board", "is_choice_input": False},
+            {"label": "County A", "element_id": "county-a-label", "value": "County A", "is_choice_input": True},
         ]
 
     def test_extracts_menuitemradio_with_aria_checked_state(self) -> None:
@@ -344,7 +344,37 @@ class TestCustomSelectCandidates:
         ]
 
         assert _custom_select_candidates_from_elements(tree) == [
-            {"label": "Choice", "element_id": "choice-radio", "value": None}
+            {"label": "Choice", "element_id": "choice-radio", "value": None, "is_choice_input": True}
+        ]
+
+    def test_role_option_wrapping_checkbox_is_choice_input_shaped(self) -> None:
+        tree = [
+            {
+                "id": "opt-panel",
+                "tagName": "div",
+                "attributes": {"role": "listbox"},
+                "children": [
+                    {
+                        "id": "opt-choice",
+                        "tagName": "div",
+                        "attributes": {"role": "option"},
+                        "text": "Choice",
+                        "interactable": True,
+                        "children": [
+                            {
+                                "id": "opt-choice-input",
+                                "tagName": "input",
+                                "attributes": {"type": "checkbox"},
+                                "interactable": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        assert _custom_select_candidates_from_elements(tree) == [
+            {"label": "Choice", "element_id": "opt-choice", "value": None, "is_choice_input": True}
         ]
 
 
@@ -683,7 +713,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="Job Board",
-            get_option_candidates=lambda: [{"label": "Job Board", "element_id": "source-job-board", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": True}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -698,6 +730,45 @@ class TestDeterministicCustomSelect:
         assert matched_label == "Job Board"
         assert action_result.exception_message is not None
         assert "could not be verified" in action_result.exception_message
+        selected_element.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_clicked_but_unverified_non_choice_option_soft_fails_to_llm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler.app,
+            "EXPERIMENTATION_PROVIDER",
+            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+        )
+        monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+        monkeypatch.setattr(
+            handler.SkyvernFrame,
+            "evaluate",
+            _stub_evaluate(
+                matched_state={"label": "Choice", "ariaSelected": False, "selectedAttr": False, "checked": False},
+                committed=False,
+            ),
+        )
+        selected_element = _FakeCustomElement()
+        selected_element.get_locator().count = AsyncMock(return_value=1)
+        # A button/div-anchored single-select listbox (role=option, not checkbox/radio) can be
+        # safely replayed by the LLM mini-agent, so an unverified click must soft-fail.
+        readback_scope_element = _FakeAnchorElement(tag_name="button")
+
+        result = await _select_deterministic_custom_option(
+            target_value="Choice",
+            get_option_candidates=lambda: [
+                {"label": "Choice", "element_id": "choice-option", "value": None, "is_choice_input": False}
+            ],
+            field_context={},
+            page=MagicMock(),
+            get_skyvern_element=AsyncMock(return_value=selected_element),
+            get_readback_scope_element=AsyncMock(return_value=readback_scope_element),
+            task=_task(),  # type: ignore[arg-type]
+        )
+
+        assert result is None
         selected_element.click.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -853,14 +924,17 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
         fake_frame = MagicMock()
         fake_frame.safe_wait_for_animation_end = AsyncMock()
+        # A checkbox-shaped option is required here: only checkbox/radio panels hard-fail on an
+        # unverified click (see SKY-11527), and this test asserts hard-fail behavior propagates
+        # through handle_select_option_action without falling back to a value-based re-select.
         fake_incremental = _FakeIncrementalScrapePage(
             [
                 [{"id": "opened-option"}],
                 [
                     {
                         "id": "choice-option",
-                        "tagName": "div",
-                        "attributes": {"role": "option"},
+                        "tagName": "input",
+                        "attributes": {"type": "checkbox"},
                         "text": "Choice",
                         "interactable": True,
                     }
