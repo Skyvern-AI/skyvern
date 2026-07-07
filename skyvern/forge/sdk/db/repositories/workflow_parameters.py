@@ -53,6 +53,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
 )
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -226,6 +227,8 @@ class WorkflowParametersRepository(BaseRepository):
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):
@@ -801,6 +804,7 @@ class WorkflowParametersRepository(BaseRepository):
                 return None
             return TaskGeneration.model_validate(task_generation)
 
+    @traced(name="skyvern.db.create_action")
     @db_operation("create_action")
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:

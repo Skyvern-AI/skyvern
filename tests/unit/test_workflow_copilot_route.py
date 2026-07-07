@@ -27,6 +27,15 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.schema_incompatibility import (
+    SchemaIncompatibility,
+    render_schema_incompatibility_user_reason,
+)
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_outcome import (
+    build_minimal_turn_outcome,
+    with_copilot_code_mode_diagnostics,
+)
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
@@ -34,12 +43,15 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_chat_audio,
     workflow_copilot_chat_post,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
+from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
 
 
 def _make_chat_request(mode: str | None = None, code_block: bool | None = None) -> WorkflowCopilotChatRequest:
@@ -223,24 +235,6 @@ def test_terminal_narrative_metadata_preserves_payload_and_adds_contract_fields(
     assert "proposalDisposition" not in payload
 
 
-def _install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Capture the stream handler that the route hands to EventSourceStream."""
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def fake_create(request: object, handler: object, ping_interval: int = 10) -> object:
-        del request, ping_interval
-        captured["handler"] = handler
-        return sentinel
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.FastAPIEventSourceStream.create",
-        fake_create,
-    )
-    captured["sentinel"] = sentinel
-    return captured
-
-
 def _install_mock_provider(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -257,58 +251,6 @@ def _install_mock_provider(
 
 
 @pytest.mark.asyncio
-async def test_flag_off_dispatches_to_old_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flag off -> workflow_copilot_chat_post must use the old-copilot stream handler.
-
-    We verify by patching _new_copilot_chat_post to something that would
-    raise if called, then confirming the old path was used instead.
-    """
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
-    # force_stub_app's _LazyNamespace auto-creates truthy AsyncMocks for any attribute
-    # access, so the provider needs an explicit False stub to keep this test accurate.
-    _install_mock_provider(monkeypatch, return_value=False)
-
-    new_copilot_mock = AsyncMock(side_effect=AssertionError("new-copilot path must not run when flag is off"))
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
-        new_copilot_mock,
-    )
-
-    captured = _install_fake_create(monkeypatch)
-
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
-
-    assert response is captured["sentinel"]
-    new_copilot_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_flag_on_dispatches_to_new_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flag on -> workflow_copilot_chat_post delegates to _new_copilot_chat_post."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-
-    sentinel = object()
-    new_copilot_mock = AsyncMock(return_value=sentinel)
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
-        new_copilot_mock,
-    )
-
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
-
-    assert response is sentinel
-    new_copilot_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """mode='ask' must take the v1 path even when the settings flag is on."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
@@ -319,7 +261,7 @@ async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.Monke
         new_copilot_mock,
     )
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -362,7 +304,7 @@ async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch)
         "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
         new_copilot_mock,
     )
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -378,74 +320,6 @@ async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch)
     response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
     assert response is new_copilot_mock.return_value
     new_copilot_mock.assert_awaited_once()
-
-
-def _setup_new_copilot_mocks(
-    monkeypatch: pytest.MonkeyPatch,
-    chat: SimpleNamespace,
-    original_workflow: SimpleNamespace,
-    agent_result: SimpleNamespace,
-) -> AsyncMock:
-    """Wire up everything the new-copilot stream handler touches.
-
-    Returns the restore-on-error mock so callers can assert on it.
-    """
-    if not hasattr(agent_result, "response_type"):
-        agent_result.response_type = "REPLY"
-    if not hasattr(agent_result, "total_tokens"):
-        agent_result.total_tokens = None
-    if not hasattr(agent_result, "output_policy_diagnostics"):
-        agent_result.output_policy_diagnostics = None
-    if not hasattr(agent_result, "turn_id"):
-        agent_result.turn_id = None
-    if not hasattr(agent_result, "narrative_summary"):
-        agent_result.narrative_summary = None
-    if not hasattr(agent_result, "narrative_payload"):
-        agent_result.narrative_payload = None
-
-    async def fake_llm_handler(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        return None
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
-        fake_llm_handler,
-    )
-
-    restore_mock = AsyncMock()
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot._restore_workflow_definition",
-        restore_mock,
-    )
-
-    run_agent_mock = AsyncMock(return_value=agent_result)
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
-        run_agent_mock,
-    )
-
-    # DB surfaces: the new-copilot handler reaches the repository directly via
-    # app.DATABASE.workflow_params.*  and app.DATABASE.workflows.*  -- mock
-    # those attribute chains.
-    app.DATABASE.workflow_params = SimpleNamespace(
-        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
-        get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
-        update_workflow_copilot_chat=AsyncMock(),
-        create_workflow_copilot_chat_message=AsyncMock(
-            return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
-        ),
-    )
-    app.DATABASE.workflows = SimpleNamespace(
-        get_workflow_by_permanent_id=AsyncMock(return_value=original_workflow),
-    )
-    app.DATABASE.observer = SimpleNamespace(
-        get_workflow_run_blocks=AsyncMock(return_value=[]),
-    )
-    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
-    app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
-    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
-
-    return restore_mock
 
 
 @pytest.mark.asyncio
@@ -474,7 +348,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -503,7 +377,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         turn_outcome=None,
     )
 
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -531,7 +405,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 @pytest.mark.asyncio
 async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -634,7 +508,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     expected_summary: str,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -659,7 +533,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         unvalidated=False,
         turn_outcome=None,
     )
-    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     monkeypatch.setattr(
         "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
         AsyncMock(side_effect=error),
@@ -717,7 +591,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -742,7 +616,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
         unvalidated=False,
         turn_outcome=None,
     )
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     finalise_results: list[object] = []
     original_finalise = workflow_copilot_route._finalise_normal_turn
 
@@ -840,7 +714,7 @@ async def test_proposed_workflow_cleared_on_restore(
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -869,7 +743,7 @@ async def test_proposed_workflow_cleared_on_restore(
         turn_outcome=None,
     )
 
-    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -914,7 +788,7 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -965,7 +839,7 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
         turn_outcome=None,
     )
 
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     workflow_service = SimpleNamespace(update_workflow_definition=AsyncMock())
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
     monkeypatch.setattr(
@@ -1011,7 +885,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -1043,7 +917,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         turn_outcome=None,
     )
 
-    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -1086,7 +960,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -1125,7 +999,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
         turn_outcome=None,
     )
 
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -1234,7 +1108,7 @@ async def test_provider_failure_falls_back_to_legacy(monkeypatch: pytest.MonkeyP
         new_copilot_mock,
     )
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -1258,7 +1132,7 @@ async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) 
         new_copilot_mock,
     )
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -1282,7 +1156,7 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     _install_mock_provider(monkeypatch, return_value=False)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -1374,3 +1248,74 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
     persisted = calls[0].kwargs["proposed_workflow"]
     assert persisted is not None
     assert persisted.get("_copilot_unvalidated") is not True
+
+
+def _schema_incompatibility_ctx() -> SimpleNamespace:
+    incompat = SchemaIncompatibility(
+        block_label="capture_row",
+        incompatible_paths=("shoebox",),
+        known_output_paths=("order_date", "order_total"),
+    )
+    return SimpleNamespace(
+        latest_schema_incompatibility=incompat,
+        turn_halt=SimpleNamespace(kind=TurnHaltKind.SCHEMA_INCOMPATIBILITY),
+        code_native_pending_capability=None,
+        last_test_ok=None,
+        last_failed_workflow_yaml=None,
+    )
+
+
+def test_schema_incompatibility_turn_outcome_is_not_repair_ceiling() -> None:
+    # SKY-11380: the schema-incompatibility halt is a distinct typed outcome; it must
+    # not masquerade as the repair-ceiling diagnostic on the persisted turn.
+    ctx = _schema_incompatibility_ctx()
+    reply = render_schema_incompatibility_user_reason(ctx.latest_schema_incompatibility)
+    outcome = with_copilot_code_mode_diagnostics(
+        build_minimal_turn_outcome(reply, ResponseKind.DIAGNOSE, terminal_reason="turn_halt:schema_incompatibility"),
+        ctx,
+    )
+
+    assert outcome.copilot_repair_ceiling_hit is False
+    assert outcome.copilot_schema_incompatibility is not None
+    assert outcome.copilot_schema_incompatibility["incompatible_paths"] == ["shoebox"]
+    assert outcome.copilot_schema_incompatibility["known_output_paths"] == ["order_date", "order_total"]
+
+
+def test_schema_incompatibility_persists_and_recalls_for_followup_turn() -> None:
+    # The follow-up "what was the problem?" turn reads the prior assistant outcome from
+    # chat history; the structured incompatibility survives the round-trip so it can be reported.
+    ctx = _schema_incompatibility_ctx()
+    reply = render_schema_incompatibility_user_reason(ctx.latest_schema_incompatibility)
+    outcome = with_copilot_code_mode_diagnostics(
+        build_minimal_turn_outcome(reply, ResponseKind.DIAGNOSE, terminal_reason="turn_halt:schema_incompatibility"),
+        ctx,
+    )
+    now = datetime.now(timezone.utc)
+    messages = [
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="m1",
+            workflow_copilot_chat_id="c1",
+            sender=WorkflowCopilotChatSender.USER,
+            content="add a shoebox field to the extraction",
+            created_at=now,
+            modified_at=now,
+        ),
+        WorkflowCopilotChatMessage(
+            workflow_copilot_chat_message_id="m2",
+            workflow_copilot_chat_id="c1",
+            sender=WorkflowCopilotChatSender.AI,
+            content=reply,
+            turn_outcome=outcome,
+            created_at=now,
+            modified_at=now,
+        ),
+    ]
+
+    recalled = workflow_copilot_route._latest_assistant_turn_outcome(messages)
+
+    assert recalled is not None
+    assert recalled.terminal_reason == "turn_halt:schema_incompatibility"
+    assert recalled.copilot_schema_incompatibility is not None
+    assert recalled.copilot_schema_incompatibility["incompatible_paths"] == ["shoebox"]
+    # The persisted reply reports the problem in product language.
+    assert "shoebox" in messages[1].content

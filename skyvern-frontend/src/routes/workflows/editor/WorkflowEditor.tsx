@@ -1,30 +1,50 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useEffect } from "react";
-import { usePostHog } from "posthog-js/react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
-import {
-  getElements,
-  upgradeWorkflowBlocksV1toV2,
-} from "./workflowEditorUtils";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
+import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getInitialParameters } from "./utils";
+import { StudioShell } from "../studio/StudioShell";
 import { Workspace } from "./Workspace";
 import { ProductTour } from "@/components/onboarding/ProductTour";
 import { useProductTourShortcut } from "@/hooks/useProductTourShortcut";
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
   const [searchParams] = useSearchParams();
-  const posthog = usePostHog();
-  const { data: workflow, isLoading } = useWorkflowQuery({
+  const studioEnabled = useWorkflowStudioEnabled();
+  const {
+    data: fetchedWorkflow,
+    isLoading,
+    isError: workflowQueryFailed,
+  } = useWorkflowQuery({
     workflowPermanentId,
   });
+
+  // Runs outlive their agent: the workflow GET 404s once the agent is deleted,
+  // but a ?wr= deep link can still be served from the run's embedded workflow
+  // snapshot (the same query the run panes use), in a read-only degraded mode.
+  const deepLinkRunId = searchParams.get("wr");
+  const { data: fallbackRun, isLoading: fallbackRunIsLoading } =
+    useWorkflowRunWithWorkflowQuery(
+      studioEnabled && deepLinkRunId
+        ? { workflowRunId: deepLinkRunId }
+        : undefined,
+    );
+  const deletedWorkflowSnapshot =
+    studioEnabled && workflowQueryFailed && fallbackRun?.workflow?.deleted_at
+      ? fallbackRun.workflow
+      : undefined;
+  const effectiveWorkflow = fetchedWorkflow ?? deletedWorkflowSnapshot;
 
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
@@ -39,21 +59,21 @@ function WorkflowEditor() {
 
   useMountEffect(() => blockOutputStore.reset());
 
-  useMountEffect(() => {
-    const via = searchParams.get("via");
-    if (via) {
-      posthog?.capture("copilot.discover.started", { entry_point: via });
-    }
-  });
+  useViaEntryPointCapture();
 
   useEffect(() => {
-    if (workflow) {
-      const initialParameters = getInitialParameters(workflow);
+    if (effectiveWorkflow) {
+      const initialParameters = getInitialParameters(effectiveWorkflow);
       setParameters(initialParameters);
     }
-  }, [workflow, setParameters]);
+  }, [effectiveWorkflow, setParameters]);
 
-  if (isLoading || isGlobalWorkflowsLoading) {
+  const awaitingRunFallback =
+    studioEnabled &&
+    workflowQueryFailed &&
+    Boolean(deepLinkRunId) &&
+    fallbackRunIsLoading;
+  if (isLoading || isGlobalWorkflowsLoading || awaitingRunFallback) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
         <div className="animate-pulse">
@@ -63,25 +83,25 @@ function WorkflowEditor() {
     );
   }
 
-  if (!workflow) {
+  if (!effectiveWorkflow) {
     return null;
   }
+  const workflow = effectiveWorkflow;
+  const workflowDeleted = Boolean(workflow.deleted_at);
 
   const isGlobalWorkflow = globalWorkflows?.some(
     (globalWorkflow) =>
       globalWorkflow.workflow_permanent_id === workflowPermanentId,
   );
 
-  // Auto-upgrade v1 workflows to v2 by assigning sequential next_block_label values
-  const workflowVersion = workflow.workflow_definition.version ?? 1;
-  const blocksToRender =
-    workflowVersion < 2
-      ? upgradeWorkflowBlocksV1toV2(workflow.workflow_definition.blocks)
-      : workflow.workflow_definition.blocks;
+  // getElements derives display routing (sequential defaulting + validation); the stored blocks are passed through unchanged.
+  const blocksToRender = workflow.workflow_definition.blocks;
 
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
+    pinSavedSessionIp: workflow.pin_saved_session_ip ?? false,
     browserProfileId: workflow.browser_profile_id ?? null,
+    browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
@@ -97,15 +117,21 @@ function WorkflowEditor() {
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
+    enableSelfHealing: workflow.enable_self_healing ?? false,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
     finallyBlockLabel:
       workflow.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
   };
 
-  const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);
+  const elements = getElements(
+    blocksToRender,
+    settings,
+    !isGlobalWorkflow && !workflowDeleted,
+  );
 
   return (
     <div className="relative flex h-screen w-full flex-col">
@@ -120,16 +146,26 @@ function WorkflowEditor() {
           {elements.validationError.message}
         </div>
       ) : null}
-      <div className="relative flex flex-1">
+      <div className="relative flex min-h-0 flex-1">
         <ReactFlowProvider>
-          <Workspace
-            key={workflowPermanentId}
-            initialEdges={elements.edges}
-            initialNodes={elements.nodes}
-            initialTitle={workflow.title}
-            showBrowser={false}
-            workflow={workflow}
-          />
+          {studioEnabled ? (
+            <StudioShell
+              key={workflowPermanentId}
+              initialEdges={elements.edges}
+              initialNodes={elements.nodes}
+              initialTitle={workflow.title}
+              workflow={workflow}
+            />
+          ) : (
+            <Workspace
+              key={workflowPermanentId}
+              initialEdges={elements.edges}
+              initialNodes={elements.nodes}
+              initialTitle={workflow.title}
+              showBrowser={false}
+              workflow={workflow}
+            />
+          )}
         </ReactFlowProvider>
       </div>
       <ProductTour />

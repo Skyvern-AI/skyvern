@@ -63,6 +63,48 @@ def _row_result_packet() -> dict:
     }
 
 
+def _max_loaded_result_packet() -> dict:
+    large_text = "Jane Customer account 123 statement ready " * 40
+    return {
+        "forms": [],
+        "navigation_targets": [{"selector": "#details", "text": "Details", "href": "/details"}],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": f"#results-{index}-" + ("x" * 220),
+                "row_selector": f"tr.statement-{index}-" + ("y" * 220),
+                "text": large_text,
+                "row_count": 100 + index,
+                "sample_rows": [
+                    {"name": f"Jane Customer {index}", "account": "1234567890", "amount": "$999.99"},
+                    {"name": f"John Customer {index}", "account": "0987654321", "amount": "$888.88"},
+                    {"name": f"Pat Customer {index}", "account": "1111111111", "amount": "$777.77"},
+                ],
+            }
+            for index in range(8)
+        ],
+    }
+
+
+def _single_max_structural_loaded_result_packet() -> dict:
+    return {
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#single-result-" + ("s" * 240),
+                "row_selector": "tr.single-row-" + ("r" * 240),
+                "row_count": 1,
+                "sample_rows": [{"name": "Jane Customer", "account": "1234567890", "amount": "$999.99"}],
+                "text": "Jane Customer account 123 statement ready " * 30,
+                "evidence_source": "evaluate-" + ("e" * 240),
+                "observation_id": "obs-" + ("o" * 240),
+            }
+        ],
+    }
+
+
 def _ctx() -> AgentContext:
     return AgentContext.__new__(AgentContext)
 
@@ -89,6 +131,25 @@ def test_signature_changes_when_controls_change() -> None:
     mutated_packet["navigation_targets"][0]["selector"] = "#print-v2"
     mutated = scouting._actionable_target_identities(mutated_packet)
     assert scouting._actionable_target_signature(base) != scouting._actionable_target_signature(mutated)
+
+
+@pytest.mark.asyncio
+async def test_standalone_controls_only_page_surfaces_grounded_targets(monkeypatch) -> None:
+    async def fake_evidence(ctx, *, url):
+        return {
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "clickable_controls": [{"selector": "#biz-tile", "text": "Business"}],
+        }
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    result = {"ok": True, "data": {"url": "https://example.com/account"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/account")
+    assert result["data"]["actionable_targets"] == [{"selector": "#biz-tile", "text": "Business"}]
 
 
 @pytest.mark.asyncio
@@ -134,8 +195,20 @@ async def test_first_loaded_result_table_steers_to_composition_not_click_even_wi
     assert result["data"]["composition_targets"] == {
         "result_container_count": 1,
         "table_result_container_count": 1,
+        "targets": [
+            {
+                "selector": "#results",
+                "is_table": True,
+                "row_count": 2,
+                "sample_rows": ["Result A May 2026 $42.00", "Result B May 2026 $51.00"],
+                "text_excerpt": "Results",
+                "structure_signature": ctx.latest_evaluate_result_composition_steer.targets[0].structure_signature,
+            }
+        ],
+        "structure_signature": ctx.latest_evaluate_result_composition_steer.structure_signature,
     }
     assert ctx.latest_evaluate_result_composition_steer.result_container_count == 1
+    assert ctx.latest_evaluate_result_composition_steer.targets[0].selector == "#results"
     assert ctx.last_evaluate_actionable_signature is None
     assert ctx.last_evaluate_actionable_url is None
 
@@ -157,6 +230,16 @@ async def test_first_loaded_result_rows_without_table_marker_steers_to_compositi
     assert result["data"]["composition_targets"] == {
         "result_container_count": 1,
         "table_result_container_count": 0,
+        "targets": [
+            {
+                "selector": "#results",
+                "is_table": False,
+                "row_count": 1,
+                "sample_rows": ["May 2026 statement available"],
+                "structure_signature": ctx.latest_evaluate_result_composition_steer.targets[0].structure_signature,
+            }
+        ],
+        "structure_signature": ctx.latest_evaluate_result_composition_steer.structure_signature,
     }
 
 
@@ -263,9 +346,98 @@ async def test_first_loaded_result_table_sheds_large_payload_but_keeps_compositi
     serialized = json.dumps(result, default=str)
     assert result["data"].get("next_action") == "compose_extraction"
     assert result["data"].get("composition_targets")
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.phase == "scout_evaluate"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "loaded_result_targets_observed"
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
     assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
     assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
     assert "compose_extraction" in serialized
+
+
+@pytest.mark.asyncio
+async def test_loaded_result_composition_targets_are_cap_aware_for_max_shaped_evaluate(monkeypatch) -> None:
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/results"
+
+    async def fake(c, *, url):
+        return _max_loaded_result_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "z" * 10000
+    result = {
+        "ok": True,
+        "data": {
+            "url": url,
+            "title": "Loaded results",
+            "result": {"html": big, "text": big},
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
+
+    serialized = json.dumps(result, default=str)
+    composition_targets = result["data"]["composition_targets"]
+    target = composition_targets["targets"][0]
+    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert result["data"]["next_action"] == "compose_extraction"
+    assert composition_targets["result_container_count"] == 8
+    assert composition_targets["table_result_container_count"] == 8
+    assert len(composition_targets["targets"]) == 1
+    assert target["selector"].startswith("#results-0-")
+    assert target["is_table"] is True
+    assert target["row_selector"].startswith("tr.statement-0-")
+    assert target["row_count"] == 100
+    assert target["structure_signature"]
+    assert composition_targets["structure_signature"]
+    assert "sample_rows" not in target
+    assert "text_excerpt" not in target
+    assert "Jane Customer" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_single_loaded_result_structural_target_fits_evaluate_cap_with_url_title(monkeypatch) -> None:
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/results?" + ("query=value&" * 20)
+
+    async def fake(c, *, url):
+        return _single_max_structural_loaded_result_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "z" * 10000
+    result = {
+        "ok": True,
+        "data": {
+            "url": url,
+            "title": "Loaded result " + ("summary " * 20),
+            "result": {"html": big, "text": big},
+        },
+    }
+
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
+
+    serialized = json.dumps(result, default=str)
+    composition_targets = result["data"]["composition_targets"]
+    target = composition_targets["targets"][0]
+    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert result["data"]["next_action"] == "compose_extraction"
+    assert composition_targets["result_container_count"] == 1
+    assert composition_targets["table_result_container_count"] == 1
+    assert len(composition_targets["targets"]) == 1
+    assert target["selector"].startswith("#single-result-")
+    assert target["is_table"] is True
+    assert target["row_count"] == 1
+    assert target["structure_signature"]
+    assert composition_targets["structure_signature"]
+    assert "sample_rows" not in target
+    assert "text_excerpt" not in target
+    assert "evidence_source" not in target
+    assert "observation_id" not in target
+    assert "Jane Customer" not in serialized
 
 
 @pytest.mark.asyncio
@@ -341,6 +513,69 @@ def test_identities_cover_all_collections() -> None:
     identities = scouting._actionable_target_identities(_full_packet())
     selectors = {sel for sel, _ in identities}
     assert {"#user", "#login", "#print", "#results", "#close"} <= selectors
+
+
+def test_identities_include_clickable_controls() -> None:
+    packet = {
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "clickable_controls": [
+            {"selector": "#biz-tile", "text": "Business"},
+            {"text": "Residential"},
+        ],
+    }
+    identities = scouting._actionable_target_identities(packet)
+    assert ("#biz-tile", "Business") in identities
+    assert ("", "Residential") in identities
+
+
+def test_identities_order_affordances_before_fields_and_selectors_first() -> None:
+    packet = {
+        "forms": [
+            {
+                "fields": [{"selector": "#user", "text": "Username"}],
+                "submit_controls": [{"selector": "#login", "text": "Log In"}],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+        "clickable_controls": [
+            {"text": "Text only tile"},
+            {"selector": "#biz-tile", "text": "Business"},
+        ],
+    }
+    identities = scouting._actionable_target_identities(packet)
+    positions = {ident: index for index, ident in enumerate(identities)}
+    field_pos = positions[("#user", "Username")]
+    # Click affordances (selector-bearing and text-only) precede the plain input field.
+    assert positions[("#login", "Log In")] < field_pos
+    assert positions[("#biz-tile", "Business")] < field_pos
+    assert positions[("", "Text only tile")] < field_pos
+    # Selector-bearing affordances precede text-only ones.
+    assert positions[("#biz-tile", "Business")] < positions[("", "Text only tile")]
+
+
+def test_click_affordance_identities_only_selector_bearing_affordances() -> None:
+    packet = {
+        "forms": [
+            {
+                "fields": [{"selector": "#user", "text": "Username"}],
+                "submit_controls": [{"selector": "#login", "text": "Log In"}],
+            }
+        ],
+        "navigation_targets": [{"selector": "a.nav", "text": "Nav"}],
+        "result_containers": [{"selector": "#results", "text": "Results"}],
+        "clickable_controls": [
+            {"selector": "#tile", "text": "Tile"},
+            {"text": "Text only"},
+        ],
+        "modal_overlays": [{"dismiss_controls": [{"selector": "#close", "text": "Close"}]}],
+    }
+    identities = scouting._click_affordance_target_identities(packet)
+    selectors = {selector for selector, _ in identities}
+    assert selectors == {"#login", "a.nav", "#tile", "#close"}
+    assert all(selector for selector, _ in identities)
 
 
 @pytest.mark.asyncio

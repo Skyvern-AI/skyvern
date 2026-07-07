@@ -72,22 +72,13 @@ def _ti(mode: TurnIntentMode) -> TurnIntent:
         (TurnIntentMode.UNKNOWN, "go to example and find sortable tables", "", "", BuildPhase.INITIAL),
         # UNKNOWN with a URL in the message -> COMPOSING (URL signal wins).
         (TurnIntentMode.UNKNOWN, "go to https://example.com/x", "", "", BuildPhase.COMPOSING),
-    ],
-)
-def test_initial_build_phase_returns_expected(
-    mode: TurnIntentMode,
-    user_message: str,
-    agent_message: str,
-    workflow_yaml: str,
-    expected: BuildPhase,
-) -> None:
-    assert initial_build_phase(_ti(mode), user_message, agent_message, workflow_yaml) == expected
-
-
-def test_initial_build_phase_lone_goto_url_enters_composing() -> None:
-    # A lone entrypoint goto_url carries a URL signal -> COMPOSING, where the agent
-    # scouts the page and authors (page-acting blocks stay evidence-gated).
-    yaml_text = """
+        # A lone entrypoint goto_url carries a URL signal -> COMPOSING, where the agent
+        # scouts the page and authors (page-acting blocks stay evidence-gated).
+        pytest.param(
+            TurnIntentMode.BUILD,
+            "do that thing",
+            "do that thing",
+            """
 title: T
 workflow_definition:
   parameters: []
@@ -95,17 +86,17 @@ workflow_definition:
     - block_type: goto_url
       label: open
       url: https://example.com/page
-"""
-    assert (
-        initial_build_phase(_ti(TurnIntentMode.BUILD), "do that thing", "do that thing", yaml_text)
-        == BuildPhase.COMPOSING
-    )
-
-
-def test_initial_build_phase_existing_composition_stays_composing() -> None:
-    # A draft that already composes a page-acting block resolves to COMPOSING on a
-    # later "run it" / edit turn.
-    yaml_text = """
+""",
+            BuildPhase.COMPOSING,
+            id="lone goto_url -> COMPOSING",
+        ),
+        # A draft that already composes a page-acting block resolves to COMPOSING on a
+        # later "run it" / edit turn.
+        pytest.param(
+            TurnIntentMode.BUILD,
+            "run it",
+            "run it",
+            """
 title: T
 workflow_definition:
   parameters: []
@@ -116,14 +107,17 @@ workflow_definition:
     - block_type: navigation
       label: act
       navigation_goal: do the thing
-"""
-    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "run it", "run it", yaml_text) == BuildPhase.COMPOSING
-
-
-def test_initial_build_phase_goto_url_plus_action_is_composition() -> None:
-    # A goto_url + a no-url action turn resolves to COMPOSING, with block-runs and
-    # browser tools available.
-    yaml_text = """
+""",
+            BuildPhase.COMPOSING,
+            id="goto_url+navigation -> COMPOSING",
+        ),
+        # A goto_url + a no-url action turn resolves to COMPOSING, with block-runs and
+        # browser tools available.
+        pytest.param(
+            TurnIntentMode.BUILD,
+            "run it",
+            "run it",
+            """
 title: T
 workflow_definition:
   parameters: []
@@ -134,12 +128,16 @@ workflow_definition:
     - block_type: action
       label: click_it
       navigation_goal: click the button
-"""
-    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "run it", "run it", yaml_text) == BuildPhase.COMPOSING
-
-
-def test_initial_build_phase_yaml_with_empty_url_does_not_unlock() -> None:
-    yaml_text = """
+""",
+            BuildPhase.COMPOSING,
+            id="goto_url+action -> COMPOSING",
+        ),
+        # An empty-url goto_url carries no URL signal -> INITIAL.
+        pytest.param(
+            TurnIntentMode.BUILD,
+            "do thing",
+            "do thing",
+            """
 title: T
 workflow_definition:
   parameters: []
@@ -147,8 +145,20 @@ workflow_definition:
     - block_type: goto_url
       label: open
       url: ""
-"""
-    assert initial_build_phase(_ti(TurnIntentMode.BUILD), "do thing", "do thing", yaml_text) == BuildPhase.INITIAL
+""",
+            BuildPhase.INITIAL,
+            id="empty-url goto_url -> INITIAL",
+        ),
+    ],
+)
+def test_initial_build_phase_returns_expected(
+    mode: TurnIntentMode,
+    user_message: str,
+    agent_message: str,
+    workflow_yaml: str,
+    expected: BuildPhase,
+) -> None:
+    assert initial_build_phase(_ti(mode), user_message, agent_message, workflow_yaml) == expected
 
 
 def test_initial_build_phase_none_turn_intent_acts_like_unknown_mode() -> None:
@@ -167,8 +177,11 @@ def test_initial_build_phase_yaml_malformed_falls_back_to_no_url() -> None:
 # ---------------- _yaml_has_target_url ----------------
 
 
-def test_yaml_has_target_url_detects_navigation_block_url() -> None:
-    yaml_text = """
+@pytest.mark.parametrize(
+    "yaml_text,expected",
+    [
+        pytest.param(
+            """
 title: T
 workflow_definition:
   parameters: []
@@ -177,12 +190,12 @@ workflow_definition:
       label: visit
       url: https://example.com/x
       navigation_goal: visit it
-"""
-    assert _yaml_has_target_url(yaml_text) is True
-
-
-def test_yaml_has_target_url_ignores_non_navigation_blocks() -> None:
-    yaml_text = """
+""",
+            True,
+            id="navigation-block URL detected",
+        ),
+        pytest.param(
+            """
 title: T
 workflow_definition:
   parameters: []
@@ -190,13 +203,16 @@ workflow_definition:
     - block_type: code
       label: c
       code: "x = 1"
-"""
-    assert _yaml_has_target_url(yaml_text) is False
-
-
-def test_yaml_has_target_url_handles_empty_and_none() -> None:
-    assert _yaml_has_target_url(None) is False
-    assert _yaml_has_target_url("") is False
+""",
+            False,
+            id="non-navigation block ignored",
+        ),
+        pytest.param(None, False, id="None yaml -> False"),
+        pytest.param("", False, id="empty yaml -> False"),
+    ],
+)
+def test_yaml_has_target_url(yaml_text: str | None, expected: bool) -> None:
+    assert _yaml_has_target_url(yaml_text) is expected
 
 
 # ---------------- transition helpers ----------------

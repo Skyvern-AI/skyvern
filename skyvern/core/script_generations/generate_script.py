@@ -2130,6 +2130,8 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         "azure_storage_account_name",
         "azure_storage_account_key",
         "azure_blob_container_name",
+        "google_credential_id",
+        "google_drive_folder_id",
         "path",
     ]:
         if block.get(key) is not None:
@@ -2328,6 +2330,18 @@ def _build_http_request_statement(block: dict[str, Any]) -> cst.SimpleStatementL
             cst.Arg(
                 keyword=cst.Name("body"),
                 value=_value(block.get("body")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("secret_response_paths") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("secret_response_paths"),
+                value=_value(block.get("secret_response_paths")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),

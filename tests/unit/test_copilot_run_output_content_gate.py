@@ -12,10 +12,15 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    grade_fallback_floor_reached_end_state_criteria,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy, build_classifier_fallback_floor
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tools import (
     _analyze_run_blocks,
     _current_workflow_has_evidence_block,
@@ -23,8 +28,11 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_unfinished_run_verification_candidate,
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
+    run_execution,
 )
 from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter_payloads
+from skyvern.forge.sdk.copilot.tools.blockers import _code_output_has_goal_content
+from skyvern.forge.sdk.copilot.tools.completion import _apply_present_value_upgrades, _build_run_evidence_snapshot
 from skyvern.forge.sdk.copilot.tools.run_execution import _attach_registered_output_parameter_values
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 
@@ -85,6 +93,27 @@ def _structured_record_payload(**overrides: Any) -> dict[str, Any]:
         ],
         "overall_status": "Active",
         "evidence_text": "Opened Details page",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _validation_review_payload(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "validation_only": True,
+        "submit_or_finalize_clicked": False,
+        "pre_submit_review_reached": True,
+        "final_controls_visible": ["Submit Request", "Back"],
+        "review_values": {
+            "Service Address": "1234 Sample Utility Way, Testville, CA 94016",
+            "Requested Start Date": "2026-06-22",
+        },
+        "evidence_text": (
+            "Start Service - Review\n"
+            "Service Address\n1234 Sample Utility Way, Testville, CA 94016\n"
+            "Requested Start Date\n2026-06-22\n"
+            "Submit Request\nBack"
+        ),
     }
     payload.update(overrides)
     return payload
@@ -151,6 +180,27 @@ def _blocked_status_run_result(block_type: str = "CODE") -> dict[str, Any]:
                 "search_registry_person",
                 {"status": "blocked_by_challenge", "records": []},
                 block_type=block_type,
+            )
+        ]
+    )
+
+
+def _domain_blocker_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "inspect_access_path",
+                {
+                    "login_only": True,
+                    "blocked_by": "online_account_required",
+                    "public_form_exists": False,
+                    "visible_page_path_label": "Account login page",
+                    "recommended_next_action": "Ask the user for online account access before continuing.",
+                    "safety_flags": {
+                        "no_sensitive_data_entered": True,
+                        "no_submission_attempted": True,
+                    },
+                },
             )
         ]
     )
@@ -224,6 +274,48 @@ def _goal_field_success_run_result() -> dict[str, Any]:
             )
         ]
     )
+
+
+def _boolean_goal_path_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "inspect_access_path",
+                {
+                    "public_form_exists": False,
+                    "login_only": True,
+                },
+            )
+        ]
+    )
+
+
+def _domain_path_summary_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "inspect_access_path",
+                {
+                    "public_form_exists": False,
+                    "login_only": True,
+                    "visible_page_path_label": "Start service sign-in gate",
+                    "recommended_next_action": "Stop before account-specific setup.",
+                },
+            )
+        ]
+    )
+
+
+def _domain_path_alias_summary_run_result(*, include_null_alias_source: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "public_form_exists": False,
+        "path_is_login_only": True,
+        "visible_page_path_label": "Start service sign-in gate",
+        "recommended_next_action": "Stop before account-specific setup.",
+    }
+    if include_null_alias_source:
+        payload["login_only"] = None
+    return _run_result([_code_block("inspect_access_path", payload)])
 
 
 def _nested_code_output_extraction_run_result() -> dict[str, Any]:
@@ -379,6 +471,41 @@ def _terminal_metadata_with_top_level_goal_fields(label: str = "expand_result_ro
     return entry
 
 
+def _terminal_metadata_with_boolean_goal_fields(label: str = "inspect_access_path") -> dict[str, Any]:
+    entry = _terminal_metadata_entry(label)
+    goal_value_paths = ["public_form_exists", "login_only"]
+    entry["claimed_outcomes"][0]["goal_value_paths"] = goal_value_paths
+    entry["terminal_verifier_expectations"] = [
+        {
+            "id": "expectation:goal",
+            "text": "Terminal verification observes the access classification flags.",
+            "criteria_ids": ["criterion:goal_0"],
+            "goal_value_paths": goal_value_paths,
+        }
+    ]
+    return entry
+
+
+def _terminal_metadata_with_path_summary_goal_fields(label: str = "inspect_access_path") -> dict[str, Any]:
+    entry = _terminal_metadata_entry(label)
+    goal_value_paths = [
+        "public_form_exists",
+        "login_only",
+        "visible_page_path_label",
+        "recommended_next_action",
+    ]
+    entry["claimed_outcomes"][0]["goal_value_paths"] = goal_value_paths
+    entry["terminal_verifier_expectations"] = [
+        {
+            "id": "expectation:goal",
+            "text": "Terminal verification observes access classification and next action.",
+            "criteria_ids": ["criterion:goal_0"],
+            "goal_value_paths": goal_value_paths,
+        }
+    ]
+    return entry
+
+
 def test_blocked_flag_run_reports_structured_blocker() -> None:
     blocker = _run_blocks_structured_blocker_message(_blocked_flag_run_result())
     assert blocker is not None
@@ -452,6 +579,85 @@ def test_blocked_status_value_rejected_deterministically(block_type: str) -> Non
     assert ctx.last_full_workflow_test_ok is False
 
 
+def test_terminal_challenge_blocker_preempts_satisfied_completion() -> None:
+    result = _blocked_flag_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.completion_criteria_turn_state = SimpleNamespace(
+        adjudication_all_no_evidence_events=[],
+        fully_satisfied_workflow_yaml=None,
+        last_verdict_state_counts={},
+    )
+
+    _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
+
+    assert result["ok"] is False
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.last_test_suspicious_success is False
+    assert verified_goal_satisfied_context(ctx) is False
+    assert ctx.completion_criteria_turn_state.fully_satisfied_workflow_yaml is None
+
+
+def test_domain_blocker_run_waits_for_completion_verification_before_success() -> None:
+    result = _domain_blocker_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    assert _run_blocks_structured_blocker_message(result) == "online_account_required"
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+    _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert result["ok"] is False
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert "online_account_required" in (ctx.last_test_failure_reason or "")
+    assert verified_goal_satisfied_context(ctx) is False
+
+
+@pytest.mark.parametrize(
+    "completion_verification",
+    [
+        None,
+        CompletionVerificationResult(status="unavailable"),
+        CompletionVerificationResult(status="evaluated", criterion_ids=[]),
+        _no_evidence("c0"),
+    ],
+)
+def test_online_account_required_blocker_requires_satisfied_completion_verification(
+    completion_verification: CompletionVerificationResult | None,
+) -> None:
+    result = _domain_blocker_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=completion_verification)
+
+    blocker_payload = result["data"]["blocks"][0]["extracted_data"]
+    assert blocker_payload["blocked_by"] == "online_account_required"
+    assert blocker_payload["safety_flags"]["no_submission_attempted"] is True
+    assert result["ok"] is False
+    assert ctx.last_test_ok is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert verified_goal_satisfied_context(ctx) is False
+    assert getattr(ctx, "last_good_workflow", None) is None
+
+
+def test_satisfied_completion_overrides_domain_blocker_wording() -> None:
+    result = _domain_blocker_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
+
+    assert result["ok"] is True
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+    assert ctx.last_full_workflow_test_ok is True
+    assert verified_goal_satisfied_context(ctx) is True
+
+
 def test_genuine_success_run_keeps_clean_path() -> None:
     result = _genuine_success_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -522,8 +728,6 @@ def test_structured_record_top_level_output_record_is_meaningful() -> None:
 async def test_registered_output_adapter_fetches_db_values_and_synthesizes_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.copilot.tools import run_execution
-
     async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
         assert workflow_run_id == "wr_test"
         return [
@@ -579,6 +783,60 @@ async def test_registered_output_adapter_fetches_db_values_and_synthesizes_block
     assert data["blocks"][0]["extracted_data"]["extract_record_status_details_output"]["record_number"] == "1234567890"
 
 
+@pytest.mark.asyncio
+async def test_registered_validation_review_output_from_dict_workflow_merges_into_block_and_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_payload = _validation_review_payload()
+
+    async def fake_get_workflow_run_output_parameters(*, workflow_run_id: str) -> list[SimpleNamespace]:
+        assert workflow_run_id == "wr_test"
+        return [
+            SimpleNamespace(
+                workflow_run_id="wr_test",
+                output_parameter_id="op_review",
+                value=review_payload,
+            )
+        ]
+
+    monkeypatch.setattr(
+        run_execution.app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(get_workflow_run_output_parameters=fake_get_workflow_run_output_parameters),
+    )
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "blocks": [
+                {
+                    "label": "validate_business_start_service_review",
+                    "block_type": "CODE",
+                    "output_parameter": {
+                        "output_parameter_id": "op_review",
+                        "key": "validate_business_start_service_review_output",
+                    },
+                }
+            ]
+        }
+    )
+    data: dict[str, Any] = {"workflow_run_id": "wr_test", "blocks": []}
+
+    by_label = await _attach_registered_output_parameter_values(
+        workflow_run_id="wr_test",
+        workflow=workflow,  # type: ignore[arg-type]
+        data=data,
+    )
+    ctx = _ctx([{"label": "validate_business_start_service_review"}])
+    snapshot = _build_run_evidence_snapshot(ctx, {"ok": True, "data": data})
+    verdicts = grade_fallback_floor_reached_end_state_criteria(build_classifier_fallback_floor([]), snapshot)
+
+    assert by_label == {
+        "validate_business_start_service_review": {"validate_business_start_service_review_output": review_payload}
+    }
+    assert data["registered_output_parameter_values"][0]["block_label"] == "validate_business_start_service_review"
+    assert data["blocks"][0]["extracted_data"]["validate_business_start_service_review_output"] == review_payload
+    assert verdicts[0].evidence_ref == "block_outputs:validate_business_start_service_review"
+
+
 def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None:
     result = _empty_extraction_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -592,6 +850,56 @@ def test_satisfied_completion_prevents_empty_output_suspicious_success() -> None
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_failure_reason is None
     assert verified_goal_satisfied_context(ctx) is True
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.verdict == "progress_observed"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "verified_success"
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+
+
+def test_unverified_success_records_goal_relative_build_test_outcome() -> None:
+    result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
+    ctx = _ctx(result["data"]["blocks"])
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_demonstrated"
+    assert recorded.reason_code == "outcome_not_demonstrated"
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.phase == "persisted_block_run"
+    assert outcome.verdict == "repairable_failure"
+    assert outcome.reason_code == "outcome_not_demonstrated"
+    assert outcome.structural_key is not None
+
+
+def test_changed_output_structure_changes_unverified_success_structural_key() -> None:
+    first_result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
+    second_result = _run_result(
+        [_code_block("search_registry_person", {"records": [{"status_present": True}], "result_count": 1})]
+    )
+    ctx = _ctx(first_result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, first_result, completion_verification=_no_evidence("c0"))
+    first_key = ctx.latest_recorded_build_test_outcome.structural_key
+    _record_run_blocks_result(ctx, second_result, completion_verification=_no_evidence("c0"))
+
+    assert first_key is not None
+    assert ctx.latest_recorded_build_test_outcome.structural_key is not None
+    assert ctx.latest_recorded_build_test_outcome.structural_key != first_key
+
+
+def test_terminal_blocker_does_not_leave_authoritative_prompt_outcome() -> None:
+    result = _blocked_flag_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.blocker_signal is not None
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None
+    assert outcome.reason_code == "terminal_challenge_blocker"
+    assert outcome.is_authoritative is False
 
 
 def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
@@ -602,13 +910,15 @@ def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
     assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    # The candidate gate no longer rejects empty output: a completed run reaches the
+    # judge, which requires positive evidence per criterion. With no verifier verdict
+    # (no criteria) the empty-output floor still marks the run suspicious.
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
     assert ctx.last_test_ok is None
     assert ctx.last_test_suspicious_success is True
-    assert ctx.null_data_streak_count == 1
     assert ctx.last_full_workflow_test_ok is False
     assert getattr(ctx, "last_good_workflow", None) is None
 
@@ -629,6 +939,46 @@ def test_metadata_goal_fields_with_values_keep_clean_path() -> None:
     assert ctx.last_full_workflow_test_ok is True
 
 
+def test_metadata_boolean_goal_paths_count_as_present_content() -> None:
+    result = _boolean_goal_path_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_boolean_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
+def test_path_summary_goal_paths_with_boolean_flags_keep_clean_path() -> None:
+    result = _domain_path_summary_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
+def test_goal_path_alias_without_exact_declared_path_is_flagged_as_no_goal_content() -> None:
+    result = _domain_path_alias_summary_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is True
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
+def test_null_goal_path_value_does_not_fall_back_to_alias_field() -> None:
+    result = _domain_path_alias_summary_run_result(include_null_alias_source=True)
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"inspect_access_path": _terminal_metadata_with_path_summary_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is True
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
 def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
     result = _partial_goal_field_run_result()
     ctx = _ctx(result["data"]["blocks"])
@@ -636,7 +986,11 @@ def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
 
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
+def test_undeclared_boolean_flags_are_not_goal_content() -> None:
+    assert _code_output_has_goal_content({"public_form_exists": False, "login_only": True}) is False
 
 
 def test_top_level_array_goal_value_paths_keep_clean_path() -> None:
@@ -690,7 +1044,7 @@ def test_array_goal_value_path_does_not_match_scalar_root() -> None:
 
     _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
 def test_candidacy_and_recording_agree_on_all_null_metadata_goal_fields() -> None:
@@ -698,7 +1052,7 @@ def test_candidacy_and_recording_agree_on_all_null_metadata_goal_fields() -> Non
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
 
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
     assert ctx.last_test_ok is None
@@ -712,7 +1066,7 @@ def test_empty_goal_collections_without_blocker_are_flagged() -> None:
     assert _run_blocks_structured_blocker_message(result) is None
     _, empty_data_blocks, _ = _analyze_run_blocks(result)
     assert empty_data_blocks is True
-    assert _is_outcome_evidence_candidate(ctx, result) is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
     assert ctx.last_test_ok is None
@@ -903,13 +1257,65 @@ def test_judge_unmet_on_detector_clean_run_does_not_reset_streaks_or_promote(met
         entry["completion_criteria"][0]["terminal"] = False
         ctx.code_artifact_metadata = {"search_registry_person": entry}
     ctx.failed_test_nudge_count = 2
-    ctx.null_data_streak_count = 3
     ctx.probable_site_block_streak_count = 4
 
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
 
     assert ctx.failed_test_nudge_count == 2
-    assert ctx.null_data_streak_count == 3
     assert ctx.probable_site_block_streak_count == 4
     assert ctx.last_full_workflow_test_ok is False
+
+
+def test_reached_goal_unfinished_run_is_recognized_when_verifier_fully_satisfied() -> None:
+    result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=False)
+    ctx = _ctx(result["data"]["blocks"])
+
+    assert _is_unfinished_run_verification_candidate(ctx, result) is True
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
+
+    assert outcome_fully_verified(ctx) is True
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+
+
+def test_unfinished_run_with_unsatisfied_verifier_stays_unrecognized() -> None:
+    result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=False)
+    ctx = _ctx(result["data"]["blocks"])
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert outcome_fully_verified(ctx) is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert recorded is None or recorded.verdict != "demonstrated"
     assert getattr(ctx, "last_good_workflow", None) is None
+
+
+def test_present_value_upgrade_flips_lone_judge_unknown_to_demonstrated_on_ok_run() -> None:
+    result = _run_result([_code_block("submit_request", {"confirmation_number": "WTR-1842-DEMO"})], ok=True)
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(id="c0", outcome="the submitted request returns confirmation number WTR-1842-DEMO")
+        ]
+    )
+
+    run_criteria = ctx.request_policy.completion_criteria
+    snapshot = _build_run_evidence_snapshot(ctx, result)
+    judge_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[CriterionVerdict(criterion_id="c0", state="unknown", reason_code="unknown")],
+    )
+    upgraded = _apply_present_value_upgrades(judge_result, run_criteria, snapshot)
+    assert upgraded.is_fully_satisfied() is True
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=upgraded)
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert outcome_fully_verified(ctx) is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True

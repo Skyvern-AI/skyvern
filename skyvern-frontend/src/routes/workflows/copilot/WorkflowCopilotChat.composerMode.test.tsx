@@ -98,7 +98,9 @@ const saveData = {
     proxyLocation: null,
     webhookCallbackUrl: null,
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
+    browserProfileKey: null,
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
@@ -159,7 +161,7 @@ async function submit(value: string) {
   });
 }
 
-async function selectMode(label: "Ask" | "Build" | "Build with code") {
+async function selectMode(label: "Ask" | "Build" | "Build workflow as code") {
   await act(async () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
       button: 0,
@@ -252,13 +254,13 @@ describe("WorkflowCopilotChat — composer default mode variant", () => {
     expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
-  it("lands on code ON when selecting Build with code", async () => {
+  it("lands on code ON when selecting Build workflow as code", async () => {
     await renderChat({
       copilotV2: true,
       codeBlockMode: true,
       defaultMode: "ask_code",
     });
-    await selectMode("Build with code");
+    await selectMode("Build workflow as code");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 

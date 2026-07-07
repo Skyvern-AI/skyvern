@@ -94,7 +94,12 @@ def _wire_block_runtime(
 def _fake_storage_app(monkeypatch: pytest.MonkeyPatch, *, save, get) -> None:
     fake_app = SimpleNamespace(
         STORAGE=SimpleNamespace(save_downloaded_files=save, get_downloaded_files=get),
-        AGENT_FUNCTION=SimpleNamespace(validate_code_block=AsyncMock()),
+        AGENT_FUNCTION=SimpleNamespace(
+            validate_code_block=AsyncMock(),
+            # Secure CodeBlock runner gating — match the OSS base no-op so execute() runs legacy.
+            should_use_codeblock_runner=AsyncMock(return_value=False),
+            execute_code_block_override=AsyncMock(return_value=None),
+        ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
 

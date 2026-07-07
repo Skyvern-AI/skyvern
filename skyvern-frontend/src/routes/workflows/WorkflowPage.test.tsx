@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
 import CloudContext from "@/store/CloudContext";
+import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { WorkflowPage } from "./WorkflowPage";
 
 const { mockFeatureFlagEnabled } = vi.hoisted(() => ({
@@ -72,6 +73,10 @@ vi.mock("./hooks/useTagKeysQuery", () => ({
   useTagKeysQuery: () => ({ data: [] }),
 }));
 
+vi.mock("./hooks/useTagValuesQuery", () => ({
+  useTagValuesQuery: () => ({ data: new Map() }),
+}));
+
 vi.mock("./hooks/useKeywordSearch", () => ({
   useKeywordSearch: () => ({
     matchesParameter: () => false,
@@ -110,24 +115,40 @@ afterEach(() => {
 type RenderOptions = {
   isCloud?: boolean;
   analyticsFlagEnabled?: boolean;
+  pageSlots?: PageSlots;
+  initialEntries?: Array<string>;
 };
+
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-search" data-search={location.search} />;
+}
 
 function renderWorkflowPage({
   isCloud = true,
   analyticsFlagEnabled = true,
+  pageSlots = {},
+  initialEntries = ["/workflows/wpid_abc123"],
 }: RenderOptions = {}) {
   mockFeatureFlagEnabled.mockReturnValue(analyticsFlagEnabled);
 
   return render(
     <CloudContext.Provider value={isCloud}>
-      <MemoryRouter initialEntries={["/workflows/wpid_abc123"]}>
-        <Routes>
-          <Route
-            path="/workflows/:workflowPermanentId"
-            element={<WorkflowPage />}
-          />
-        </Routes>
-      </MemoryRouter>
+      <PageSlotsProvider value={pageSlots}>
+        <MemoryRouter initialEntries={initialEntries}>
+          <Routes>
+            <Route
+              path="/workflows/:workflowPermanentId"
+              element={
+                <>
+                  <WorkflowPage />
+                  <LocationProbe />
+                </>
+              }
+            />
+          </Routes>
+        </MemoryRouter>
+      </PageSlotsProvider>
     </CloudContext.Provider>,
   );
 }
@@ -138,7 +159,7 @@ describe("WorkflowPage analytics button", () => {
 
     const analyticsLink = screen.getByRole("link", { name: /analytics/i });
     expect(analyticsLink.getAttribute("href")).toBe(
-      "/analytics?compare=wpid_abc123",
+      "/analytics?workflow=wpid_abc123",
     );
     expect(mockFeatureFlagEnabled).toHaveBeenCalledWith("ANALYTICS_DASHBOARD");
   });
@@ -153,5 +174,46 @@ describe("WorkflowPage analytics button", () => {
     renderWorkflowPage({ isCloud: false });
 
     expect(screen.queryByRole("link", { name: /analytics/i })).toBeNull();
+  });
+
+  it("renders the injected workflow analytics panel above Past Runs", () => {
+    const PanelStub = () => <div data-testid="analytics-panel-stub" />;
+    const { container } = renderWorkflowPage({
+      pageSlots: { workflowAnalyticsPanel: PanelStub },
+    });
+
+    expect(
+      container.querySelector('[data-testid="analytics-panel-stub"]'),
+    ).not.toBeNull();
+  });
+
+  it("renders the injected workflow runs filter controls in the Past Runs row", () => {
+    const FilterStub = () => <div data-testid="filter-controls-stub" />;
+    const { container } = renderWorkflowPage({
+      pageSlots: { workflowRunsFilterControls: FilterStub },
+    });
+
+    expect(
+      container.querySelector('[data-testid="filter-controls-stub"]'),
+    ).not.toBeNull();
+  });
+
+  it("preserves period/from/to while an empty page rolls back", () => {
+    // The mocked useWorkflowRunsQuery always returns an empty page, so the
+    // rollback effect cascades all the way to page=1 — this still proves the
+    // fix, since period/from/to must survive every intermediate replacement.
+    const { container } = renderWorkflowPage({
+      initialEntries: [
+        "/workflows/wpid_abc123?period=custom&from=2026-06-01&to=2026-06-03&page=3",
+      ],
+    });
+
+    const search = container
+      .querySelector('[data-testid="location-search"]')
+      ?.getAttribute("data-search");
+    expect(search).toContain("page=1");
+    expect(search).toContain("period=custom");
+    expect(search).toContain("from=2026-06-01");
+    expect(search).toContain("to=2026-06-03");
   });
 });

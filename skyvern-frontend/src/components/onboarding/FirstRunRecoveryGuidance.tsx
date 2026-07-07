@@ -10,6 +10,8 @@ import {
   type RecoveryPath,
   type RecoveryPathId,
 } from "./recoveryPaths";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
 const DOCS_URL = "https://docs.skyvern.com";
 const SUPPORT_URL = "mailto:support@skyvern.com";
@@ -28,6 +30,7 @@ function FirstRunRecoveryGuidance({
   onRetry,
 }: Props) {
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const paths = getRecoveryPaths(failureCategory);
   const shownRef = useRef(false);
 
@@ -50,8 +53,8 @@ function FirstRunRecoveryGuidance({
   function routeFor(id: RecoveryPathId): string {
     if (id === "edit_workflow") {
       return workflowPermanentId
-        ? `/workflows/${workflowPermanentId}/build`
-        : "/workflows";
+        ? workflowEditorPath(workflowPermanentId, studioEnabled)
+        : "/agents";
     }
     return "/credentials";
   }

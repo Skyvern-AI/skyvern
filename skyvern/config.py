@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
+    # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
+    # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
+    # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
+    # instead of surfacing an opaque ECONNREFUSED.
+    CDP_CONNECT_RETRY_ATTEMPTS: int = 6
+    CDP_CONNECT_RETRY_BACKOFF_SECONDS: list[float] = [1, 2, 3, 4, 5]
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
@@ -111,6 +117,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
+    # Pre-screenshot readiness guard; kept short so a page that never settles
+    # degrades fast instead of burning the full loading-timeout budget.
+    BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS: int = 5000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
     CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
     # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
@@ -120,6 +129,11 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
+    # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
+    MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
+    # Overall wall-clock budget for the completion screenshot loop.
+    COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS: float = 60.0
     MAX_NUM_SCREENSHOTS: int = 10
     # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
     # screenshot spend can be monitored independently of the provider's blended tokens.
@@ -131,6 +145,9 @@ class Settings(BaseSettings):
     # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
     # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
     FAIL_FAST_SHADOW: bool = False
+    # Global kill-switch for select/autocomplete shadow-match observability (LLM-vs-deterministic
+    # agreement logging). Not per-org; set false to silence the logs everywhere.
+    SKYVERN_SELECT_SHADOW_MATCH: bool = True
     DEBUG_MODE: bool = False
     DATABASE_STRING: str = Field(default_factory=_default_database_string)
     DATABASE_REPLICA_STRING: str | None = None
@@ -138,6 +155,11 @@ class Settings(BaseSettings):
     DISABLE_CONNECTION_POOL: bool = False
     DATABASE_POOL_SIZE: int = 5
     DATABASE_POOL_MAX_OVERFLOW: int = 10
+    # Timeout/recycle defaults mirror SQLAlchemy's QueuePool. Size pools per service
+    # via env vars: raising defaults here multiplies across every engine and replica
+    # and can exhaust pgbouncer client connections.
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_RECYCLE: int = -1
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -164,6 +186,14 @@ class Settings(BaseSettings):
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
     COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
+    # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
+    COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
+    COPILOT_CLICK_SETTLE_DELAY_SECONDS: float = 0.6
+    COPILOT_CLICK_SETTLE_DEADLINE_SECONDS: float = 3.5
+    # Kill switch for the clickable-controls grounding channel: when off, composition evidence omits the
+    # clickable_controls key entirely, reverting both the re-perception attach and the evaluate steer.
+    COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED: bool = True
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
@@ -175,11 +205,10 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
-    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
-    # already-authenticated session (the first run and every login-replaying repair re-run alike).
-    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
-    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
+    # Default code_only for MCP block/workflow tools. Off = permissive.
+    MCP_CODE_ONLY_MODE: bool = False
+    # Default for the bounded code-block self-heal; off by default.
+    ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -260,6 +289,18 @@ class Settings(BaseSettings):
     # set both to record at an explicit resolution.
     BROWSER_RECORDING_WIDTH: int | None = None
     BROWSER_RECORDING_HEIGHT: int | None = None
+    # Max concurrent LLM enrichment calls per live browser-recording interpretation
+    # session. Bounds the per-action enrichment fan-out so a burst of interactions
+    # can't flood the event loop with simultaneous LLM requests.
+    RECORDING_ENRICHMENT_MAX_CONCURRENCY: int = 4
+    # LLM used to enrich live recording draft steps (label/title/goal). A fast, cheap
+    # model keeps the click->labeled-draft latency low. Falls back to the default
+    # LLM_API_HANDLER when the key is unset or not registered in this environment.
+    RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
+    # Server-side kill switch for delta interpretation updates. Deltas are also
+    # gated per-connection on the client declaring support (begin-exfiltration
+    # supports_interpretation_deltas); this only force-disables them everywhere.
+    RECORDING_INTERPRETATION_DELTAS_ENABLED: bool = True
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
@@ -316,6 +357,9 @@ class Settings(BaseSettings):
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
     LLM_CONFIG_ADD_ASSISTANT_PREFIX: bool = False  # Whether to add assistant prefix
+    # Self-hosted users commonly run Ollama on localhost/private networks. Cloud
+    # overrides this to False so user-defined LLM API bases use SSRF protections.
+    ALLOW_CUSTOM_LLM_LOCAL_API_BASES: bool = True
     # LLM PROVIDER SPECIFIC
     ENABLE_OPENAI: bool = False
     ENABLE_ANTHROPIC: bool = False
@@ -518,8 +562,11 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
-    # Where credentials are stored: bitwarden, azure_vault, gcp, or custom
+    # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
     CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
+    LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
+    LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
 
     # GCP Secret Manager credential vault settings
     GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
@@ -611,6 +658,13 @@ class Settings(BaseSettings):
     Set to 10 minutes so that a 5-minute renewal loop gets 2+ attempts before expiry.
     """
 
+    PERSISTENT_SESSIONS_REAPER_INTERVAL_SECONDS: int = 60
+    """
+    How often the OSS in-process reaper scans for persistent browser sessions past their
+    timeout and closes them, freeing the leaked Chromium + record_video ffmpeg encoder.
+    Set to 0 to disable the reaper.
+    """
+
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
@@ -640,6 +694,9 @@ class Settings(BaseSettings):
     # Google Sheets API runtime tuning
     GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
     GOOGLE_SHEETS_API_MAX_RETRIES: int = 3
+    # Google Drive API runtime tuning
+    GOOGLE_DRIVE_API_TIMEOUT_SECONDS: float = 30.0
+    GOOGLE_DRIVE_API_MAX_RETRIES: int = 3
 
     # Cleanup Cron Settings
     ENABLE_CLEANUP_CRON: bool = False
@@ -668,7 +725,7 @@ class Settings(BaseSettings):
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
-    def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
+    def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
@@ -696,6 +753,12 @@ class Settings(BaseSettings):
         }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
+
+        # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
+        # would offer models that resolve to unregistered configs and fail at runtime.
+        if self.ENABLE_OPENROUTER:
+            mapping["deepseek-v4-flash"] = {"llm_key": "OPENROUTER_DEEPSEEK_V4_FLASH", "label": "DeepSeek V4 Flash"}
+            mapping["mimo-v2.5"] = {"llm_key": "OPENROUTER_XIAOMI_MIMO_V2_5", "label": "Xiaomi MiMo V2.5"}
 
         # GPT models: prefer Azure when enabled, fall back to OpenAI
         gpt_models = [
@@ -784,6 +847,16 @@ class Settings(BaseSettings):
                 "label": "Anthropic Claude Fable 5",
             }
 
+        try:
+            from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415
+                get_custom_llm_model_mappings,
+            )
+
+            mapping.update(get_custom_llm_model_mappings(organization_id=organization_id))
+        except Exception:
+            # Settings is used by scripts and import-time paths before the API app is fully initialized.
+            pass
+
         return mapping
 
     def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
@@ -817,6 +890,11 @@ class Settings(BaseSettings):
         :return: True if env is not local, else False
         """
         return self.ENV != "local"
+
+    def is_local_credential_vault_enabled(self) -> bool:
+        if self.ENABLE_LOCAL_CREDENTIAL_VAULT is not None:
+            return self.ENABLE_LOCAL_CREDENTIAL_VAULT
+        return not self.is_cloud_environment()
 
     def execute_all_steps(self) -> bool:
         """

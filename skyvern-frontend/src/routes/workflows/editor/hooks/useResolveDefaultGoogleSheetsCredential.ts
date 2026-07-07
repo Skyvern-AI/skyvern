@@ -2,7 +2,9 @@ import { useReactFlow } from "@xyflow/react";
 import { useEffect, useMemo } from "react";
 
 import {
+  GOOGLE_SHEETS_REQUIRED_SCOPES,
   getDefaultGoogleOAuthCredentialId,
+  hasGoogleOAuthCredentialScopes,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -45,7 +47,19 @@ export function useResolveDefaultGoogleSheetsCredential(
   const { credentials, isLoading, isFetching } = useGoogleOAuthCredentials({
     enabled: !readOnly && unconfiguredNodeIds.length > 0,
   });
-  const defaultCredentialId = getDefaultGoogleOAuthCredentialId(credentials);
+  const googleSheetsCredentials = useMemo(
+    () =>
+      credentials.filter((credential) =>
+        hasGoogleOAuthCredentialScopes(
+          credential,
+          GOOGLE_SHEETS_REQUIRED_SCOPES,
+        ),
+      ),
+    [credentials],
+  );
+  const defaultCredentialId = getDefaultGoogleOAuthCredentialId(
+    googleSheetsCredentials,
+  );
 
   // Stable for a given set of unconfigured blocks regardless of node ordering.
   const unconfiguredKey = unconfiguredNodeIds.join(",");

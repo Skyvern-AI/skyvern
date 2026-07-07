@@ -63,11 +63,17 @@ async def do_session_create(
     timeout: int = 60,
     proxy_location: ProxyLocationInput | str | None = None,
     extensions: list[Extensions] | None = None,
+    browser_profile_id: str | None = None,
+    generate_browser_profile: bool = False,
     local: bool = False,
     headless: bool = False,
 ) -> tuple[Any, SessionCreateResult]:
     """Create browser session. Returns (browser, result)."""
     if local:
+        if browser_profile_id is not None or generate_browser_profile:
+            raise ValueError(
+                "browser_profile_id and generate_browser_profile are only supported for cloud sessions, not local=True."
+            )
         browser = await skyvern.launch_local_browser(headless=headless)
         return browser, SessionCreateResult(session_id=None, local=True, headless=headless)
 
@@ -75,11 +81,88 @@ async def do_session_create(
     launch_kwargs: dict[str, Any] = {"timeout": timeout, "proxy_location": proxy}
     if extensions is not None:
         launch_kwargs["extensions"] = extensions
+    if browser_profile_id is not None:
+        launch_kwargs["browser_profile_id"] = browser_profile_id
     browser = await skyvern.launch_cloud_browser(**launch_kwargs)
+    session_id = browser.browser_session_id
+    if generate_browser_profile and session_id:
+        await do_session_arm_generate_browser_profile(skyvern, session_id, browser=browser)
     return browser, SessionCreateResult(
-        session_id=browser.browser_session_id,
+        session_id=session_id,
         timeout_minutes=timeout,
     )
+
+
+async def do_session_arm_generate_browser_profile(
+    skyvern: Any,
+    session_id: str,
+    *,
+    browser: Any | None = None,
+) -> None:
+    """Arm profile capture on a freshly created session, rolling the session back if arming fails.
+
+    Shared by the stateful and stateless create paths so the create -> PATCH -> rollback contract
+    lives in one place. Pass ``browser`` for the stateful path so its local CDP connection is torn
+    down on rollback too.
+    """
+    try:
+        await do_session_update_generate_browser_profile(skyvern, session_id, True)
+    except Exception as exc:
+        await do_session_rollback_created_session(skyvern, session_id, exc, browser=browser)
+        raise
+
+
+async def do_session_update_generate_browser_profile(
+    skyvern: Any,
+    session_id: str,
+    generate_browser_profile: bool,
+) -> None:
+    """PATCH a live browser session's profile-capture flag via the private SDK wrapper.
+
+    The generated Fern client has no browser-session update method yet (the route exists and is
+    annotated for Fern), so we reach through the wrapper deliberately until the SDK is regenerated.
+    """
+    response = await skyvern._client_wrapper.httpx_client.request(
+        f"v1/browser_sessions/{session_id}",
+        method="PATCH",
+        json={"generate_browser_profile": generate_browser_profile},
+        headers={"content-type": "application/json"},
+    )
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+            detail = body.get("detail", response.text) if isinstance(body, dict) else response.text
+        except (ValueError, json.JSONDecodeError):
+            detail = response.text
+        raise RuntimeError(f"Failed to update browser session {session_id}: HTTP {response.status_code}: {detail}")
+
+
+async def do_session_rollback_created_session(
+    skyvern: Any,
+    session_id: str,
+    failure: Exception,
+    *,
+    browser: Any | None = None,
+) -> None:
+    """Close a just-created cloud session (and its local browser) after later setup fails.
+
+    Tears down both the remote session and, when provided, the local CDP/Playwright connection. If
+    either cleanup fails, the original ``failure`` is preserved and the cleanup error is appended.
+    """
+    cleanup_errors: list[str] = []
+    try:
+        await do_session_close(skyvern, session_id)
+    except Exception as session_error:
+        cleanup_errors.append(f"failed to close browser session {session_id}: {session_error}")
+    if browser is not None:
+        try:
+            await browser.close()
+        except Exception as browser_error:
+            cleanup_errors.append(f"failed to close local browser for {session_id}: {browser_error}")
+    if cleanup_errors:
+        raise RuntimeError(
+            f"{failure}; additionally {'; '.join(cleanup_errors)} after session setup failed"
+        ) from failure
 
 
 async def do_session_close(skyvern: Any, session_id: str) -> SessionCloseResult:

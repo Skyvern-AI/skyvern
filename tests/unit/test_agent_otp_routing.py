@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.agent import ForgeAgent, PromptBuildResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
@@ -90,7 +90,14 @@ async def test_handle_potential_verification_code_skips_polling_when_credential_
     monkeypatch.setattr("skyvern.forge.agent.poll_otp_value", poll)
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run", db_get)
 
-    rebuilt = AsyncMock(return_value=("prompt", False, "prompt_name"))
+    rebuilt = AsyncMock(
+        return_value=PromptBuildResult(
+            prompt="prompt",
+            use_caching=False,
+            prompt_name="prompt_name",
+            without_page_information=False,
+        )
+    )
     monkeypatch.setattr(ForgeAgent, "_build_extract_action_prompt", rebuilt)
     monkeypatch.setattr("skyvern.forge.agent.service_utils.is_cua_task", AsyncMock(return_value=False))
 

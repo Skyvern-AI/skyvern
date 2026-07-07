@@ -23,6 +23,7 @@ import { ProxyLocation } from "@/api/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Switch } from "@/components/ui/switch";
+import { hasExtraHttpHeaders } from "@/util/extraHttpHeaders";
 
 function DebuggerPostRunParameters() {
   const { workflowPermanentId } = useParams();
@@ -89,6 +90,7 @@ function DebuggerPostRunParameters() {
   const extraHttpHeaders = isTaskV2
     ? workflowRun.task_v2?.extra_http_headers
     : workflowRun.extra_http_headers;
+  const showExtraHttpHeaders = hasExtraHttpHeaders(extraHttpHeaders);
 
   return (
     <div className="space-y-5">
@@ -317,21 +319,21 @@ function DebuggerPostRunParameters() {
               }}
             />
           </div>
-          <div className="flex flex-col gap-2">
-            <div className="flex w-full items-center justify-start gap-2">
-              <h1 className="text-sm">Extra HTTP Headers</h1>
-              <HelpTooltip content="The extra HTTP headers for the workflow." />
+          {showExtraHttpHeaders ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex w-full items-center justify-start gap-2">
+                <h1 className="text-sm">Extra HTTP Headers</h1>
+                <HelpTooltip content="The extra HTTP headers for the workflow." />
+              </div>
+              <div className="w-full">
+                <KeyValueInput
+                  value={JSON.stringify(extraHttpHeaders)}
+                  readOnly={true}
+                  onChange={() => {}}
+                />
+              </div>
             </div>
-            <div className="w-full">
-              <KeyValueInput
-                value={
-                  extraHttpHeaders ? JSON.stringify(extraHttpHeaders) : null
-                }
-                readOnly={true}
-                onChange={() => {}}
-              />
-            </div>
-          </div>
+          ) : null}
           {workflowRun.browser_session_id ? (
             <div className="flex flex-col gap-2">
               <div className="flex w-full items-center justify-start gap-2">

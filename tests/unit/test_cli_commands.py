@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
+from skyvern.cli.commands import cli_app
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
+from skyvern.cli.status import _status_data
 
 # ---------------------------------------------------------------------------
 # _state.py
@@ -96,6 +100,24 @@ class TestOutput:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert parsed["error"]["message"] == "bad thing"
+
+
+# ---------------------------------------------------------------------------
+# status.py
+# ---------------------------------------------------------------------------
+
+
+class TestStatusCommands:
+    def test_status_start_commands_are_accepted_by_cli_parser(self) -> None:
+        runner = CliRunner()
+
+        for row in _status_data():
+            command_parts = shlex.split(row["start_command"])
+            assert command_parts[0] == "skyvern"
+
+            result = runner.invoke(cli_app, [*command_parts[1:], "--help"])
+
+            assert result.exit_code == 0, result.output
 
 
 # ---------------------------------------------------------------------------

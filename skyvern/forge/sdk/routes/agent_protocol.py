@@ -41,6 +41,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
@@ -55,6 +56,7 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.repositories.tags import TagValueRenameCollision, TagValueRenameResult
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
@@ -109,6 +111,7 @@ from skyvern.forge.sdk.schemas.tasks import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -129,6 +132,7 @@ from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
     CUA_ENGINES,
+    MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
     BlockRunResponse,
     BulkCancelRunsRequest,
@@ -154,6 +158,12 @@ from skyvern.schemas.tags import (
     TagKeyUpdate,
     TagResponse,
     TagsResponse,
+    TagValue,
+    TagValueDelete,
+    TagValueDeleteResponse,
+    TagValueRename,
+    TagValueRenameResponse,
+    TagValueUpdate,
     WorkflowTagsBatchRequest,
     WorkflowTagsBatchResponse,
     _assert_user_key_writable,
@@ -321,15 +331,18 @@ async def run_task(
             cdp_connect_headers=run_request.cdp_connect_headers,
             browser_address=run_request.browser_address,
         )
-        task_v1_response = await task_v1_service.run_task(
-            task=task_v1_request,
-            organization=current_org,
-            engine=run_request.engine,
-            x_max_steps_override=run_request.max_steps,
-            x_api_key=x_api_key,
-            request=request,
-            background_tasks=background_tasks,
-        )
+        try:
+            task_v1_response = await task_v1_service.run_task(
+                task=task_v1_request,
+                organization=current_org,
+                engine=run_request.engine,
+                x_max_steps_override=run_request.max_steps,
+                x_api_key=x_api_key,
+                request=request,
+                background_tasks=background_tasks,
+            )
+        except task_v1_service.InvalidTaskV1ModelError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         if settings.OTEL_ENABLED:
             span = trace.get_current_span()
             if span and task_v1_response.task_id:
@@ -393,6 +406,8 @@ async def run_task(
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
             )
+        except task_v2_service.InvalidTaskV2ModelError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
@@ -1566,6 +1581,7 @@ async def _apply_tag_changes_with_retry(
     context: TagWriteContext,
     label_sets: list[str] | None = None,
     label_deletes: list[str] | None = None,
+    colors: dict[str, str] | None = None,
 ) -> None:
     """Wrap ``apply_tag_changes`` with one IntegrityError retry: concurrent
     same-identity SETs race the partial UNIQUE; last-write-wins, else 409."""
@@ -1579,6 +1595,7 @@ async def _apply_tag_changes_with_retry(
                 context=context,
                 label_sets=label_sets,
                 label_deletes=label_deletes,
+                colors=colors,
             )
             return
         except IntegrityError:
@@ -1589,6 +1606,39 @@ async def _apply_tag_changes_with_retry(
                 status_code=http_status.HTTP_409_CONFLICT,
                 detail="Tag write conflicted with a concurrent update; please retry",
             )
+
+
+async def _rename_tag_value_with_retry(
+    *,
+    organization_id: str,
+    key: str,
+    old_value: str,
+    new_value: str,
+    context: TagWriteContext,
+) -> TagValueRenameResult | None:
+    """Wrap ``rename_tag_value`` with one IntegrityError retry: a concurrent SET on
+    ``(key, new_value)`` can race the active-SET partial UNIQUE between the rename's
+    collision check and its new SET inserts; last-write-wins on retry, else 409
+    (mirrors ``_apply_tag_changes_with_retry``). ``TagValueRenameCollision`` is a
+    deterministic conflict and is mapped to 409 by the caller, not retried here."""
+    for attempt in range(2):
+        try:
+            return await app.DATABASE.tags.rename_tag_value(
+                organization_id=organization_id,
+                key=key,
+                old_value=old_value,
+                new_value=new_value,
+                context=context,
+            )
+        except IntegrityError:
+            if attempt == 0:
+                await asyncio.sleep(random.uniform(0.01, 0.05))
+                continue
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="Tag value rename conflicted with a concurrent update; please retry",
+            )
+    return None
 
 
 async def require_workflow_tagging(
@@ -1655,6 +1705,7 @@ async def apply_workflow_tags(
             context=write_ctx,
             label_sets=label_sets,
             label_deletes=label_deletes,
+            colors=data.colors,
         )
     except ValueError as e:
         # Cap-breach is the only ValueError surfaced; treat as 422 (user input).
@@ -1901,6 +1952,179 @@ async def delete_tag_key(
     if removed_count is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
     return TagKeyDeleteResponse(key=key, removed_from_workflow_count=removed_count)
+
+
+@legacy_base_router.get("/tag-values", response_model=list[TagValue], tags=["agent"], include_in_schema=False)
+@legacy_base_router.get("/tag-values/", response_model=list[TagValue], include_in_schema=False)
+@base_router.get(
+    "/tag-values",
+    response_model=list[TagValue],
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "list_tag_values"},
+    description="List the palette color and current workflow usage count for each grouped tag (key, value) "
+    "for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number "
+    "of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
+    summary="List tag values",
+    responses={200: {"description": "Successfully retrieved tag values"}},
+)
+@base_router.get("/tag-values/", response_model=list[TagValue], include_in_schema=False)
+async def list_tag_values(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> list[TagValue]:
+    organization_id = current_org.organization_id
+    rows = await app.DATABASE.tags.list_tag_values(organization_id=organization_id)
+    counts = await app.DATABASE.tags.count_active_workflows_per_value(organization_id=organization_id)
+    return [
+        TagValue(
+            key=row.key,
+            value=row.value,
+            color=row.color,
+            workflow_count=counts.get((row.key, row.value), 0),
+        )
+        for row in rows
+    ]
+
+
+@legacy_base_router.patch("/tag-values/{key}", response_model=TagValue, tags=["agent"], include_in_schema=False)
+@legacy_base_router.patch("/tag-values/{key}/", response_model=TagValue, include_in_schema=False)
+@base_router.patch(
+    "/tag-values/{key}",
+    response_model=TagValue,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "update_tag_value"},
+    description="Recolor a grouped tag (key, value). The value is supplied in the body so values "
+    "containing '/' stay addressable. The new color must be a palette name.",
+    summary="Update tag value color",
+    responses={
+        200: {"description": "Successfully recolored tag value"},
+        404: {"description": "Tag value not found"},
+        422: {"description": "Invalid palette color"},
+    },
+)
+@base_router.patch("/tag-values/{key}/", response_model=TagValue, include_in_schema=False)
+async def update_tag_value(
+    key: str = Path(..., description="Tag key (group)", examples=["env"]),
+    data: TagValueUpdate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValue:
+    _validate_path_key(key)
+    organization_id = current_org.organization_id
+    row = await app.DATABASE.tags.recolor_tag_value(
+        organization_id=organization_id,
+        key=key,
+        value=data.value,
+        color=data.color,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Tag value '{key}:{data.value}' not found",
+        )
+    count = await app.DATABASE.tags.count_active_workflows_for_value(
+        organization_id=organization_id, key=row.key, value=row.value
+    )
+    return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=count)
+
+
+@legacy_base_router.patch("/tag-values/{key}/rename", response_model=TagValueRenameResponse, include_in_schema=False)
+@legacy_base_router.patch("/tag-values/{key}/rename/", response_model=TagValueRenameResponse, include_in_schema=False)
+@base_router.patch(
+    "/tag-values/{key}/rename",
+    response_model=TagValueRenameResponse,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "rename_tag_value"},
+    description="Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow "
+    "carrying the old label; the new label inherits the old color. Both values ride in the body so values "
+    "containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
+    summary="Rename tag value",
+    responses={
+        200: {"description": "Successfully renamed tag value"},
+        404: {"description": "Tag value not found"},
+        409: {"description": "Target value already exists for this key"},
+        422: {"description": "Invalid value"},
+    },
+)
+@base_router.patch("/tag-values/{key}/rename/", response_model=TagValueRenameResponse, include_in_schema=False)
+async def rename_tag_value(
+    key: str = Path(..., description="Tag key (group)", examples=["env"]),
+    data: TagValueRename = Body(...),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValueRenameResponse:
+    analytics.capture("skyvern-oss-tag-value-rename")
+    _validate_path_key(key)
+    context = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    try:
+        result = await _rename_tag_value_with_retry(
+            organization_id=caller.organization.organization_id,
+            key=key,
+            old_value=data.value,
+            new_value=data.new_value,
+            context=context,
+        )
+    except TagValueRenameCollision as e:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    if result is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Tag value '{key}:{data.value}' not found",
+        )
+    return TagValueRenameResponse(
+        key=result.key,
+        value=result.value,
+        color=result.color,
+        renamed_workflow_count=result.renamed_workflow_count,
+    )
+
+
+@legacy_base_router.delete("/tag-values/{key}", tags=["agent"], include_in_schema=False)
+@legacy_base_router.delete("/tag-values/{key}/", include_in_schema=False)
+@base_router.delete(
+    "/tag-values/{key}",
+    response_model=TagValueDeleteResponse,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "delete_tag_value"},
+    description="Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it "
+    "(cascade). The value rides in the body so values containing '/' stay addressable. Returns how many "
+    "workflows the label was removed from.",
+    summary="Delete tag value",
+    responses={
+        200: {"description": "Successfully deleted tag value"},
+        404: {"description": "Tag value not found"},
+    },
+)
+@base_router.delete("/tag-values/{key}/", response_model=TagValueDeleteResponse, include_in_schema=False)
+async def delete_tag_value(
+    key: str = Path(..., description="Tag key (group)", examples=["env"]),
+    data: TagValueDelete = Body(...),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValueDeleteResponse:
+    analytics.capture("skyvern-oss-tag-value-delete")
+    _validate_path_key(key)
+    context = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    removed_count = await app.DATABASE.tags.delete_tag_value(
+        organization_id=caller.organization.organization_id,
+        key=key,
+        value=data.value,
+        context=context,
+    )
+    if removed_count is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Tag value '{key}:{data.value}' not found",
+        )
+    return TagValueDeleteResponse(key=key, value=data.value, removed_from_workflow_count=removed_count)
 
 
 # Keep in sync with BATCH_TAGS_MAX_WPIDS in the frontend
@@ -2726,11 +2950,14 @@ async def get_version() -> dict[str, str]:
     openapi_extra={},
 )
 @legacy_base_router.get("/models/", include_in_schema=False)
-async def models() -> ModelsResponse:
+async def models(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ModelsResponse:
     """
     Get a list of available models.
     """
-    mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
+    await load_custom_llm_configs_for_organization(app.DATABASE, current_org.organization_id)
+    mapping = SettingsManager.get_settings().get_model_name_to_llm_key(organization_id=current_org.organization_id)
     just_labels = {k: v["label"] for k, v in mapping.items() if "anthropic" not in k.lower()}
 
     return ModelsResponse(models=just_labels)
@@ -2767,14 +2994,17 @@ async def run_task_v1(
         model=task.model,
     )
 
-    created_task = await task_v1_service.run_task(
-        task=task,
-        organization=current_org,
-        x_max_steps_override=x_max_steps_override,
-        x_api_key=x_api_key,
-        request=request,
-        background_tasks=background_tasks,
-    )
+    try:
+        created_task = await task_v1_service.run_task(
+            task=task,
+            organization=current_org,
+            x_max_steps_override=x_max_steps_override,
+            x_api_key=x_api_key,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except task_v1_service.InvalidTaskV1ModelError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return CreateTaskResponse(task_id=created_task.task_id)
 
 
@@ -3283,6 +3513,11 @@ async def get_runs_v2(
     ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
+    if search_key and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"Search pagination is limited to the first {MAX_SEARCH_FETCH_LIMIT} matches. Use a narrower search.",
+        )
 
     rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
         current_org.organization_id,
@@ -3631,6 +3866,8 @@ async def _get_workflow_runs_by_id(
     search_key: str | None,
     error_code: str | None,
     exclude_child_runs: bool,
+    created_at_start: datetime | None = None,
+    created_at_end: datetime | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -3642,6 +3879,8 @@ async def _get_workflow_runs_by_id(
         search_key=search_key,
         error_code=error_code,
         exclude_child_runs=exclude_child_runs,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
     )
 
 
@@ -3686,6 +3925,14 @@ async def get_workflow_runs_by_id(
         ),
         examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
+    created_at_start: Annotated[
+        datetime | None,
+        Query(description="Only include runs created at or after this UTC timestamp (ISO 8601)."),
+    ] = None,
+    created_at_end: Annotated[
+        datetime | None,
+        Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
@@ -3702,6 +3949,8 @@ async def get_workflow_runs_by_id(
         status=status,
         search_key=search_key,
         error_code=error_code,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
         exclude_child_runs=True,
     )
 
@@ -3747,6 +3996,14 @@ async def get_workflow_runs_by_id_legacy(
         ),
         examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
+    created_at_start: Annotated[
+        datetime | None,
+        Query(description="Only include runs created at or after this UTC timestamp (ISO 8601)."),
+    ] = None,
+    created_at_end: Annotated[
+        datetime | None,
+        Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
@@ -3762,6 +4019,8 @@ async def get_workflow_runs_by_id_legacy(
         status=status,
         search_key=search_key,
         error_code=error_code,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
         exclude_child_runs=False,
     )
 
@@ -4020,6 +4279,12 @@ async def get_workflows(
             else:
                 workflow_tags.append((tag_key, tag_value))
 
+    if workflow_tags and not await app.AGENT_FUNCTION.is_workflow_tagging_enabled(current_org.organization_id):
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Workflow tagging is not enabled for this organization.",
+        )
+
     if template and workflow_tags:
         # Templates are global; tags are org-scoped, so the two can't combine.
         raise HTTPException(
@@ -4137,11 +4402,20 @@ async def get_workflow(
         if workflow_permanent_id not in await app.STORAGE.retrieve_global_workflows():
             raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_permanent_id)
 
-    return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=None if template else current_org.organization_id,
         version=version,
     )
+    if not template:
+        workflow.copilot_authored = "copilot" in (
+            workflow.created_by,
+            workflow.edited_by,
+        ) or await app.DATABASE.workflows.is_workflow_copilot_authored(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+        )
+    return workflow
 
 
 @legacy_base_router.get(
@@ -4233,10 +4507,38 @@ async def reset_workflow_browser_profile(
         workflow_permanent_id=workflow_permanent_id,
     )
     try:
+        # Include soft-deleted rows: their segment digests still address legacy archives
+        # that would otherwise survive the reset and reseed state on the next run.
+        managed_profiles = await app.DATABASE.browser_sessions.list_managed_browser_profiles_for_workflow(
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            include_deleted=True,
+        )
         await app.STORAGE.delete_browser_session(
             organization_id=current_org.organization_id,
             workflow_permanent_id=workflow_permanent_id,
         )
+        segment_digests = {
+            profile.browser_profile_key_digest for profile in managed_profiles if profile.browser_profile_key_digest
+        }
+        for digest in segment_digests:
+            await app.STORAGE.delete_browser_session(
+                organization_id=current_org.organization_id,
+                workflow_permanent_id=build_workflow_browser_session_storage_key_from_digest(
+                    workflow_permanent_id, digest
+                ),
+            )
+        for profile in managed_profiles:
+            if profile.deleted_at is not None:
+                continue
+            await app.STORAGE.delete_browser_profile(
+                organization_id=current_org.organization_id,
+                profile_id=profile.browser_profile_id,
+            )
+            await app.DATABASE.browser_sessions.delete_browser_profile(
+                profile_id=profile.browser_profile_id,
+                organization_id=current_org.organization_id,
+            )
     except SkyvernHTTPException:
         raise
     except Exception as exc:
@@ -4532,8 +4834,13 @@ async def run_task_v2(
             extra_http_headers=data.extra_http_headers,
             cdp_connect_headers=data.cdp_connect_headers,
             browser_address=data.browser_address,
+            workflow_system_prompt=data.workflow_system_prompt,
+            model=data.model,
+            run_with=data.run_with,
             trigger_type=legacy_v2_trigger_type,
         )
+    except task_v2_service.InvalidTaskV2ModelError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:

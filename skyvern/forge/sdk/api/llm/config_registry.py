@@ -1638,13 +1638,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1757,13 +1757,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1978,7 +1978,10 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
-            max_completion_tokens=131072,
+            # MiMo v2.5 is a reasoning model; uncapped it emits 100k+ reasoning/output
+            # tokens (multi-minute calls) on short prompts. Cap output + reasoning effort.
+            max_completion_tokens=16384,
+            reasoning_effort="low",
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,

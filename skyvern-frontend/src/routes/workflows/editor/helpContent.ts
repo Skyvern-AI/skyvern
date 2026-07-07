@@ -167,7 +167,7 @@ export const helpTooltips = {
     fileUrl:
       "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
     fileType:
-      "The format of the file to parse. Auto-detected from the URL extension when possible.",
+      "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are unzipped: without a data schema the block outputs the list of extracted files; with a schema it parses the files inside and extracts against the schema.",
   },
   wait: {
     ...baseHelpTooltipContent,

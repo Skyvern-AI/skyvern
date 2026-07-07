@@ -12,6 +12,7 @@ from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.schemas.credentials import TestCredentialRequest as CredentialTestRequest
 from skyvern.forge.sdk.schemas.credentials import TestLoginRequest as LoginTestRequest
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.schemas.runs import ProxyLocation
 
 USER_AGENT_CASES = [
     ("skyvern-ui", WorkflowRunTriggerType.manual),
@@ -43,6 +44,15 @@ def _patch_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(credentials.AsyncExecutorFactory, "get_executor", lambda: executor)
 
 
+def _patch_cloud_proxy_session_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_function = SimpleNamespace(
+        build_proxy_session_extra_http_headers=lambda proxy_session_id: (
+            {"dedicated-ip": proxy_session_id} if proxy_session_id else None
+        )
+    )
+    monkeypatch.setattr(credentials.app, "AGENT_FUNCTION", agent_function)
+
+
 @pytest.mark.parametrize("x_user_agent, expected", USER_AGENT_CASES)
 @pytest.mark.asyncio
 async def test_test_credential_trigger_type_from_user_agent(
@@ -58,11 +68,14 @@ async def test_test_credential_trigger_type_from_user_agent(
                 browser_profile_id=None,
                 totp_identifier=None,
                 name="Test Credential",
+                proxy_location=None,
+                proxy_session_id=None,
             )
         )
     )
     monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
     monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
+    _patch_cloud_proxy_session_headers(monkeypatch)
     _patch_executor(monkeypatch)
 
     response = await credentials.test_credential(
@@ -76,6 +89,39 @@ async def test_test_credential_trigger_type_from_user_agent(
     setup_mock.assert_awaited_once()
     assert setup_mock.call_args.kwargs["trigger_type"] == expected
     assert response.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_test_credential_seeds_proxy_pin_workflow_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    setup_mock = _setup_mock()
+    mock_credentials = SimpleNamespace(
+        get_credential=AsyncMock(
+            return_value=SimpleNamespace(
+                credential_type=CredentialType.PASSWORD,
+                browser_profile_id=None,
+                totp_identifier=None,
+                name="Test Credential",
+                proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+                proxy_session_id="abc1234567",
+            )
+        )
+    )
+    monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
+    monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
+    _patch_cloud_proxy_session_headers(monkeypatch)
+    _patch_executor(monkeypatch)
+
+    await credentials.test_credential(
+        background_tasks=BackgroundTasks(),
+        credential_id="cred_test",
+        data=CredentialTestRequest(url="https://example.com/login", save_browser_profile=False),
+        current_org=SimpleNamespace(organization_id="org_test"),
+        x_user_agent=None,
+    )
+
+    workflow_request = setup_mock.call_args.kwargs["workflow_request"]
+    assert workflow_request.proxy_location == ProxyLocation.RESIDENTIAL_ISP
+    assert workflow_request.extra_http_headers == {"dedicated-ip": "abc1234567"}
 
 
 @pytest.mark.parametrize("x_user_agent, expected", USER_AGENT_CASES)
@@ -111,6 +157,50 @@ async def test_test_login_trigger_type_from_user_agent(
     await asyncio.sleep(0)
 
 
+@pytest.mark.asyncio
+async def test_test_login_seeds_proxy_pin_workflow_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    setup_mock = _setup_mock()
+    vault_service = SimpleNamespace(
+        create_credential=AsyncMock(
+            return_value=SimpleNamespace(vault_type=None, credential_id="cred_test", totp_identifier=None)
+        )
+    )
+    mock_credentials = SimpleNamespace(
+        update_credential=AsyncMock(
+            return_value=SimpleNamespace(
+                vault_type=None,
+                credential_id="cred_test",
+                totp_identifier=None,
+                proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+                proxy_session_id="abc1234567",
+            )
+        )
+    )
+    monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(credentials, "_create_browser_profile_after_workflow", AsyncMock())
+    monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
+    monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
+    _patch_cloud_proxy_session_headers(monkeypatch)
+    _patch_executor(monkeypatch)
+
+    await credentials.test_login(
+        background_tasks=BackgroundTasks(),
+        data=LoginTestRequest(
+            url="https://example.com/login",
+            username="user@example.com",
+            password="pw",
+            proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        ),
+        current_org=SimpleNamespace(organization_id="org_test"),
+        x_user_agent=None,
+    )
+
+    workflow_request = setup_mock.call_args.kwargs["workflow_request"]
+    assert workflow_request.proxy_location == ProxyLocation.RESIDENTIAL_ISP
+    assert workflow_request.extra_http_headers == {"dedicated-ip": "abc1234567"}
+    await asyncio.sleep(0)
+
+
 def _auth_override() -> SimpleNamespace:
     return SimpleNamespace(organization_id="org_test")
 
@@ -140,11 +230,14 @@ def test_test_credential_endpoint_wires_user_agent_header(
                 browser_profile_id=None,
                 totp_identifier=None,
                 name="Test Credential",
+                proxy_location=None,
+                proxy_session_id=None,
             )
         )
     )
     monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
     monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
+    _patch_cloud_proxy_session_headers(monkeypatch)
     _patch_executor(monkeypatch)
 
     app = FastAPI()

@@ -42,6 +42,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
@@ -105,9 +106,17 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   return null;
 }
 
-function getRunNavigationPath(run: TaskRunListItem): string {
+function getRunNavigationPath(
+  run: TaskRunListItem,
+  studioEnabled: boolean,
+): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
+      // With the studio on, workflow runs open in its Run tab; otherwise they
+      // use the standalone run page (also the fallback when there is no wpid).
+      return studioEnabled && run.workflow_permanent_id
+        ? `/agents/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
+        : `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV1:
@@ -147,6 +156,7 @@ function RunHistory() {
     search: effectiveSearch,
   });
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const { data: rawNextPageRuns } = useRunsQuery({
     page: page + 1,
@@ -239,7 +249,7 @@ function RunHistory() {
       );
       const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
-      const navPath = getRunNavigationPath(run);
+      const navPath = getRunNavigationPath(run, studioEnabled);
       const triggerType = inferTriggerType(run);
 
       const titleContent =
@@ -389,11 +399,11 @@ function RunHistory() {
             description="Every time you run a workflow, the result shows up on this page. Create your first workflow to get started."
             primaryAction={{
               label: "Create your first workflow",
-              onClick: () => navigate("/workflows"),
+              onClick: () => navigate("/agents"),
             }}
             secondaryAction={{
               label: "Browse templates",
-              onClick: () => navigate("/workflows"),
+              onClick: () => navigate("/agents"),
             }}
           />
         </div>

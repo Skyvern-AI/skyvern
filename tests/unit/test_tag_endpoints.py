@@ -20,10 +20,11 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.models import Base, WorkflowModel
 from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -51,6 +52,14 @@ async def engine() -> AsyncGenerator[AsyncEngine]:
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # The workflow the tag routes operate on must exist (non-deleted) so the
+    # value-count filter can resolve it, mirroring the existence mock below.
+    session_maker = async_sessionmaker(eng, expire_on_commit=False)
+    async with session_maker() as session:
+        session.add(
+            WorkflowModel(organization_id=ORG_ID, workflow_permanent_id=WPID, title="t", workflow_definition={})
+        )
+        await session.commit()
     yield eng
     await eng.dispose()
 
@@ -308,6 +317,33 @@ def test_tagging_gate_returns_403_when_disabled(client: TestClient) -> None:
         ).status_code
         == 403
     )
+
+
+# ----------------------------- GET /workflows tag-filter gate ------------------------
+
+
+def test_get_workflows_with_tag_filter_returns_403_when_disabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[])
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=False)
+    assert client.get("/v1/workflows?tags=env:prod").status_code == 403
+
+
+def test_get_workflows_without_tag_filter_succeeds_when_disabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[])
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=False)
+    assert client.get("/v1/workflows").status_code == 200
+
+
+def test_get_workflows_with_tag_filter_succeeds_when_enabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.WORKFLOW_SERVICE.get_workflows_by_organization_id = AsyncMock(return_value=[])
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    assert client.get("/v1/workflows?tags=env:prod").status_code == 200
 
 
 # ----------------------------- GET /workflows/{wpid}/tags/history --------------------
@@ -665,3 +701,259 @@ def test_post_succeeds_when_first_integrity_error_then_succeeds(app_with_routes:
     resp = client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
     assert resp.status_code == 200
     assert attempts["n"] == 2
+
+
+# ----------------------------- GET /tag-values -------------------------------------
+
+
+def test_get_tag_values_reflects_applied_colors(client: TestClient) -> None:
+    resp = client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={
+            "tags": [{"key": "env", "value": "prod"}, {"key": "team", "value": "growth"}],
+            "colors": {"env": "blue", "team": "purple"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    values = client.get("/v1/tag-values").json()
+    by_pair = {(row["key"], row["value"]): row["color"] for row in values}
+    assert by_pair == {("env", "prod"): "blue", ("team", "growth"): "purple"}
+
+
+def test_get_tag_values_assigns_random_palette_color_when_unset(client: TestClient) -> None:
+    from skyvern.forge.sdk.workflow.models.validators import TAG_COLOR_PALETTE
+
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+
+    values = client.get("/v1/tag-values").json()
+    assert len(values) == 1
+    assert values[0]["color"] in TAG_COLOR_PALETTE
+
+
+def test_get_tag_values_excludes_standalone_labels(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"value": "urgent"}]})
+    assert client.get("/v1/tag-values").json() == []
+
+
+def test_get_tag_values_legacy_route_works(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "green"}},
+    )
+    resp = client.get("/api/v1/tag-values")
+    assert resp.status_code == 200
+    assert resp.json()[0]["color"] == "green"
+
+
+def test_post_tags_invalid_color_returns_422(client: TestClient) -> None:
+    resp = client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "#ff0000"}},
+    )
+    assert resp.status_code == 422
+
+
+def test_post_tags_color_is_case_insensitive(client: TestClient) -> None:
+    resp = client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "BLUE"}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert client.get("/v1/tag-values").json()[0]["color"] == "blue"
+
+
+# ----------------------------- PATCH /tag-values/{key} -----------------------------
+
+
+def test_patch_tag_value_recolors(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/env", json={"value": "prod", "color": "pink"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"key": "env", "value": "prod", "color": "pink", "workflow_count": 1}
+    assert client.get("/v1/tag-values").json()[0]["color"] == "pink"
+
+
+def test_patch_tag_value_recolors_value_containing_slash(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "region", "value": "us/west"}], "colors": {"region": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/region", json={"value": "us/west", "color": "pink"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"key": "region", "value": "us/west", "color": "pink", "workflow_count": 1}
+
+
+def test_patch_tag_value_404_when_absent(client: TestClient) -> None:
+    resp = client.patch("/v1/tag-values/env", json={"value": "prod", "color": "pink"})
+    assert resp.status_code == 404
+
+
+def test_patch_tag_value_invalid_color_returns_422(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/env", json={"value": "prod", "color": "chartreuse"})
+    assert resp.status_code == 422
+
+
+def test_patch_tag_value_reserved_prefix_returns_400(client: TestClient) -> None:
+    resp = client.patch("/v1/tag-values/skyvern.system", json={"value": "prod", "color": "blue"})
+    assert resp.status_code == 400
+
+
+# ----------------------------- GET /tag-values workflow_count ----------------------
+
+
+def test_get_tag_values_includes_workflow_count(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    values = client.get("/v1/tag-values").json()
+    assert len(values) == 1
+    assert values[0]["workflow_count"] == 1
+
+
+# ----------------------------- PATCH /tag-values/{key}/rename -----------------------
+
+
+def test_rename_tag_value_cascades_and_carries_color(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/env/rename", json={"value": "prod", "new_value": "production"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "key": "env",
+        "value": "production",
+        "color": "blue",
+        "renamed_workflow_count": 1,
+    }
+    # The value list now reflects the new label, color carried over.
+    values = client.get("/v1/tag-values").json()
+    assert [(v["value"], v["color"]) for v in values] == [("production", "blue")]
+
+
+def test_rename_tag_value_404_when_absent(client: TestClient) -> None:
+    resp = client.patch("/v1/tag-values/env/rename", json={"value": "prod", "new_value": "production"})
+    assert resp.status_code == 404
+
+
+def test_rename_tag_value_409_on_collision(client: TestClient) -> None:
+    # One workflow holds one value per key, so SET stg then prod: both color rows
+    # stay registered org-wide, making stg a rename collision target for prod.
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "stg"}]})
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+    resp = client.patch("/v1/tag-values/env/rename", json={"value": "prod", "new_value": "stg"})
+    assert resp.status_code == 409
+
+
+def test_rename_tag_value_422_when_same_value(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+    resp = client.patch("/v1/tag-values/env/rename", json={"value": "prod", "new_value": "prod"})
+    assert resp.status_code == 422
+
+
+def test_rename_tag_value_reserved_prefix_returns_400(client: TestClient) -> None:
+    resp = client.patch("/v1/tag-values/skyvern.system/rename", json={"value": "prod", "new_value": "production"})
+    assert resp.status_code == 400
+
+
+def test_rename_tag_value_handles_value_with_slash(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "region", "value": "us/west"}], "colors": {"region": "blue"}},
+    )
+    resp = client.patch("/v1/tag-values/region/rename", json={"value": "us/west", "new_value": "us/east"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["value"] == "us/east"
+    assert resp.json()["color"] == "blue"
+
+
+def test_rename_tag_value_legacy_route_works(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+    resp = client.patch("/api/v1/tag-values/env/rename", json={"value": "prod", "new_value": "production"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["renamed_workflow_count"] == 1
+
+
+def _integrity_error() -> IntegrityError:
+    return IntegrityError("INSERT", {}, Exception("duplicate active SET"))
+
+
+def test_rename_tag_value_retries_then_succeeds_on_transient_integrity_error(
+    repo: TagsRepository, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+    real_rename = repo.rename_tag_value
+    calls = {"n": 0}
+
+    async def _flaky_rename(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _integrity_error()
+        return await real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "rename_tag_value", _flaky_rename)
+    resp = client.patch("/v1/tag-values/env/rename", json={"value": "prod", "new_value": "production"})
+    assert resp.status_code == 200, resp.text
+    assert calls["n"] == 2
+
+
+def test_rename_tag_value_409_on_persistent_integrity_error(
+    repo: TagsRepository, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+
+    async def _always_conflict(*args: Any, **kwargs: Any) -> Any:
+        raise _integrity_error()
+
+    monkeypatch.setattr(repo, "rename_tag_value", _always_conflict)
+    resp = client.patch("/v1/tag-values/env/rename", json={"value": "prod", "new_value": "production"})
+    assert resp.status_code == 409
+
+
+# ----------------------------- DELETE /tag-values/{key} ----------------------------
+
+
+def test_delete_tag_value_cascades_and_returns_count(client: TestClient) -> None:
+    client.post(
+        f"/v1/workflows/{WPID}/tags",
+        json={"tags": [{"key": "env", "value": "prod"}], "colors": {"env": "blue"}},
+    )
+    resp = client.request("DELETE", "/v1/tag-values/env", json={"value": "prod"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"key": "env", "value": "prod", "removed_from_workflow_count": 1}
+    # The label is gone from the workflow and from the value registry.
+    assert client.get(f"/v1/workflows/{WPID}/tags").json()["tags"] == []
+    assert client.get("/v1/tag-values").json() == []
+
+
+def test_delete_tag_value_404_when_absent(client: TestClient) -> None:
+    resp = client.request("DELETE", "/v1/tag-values/env", json={"value": "prod"})
+    assert resp.status_code == 404
+
+
+def test_delete_tag_value_reserved_prefix_returns_400(client: TestClient) -> None:
+    resp = client.request("DELETE", "/v1/tag-values/skyvern.system", json={"value": "prod"})
+    assert resp.status_code == 400
+
+
+def test_delete_tag_value_handles_value_with_slash(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "region", "value": "us/west"}]})
+    resp = client.request("DELETE", "/v1/tag-values/region", json={"value": "us/west"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["removed_from_workflow_count"] == 1
+
+
+def test_delete_tag_value_legacy_route_works(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": [{"key": "env", "value": "prod"}]})
+    resp = client.request("DELETE", "/api/v1/tag-values/env", json={"value": "prod"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["removed_from_workflow_count"] == 1

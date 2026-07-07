@@ -27,16 +27,25 @@ class RecordingInterpretationSessionRegistry:
         organization_id: str,
         workflow_permanent_id: str,
         on_update: OnRecordingInterpretationUpdate,
+        deltas_enabled: bool = False,
+        recording_attempt_id: str | None = None,
     ) -> None:
         self._prune_expired_sessions()
         existing = self._sessions.get(browser_session_id)
+        # Reuse the cached session only for a reconnect to the SAME recording. A
+        # new recording sends a different recording_attempt_id, so its events must
+        # not be appended to the prior session's already-consumed state machines
+        # (which would emit zero new draft steps). Clients that omit the id keep
+        # the legacy reuse behavior.
         if (
             existing is not None
             and existing.workflow_permanent_id == workflow_permanent_id
             and existing.organization_id == organization_id
             and not existing.finalized
+            and (recording_attempt_id is None or existing.recording_attempt_id == recording_attempt_id)
         ):
             existing.on_update = on_update
+            existing.set_deltas_enabled(deltas_enabled)
             self._last_seen[browser_session_id] = time.monotonic()
             existing.emit_snapshot()
             return
@@ -47,6 +56,8 @@ class RecordingInterpretationSessionRegistry:
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             on_update=on_update,
+            deltas_enabled=deltas_enabled,
+            recording_attempt_id=recording_attempt_id,
         )
         self._last_seen[browser_session_id] = time.monotonic()
 

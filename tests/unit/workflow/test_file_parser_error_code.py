@@ -133,7 +133,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     side_effect=Exception("Download failed"),
                 ):
                     result = await block.execute(
@@ -153,7 +153,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/bad.csv",
                 ):
                     with patch.object(
@@ -176,7 +176,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test_file",
                 ):
                     with patch.object(FileParserBlock, "_detect_file_type_from_url", return_value="unsupported_type"):
@@ -201,7 +201,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/statement.pdf",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -234,7 +234,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/statement.pdf",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -262,7 +262,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test.csv",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -286,7 +286,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test.csv",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -412,7 +412,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     side_effect=Exception("Download failed"),
                 ):
                     with patch.object(
@@ -437,7 +437,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test_file",
                 ):
                     with patch.object(FileParserBlock, "_detect_file_type_from_url", return_value="unsupported_type"):
@@ -464,7 +464,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/statement.pdf",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -496,7 +496,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test.csv",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):

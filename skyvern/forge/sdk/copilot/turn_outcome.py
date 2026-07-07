@@ -167,7 +167,16 @@ def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def derive_copilot_code_mode_diagnostics(ctx: Any) -> dict[str, bool | str | None]:
+def _schema_incompatibility_summary(ctx: Any) -> dict[str, Any] | None:
+    incompatibility = getattr(ctx, "latest_schema_incompatibility", None)
+    to_summary = getattr(incompatibility, "to_summary_dict", None)
+    if not callable(to_summary):
+        return None
+    summary = to_summary()
+    return summary if isinstance(summary, dict) else None
+
+
+def derive_copilot_code_mode_diagnostics(ctx: Any) -> dict[str, Any]:
     turn_halt_kind = getattr(getattr(ctx, "turn_halt", None), "kind", None)
     turn_halt_kind_value = getattr(turn_halt_kind, "value", turn_halt_kind)
     pending_capability = _string_or_none(getattr(ctx, "code_native_pending_capability", None))
@@ -177,6 +186,7 @@ def derive_copilot_code_mode_diagnostics(ctx: Any) -> dict[str, bool | str | Non
         ),
         "copilot_repair_ceiling_hit": turn_halt_kind_value == "repair_ceiling_reached",
         "copilot_pending_capability": pending_capability,
+        "copilot_schema_incompatibility": _schema_incompatibility_summary(ctx),
     }
 
 

@@ -38,6 +38,9 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./log:/data/log
+      - ./downloads:/data/downloads
+      - ./browser_sessions:/data/browser_sessions
+      - ./credential_vault:/data/credential_vault
       # Generated credentials allow the UI to pick up the local API key on first startup.
       - ./.skyvern:/app/.skyvern
       # Uncomment the following two lines if you want to connect to any local changes
@@ -62,6 +65,11 @@ services:
       - BROWSER_REMOTE_DEBUGGING_URL=${BROWSER_REMOTE_DEBUGGING_URL:-http://127.0.0.1:9222}
       - BROWSER_REMOTE_DEBUGGING_HOST_HEADER=${BROWSER_REMOTE_DEBUGGING_HOST_HEADER:-}
       - BROWSER_CDP_CONNECT_TIMEOUT_MS=${BROWSER_CDP_CONNECT_TIMEOUT_MS:-120000}
+      - DOWNLOAD_PATH=/data/downloads
+      - BROWSER_SESSION_BASE_PATH=/data/browser_sessions
+      - CREDENTIAL_VAULT_TYPE=${CREDENTIAL_VAULT_TYPE:-skyvern}
+      - ENABLE_LOCAL_CREDENTIAL_VAULT=${ENABLE_LOCAL_CREDENTIAL_VAULT:-true}
+      - LOCAL_CREDENTIAL_VAULT_PATH=/data/credential_vault
       - ENABLE_CODE_BLOCK=true
       # --- Control your own browser (Chrome/Chromium) ---
       # Prefer Chrome's chrome://inspect/#remote-debugging flow for an existing profile.

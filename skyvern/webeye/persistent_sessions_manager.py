@@ -20,7 +20,24 @@ class PersistentSessionsManager(Protocol):
         """Initialize monitoring of the session pool."""
         ...
 
+    def start_reaper(self) -> None:
+        """Start the periodic reaper that closes idle/expired sessions."""
+        ...
+
     def can_probe_registered_browser_state(self) -> bool: ...
+
+    def supports_evict_and_reconnect(self) -> bool:
+        """Whether ``evict_cached_browser_state`` followed by ``get_browser_state`` can
+        yield a fresh, reconnected ``BrowserState`` for the same ``session_id``.
+
+        True for managers (e.g. the cloud V2 manager) whose ``get_browser_state`` performs
+        a network-level reconnect when the cache is empty. False for managers (e.g. the
+        OSS default impl) whose ``get_browser_state`` is a pure in-memory lookup — for
+        those, evicting removes the only ``BrowserState`` and the next call returns None,
+        so callers must avoid the evict-and-reconnect pattern entirely or risk leaving
+        the cache empty for the rest of the session's lifetime.
+        """
+        ...
 
     async def begin_session(
         self,
@@ -80,9 +97,11 @@ class PersistentSessionsManager(Protocol):
         timeout_minutes: int | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
+        proxy_session_id: str | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
+        inherit_profile_proxy: bool = False,
         wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
@@ -110,6 +129,23 @@ class PersistentSessionsManager(Protocol):
 
     async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a browser session."""
+        ...
+
+    async def evict_cached_browser_state(
+        self,
+        session_id: str,
+        organization_id: str | None = None,
+        expected: BrowserState | None = None,
+    ) -> None:
+        """Drop any in-process cache entry for this session and close its BrowserState,
+        so the next get_browser_state call re-establishes a fresh CDP connection.
+
+        When ``expected`` is provided the eviction is race-safe: callers can pass the
+        stale BrowserState they just navigated against, and the manager skips eviction
+        if the cached wrapper now holds a different (fresh) BrowserState that another
+        coroutine just stored. This guards against closing a fresh wrapper that a
+        parallel caller is already holding.
+        """
         ...
 
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:

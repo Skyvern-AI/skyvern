@@ -53,25 +53,22 @@ def _ctx(
 # ---------------------------------------------------------------------------
 
 
-def test_detect_transitions_workflow_updated_on_false_to_true() -> None:
-    before = snapshot_ctx(_ctx(update_workflow_called=False))
-    after = snapshot_ctx(_ctx(update_workflow_called=True))
-    result = detect_transitions(before, after, tool_name="update_workflow", prior_tool_name="evaluate")
-    assert TransitionKind.WORKFLOW_UPDATED in result
-
-
-def test_detect_transitions_test_completed() -> None:
-    before = snapshot_ctx(_ctx(test_after_update_done=False))
-    after = snapshot_ctx(_ctx(test_after_update_done=True))
-    result = detect_transitions(before, after, tool_name="run_blocks_and_collect_debug", prior_tool_name=None)
-    assert TransitionKind.TEST_COMPLETED in result
-
-
-def test_detect_transitions_navigation_completed() -> None:
-    before = snapshot_ctx(_ctx(navigate_called=False))
-    after = snapshot_ctx(_ctx(navigate_called=True))
-    result = detect_transitions(before, after, tool_name="navigate_browser", prior_tool_name=None)
-    assert TransitionKind.NAVIGATION_COMPLETED in result
+@pytest.mark.parametrize(
+    ("ctx_field", "tool_name", "prior_tool_name", "expected_kind"),
+    [
+        ("update_workflow_called", "update_workflow", "evaluate", TransitionKind.WORKFLOW_UPDATED),
+        ("test_after_update_done", "run_blocks_and_collect_debug", None, TransitionKind.TEST_COMPLETED),
+        ("navigate_called", "navigate_browser", None, TransitionKind.NAVIGATION_COMPLETED),
+    ],
+    ids=["workflow_updated", "test_completed", "navigation_completed"],
+)
+def test_detect_transitions_flag_false_to_true(
+    ctx_field: str, tool_name: str, prior_tool_name: str | None, expected_kind: TransitionKind
+) -> None:
+    before = snapshot_ctx(_ctx())
+    after = snapshot_ctx(_ctx(**{ctx_field: True}))
+    result = detect_transitions(before, after, tool_name=tool_name, prior_tool_name=prior_tool_name)
+    assert expected_kind in result
 
 
 def test_detect_transitions_new_tool_cluster_only_on_change() -> None:
@@ -492,31 +489,14 @@ async def test_schedule_narration_keeps_clock_frozen_on_failure(monkeypatch: pyt
     assert state.in_flight_task is None
 
 
-@pytest.mark.asyncio
-async def test_schedule_narration_swallows_handler_exception(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+async def _configure_raising_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _raising_handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
         raise RuntimeError("provider down")
 
     await _install_handler(monkeypatch, _raising_handler)
 
-    state = NarratorState()
-    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=1)  # type: ignore[arg-type]
-    assert state.in_flight_task is not None
-    # Awaiting the task should not raise -- errors are swallowed inside.
-    await state.in_flight_task
-
-    assert state.in_flight_task is None
-    assert stream.sent == []
-
-
-@pytest.mark.asyncio
-async def test_schedule_narration_drops_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _configure_timeout_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(narration, "NARRATOR_TIMEOUT_SECONDS", 0.05)
 
     async def _slow_handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
@@ -525,52 +505,47 @@ async def test_schedule_narration_drops_on_timeout(monkeypatch: pytest.MonkeyPat
 
     await _install_handler(monkeypatch, _slow_handler)
 
-    state = NarratorState()
-    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
-    stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=2)  # type: ignore[arg-type]
-    assert state.in_flight_task is not None
-    await state.in_flight_task
-
-    assert state.in_flight_task is None
-    assert stream.sent == []
-
-
-@pytest.mark.asyncio
-async def test_schedule_narration_drops_empty_response(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _configure_blank_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _blank_handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
         return "   "
 
     await _install_handler(monkeypatch, _blank_handler)
 
-    state = NarratorState()
-    state.record_transition(TransitionKind.TEST_COMPLETED)
-    stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=4)  # type: ignore[arg-type]
-    assert state.in_flight_task is not None
-    await state.in_flight_task
-
-    assert stream.sent == []
-    assert state.in_flight_task is None
-
-
-@pytest.mark.asyncio
-async def test_schedule_narration_no_handler_available(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _configure_no_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     # Simulate the AppHolder-not-initialized case (unit tests, pre-startup).
     await _install_handler(monkeypatch, None)
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configure",
+    [
+        _configure_raising_handler,
+        _configure_timeout_handler,
+        _configure_blank_handler,
+        _configure_no_handler,
+    ],
+    ids=["handler_exception", "llm_timeout", "blank_response", "no_handler_available"],
+)
+async def test_schedule_narration_drops_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    configure: Any,
+) -> None:
+    await configure(monkeypatch)
+
     state = NarratorState()
-    state.record_transition(TransitionKind.NAVIGATION_COMPLETED)
+    state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     stream = _FakeStream()
 
-    schedule_narration(state, stream, iteration=0)  # type: ignore[arg-type]
+    schedule_narration(state, stream, iteration=1)  # type: ignore[arg-type]
     assert state.in_flight_task is not None
+    # Awaiting the task must not raise -- every failure mode is swallowed inside.
     await state.in_flight_task
 
-    assert stream.sent == []
     assert state.in_flight_task is None
+    assert stream.sent == []
 
 
 @pytest.mark.asyncio
@@ -729,12 +704,6 @@ def test_record_block_transitions_advances_seen_state_for_subsequent_calls() -> 
     record_block_transitions(state, _snap(("b1", "completed")), seen, iteration=0)
     assert seen == {"b1": "completed"}
     assert state.pending_transition == TransitionKind.BLOCK_COMPLETED
-
-
-def test_record_block_transitions_returns_empty_when_nothing_changed() -> None:
-    state = NarratorState()
-    seen = {"b1": "completed"}
-    assert record_block_transitions(state, _snap(("b1", "completed")), seen, iteration=0) == []
 
 
 def test_record_block_transitions_records_synthetic_activity_entry() -> None:

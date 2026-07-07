@@ -3,9 +3,15 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useQueryClient } from "@tanstack/react-query";
 
-function WorkflowRunVerificationCodeForm() {
+function WorkflowRunVerificationCodeForm({
+  workflowRunId,
+}: {
+  workflowRunId?: string;
+} = {}) {
   const queryClient = useQueryClient();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    workflowRunId ? { workflowRunId } : undefined,
+  );
 
   const isRunFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const isWaitingForCode =
@@ -13,7 +19,7 @@ function WorkflowRunVerificationCodeForm() {
 
   const navigateUrl =
     workflowRun?.workflow?.workflow_permanent_id && workflowRun?.workflow_run_id
-      ? `/workflows/${workflowRun.workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}`
+      ? `/agents/${workflowRun.workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}`
       : undefined;
 
   return (

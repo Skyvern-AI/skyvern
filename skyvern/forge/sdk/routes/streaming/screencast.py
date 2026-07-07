@@ -65,12 +65,44 @@ async def _resolve_browser_state(
     return None
 
 
+async def _resolve_working_page(
+    browser_state: BrowserState,
+    entity_id: str,
+    entity_type: str,
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
+    fall_back_to_captured: bool = True,
+) -> object | None:
+    # Re-resolve each poll so the screencast follows a BrowserState the run swaps in post-connect (skyvern#6703).
+    try:
+        state = await _resolve_browser_state(entity_id, entity_type, workflow_run_id, organization_id)
+    except Exception:
+        state = None
+    if state is not None:
+        try:
+            page = await state.get_working_page()
+        except Exception:
+            page = None
+        if page is not None:
+            return page
+    # Captured fallback (validated by wait_for_browser_state) only before the first rebind; afterwards a transient
+    # failure returns None so the caller keeps the live page instead of downgrading to the initial about:blank.
+    if not fall_back_to_captured:
+        return None
+    try:
+        return await browser_state.get_working_page()
+    except Exception:
+        return None
+
+
 async def start_screencast_loop(
     websocket: WebSocket,
     browser_state: BrowserState,
     entity_id: str,
     entity_type: str,
     check_finalized: Callable[[], Awaitable[bool]],
+    workflow_run_id: str | None = None,
+    organization_id: str | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
     cdp_session: CDPSession | None = None
@@ -208,12 +240,11 @@ async def start_screencast_loop(
         while True:
             data = await frame_queue.get()
             current_url = ""
-            try:
-                page = await browser_state.get_working_page()
-                if page is not None:
-                    current_url = page.url
-            except Exception:
-                pass
+            if attached_page is not None:
+                try:
+                    current_url = getattr(attached_page, "url", "") or ""
+                except Exception:
+                    pass
             try:
                 await websocket.send_json(
                     {
@@ -247,7 +278,14 @@ async def start_screencast_loop(
         while True:
             await asyncio.sleep(ACTIVE_PAGE_POLL_INTERVAL)
             try:
-                page = await browser_state.get_working_page()
+                page = await _resolve_working_page(
+                    browser_state,
+                    entity_id,
+                    entity_type,
+                    workflow_run_id,
+                    organization_id,
+                    fall_back_to_captured=False,
+                )
                 if page is not None and page is not attached_page:
                     await _attach_to_page(page)
             except Exception:
@@ -259,7 +297,7 @@ async def start_screencast_loop(
                 )
 
     try:
-        page = await browser_state.get_working_page()
+        page = await _resolve_working_page(browser_state, entity_id, entity_type, workflow_run_id, organization_id)
         if page is None:
             raise RuntimeError("No working page available for screencast")
 

@@ -13,8 +13,9 @@ import {
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-function useWorkflowRunWithWorkflowQuery() {
-  const workflowRunId = useFirstParam("workflowRunId", "runId");
+function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);

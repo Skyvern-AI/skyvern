@@ -12,7 +12,10 @@ import {
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { useGoogleOAuthCredentials } from "@/hooks/useGoogleOAuthCredentials";
+import {
+  GOOGLE_SHEETS_REQUIRED_SCOPES,
+  useGoogleOAuthCredentials,
+} from "@/hooks/useGoogleOAuthCredentials";
 import { useGoogleSpreadsheet } from "@/hooks/useGoogleSpreadsheet";
 import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import { SheetTabCombobox } from "@/routes/workflows/components/SheetTabCombobox";
@@ -102,6 +105,7 @@ function GoogleSheetsReadEditorBody({
             nodeId={blockId}
             value={data.credentialId}
             onChange={(next) => update({ credentialId: next })}
+            requiredScopes={GOOGLE_SHEETS_REQUIRED_SCOPES}
           />
         </div>
 

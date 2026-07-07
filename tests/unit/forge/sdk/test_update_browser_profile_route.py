@@ -16,6 +16,8 @@ from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.schemas.proxy_pinning import generate_proxy_session_id
+from skyvern.schemas.runs import ProxyLocation
 
 ORG_ID = "org_oss"
 PROFILE_ID = "bp_test_profile"
@@ -26,6 +28,8 @@ def _profile(
     description: str | None = "A profile",
     organization_id: str = ORG_ID,
     profile_id: str = PROFILE_ID,
+    proxy_location: ProxyLocation | None = None,
+    proxy_session_id: str | None = None,
 ) -> BrowserProfile:
     now = datetime.now(timezone.utc)
     return BrowserProfile(
@@ -34,6 +38,8 @@ def _profile(
         name=name,
         description=description,
         source_browser_type=None,
+        proxy_location=proxy_location,
+        proxy_session_id=proxy_session_id,
         created_at=now,
         modified_at=now,
         deleted_at=None,
@@ -121,6 +127,132 @@ def test_update_browser_profile_name_and_description(monkeypatch: pytest.MonkeyP
         organization_id=ORG_ID,
         name="Renamed",
         description="New desc",
+    )
+
+
+def test_update_browser_profile_enables_proxy_pin_with_generated_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, update_browser_profile = _build_client(monkeypatch)
+    generated_session_id = generate_proxy_session_id(PROFILE_ID)
+    update_browser_profile.return_value = _profile(
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id=generated_session_id,
+    )
+
+    response = client.patch(
+        f"/v1/browser_profiles/{PROFILE_ID}",
+        json={"proxy_location": "RESIDENTIAL_ISP", "proxy_session_id": None},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proxy_location"] == "RESIDENTIAL_ISP"
+    assert body["proxy_session_id"] == generated_session_id
+    update_browser_profile.assert_awaited_once_with(
+        profile_id=PROFILE_ID,
+        organization_id=ORG_ID,
+        name=None,
+        description=None,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+    )
+
+
+def test_update_browser_profile_rotates_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, update_browser_profile = _build_client(monkeypatch)
+    rotated_session_id = generate_proxy_session_id(PROFILE_ID)
+    update_browser_profile.return_value = _profile(
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id=rotated_session_id,
+    )
+
+    response = client.patch(
+        f"/v1/browser_profiles/{PROFILE_ID}",
+        json={"proxy_location": "RESIDENTIAL_ISP", "rotate_proxy_session_id": True},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proxy_location"] == "RESIDENTIAL_ISP"
+    assert body["proxy_session_id"] == rotated_session_id
+    update_browser_profile.assert_awaited_once_with(
+        profile_id=PROFILE_ID,
+        organization_id=ORG_ID,
+        name=None,
+        description=None,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        rotate_proxy_session_id=True,
+    )
+
+
+def test_update_browser_profile_sets_explicit_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, update_browser_profile = _build_client(monkeypatch)
+    update_browser_profile.return_value = _profile(
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+
+    response = client.patch(
+        f"/v1/browser_profiles/{PROFILE_ID}",
+        json={"proxy_location": "RESIDENTIAL_ISP", "proxy_session_id": "abc1234567"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proxy_location"] == "RESIDENTIAL_ISP"
+    assert body["proxy_session_id"] == "abc1234567"
+    update_browser_profile.assert_awaited_once_with(
+        profile_id=PROFILE_ID,
+        organization_id=ORG_ID,
+        name=None,
+        description=None,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id="abc1234567",
+    )
+
+
+def test_update_browser_profile_stores_advanced_proxy_identity_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, update_browser_profile = _build_client(monkeypatch)
+    advanced_key = "support-shared-login@example.com"
+    update_browser_profile.return_value = _profile(
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id=advanced_key,
+    )
+
+    response = client.patch(
+        f"/v1/browser_profiles/{PROFILE_ID}",
+        json={"proxy_session_id": advanced_key},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proxy_location"] == "RESIDENTIAL_ISP"
+    assert body["proxy_session_id"] == advanced_key
+    update_browser_profile.assert_awaited_once_with(
+        profile_id=PROFILE_ID,
+        organization_id=ORG_ID,
+        name=None,
+        description=None,
+        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_session_id=advanced_key,
+    )
+
+
+def test_update_browser_profile_clears_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, update_browser_profile = _build_client(monkeypatch)
+    update_browser_profile.return_value = _profile(proxy_location=None, proxy_session_id=None)
+
+    response = client.patch(
+        f"/v1/browser_profiles/{PROFILE_ID}",
+        json={"proxy_location": None},
+    )
+
+    assert response.status_code == 200
+    update_browser_profile.assert_awaited_once_with(
+        profile_id=PROFILE_ID,
+        organization_id=ORG_ID,
+        name=None,
+        description=None,
+        proxy_location=None,
+        proxy_session_id=None,
     )
 
 

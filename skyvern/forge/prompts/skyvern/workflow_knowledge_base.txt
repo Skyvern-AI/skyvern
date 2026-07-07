@@ -608,7 +608,7 @@ Purpose: Upload files to storage. This is the "Cloud Storage Block" in the UI.
 Structure:
 block_type: file_upload
 label: <unique_label>
-storage_type: <s3|azure>                       # Optional: Storage backend (default: s3)
+storage_type: <s3|azure|google_drive>          # Optional: Storage backend (default: s3)
 s3_bucket: <bucket_name>                       # Optional: S3 bucket name
 aws_access_key_id: <access_key_id>             # Optional: AWS access key id
 aws_secret_access_key: <secret_access_key>     # Optional: AWS secret access key
@@ -617,11 +617,14 @@ azure_storage_account_name: <account_name>     # Optional: Azure storage account
 azure_storage_account_key: <account_key>       # Optional: Azure storage account key
 azure_blob_container_name: <container_name>    # Optional: Azure blob container
 azure_folder_path: <folder_path>               # Optional: Azure folder path
+google_credential_id: <credential_id>          # Required for google_drive: Google OAuth credential ID
+google_drive_folder_id: <folder_id_or_url>     # Required for google_drive: Drive folder ID or URL
 path: <local_or_workspace_path>                # Optional: File path to upload
 
 Use Cases:
 - Upload downloaded artifacts to S3
 - Publish files to Azure Blob Storage
+- Upload workflow files to a Google Drive folder
 - Persist workflow outputs to storage
 
 Example:
@@ -634,21 +637,36 @@ blocks:
     region_name: "us-west-2"
     path: "/tmp/latest_report.pdf"
 
+Google Drive example:
+blocks:
+  - block_type: file_upload
+    label: upload_report_to_drive
+    next_block_label: null
+    storage_type: google_drive
+    google_credential_id: "cred_google_drive"
+    google_drive_folder_id: "https://drive.google.com/drive/folders/folder_id"
+    path: "/tmp/latest_report.pdf"
+
 ** FILE PARSER BLOCK (file_url_parser) **
 
-Purpose: Parse PDFs, CSVs, Excel files, images, and DOCX files. This is the "File Parser Block" in the UI.
+Purpose: Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives. This is the "File Parser Block" in the UI.
 
 Structure:
 block_type: file_url_parser
 label: <unique_label>
 file_url: <https_url_or_file_url>             # Required: URL to the file
-file_type: <auto_detect|csv|excel|pdf|image|docx>  # Optional: defaults to auto_detect (infer from URL/content)
+file_type: <auto_detect|csv|excel|pdf|image|docx|zip>  # Optional: defaults to auto_detect (infer from URL/content)
 json_schema: <json_schema>                     # Optional: Structure of parsed output
 
 Use Cases:
 - Parse a PDF invoice into structured fields
 - Extract rows from a CSV file
 - Read Excel sheets for downstream processing
+- Unzip a ZIP archive of PDFs and extract structured data across all of them
+
+ZIP behavior:
+- Without json_schema: outputs the list of extracted files as [{file_name, file_path, file_size}]. Loop over the output and pass each file_path as the file_url of another file_url_parser block to parse files individually.
+- With json_schema: parses every supported file inside the archive (CSV/Excel/PDF/image/DOCX) and extracts against the schema from the combined content.
 
 Example:
 blocks:

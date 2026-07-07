@@ -7,7 +7,10 @@ from playwright.async_api import Locator, Page
 from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.forge.sdk.api.files import download_file as download_file_api
+from skyvern.forge.sdk.api.files import resolve_run_download_id, validate_local_file_path
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.webeye.actions.actions import Action, KeypressAction
 
 LOG = structlog.get_logger()
 
@@ -17,6 +20,10 @@ async def download_file(
     action: dict[str, Any] | None = None,
     organization_id: str | None = None,
 ) -> str | list[str]:
+    if file_url.startswith("/"):
+        run_id = resolve_run_download_id(skyvern_context.current())
+        return validate_local_file_path(file_url, run_id)
+
     try:
         return await download_file_api(file_url, organization_id=organization_id)
     except Exception:
@@ -39,11 +46,28 @@ async def input_sequentially(locator: Locator, text: str, timeout: float = setti
     await EventStrategyFactory.type_text(locator.page, locator, text)
 
 
+ENTER_KEY_ALIASES = ("enter", "return")
+
+
+def keys_include_enter(keys: list[str]) -> bool:
+    # "enter" and "return" both execute as the Enter key (see keypress() below).
+    return any(key.lower() in ENTER_KEY_ALIASES for key in keys)
+
+
+def should_stop_batch_after_dropdown_select(next_action: Action | None) -> bool:
+    """Whether a committed in-INPUT_TEXT combobox selection should stop the batch.
+
+    True only when the next batched action would clobber the selection: a trailing Enter/Return
+    keypress. Same-element / other follow-ups are intentionally left to run.
+    """
+    return isinstance(next_action, KeypressAction) and keys_include_enter(next_action.keys)
+
+
 async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0, repeat: int = 1) -> None:
     updated_keys = []
     for key in keys:
         key_lower_case = key.lower()
-        if key_lower_case in ("enter", "return"):
+        if key_lower_case in ENTER_KEY_ALIASES:
             updated_keys.append("Enter")
         elif key_lower_case == "space":
             updated_keys.append(" ")

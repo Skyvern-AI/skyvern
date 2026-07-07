@@ -15,6 +15,8 @@ export const ActionType = {
     Complete: "complete",
     ReloadPage: "reload_page",
     ClosePage: "close_page",
+    NewTab: "new_tab",
+    SwitchTab: "switch_tab",
     Extract: "extract",
     VerificationCode: "verification_code",
     GotoUrl: "goto_url",

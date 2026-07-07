@@ -75,6 +75,14 @@ from .browser import (
     skyvern_validate,
     skyvern_wait,
 )
+from .browser_profiles import (
+    skyvern_browser_profile_create,
+    skyvern_browser_profile_delete,
+    skyvern_browser_profile_get,
+    skyvern_browser_profile_list,
+    skyvern_browser_profile_update,
+)
+from .code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from .credential import (
     skyvern_credential_delete,
     skyvern_credential_get,
@@ -349,6 +357,13 @@ mcp.tool(tags={"session"}, annotations=_ro("List Browser Sessions"))(skyvern_bro
 mcp.tool(tags={"session"}, annotations=_ro("Get Browser Session"))(skyvern_browser_session_get)
 mcp.tool(tags={"session"}, annotations=_web_mut("Connect to Browser Session"))(skyvern_browser_session_connect)
 
+# -- Browser profile management --
+mcp.tool(tags={"browser_profile"}, annotations=_mut("Create Browser Profile"))(skyvern_browser_profile_create)
+mcp.tool(tags={"browser_profile"}, annotations=_ro("List Browser Profiles"))(skyvern_browser_profile_list)
+mcp.tool(tags={"browser_profile"}, annotations=_ro("Get Browser Profile"))(skyvern_browser_profile_get)
+mcp.tool(tags={"browser_profile"}, annotations=_mut("Update Browser Profile"))(skyvern_browser_profile_update)
+mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(skyvern_browser_profile_delete)
+
 # -- Primary tools (AI-powered exploration + observation) --
 # Browser tools run against arbitrary websites. Read-only inspection remains
 # non-destructive, but still open-world because the target site is unbounded.
@@ -424,6 +439,8 @@ mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern
 # -- Block discovery + validation (no browser needed) --
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Synthesize Code Block"))(skyvern_code_block_synthesize)
 
 # -- Organization settings (no browser needed) --
 mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
@@ -485,6 +502,12 @@ __all__ = [
     "skyvern_browser_session_list",
     "skyvern_browser_session_get",
     "skyvern_browser_session_connect",
+    # Browser profiles
+    "skyvern_browser_profile_create",
+    "skyvern_browser_profile_list",
+    "skyvern_browser_profile_get",
+    "skyvern_browser_profile_update",
+    "skyvern_browser_profile_delete",
     # Primary (AI-powered)
     "skyvern_act",
     "skyvern_extract",
@@ -542,6 +565,8 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    "skyvern_code_block_lint",
+    "skyvern_code_block_synthesize",
     # Organization settings
     "skyvern_org_get",
     "skyvern_org_update",

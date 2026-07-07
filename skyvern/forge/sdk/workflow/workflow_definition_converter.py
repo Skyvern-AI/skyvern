@@ -168,6 +168,8 @@ def convert_workflow_definition(
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 created_at=now,
                 modified_at=now,
             )
@@ -327,10 +329,8 @@ def convert_workflow_definition(
         blocks.append(block)
         block_label_mapping[block.label] = block
 
-    # Set the blocks for the workflow definition and derive DAG version metadata
-    dag_version = workflow_definition_yaml.version
-    if dag_version is None:
-        dag_version = 2 if _has_dag_metadata(workflow_definition_yaml.blocks) else 1
+    # version is populated by the WorkflowDefinitionYAML after-validator; `or 1` only narrows int | None.
+    dag_version = workflow_definition_yaml.version or 1
 
     workflow_definition = WorkflowDefinition(
         parameters=parameters.values(),
@@ -633,6 +633,8 @@ def block_yaml_to_block(
             azure_storage_account_name=block_yaml.azure_storage_account_name,
             azure_storage_account_key=block_yaml.azure_storage_account_key,
             azure_blob_container_name=block_yaml.azure_blob_container_name,
+            google_credential_id=block_yaml.google_credential_id,
+            google_drive_folder_id=block_yaml.google_drive_folder_id,
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:
@@ -842,6 +844,7 @@ def block_yaml_to_block(
             follow_redirects=block_yaml.follow_redirects,
             download_filename=block_yaml.download_filename,
             save_response_as_file=block_yaml.save_response_as_file,
+            secret_response_paths=block_yaml.secret_response_paths,
             parameters=http_request_block_parameters,
         )
     elif block_yaml.block_type == BlockType.GOTO_URL:
@@ -943,12 +946,3 @@ def _resolve_block_parameters(
 ) -> list[PARAMETER_TYPE]:
     parameter_keys = getattr(block_yaml, "parameter_keys", None)
     return [parameters[parameter_key] for parameter_key in parameter_keys] if parameter_keys else []
-
-
-def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
-    for block_yaml in block_yamls:
-        if block_yaml.next_block_label:
-            return True
-        if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and _has_dag_metadata(block_yaml.loop_blocks):
-            return True
-    return False

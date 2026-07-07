@@ -20,5 +20,7 @@ export interface FileUploadBlockYaml {
     azure_storage_account_key?: string;
     azure_blob_container_name?: string;
     azure_folder_path?: string;
+    google_credential_id?: string;
+    google_drive_folder_id?: string;
     path?: string;
 }

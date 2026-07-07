@@ -5,7 +5,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from skyvern.utils.script_file_paths import normalize_script_file_path
 
 
 class FileEncoding(StrEnum):
@@ -49,6 +51,11 @@ class ScriptFileCreate(BaseModel):
     content: str = Field(..., description="Base64 encoded file content")
     encoding: FileEncoding = Field(default=FileEncoding.BASE64, description="Content encoding")
     mime_type: str | None = Field(default=None, description="MIME type (auto-detected if not provided)")
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        return normalize_script_file_path(value)
 
 
 class CreateScriptRequest(BaseModel):

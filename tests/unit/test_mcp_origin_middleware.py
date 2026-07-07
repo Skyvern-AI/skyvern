@@ -70,6 +70,13 @@ def test_is_allowed_origin_random_is_rejected() -> None:
     assert is_allowed_origin("https://attacker.com") is False
 
 
+def test_is_allowed_origin_extra_origin_allowed() -> None:
+    extra = frozenset({"https://inspector.skyvern.example"})
+    assert is_allowed_origin("https://inspector.skyvern.example", extra) is True
+    assert is_allowed_origin("https://inspector.skyvern.example:8443", extra) is False
+    assert is_allowed_origin("https://evil.example", extra) is False
+
+
 def test_is_allowed_origin_prefix_spoofing_rejected() -> None:
     # Subdomain claiming claude.ai must not pass (only hostname exact matches).
     assert is_allowed_origin("https://claude.ai.attacker.com") is False
@@ -110,6 +117,17 @@ def test_middleware_allows_claude_ai(client: TestClient) -> None:
 def test_middleware_allows_loopback(client: TestClient) -> None:
     response = client.post("/mcp/", headers={"origin": "http://127.0.0.1:12345"})
     assert response.status_code == 200
+
+
+def test_middleware_allows_configured_extra_origin() -> None:
+    async def app_factory(scope, receive, send):  # type: ignore[no-untyped-def]
+        inner = Starlette(routes=[Route("/mcp/", _ok_handler, methods=["GET", "POST"])])
+        middleware = OriginValidationMiddleware(inner, extra_allowed_origins=["https://Inspector.Skyvern.Example/"])
+        await middleware(scope, receive, send)
+
+    client = TestClient(app_factory)
+    assert client.post("/mcp/", headers={"origin": "https://inspector.skyvern.example"}).status_code == 200
+    assert client.post("/mcp/", headers={"origin": "https://evil.example"}).status_code == 403
 
 
 def test_middleware_rejects_unknown_origin(client: TestClient) -> None:

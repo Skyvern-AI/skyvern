@@ -43,6 +43,10 @@ class ExfiltratedEvent:
     params: dict = dataclasses.field(default_factory=dict)
     source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
     timestamp: float = dataclasses.field(default_factory=lambda: time.time())  # seconds since epoch
+    # Monotonic order assigned at the earliest synchronous capture point so the
+    # interpreter can restore chronological order after async materialization
+    # (e.g. console json_value round-trips) reorders events under load.
+    capture_seq: int = -1
 
 
 OnExfiltrationEvent = t.Callable[[list[ExfiltratedEvent]], None]
@@ -82,8 +86,14 @@ class ExfiltrationChannel(CdpChannel):
         self._last_network_activity_emit = 0.0
         self._network_activity_flush_task: asyncio.Task[None] | None = None
         self._capture_paused = False
+        self._capture_seq = 0
 
         super().__init__(vnc_channel=vnc_channel)
+
+    def _next_capture_seq(self) -> int:
+        seq = self._capture_seq
+        self._capture_seq += 1
+        return seq
 
     def pause_capture(self) -> None:
         self._capture_paused = True
@@ -174,11 +184,32 @@ class ExfiltrationChannel(CdpChannel):
         for fingerprint in expired:
             self._recent_console_event_fingerprints.pop(fingerprint, None)
 
-    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+    # Excluded from the fingerprint: advances by ms when one interaction is re-captured across a reconnect.
+    _CONSOLE_FINGERPRINT_VOLATILE_KEYS: t.ClassVar[frozenset[str]] = frozenset({"timestamp"})
+
+    def _console_fingerprint(self, event_data: dict[str, t.Any]) -> str:
+        # Drop None values (recursively) as well as volatile keys: the binding,
+        # Playwright-console, and raw-CDP transports materialize the same event
+        # with None-vs-absent differences (JSON.stringify drops undefined keys;
+        # the binding serializes them to null), which otherwise defeats dedup.
+        stable = self._strip_none(
+            {k: v for k, v in event_data.items() if k not in self._CONSOLE_FINGERPRINT_VOLATILE_KEYS}
+        )
         try:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"))
         except TypeError:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"), default=str)
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+
+    @classmethod
+    def _strip_none(cls, value: t.Any) -> t.Any:
+        if isinstance(value, dict):
+            return {k: cls._strip_none(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [cls._strip_none(item) for item in value]
+        return value
+
+    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+        fingerprint = self._console_fingerprint(event_data)
 
         now = time.monotonic()
         self._prune_console_dedup_cache(now)
@@ -189,7 +220,7 @@ class ExfiltrationChannel(CdpChannel):
         self._recent_console_event_fingerprints[fingerprint] = now
         return True
 
-    def _emit_console_event(self, event_data: dict[str, t.Any]) -> None:
+    def _emit_console_event(self, event_data: dict[str, t.Any], capture_seq: int) -> None:
         if not self._should_emit_console_event(event_data):
             return
 
@@ -201,6 +232,7 @@ class ExfiltrationChannel(CdpChannel):
                     params=event_data,
                     source=ExfiltratedEventSource.CONSOLE,
                     timestamp=time.time(),
+                    capture_seq=capture_seq,
                 )
             ]
         )
@@ -212,9 +244,9 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        active_channel._emit_console_event(event_data)
+        active_channel._emit_console_event(event_data, active_channel._next_capture_seq())
 
-    async def _handle_console_event_async(self, msg: ConsoleMessage) -> None:
+    async def _handle_console_event_async(self, msg: ConsoleMessage, capture_seq: int) -> None:
         """Parse Playwright console messages for exfiltrated event data."""
         event_data: dict[str, t.Any] | None = None
         try:
@@ -232,12 +264,12 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        self._emit_console_event(event_data)
+        self._emit_console_event(event_data, capture_seq)
 
     def _handle_console_event(self, msg: ConsoleMessage) -> None:
-        self._track_event_task(self._handle_console_event_async(msg))
+        self._track_event_task(self._handle_console_event_async(msg, self._next_capture_seq()))
 
-    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any]) -> None:
+    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any], capture_seq: int) -> None:
         raw_args = params.get("args")
         if not isinstance(raw_args, list):
             return
@@ -246,14 +278,16 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        self._emit_console_event(event_data)
+        self._emit_console_event(event_data, capture_seq)
 
     async def _attach_page_cdp_console_capture(self, page: Page) -> CDPSession | None:
         cdp_session = await page.context.new_cdp_session(page)
         await cdp_session.send("Runtime.enable")
         cdp_session.on(
             "Runtime.consoleAPICalled",
-            lambda params: self._track_event_task(self._handle_runtime_console_event_async(params)),
+            lambda params: self._track_event_task(
+                self._handle_runtime_console_event_async(params, self._next_capture_seq())
+            ),
         )
         return cdp_session
 
@@ -335,6 +369,7 @@ class ExfiltrationChannel(CdpChannel):
                 params=params,
                 source=ExfiltratedEventSource.CDP,
                 timestamp=time.time(),
+                capture_seq=self._next_capture_seq(),
             ),
         ]
 

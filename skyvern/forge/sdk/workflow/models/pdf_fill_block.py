@@ -23,7 +23,11 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILE
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import download_file, get_path_for_workflow_download_directory
+from skyvern.forge.sdk.api.files import (
+    download_file,
+    get_path_for_workflow_download_directory,
+    validate_local_file_path,
+)
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -32,6 +36,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.utils.pdf_parser import render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.tesseract_languages import DEFAULT_FLAT_FILL_OCR_LANGUAGES
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
 from skyvern.forge.sdk.workflow.models._jinja import render_templates_in_json_value
@@ -60,6 +65,7 @@ FLAT_FILL_OCR_TIMEOUT_SECONDS = 60
 # Outer budget across all pages so a flat PDF can't pin a worker for the full per-page timeout x max pages.
 FLAT_FILL_OCR_TOTAL_TIMEOUT_SECONDS = 300
 FLAT_FILL_MAX_PAGES = 25
+FLAT_FILL_OCR_LANGUAGES = os.getenv("FLAT_FILL_OCR_LANGUAGES", DEFAULT_FLAT_FILL_OCR_LANGUAGES).strip()
 
 
 @dataclass(frozen=True)
@@ -177,13 +183,18 @@ class PdfFillBlock(Block):
             organization_id=organization_id,
         )
 
-    async def _resolve_source_pdf(self, organization_id: str | None) -> tuple[str, bool]:
-        # Bare local paths bypass download_file's gating, so only honor them in local dev;
-        # in deployed environments they could read other runs' files off a shared worker.
+    async def _resolve_source_pdf(self, workflow_run_id: str, organization_id: str | None) -> tuple[str, bool]:
         # Returns (path, is_temp): is_temp marks a download_file temp the caller must clean up;
         # a user-supplied local path is never deleted.
         if settings.ENV == "local" and os.path.exists(self.file_url):
             return self.file_url, False
+        if self.file_url.startswith("/"):
+            context = skyvern_context.current()
+            run_id = context.run_id if context and context.run_id else workflow_run_id
+            resolved = validate_local_file_path(self.file_url, run_id)
+            if not os.path.isfile(resolved):
+                raise FileNotFoundError(f"Local file not found: {self.file_url}")
+            return resolved, False
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
@@ -342,7 +353,7 @@ class PdfFillBlock(Block):
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key or self.llm_key,
+            self.override_llm_key_for_organization(organization_id) or self.llm_key,
             default=default_llm_handler,
         )
         prompt = prompt_engine.load_prompt(
@@ -511,10 +522,7 @@ class PdfFillBlock(Block):
                 async with aiofiles.open(image_path, "wb") as f:
                     await f.write(image_bytes)
                 process = await asyncio.create_subprocess_exec(
-                    "tesseract",
-                    image_path,
-                    "stdout",
-                    "tsv",
+                    *self._tesseract_command(image_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -531,6 +539,14 @@ class PdfFillBlock(Block):
                     self._parse_tesseract_tsv(stdout.decode("utf-8", errors="replace"), page_index, len(anchors))
                 )
         return anchors
+
+    @staticmethod
+    def _tesseract_command(image_path: str) -> list[str]:
+        command = ["tesseract", image_path, "stdout"]
+        if FLAT_FILL_OCR_LANGUAGES:
+            command.extend(["-l", FLAT_FILL_OCR_LANGUAGES])
+        command.append("tsv")
+        return command
 
     @staticmethod
     def _tsv_int(row: dict[str, str], key: str) -> int | None:
@@ -607,7 +623,7 @@ class PdfFillBlock(Block):
     ) -> dict[str, Any]:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key or self.llm_key,
+            self.override_llm_key_for_organization(organization_id) or self.llm_key,
             default=default_llm_handler,
         )
         prompt = prompt_engine.load_prompt(
@@ -847,7 +863,7 @@ class PdfFillBlock(Block):
             )
 
         try:
-            source_pdf_path, source_is_temp = await self._resolve_source_pdf(organization_id)
+            source_pdf_path, source_is_temp = await self._resolve_source_pdf(workflow_run_id, organization_id)
         except Exception as e:
             return await self._record_failure(
                 workflow_run_context,

@@ -10,6 +10,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update
 from ..core.serialization import FieldMetadata
 from .action_block_data_schema import ActionBlockDataSchema
 from .action_block_parameters_item import ActionBlockParametersItem
+from .ai_fallback_mode import AiFallbackMode
 from .aws_secret_parameter import AwsSecretParameter
 from .branch_condition import BranchCondition
 from .code_block_parameters_item import CodeBlockParametersItem
@@ -77,6 +78,8 @@ class WhileLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
+    selector: typing.Optional[str] = None
+    ai_fallback: typing.Optional[AiFallbackMode] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -257,6 +260,8 @@ class WhileLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     azure_storage_account_name: typing.Optional[str] = None
     azure_storage_account_key: typing.Optional[str] = None
     azure_blob_container_name: typing.Optional[str] = None
+    google_credential_id: typing.Optional[str] = None
+    google_drive_folder_id: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -530,6 +535,7 @@ class WhileLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
+    skip_saved_profile: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -929,63 +935,24 @@ WhileLoopBlockLoopBlocksItem = typing.Union[
     WhileLoopBlockLoopBlocksItem_WhileLoop,
     WhileLoopBlockLoopBlocksItem_WorkflowTrigger,
 ]
-# Manual patch: see for_loop_block.py header note.
-try:
-    from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
-except ImportError:
-    pass
-else:
-    for _cls in (
-        WhileLoopBlockLoopBlocksItem_Action,
-        WhileLoopBlockLoopBlocksItem_Code,
-        WhileLoopBlockLoopBlocksItem_Extraction,
-        WhileLoopBlockLoopBlocksItem_FileDownload,
-        WhileLoopBlockLoopBlocksItem_ForLoop,
-        WhileLoopBlockLoopBlocksItem_GoogleSheetsRead,
-        WhileLoopBlockLoopBlocksItem_GoogleSheetsWrite,
-        WhileLoopBlockLoopBlocksItem_GotoUrl,
-        WhileLoopBlockLoopBlocksItem_HttpRequest,
-        WhileLoopBlockLoopBlocksItem_HumanInteraction,
-        WhileLoopBlockLoopBlocksItem_Login,
-        WhileLoopBlockLoopBlocksItem_Navigation,
-        WhileLoopBlockLoopBlocksItem_PrintPage,
-        WhileLoopBlockLoopBlocksItem_Task,
-        WhileLoopBlockLoopBlocksItem_TextPrompt,
-        WhileLoopBlockLoopBlocksItem_Validation,
-        WhileLoopBlockLoopBlocksItem_Wait,
-        WhileLoopBlockLoopBlocksItem_WhileLoop,
-        WhileLoopBlockLoopBlocksItem_WorkflowTrigger,
-    ):
-        update_forward_refs(_cls)
-    from . import for_loop_block_loop_blocks_item as _fllb
-    _fllb.WhileLoopBlockLoopBlocksItem = WhileLoopBlockLoopBlocksItem  # type: ignore[attr-defined]
-    for _cls in (
-        _fllb.ForLoopBlockLoopBlocksItem_Action,
-        _fllb.ForLoopBlockLoopBlocksItem_Code,
-        _fllb.ForLoopBlockLoopBlocksItem_Extraction,
-        _fllb.ForLoopBlockLoopBlocksItem_FileDownload,
-        _fllb.ForLoopBlockLoopBlocksItem_ForLoop,
-        _fllb.ForLoopBlockLoopBlocksItem_GoogleSheetsRead,
-        _fllb.ForLoopBlockLoopBlocksItem_GoogleSheetsWrite,
-        _fllb.ForLoopBlockLoopBlocksItem_GotoUrl,
-        _fllb.ForLoopBlockLoopBlocksItem_HttpRequest,
-        _fllb.ForLoopBlockLoopBlocksItem_HumanInteraction,
-        _fllb.ForLoopBlockLoopBlocksItem_Login,
-        _fllb.ForLoopBlockLoopBlocksItem_Navigation,
-        _fllb.ForLoopBlockLoopBlocksItem_PrintPage,
-        _fllb.ForLoopBlockLoopBlocksItem_Task,
-        _fllb.ForLoopBlockLoopBlocksItem_TextPrompt,
-        _fllb.ForLoopBlockLoopBlocksItem_Validation,
-        _fllb.ForLoopBlockLoopBlocksItem_Wait,
-        _fllb.ForLoopBlockLoopBlocksItem_WhileLoop,
-        _fllb.ForLoopBlockLoopBlocksItem_WorkflowTrigger,
-    ):
-        update_forward_refs(_cls)
-    from . import for_loop_block as _flb
-    _flb.ForLoopBlockLoopBlocksItem = ForLoopBlockLoopBlocksItem  # type: ignore[attr-defined]
-    _flb.WhileLoopBlockLoopBlocksItem = WhileLoopBlockLoopBlocksItem  # type: ignore[attr-defined]
-    update_forward_refs(_flb.ForLoopBlock)
-    from . import while_loop_block as _wlb
-    _wlb.ForLoopBlockLoopBlocksItem = ForLoopBlockLoopBlocksItem  # type: ignore[attr-defined]
-    _wlb.WhileLoopBlockLoopBlocksItem = WhileLoopBlockLoopBlocksItem  # type: ignore[attr-defined]
-    update_forward_refs(_wlb.WhileLoopBlock)
+from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
+
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Action)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Code)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Extraction)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_FileDownload)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_ForLoop)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_GoogleSheetsRead)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_GoogleSheetsWrite)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_GotoUrl)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_HttpRequest)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_HumanInteraction)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Login)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Navigation)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_PrintPage)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Task)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_TextPrompt)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Validation)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_Wait)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_WhileLoop)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_WorkflowTrigger)

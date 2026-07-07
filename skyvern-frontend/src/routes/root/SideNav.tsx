@@ -15,6 +15,7 @@ import {
   ReaderIcon,
   ReloadIcon,
   Share1Icon,
+  TokensIcon,
 } from "@radix-ui/react-icons";
 
 import { BagIcon } from "@/components/icons/BagIcon";
@@ -77,7 +78,7 @@ function SideNav({ collapsed }: Props = {}) {
     },
     {
       label: "Agents",
-      to: "/workflows",
+      to: "/agents",
       icon: <LightningBoltIcon className="size-4" />,
       children: [
         {
@@ -100,7 +101,7 @@ function SideNav({ collapsed }: Props = {}) {
         },
         {
           label: "All Agents",
-          to: "/workflows",
+          to: "/agents",
           icon: <ListBulletIcon className="size-3.5" />,
         },
         {
@@ -267,6 +268,11 @@ function SideNav({ collapsed }: Props = {}) {
           label: "General",
           to: "/settings",
           icon: <GearIcon className="size-3.5" />,
+        },
+        {
+          label: "Labels",
+          to: "/settings/labels",
+          icon: <TokensIcon className="size-3.5" />,
         },
       ],
     },

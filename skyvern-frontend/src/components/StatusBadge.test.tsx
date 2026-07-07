@@ -16,6 +16,14 @@ describe("StatusBadge", () => {
     expect(label.classList.contains("md:not-sr-only")).toBe(true);
   });
 
+  test("keeps the label visible at every width when alwaysShowLabel is set", () => {
+    render(<StatusBadge status={Status.Terminated} alwaysShowLabel />);
+
+    const label = screen.getByText("terminated");
+    expect(label.classList.contains("sr-only")).toBe(false);
+    expect(label.classList.contains("md:not-sr-only")).toBe(false);
+  });
+
   test("collapses to a compact pill below md via responsive classes", () => {
     const { container } = render(<StatusBadge status={Status.Completed} />);
 

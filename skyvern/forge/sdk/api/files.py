@@ -44,7 +44,7 @@ def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[
     # retrieve the suffix from Content-Type
     content_type = headers.get("Content-Type")
     if content_type:
-        if file_suffix := mimetypes.guess_extension(content_type):
+        if file_suffix := mimetypes.guess_extension(content_type.split(";")[0].strip()):
             return file_stem, file_suffix
 
     return file_stem, file_suffix or ""
@@ -66,7 +66,7 @@ def is_valid_mime_type(file_path: str) -> bool:
 
 def _determine_download_filename(
     filename: str | None,
-    response_headers: dict,
+    response_headers: CIMultiDictProxy[str] | dict[str, str],
     url: str,
 ) -> str:
     """Determine the filename for a downloaded file."""
@@ -220,27 +220,54 @@ async def download_file(
 
                 # Get the file name
                 if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                    download_dir = output_dir
+                    download_dir_path = Path(output_dir)
+                    download_dir_path.mkdir(parents=True, exist_ok=True)
                 else:
-                    download_dir = make_temp_directory(prefix="skyvern_downloads_")
+                    download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
-                # Determine filename - use provided filename or derive from response/URL
-                file_name = _determine_download_filename(filename, dict(response.headers), url)
-                file_path = os.path.join(download_dir, file_name)
+                download_dir_resolved = download_dir_path.resolve()
+                # response.headers stays a CIMultiDictProxy: dict() would make header
+                # lookups case-sensitive and miss lowercase wire headers.
+                file_name = _determine_download_filename(filename, response.headers, url)
+                allowed_dir = os.path.realpath(download_dir_resolved)
+                resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
+                # sanitize_filename strips separators but keeps dots, so a dots-only name can
+                # still resolve outside the download dir; require a direct child. Checked
+                # before streaming so a rejected name downloads zero bytes.
+                if (
+                    resolved_final_path == allowed_dir
+                    or not resolved_final_path.startswith(allowed_dir + os.sep)
+                    or os.path.dirname(resolved_final_path) != allowed_dir
+                ):
+                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                final_path = Path(resolved_final_path)
 
-                LOG.info(f"Downloading file to {file_path}")
-                with open(file_path, "wb") as f:
-                    # Write the content of the request into the file
-                    total_bytes_downloaded = 0
-                    async for chunk in response.content.iter_chunked(1024):
-                        f.write(chunk)
-                        total_bytes_downloaded += len(chunk)
-                        if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
-                            raise DownloadFileMaxSizeExceeded(max_size_mb)
+                temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
+                file_path = Path(temp_file.name).resolve()
+                if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
+                    temp_file.close()
+                    raise ValueError("Unsafe temporary file path created for download")
 
-                LOG.info(f"File downloaded successfully to {file_path}")
-                return file_path
+                LOG.info("Downloading file to temporary path", file_path=str(file_path))
+                try:
+                    with temp_file as f:
+                        # Write the content of the request into the file
+                        total_bytes_downloaded = 0
+                        async for chunk in response.content.iter_chunked(1024):
+                            f.write(chunk)
+                            total_bytes_downloaded += len(chunk)
+                            if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
+                                raise DownloadFileMaxSizeExceeded(max_size_mb)
+
+                    file_path.replace(final_path)
+                except BaseException:
+                    # An orphaned temp file in a run download dir would get synced to storage
+                    # under the tmpXXXX name; drop it on any failure (incl. cancellation).
+                    file_path.unlink(missing_ok=True)
+                    raise
+
+                LOG.info(f"File downloaded successfully to {final_path}")
+                return str(final_path)
     except aiohttp.ClientResponseError as e:
         LOG.exception(f"Failed to download file, status code: {e.status}")
         raise
@@ -258,6 +285,27 @@ async def download_file(
     except Exception:
         LOG.exception("Failed to download file")
         raise
+
+
+async def resolve_local_or_download_file(
+    file_url: str,
+    run_id: str | None,
+    organization_id: str | None = None,
+    max_size_mb: int | None = None,
+) -> str:
+    """Resolve a file input to a local path.
+
+    Absolute paths are validated against the run's download directory; anything else is downloaded.
+    """
+    # Absolute paths are the run-local convention; treating all non-remote strings as paths would misroute bad URLs.
+    if file_url.startswith("/"):
+        resolved = validate_local_file_path(file_url, run_id)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"Local file not found: {file_url}")
+        if max_size_mb is not None and os.path.getsize(resolved) > max_size_mb * 1024 * 1024:
+            raise DownloadFileMaxSizeExceeded(max_size_mb)
+        return resolved
+    return await download_file(file_url, max_size_mb=max_size_mb, organization_id=organization_id)
 
 
 def zip_files(files_path: str, zip_file_path: str) -> str:
@@ -347,6 +395,41 @@ def list_files_in_directory(directory: Path, recursive: bool = False) -> list[st
             break
 
     return listed_files
+
+
+PENDING_EXTENSION_RENAME_WAIT_SECONDS = 3.0
+PENDING_EXTENSION_RENAME_POLL_SECONDS = 0.1
+
+
+async def wait_for_pending_extension_rename(download_dir: str, filename: str) -> str:
+    """Return the file's final name, waiting out an in-flight extension-recovery rename.
+
+    The browser finalizes a download under an extensionless name moments before the
+    async download listener renames it in place (bare GUID -> GUID.pdf). Storage syncs
+    must never upload the intermediate name — the same bytes would get registered
+    under both names across two syncs. For an extensionless file, wait briefly for the
+    rename to land and return the renamed filename; on timeout return the original so
+    the file is still uploaded rather than dropped.
+    """
+    if Path(filename).suffix:
+        return filename
+    deadline = asyncio.get_event_loop().time() + PENDING_EXTENSION_RENAME_WAIT_SECONDS
+    while asyncio.get_event_loop().time() < deadline:
+        if not os.path.exists(os.path.join(download_dir, filename)):
+            return _resolve_extension_rename_twin(download_dir, filename)
+        await asyncio.sleep(PENDING_EXTENSION_RENAME_POLL_SECONDS)
+    if not os.path.exists(os.path.join(download_dir, filename)):
+        return _resolve_extension_rename_twin(download_dir, filename)
+    return filename
+
+
+def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:
+    renamed = [
+        candidate
+        for candidate in os.listdir(download_dir)
+        if candidate != filename and Path(candidate).stem == filename and Path(candidate).suffix
+    ]
+    return renamed[0] if renamed else filename
 
 
 def list_downloading_files_in_directory(
@@ -481,6 +564,8 @@ def create_named_temporary_file(delete: bool = True, file_name: str | None = Non
         safe_file_name = sanitize_filename(file_name)
         # Create file with exact name (without random characters)
         file_path = os.path.join(temp_dir, safe_file_name)
+        if not os.path.abspath(file_path).startswith(os.path.abspath(temp_dir) + os.sep):
+            raise ValueError(f"Unsafe filename in temporary file creation: {safe_file_name!r}")
         # Open in binary mode and return a NamedTemporaryFile-like object
         file = open(file_path, "wb")
         return tempfile._TemporaryFileWrapper(file, file_path, delete=delete)

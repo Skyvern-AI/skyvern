@@ -1,7 +1,11 @@
 import pytest
+from pydantic import ValidationError
 
 from skyvern.config import settings
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_proxy_location
+from skyvern.forge.sdk.schemas.browser_profiles import UpdateBrowserProfileRequest
+from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_proxy_url, _redact_url_query
 
@@ -67,6 +71,18 @@ def test_build_browser_args_uses_configured_recording_size(monkeypatch: pytest.M
     assert args["record_video_size"] == {"width": 1280, "height": 720}
 
 
+@pytest.mark.asyncio
+async def test_resolve_recording_video_size_is_noop_in_oss() -> None:
+    agent_function = AgentFunction()
+
+    assert await agent_function.resolve_recording_video_size(None, distinct_id="wr_1", organization_id="o_1") is None
+    existing = {"width": 1280, "height": 720}
+    assert (
+        await agent_function.resolve_recording_video_size(existing, distinct_id="wr_1", organization_id="o_1")
+        == existing
+    )
+
+
 def test_deserialize_proxy_location_custom_url_returns_dict() -> None:
     result = deserialize_proxy_location('{"url": "http://user:pass@proxy.example.com:8080"}')
     assert result == {"url": "http://user:pass@proxy.example.com:8080"}
@@ -77,6 +93,12 @@ def test_proxy_location_db_round_trip_custom_url() -> None:
     serialized = serialize_proxy_location(original)
     assert serialized is not None
     assert deserialize_proxy_location(serialized) == original
+
+
+@pytest.mark.parametrize("request_model", [UpdateCredentialRequest, UpdateBrowserProfileRequest])
+def test_proxy_pin_requests_reject_custom_proxy_urls(request_model: type) -> None:
+    with pytest.raises(ValidationError, match="Custom proxy URLs are not supported"):
+        request_model(proxy_location={"url": "http://user:pass@proxy.example.com:8080"})
 
 
 def test_proxy_location_db_round_trip_geo_target() -> None:

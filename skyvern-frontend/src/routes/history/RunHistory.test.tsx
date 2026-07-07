@@ -39,6 +39,7 @@ vi.mock("use-debounce", () => ({
 
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => undefined,
+  useFeatureFlagEnabled: () => false,
 }));
 
 vi.mock("@/hooks/useRunsQuery", () => ({

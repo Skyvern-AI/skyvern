@@ -123,7 +123,7 @@ class TestExfiltrationChannelEvents:
         message.args = []
         message.text = f"[EXFIL] {json.dumps(event_data)}"
 
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 0)
 
         on_event.assert_called_once()
         assert on_event.call_args.args[0][0].params == event_data
@@ -134,7 +134,7 @@ class TestExfiltrationChannelEvents:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def handle_console_event(_: object) -> None:
+        async def handle_console_event(_: object, __: int) -> None:
             started.set()
             await release.wait()
 
@@ -163,7 +163,7 @@ class TestExfiltrationChannelEvents:
         message.args = [marker, payload]
         message.text = "[EXFIL] JSHandle@object"
 
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 0)
 
         on_event.assert_called_once()
         assert on_event.call_args.args[0][0].params == event_data
@@ -180,14 +180,15 @@ class TestExfiltrationChannelEvents:
         message.text = f"[EXFIL] {json.dumps(event_data)}"
 
         channel._handle_binding_event({"page": page}, event_data)
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 1)
         await channel._handle_runtime_console_event_async(
             {
                 "args": [
                     {"type": "string", "value": "[EXFIL]"},
                     {"type": "string", "value": json.dumps(event_data)},
                 ]
-            }
+            },
+            2,
         )
 
         on_event.assert_called_once()
@@ -292,6 +293,79 @@ class TestExfiltrationChannelEvents:
         page.on.assert_not_called()
         page.add_init_script.assert_not_awaited()
         assert page.evaluate.await_count == 2
+
+    def test_console_fingerprint_ignores_volatile_timestamp(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        jittered = {**_make_event_data(), "timestamp": 1002.0}
+
+        assert channel._console_fingerprint(first) == channel._console_fingerprint(jittered)
+
+    def test_should_emit_console_event_dedupes_across_ms_jitter(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        jittered = {**_make_event_data(), "timestamp": 1002.0}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(jittered) is False
+
+    def test_should_emit_console_event_keeps_distinct_interactions(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        distinct_target = {
+            **_make_event_data(),
+            "timestamp": 1002.0,
+            "target": {"tagName": "BUTTON", "id": "cancel", "skyId": "sky-2", "text": ["Cancel"]},
+        }
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(distinct_target) is True
+
+    def test_reconnect_recapture_with_jitter_emits_single_interaction(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        ExfiltrationChannel._active_binding_channels[page] = channel
+
+        # A reconnect re-injects the exfiltrate script, re-emitting the same DOM
+        # interaction with an advanced browser clock; the stable fingerprint dedupes
+        # it even though the channel instance (and its cache) survived the reconnect.
+        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1000.0})
+        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1002.0})
+
+        on_event.assert_called_once()
+
+    def test_fingerprint_treats_none_and_absent_keys_as_equal(self) -> None:
+        # The binding transport serializes JS undefined to None while the console
+        # transports drop those keys entirely (JSON.stringify). Both shapes must
+        # dedup as one event or every interaction is delivered 2-3x.
+        channel, _ = _make_channel()
+        via_binding = {
+            **_make_event_data(),
+            "inputValue": None,
+            "mousePosition": {"xa": 10, "ya": 20, "xp": None, "yp": None},
+        }
+        via_console = {
+            **_make_event_data(),
+            "mousePosition": {"xa": 10, "ya": 20},
+        }
+
+        assert channel._console_fingerprint(via_binding) == channel._console_fingerprint(via_console)
+
+    def test_should_emit_console_event_dedupes_none_vs_absent_duplicates(self) -> None:
+        channel, _ = _make_channel()
+        via_binding = {**_make_event_data(), "inputValue": None}
+        via_console = _make_event_data()
+
+        assert channel._should_emit_console_event(via_binding) is True
+        assert channel._should_emit_console_event(via_console) is False
+
+    def test_should_emit_console_event_keeps_distinct_values_over_none(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "inputValue": None}
+        distinct = {**_make_event_data(), "inputValue": "hello"}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(distinct) is True
 
 
 class TestNavigationReExfiltration:

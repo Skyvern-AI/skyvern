@@ -193,7 +193,7 @@ class OrganizationsRepository(BaseRepository):
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account", "custom_credential_service"],
+        token_type: Literal["api", "onepassword_service_account", "custom_credential_service", "custom_llm"],
     ) -> OrganizationAuthToken | None: ...
 
     @overload
@@ -220,6 +220,7 @@ class OrganizationsRepository(BaseRepository):
             "azure_client_secret_credential",
             "bitwarden_credential",
             "custom_credential_service",
+            "custom_llm",
         ],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | None:
         async with self.Session() as session:
@@ -304,6 +305,22 @@ class OrganizationsRepository(BaseRepository):
             ).all()
             return [await convert_to_organization_auth_token(token, token_type) for token in tokens]
 
+    @db_operation("get_valid_org_auth_tokens_by_type")
+    async def get_valid_org_auth_tokens_by_type(
+        self,
+        token_type: OrganizationAuthTokenType,
+    ) -> list[OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken]:
+        async with self.Session() as session:
+            tokens = (
+                await session.scalars(
+                    select(OrganizationAuthTokenModel)
+                    .filter_by(token_type=token_type)
+                    .filter_by(valid=True)
+                    .order_by(OrganizationAuthTokenModel.created_at.desc())
+                )
+            ).all()
+            return [await convert_to_organization_auth_token(token, token_type) for token in tokens]
+
     @db_operation("validate_org_auth_token")
     async def validate_org_auth_token(
         self,
@@ -375,6 +392,54 @@ class OrganizationsRepository(BaseRepository):
 
         return await convert_to_organization_auth_token(auth_token, token_type)
 
+    @db_operation("update_org_auth_token")
+    async def update_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token_id: str,
+        token: str | AzureClientSecretCredential | BitwardenCredential,
+        encrypted_method: EncryptMethod | None = None,
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+        if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
+            if not isinstance(token, AzureClientSecretCredential):
+                raise TypeError("Expected AzureClientSecretCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        elif token_type is OrganizationAuthTokenType.bitwarden_credential:
+            if not isinstance(token, BitwardenCredential):
+                raise TypeError("Expected BitwardenCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        else:
+            if not isinstance(token, str):
+                raise TypeError("Expected str token for this token_type")
+            plaintext_token = token
+
+        encrypted_token = ""
+        if encrypted_method is not None:
+            encrypted_token = await encryptor.encrypt(plaintext_token, encrypted_method)
+            plaintext_token = ""
+
+        async with self.Session() as session:
+            auth_token = (
+                await session.scalars(
+                    select(OrganizationAuthTokenModel)
+                    .filter_by(id=token_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(token_type=token_type)
+                    .filter_by(valid=True)
+                )
+            ).first()
+            if auth_token is None:
+                raise NotFoundError("Organization auth token not found")
+
+            auth_token.token = plaintext_token
+            auth_token.encrypted_token = encrypted_token
+            auth_token.encrypted_method = encrypted_method.value if encrypted_method is not None else ""
+            await session.commit()
+            await session.refresh(auth_token)
+
+        return await convert_to_organization_auth_token(auth_token, token_type)
+
     @db_operation("invalidate_org_auth_tokens")
     async def invalidate_org_auth_tokens(
         self,
@@ -390,4 +455,24 @@ class OrganizationsRepository(BaseRepository):
                 .filter_by(valid=True)
                 .values(valid=False)
             )
+            await session.commit()
+
+    @db_operation("invalidate_org_auth_token")
+    async def invalidate_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(OrganizationAuthTokenModel)
+                .filter_by(id=token_id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .filter_by(valid=True)
+                .values(valid=False)
+            )
+            if result.rowcount == 0:
+                raise NotFoundError("Organization auth token not found")
             await session.commit()

@@ -75,10 +75,12 @@ ORGANIZATION_BILLING_PREFIX = "ob"
 WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
 WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX = "wccs"
+WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX = "wrcs"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
 TAG_EVENT_PREFIX = "tge"
 TAG_KEY_PREFIX = "tkey"
+TAG_VALUE_PREFIX = "tval"
 
 
 def generate_workflow_id() -> str:
@@ -266,6 +268,11 @@ def generate_tag_key_id() -> str:
     return f"{TAG_KEY_PREFIX}_{int_id}"
 
 
+def generate_tag_value_id() -> str:
+    int_id = generate_id()
+    return f"{TAG_VALUE_PREFIX}_{int_id}"
+
+
 def generate_google_oauth_credential_id() -> str:
     int_id = generate_id()
     return f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
@@ -314,6 +321,11 @@ def generate_workflow_copilot_chat_message_id() -> str:
 def generate_workflow_copilot_completion_criteria_set_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX}_{int_id}"
+
+
+def generate_workflow_run_credential_selection_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX}_{int_id}"
 
 
 def generate_script_fallback_episode_id() -> str:

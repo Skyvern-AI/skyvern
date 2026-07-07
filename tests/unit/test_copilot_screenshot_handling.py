@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,42 +31,29 @@ class TestIsValidPngBase64:
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     )
 
+    JPEG_B64 = base64.b64encode(b"\xff\xd8\xff\xe0" + b"\x00" * 80).decode()
+    GIF_B64 = base64.b64encode(b"GIF89a" + b"\x00" * 80).decode()
+
     @staticmethod
     def _check(value: Any) -> bool:
         from skyvern.forge.sdk.copilot.output_utils import is_valid_image_base64
 
         return is_valid_image_base64(value)
 
-    def test_valid_png_header(self) -> None:
-        assert self._check(self.VALID_PNG_B64) is True
-
-    def test_invalid_data(self) -> None:
-        assert self._check("not-valid-base64-at-all!!!" + "x" * 100) is False
-
-    def test_empty_string(self) -> None:
-        assert self._check("") is False
-
-    def test_none(self) -> None:
-        assert self._check(None) is False
-
-    def test_short_string(self) -> None:
-        assert self._check("iVBOR") is False
-
-    def test_jpeg_base64_accepted(self) -> None:
-        import base64
-
-        # Valid base64 with JFIF JPEG header — now accepted
-        jpeg_header = b"\xff\xd8\xff\xe0" + b"\x00" * 80
-        b64 = base64.b64encode(jpeg_header).decode()
-        assert self._check(b64) is True
-
-    def test_non_image_base64(self) -> None:
-        import base64
-
-        # Valid base64 but not PNG or JPEG
-        gif_header = b"GIF89a" + b"\x00" * 80
-        b64 = base64.b64encode(gif_header).decode()
-        assert self._check(b64) is False
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            pytest.param(VALID_PNG_B64, True, id="png_header"),
+            pytest.param(JPEG_B64, True, id="jpeg_header"),
+            pytest.param(GIF_B64, False, id="gif_rejected"),
+            pytest.param("", False, id="empty"),
+            pytest.param(None, False, id="none"),
+            pytest.param("iVBOR", False, id="short"),
+            pytest.param("not-valid-base64-at-all!!!" + "x" * 100, False, id="garbage"),
+        ],
+    )
+    def test_is_valid_image_base64(self, payload: Any, expected: bool) -> None:
+        assert self._check(payload) is expected
 
 
 class TestEnqueueScreenshot:
@@ -189,17 +177,17 @@ class TestExtractScreenshotB64:
 
         return extract_screenshot_b64(result)
 
-    def test_extracts_from_data(self) -> None:
-        assert self._extract({"data": {"screenshot_base64": "abc"}}) == "abc"
-
-    def test_returns_none_when_no_data(self) -> None:
-        assert self._extract({"ok": True}) is None
-
-    def test_returns_none_when_data_not_dict(self) -> None:
-        assert self._extract({"data": "string"}) is None
-
-    def test_returns_none_when_no_screenshot_key(self) -> None:
-        assert self._extract({"data": {"url": "https://example.com"}}) is None
+    @pytest.mark.parametrize(
+        ("result_dict", "expected"),
+        [
+            pytest.param({"data": {"screenshot_base64": "abc"}}, "abc", id="present"),
+            pytest.param({"ok": True}, None, id="no_data"),
+            pytest.param({"data": "string"}, None, id="data_not_dict"),
+            pytest.param({"data": {"url": "https://example.com"}}, None, id="no_screenshot_key"),
+        ],
+    )
+    def test_extract_screenshot_b64(self, result_dict: dict, expected: Any) -> None:
+        assert self._extract(result_dict) == expected
 
 
 class TestAttachActionTraces:

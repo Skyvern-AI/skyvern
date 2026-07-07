@@ -21,6 +21,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
             key: parameter.key,
             parameterType: WorkflowEditorParameterTypes.Credential,
             credentialId: parameter.default_value as string,
+            dataType: WorkflowParameterValueType.CredentialId,
             description: parameter.description,
           };
         }
@@ -68,6 +69,8 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           key: parameter.key,
           parameterType: WorkflowEditorParameterTypes.Credential,
           credentialId: parameter.credential_id,
+          credentialIds: parameter.credential_ids ?? null,
+          selectionStrategy: parameter.selection_strategy ?? null,
           description: parameter.description,
         };
       } else if (

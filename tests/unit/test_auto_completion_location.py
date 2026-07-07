@@ -13,10 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.constants import SKYVERN_ID_ATTR
+from skyvern.exceptions import NoIncrementalElementFoundForAutoCompletion
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext
 from skyvern.webeye.actions.handler import (
     AutoCompletionResult,
+    _reset_autocomplete_for_llm_fallback,
     choose_auto_completion_dropdown,
     input_or_auto_complete_input,
 )
@@ -424,6 +426,41 @@ async def test_input_or_auto_complete_passes_false_for_non_location() -> None:
 
 NO_RESULT_ELEMENTS = [{"id": "AAAA", "tag": "div", "text": "No results"}]
 UNRELATED_ELEMENTS = [{"id": "AAAA", "tag": "div", "text": "Something completely different"}]
+DETERMINISTIC_ELEMENTS = [
+    {"id": "AAAA", "tagName": "li", "attributes": {"role": "option"}, "text": "San Francisco, California"},
+    {"id": "AAAB", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland, California"},
+]
+DUPLICATE_DETERMINISTIC_ELEMENTS = [
+    {"id": "AAAA", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland, California"},
+    {"id": "AAAB", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland, California"},
+]
+
+
+def _mock_autocomplete_input(
+    *,
+    selected_value: str,
+    option_identity: dict[str, object] | None = None,
+) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+    frame = MagicMock()
+    option_locator = MagicMock()
+    option_locator.count = AsyncMock(return_value=1)
+    option_locator.element_handle = AsyncMock(return_value=MagicMock())
+    option_locator.click = AsyncMock()
+    frame.locator.return_value = option_locator
+
+    input_locator = MagicMock()
+    input_locator.input_value = AsyncMock(return_value=selected_value)
+
+    skyvern_el = _mock_skyvern_element(frame)
+    skyvern_el.get_locator.return_value = input_locator
+    skyvern_el.get_tag_name.return_value = "input"
+    skyvern_el.press_key = AsyncMock()
+
+    skyvern_frame = MagicMock(safe_wait_for_animation_end=AsyncMock())
+    skyvern_frame.read_autocomplete_option_identity = AsyncMock(
+        return_value=option_identity or {"index": 1, "label": selected_value}
+    )
+    return frame, option_locator, skyvern_el, skyvern_frame
 
 
 @pytest.mark.asyncio
@@ -522,3 +559,503 @@ async def test_location_unrelated_option_falls_through_to_llm() -> None:
 
         # LLM should be called because option doesn't contain the input
         mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_exact_match_skips_llm() -> None:
+    """When the collapse flag is on, an exact singleton option match is clicked without the LLM."""
+    frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Oakland, California",
+        option_identity={"index": 0, "label": "Oakland, California"},
+    )
+    inc_scrape = _mock_incremental_scrape(DETERMINISTIC_ELEMENTS)
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc_scrape),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock()
+
+        result = await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Current location"),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Oakland, California",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_not_called()
+        frame.locator.assert_called_with(f'[{SKYVERN_ID_ATTR}="AAAB"]')
+        option_locator.click.assert_awaited_once()
+        assert isinstance(result.action_result, ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_stem_match_skips_llm() -> None:
+    """The deterministic autocomplete path uses the same exact/stem tier as normal select."""
+    frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Masters",
+        option_identity={"index": 0, "label": "Masters"},
+    )
+    inc_scrape = _mock_incremental_scrape(
+        [{"id": "AAAA", "tagName": "li", "attributes": {"role": "option"}, "text": "Masters"}]
+    )
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc_scrape),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock()
+
+        result = await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Degree"),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Master",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_not_called()
+        frame.locator.assert_called_with(f'[{SKYVERN_ID_ATTR}="AAAA"]')
+        option_locator.click.assert_awaited_once()
+        assert isinstance(result.action_result, ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_search_bar_exact_match_uses_llm() -> None:
+    """Search bars keep the existing LLM path even when an exact option is visible."""
+    _frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Oakland, California"
+    )
+    skyvern_el.press_key = AsyncMock()
+    inc_scrape = _mock_incremental_scrape(DETERMINISTIC_ELEMENTS)
+
+    llm_response = {
+        "auto_completion_attempt": False,
+        "relevance_float": 0.0,
+        "id": "",
+        "direct_searching": True,
+        "reasoning": "Search bars should direct search",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc_scrape),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Search", is_search_bar=True),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Oakland, California",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        option_locator.click.assert_not_called()
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+        skyvern_el.press_key.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_ambiguous_exact_match_falls_back_to_llm() -> None:
+    """Duplicate exact labels are unsafe and must keep the existing LLM chooser path."""
+    _frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Oakland, California"
+    )
+    skyvern_el.press_key = AsyncMock()
+    inc_scrape = _mock_incremental_scrape(DUPLICATE_DETERMINISTIC_ELEMENTS)
+
+    llm_response = {
+        "auto_completion_attempt": False,
+        "relevance_float": 0.0,
+        "id": "",
+        "direct_searching": True,
+        "reasoning": "Ambiguous duplicate labels",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc_scrape),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Current location"),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Oakland, California",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        option_locator.click.assert_not_called()
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+        skyvern_el.press_key.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_identity_mismatch_resets_before_llm() -> None:
+    """An option identity mismatch must refresh the dropdown before the LLM chooser runs."""
+    _frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Oakland, California",
+        option_identity={"index": 1, "label": "San Jose, California"},
+    )
+    events: list[str] = []
+    skyvern_el.input_clear = AsyncMock(side_effect=lambda: events.append("clear"))
+    skyvern_el.press_fill = AsyncMock(side_effect=lambda value: events.append(f"fill:{value}"))
+    skyvern_el.press_key = AsyncMock()
+    initial_scrape = _mock_incremental_scrape(DETERMINISTIC_ELEMENTS)
+    initial_scrape.build_html_tree.return_value = '<div data-stale-id="AAAB">stale options</div>'
+    fallback_scrape = _mock_incremental_scrape(
+        [{"id": "FRESH", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland, California"}]
+    )
+    fallback_scrape.build_html_tree.return_value = '<div data-fresh-id="FRESH">fresh options</div>'
+
+    llm_response = {
+        "auto_completion_attempt": False,
+        "relevance_float": 0.0,
+        "id": "",
+        "direct_searching": True,
+        "reasoning": "Option rerendered",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            side_effect=[initial_scrape, fallback_scrape],
+        ) as scrape_factory,
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+
+        async def _llm_handler(**_: object) -> dict[str, object]:
+            events.append("llm")
+            return llm_response
+
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(side_effect=_llm_handler)
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Current location"),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Oakland, California",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        option_locator.click.assert_not_called()
+        assert scrape_factory.call_count == 2
+        skyvern_el.input_clear.assert_awaited_once()
+        assert skyvern_el.press_fill.await_count == 2
+        assert events == ["fill:Oakland, California", "clear", "fill:Oakland, California", "llm"]
+        assert mock_prompt.load_prompt.call_args.kwargs["elements"] == '<div data-fresh-id="FRESH">fresh options</div>'
+        assert "stale" not in mock_prompt.load_prompt.call_args.kwargs["elements"]
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+        skyvern_el.press_key.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_readback_mismatch_falls_back_to_llm() -> None:
+    """A deterministic click is not accepted when the input read-back is not the matched label."""
+    _frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Wrong city",
+        option_identity={"index": 1, "label": "Oakland, California"},
+    )
+    events: list[str] = []
+    skyvern_el.input_clear = AsyncMock(side_effect=lambda: events.append("clear"))
+    skyvern_el.press_fill = AsyncMock(side_effect=lambda value: events.append(f"fill:{value}"))
+    skyvern_el.press_key = AsyncMock()
+    initial_scrape = _mock_incremental_scrape(DETERMINISTIC_ELEMENTS)
+    initial_scrape.build_html_tree.return_value = "<div>stale options</div>"
+    fallback_scrape = _mock_incremental_scrape(
+        [{"id": "AAAB", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland, California"}]
+    )
+    fallback_scrape.build_html_tree.return_value = "<div>fresh options</div>"
+
+    llm_response = {
+        "auto_completion_attempt": False,
+        "relevance_float": 0.0,
+        "id": "",
+        "direct_searching": True,
+        "reasoning": "Read-back mismatch",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            side_effect=[initial_scrape, fallback_scrape],
+        ) as scrape_factory,
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+
+        async def _llm_handler(**_: object) -> dict[str, object]:
+            events.append("llm")
+            return llm_response
+
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(side_effect=_llm_handler)
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Current location"),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Oakland, California",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        option_locator.click.assert_awaited_once()
+        assert scrape_factory.call_count == 2
+        skyvern_el.input_clear.assert_awaited_once()
+        assert skyvern_el.press_fill.await_count == 2
+        assert events == ["fill:Oakland, California", "clear", "fill:Oakland, California", "llm"]
+        assert mock_prompt.load_prompt.call_args.kwargs["elements"] == "<div>fresh options</div>"
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+        skyvern_el.press_key.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_collapse_autocomplete_detached_option_resets_before_llm() -> None:
+    """A deterministic candidate that detaches before the click must refresh before the LLM chooser."""
+    _frame, option_locator, skyvern_el, skyvern_frame_mock = _mock_autocomplete_input(
+        selected_value="Oakland, California",
+        option_identity={"index": 0, "label": "Oakland, California"},
+    )
+    option_locator.count = AsyncMock(return_value=0)
+    events: list[str] = []
+    skyvern_el.input_clear = AsyncMock(side_effect=lambda: events.append("clear"))
+    skyvern_el.press_fill = AsyncMock(side_effect=lambda value: events.append(f"fill:{value}"))
+    skyvern_el.press_key = AsyncMock()
+    initial_scrape = _mock_incremental_scrape(DETERMINISTIC_ELEMENTS)
+    initial_scrape.build_html_tree.return_value = '<div data-stale-id="AAAB">stale options</div>'
+    fallback_scrape = _mock_incremental_scrape(
+        [{"id": "FRESH", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland, California"}]
+    )
+    fallback_scrape.build_html_tree.return_value = '<div data-fresh-id="FRESH">fresh options</div>'
+
+    llm_response = {
+        "auto_completion_attempt": False,
+        "relevance_float": 0.0,
+        "id": "",
+        "direct_searching": True,
+        "reasoning": "Option detached",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame_mock),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            side_effect=[initial_scrape, fallback_scrape],
+        ) as scrape_factory,
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+
+        async def _llm_handler(**_: object) -> dict[str, object]:
+            events.append("llm")
+            return llm_response
+
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(side_effect=_llm_handler)
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        await choose_auto_completion_dropdown(
+            context=_make_non_location_context(field="Current location"),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="Oakland, California",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            collapse_autocomplete_fanout_enabled=True,
+        )
+
+        option_locator.click.assert_not_called()
+        skyvern_frame_mock.read_autocomplete_option_identity.assert_not_called()
+        assert scrape_factory.call_count == 2
+        skyvern_el.input_clear.assert_awaited_once()
+        assert skyvern_el.press_fill.await_count == 2
+        assert events == ["fill:Oakland, California", "clear", "fill:Oakland, California", "llm"]
+        assert mock_prompt.load_prompt.call_args.kwargs["elements"] == '<div data-fresh-id="FRESH">fresh options</div>'
+        assert "stale" not in mock_prompt.load_prompt.call_args.kwargs["elements"]
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+        skyvern_el.press_key.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_reset_autocomplete_empty_incremental_rescrapes_page_elements() -> None:
+    """Empty reset increments fall back to a full page scrape for fresh interactable options."""
+    current_scrape = MagicMock(stop_listen_dom_increment=AsyncMock())
+    fallback_scrape = _mock_incremental_scrape([])
+    skyvern_el = _mock_skyvern_element()
+    skyvern_frame = MagicMock(safe_wait_for_animation_end=AsyncMock())
+    fresh_element = {"id": "FRESH", "tagName": "li", "attributes": {"role": "option"}, "text": "Oakland"}
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_css_dict = {"OLD": "[data-skyvern-id='OLD']"}
+    scraped_after_open = MagicMock()
+    scraped_after_open.id_to_css_dict = {
+        "OLD": "[data-skyvern-id='OLD']",
+        "FRESH": "[data-skyvern-id='FRESH']",
+    }
+    scraped_after_open.id_to_element_dict = {"FRESH": fresh_element}
+    scraped_after_open.build_element_tree.return_value = "<div>fresh page scrape</div>"
+    scraped_page.generate_scraped_page_without_screenshots = AsyncMock(return_value=scraped_after_open)
+
+    interactable = MagicMock()
+    interactable.is_interactable.return_value = True
+    dom_after_open = MagicMock()
+    dom_after_open.get_skyvern_element_by_id = AsyncMock(return_value=interactable)
+
+    with (
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=fallback_scrape) as scrape_factory,
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_after_open),
+    ):
+        (
+            returned_scrape,
+            fallback_elements,
+            cleaned_elements,
+            html,
+            new_element_ids,
+        ) = await _reset_autocomplete_for_llm_fallback(
+            current_incremental_scraped=current_scrape,
+            skyvern_frame=skyvern_frame,
+            skyvern_element=skyvern_el,
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            dom=MagicMock(),
+            text="Oakland",
+            task=_TASK,
+            step=_STEP,
+        )
+
+    current_scrape.stop_listen_dom_increment.assert_awaited_once()
+    skyvern_el.input_clear.assert_awaited_once()
+    skyvern_el.press_fill.assert_awaited_once_with("Oakland")
+    skyvern_frame.safe_wait_for_animation_end.assert_awaited_once()
+    scrape_factory.assert_called_once_with(skyvern_frame=skyvern_frame)
+    fallback_scrape.get_incremental_element_tree.assert_awaited_once()
+    scraped_page.generate_scraped_page_without_screenshots.assert_awaited_once()
+    dom_after_open.get_skyvern_element_by_id.assert_awaited_once_with("FRESH")
+    assert returned_scrape is fallback_scrape
+    assert fallback_elements == [fresh_element]
+    assert cleaned_elements == [fresh_element]
+    assert html == "<div>fresh page scrape</div>"
+    assert new_element_ids == ["FRESH"]
+
+
+@pytest.mark.asyncio
+async def test_reset_autocomplete_empty_rescrape_without_interactable_elements_raises() -> None:
+    """The reset helper raises when neither incremental nor page-rescrape options are interactable."""
+    current_scrape = MagicMock(stop_listen_dom_increment=AsyncMock())
+    fallback_scrape = _mock_incremental_scrape([])
+    skyvern_el = _mock_skyvern_element()
+    skyvern_frame = MagicMock(safe_wait_for_animation_end=AsyncMock())
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_css_dict = {"OLD": "[data-skyvern-id='OLD']"}
+    scraped_after_open = MagicMock()
+    scraped_after_open.id_to_css_dict = {
+        "OLD": "[data-skyvern-id='OLD']",
+        "FRESH": "[data-skyvern-id='FRESH']",
+    }
+    scraped_after_open.id_to_element_dict = {"FRESH": {"id": "FRESH", "text": "Oakland"}}
+    scraped_page.generate_scraped_page_without_screenshots = AsyncMock(return_value=scraped_after_open)
+
+    non_interactable = MagicMock()
+    non_interactable.is_interactable.return_value = False
+    dom_after_open = MagicMock()
+    dom_after_open.get_skyvern_element_by_id = AsyncMock(return_value=non_interactable)
+
+    with (
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=fallback_scrape),
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_after_open),
+        pytest.raises(NoIncrementalElementFoundForAutoCompletion),
+    ):
+        await _reset_autocomplete_for_llm_fallback(
+            current_incremental_scraped=current_scrape,
+            skyvern_frame=skyvern_frame,
+            skyvern_element=skyvern_el,
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            dom=MagicMock(),
+            text="Oakland",
+            task=_TASK,
+            step=_STEP,
+        )
+
+    current_scrape.stop_listen_dom_increment.assert_awaited_once()
+    skyvern_el.input_clear.assert_awaited_once()
+    skyvern_el.press_fill.assert_awaited_once_with("Oakland")
+    scraped_page.generate_scraped_page_without_screenshots.assert_awaited_once()
+    dom_after_open.get_skyvern_element_by_id.assert_awaited_once_with("FRESH")

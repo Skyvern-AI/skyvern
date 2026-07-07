@@ -63,6 +63,7 @@ const contextValue: WorkflowsListContextValue = {
   foldersMap: new Map(),
   workflowTagsMap: {},
   tagDescriptions: new Map(),
+  tagColors: new Map(),
   tagKeys: [],
   labelSuggestions: [],
   valueSuggestionsByKey: new Map(),
@@ -74,6 +75,7 @@ const contextValue: WorkflowsListContextValue = {
   matchesParameter: () => false,
   handleRowClick: () => {},
   handleIconClick: () => {},
+  onRowDeleted: () => {},
 };
 
 function renderNode({

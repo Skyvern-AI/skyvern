@@ -44,6 +44,8 @@ import { ImprovePrompt } from "@/components/ImprovePrompt";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { cn } from "@/util/utils";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
 const exampleCases = [
   {
@@ -139,6 +141,7 @@ function buildBlankWorkflowRequest(
 
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const [prompt, setPrompt] = useState<string>("");
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -235,7 +238,9 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         setAutoplay(workflow.workflow_permanent_id, firstBlock.label);
       }
 
-      navigate(`/workflows/${workflow.workflow_permanent_id}/build`);
+      navigate(
+        workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
+      );
     },
     onError: (error: AxiosError) => {
       toast({
@@ -275,9 +280,18 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     onSuccess: ({ data: workflow, prompt }) => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
-      navigate(`/workflows/${workflow.workflow_permanent_id}/build`, {
-        state: { copilotMessage: prompt },
-      });
+      // `?via=discover` is what makes WorkflowEditor fire
+      // `copilot.discover.started` with entry_point=discover on mount.
+      navigate(
+        workflowEditorPath(
+          workflow.workflow_permanent_id,
+          studioEnabled,
+          "?via=discover",
+        ),
+        {
+          state: { copilotMessage: prompt },
+        },
+      );
     },
     onError: (error: AxiosError) => {
       toast({

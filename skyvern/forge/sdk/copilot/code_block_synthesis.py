@@ -156,6 +156,9 @@ class SynthesisDiagnostics:
     truncated: bool = False
     dropped_interactions: list[dict[str, Any]] = field(default_factory=list)
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
+    # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
+    # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
+    typed_param_bindings: list[tuple[int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -445,7 +448,7 @@ def _credential_param_key(interaction: Mapping[str, Any], used: set[str]) -> str
     return _unique_key(_safe_param_base(name or "credential"), used)
 
 
-def _is_durable_fallback_entry_target(interaction: Mapping[str, Any]) -> bool:
+def is_durable_fallback_entry_target(interaction: Mapping[str, Any]) -> bool:
     tool_name = str(interaction.get("tool_name") or "")
     if tool_name not in _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS:
         return False
@@ -458,7 +461,7 @@ def _is_durable_fallback_entry_target(interaction: Mapping[str, Any]) -> bool:
     return True
 
 
-def _is_generic_entry_opener_click(interaction: Mapping[str, Any]) -> bool:
+def is_generic_entry_opener_click(interaction: Mapping[str, Any]) -> bool:
     if str(interaction.get("tool_name") or "") != "click":
         return False
     if str(interaction.get("accessible_name") or "").strip():
@@ -517,7 +520,7 @@ def _has_later_durable_fallback_target(
         source_url = str(interaction.get("source_url") or "").strip()
         if first_source_url and source_url and source_url != first_source_url:
             continue
-        if _is_durable_fallback_entry_target(interaction):
+        if is_durable_fallback_entry_target(interaction):
             return True
     return False
 
@@ -545,7 +548,7 @@ def _optional_dismissal_locator_expr(interaction: Mapping[str, Any], fallback_lo
 
 def _should_prefer_durable_entry_target(trajectory: Sequence[Mapping[str, Any]]) -> bool:
     if not trajectory or not (
-        _is_generic_entry_opener_click(trajectory[0])
+        is_generic_entry_opener_click(trajectory[0])
         or _is_optional_dismissal_click(trajectory[0])
         or _is_structural_dismissal_click(trajectory[0])
     ):
@@ -580,7 +583,7 @@ def _entry_target_locator(
         if not first_locator:
             first_locator = locator
             first_index = index
-        if prefer_durable and _is_durable_fallback_entry_target(interaction):
+        if prefer_durable and is_durable_fallback_entry_target(interaction):
             return locator, index
         if not prefer_durable:
             return locator, index
@@ -611,7 +614,7 @@ def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict
     for index in range(submit_index + 1, len(trajectory)):
         interaction = trajectory[index]
         tool_name = str(interaction.get("tool_name") or "")
-        if tool_name not in _ENTRY_TARGET_TOOLS or _is_generic_entry_opener_click(interaction):
+        if tool_name not in _ENTRY_TARGET_TOOLS or is_generic_entry_opener_click(interaction):
             continue
         if tool_name == "press_key" and not interaction.get("selector"):
             continue
@@ -716,7 +719,7 @@ def synthesize_code_block(
         if fallback_entry_index > entry_index:
             for recovery_index in range(entry_index, fallback_entry_index):
                 recovery_interaction = trajectory[recovery_index]
-                if not _is_generic_entry_opener_click(recovery_interaction):
+                if not is_generic_entry_opener_click(recovery_interaction):
                     continue
                 recovery_locator = _locator_expr(
                     recovery_interaction,
@@ -907,6 +910,7 @@ def synthesize_code_block(
                 parameters.append(parameter)
                 if typed_identity is not None:
                     typed_param_keys[typed_identity] = param_key
+            diagnostics.typed_param_bindings.append((trajectory_index, param_key))
             lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
             append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
@@ -1059,6 +1063,7 @@ def build_artifact_metadata_skeleton(
                 "covered_criteria": [_FILL_CRITERION_ID],
                 "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
                 "extraction_schema": _FILL_EXTRACTION_SCHEMA,
+                "extraction_schema_provenance": "self_authored",
                 "observation_refs": [observation_ref_id],
             }
         ],

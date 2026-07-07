@@ -1,16 +1,16 @@
 """Regression tests for ``WorkflowsRepository.update_workflow_and_reconcile_definition_params``.
 
-Covers the 16 workflow-level fields that were newly threaded through
+Covers the 18 workflow-level fields that were newly threaded through
 ``WorkflowService.update_workflow_definition`` in the copilot-v2 stack:
 
-- ``_UNSET``-guarded (11): ``proxy_location``, ``webhook_callback_url``,
+- ``_UNSET``-guarded (12): ``proxy_location``, ``webhook_callback_url``,
   ``model``, ``max_screenshot_scrolling_times``, ``extra_http_headers``,
   ``sequential_key``, ``browser_profile_id``, ``totp_verification_url``,
-  ``totp_identifier``, ``adaptive_caching``, ``code_version``. Omitting the kwarg must
-  leave the persisted value unchanged; passing explicit ``None`` clears
-  nullable columns.
-- bare-``None`` (5): ``persist_browser_session``, ``run_with``,
-  ``ai_fallback``, ``cache_key``, ``run_sequentially``.  Both omitting
+  ``browser_profile_key``, ``totp_identifier``, ``adaptive_caching``,
+  ``code_version``. Omitting the kwarg must leave the persisted value
+  unchanged; passing explicit ``None`` clears nullable columns.
+- bare-``None`` (6): ``persist_browser_session``, ``pin_saved_session_ip``,
+  ``run_with``, ``ai_fallback``, ``cache_key``, ``run_sequentially``.  Both omitting
   the kwarg and passing ``None`` must leave the persisted value
   unchanged (matches the existing ``update_workflow`` semantics).
 
@@ -73,7 +73,9 @@ async def seeded_workflow(agent_db: AgentDB) -> dict[str, str]:
         max_screenshot_scrolling_times=7,
         extra_http_headers={"X-Seed": "yes"},
         persist_browser_session=True,
+        pin_saved_session_ip=True,
         browser_profile_id="bp_seed_profile",
+        browser_profile_key="{{ credential_id }}",
         model={"model_name": "seed-model"},
         run_with="agent",
         ai_fallback=False,
@@ -227,7 +229,9 @@ async def test_omitting_all_workflow_level_fields_preserves_seed(
     assert workflow.max_screenshot_scrolls == 7
     assert workflow.extra_http_headers == {"X-Seed": "yes"}
     assert workflow.persist_browser_session is True
+    assert workflow.pin_saved_session_ip is True
     assert workflow.browser_profile_id == "bp_seed_profile"
+    assert workflow.browser_profile_key == "{{ credential_id }}"
     assert workflow.model == {"model_name": "seed-model"}
     assert workflow.run_with == "agent"
     assert workflow.ai_fallback is False
@@ -250,6 +254,7 @@ async def test_passing_none_to_bare_none_fields_does_not_clobber(
         workflow_id=seeded_workflow["workflow_id"],
         organization_id=seeded_workflow["organization_id"],
         persist_browser_session=None,
+        pin_saved_session_ip=None,
         run_with=None,
         ai_fallback=None,
         cache_key=None,
@@ -258,6 +263,7 @@ async def test_passing_none_to_bare_none_fields_does_not_clobber(
     workflow = await _get(agent_db, seeded_workflow)
 
     assert workflow.persist_browser_session is True
+    assert workflow.pin_saved_session_ip is True
     assert workflow.run_with == "agent"
     assert workflow.ai_fallback is False
     assert workflow.cache_key == "seed-cache-key"
@@ -284,6 +290,7 @@ async def test_passing_none_to_unset_guarded_fields_clears_them(
         extra_http_headers=None,
         sequential_key=None,
         browser_profile_id=None,
+        browser_profile_key=None,
         code_version=None,
     )
     workflow = await _get(agent_db, seeded_workflow)
@@ -297,6 +304,7 @@ async def test_passing_none_to_unset_guarded_fields_clears_them(
     assert workflow.extra_http_headers is None
     assert workflow.sequential_key is None
     assert workflow.browser_profile_id is None
+    assert workflow.browser_profile_key is None
     assert workflow.code_version is None
 
 
@@ -314,7 +322,9 @@ async def test_setting_new_values_persists_across_all_fields(
         max_screenshot_scrolling_times=12,
         extra_http_headers={"X-Updated": "yes"},
         persist_browser_session=False,
+        pin_saved_session_ip=False,
         browser_profile_id="bp_new_profile",
+        browser_profile_key="{{ account_id }}",
         model={"model_name": "new-model"},
         run_with="code",
         ai_fallback=True,
@@ -333,7 +343,9 @@ async def test_setting_new_values_persists_across_all_fields(
     assert workflow.max_screenshot_scrolls == 12
     assert workflow.extra_http_headers == {"X-Updated": "yes"}
     assert workflow.persist_browser_session is False
+    assert workflow.pin_saved_session_ip is False
     assert workflow.browser_profile_id == "bp_new_profile"
+    assert workflow.browser_profile_key == "{{ account_id }}"
     assert workflow.model == {"model_name": "new-model"}
     assert workflow.run_with == "code"
     assert workflow.ai_fallback is True

@@ -15,6 +15,7 @@ try:
 except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
     advance_to_composing,
@@ -56,6 +57,7 @@ _DISCOVERY_DOMAIN_WITH_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _DISCOVERY_BARE_WORD_RE = re.compile(r"^[a-z0-9-]{2,32}$", re.IGNORECASE)
+_DISCOVERY_ALIAS_SEPARATOR_RE = re.compile(r"[\s_-]+")
 _DISCOVERY_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _DISCOVERY_CANDIDATE_EVIDENCE_STOPWORDS = frozenset({"a", "an", "and", "for", "in", "of", "on", "or", "the", "to"})
 _DISCOVERY_LOGIN_TITLE_RE = re.compile(r"\b(sign\s*in|log\s*in|login)\b", re.IGNORECASE)
@@ -65,11 +67,15 @@ _DISCOVERY_PASSWORD_INPUT_RE = re.compile(
 )
 
 
+def _normalize_discovery_alias(site_or_url: str) -> str:
+    return _DISCOVERY_ALIAS_SEPARATOR_RE.sub("", site_or_url.strip().lower())
+
+
 def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
     """Resolve the user-supplied site name/URL into a navigable URL.
 
     Returns ``(resolved_url, kind)`` where ``kind`` is one of:
-    ``url`` / ``domain`` / ``word`` / ``unresolved``.
+    ``url`` / ``domain`` / ``canonical_alias`` / ``word`` / ``unresolved``.
     """
     token = (site_or_url or "").strip()
     if not token:
@@ -78,6 +84,12 @@ def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
         return token, "url"
     if _DISCOVERY_DOMAIN_WITH_PATH_RE.match(token):
         return f"https://{token}", "domain"
+    alias_resolution = app.AGENT_FUNCTION.resolve_copilot_entrypoint_alias(
+        site_or_url=token,
+        normalized_alias=_normalize_discovery_alias(token),
+    )
+    if alias_resolution:
+        return alias_resolution.url, alias_resolution.kind
     if _DISCOVERY_BARE_WORD_RE.match(token):
         return f"https://www.{token.lower()}.com", "word"
     return None, "unresolved"

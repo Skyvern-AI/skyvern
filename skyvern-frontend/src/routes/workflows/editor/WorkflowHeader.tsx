@@ -2,7 +2,6 @@ import {
   CalendarIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  CopyIcon,
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
@@ -20,7 +19,8 @@ import {
 } from "@/components/ui/tooltip";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
-import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
+import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
+import { MakeACopyButton } from "./MakeACopyButton";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
@@ -38,17 +38,6 @@ import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { useToggleCodeView } from "./hooks/useToggleCodeView";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
-import { convert } from "./workflowEditorUtils";
-
-function useIsGlobalWorkflow(): boolean {
-  const { workflowPermanentId } = useParams();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  return Boolean(
-    globalWorkflows?.some(
-      (w) => w.workflow_permanent_id === workflowPermanentId,
-    ),
-  );
-}
 
 function GeneratingCodeButton() {
   const showAllCode = useShowAllCodeStore((s) => s.showAllCode);
@@ -65,33 +54,6 @@ function GeneratingCodeButton() {
   );
 }
 
-function MakeACopyButton() {
-  const { workflowPermanentId } = useParams();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  const createWorkflowMutation = useCreateWorkflowMutation();
-
-  const handleClick = () => {
-    const workflow = globalWorkflows?.find(
-      (w) => w.workflow_permanent_id === workflowPermanentId,
-    );
-    if (!workflow) {
-      return;
-    }
-    createWorkflowMutation.mutate(convert(workflow));
-  };
-
-  return (
-    <Button size="lg" onClick={handleClick}>
-      {createWorkflowMutation.isPending ? (
-        <ReloadIcon className="mr-3 h-6 w-6 animate-spin" />
-      ) : (
-        <CopyIcon className="mr-3 h-6 w-6" />
-      )}
-      Make a Copy to Edit
-    </Button>
-  );
-}
-
 function BrowserModeButton() {
   const navigate = useNavigate();
   const { workflowPermanentId } = useParams();
@@ -104,7 +66,7 @@ function BrowserModeButton() {
 
   const handleClick = () => {
     const target = debugStore.isDebugMode ? "edit" : "build";
-    navigate(`/workflows/${workflowPermanentId}/${target}`);
+    navigate(`/agents/${workflowPermanentId}/${target}`);
   };
 
   return (
@@ -243,7 +205,7 @@ function RunButton() {
 
   const handleClick = () => {
     closeWorkflowPanel();
-    navigate(`/workflows/${workflowPermanentId}/run`);
+    navigate(`/agents/${workflowPermanentId}/run`);
   };
 
   return (

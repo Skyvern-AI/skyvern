@@ -553,7 +553,7 @@ class TestUpdateWorkflowDirect:
 
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
-            lambda **kwargs: mock_workflow,
+            AsyncMock(return_value=mock_workflow),
         )
 
         mock_wf_service = MagicMock()
@@ -585,7 +585,7 @@ class TestUpdateWorkflowDirect:
 
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
-            lambda **kwargs: mock_workflow,
+            AsyncMock(return_value=mock_workflow),
         )
 
         mock_wf_service = MagicMock()

@@ -61,6 +61,8 @@ from skyvern.schemas.run_enums import (  # noqa: F401
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
+MAX_SEARCH_FETCH_LIMIT = 1000
+
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:

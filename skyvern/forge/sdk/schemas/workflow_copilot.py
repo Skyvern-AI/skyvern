@@ -115,6 +115,15 @@ class WorkflowCopilotChatRequest(BaseModel):
             "other block unchanged. Used by the block-level Generate action."
         ),
     )
+    fix_origin: bool = Field(
+        False,
+        description=(
+            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Routes the "
+            "run-grounded turn to diagnose-first (DIAGNOSE, no write authority) instead of a direct rewrite. "
+            "Only takes effect when a run signal (workflow_run_id or prior run context) is present; "
+            "otherwise it is a no-op."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
@@ -277,6 +286,14 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         description=(
             "Longer-cap sanitized failure text for tooltip display. None on success. "
             "Distinct from `summary`, which is capped tighter for the visible bullet."
+        ),
+    )
+    workflow_run_id: str | None = Field(
+        None,
+        description=(
+            "The workflow run a block-running tool created, when this result came from one "
+            "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
+            "passed or failed; None for non-run tools."
         ),
     )
 

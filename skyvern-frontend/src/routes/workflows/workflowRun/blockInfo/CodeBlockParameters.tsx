@@ -95,6 +95,7 @@ function CodeBlockParameters({
             language="python"
             value={code}
             readOnly
+            lineWrap={false}
             minHeight="160px"
             maxHeight="400px"
             extraExtensions={codeExtensions}

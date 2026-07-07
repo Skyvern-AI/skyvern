@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import {
   getDefaultGoogleOAuthCredentialId,
+  hasGoogleOAuthCredentialScopes,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
 import { PlusIcon } from "@radix-ui/react-icons";
@@ -20,6 +21,7 @@ type Props = {
   nodeId: string;
   value: string;
   onChange: (value: string) => void;
+  requiredScopes: readonly string[];
 };
 
 const ADVANCED_OPTION = "__advanced__";
@@ -29,9 +31,17 @@ function GoogleOAuthCredentialSelector({
   nodeId,
   value,
   onChange,
+  requiredScopes,
 }: Readonly<Props>) {
-  const { credentials, isLoading, isFetching } = useGoogleOAuthCredentials();
+  const {
+    credentials: allCredentials,
+    isLoading,
+    isFetching,
+  } = useGoogleOAuthCredentials();
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const credentials = allCredentials.filter((credential) =>
+    hasGoogleOAuthCredentialScopes(credential, requiredScopes),
+  );
 
   // Keep latest callback without forcing effect re-runs.
   const onChangeRef = useRef(onChange);
