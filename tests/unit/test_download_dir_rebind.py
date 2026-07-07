@@ -1169,6 +1169,7 @@ async def test_register_downloaded_files_uses_download_run_id_as_storage_key() -
     with (
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.code_block.app", mock_app),
     ):
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
@@ -1193,6 +1194,7 @@ async def test_register_downloaded_files_defaults_to_workflow_run_id() -> None:
     with (
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.code_block.app", mock_app),
     ):
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
