@@ -300,6 +300,21 @@ def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any
     return None
 
 
+def _inject_gemini_safety_settings(model_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach safety_settings to Gemini deployments only, in place.
+
+    Setting it as a request-level param instead rides along to whichever deployment the
+    router selects, so a non-Gemini fallback (e.g. Azure) 400s on the unknown `safety_settings`
+    param and the fallback hop dies. Per-deployment keeps it off the fallback. SKY-11766.
+    """
+    for deployment in model_list:
+        litellm_params = deployment.get("litellm_params") or {}
+        if "gemini" in str(litellm_params.get("model", "")).lower():
+            litellm_params.setdefault("safety_settings", GEMINI_SAFETY_SETTINGS)
+            deployment["litellm_params"] = litellm_params
+    return model_list
+
+
 class LLMCallStats(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -976,7 +991,7 @@ class LLMAPIHandlerFactory:
         fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
 
         router = litellm.Router(
-            model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
+            model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
@@ -2228,10 +2243,11 @@ class LLMAPIHandlerFactory:
         if llm_config.reasoning_effort is not None:
             params["reasoning_effort"] = llm_config.reasoning_effort
 
-        is_gemini = "gemini" in llm_config.model_name.lower()
-        if isinstance(llm_config, LLMRouterConfig):
-            is_gemini = is_gemini or "gemini" in (llm_config.main_model_group or "").lower()
-        if is_gemini:
+        # Direct (non-router) Gemini configs carry safety_settings at the request level.
+        # Router configs inject per-deployment at build time (see _inject_gemini_safety_settings)
+        # so the param never rides along to a non-Gemini fallback deployment, which would 400 on
+        # the unknown `safety_settings` param and break the fallback hop. SKY-11766.
+        if not isinstance(llm_config, LLMRouterConfig) and "gemini" in llm_config.model_name.lower():
             params["safety_settings"] = GEMINI_SAFETY_SETTINGS
 
         return params
