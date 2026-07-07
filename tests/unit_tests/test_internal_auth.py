@@ -25,9 +25,23 @@ def test_is_local_request_accepts_loopback() -> None:
     assert _is_local_request(request) is True
 
 
-def test_is_local_request_accepts_private_networks() -> None:
-    request = _make_request("192.168.1.20")
+def test_is_local_request_accepts_ipv6_loopback() -> None:
+    request = _make_request("::1")
     assert _is_local_request(request) is True
+
+
+def test_is_local_request_rejects_private_networks() -> None:
+    # RFC1918 private addresses must NOT be treated as local: trusting them lets
+    # a private-network caller bypass the localhost gate on these key-minting
+    # internal routes. See Skyvern-AI/skyvern#6890.
+    request = _make_request("192.168.1.20")
+    assert _is_local_request(request) is False
+
+
+def test_is_local_request_rejects_docker_bridge_address() -> None:
+    # Exact reproduction address from issue #6890.
+    request = _make_request("172.17.0.2")
+    assert _is_local_request(request) is False
 
 
 def test_is_local_request_handles_missing_client() -> None:
