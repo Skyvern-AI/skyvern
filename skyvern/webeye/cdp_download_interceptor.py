@@ -99,8 +99,25 @@ DOWNLOAD_MIME_TYPES = frozenset(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.ms-excel",
         "application/msword",
+        "text/csv",
+        "application/csv",
     }
 )
+
+# Literal Content-Type strings that some misconfigured servers send verbatim for
+# file bytes (e.g. the literal "application/*"). Matched by exact string equality,
+# NOT wildcard/prefix semantics. Only eligible for XHR/Fetch responses with
+# Content-Length >= MIN_XHR_DOWNLOAD_BYTES; non-XHR responses must rely on stronger
+# signals (attachment header or known download MIME).
+GENERIC_DOWNLOAD_CONTENT_TYPE_LITERALS = frozenset(
+    {
+        "application/*",
+    }
+)
+
+# Minimum response size (bytes) for XHR/Fetch responses with generic binary MIME to be
+# treated as downloads, even without Content-Disposition: attachment.
+MIN_XHR_DOWNLOAD_BYTES = 1024  # 1 KB
 
 DOWNLOAD_EXTENSION_BY_MIME_TYPE = {
     "application/pdf": ".pdf",
@@ -176,6 +193,9 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     2. Skip API content types (application/json, etc.)
     3. For XHR/Fetch: require BOTH attachment header AND download MIME type
        (prevents false positives like Google's text/plain + attachment XHR responses)
+       Exception: generic binary MIME types (like application/*) where the server
+       does not set a specific Content-Type but the response carries meaningful
+       bytes (Content-Length >= MIN_XHR_DOWNLOAD_BYTES).
     4. Content-Disposition contains "attachment"
     5. Content-Type is a known download MIME type
     """
@@ -193,11 +213,21 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
 
     is_attachment = "attachment" in content_disposition.lower()
     is_download_mime = content_type in DOWNLOAD_MIME_TYPES
+    is_generic_binary = content_type in GENERIC_DOWNLOAD_CONTENT_TYPE_LITERALS
 
     # XHR/Fetch require both signals to avoid false positives
     # (e.g. Google async requests: text/plain + attachment; filename="f.txt")
     if resource_type in XHR_FETCH_RESOURCE_TYPES:
-        return is_attachment and is_download_mime
+        # Primary path: attachment header + known download MIME
+        if is_attachment and is_download_mime:
+            return True
+        # Secondary path: generic binary MIME with evidence of actual file content.
+        # Some sites (e.g. report exports) return XHR file responses with
+        # Content-Type: application/* and no Content-Disposition header.
+        content_length = _parse_content_length(headers)
+        if is_generic_binary and content_length is not None and content_length >= MIN_XHR_DOWNLOAD_BYTES:
+            return True
+        return False
 
     if is_attachment:
         return True
