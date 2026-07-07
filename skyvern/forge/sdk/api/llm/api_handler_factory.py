@@ -34,6 +34,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
+    is_content_filtered_response,
     is_image_message,
     is_truncated_response,
     llm_messages_builder,
@@ -1377,6 +1378,43 @@ class LLMAPIHandlerFactory:
                                     (getattr(_fb_detail, "reasoning_tokens", 0) or 0) if _fb_detail else 0
                                 ),
                             )
+
+                    # A content_filter response with empty content is a valid ModelResponse,
+                    # so litellm's router fallback (which only fires on exceptions) never
+                    # recovers it. Gemini's non-configurable safety filters block PII-heavy
+                    # prompts that safety_settings=BLOCK_NONE cannot recover, so retrying on
+                    # another Gemini tier hits the same block — jump straight to the first
+                    # non-Gemini fallback group. Fires for any Gemini model that produced the
+                    # block, including a standard tier litellm already fell back to (SKY-11766).
+                    non_gemini_fallback = next(
+                        (group for group in fallback_groups if "gemini" not in group.lower()), None
+                    )
+                    if (
+                        is_content_filtered_response(response)
+                        and non_gemini_fallback is not None
+                        and "gemini" in (model_used or "").lower()
+                    ):
+                        fallback_model = non_gemini_fallback
+                        LOG.warning(
+                            "LLM response blocked by content filter on Gemini, retrying with non-Gemini fallback",
+                            llm_key=llm_key,
+                            prompt_name=prompt_name,
+                            filtered_model=model_used,
+                            fallback_model=fallback_model,
+                        )
+                        _llm_call_start = time.perf_counter()
+                        try:
+                            # No timeout= kwarg here either; see SKY-10200 note on
+                            # the primary call site above.
+                            response = await router.acompletion(
+                                model=fallback_model,
+                                messages=messages,
+                                drop_params=True,
+                                **parameters,
+                            )
+                        finally:
+                            llm_duration_seconds += time.perf_counter() - _llm_call_start
+                        model_used = response.model or fallback_model
 
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
