@@ -22,6 +22,7 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.utils.script_file_paths import build_script_file_storage_uri
 from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
 
 LOG = structlog.get_logger()
@@ -122,7 +123,12 @@ class LocalStorage(BaseStorage):
     def build_script_file_uri(
         self, *, organization_id: str, script_id: str, script_version: int, file_path: str
     ) -> str:
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/scripts/{script_id}/{script_version}/{file_path}"
+        return build_script_file_storage_uri(
+            f"file://{self.artifact_path}/{settings.ENV}/{organization_id}",
+            script_id=script_id,
+            script_version=script_version,
+            file_path=file_path,
+        )
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None

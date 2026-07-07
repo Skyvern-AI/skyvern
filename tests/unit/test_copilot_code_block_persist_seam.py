@@ -47,7 +47,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
     _check_enforcement,
 )
-from skyvern.forge.sdk.copilot.output_contracts import code_block_available_binding_keys_by_label
+from skyvern.forge.sdk.copilot.output_contracts import (
+    OutputContractAdvisoryState,
+    code_block_available_binding_keys_by_label,
+)
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -5905,20 +5908,78 @@ class TestSeparatedSpineViolationActuation:
             ctx.last_code_authoring_repair_context.required_block_structure == "separated_browser_spine_plus_extraction"
         )
 
-    def test_composite_key_rearms_on_changed_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_cosmetic_churn_escalates_to_advisory_instead_of_rearming(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
         ctx = _spine_actuation_ctx()
         first_yaml = _collapsed_spine_yaml(
             "_setup = 1\n" + _SPINE_SYNTH_CODE + '\nreturn {"output": {"record_id": "X"}}'
         )
-        second_yaml = _collapsed_spine_yaml(
+        cosmetic_yaml = _collapsed_spine_yaml(
             "_setup = 2\n" + _SPINE_SYNTH_CODE + '\nreturn {"output": {"record_id": "X"}}'
         )
 
         workflow_update_module._impose_output_contract_envelope_after_steering(ctx, first_yaml, [])
-        workflow_update_module._impose_output_contract_envelope_after_steering(ctx, second_yaml, [])
+        assert len(ctx.output_contract_spine_directive_blockers_by_attempt_key) == 1
+        assert not ctx.output_contract_actuation_by_signature
+        assert ctx.turn_halt is None
 
-        assert len(ctx.output_contract_spine_directive_blockers_by_attempt_key) == 2
+        workflow_update_module._impose_output_contract_envelope_after_steering(ctx, cosmetic_yaml, [])
+        assert list(ctx.output_contract_actuation_by_signature.values()) == [OutputContractAdvisoryState.GRANTED]
+        assert ctx.turn_halt is None
+        assert len(ctx.output_contract_spine_directive_blockers_by_attempt_key) == 1
+
+    def test_granted_advisory_arms_run_evidence_before_consume_when_run_attemptable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _spine_actuation_ctx()
+        signature = "sig_preflight_dispatch"
+        ctx.output_contract_actuation_by_signature[signature] = OutputContractAdvisoryState.GRANTED
+        evaluation = workflow_update_module._OutputContractEvaluation(
+            block_label="extract_record",
+            artifact_id="art-1",
+            required_paths={"output.confirmation_number"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            missing_metadata_paths=[],
+            missing_schema_paths=[],
+            missing_return_paths=[],
+            shape_violations=["separated_spine_shape_violation"],
+            canonical_signature=signature,
+            payload={
+                "reason_code": "requested_output_contract_missing_output_coverage",
+                "missing_requested_output_facts": [],
+            },
+            repair_context=None,
+            can_attempt_run=True,
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_impose_output_contract_envelope_after_steering",
+            lambda ctx, wf, meta: (wf, meta, False),
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_scaffold_metadata_contract_for_update",
+            lambda ctx, wf, meta: (meta, False),
+        )
+        monkeypatch.setattr(
+            workflow_update_module,
+            "_evaluate_output_contract_for_code_block",
+            lambda *a, **k: evaluation,
+        )
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, "title: x", [])
+
+        assert result is None
+        assert ctx.output_contract_pending_run_evidence.get(signature) == ["output.confirmation_number"]
+        assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.CONSUMED
+
+        run_result = {
+            "data": {"blocks": [{"label": "extract_record", "extracted_data": {"confirmation_number": "R-9"}}]}
+        }
+        workflow_update_module.record_output_contract_run_output_evidence(ctx, run_result)
+        assert ctx.output_contract_run_output_observed_by_signature[signature] is True
+        assert ctx.output_contract_run_bound_required_path_by_signature[signature] is True
 
 
 def _dual_output_owner_yaml() -> str:
@@ -6162,6 +6223,32 @@ class TestSeparatedSpineImpositionRunEligibility:
         )
 
         assert read_key in armed_keys
+
+    def test_granted_structural_advisory_lifts_output_contract_run_gate_on_unsplit_draft(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(workflow_update_module, "synthesize_code_block", lambda *a, **k: _fake_spine_synthesized())
+        ctx = _spine_actuation_ctx()
+        collapsed_yaml = _collapsed_spine_yaml(
+            "_setup = 1\n" + _SPINE_SYNTH_CODE + '\nreturn {"output": {"record_id": "X"}}'
+        )
+
+        workflow_update_module._impose_output_contract_envelope_after_steering(ctx, collapsed_yaml, [])
+        blocked = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx, collapsed_yaml, [], allow_static_return_advisory=True
+        )
+        assert blocked is not None and blocked.can_attempt_run is False
+
+        workflow_update_module._impose_output_contract_envelope_after_steering(ctx, collapsed_yaml, [])
+        assert list(ctx.output_contract_actuation_by_signature.values()) == [OutputContractAdvisoryState.GRANTED]
+
+        scaffolded_metadata, _applied = workflow_update_module._scaffold_metadata_contract_for_update(
+            ctx, collapsed_yaml, []
+        )
+        granted = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx, collapsed_yaml, scaffolded_metadata, allow_static_return_advisory=True
+        )
+        assert granted is not None and granted.can_attempt_run is True
 
 
 def _budget_evaluation(ctx: CopilotContext) -> _OutputContractEvaluation:
@@ -9105,6 +9192,26 @@ class TestCodeAuthoringGuardrailChurnBackstop:
         assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
         assert ctx.blocker_signal is terminal
         assert ctx.latest_tool_blocker_signal is terminal
+
+    def test_churn_stop_defers_while_output_contract_ladder_active_then_fires(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.output_contract_actuation_count_by_signature["sig_active"] = 1
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            workflow_update_module._record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
+        assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+        assert ctx.blocker_signal is None
+        ctx.output_contract_actuation_count_by_signature.clear()
+        workflow_update_module._record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
+        churn = ctx.blocker_signal
+        assert isinstance(churn, CopilotToolBlockerSignal)
+        assert churn.internal_reason_code == "code_authoring_guardrail_churn"
+
+    def test_churn_stop_defers_while_advisory_grant_held(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.output_contract_actuation_by_signature["sig_granted"] = OutputContractAdvisoryState.GRANTED
+        for _ in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+            workflow_update_module._record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
+        assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
     async def test_mixed_credential_and_unresolved_name_reject_returns_code_repair_progress(

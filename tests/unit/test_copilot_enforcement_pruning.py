@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _needs_suspicious_success_nudge,
     _prune_input_list,
     _should_block_mutating_tool_after_synthesized_offer,
+    _should_force_advisory_run_dispatch,
     _should_force_synthesized_block_persistence,
     _summarize_tool_output,
     _uncovered_output_reject_admits_evaluate,
@@ -54,6 +55,10 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _restore_post_hook_context,
     _snapshot_post_hook_context,
 )
+from skyvern.forge.sdk.copilot.output_contracts import (
+    OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+    OutputContractAdvisoryState,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
@@ -64,6 +69,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_run_blocks_result,
     _record_workflow_update_result,
 )
+from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit.conftest import make_copilot_context
@@ -1225,6 +1231,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         repeated_action_fingerprint_streak_count=0,
         copilot_total_timeout_exceeded=False,
         workflow_verification_evidence=WorkflowVerificationEvidence(),
+        output_contract_pending_run_evidence={},
     )
 
 
@@ -2341,3 +2348,78 @@ class TestScoutOutputCoverageGate:
         _restore_post_hook_context(ctx, snapshot)
         assert ctx.scouted_output_covered_paths == {"output.document_name"}
         assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+
+class TestAdvisoryRunDispatchForceLane:
+    """A granted output-contract advisory run is forced onto update_and_run_blocks through the same
+    tool_choice forcing lane as the synthesized-persistence force, and releases on consume or terminal."""
+
+    def _granted_ctx(self) -> _Ctx:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.turn_halt = None
+        ctx.blocker_signal = None
+        ctx.output_contract_actuation_by_signature = {"sig_a": OutputContractAdvisoryState.GRANTED}
+        return ctx
+
+    def test_granted_advisory_forces_run_dispatch(self) -> None:
+        assert _should_force_advisory_run_dispatch(self._granted_ctx()) is True
+
+    def test_consumed_advisory_releases_the_force(self) -> None:
+        ctx = self._granted_ctx()
+        ctx.output_contract_actuation_by_signature = {"sig_a": OutputContractAdvisoryState.CONSUMED}
+        assert _should_force_advisory_run_dispatch(ctx) is False
+
+    def test_no_grant_does_not_force(self) -> None:
+        ctx = self._granted_ctx()
+        ctx.output_contract_actuation_by_signature = {}
+        assert _should_force_advisory_run_dispatch(ctx) is False
+
+    def test_authority_forbidding_run_never_forces(self) -> None:
+        ctx = self._granted_ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+        )
+        assert _should_force_advisory_run_dispatch(ctx) is False
+
+    def test_held_genuinely_terminal_blocker_releases_the_force(self) -> None:
+        ctx = self._granted_ctx()
+        ctx.blocker_signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="",
+            user_facing_reason="",
+            recovery_hint="stop",
+            internal_reason_code=OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        )
+        assert _should_force_advisory_run_dispatch(ctx) is False
+
+    def test_non_code_only_policy_does_not_force(self) -> None:
+        ctx = self._granted_ctx()
+        ctx.block_authoring_policy = None
+        assert _should_force_advisory_run_dispatch(ctx) is False
+
+    def test_granted_advisory_survives_model_churn_and_stays_force_eligible(self) -> None:
+        ctx = self._granted_ctx()
+        ctx.latest_tool_blocker_signal = None
+        ctx.tool_blocker_signals = []
+        ctx.output_contract_actuation_count_by_signature = {}
+        ctx.output_contract_run_output_observed_by_signature = {}
+        ctx.output_contract_page_extraction_imposed_by_signature = {}
+        ctx.output_contract_pending_run_evidence = {"sig_a": ["output.confirmation_number"]}
+        churn = CopilotToolBlockerSignal(
+            blocker_kind="loop_detected",
+            agent_steering_text="",
+            user_facing_reason="",
+            recovery_hint="stop",
+            internal_reason_code="code_authoring_guardrail_churn",
+        )
+        stash_turn_halt_from_blocker_signal(ctx, churn, source="enforcement_backstop")
+        stash_turn_halt_from_blocker_signal(ctx, churn, source="enforcement_backstop")
+        assert ctx.turn_halt is None
+        assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+        assert _should_force_advisory_run_dispatch(ctx) is True

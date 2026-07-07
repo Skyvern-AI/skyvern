@@ -281,7 +281,6 @@ def test_text_prompt_block_forwards_system_prompt(monkeypatch) -> None:
     asyncio.run(
         block.send_prompt(
             prompt="What is the meaning of life?",
-            parameter_values={},
             workflow_run_id="wfr_sp",
             organization_id="o_sp",
             workflow_run_block_id=None,

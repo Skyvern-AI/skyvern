@@ -252,6 +252,9 @@ from .workflow_update import _record_workflow_proxy_location_span as _record_wor
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
 from .workflow_update import _scaffold_metadata_contract_for_update as _scaffold_metadata_contract_for_update
 from .workflow_update import _update_workflow as _update_workflow
+from .workflow_update import (
+    consume_output_contract_advisory_grant_for_run as consume_output_contract_advisory_grant_for_run,
+)
 
 LOG = structlog.get_logger()
 
@@ -464,6 +467,8 @@ async def run_blocks_tool(
             result=result,
         )
         return json.dumps(result)
+
+    consume_output_contract_advisory_grant_for_run(copilot_ctx)
 
     with copilot_span(
         "run_blocks",
@@ -761,6 +766,8 @@ async def update_and_run_blocks_tool(
             workflow_updated=True,
         )
         return json.dumps(result)
+
+    consume_output_contract_advisory_grant_for_run(copilot_ctx)
 
     with copilot_span(
         "run_blocks",
