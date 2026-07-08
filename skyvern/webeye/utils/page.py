@@ -363,13 +363,19 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
 # FileReader keeps the payload binary-safe without arrayBuffer/Uint8Array
 # transcoding back across CDP.
 _BLOB_FETCH_JS = """
-async (blobUrl) => {
+async (args) => {
     try {
+        const { blobUrl, maxSizeBytes } = args;
         const response = await fetch(blobUrl);
         if (!response.ok) {
             return { ok: false, status: response.status };
         }
         const blob = await response.blob();
+        // Reject oversized blobs before serializing them to a data URL, so a huge
+        // client-side blob can't be read fully into memory / base64-transcoded.
+        if (maxSizeBytes != null && blob.size > maxSizeBytes) {
+            return { ok: false, error: 'too_large', size: blob.size };
+        }
         return await new Promise((resolve) => {
             const reader = new FileReader();
             reader.onloadend = () => {
@@ -428,6 +434,19 @@ def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
         if _frame_origin(frame_url) == blob_origin:
             matches.append(frame)
     return matches
+
+
+def _all_page_frames(page: Page) -> list[Frame]:
+    """All frames on the page, main frame first, deduped."""
+    seen: set[int] = set()
+    frames: list[Frame] = []
+    for frame in [page.main_frame, *page.frames]:
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        frames.append(frame)
+    return frames
 
 
 class SkyvernFrame:
@@ -565,23 +584,32 @@ class SkyvernFrame:
         page: Page,
         blob_url: str,
         workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        probe: bool = False,
     ) -> bytes | None:
+        # probe=True is for best-effort multi-page fallback where the caller tries every open
+        # page; expected misses on non-owning pages shouldn't spam ERROR/WARN logs, so downgrade
+        # give-up/retry logging to debug. The final failure signal stays with the caller.
+        give_up_log = LOG.debug if probe else LOG.error
+        retry_log = LOG.debug if probe else LOG.warning
+
         blob_origin = _blob_url_origin(blob_url)
-        if blob_origin is None:
-            LOG.error(
-                "blob URL read aborted: unparseable origin",
-                workflow_run_id=workflow_run_id,
-            )
+        if blob_origin is not None:
+            frames = _frames_for_blob_origin(page, blob_origin)
+        elif blob_url.startswith("blob:"):
+            # Opaque-origin blobs (blob:null/...) from sandboxed iframes or data: documents have
+            # no matchable origin — probe every frame since we can't identify the owner by origin.
+            frames = _all_page_frames(page)
+        else:
+            give_up_log("blob URL read aborted: not a blob URL", workflow_run_id=workflow_run_id)
             return None
 
-        frames = _frames_for_blob_origin(page, blob_origin)
         if not frames:
-            LOG.error(
-                "blob URL read found no frame at the blob origin",
-                workflow_run_id=workflow_run_id,
-            )
+            give_up_log("blob URL read found no candidate frame", workflow_run_id=workflow_run_id)
             return None
 
+        # blob.size is checked in-page against this before the payload is serialized.
+        blob_arg = {"blobUrl": blob_url, "maxSizeBytes": max_size_bytes}
         main_frame = page.main_frame
         for frame in frames:
             try:
@@ -589,41 +617,49 @@ class SkyvernFrame:
                 # context-level main-world prefix stays attached; sub-frames use
                 # frame.evaluate (main-world prefixes are page-scoped).
                 if frame is main_frame:
-                    result = await evaluate_in_main_world(page, _BLOB_FETCH_JS, blob_url)
+                    result = await evaluate_in_main_world(page, _BLOB_FETCH_JS, blob_arg)
                 else:
-                    result = await frame.evaluate(_BLOB_FETCH_JS, blob_url)
+                    result = await frame.evaluate(_BLOB_FETCH_JS, blob_arg)
             except Exception:
-                LOG.warning(
+                retry_log(
                     "blob URL in-frame fetch raised; trying next frame if any",
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
                 continue
-            if not isinstance(result, dict) or not result.get("ok"):
+            if isinstance(result, dict) and result.get("error") == "too_large":
                 LOG.warning(
+                    "blob URL exceeds max size; not reading",
+                    workflow_run_id=workflow_run_id,
+                    size=result.get("size"),
+                    max_size_bytes=max_size_bytes,
+                )
+                return None
+            if not isinstance(result, dict) or not result.get("ok"):
+                retry_log(
                     "blob URL in-frame fetch returned not-ok; trying next frame if any",
                     workflow_run_id=workflow_run_id,
                     result=result if isinstance(result, dict) else None,
                 )
                 continue
             b64_payload = result.get("base64")
-            if not isinstance(b64_payload, str) or not b64_payload:
-                LOG.warning(
-                    "blob URL in-frame fetch returned empty payload; trying next frame if any",
+            if not isinstance(b64_payload, str):
+                retry_log(
+                    "blob URL in-frame fetch returned non-string payload; trying next frame if any",
                     workflow_run_id=workflow_run_id,
                 )
                 continue
             try:
                 return base64.b64decode(b64_payload, validate=True)
             except Exception:
-                LOG.warning(
+                retry_log(
                     "blob URL in-frame fetch payload was not valid base64; trying next frame if any",
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
                 continue
 
-        LOG.error(
+        give_up_log(
             "blob URL read could not retrieve bytes from any matching frame",
             workflow_run_id=workflow_run_id,
         )
