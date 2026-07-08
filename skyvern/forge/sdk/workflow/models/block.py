@@ -336,6 +336,9 @@ class BaseTaskBlock(Block):
     download_timeout: float | None = None  # minutes
     include_extracted_text: bool = True
 
+    def get_engine(self) -> RunEngine | None:
+        return self.engine
+
     def get_all_parameters(
         self,
         workflow_run_id: str,

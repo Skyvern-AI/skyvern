@@ -12,6 +12,7 @@ import pytest
 
 from skyvern.forge.sdk.workflow.models.block import Block, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 
 
@@ -122,3 +123,28 @@ class TestDescriptionSkippedOnLoopIterations:
                 await block.execute_safe(workflow_run_id="wr_1", current_index=i)
 
             assert mock_gen_desc.call_count == 1
+
+
+class TestEngineRecordedForTaskBlock:
+    """Regression guard for the block.py split: task blocks must record their RunEngine
+    on the workflow_run_block. The split replaced an ``isinstance(self, BaseTaskBlock)``
+    check in execute_safe with a polymorphic ``get_engine()``; if BaseTaskBlock's override
+    is dropped, execute_safe silently records ``engine=None`` (observability regression).
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_block_records_its_engine(self) -> None:
+        block = _make_block()  # _make_block defaults to RunEngine.skyvern_v1
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+            patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        ):
+            _setup_mocks(mock_app)
+
+            await block.execute_safe(workflow_run_id="wr_1", current_index=None)
+
+            _, kwargs = mock_app.DATABASE.observer.create_workflow_run_block.call_args
+            assert kwargs["engine"] == RunEngine.skyvern_v1

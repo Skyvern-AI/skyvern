@@ -44,7 +44,7 @@ from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.workflow.models.task_blocks import BaseTaskBlock
+    from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock
 
 LOG = structlog.get_logger()
 
