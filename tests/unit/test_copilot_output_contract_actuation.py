@@ -521,6 +521,8 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_run_bound_required_path_by_signature={},
         output_contract_bail_actuated_this_call=False,
         author_time_gate_ablation_events=[],
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
         scouted_output_covered_paths=set(),
         composition_page_evidence=None,
         latest_recorded_build_test_outcome=None,
