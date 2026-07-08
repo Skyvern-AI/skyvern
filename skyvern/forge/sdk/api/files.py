@@ -18,7 +18,12 @@ from yarl import URL
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
-from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime, SkyvernHTTPException
+from skyvern.exceptions import (
+    BlockedHost,
+    DownloadFileMaxSizeExceeded,
+    DownloadFileMaxWaitingTime,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
@@ -330,6 +335,10 @@ async def download_file(
     except aiohttp.InvalidURL:
         # Malformed customer-provided URL - a client-data error, not a platform fault.
         LOG.warning("Failed to download file, invalid URL", exc_info=True)
+        raise
+    except BlockedHost:
+        # SSRF guard rejected the customer-provided host; policy outcome, kept at warning.
+        LOG.warning("Failed to download file, blocked host", exc_info=True)
         raise
     except Exception:
         LOG.exception("Failed to download file")
