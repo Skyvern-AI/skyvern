@@ -79,6 +79,7 @@ WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX = "wrcs"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
 TAG_EVENT_PREFIX = "tge"
+RUN_TAG_EVENT_PREFIX = "rtge"
 TAG_KEY_PREFIX = "tkey"
 TAG_VALUE_PREFIX = "tval"
 
@@ -261,6 +262,11 @@ def generate_credential_folder_id() -> str:
 def generate_tag_event_id() -> str:
     int_id = generate_id()
     return f"{TAG_EVENT_PREFIX}_{int_id}"
+
+
+def generate_run_tag_event_id() -> str:
+    int_id = generate_id()
+    return f"{RUN_TAG_EVENT_PREFIX}_{int_id}"
 
 
 def generate_tag_key_id() -> str:
