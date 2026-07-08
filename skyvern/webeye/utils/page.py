@@ -485,7 +485,9 @@ class SkyvernFrame:
                 initial_error=error_msg,
             )
         except asyncio.TimeoutError:
-            LOG.exception("Skyvern timed out trying to analyze the page", expression=expression)
+            # Re-raised and handled by the caller (scrape retries / failure classification),
+            # so this is not the failure boundary; log without a traceback at warning.
+            LOG.warning("Skyvern timed out trying to analyze the page", expression=expression)
             raise TimeoutError("Skyvern timed out trying to analyze the page")
 
     @staticmethod
@@ -511,7 +513,7 @@ class SkyvernFrame:
         last_error_msg = initial_error
         for attempt in range(1, _NAVIGATION_RECOVERY_MAX_ATTEMPTS + 1):
             if _remaining_seconds() <= 0:
-                LOG.error(
+                LOG.warning(
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
