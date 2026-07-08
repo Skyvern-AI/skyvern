@@ -17,6 +17,7 @@ class _FakeDownloadResponse:
         self._data = data
         # aiohttp exposes headers as a case-insensitive CIMultiDictProxy; mirror that.
         self.headers = CIMultiDictProxy(CIMultiDict(headers or {}))
+        self.status = 200
         self.content_length = len(data) if advertise_length else None
         self.content = self
         self.body_read = False
@@ -36,7 +37,9 @@ class _FakeDownloadSession:
     def __init__(self, response: _FakeDownloadResponse) -> None:
         self._response = response
 
-    def get(self, url: object, headers: dict[str, str] | None = None) -> _FakeDownloadResponse:
+    def get(
+        self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True
+    ) -> _FakeDownloadResponse:
         return self._response
 
     async def __aenter__(self) -> _FakeDownloadSession:
