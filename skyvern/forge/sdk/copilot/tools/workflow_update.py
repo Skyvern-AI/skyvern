@@ -1566,7 +1566,7 @@ def _recorded_outcome_convergence_reject(
     workflow_yaml: str,
     code_artifact_metadata: object,
 ) -> _ConvergenceReject | None:
-    latest = ctx.latest_recorded_build_test_outcome
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
     if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
         return None
     candidate_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
