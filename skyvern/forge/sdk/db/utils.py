@@ -842,6 +842,7 @@ def convert_to_workflow_run_block(
         attachments=workflow_run_block_model.attachments,
         subject=workflow_run_block_model.subject,
         body=workflow_run_block_model.body,
+        prompt=workflow_run_block_model.prompt,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
         instructions=workflow_run_block_model.instructions,

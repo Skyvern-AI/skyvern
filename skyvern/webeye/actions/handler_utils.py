@@ -27,10 +27,12 @@ async def download_file(
     try:
         return await download_file_api(file_url, organization_id=organization_id)
     except Exception:
-        LOG.exception(
+        # Fully self-recovering: the action proceeds without the file.
+        LOG.warning(
             "Failed to download file, continuing without it",
             action=action,
             file_url=file_url,
+            exc_info=True,
         )
         return []
 

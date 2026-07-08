@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { GoogleOAuthCredential } from "@/api/types";
 import {
   getGoogleOAuthCredentialScopesGranted,
   getGoogleOAuthCredentialScopesRequested,
   matchesGoogleOAuthIntegrationScopes,
   normalizeGoogleOAuthScopes,
+  safePostCredentialsInvalidate,
 } from "./useGoogleOAuthCredentials";
 
 const baseCredential: GoogleOAuthCredential = {
@@ -81,5 +82,35 @@ describe("Google OAuth credential scope helpers", () => {
         ["sheets"],
       ),
     ).toBe(true);
+  });
+});
+
+describe("safePostCredentialsInvalidate", () => {
+  it("posts on a live channel", () => {
+    const postMessage = vi.fn();
+    safePostCredentialsInvalidate({ postMessage });
+    expect(postMessage).toHaveBeenCalledWith("invalidate");
+  });
+
+  it("no-ops when the channel is null", () => {
+    expect(() => safePostCredentialsInvalidate(null)).not.toThrow();
+  });
+
+  it("swallows errors from a disposed channel", () => {
+    const postMessage = vi.fn(() => {
+      throw new DOMException("channel is closed", "InvalidStateError");
+    });
+    expect(() => safePostCredentialsInvalidate({ postMessage })).not.toThrow();
+    expect(postMessage).toHaveBeenCalledWith("invalidate");
+  });
+
+  it("rethrows unexpected postMessage errors", () => {
+    const postMessage = vi.fn(() => {
+      throw new Error("unexpected broadcast failure");
+    });
+
+    expect(() => safePostCredentialsInvalidate({ postMessage })).toThrow(
+      "unexpected broadcast failure",
+    );
   });
 });

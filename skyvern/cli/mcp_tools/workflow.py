@@ -1180,16 +1180,32 @@ def _parse_definition(definition: str, fmt: str) -> tuple[dict[str, Any] | None,
 
 async def skyvern_workflow_list(
     search: Annotated[str | None, "Search across workflow titles, folder names, and parameter metadata"] = None,
+    query: Annotated[
+        str | None,
+        "Deprecated alias for search. Use search for new calls.",
+    ] = None,
     page: Annotated[int, Field(description="Page number (1-based)", ge=1)] = 1,
     page_size: Annotated[int, Field(description="Results per page", ge=1, le=100)] = 10,
     only_workflows: Annotated[bool, "Only return multi-step workflows (exclude saved tasks)"] = False,
 ) -> dict[str, Any]:
     """Find and browse available Skyvern workflows. Use when you need to discover what workflows exist,
     search for a workflow by name, or list all workflows for an organization."""
+    if search is not None and query is not None and search != query:
+        return make_result(
+            "skyvern_workflow_list",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Provide either search or query, not conflicting values",
+                "Use search for new calls; query is a compatibility alias.",
+            ),
+        )
+
+    effective_search = search if search is not None else query
     with Timer() as timer:
         try:
             workflows = await list_workflows_raw(
-                search=search,
+                search=effective_search,
                 page=page,
                 page_size=page_size,
                 only_workflows=only_workflows,
@@ -1211,7 +1227,9 @@ async def skyvern_workflow_list(
             "page_size": page_size,
             "count": len(workflows),
             "has_more": len(workflows) == page_size,
-            "sdk_equivalent": f"await skyvern.get_workflows(search_key={search!r}, page={page}, page_size={page_size})",
+            "sdk_equivalent": (
+                f"await skyvern.get_workflows(search_key={effective_search!r}, page={page}, page_size={page_size})"
+            ),
         },
         timing_ms=timer.timing_ms,
     )

@@ -79,7 +79,9 @@ class PersistentSessionsManager(Protocol):
         """Get the browser state for a session."""
         ...
 
-    async def set_browser_state(self, session_id: str, browser_state: BrowserState) -> None:
+    async def set_browser_state(
+        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
+    ) -> None:
         """Set the browser state for a session."""
         ...
 

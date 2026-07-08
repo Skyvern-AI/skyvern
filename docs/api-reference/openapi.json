@@ -10519,6 +10519,31 @@
             "type": "string",
             "title": "Credential Id"
           },
+          "credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ids"
+          },
+          "selection_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Strategy"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10579,6 +10604,31 @@
           "credential_id": {
             "type": "string",
             "title": "Credential Id"
+          },
+          "credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ids"
+          },
+          "selection_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Strategy"
           }
         },
         "type": "object",
@@ -12853,7 +12903,8 @@
           "excel",
           "pdf",
           "image",
-          "docx"
+          "docx",
+          "zip"
         ],
         "title": "FileType"
       },
@@ -14664,6 +14715,20 @@
             "title": "Save Response As File",
             "default": false
           },
+          "secret_response_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Response Paths"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14863,6 +14928,20 @@
             "type": "boolean",
             "title": "Save Response As File",
             "default": false
+          },
+          "secret_response_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Response Paths"
           },
           "parameter_keys": {
             "anyOf": [
@@ -25984,6 +26063,17 @@
               }
             ],
             "title": "Body"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
           },
           "instructions": {
             "anyOf": [

@@ -1,4 +1,5 @@
 import os
+import socket
 import tempfile
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,7 +7,89 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import pytest
 
-from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.exceptions import BlockedHost, HttpException
+from skyvern.forge.sdk.core.aiohttp_helper import SSRFGuardedResolver, aiohttp_request
+from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS, validate_fetch_url
+
+
+@pytest.fixture(autouse=True)
+def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
+
+@pytest.mark.asyncio
+async def test_ssrf_guarded_resolver_blocks_dns_rebind_after_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    dns_answers = iter(
+        [
+            [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))],
+        ]
+    )
+
+    def rebinding_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return next(dns_answers)
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", rebinding_dns)
+
+    assert validate_fetch_url("https://rebind.example.test/file.pdf") is not None
+    with pytest.raises(BlockedHost):
+        await SSRFGuardedResolver().resolve("rebind.example.test", 443)
+
+
+@pytest.mark.asyncio
+async def test_ssrf_guarded_resolver_uses_pinned_ips_without_resolving(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("pinned host should not be re-resolved")
+
+    resolver = SSRFGuardedResolver()
+    resolver.pin_url_ips("https://rebind.example.test/file.pdf", ("93.184.216.34",))
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", unexpected_dns)
+
+    results = await resolver.resolve("rebind.example.test", 443)
+
+    assert [result["host"] for result in results] == ["93.184.216.34"]
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_trusts_internal_proxy_without_trusting_target() -> None:
+    captured_resolver: SSRFGuardedResolver | None = None
+
+    def capture_connector(resolver: SSRFGuardedResolver | None = None) -> object:
+        nonlocal captured_resolver
+        captured_resolver = resolver
+        return object()
+
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.headers = {"Content-Type": "application/json"}
+    mock_response.json = AsyncMock(return_value={"success": True})
+    mock_response.text = AsyncMock(return_value='{"success": true}')
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(return_value=mock_response)
+
+    with (
+        patch("skyvern.forge.sdk.core.aiohttp_helper.ssrf_guarded_tcp_connector", side_effect=capture_connector),
+        patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session),
+    ):
+        await aiohttp_request(
+            method="GET",
+            url="https://example.com/api",
+            proxy="http://127.0.0.1:8080",
+        )
+
+    assert captured_resolver is not None
+    proxy_results = await captured_resolver.resolve("127.0.0.1", 8080)
+    assert proxy_results
+    with pytest.raises(BlockedHost):
+        await SSRFGuardedResolver().resolve("127.0.0.1", 8080)
 
 
 @pytest.mark.asyncio
@@ -543,7 +626,7 @@ async def test_aiohttp_request_response_headers_dict() -> None:
 
 @pytest.mark.asyncio
 async def test_aiohttp_request_follow_redirects() -> None:
-    """Test that follow_redirects parameter is passed correctly"""
+    """Test that redirects are handled manually for SSRF validation."""
     captured_args: list[Any] = []
     captured_request_kwargs: dict[str, Any] = {}
 
@@ -573,8 +656,200 @@ async def test_aiohttp_request_follow_redirects() -> None:
             follow_redirects=False,
         )
 
-    # Verify allow_redirects parameter was set correctly
+    # aiohttp automatic redirects stay disabled so each Location target is SSRF-checked first.
     assert captured_request_kwargs["allow_redirects"] is False
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_follows_safe_redirect() -> None:
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "https://example.com/final"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    final_response = AsyncMock()
+    final_response.status = 200
+    final_response.headers = {"Content-Type": "application/json"}
+    final_response.json = AsyncMock(return_value={"success": True})
+    final_response.text = AsyncMock(return_value='{"success": true}')
+    final_response.__aenter__ = AsyncMock(return_value=final_response)
+    final_response.__aexit__ = AsyncMock(return_value=None)
+
+    responses = [redirect_response, final_response]
+    requested_urls: list[str] = []
+
+    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
+        requested_urls.append(kwargs["url"])
+        return responses.pop(0)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(side_effect=capture_request)
+
+    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
+        status, _headers, body = await aiohttp_request(
+            method="GET",
+            url="https://example.com/start",
+            follow_redirects=True,
+        )
+
+    assert status == 200
+    assert body == {"success": True}
+    assert requested_urls == ["https://example.com/start", "https://example.com/final"]
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> None:
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "https://other.example.com/final"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    final_response = AsyncMock()
+    final_response.status = 200
+    final_response.headers = {"Content-Type": "application/json"}
+    final_response.json = AsyncMock(return_value={"success": True})
+    final_response.text = AsyncMock(return_value='{"success": true}')
+    final_response.__aenter__ = AsyncMock(return_value=final_response)
+    final_response.__aexit__ = AsyncMock(return_value=None)
+
+    responses = [redirect_response, final_response]
+    requested_headers: list[dict[str, str]] = []
+    requested_cookies: list[dict[str, str] | None] = []
+
+    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
+        requested_headers.append(kwargs["headers"])
+        requested_cookies.append(kwargs["cookies"])
+        return responses.pop(0)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(side_effect=capture_request)
+
+    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
+        await aiohttp_request(
+            method="GET",
+            url="https://example.com/start",
+            headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
+            cookies={"session": "abc"},
+            follow_redirects=True,
+        )
+
+    assert requested_headers[0]["Authorization"] == "Bearer secret"
+    assert requested_headers[0]["Cookie"] == "sid=abc"
+    assert requested_cookies[0] == {"session": "abc"}
+    assert requested_headers[1] == {"X-Keep": "1"}
+    assert requested_cookies[1] is None
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_rebuilds_multipart_for_307_redirect() -> None:
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as tmp_file:
+        tmp_file.write("test file content")
+        tmp_file_path = tmp_file.name
+
+    try:
+        redirect_response = AsyncMock()
+        redirect_response.status = 307
+        redirect_response.headers = {"Location": "https://example.com/final"}
+        redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+        redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+        final_response = AsyncMock()
+        final_response.status = 200
+        final_response.headers = {"Content-Type": "application/json"}
+        final_response.json = AsyncMock(return_value={"success": True})
+        final_response.text = AsyncMock(return_value='{"success": true}')
+        final_response.__aenter__ = AsyncMock(return_value=final_response)
+        final_response.__aexit__ = AsyncMock(return_value=None)
+
+        responses = [redirect_response, final_response]
+        multipart_bodies: list[aiohttp.FormData] = []
+
+        def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
+            multipart_bodies.append(kwargs["data"])
+            return responses.pop(0)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.request = MagicMock(side_effect=capture_request)
+
+        with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
+            status, _headers, body = await aiohttp_request(
+                method="POST",
+                url="https://example.com/start",
+                files={"file": tmp_file_path},
+                follow_redirects=True,
+            )
+
+        assert status == 200
+        assert body == {"success": True}
+        assert len(multipart_bodies) == 2
+        assert multipart_bodies[0] is not multipart_bodies[1]
+    finally:
+        if os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_rejects_unsafe_redirect_target() -> None:
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "http://169.254.169.254/latest/meta-data"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    requested_urls: list[str] = []
+
+    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
+        requested_urls.append(kwargs["url"])
+        return redirect_response
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(side_effect=capture_request)
+
+    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
+        with pytest.raises(BlockedHost):
+            await aiohttp_request(
+                method="GET",
+                url="https://example.com/start",
+                follow_redirects=True,
+            )
+
+    assert requested_urls == ["https://example.com/start"]
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_request_redirect_limit_raises_http_exception() -> None:
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "https://example.com/next"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.request = MagicMock(return_value=redirect_response)
+
+    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
+        with pytest.raises(HttpException) as exc_info:
+            await aiohttp_request(
+                method="GET",
+                url="https://example.com/start",
+                follow_redirects=True,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert "Too many redirects" in (exc_info.value.error_message or "")
+    assert mock_session.request.call_count == MAX_SAFE_REDIRECTS + 1
 
 
 @pytest.mark.asyncio
@@ -646,10 +921,12 @@ async def test_aiohttp_request_with_files_uses_multipart() -> None:
         mock_session.__aexit__ = AsyncMock(return_value=None)
         mock_session.request = MagicMock(side_effect=capture_request)
 
+        headers = {"Content-Type": "multipart/form-data", "X-Test": "value"}
         with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
             await aiohttp_request(
                 method="POST",
                 url="https://example.com/api/upload",
+                headers=headers,
                 files={"file": tmp_file_path},
             )
 
@@ -660,6 +937,7 @@ async def test_aiohttp_request_with_files_uses_multipart() -> None:
         # Verify Content-Type header was removed (aiohttp will set it for multipart)
         assert "Content-Type" not in captured_request_kwargs["headers"]
         assert "content-type" not in captured_request_kwargs["headers"]
+        assert headers == {"Content-Type": "multipart/form-data", "X-Test": "value"}
     finally:
         # Clean up temporary file
         if os.path.exists(tmp_file_path):

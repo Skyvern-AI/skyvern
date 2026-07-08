@@ -4388,7 +4388,8 @@ class WorkflowService:
             workflow_run = await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run_id)
             return workflow_run, True
         if block_result.status == BlockStatus.failed:
-            LOG.error(
+            # Run-level outcome, recorded as the run's failure_reason below; not a platform fault.
+            LOG.warning(
                 f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed for workflow run {workflow_run_id}",
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,

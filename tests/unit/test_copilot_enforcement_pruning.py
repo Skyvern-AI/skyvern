@@ -16,7 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from agents import RunConfig
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.config import settings
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
+    CopilotToolBlockerSignal,
+    stash_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     author_time_reject_missing_output_paths,
@@ -75,6 +80,11 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from tests.unit.conftest import make_copilot_context
 
 
+@pytest.fixture(autouse=True)
+def _disable_author_time_gate_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", False)
+
+
 class _Ctx:
     """Minimal stand-in for CopilotContext used in enforcement checks.
 
@@ -117,6 +127,7 @@ class _Ctx:
         self.last_run_blocks_workflow_run_id = None
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
+        self.author_time_gate_ablation_events = []
 
 
 class TestSynthesizedOfferPersistenceGate:
@@ -2263,6 +2274,30 @@ class TestScoutOutputCoverageGate:
         assert isinstance(steer, CopilotToolBlockerSignal)
         assert steer.cleared_by_tools == frozenset({"evaluate"})
         assert steer.blocked_tool == "update_workflow"
+
+    def test_log_only_rescout_steer_records_without_consuming(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings, "ENV", "local")
+        monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        consume_uncovered_output_reopen_event(ctx)
+
+        steer = uncovered_output_reject_scout_steer_signal(ctx, "update_workflow")
+
+        assert steer is None
+        assert ctx.uncovered_output_rescout_steer_key is None
+        event = ctx.author_time_gate_ablation_events[-1]
+        assert event.gate_id == "uncovered_output_rescout_steer"
+        assert event.reason_code == UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE
+        assert event.blocked_tool == "update_workflow"
+        assert event.fingerprint == (
+            f"{ctx.latest_recorded_build_test_outcome.structural_failure_identity}|output.document_name"
+        )
+        assert event.log_only is True
 
     def test_steer_inert_without_reopen_latch(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))

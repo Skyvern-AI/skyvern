@@ -78,8 +78,13 @@ ClarificationReason = Literal[
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
+# Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
+)
+# Broader: any reason credential_prompt_reason() should surface an add-credential CTA for.
+CREDENTIAL_PROMPT_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"raw_secret", "credential_name_unresolved", "credential_invention_requested", "workflow_credential_inputs_unbound"}
 )
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "credential_invention_requested",
@@ -97,6 +102,9 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
+# Matches any final reply containing these substrings, not just credential-blocking
+# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
+_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 _RAW_SECRET_QUESTION = (
@@ -280,6 +288,10 @@ class RequestPolicy:
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
     allow_missing_credentials_in_draft: bool = False
+    # Narrower than the flag above: True only when a credential-specific path (an explicit
+    # code-block credential draft, or a redacted raw secret) set it, not the generic
+    # skip_test fallthrough that fires for any untested draft regardless of credentials.
+    credential_draft_deferred_explicitly: bool = False
     user_response_policy: str = "proceed"
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
@@ -313,6 +325,7 @@ class RequestPolicy:
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
+            "credential_draft_deferred_explicitly": self.credential_draft_deferred_explicitly,
             "resolved_credential_count": len(self.resolved_credentials),
             "has_completion_contract": bool(self.completion_contract),
             "completion_criteria_count": len(self.graded_completion_criteria()),
@@ -403,6 +416,21 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     if request_policy is None:
         return False
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
+    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
+    # allow_missing_credentials_in_draft alone also covers the generic skip_test
+    # fallthrough with no credential involvement — then a text marker.
+    if isinstance(policy, RequestPolicy):
+        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+            return policy.clarification_reason
+        if policy.credential_draft_deferred_explicitly:
+            return "credential_deferred_draft"
+    normalized = " ".join((final_text or "").lower().split())
+    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
+        return "assistant_directed"
+    return None
 
 
 def _is_judgment_boolean_criterion(criterion: CompletionCriterion) -> bool:
@@ -1793,6 +1821,7 @@ def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, us
     policy.allow_update_workflow = True
     policy.allow_run_blocks = False
     policy.allow_missing_credentials_in_draft = True
+    policy.credential_draft_deferred_explicitly = True
     policy.requires_user_clarification = False
     policy.user_response_policy = "proceed"
     policy.clarification_reason = "none"
@@ -2485,6 +2514,7 @@ async def build_request_policy(
         policy.allow_update_workflow = True
         policy.allow_run_blocks = False
         policy.allow_missing_credentials_in_draft = True
+        policy.credential_draft_deferred_explicitly = True
         policy.clarification_reason = "none"
         policy.clarification_question = None
 
