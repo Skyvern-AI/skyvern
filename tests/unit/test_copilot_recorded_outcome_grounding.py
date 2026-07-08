@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import _recorded_build_test_outcome_prompt
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -81,6 +82,11 @@ workflow_definition:
     code: |
       return {"records": [{"npi": "123"}]}
 """
+
+
+@pytest.fixture(autouse=True)
+def _disable_author_time_gate_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", False)
 
 
 def _outcome(**updates: object) -> RecordedBuildTestOutcome:
@@ -188,6 +194,29 @@ def test_repeated_authoritative_outcome_arms_grounding_before_repair_ceiling() -
     assert requirement.required_target_url == "current_page"
     assert requirement.workflow_run_id == "wr_123"
     assert ctx.blocker_signal is None
+
+
+def test_log_only_recorded_outcome_grounding_records_without_stashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    result = _tool_loop_error(ctx, "update_workflow")
+
+    assert result is None
+    assert ctx.blocker_signal is None
+    assert ctx.latest_tool_blocker_signal is None
+    assert ctx.turn_halt is None
+    event = ctx.author_time_gate_ablation_events[-1]
+    assert event.gate_id == "recorded_outcome_grounding"
+    assert event.reason_code == "recorded_outcome_grounding_required"
+    assert event.blocked_tool == "update_workflow"
+    assert event.fingerprint == outcome.structural_key
+    assert event.log_only is True
 
 
 def test_authoritative_persisted_outcome_arms_without_recorded_signature_prefix(
@@ -322,7 +351,27 @@ def test_grounding_rejection_logs_reason_and_run_id_fields(
     assert event["current_url_present"] is (reject_reason != "no_url")
 
 
-def test_no_run_degraded_grounding_remains_unsatisfied_and_logs_degraded_page() -> None:
+def test_evaluate_grounding_payload_requires_inspect_recovery() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = _bounded_inspect_evidence(
+        source_tool="evaluate",
+        workflow_run_id=None,
+        observed_after_workflow_run=False,
+    )
+
+    with capture_logs() as logs:
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
+    assert event["reject_reason"] == "not_inspect_source"
+    assert event["source_tool"] == "evaluate"
+
+    assert _tool_loop_error(ctx, "evaluate", {}) is None
+
+
+def test_no_run_degraded_grounding_satisfies_with_typed_capture_degraded_payload() -> None:
     outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
     ctx = _ctx(outcome)
     arm_recorded_outcome_grounding_requirement(ctx)
@@ -335,11 +384,14 @@ def test_no_run_degraded_grounding_remains_unsatisfied_and_logs_degraded_page() 
         challenge_controls=[],
     )
 
-    with capture_logs() as logs:
-        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
 
-    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
-    assert event["reject_reason"] == "degraded_page"
+    requirement = ctx.recorded_outcome_grounding_requirement
+    assert requirement is not None
+    payload = requirement.payload
+    assert payload is not None
+    assert payload.capture_degraded is True
+    assert payload.payload_workflow_run_id is None
 
 
 def test_persisted_degraded_empty_grounding_satisfies_and_reaches_prompt() -> None:

@@ -1,6 +1,7 @@
 import json
+import socket
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -193,6 +194,31 @@ class TestSecretResponsePaths:
 
 
 class TestHttpRequestBlockSecretResponsePaths:
+    @pytest.mark.asyncio
+    async def test_execute_rejects_hostname_resolving_to_private_ip_before_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _make_context()
+        block = _http_block(url="https://evil.example.test/api")
+        db_mock = AsyncMock()
+        client_session = MagicMock()
+
+        def resolves_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", port or 0))]
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_private)
+        monkeypatch.setattr("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", client_session)
+        monkeypatch.setattr(block_module.app, "DATABASE", db_mock)
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert result.failure_reason is not None
+        assert "blocked" in result.failure_reason
+        client_session.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_execute_records_placeholder_and_masks_duplicate_echo(self, monkeypatch: pytest.MonkeyPatch) -> None:
         context = _make_context()
