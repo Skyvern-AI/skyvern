@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 from multidict import CIMultiDict, CIMultiDictProxy
 
@@ -13,33 +14,58 @@ from skyvern.forge.sdk.api import files
 
 
 class _FakeDownloadResponse:
-    def __init__(self, data: bytes, headers: dict[str, str] | None = None, advertise_length: bool = True) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        headers: dict[str, str] | None = None,
+        advertise_length: bool = True,
+        status: int = 200,
+    ) -> None:
         self._data = data
         # aiohttp exposes headers as a case-insensitive CIMultiDictProxy; mirror that.
         self.headers = CIMultiDictProxy(CIMultiDict(headers or {}))
-        self.status = 200
+        self.status = status
+        self.reason = "Unknown Error" if status >= 400 else "OK"
+        self.history = ()
+        self.request_info = MagicMock(real_url="https://example.com/files/rate-limited.png")
         self.content_length = len(data) if advertise_length else None
         self.content = self
         self.body_read = False
+        self.auto_raise_for_status = False
 
     async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
         self.body_read = True
         yield self._data
 
     async def __aenter__(self) -> _FakeDownloadResponse:
+        if self.auto_raise_for_status:
+            self.raise_for_status()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         return None
 
+    def raise_for_status(self) -> None:
+        if self.status < 400:
+            return
+        raise aiohttp.ClientResponseError(
+            request_info=self.request_info,
+            history=self.history,
+            status=self.status,
+            message=self.reason,
+            headers=self.headers,
+        )
+
 
 class _FakeDownloadSession:
-    def __init__(self, response: _FakeDownloadResponse) -> None:
+    def __init__(self, response: _FakeDownloadResponse, *, raise_for_status: bool = False) -> None:
         self._response = response
+        self._raise_for_status = raise_for_status
 
     def get(
         self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True
     ) -> _FakeDownloadResponse:
+        self._response.auto_raise_for_status = self._raise_for_status
         return self._response
 
     async def __aenter__(self) -> _FakeDownloadSession:
@@ -54,9 +80,17 @@ def _patch_download_session(
     data: bytes,
     headers: dict[str, str] | None = None,
     advertise_length: bool = True,
+    status: int = 200,
+    captured_session_kwargs: dict[str, object] | None = None,
 ) -> _FakeDownloadResponse:
-    response = _FakeDownloadResponse(data, headers, advertise_length=advertise_length)
-    monkeypatch.setattr(files.aiohttp, "ClientSession", lambda **kwargs: _FakeDownloadSession(response))
+    response = _FakeDownloadResponse(data, headers, advertise_length=advertise_length, status=status)
+
+    def make_session(**kwargs: object) -> _FakeDownloadSession:
+        if captured_session_kwargs is not None:
+            captured_session_kwargs.update(kwargs)
+        return _FakeDownloadSession(response, raise_for_status=kwargs.get("raise_for_status") is True)
+
+    monkeypatch.setattr(files.aiohttp, "ClientSession", make_session)
     return response
 
 
@@ -195,4 +229,25 @@ async def test_download_file_cleans_up_temp_file_when_max_size_exceeded_mid_stre
     with pytest.raises(DownloadFileMaxSizeExceeded):
         await files.download_file("https://example.com/files/big.bin", output_dir=str(tmp_path), max_size_mb=1)
 
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_file_raises_http_error_without_aiohttp_auto_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_session_kwargs: dict[str, object] = {}
+    response = _patch_download_session(
+        monkeypatch,
+        b"",
+        status=429,
+        captured_session_kwargs=captured_session_kwargs,
+    )
+
+    with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+        await files.download_file("https://example.com/files/rate-limited.png", output_dir=str(tmp_path))
+
+    assert exc_info.value.status == 429
+    assert captured_session_kwargs.get("raise_for_status") is not True
+    assert not response.body_read
     assert list(tmp_path.iterdir()) == []
