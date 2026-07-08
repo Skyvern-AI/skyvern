@@ -335,6 +335,36 @@ class TestBrowserCommands:
 
 
 class TestWorkflowCommands:
+    def test_workflow_list_query_alias_maps_to_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        monkeypatch.setattr(workflow_cmd, "prepare_cli_runtime", lambda **_: None)
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_list",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflows": [], "page": 1, "page_size": 10, "count": 0, "has_more": False},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_list", tool)
+
+        result = CliRunner().invoke(workflow_cmd.workflow_app, ["list", "--query", "invoice", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert tool.await_args.kwargs == {
+            "search": "invoice",
+            "page": 1,
+            "page_size": 10,
+            "only_workflows": False,
+        }
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is True
+
     def test_workflow_get_outputs_mcp_envelope_in_json_mode(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
