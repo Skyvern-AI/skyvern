@@ -303,10 +303,11 @@ async def download_file(
                 status_code=HTTPStatus.BAD_REQUEST,
             )
     except aiohttp.ClientResponseError as e:
-        LOG.exception(f"Failed to download file, status code: {e.status}")
+        # Re-raised and handled at the action/block boundary; server rejections are external.
+        LOG.warning(f"Failed to download file, status code: {e.status}", exc_info=True)
         raise
     except DownloadFileMaxSizeExceeded as e:
-        LOG.exception(f"Failed to download file, max size exceeded: {e.max_size}")
+        LOG.warning(f"Failed to download file, max size exceeded: {e.max_size}", exc_info=True)
         raise
     except PermissionError as e:
         LOG.warning(
@@ -315,6 +316,10 @@ async def download_file(
             organization_id=organization_id,
             reason=str(e),
         )
+        raise
+    except aiohttp.InvalidURL:
+        # Malformed customer-provided URL - a client-data error, not a platform fault.
+        LOG.warning("Failed to download file, invalid URL", exc_info=True)
         raise
     except Exception:
         LOG.exception("Failed to download file")

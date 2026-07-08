@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
+    authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
     recorded_outcome_from_author_time_reject,
@@ -2979,6 +2980,69 @@ class TestCodeRepairProgressClassification:
         assert run_eval.payload["static_return_advisory_paths"] == ["output.record_id"]
         assert run_eval.can_attempt_run is True
 
+    def test_complete_metadata_without_code_return_is_run_preflight_advisory(self) -> None:
+        ctx = _code_only_ctx()
+        required_paths = {"output.account_number", "output.confirmation_number"}
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                SimpleNamespace(
+                    id="requested_account",
+                    output_path="output.account_number",
+                    level="run",
+                    method_mandated=False,
+                    kind="outcome",
+                ),
+                SimpleNamespace(
+                    id="requested_confirmation",
+                    output_path="output.confirmation_number",
+                    level="run",
+                    method_mandated=False,
+                    kind="outcome",
+                ),
+            ]
+        )
+        schema = workflow_update_module._schema_template_text_for_required_paths(required_paths)
+        metadata = [
+            {
+                "block_label": "submit_service_request",
+                "claimed_outcomes": [{"goal_value_paths": sorted(required_paths), "extraction_schema": schema}],
+                "terminal_verifier_expectations": [
+                    {"goal_value_paths": sorted(required_paths), "extraction_schema": schema}
+                ],
+            }
+        ]
+        workflow_yaml = _yaml(
+            """
+            title: Service request
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                code: |
+                  await page.get_by_role("button", name="Submit").click()
+            """
+        )
+        signature = workflow_update_module._output_contract_signature(
+            ctx=ctx,
+            workflow_yaml=workflow_yaml,
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            required_paths=required_paths,
+        )
+        ctx.output_contract_reject_count_by_signature = {signature: 2}
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx, workflow_yaml, metadata, allow_static_return_advisory=True
+        )
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
+
+        assert evaluation is not None
+        assert evaluation.can_attempt_run is True
+        assert evaluation.missing_return_paths == []
+        assert evaluation.payload["static_return_advisory_paths"] == sorted(required_paths)
+        assert evaluation.payload["post_steering_static_return_advisory"] is True
+        assert result is None
+
     @pytest.mark.asyncio
     async def test_save_only_update_rejects_post_steering_static_return_gap(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3796,6 +3860,79 @@ class TestCodeRepairProgressClassification:
             "requested_output_contract"
         )
         assert sanitized["data"]["metadata_repair_contract"] == result["data"]["metadata_repair_contract"]
+
+    def test_metadata_contract_run_preflight_preserves_run_backed_convergence_terminal(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                SimpleNamespace(
+                    id="requested_account",
+                    output_path="output.account_number",
+                    level="run",
+                    method_mandated=False,
+                    kind="outcome",
+                )
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Service request
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                code: |
+                  await page.get_by_role("button", name="Submit").click()
+            """
+        )
+        metadata = [
+            {
+                "artifact_id": "code_artifact:submit_service_request",
+                "block_label": "submit_service_request",
+                "claimed_outcomes": [
+                    {
+                        "goal_value_paths": ["output.account_number"],
+                        "extraction_schema": (
+                            '{"type":"object","properties":{"output":{"type":"object","properties":'
+                            '{"account_number":{}}}}}'
+                        ),
+                    }
+                ],
+            }
+        ]
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_recorded",
+            block_labels=["submit_service_request"],
+            structural_failure_identity="completion:typed-output",
+            authored_structure_signature="previous-authoring-signature",
+        )
+        recorded_sig = authored_block_signatures_from_workflow(workflow_yaml, metadata)["submit_service_request"]
+        ctx.recorded_outcome_binding_constraint = RecordedOutcomeBindingConstraint(
+            repeated_structural_key=ctx.latest_recorded_build_test_outcome.structural_key or "",
+            phase="persisted_block_run",
+            reason_code="outcome_not_demonstrated",
+            frontier_facet="value_shape",
+            owning_block_labels=["submit_service_request"],
+            diagnostic_reason="empty_page",
+            workflow_run_id="wr_recorded",
+            recorded_block_signatures={"submit_service_request": recorded_sig},
+        )
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, metadata)
+
+        assert result is not None
+        assert result["ok"] is False
+        assert "frontier" in result["error"]
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind is TurnHaltKind.REPAIR_CEILING_REACHED
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert outcome is not None
+        assert outcome.reason_code == "unchanged_after_recorded_outcome"
+        assert outcome.workflow_run_id is None
 
     def test_metadata_contract_run_preflight_budget_remains_repair_before_run(self) -> None:
         ctx = _code_only_ctx()
@@ -5931,7 +6068,7 @@ class TestSeparatedSpineViolationActuation:
         assert ctx.turn_halt is None
         assert len(ctx.output_contract_spine_directive_blockers_by_attempt_key) == 1
 
-    def test_granted_advisory_arms_run_evidence_before_consume_when_run_attemptable(
+    def test_granted_advisory_arms_run_evidence_without_preflight_consume_when_run_attemptable(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ctx = _spine_actuation_ctx()
@@ -5975,7 +6112,7 @@ class TestSeparatedSpineViolationActuation:
 
         assert result is None
         assert ctx.output_contract_pending_run_evidence.get(signature) == ["output.confirmation_number"]
-        assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.CONSUMED
+        assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
 
         run_result = {
             "data": {"blocks": [{"label": "extract_record", "extracted_data": {"confirmation_number": "R-9"}}]}
@@ -10804,6 +10941,23 @@ class TestWholeTrajectoryImposition:
         assert repair["reason_code"] == "synthesized_parameter_binding_ambiguous"
         assert repair["unresolved_names"] == ["provider_name"]
         assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
+
+    def test_author_ambiguous_selector_reject_reopens_strict_imposition_with_typed_repair_context(self) -> None:
+        ctx = _resale_ctx()
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("code_safety_reject")
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_resale_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        block = _single_code_block(parse_workflow_yaml(result.workflow_yaml))
+        assert 'button[data-action=\\"status\\"]' in str(block["code"])
 
     def test_author_schema_incompatibility_does_not_reopen_collapsed_code_block(self) -> None:
         ctx = _quote_ctx()

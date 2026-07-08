@@ -1341,6 +1341,29 @@ def test_terminal_goal_record_self_asserted_boolean_without_identifier_remains_u
     )
 
 
+def test_submit_terminal_still_rejects_false_submit_with_author_time_log_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+    snapshot = RunEvidenceSnapshot(block_outputs={"terminal_result": _terminal_goal_payload(submitted=False)})
+
+    assert (
+        grade_terminal_goal_record_criteria(
+            [
+                _criterion(
+                    "c0",
+                    "a commercial water service request is submitted",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ],
+            snapshot,
+        )
+        == []
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -9141,6 +9164,21 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
     assert no_handler_result is not None
     assert no_handler_result.status == "unavailable"
     assert no_handler_result.is_fully_satisfied() is False
+
+
+@pytest.mark.asyncio
+async def test_completion_verification_still_fails_closed_with_author_time_log_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+    _patch_completion_handler(monkeypatch, None)
+
+    result = await _maybe_run_completion_verification(_run_ctx(), _clean_success_result(), time.monotonic())
+
+    assert result is not None
+    assert result.status == "unavailable"
+    assert result.is_fully_satisfied() is False
 
 
 def test_completion_contract_not_violated_unavailable_blocks_surfacing() -> None:

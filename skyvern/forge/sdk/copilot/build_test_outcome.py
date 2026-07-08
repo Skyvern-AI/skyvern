@@ -539,8 +539,7 @@ def _grounding_payload_from_evidence(
     challenge_gated = _challenge_gated_page_evidence(evidence)
     capture_degraded = not has_bounded_page_schema(evidence)
     observed_empty_page = _observed_empty_page_evidence(evidence)
-    if (challenge_gated or capture_degraded or observed_empty_page) and not (isinstance(run_id, str) and run_id):
-        return None
+    # No-run degraded captures are typed grounding evidence; downstream binding remains a separate gate.
     diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = "none"
     if challenge_gated:
         diagnostic_reason = "challenge_gated"

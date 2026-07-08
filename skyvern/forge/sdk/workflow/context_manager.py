@@ -32,7 +32,12 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordC
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, normalize_totp_config
+from skyvern.forge.sdk.services.credentials import (
+    AzureVaultConstants,
+    OnePasswordConstants,
+    extract_onepassword_upstream_5xx_status,
+    normalize_totp_config,
+)
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -76,14 +81,6 @@ _CREDENTIAL_PARAMETER_TYPES: tuple[type, ...] = (
     OnePasswordCredentialParameter,
 )
 
-# 1Password's Python SDK forwards generic 5xx upstream failures as plain Exceptions
-# whose stringified message embeds the HTTP status.
-_ONEPASSWORD_5XX_PATTERN = re.compile(
-    r"(?i)"
-    r"(?:\b(?:HTTP|status(?:\s+code)?|code|response)\s*[:=]?\s*(5\d{2})\b)"
-    r"|"
-    r"(?:\b(5\d{2})\s+(?:service\s+unavailable|bad\s+gateway|gateway\s+timeout|internal\s+server\s+error)\b)"
-)
 _SECRET_FIELD_KEY_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 
 
@@ -822,11 +819,10 @@ class WorkflowRunContext:
             raise OnePasswordSessionExpiredError(f"{str(e)} {lookup_context}") from e
         except Exception as e:
             raw = str(e)
-            match = _ONEPASSWORD_5XX_PATTERN.search(raw)
-            if match:
-                status_digits = match.group(1) or match.group(2)
+            upstream_status = extract_onepassword_upstream_5xx_status(raw)
+            if upstream_status is not None:
                 raise OnePasswordServiceUnavailableError(
-                    status_code=int(status_digits),
+                    status_code=upstream_status,
                     lookup_context=lookup_context,
                 ) from e
             raise OnePasswordGetItemError(f"{raw} {lookup_context}") from e
