@@ -108,9 +108,55 @@ async def test_mcp_http_auth_rejects_missing_api_key(monkeypatch: pytest.MonkeyP
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "UNAUTHORIZED"
-    assert "x-api-key" in response.json()["error"]["message"]
+    assert response.json()["error"]["message"] == mcp_http_auth._MISSING_CREDENTIALS_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
     assert response.headers["www-authenticate"] == expected_challenge
     assert response.headers["access-control-expose-headers"] == "WWW-Authenticate"
+
+
+@pytest.mark.parametrize("api_key", ["", "   "])
+@pytest.mark.asyncio
+async def test_mcp_http_auth_rejects_empty_api_key_without_oauth_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key: str,
+) -> None:
+    validate_api_key = AsyncMock(side_effect=AssertionError("empty API key should not be validated"))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = _build_test_app()
+
+    response = await _request(app, "POST", "/mcp", headers={"x-api-key": api_key}, json={})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+    assert response.json()["error"]["message"] == mcp_http_auth._EMPTY_API_KEY_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
+    assert "www-authenticate" not in response.headers
+    validate_api_key.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bearer_token", ["", "   "])
+@pytest.mark.asyncio
+async def test_mcp_http_auth_rejects_empty_bearer_with_oauth_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+    bearer_token: str,
+) -> None:
+    validate_oauth_token = AsyncMock(side_effect=AssertionError("empty Bearer token should not be validated"))
+    validate_api_key = AsyncMock(side_effect=AssertionError("empty Bearer token should not be validated"))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", validate_oauth_token)
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = _build_test_app()
+    expected_challenge = _expected_oauth_challenge(monkeypatch)
+
+    response = await _request(app, "POST", "/mcp", headers={"authorization": f"Bearer {bearer_token}"}, json={})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+    assert response.json()["error"]["message"] == mcp_http_auth._EMPTY_BEARER_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
+    assert response.headers["www-authenticate"] == expected_challenge
+    assert response.headers["access-control-expose-headers"] == "WWW-Authenticate"
+    validate_oauth_token.assert_not_awaited()
+    validate_api_key.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -148,7 +194,8 @@ async def test_mcp_http_auth_rejects_invalid_api_key(monkeypatch: pytest.MonkeyP
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "UNAUTHORIZED"
-    assert response.json()["error"]["message"] == "Invalid API key"
+    assert response.json()["error"]["message"] == mcp_http_auth._INVALID_API_KEY_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
     assert "www-authenticate" not in response.headers
 
 
