@@ -21,6 +21,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models import block_base as block_base_module
+from skyvern.forge.sdk.workflow.models import code_block as code_block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -104,6 +105,7 @@ def _fake_storage_app(monkeypatch: pytest.MonkeyPatch, *, save, get) -> None:
     )
     monkeypatch.setattr(block_module, "app", fake_app)
     monkeypatch.setattr(block_base_module, "app", fake_app)
+    monkeypatch.setattr(code_block_module, "app", fake_app)
 
 
 @pytest.mark.asyncio
@@ -306,7 +308,7 @@ async def test_code_block_materializes_file_parameter_to_local_path(
         f.write(b"%PDF-1.4 upload")
 
     download_mock = AsyncMock(return_value=local_path)
-    monkeypatch.setattr(block_module, "download_file", download_mock)
+    monkeypatch.setattr(code_block_module, "download_file", download_mock)
 
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
     _wire_block_runtime(monkeypatch, values={"resume": "https://files.example.com/resume.pdf"})
@@ -331,7 +333,7 @@ async def test_code_block_file_parameter_empty_uri_left_unchanged(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
     download_mock = AsyncMock()
-    monkeypatch.setattr(block_module, "download_file", download_mock)
+    monkeypatch.setattr(code_block_module, "download_file", download_mock)
 
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
     _wire_block_runtime(monkeypatch, values={"resume": {"s3uri": ""}})

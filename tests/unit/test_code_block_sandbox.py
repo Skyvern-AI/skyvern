@@ -1069,7 +1069,7 @@ class TestCodeBlockOtpMintAtCallTime:
     async def test_otp_returns_current_totp(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
 
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
@@ -1087,7 +1087,7 @@ class TestCodeBlockOtpMintAtCallTime:
 
         import pyotp.totp as pyotp_totp
 
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
 
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
@@ -1112,7 +1112,7 @@ class TestCodeBlockOtpMintAtCallTime:
 
     @pytest.mark.asyncio
     async def test_returned_code_is_not_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
 
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
@@ -1122,7 +1122,7 @@ class TestCodeBlockOtpMintAtCallTime:
 
     @pytest.mark.asyncio
     async def test_minted_code_registered_in_secrets(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
 
         wrc = _build_wrc_with_totp_seed()
         _patch_context_resolution(monkeypatch, wrc)
@@ -1136,8 +1136,8 @@ class TestCodeBlockOtpIdentifierFetch:
 
     @pytest.mark.asyncio
     async def test_fetches_via_poll_with_run_start_anchor(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models import block as block_module
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
         from skyvern.services.otp_service import OTPValue
 
         wrc = _build_wrc_with_identifier()
@@ -1171,8 +1171,8 @@ class TestCodeBlockOtpIdentifierFetch:
 
     @pytest.mark.asyncio
     async def test_fetched_code_registered_in_secrets(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models import block as block_module
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
         from skyvern.services.otp_service import OTPValue
 
         wrc = _build_wrc_with_identifier()
@@ -1195,8 +1195,8 @@ class TestCodeBlockOtpIdentifierFetch:
 
     @pytest.mark.asyncio
     async def test_magic_link_returned_as_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models import block as block_module
-        from skyvern.forge.sdk.workflow.models.block import _resolve_code_block_otp
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
+        from skyvern.forge.sdk.workflow.models.code_block import _resolve_code_block_otp
         from skyvern.services.otp_service import OTPValue
 
         wrc = _build_wrc_with_identifier()
@@ -1225,7 +1225,7 @@ class TestCodeBlockOtpBudget:
 
     @pytest.mark.asyncio
     async def test_poll_timeout_raises_clear_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
         from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _resolve_code_block_otp
 
         wrc = _build_wrc_with_identifier()
@@ -1251,7 +1251,7 @@ class TestCodeBlockOtpBudget:
     async def test_poll_timeout_error_is_not_asyncio_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The in-block budget surfaces CodeBlockOTPError, not the bare asyncio.TimeoutError
         that the outer 300s wait_for would raise."""
-        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
         from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _resolve_code_block_otp
 
         wrc = _build_wrc_with_identifier()
@@ -1282,7 +1282,7 @@ class TestCodeBlockOtpBudget:
     async def test_poll_exception_is_sanitized(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A poll failure carrying the identifier must not leak it through the in-block error."""
         from skyvern.exceptions import NoTOTPVerificationCodeFound
-        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
         from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _resolve_code_block_otp
 
         wrc = _build_wrc_with_identifier(identifier="secret-identifier@example.com")
@@ -1339,7 +1339,7 @@ class TestCodeBlockOtpNoSource:
 
     @pytest.mark.asyncio
     async def test_missing_run_context_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models import code_block as block_module
         from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _resolve_code_block_otp
 
         monkeypatch.setattr(
