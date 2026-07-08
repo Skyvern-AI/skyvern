@@ -762,7 +762,7 @@ async def wrapper({default_args}):
             return None
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            "skyvern.forge.sdk.workflow.models.code_block.app.AGENT_FUNCTION.validate_code_block",
             validate_code_block,
         )
         monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
@@ -986,7 +986,7 @@ class _FakeWorkflowRun:
 
 def _patch_context_resolution(monkeypatch: "pytest.MonkeyPatch", wrc) -> None:
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
+        "skyvern.forge.sdk.workflow.models.code_block.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context",
         lambda *args, **kwargs: wrc,
     )
 
@@ -1024,7 +1024,7 @@ async def _run_credential_code_block(monkeypatch: "pytest.MonkeyPatch", wrc, cod
         persisted["value"] = value
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+        "skyvern.forge.sdk.workflow.models.code_block.app.AGENT_FUNCTION.validate_code_block",
         validate_code_block,
     )
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)

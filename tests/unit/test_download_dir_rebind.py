@@ -320,8 +320,7 @@ async def test_block_adoption_seam_rebinds_to_run_dir() -> None:
     browser_state.browser_context.browser = browser
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
@@ -350,8 +349,7 @@ async def test_block_adoption_seam_rebinds_via_context_page_without_owning_brows
     browser_state.get_working_page = AsyncMock(return_value=page)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
 
@@ -376,8 +374,7 @@ async def test_block_adoption_seam_no_browser_no_page_returns_state() -> None:
     browser_state.get_working_page = AsyncMock(return_value=None)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
 
@@ -401,8 +398,7 @@ async def test_block_non_adoption_cache_hit_rebinds_to_run_dir() -> None:
     browser_state.is_connected = MagicMock(return_value=True)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)
 
@@ -430,8 +426,7 @@ async def test_block_non_adoption_rebinds_when_org_id_missing() -> None:
     browser_state.is_connected = MagicMock(return_value=True)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)
 
@@ -459,8 +454,7 @@ async def test_block_non_adoption_rebinds_via_context_page_when_browser_is_none(
     browser_state.get_working_page = AsyncMock(return_value=page)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)
 
@@ -489,9 +483,8 @@ async def test_block_non_adoption_fresh_create_empty_context_rebinds_with_workfl
     empty_ctx = SkyvernContext(run_id=None, workflow_run_id=None, task_id=None)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
-        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=empty_ctx),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.skyvern_context.current", return_value=empty_ctx),
     ):
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.get_workflow_run = AsyncMock(return_value=MagicMock())
@@ -518,8 +511,7 @@ async def test_block_non_adoption_rebind_fail_open() -> None:
     browser_state.is_connected = MagicMock(return_value=True)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
         patch(
             "skyvern.forge.sdk.workflow.models.block_base.rebind_download_dir",
             new_callable=AsyncMock,
@@ -546,8 +538,7 @@ async def test_block_adoption_seam_fail_open_on_rebind_error() -> None:
     browser_state.browser_context.browser = MagicMock()
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
         patch(
             "skyvern.forge.sdk.workflow.models.block_base.rebind_download_dir",
             new_callable=AsyncMock,
@@ -595,9 +586,8 @@ async def test_block_adoption_prefers_context_run_id_over_workflow_run_id() -> N
     ctx = SkyvernContext(run_id="run_ctx", workflow_run_id="wr_block")
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
-        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.skyvern_context.current", return_value=ctx),
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
@@ -1108,9 +1098,8 @@ async def test_block_non_adoption_override_takes_precedence_over_context() -> No
     ctx = SkyvernContext(run_id=None, workflow_run_id="wr_block", task_id=None)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
-        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=ctx),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.skyvern_context.current", return_value=ctx),
     ):
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)
 
@@ -1136,8 +1125,7 @@ async def test_block_non_adoption_reused_browser_rebinds_to_second_run() -> None
     browser_state.is_connected = MagicMock(return_value=True)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=browser_state)
 
@@ -1167,8 +1155,7 @@ async def test_register_downloaded_files_uses_download_run_id_as_storage_key() -
     block = CodeBlock.__new__(CodeBlock)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.code_block.app", mock_app),
     ):
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
@@ -1192,8 +1179,7 @@ async def test_register_downloaded_files_defaults_to_workflow_run_id() -> None:
     block = CodeBlock.__new__(CodeBlock)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.code_block.app", mock_app),
     ):
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
@@ -1215,7 +1201,7 @@ async def test_register_pdf_uses_download_run_id_as_storage_key() -> None:
     block = PrintPageBlock.__new__(PrintPageBlock)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
         patch("skyvern.forge.sdk.workflow.models.misc_blocks.app", mock_app),
     ):
@@ -1240,7 +1226,7 @@ async def test_register_pdf_defaults_to_workflow_run_id() -> None:
     block = PrintPageBlock.__new__(PrintPageBlock)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
         patch("skyvern.forge.sdk.workflow.models.misc_blocks.app", mock_app),
     ):
@@ -1312,7 +1298,7 @@ async def test_print_page_block_threads_resolved_id_to_all_sinks(tmp_path) -> No
         ),
         patch("skyvern.forge.sdk.workflow.models.misc_blocks.get_download_dir", side_effect=fake_get_download_dir),
         patch("skyvern.forge.sdk.workflow.models.misc_blocks.skyvern_context.current", return_value=ctx),
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
         patch("skyvern.forge.sdk.workflow.models.misc_blocks.app", mock_app),
     ):

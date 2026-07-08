@@ -423,7 +423,7 @@ def _patch_execute_environment(
         "update_step": AsyncMock(return_value=None),
     }
     monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", validate_code_block
+        "skyvern.forge.sdk.workflow.models.code_block.app.AGENT_FUNCTION.validate_code_block", validate_code_block
     )
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: context)
