@@ -140,18 +140,19 @@ claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/"
 3. When Claude Desktop opens the Skyvern installer preview, click **Install**.
 4. In the **Configure Skyvern** dialog, paste your Skyvern API key.
 5. Leave **Skyvern MCP URL** set to `https://api.skyvern.com/mcp/` unless you are connecting to a different deployment, then click **Save**.
+6. In Claude, ask: "Create a Skyvern browser session". A working setup returns a Skyvern browser session id.
 
 If double-clicking is blocked by your system, you can instead open **Claude Desktop > Settings > Extensions > Install Extension** and select the downloaded file manually.
 
 The bundle defaults to `https://api.skyvern.com/mcp/` and removes the separate Node.js requirement.
 
-**Linux, self-hosted, or advanced fallback (requires Node.js >= 20)**
+<Note>
+If Claude says Skyvern "needs authorization" or mentions OAuth, the API key is not configured. Open Claude Desktop **Settings -> Extensions -> Skyvern -> Configure**, paste your Skyvern API key, and save.
+</Note>
 
-Add this manual bridge to your Claude Desktop config file:
+**Linux manual config (requires Node.js >= 20)**
 
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Linux**: `~/.config/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+On Linux, add this manual bridge to `~/.config/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -169,7 +170,7 @@ Add this manual bridge to your Claude Desktop config file:
 }
 ```
 
-Use this fallback for Linux or any Claude Desktop setup where the one-click bundle is not available. It uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio and requires Node.js >= 20.
+Use this Linux path when the one-click bundle is not available on your platform. It uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio and requires Node.js >= 20.
 
 </Tab>
 <Tab title="Cursor">
