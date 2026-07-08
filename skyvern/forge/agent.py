@@ -3143,6 +3143,14 @@ class ForgeAgent:
                 verified=True,
             )
 
+        except SkyvernException:
+            # Expected transient failures (LLM response/scrape errors); the check re-runs next step.
+            LOG.warning(
+                "Failed to check user goal complete, skipping",
+                workflow_run_id=task.workflow_run_id,
+                exc_info=True,
+            )
+            return None
         except Exception:
             LOG.exception(
                 "Failed to check user goal complete, skipping",
