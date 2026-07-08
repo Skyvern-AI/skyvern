@@ -523,6 +523,7 @@ def _advisory_ctx() -> SimpleNamespace:
         author_time_gate_ablation_events=[],
         scouted_output_covered_paths=set(),
         composition_page_evidence=None,
+        latest_recorded_build_test_outcome=None,
     )
 
 
