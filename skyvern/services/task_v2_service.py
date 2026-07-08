@@ -1372,7 +1372,8 @@ async def handle_block_result(
         )
 
     elif block_result.status == BlockStatus.failed:
-        LOG.error(
+        # Run-level outcome, surfaced via the run's failure handling below; not a platform fault.
+        LOG.warning(
             f"Block with type {block.block_type} failed for workflow run {workflow_run_id}",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
