@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot import llm_config
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -257,7 +258,17 @@ def _copilot_turn_span(
         yield span
 
 
-def _resolve_request_policy_handler(llm_api_handler: Any) -> Any:
+async def _resolve_request_policy_handler(
+    llm_api_handler: LLMAPIHandler | None, workflow_permanent_id: str | None, organization_id: str | None
+) -> Any:
+    lite_handler = await llm_config.resolve_lite_copilot_handler(workflow_permanent_id, organization_id)
+    if lite_handler is not None:
+        return lite_handler
+    LOG.warning(
+        "copilot request policy lite handler unavailable, falling back to main handler",
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
     return llm_api_handler
 
 
@@ -269,7 +280,8 @@ class RequestPolicyGuardrailInputs:
     chat_history_messages: list[WorkflowCopilotChatHistoryMessage]
     global_llm_context: str
     organization_id: str
-    handler: Any
+    request_policy_handler: Any
+    turn_intent_handler: LLMAPIHandler | None
     previous_user_message: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
@@ -3647,7 +3659,7 @@ def _build_copilot_input_guardrails(
                 chat_history=policy_inputs.chat_history_messages,
                 global_llm_context=policy_inputs.global_llm_context,
                 organization_id=policy_inputs.organization_id,
-                handler=policy_inputs.handler,
+                handler=policy_inputs.request_policy_handler,
                 active_criteria=_stored_active_completion_criteria(policy_inputs),
                 config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
             )
@@ -3660,7 +3672,7 @@ def _build_copilot_input_guardrails(
                         chat_history=policy_inputs.chat_history_messages,
                         global_llm_context=policy_inputs.global_llm_context,
                         request_policy=policy,
-                        handler=policy_inputs.handler,
+                        handler=policy_inputs.turn_intent_handler,
                     )
                 _store_request_policy_on_context(
                     ctx,
@@ -4128,7 +4140,12 @@ async def _run_copilot_turn_impl(
         chat_history_messages=list(chat_history),
         global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
-        handler=_resolve_request_policy_handler(llm_api_handler),
+        request_policy_handler=await _resolve_request_policy_handler(
+            llm_api_handler,
+            chat_request.workflow_permanent_id,
+            organization_id,
+        ),
+        turn_intent_handler=llm_api_handler,
         previous_user_message=previous_user_message,
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,

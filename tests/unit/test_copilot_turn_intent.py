@@ -872,7 +872,8 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
         chat_history_messages=[],
         global_llm_context="",
         organization_id="org-1",
-        handler=None,
+        request_policy_handler=None,
+        turn_intent_handler=None,
         previous_user_message=None,
     )
 

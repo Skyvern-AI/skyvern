@@ -350,6 +350,7 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
     # COMMON

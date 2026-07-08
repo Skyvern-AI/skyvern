@@ -2385,7 +2385,7 @@ def _uncovered_output_reject_rescout_key(canonical_paths: set[str], structural_f
 def _active_uncovered_output_reject_paths(ctx: AgentContext) -> set[str]:
     canonical = {
         _canonical_output_path(path)
-        for path in author_time_reject_missing_output_paths(getattr(ctx, "latest_recorded_build_test_outcome", None))
+        for path in author_time_reject_missing_output_paths(ctx.latest_recorded_build_test_outcome)
     }
     return canonical & uncovered_requested_output_paths(ctx) if canonical else set()
 
