@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     record_scouted_output_coverage,
@@ -62,6 +63,8 @@ from ._shared import (
 from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
+
+_FILL_CARRY_RETRYABLE_VALIDATION_FAILURES = frozenset({"page_mismatch", "selector_absent_from_page_evidence"})
 
 
 def _mark_page_inspected(ctx: AgentContext) -> None:
@@ -109,6 +112,7 @@ def _consume_pending_browser_interaction_observation(
 
 
 _MAX_SCOUTED_INTERACTIONS = 60
+_FILL_CARRY_SELECTOR_COUNT_TIMEOUT_SECONDS = 2.0
 
 
 async def _live_working_page_url(ctx: AgentContext) -> str | None:
@@ -129,7 +133,14 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
 
 async def _capture_scout_source_url(ctx: AgentContext) -> None:
     # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
-    ctx.pending_scout_source_url = await _live_working_page_url(ctx)
+    source_url = await _live_working_page_url(ctx)
+    ctx.pending_scout_source_url = source_url
+    if not source_url or ctx.fill_carry_rebound_done or not ctx.prior_fill_carry:
+        return
+    page_evidence = await _scout_act_observe_page_evidence(ctx, url=source_url)
+    if page_evidence is None or not has_bounded_page_schema(page_evidence):
+        return
+    await rebind_prior_fill_carry_from_page_evidence(ctx, page_evidence=page_evidence, url=source_url)
 
 
 def _consume_scout_source_url(ctx: AgentContext) -> str | None:
@@ -370,6 +381,158 @@ def _record_scouted_interaction(
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
+
+
+def _page_evidence_has_selector(value: Any, selector: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("selector") == selector:
+            return True
+        return any(_page_evidence_has_selector(child, selector) for child in value.values())
+    if isinstance(value, list):
+        return any(_page_evidence_has_selector(child, selector) for child in value)
+    return False
+
+
+def _page_evidence_with_inputs_as_fields(page_evidence: dict[str, Any]) -> dict[str, Any]:
+    inputs = page_evidence.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        return page_evidence
+    fields: list[dict[str, Any]] = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            continue
+        field = dict(item)
+        selector = field.get("selector")
+        if isinstance(selector, str) and selector.startswith("input#"):
+            field["selector"] = f"#{selector.split('#', 1)[1]}"
+        fields.append(field)
+    if not fields:
+        return page_evidence
+    forms = page_evidence.get("forms")
+    normalized = dict(page_evidence)
+    normalized["forms"] = [*(forms if isinstance(forms, list) else []), {"fields": fields}]
+    return normalized
+
+
+async def _fill_carry_validation_failure(
+    ctx: AgentContext,
+    carry: FillCarry,
+    *,
+    page_evidence: dict[str, Any],
+    url: str,
+) -> str | None:
+    evidence_url = str(page_evidence.get("current_url") or page_evidence.get("inspected_url") or url).strip()
+    if not evidence_url or not _same_page_ignoring_fragment(carry.source_url, evidence_url):
+        return "page_mismatch"
+    count = await _selector_live_match_count(
+        ctx, carry.selector, timeout_seconds=_FILL_CARRY_SELECTOR_COUNT_TIMEOUT_SECONDS
+    )
+    if count != 1:
+        return "selector_count_mismatch"
+    selector_in_page_evidence = _page_evidence_has_selector(
+        _page_evidence_with_inputs_as_fields(page_evidence), carry.selector
+    )
+    if carry.role and carry.accessible_name:
+        role, accessible_name = await _resolve_scout_role_name(ctx, carry.selector)
+        if role != carry.role or accessible_name != carry.accessible_name:
+            return "role_name_mismatch"
+    elif not selector_in_page_evidence:
+        return "selector_absent_from_page_evidence"
+    return None
+
+
+def _fill_carry_to_interaction(carry: FillCarry, trajectory_index: int) -> ScoutedInteraction:
+    interaction: ScoutedInteraction = {
+        "tool_name": carry.tool_name,
+        "selector": carry.selector,
+        "source_url": carry.source_url,
+        "trajectory_index": trajectory_index,
+        "carried": True,
+    }
+    if carry.role:
+        interaction["role"] = carry.role
+    if carry.accessible_name:
+        interaction["accessible_name"] = carry.accessible_name
+    if carry.typed_length:
+        interaction["typed_length"] = carry.typed_length
+    if carry.tool_name == "type_text" and carry.typed_value:
+        interaction["typed_value"] = carry.typed_value
+    elif carry.tool_name == "select_option" and carry.value:
+        interaction["value"] = carry.value
+    elif carry.tool_name == "fill_credential_field":
+        interaction["credential_id"] = carry.credential_id
+        interaction["credential_field"] = carry.credential_field
+    return interaction
+
+
+async def _maybe_rebind_prior_fill_carry(
+    ctx: AgentContext,
+    *,
+    page_evidence: dict[str, Any],
+    url: str,
+) -> None:
+    if ctx.fill_carry_rebound_done:
+        return
+    prior = []
+    for raw in ctx.prior_fill_carry:
+        try:
+            prior.append(FillCarry.model_validate(raw))
+        except Exception:
+            continue
+    if not prior:
+        ctx.fill_carry_rebound_done = True
+        return
+    rebound: list[FillCarry] = []
+    for carry in prior:
+        failure = await _fill_carry_validation_failure(ctx, carry, page_evidence=page_evidence, url=url)
+        if failure is not None:
+            LOG.info(
+                "copilot_fill_carry_rebind_degraded",
+                reason=failure,
+                url=url,
+                source_url=carry.source_url,
+            )
+            if failure not in _FILL_CARRY_RETRYABLE_VALIDATION_FAILURES:
+                ctx.fill_carry_rebound_done = True
+            return
+        rebound.append(carry)
+    ctx.fill_carry_rebound_done = True
+    trajectory = list(ctx.scout_trajectory)
+    for carry in rebound:
+        trajectory.append(_fill_carry_to_interaction(carry, len(trajectory)))
+    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+    LOG.info(
+        "copilot_fill_carry_rebound",
+        url=url,
+        field_count=len(rebound),
+    )
+
+
+async def rebind_prior_fill_carry_from_current_page(ctx: AgentContext) -> bool:
+    if ctx.fill_carry_rebound_done or not ctx.prior_fill_carry:
+        return False
+    url = await _live_working_page_url(ctx)
+    if not url:
+        return False
+    page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+    if page_evidence is None or not has_bounded_page_schema(page_evidence):
+        return False
+    return await rebind_prior_fill_carry_from_page_evidence(ctx, page_evidence=page_evidence, url=url)
+
+
+async def rebind_prior_fill_carry_from_page_evidence(
+    ctx: AgentContext,
+    *,
+    page_evidence: dict[str, Any],
+    url: str,
+) -> bool:
+    if ctx.fill_carry_rebound_done or not ctx.prior_fill_carry:
+        return False
+    if not has_bounded_page_schema(page_evidence):
+        return False
+    trajectory_len = len(ctx.scout_trajectory)
+    await _maybe_rebind_prior_fill_carry(ctx, page_evidence=page_evidence, url=url)
+    return len(ctx.scout_trajectory) > trajectory_len
 
 
 _ACT_OBSERVE_TOOLS = frozenset({"click"})
@@ -1150,6 +1313,8 @@ async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, u
     if not isinstance(result.get("data"), dict):
         return
     page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+    if page_evidence is not None and has_bounded_page_schema(page_evidence):
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=page_evidence, url=url)
     acted = await _maybe_steer_evaluate_to_action(ctx, result, url=url, page_evidence=page_evidence)
     await _maybe_attach_reached_download_target(
         ctx, result, url=url, page_evidence=_EVIDENCE_UNSET if acted else page_evidence
