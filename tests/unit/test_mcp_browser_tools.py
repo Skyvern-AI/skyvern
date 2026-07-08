@@ -10,6 +10,7 @@ import pytest
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
 
 
@@ -148,6 +149,56 @@ async def test_skyvern_run_task_timeout_returns_timeout_code(monkeypatch: pytest
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
     assert "45" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_targeting_schema_prefers_direct_params() -> None:
+    tools_by_name = {tool.name: tool for tool in await mcp.list_tools()}
+    expectations = {
+        "skyvern_click": (("selector",), ("intent",)),
+        "skyvern_drag": (("source_selector", "target_selector"), ("source_intent", "target_intent")),
+        "skyvern_file_upload": (("selector",), ("intent",)),
+        "skyvern_hover": (("selector",), ("intent",)),
+        "skyvern_type": (("selector",), ("intent",)),
+        "skyvern_screenshot": (("selector",), ()),
+        "skyvern_scroll": (("selector",), ("intent",)),
+        "skyvern_select_option": (("selector",), ("intent",)),
+        "skyvern_press_key": (("selector",), ("intent",)),
+        "skyvern_wait": (("selector",), ("intent",)),
+        "skyvern_observe": (("selector",), ()),
+        "skyvern_frame_switch": (("selector",), ()),
+        "skyvern_execute": (("steps",), ()),
+        "skyvern_get_html": (("selector",), ()),
+        "skyvern_get_value": (("selector",), ()),
+        "skyvern_get_styles": (("selector",), ()),
+    }
+
+    for tool_name, (direct_params, intent_params) in expectations.items():
+        tool = tools_by_name[tool_name]
+        properties = tool.parameters["properties"]
+        ordered_property_names = list(properties)
+
+        for direct_param in direct_params:
+            assert mcp_browser.DIRECT_TARGET_DESCRIPTION in properties[direct_param]["description"]
+            assert ordered_property_names.index(direct_param) < ordered_property_names.index("session_id")
+            for intent_param in intent_params:
+                assert ordered_property_names.index(direct_param) < ordered_property_names.index(intent_param)
+
+        for intent_param in intent_params:
+            assert properties[intent_param]["description"] == mcp_browser.AI_FALLBACK_DESCRIPTION
+
+
+@pytest.mark.asyncio
+async def test_run_task_schema_description_demotes_autonomous_trial() -> None:
+    tools_by_name = {tool.name: tool for tool in await mcp.list_tools()}
+    description = tools_by_name["skyvern_run_task"].description or ""
+
+    assert "one-off autonomous trial" in description
+    assert "highest-cost AI path" in description
+    assert "Not for production or reusable automations" in description
+    assert "Prefer direct tools" in description
+    assert "selector/ref" in description
+    assert "skyvern_observe + skyvern_execute" in description
 
 
 def _click_page(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
