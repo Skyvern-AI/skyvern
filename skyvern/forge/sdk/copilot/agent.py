@@ -1012,6 +1012,16 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if is_optional_dismissal_only_trajectory(ctx.scout_trajectory):
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="optional_dismissal_only")
         return ""
+    fill_step_count = sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if str(interaction.get("tool_name") or "") in {"type_text", "select_option", "fill_credential_field"}
+    )
+    LOG.info(
+        "copilot_synthesis_input_fill_steps",
+        trajectory_len=len(ctx.scout_trajectory),
+        fill_step_count=fill_step_count,
+    )
     synthesized = synthesize_code_block(ctx.scout_trajectory, reached_download_target=ctx.reached_download_target)
     if synthesized is None:
         LOG.debug(
@@ -4259,6 +4269,7 @@ async def _run_copilot_turn_impl(
     ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
+    ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
