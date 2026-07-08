@@ -1064,7 +1064,8 @@ def _policy_inputs(snapshot: StoredCriteriaSnapshot | None) -> RequestPolicyGuar
         chat_history_messages=[],
         global_llm_context="",
         organization_id="org-1",
-        handler=None,
+        request_policy_handler=None,
+        turn_intent_handler=None,
         stored_completion_criteria=snapshot,
     )
 

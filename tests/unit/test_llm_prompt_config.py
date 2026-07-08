@@ -8,6 +8,7 @@ Verified contracts:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -41,6 +42,27 @@ def _make_log_recorder() -> tuple[MagicMock, list[tuple[str, dict[str, Any]]]]:
 # ---------------------------------------------------------------------------
 # get_llm_handler_for_prompt_type: no-config path
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prompt_type_config_uses_cached_posthog_methods(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(return_value="enabled"),
+        get_payload_cached=AsyncMock(return_value='{"workflow-copilot-lite": "OPENAI_GPT5_4_MINI"}'),
+        get_value=AsyncMock(side_effect=AssertionError("must use cached value lookup")),
+        get_payload=AsyncMock(side_effect=AssertionError("must use cached payload lookup")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+
+    config = await module.get_llm_config_by_prompt_type("wpid_1", "org_1")
+
+    assert config == {"workflow-copilot-lite": "OPENAI_GPT5_4_MINI"}
+    provider.get_value_cached.assert_awaited_once_with(
+        "LLM_CONFIG_BY_PROMPT_TYPE", "wpid_1", properties={"organization_id": "org_1"}
+    )
+    provider.get_payload_cached.assert_awaited_once_with(
+        "LLM_CONFIG_BY_PROMPT_TYPE", "wpid_1", properties={"organization_id": "org_1"}
+    )
 
 
 @pytest.mark.asyncio
