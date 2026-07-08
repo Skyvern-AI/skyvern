@@ -25,7 +25,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 
-_BLOCK_PATH = "skyvern.forge.sdk.workflow.models.block.app"
+_BLOCK_PATH = "skyvern.forge.sdk.workflow.models.code_block.app"
 _MANAGER_PATH = "skyvern.forge.sdk.artifact.manager.app"
 _SERVICE_PATH = "skyvern.forge.sdk.workflow.service.app"
 

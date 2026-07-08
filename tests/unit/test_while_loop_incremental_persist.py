@@ -31,7 +31,7 @@ async def test_persist_partial_while_loop_output_calls_db() -> None:
         loop_blocks=[inner],
         condition=JinjaBranchCriteria(expression="{{ false }}"),
     )
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app:
         mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
         await loop._persist_partial_loop_output("wr1", [[]], loop_idx=0)
     mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter.assert_awaited_once()

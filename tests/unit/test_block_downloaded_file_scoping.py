@@ -124,8 +124,7 @@ async def test_baseline_captured_when_loop_internal_state_is_none():
     mock_storage.get_downloaded_files = AsyncMock(return_value=[file1])
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
@@ -153,8 +152,7 @@ async def test_baseline_recaptured_when_set_by_previous_block():
     mock_storage.get_downloaded_files = AsyncMock(return_value=[file1, file2])
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_2")
@@ -183,8 +181,7 @@ async def test_baseline_recaptured_even_when_loop_set_it():
     )
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_2")
@@ -203,8 +200,7 @@ async def test_baseline_capture_degrades_on_timeout():
     mock_storage.get_downloaded_files = AsyncMock(side_effect=asyncio.TimeoutError)
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.STORAGE = mock_storage
         # Must not raise
@@ -225,8 +221,7 @@ async def test_stale_loop_baseline_overwritten_by_fresh_capture():
     mock_storage.get_downloaded_files = AsyncMock(return_value=[])
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
@@ -244,8 +239,7 @@ async def test_baseline_capture_degrades_on_generic_exception():
     mock_storage.get_downloaded_files = AsyncMock(side_effect=RuntimeError("S3 blip"))
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
     ):
         mock_app.STORAGE = mock_storage
         # Must not raise — baseline capture is best-effort
@@ -317,8 +311,7 @@ async def test_sibling_download_blocks_in_loop_iteration_scope_to_own_files():
 
     async def run_download_block(produced: FileInfo) -> list[FileInfo]:
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+            patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
         ):
             mock_app.STORAGE = mock_storage
             await capture_block_download_baseline(context, "org_1", "wr_test", "print")

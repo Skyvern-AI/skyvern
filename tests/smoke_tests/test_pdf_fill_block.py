@@ -79,7 +79,6 @@ def _install_context(monkeypatch: pytest.MonkeyPatch, values: dict[str, Any]) ->
     mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
     mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.app", mock_app)
-    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.app", mock_app)
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block_base.app", mock_app)
     return context
 

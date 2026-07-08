@@ -64,7 +64,7 @@ class TestDescriptionSkippedOnLoopIterations:
         block = _make_block()
 
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
             patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
@@ -80,7 +80,7 @@ class TestDescriptionSkippedOnLoopIterations:
         block = _make_block()
 
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
             patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
@@ -96,7 +96,7 @@ class TestDescriptionSkippedOnLoopIterations:
         block = _make_block()
 
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
             patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
@@ -112,7 +112,7 @@ class TestDescriptionSkippedOnLoopIterations:
         block = _make_block()
 
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block_base.app") as mock_app,
             patch.object(TaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):

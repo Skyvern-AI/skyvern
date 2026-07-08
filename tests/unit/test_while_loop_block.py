@@ -240,8 +240,8 @@ class TestExecuteTopOfLoopSemantics:
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new_callable=AsyncMock, return_value=False),
             patch.object(Block, "execute_safe", new_callable=AsyncMock) as mock_execute_safe,
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -277,8 +277,8 @@ class TestExecuteTopOfLoopSemantics:
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new=fake_eval),
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -328,8 +328,8 @@ class TestExecuteTopOfLoopSemantics:
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new=fake_eval),
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -371,11 +371,11 @@ class TestExecuteMaxIterationsCap:
 
         # Patch the cap to a small number so the test is fast.
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.DEFAULT_MAX_LOOP_ITERATIONS", 5),
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.DEFAULT_MAX_LOOP_ITERATIONS", 5),
             patch.object(WhileLoopBlock, "_evaluate_condition", new_callable=AsyncMock, return_value=True),
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -418,11 +418,11 @@ class TestExecuteMaxIterationsCap:
             return next(condition_results)
 
         with (
-            patch("skyvern.forge.sdk.workflow.models.block.DEFAULT_MAX_LOOP_ITERATIONS", 3),
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.DEFAULT_MAX_LOOP_ITERATIONS", 3),
             patch.object(WhileLoopBlock, "_evaluate_condition", new=fake_eval),
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -472,8 +472,8 @@ class TestCurrentIndexWrittenBeforeCondition:
 
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new=fake_eval),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -513,8 +513,8 @@ class TestWhileLoopJinjaCurrentIndexIntegration:
 
         with (
             patch.object(Block, "execute_safe", new_callable=AsyncMock) as mock_execute_safe,
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -541,8 +541,8 @@ class TestWhileLoopJinjaCurrentIndexIntegration:
 
         with (
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result) as mock_execute_safe,
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -571,8 +571,8 @@ class TestWhileLoopJinjaCurrentIndexIntegration:
 
         with (
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result) as mock_execute_safe,
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -600,8 +600,8 @@ class TestExecuteConditionRenderingErrors:
 
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new=raise_format_error),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -628,8 +628,8 @@ class TestExecuteConditionRenderingErrors:
 
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new=raise_missing),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -666,8 +666,8 @@ class TestExecuteCancellationPropagation:
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new_callable=AsyncMock, return_value=True),
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=canceled_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
@@ -703,7 +703,7 @@ class TestPromptCriteriaEvaluation:
         mock_context = MagicMock()
 
         with patch(
-            "skyvern.forge.sdk.workflow.models.block._evaluate_prompt_branch_conditions_batch",
+            "skyvern.forge.sdk.workflow.models.control_flow_blocks._evaluate_prompt_branch_conditions_batch",
             new_callable=AsyncMock,
         ) as mock_batch:
             mock_batch.return_value = ([True], ["dates on the page are still recent"], "goal", {})

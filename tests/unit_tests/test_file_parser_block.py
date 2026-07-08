@@ -183,7 +183,7 @@ class TestFileParserBlock:
         with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
             mock_llm.return_value = mock_response
 
-            with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
+            with patch("skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt") as mock_prompt:
                 mock_prompt.return_value = "mocked prompt"
 
                 result = await file_parser_block._extract_with_ai([{"name": "John"}, {"name": "Jane"}], MagicMock())
@@ -201,7 +201,7 @@ class TestFileParserBlock:
         with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
             mock_llm.return_value = mock_response
 
-            with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
+            with patch("skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt") as mock_prompt:
                 mock_prompt.return_value = "mocked prompt"
 
                 result = await file_parser_block._extract_with_ai("Some text content", MagicMock())

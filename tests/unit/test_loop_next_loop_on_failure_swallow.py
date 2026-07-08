@@ -145,7 +145,7 @@ class TestForLoopParentNextLoopOnFailureSwallowsLastIterationFailure:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -196,7 +196,7 @@ class TestForLoopParentNextLoopOnFailureSwallowsLastIterationFailure:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -252,7 +252,7 @@ class TestForLoopInnerNextLoopOnFailureSwallowsLastIterationFailure:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -307,7 +307,7 @@ class TestForLoopWithoutFlagsStillTerminatesOnBodyFailure:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -363,7 +363,7 @@ class TestWhileLoopParentNextLoopOnFailureSwallowsLastIterationFailure:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -421,7 +421,7 @@ class TestLoopBlockSwallowPathClearsFailureReason:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -473,7 +473,7 @@ class TestLoopBlockSwallowPathClearsFailureReason:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(
@@ -543,7 +543,7 @@ class TestSyntheticSafetyLimitNotSwallowedByNextLoopOnFailure:
             ),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
             patch.object(Block, "build_block_result", side_effect=fake_build_block_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
             await loop_block.execute(

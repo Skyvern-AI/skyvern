@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import skyvern.forge.sdk.workflow.models.block as block_module
+import skyvern.forge.sdk.workflow.models.block_base as block_module
 from skyvern.exceptions import ConditionalBranchEvaluationError
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.block import (

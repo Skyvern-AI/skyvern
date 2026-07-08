@@ -18,7 +18,7 @@ from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, LoopBlo
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 
-INTERVAL_PATCH = "skyvern.forge.sdk.workflow.models.block.PERSIST_LOOP_OUTPUT_INTERVAL"
+INTERVAL_PATCH = "skyvern.forge.sdk.workflow.models.control_flow_blocks.PERSIST_LOOP_OUTPUT_INTERVAL"
 
 
 def _make_output_param(label: str) -> OutputParameter:
@@ -71,7 +71,7 @@ class TestExecuteCallsRecordOnceAtEnd:
             patch.object(ForLoopBlock, "execute_loop_helper", new_callable=AsyncMock, return_value=loop_result),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
             patch.object(Block, "build_block_result", new_callable=AsyncMock, return_value=final_result),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
         ):
             mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
 
@@ -116,8 +116,8 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
             patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock) as mock_record,
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
@@ -166,8 +166,8 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
             patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
@@ -207,8 +207,8 @@ class TestExecuteLoopHelperPersistsToDbDirectly:
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
             patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
@@ -252,8 +252,8 @@ class TestIncrementalPersistFailureResilience:
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
             patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
@@ -305,8 +305,8 @@ class TestIncrementalPersistFailureResilience:
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
             patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
@@ -356,8 +356,8 @@ class TestPersistIntervalBatching:
             patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
             patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
             patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
-            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.skyvern_context") as mock_skyvern_ctx,
         ):
             mock_skyvern_ctx.current.return_value = None
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
@@ -389,7 +389,7 @@ class TestPersistIntervalBatching:
 
         mock_db_upsert = AsyncMock()
 
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.control_flow_blocks.app") as mock_app:
             mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = mock_db_upsert
 
             await loop_block._persist_partial_loop_output(
