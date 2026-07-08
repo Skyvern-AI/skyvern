@@ -39,7 +39,12 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
-from skyvern.forge.sdk.copilot.runtime import AgentContext, output_contract_ladder_unresolved
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    AuthorTimeGateAblationPayload,
+    output_contract_ladder_unresolved,
+    record_author_time_gate_ablation_event,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
@@ -1662,6 +1667,26 @@ def _recorded_outcome_grounding_signal(ctx: AgentContext, tool_name: str) -> Cop
     if maybe_satisfy_recorded_outcome_grounding_requirement(ctx):
         return None
     if not recorded_outcome_grounding_requires_current_page(ctx):
+        return None
+    requirement = ctx.recorded_outcome_grounding_requirement
+    if requirement is None:
+        return None
+    payload: AuthorTimeGateAblationPayload = {
+        "phase": requirement.phase,
+        "outcome_reason_code": requirement.reason_code,
+        "workflow_run_id": requirement.workflow_run_id,
+        "block_labels": list(requirement.block_labels),
+        "required_tool": requirement.required_tool,
+        "required_target_url": requirement.required_target_url,
+    }
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id="recorded_outcome_grounding",
+        reason_code="recorded_outcome_grounding_required",
+        fingerprint=requirement.structural_key,
+        blocked_tool=tool_name,
+        payload=payload,
+    ):
         return None
     return CopilotToolBlockerSignal(
         blocker_kind="missing_required_context",
