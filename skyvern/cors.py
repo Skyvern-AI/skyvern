@@ -25,3 +25,11 @@ def credentialed_cors_allow_origins(allowed_origins: Sequence[str]) -> list[str]
         )
 
     return credentialed_origins
+
+
+def credentialed_cors_allow_origin_regex(allowed_origin_regex: str | None) -> str | None:
+    if allowed_origin_regex is None:
+        return None
+
+    stripped_origin_regex = allowed_origin_regex.strip()
+    return stripped_origin_regex or None

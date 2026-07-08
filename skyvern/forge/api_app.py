@@ -26,7 +26,7 @@ from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
 from skyvern.config import _ensure_sqlite_dir, settings
-from skyvern.cors import credentialed_cors_allow_origins
+from skyvern.cors import credentialed_cors_allow_origin_regex, credentialed_cors_allow_origins
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
@@ -64,6 +64,7 @@ def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_origin_regex=credentialed_cors_allow_origin_regex(settings.ALLOWED_ORIGIN_REGEX),
     )
 
 

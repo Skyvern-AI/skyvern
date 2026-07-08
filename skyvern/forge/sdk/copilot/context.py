@@ -592,6 +592,9 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
+    delivered_unverified_terminal: bool = False
+    delivered_unverified_workflow_run_id: str | None = None
+    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=dict)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
