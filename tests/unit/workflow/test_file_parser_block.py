@@ -360,11 +360,11 @@ class TestExtractWithAiSerialization:
         with pytest.MonkeyPatch.context() as mp:
             mock_handler = AsyncMock(return_value={})
             mp.setattr(
-                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                "skyvern.forge.sdk.workflow.models.parser_blocks.LLMAPIHandlerFactory.get_override_llm_api_handler",
                 lambda *a, **kw: mock_handler,
             )
             mock_load = MagicMock(return_value="prompt")
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt", mock_load)
 
             await block._extract_with_ai(records, MagicMock())
 
@@ -382,11 +382,11 @@ class TestExtractWithAiSerialization:
         with pytest.MonkeyPatch.context() as mp:
             mock_handler = AsyncMock(return_value={})
             mp.setattr(
-                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                "skyvern.forge.sdk.workflow.models.parser_blocks.LLMAPIHandlerFactory.get_override_llm_api_handler",
                 lambda *a, **kw: mock_handler,
             )
             mock_load = MagicMock(return_value="prompt")
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt", mock_load)
 
             await block._extract_with_ai("Hello\nWorld", MagicMock())
 
@@ -401,11 +401,11 @@ class TestExtractWithAiSchemaValidation:
     @staticmethod
     def _patch_prompt_and_handler(mp: pytest.MonkeyPatch, handler: AsyncMock, prompt: str = "base prompt") -> None:
         mp.setattr(
-            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            "skyvern.forge.sdk.workflow.models.parser_blocks.LLMAPIHandlerFactory.get_override_llm_api_handler",
             lambda *a, **kw: handler,
         )
         mp.setattr(
-            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            "skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt",
             MagicMock(return_value=prompt),
         )
 
@@ -556,12 +556,14 @@ class TestPDFParserSchemaValidation:
         mp.setattr(PDFParserBlock, "record_output_parameter_value", record_output_parameter_value)
         mp.setattr(PDFParserBlock, "build_block_result", fake_build_block_result)
         mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value="/tmp/test.pdf"))
-        mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", MagicMock(return_value="name\nAlice"))
         mp.setattr(
-            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            "skyvern.forge.sdk.workflow.models.parser_blocks.extract_pdf_file", MagicMock(return_value="name\nAlice")
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt",
             MagicMock(return_value="base prompt"),
         )
-        mp.setattr("skyvern.forge.sdk.workflow.models.block.app.LLM_API_HANDLER", handler)
+        mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.app.LLM_API_HANDLER", handler)
         return record_output_parameter_value
 
     async def test_execute_retries_schema_validation_without_prevalidation_coercion(self) -> None:
@@ -603,11 +605,11 @@ class TestOcrPdfPages:
     @staticmethod
     def _patch_handler(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
         mp.setattr(
-            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            "skyvern.forge.sdk.workflow.models.parser_blocks.LLMAPIHandlerFactory.get_override_llm_api_handler",
             lambda *a, **kw: handler,
         )
         mp.setattr(
-            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            "skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt",
             MagicMock(return_value="prompt"),
         )
 
@@ -749,8 +751,8 @@ class TestOcrPdfPages:
             handler = AsyncMock(side_effect=fake_handler)
             self._patch_handler(mp, handler)
             # Each page chunk counts as 10 tokens; a 15-token budget admits only the first page.
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.count_tokens", lambda text: 10)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.MAX_FILE_PARSE_INPUT_TOKENS", 15)
 
             result = await block._ocr_pdf_pages([b"page-1", b"page-2", b"page-3"])
 
@@ -768,9 +770,9 @@ class TestOcrPdfPages:
         with pytest.MonkeyPatch.context() as mp:
             handler = AsyncMock(side_effect=fake_handler)
             self._patch_handler(mp, handler)
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "")
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.extract_pdf_file", lambda *a, **kw: "")
             mp.setattr(
-                "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+                "skyvern.forge.sdk.workflow.models.parser_blocks.render_pdf_pages_as_images",
                 lambda *a, **kw: [b"A", b"B"],
             )
 

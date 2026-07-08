@@ -335,8 +335,8 @@ class TestParseZipContents:
 
         block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.count_tokens", lambda text: 10)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.MAX_FILE_PARSE_INPUT_TOKENS", 15)
             entries = await block._parse_zip_contents(
                 [self._file_info(first, tmp_path), self._file_info(second, tmp_path)]
             )
@@ -357,8 +357,8 @@ class TestParseZipContents:
 
         block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 100)
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.count_tokens", lambda text: 100)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.MAX_FILE_PARSE_INPUT_TOKENS", 15)
             with pytest.raises(InvalidFileType, match="alone exceeds the maximum extraction input size"):
                 await block._parse_zip_contents([self._file_info(csv_path, tmp_path)])
 
@@ -429,11 +429,11 @@ class TestExecuteWithZipAndLocalPaths:
             record_output = self._patch_execute_dependencies(mp, tmp_path)
             mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
             mp.setattr(
-                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                "skyvern.forge.sdk.workflow.models.parser_blocks.LLMAPIHandlerFactory.get_override_llm_api_handler",
                 lambda *a, **kw: AsyncMock(return_value={"answer": 42}),
             )
             mock_load = MagicMock(return_value="prompt")
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+            mp.setattr("skyvern.forge.sdk.workflow.models.parser_blocks.prompt_engine.load_prompt", mock_load)
 
             result = await block.execute("wr_test", "wrb_test", organization_id="org-1")
 

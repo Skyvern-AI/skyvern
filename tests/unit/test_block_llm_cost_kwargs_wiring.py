@@ -11,7 +11,12 @@ import pathlib
 _MODELS_DIR = pathlib.Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "sdk" / "workflow" / "models"
 # _generate_workflow_run_block_description lives in block_base.py (Block base class);
 # the other five methods live in block.py.
-BLOCK_MODEL_FILES = (_MODELS_DIR / "block.py", _MODELS_DIR / "block_base.py")
+BLOCK_MODEL_FILES = (
+    _MODELS_DIR / "block.py",
+    _MODELS_DIR / "block_base.py",
+    _MODELS_DIR / "code_block.py",
+    _MODELS_DIR / "parser_blocks.py",
+)
 
 # Methods that make block-scoped LLM calls. Each must pass
 # workflow_run_block_id= and organization_id= to any LLM handler call

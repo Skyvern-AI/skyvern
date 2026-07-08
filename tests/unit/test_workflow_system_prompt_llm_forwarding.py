@@ -296,7 +296,7 @@ def test_text_prompt_block_forwards_system_prompt(monkeypatch) -> None:
 
 
 def test_file_parser_block_forwards_system_prompt(monkeypatch) -> None:
-    from skyvern.forge.sdk.workflow.models import block as block_module
+    from skyvern.forge.sdk.workflow.models import parser_blocks as block_module
 
     captured: dict = {}
 
@@ -329,7 +329,7 @@ def test_file_parser_block_forwards_system_prompt(monkeypatch) -> None:
 
 
 def test_pdf_parser_block_forwards_system_prompt(monkeypatch) -> None:
-    from skyvern.forge.sdk.workflow.models import block as block_module
+    from skyvern.forge.sdk.workflow.models import parser_blocks as block_module
 
     captured: dict = {}
 
