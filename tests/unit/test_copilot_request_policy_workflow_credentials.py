@@ -8,7 +8,14 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import CredentialCheck, StructuredContext
-from skyvern.forge.sdk.copilot.request_policy import _workflow_credential_inputs_unbound, build_request_policy
+from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_DEFERRED_DRAFT_REASONS,
+    CREDENTIAL_PROMPT_CLARIFICATION_REASONS,
+    RequestPolicy,
+    _workflow_credential_inputs_unbound,
+    build_request_policy,
+    credential_prompt_reason,
+)
 
 
 def _yaml(body: str) -> str:
@@ -337,6 +344,81 @@ async def test_fallback_code_block_generic_one_time_code_does_not_skip_run() -> 
     assert policy.allow_run_blocks is True
     assert policy.allow_missing_credentials_in_draft is False
     assert policy.testing_intent == "unspecified"
+
+
+def test_credential_prompt_clarification_reasons_membership() -> None:
+    assert CREDENTIAL_PROMPT_CLARIFICATION_REASONS == {
+        "raw_secret",
+        "credential_name_unresolved",
+        "credential_invention_requested",
+        "workflow_credential_inputs_unbound",
+    }
+
+
+def test_credential_deferred_draft_reasons_is_narrower_than_prompt_reasons() -> None:
+    assert CREDENTIAL_DEFERRED_DRAFT_REASONS < CREDENTIAL_PROMPT_CLARIFICATION_REASONS
+
+
+def test_credential_prompt_reason_typed_reason_wins_over_deferred_draft_flag() -> None:
+    policy = RequestPolicy(clarification_reason="credential_name_unresolved", allow_missing_credentials_in_draft=True)
+    assert credential_prompt_reason(policy, None) == "credential_name_unresolved"
+
+
+def test_credential_prompt_reason_deferred_draft_when_reason_cleared_but_flag_set() -> None:
+    # Mirrors the explicit-defer path (_apply_explicit_code_block_credential_draft_policy),
+    # which clears clarification_reason to "none" while leaving both flags set.
+    policy = RequestPolicy(
+        clarification_reason="none",
+        allow_missing_credentials_in_draft=True,
+        credential_draft_deferred_explicitly=True,
+    )
+    assert credential_prompt_reason(policy, None) == "credential_deferred_draft"
+
+
+def test_credential_prompt_reason_ignores_generic_skip_test_with_no_credential_signal() -> None:
+    # allow_missing_credentials_in_draft alone also fires for the generic skip_test
+    # fallthrough (any "draft only, don't test" turn), independent of credentials;
+    # only credential_draft_deferred_explicitly means a credential was really deferred.
+    policy = RequestPolicy(
+        testing_intent="skip_test",
+        clarification_reason="none",
+        allow_missing_credentials_in_draft=True,
+        credential_draft_deferred_explicitly=False,
+    )
+    assert credential_prompt_reason(policy, None) is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_code_block_login_block_ban_surfaces_credential_prompt_end_to_end() -> None:
+    policy = await build_request_policy(
+        user_message="Write this as a code block. Do not create a login block for this part.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="o_test",
+        handler=None,
+    )
+    assert policy.credential_input_kind == "none"
+    assert policy.testing_intent == "skip_test"
+    assert credential_prompt_reason(policy, None) == "credential_deferred_draft"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Add it at https://app.skyvern.com/credentials.",
+        "ADD IT AT HTTPS://APP.SKYVERN.COM/CREDENTIALS.",
+        "Store it in the Credentials UI first.",
+        "store it in the CREDENTIALS UI first.",
+    ],
+)
+def test_credential_prompt_reason_marker_fallback_is_case_insensitive(text: str) -> None:
+    assert credential_prompt_reason(None, text) == "assistant_directed"
+
+
+def test_credential_prompt_reason_policy_none_is_safe() -> None:
+    assert credential_prompt_reason(None, None) is None
+    assert credential_prompt_reason(None, "Everything is set, no action needed.") is None
 
 
 @pytest.mark.asyncio

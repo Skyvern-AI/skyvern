@@ -136,6 +136,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
     build_request_policy,
+    credential_prompt_reason,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
@@ -1524,6 +1525,11 @@ def _make_agent_result(
             payload_updates["proposalDisposition"] = proposal_disposition
         if turn_outcome is not None and "responseKind" not in narrative_payload:
             payload_updates["responseKind"] = turn_outcome.response_kind.value
+        if "credentialPrompt" not in narrative_payload:
+            policy = ctx.request_policy if ctx is not None else None
+            reason = credential_prompt_reason(policy, kwargs.get("user_response"))
+            if reason:
+                payload_updates["credentialPrompt"] = {"reason": reason}
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
             payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
         if ctx is not None and "outcomeAdjudication" not in narrative_payload:
