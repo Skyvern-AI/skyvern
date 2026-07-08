@@ -364,7 +364,8 @@ async def resolve_org_from_api_key(
             else:
                 normalized_api_key, normalization_flags = _normalize_api_key_with_flags(x_api_key)
             api_key_debug_fields = _get_api_key_debug_fields(x_api_key, normalized_api_key, normalization_flags)
-            LOG.error(
+            # Malformed client key rejected with 403 — a client error, not a server fault.
+            LOG.warning(
                 "Error decoding JWT",
                 error_type=type(exc).__name__,
                 error_reason=_get_safe_auth_error_reason(exc),

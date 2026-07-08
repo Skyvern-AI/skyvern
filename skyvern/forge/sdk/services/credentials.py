@@ -10,6 +10,39 @@ LOG = structlog.get_logger()
 
 _SECRET_QUERY_PATTERN = re.compile(r"(?i)(?:^|[?&])secret=([^&#]+)")
 
+# 1Password's Python SDK forwards generic 5xx upstream failures as plain Exceptions
+# whose stringified message embeds the HTTP status.
+_ONEPASSWORD_UPSTREAM_5XX_PATTERN = re.compile(
+    r"(?i)"
+    r"(?:\b(?:HTTP|status(?:\s+code)?|code|response)\s*[:=]?\s*(5\d{2})\b)"
+    r"|"
+    r"(?:\b(5\d{2})\s+(?:service\s+unavailable|bad\s+gateway|gateway\s+timeout|internal\s+server\s+error)\b)"
+)
+_ONEPASSWORD_CREDENTIAL_ERROR_PATTERN = re.compile(
+    r"(?i)"
+    r"(?:\b(?:unauthorized|forbidden|not\s+authenticated|authentication\s+failed)\b)"
+    r"|"
+    r"(?:\b(?:invalid|expired|malformed|parse(?:d)?)\b.{0,48}\b(?:token|credential|service\s+account)\b)"
+    r"|"
+    r"(?:\b(?:token|credential|service\s+account)\b.{0,48}\b(?:invalid|expired|malformed|not\s+valid|parse(?:d)?)\b)"
+)
+
+
+def extract_onepassword_upstream_5xx_status(message: str) -> int | None:
+    """Return the upstream 5xx HTTP status embedded in a 1Password SDK error message, if any.
+
+    A match means the failure originated on 1Password's side.
+    """
+    match = _ONEPASSWORD_UPSTREAM_5XX_PATTERN.search(message)
+    if not match:
+        return None
+    status_digits = match.group(1) or match.group(2)
+    return int(status_digits) if status_digits else None
+
+
+def is_onepassword_credential_error(message: str) -> bool:
+    return bool(_ONEPASSWORD_CREDENTIAL_ERROR_PATTERN.search(message))
+
 
 class OnePasswordConstants(StrEnum):
     """Constants for 1Password integration."""

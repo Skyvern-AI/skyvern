@@ -40,6 +40,7 @@ import pyotp
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
 from onepassword.client import Client as OnePasswordClient
+from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
 from skyvern.exceptions import HttpException as SkyvernHttpException
@@ -115,6 +116,8 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import Crede
 from skyvern.forge.sdk.services.credentials import (
     AuthenticatorTotpErrorCode,
     AuthenticatorTotpParseResult,
+    extract_onepassword_upstream_5xx_status,
+    is_onepassword_credential_error,
     normalize_totp_config,
     parse_totp_config,
 )
@@ -2323,14 +2326,72 @@ async def list_onepassword_items(
                 )
 
         return OnePasswordItemsResponse(configured=True, items=items)
-    except Exception as e:
-        LOG.error(
-            "Failed to list 1Password items",
+    except asyncio.TimeoutError as e:
+        LOG.warning(
+            "Timed out while listing 1Password items",
             organization_id=current_org.organization_id,
-            error=str(e),
             exc_info=True,
         )
-        raise HTTPException(status_code=502, detail="Failed to list 1Password items") from e
+        raise HTTPException(
+            status_code=502,
+            detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+        ) from e
+    except RateLimitExceededException as e:
+        LOG.warning(
+            "1Password rate limit exceeded while listing items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="1Password rate limit exceeded. Please retry in a few minutes.",
+        ) from e
+    except DesktopSessionExpiredException as e:
+        LOG.warning(
+            "1Password session expired while listing items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Your 1Password session appears to be expired. Please update your token in Settings and try again."
+            ),
+        ) from e
+    except Exception as e:
+        raw = str(e)
+        # The 1Password SDK exposes these as plain string exceptions; credential
+        # evidence takes precedence over embedded status text.
+        if is_onepassword_credential_error(raw):
+            LOG.warning(
+                "Invalid 1Password service account token while listing items",
+                organization_id=current_org.organization_id,
+                error=raw,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Your 1Password service account token appears to be invalid or expired. "
+                    "Please update it in Settings and try again."
+                ),
+            ) from e
+        upstream_status = extract_onepassword_upstream_5xx_status(raw)
+        if upstream_status is not None:
+            LOG.warning(
+                "1Password is temporarily unavailable while listing items",
+                organization_id=current_org.organization_id,
+                upstream_status=upstream_status,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+            ) from e
+        LOG.error(
+            "Unexpected failure while listing 1Password items",
+            organization_id=current_org.organization_id,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to list 1Password items.") from e
 
 
 @base_router.get(
