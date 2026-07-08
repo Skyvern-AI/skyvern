@@ -224,13 +224,45 @@ function anchorViewportToNode(node: AppNode, deps: FocusBlockDeps): void {
 }
 
 /**
+ * Returns the labels of loop/conditional container ancestors of `targetNodeId`,
+ * ordered root→leaf (outermost first), so callers can expand them in order.
+ * Only `loop` and `conditional` RF node types are containers; other parents
+ * (e.g. a block's own sub-group nodes) are skipped without being collected.
+ */
+export function resolveContainerAncestorLabels(
+  nodes: Array<AppNode>,
+  targetNodeId: string,
+): Array<string> {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const labels: Array<string> = [];
+  const visited = new Set<string>();
+  let current = byId.get(targetNodeId);
+  while (current && current.parentId && !visited.has(current.id)) {
+    visited.add(current.id);
+    const parent = byId.get(current.parentId);
+    if (!parent) break;
+    if (parent.type === "loop" || parent.type === "conditional") {
+      const label = isWorkflowBlockNode(parent) ? parent.data.label : null;
+      if (label) {
+        labels.unshift(label);
+      }
+    }
+    current = parent;
+  }
+  return labels;
+}
+
+/**
  * Selects the block (which the selected-block URL sync mirrors into
  * `?selected-block=`), reveals its inline editor, and top-anchors the
  * viewport on it at the current zoom. A target hidden inside inactive
  * conditional branches is first revealed level by level (root→leaf): focus
  * the conditional, switch it to the target's branch, wait for the visibility
- * cascade + re-layout to settle, then continue. Returns false when the node
- * no longer exists or is not a workflow block.
+ * cascade + re-layout to settle, then continue. If the target is still hidden
+ * after branch resolution (collapsed loop/conditional ancestor), every
+ * container ancestor is expanded and a second settle is awaited before
+ * anchoring. Returns false when the node no longer exists or is not a workflow
+ * block.
  */
 export async function focusBlockTarget(
   nodeId: string,
@@ -255,6 +287,24 @@ export async function focusBlockTarget(
     }
     deps.switchBranch(conditionalId, branchId);
     await deps.waitForSettle(nodeId);
+  }
+
+  const afterBranches = findNode(nodeId);
+  if (!afterBranches || !isWorkflowBlockNode(afterBranches)) {
+    return false;
+  }
+
+  if (afterBranches.hidden) {
+    const ancestorLabels = resolveContainerAncestorLabels(
+      deps.getNodes(),
+      nodeId,
+    );
+    if (ancestorLabels.length > 0) {
+      for (const label of ancestorLabels) {
+        deps.expandBlock(label);
+      }
+      await deps.waitForSettle(nodeId);
+    }
   }
 
   const settled = findNode(nodeId);
