@@ -1574,7 +1574,7 @@ def _recorded_outcome_convergence_reject(
         return None
     if candidate_signature == latest.authored_structure_signature:
         return _ConvergenceReject(candidate_signature, "identical_authored_structure", False)
-    constraint = ctx.recorded_outcome_binding_constraint
+    constraint = getattr(ctx, "recorded_outcome_binding_constraint", None)
     if not isinstance(constraint, RecordedOutcomeBindingConstraint):
         return None
     # An author-time reject re-keys `latest` without an executed run, so keep the binding
