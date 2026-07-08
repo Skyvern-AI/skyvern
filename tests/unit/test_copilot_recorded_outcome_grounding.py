@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import _recorded_build_test_outcome_prompt
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -81,6 +82,11 @@ workflow_definition:
     code: |
       return {"records": [{"npi": "123"}]}
 """
+
+
+@pytest.fixture(autouse=True)
+def _disable_author_time_gate_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", False)
 
 
 def _outcome(**updates: object) -> RecordedBuildTestOutcome:
@@ -188,6 +194,29 @@ def test_repeated_authoritative_outcome_arms_grounding_before_repair_ceiling() -
     assert requirement.required_target_url == "current_page"
     assert requirement.workflow_run_id == "wr_123"
     assert ctx.blocker_signal is None
+
+
+def test_log_only_recorded_outcome_grounding_records_without_stashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    result = _tool_loop_error(ctx, "update_workflow")
+
+    assert result is None
+    assert ctx.blocker_signal is None
+    assert ctx.latest_tool_blocker_signal is None
+    assert ctx.turn_halt is None
+    event = ctx.author_time_gate_ablation_events[-1]
+    assert event.gate_id == "recorded_outcome_grounding"
+    assert event.reason_code == "recorded_outcome_grounding_required"
+    assert event.blocked_tool == "update_workflow"
+    assert event.fingerprint == outcome.structural_key
+    assert event.log_only is True
 
 
 def test_authoritative_persisted_outcome_arms_without_recorded_signature_prefix(
