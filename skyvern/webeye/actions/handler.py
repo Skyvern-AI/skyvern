@@ -6831,6 +6831,10 @@ async def select_from_dropdown(
         return single_select_result
 
 
+def _no_element_matched_failure(value: str, reason: str) -> ActionFailure:
+    return ActionFailure(NoElementMatchedForTargetOption(target=value, reason=reason))
+
+
 @traced(name="skyvern.agent.dropdown.select_by_value")
 async def select_from_dropdown_by_value(
     value: str,
@@ -6864,7 +6868,7 @@ async def select_from_dropdown_by_value(
         )
 
     if not dropdown_menu_element:
-        raise NoElementMatchedForTargetOption(target=value, reason="No value matched")
+        return _no_element_matched_failure(value=value, reason="No value matched")
 
     potential_scrollable_element = await try_to_find_potential_scrollable_element(
         skyvern_element=dropdown_menu_element,
@@ -6873,8 +6877,9 @@ async def select_from_dropdown_by_value(
         step=step,
     )
     if not await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
-        raise NoElementMatchedForTargetOption(
-            target=value, reason="No value matched and element can't scroll to find more options"
+        return _no_element_matched_failure(
+            value=value,
+            reason="No value matched and element can't scroll to find more options",
         )
 
     selected: bool = False
@@ -6909,7 +6914,7 @@ async def select_from_dropdown_by_value(
     if selected:
         return ActionSuccess()
 
-    raise NoElementMatchedForTargetOption(target=value, reason="No value matched after scrolling")
+    return _no_element_matched_failure(value=value, reason="No value matched after scrolling")
 
 
 async def locate_dropdown_menu(

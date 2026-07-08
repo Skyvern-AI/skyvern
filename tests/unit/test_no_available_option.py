@@ -10,6 +10,7 @@ import pytest
 
 from skyvern.exceptions import (
     NoAvailableOptionFoundForCustomSelection,
+    NoElementMatchedForTargetOption,
     NoIncrementalElementFoundForCustomSelection,
 )
 from skyvern.forge.agent_functions import AgentFunction
@@ -100,6 +101,17 @@ class _FakeIncrementalScrapePage:
 
     async def get_incremental_element_tree(self, *_args: object, **_kwargs: object) -> list[dict]:
         return self._element_trees.pop(0)
+
+
+class _FakeValueFallbackScrapePage:
+    def __init__(self) -> None:
+        self.get_incremental_element_tree = AsyncMock(return_value=[])
+        self.select_one_element_by_value = AsyncMock(return_value=None)
+
+
+class _FakeDropdownMenuElement:
+    def __init__(self) -> None:
+        self.get_element_handler = AsyncMock(return_value=MagicMock())
 
 
 def _task() -> object:
@@ -1203,3 +1215,75 @@ class TestNoMatchExceptionForDropdown:
         )
         assert isinstance(exc, NoAvailableOptionFoundForCustomSelection)
         assert exc.observed_options_count == 2
+
+
+class TestSelectFromDropdownByValueNoMatch:
+    @pytest.mark.asyncio
+    async def test_returns_failure_when_no_dropdown_menu_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=None))
+
+        result = await handler.select_from_dropdown_by_value(
+            value="Missing",
+            page=MagicMock(),
+            skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+            skyvern_frame=MagicMock(),
+            dom=MagicMock(),
+            incremental_scraped=_FakeValueFallbackScrapePage(),  # type: ignore[arg-type]
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert isinstance(result, handler.ActionFailure)
+        assert result.exception_type == NoElementMatchedForTargetOption.__name__
+        assert "No value matched" in (result.exception_message or "")
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_when_dropdown_cannot_scroll(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        dropdown_menu = _FakeDropdownMenuElement()
+        skyvern_frame = MagicMock()
+        skyvern_frame.get_element_scrollable = AsyncMock(return_value=False)
+
+        monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=dropdown_menu))
+        monkeypatch.setattr(handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=dropdown_menu))
+
+        result = await handler.select_from_dropdown_by_value(
+            value="Missing",
+            page=MagicMock(),
+            skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+            skyvern_frame=skyvern_frame,
+            dom=MagicMock(),
+            incremental_scraped=_FakeValueFallbackScrapePage(),  # type: ignore[arg-type]
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert isinstance(result, handler.ActionFailure)
+        assert result.exception_type == NoElementMatchedForTargetOption.__name__
+        assert "can't scroll" in (result.exception_message or "")
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_after_scrolling_without_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        dropdown_menu = _FakeDropdownMenuElement()
+        skyvern_frame = MagicMock()
+        skyvern_frame.get_element_scrollable = AsyncMock(return_value=True)
+        scroll_down_to_load_all_options = AsyncMock()
+
+        monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=dropdown_menu))
+        monkeypatch.setattr(handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=dropdown_menu))
+        monkeypatch.setattr(handler, "scroll_down_to_load_all_options", scroll_down_to_load_all_options)
+
+        result = await handler.select_from_dropdown_by_value(
+            value="Missing",
+            page=MagicMock(),
+            skyvern_element=_FakeAnchorElement(),  # type: ignore[arg-type]
+            skyvern_frame=skyvern_frame,
+            dom=MagicMock(),
+            incremental_scraped=_FakeValueFallbackScrapePage(),  # type: ignore[arg-type]
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert isinstance(result, handler.ActionFailure)
+        assert result.exception_type == NoElementMatchedForTargetOption.__name__
+        assert "after scrolling" in (result.exception_message or "")
+        scroll_down_to_load_all_options.assert_awaited_once()
