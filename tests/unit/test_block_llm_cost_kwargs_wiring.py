@@ -8,9 +8,10 @@ from __future__ import annotations
 import ast
 import pathlib
 
-BLOCK_PY = (
-    pathlib.Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "sdk" / "workflow" / "models" / "block.py"
-)
+_MODELS_DIR = pathlib.Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "sdk" / "workflow" / "models"
+# _generate_workflow_run_block_description lives in block_base.py (Block base class);
+# the other five methods live in block.py.
+BLOCK_MODEL_FILES = (_MODELS_DIR / "block.py", _MODELS_DIR / "block_base.py")
 
 # Methods that make block-scoped LLM calls. Each must pass
 # workflow_run_block_id= and organization_id= to any LLM handler call
@@ -60,12 +61,12 @@ def _kwarg_names(call: ast.Call) -> set[str]:
 
 
 def test_every_block_scoped_llm_call_passes_both_cost_attribution_kwargs() -> None:
-    tree = ast.parse(BLOCK_PY.read_text())
+    nodes = [node for path in BLOCK_MODEL_FILES for node in ast.walk(ast.parse(path.read_text()))]
 
     offenders: list[str] = []
     methods_with_calls: set[str] = set()
 
-    for node in ast.walk(tree):
+    for node in nodes:
         if not isinstance(node, ast.AsyncFunctionDef):
             continue
         if node.name not in BLOCK_ATTRIBUTED_METHODS:

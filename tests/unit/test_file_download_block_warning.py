@@ -31,7 +31,7 @@ def test_threshold_constant_is_five() -> None:
 @pytest.mark.parametrize("configured", [1, 2, 3, 4])
 def test_warning_fires_below_threshold(configured: int) -> None:
     block = _make_block(configured)
-    with patch("skyvern.forge.sdk.workflow.models.block.LOG") as mock_log:
+    with patch("skyvern.forge.sdk.workflow.models.block_base.LOG") as mock_log:
         warn_if_file_download_max_steps_low(block, workflow_run_id="wr_test")
     assert mock_log.warning.call_count == 1
     _, kwargs = mock_log.warning.call_args
@@ -44,7 +44,7 @@ def test_warning_fires_below_threshold(configured: int) -> None:
 @pytest.mark.parametrize("configured", [5, 6, 10, 25])
 def test_warning_does_not_fire_at_or_above_threshold(configured: int) -> None:
     block = _make_block(configured)
-    with patch("skyvern.forge.sdk.workflow.models.block.LOG") as mock_log:
+    with patch("skyvern.forge.sdk.workflow.models.block_base.LOG") as mock_log:
         warn_if_file_download_max_steps_low(block, workflow_run_id="wr_test")
     assert mock_log.warning.call_count == 0
 
@@ -52,6 +52,6 @@ def test_warning_does_not_fire_at_or_above_threshold(configured: int) -> None:
 def test_warning_does_not_fire_when_max_steps_unset() -> None:
     """max_steps_per_run=None means the org-level default applies — not a misconfiguration signal."""
     block = _make_block(None)
-    with patch("skyvern.forge.sdk.workflow.models.block.LOG") as mock_log:
+    with patch("skyvern.forge.sdk.workflow.models.block_base.LOG") as mock_log:
         warn_if_file_download_max_steps_low(block, workflow_run_id="wr_test")
     assert mock_log.warning.call_count == 0

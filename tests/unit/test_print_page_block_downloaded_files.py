@@ -10,6 +10,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models import block_base as block_base_module
 from skyvern.forge.sdk.workflow.models.block import PrintPageBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
@@ -95,6 +96,7 @@ async def test_print_page_block_includes_downloaded_files_in_output(
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(block_base_module, "app", fake_app)
 
     block = PrintPageBlock(
         label="print",
@@ -179,6 +181,7 @@ async def test_print_page_block_filters_downloads_to_current_loop_iteration(
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(block_base_module, "app", fake_app)
 
     block = PrintPageBlock(
         label="print",
@@ -234,6 +237,7 @@ async def test_print_page_block_tolerates_save_failure(
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(block_base_module, "app", fake_app)
 
     block = PrintPageBlock(label="print", output_parameter=_output_parameter("print_out"))
     monkeypatch.setattr(
@@ -310,6 +314,7 @@ async def test_print_page_block_excludes_files_downloaded_by_prior_block(
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(block_base_module, "app", fake_app)
 
     block = PrintPageBlock(label="print", output_parameter=_output_parameter("print_out"))
     monkeypatch.setattr(

@@ -123,7 +123,10 @@ async def test_baseline_captured_when_loop_internal_state_is_none():
     mock_storage = AsyncMock()
     mock_storage.get_downloaded_files = AsyncMock(return_value=[file1])
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+    ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
 
@@ -149,7 +152,10 @@ async def test_baseline_recaptured_when_set_by_previous_block():
     mock_storage = AsyncMock()
     mock_storage.get_downloaded_files = AsyncMock(return_value=[file1, file2])
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+    ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_2")
 
@@ -176,7 +182,10 @@ async def test_baseline_recaptured_even_when_loop_set_it():
         return_value=[_make_file_info("s3://a.pdf", "a.pdf", "abc"), sibling_file]
     )
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+    ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_2")
 
@@ -193,7 +202,10 @@ async def test_baseline_capture_degrades_on_timeout():
     mock_storage = AsyncMock()
     mock_storage.get_downloaded_files = AsyncMock(side_effect=asyncio.TimeoutError)
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+    ):
         mock_app.STORAGE = mock_storage
         # Must not raise
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
@@ -212,7 +224,10 @@ async def test_stale_loop_baseline_overwritten_by_fresh_capture():
     mock_storage = AsyncMock()
     mock_storage.get_downloaded_files = AsyncMock(return_value=[])
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+    ):
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
 
@@ -228,7 +243,10 @@ async def test_baseline_capture_degrades_on_generic_exception():
     mock_storage = AsyncMock()
     mock_storage.get_downloaded_files = AsyncMock(side_effect=RuntimeError("S3 blip"))
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+    ):
         mock_app.STORAGE = mock_storage
         # Must not raise — baseline capture is best-effort
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
@@ -298,7 +316,10 @@ async def test_sibling_download_blocks_in_loop_iteration_scope_to_own_files():
     mock_storage.get_downloaded_files = AsyncMock(side_effect=lambda **_: list(run_files))
 
     async def run_download_block(produced: FileInfo) -> list[FileInfo]:
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block_base.app", mock_app),
+        ):
             mock_app.STORAGE = mock_storage
             await capture_block_download_baseline(context, "org_1", "wr_test", "print")
         run_files.append(produced)
