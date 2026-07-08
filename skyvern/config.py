@@ -205,6 +205,7 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.

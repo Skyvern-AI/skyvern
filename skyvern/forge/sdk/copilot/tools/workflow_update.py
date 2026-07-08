@@ -113,7 +113,14 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestedOutputEvidenceSource,
     _coerce_requested_output_evidence_source,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction, output_contract_ladder_unresolved
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    AuthorTimeGateAblationPayload,
+    ScoutedInteraction,
+    copilot_author_time_gate_log_only_enabled,
+    output_contract_ladder_unresolved,
+    record_author_time_gate_ablation_event,
+)
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
     SchemaIncompatibility,
@@ -1775,6 +1782,8 @@ _MAX_OUTPUT_CONTRACT_REJECTS = 4
 _MAX_OUTPUT_CONTRACT_DEFERRALS = 3
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
 _OUTPUT_CONTRACT_PAGE_EXTRACT_VAR = "output_contract_page_values"
+_OUTPUT_CONTRACT_ABLATION_GATE_ID = "output_contract_actuation"
+_METADATA_PREFLIGHT_ABLATION_GATE_ID = "metadata_run_preflight_reject"
 
 
 @dataclass(frozen=True)
@@ -1801,6 +1810,37 @@ class _OutputContractEvaluation:
             or self.missing_return_paths
             or self.shape_violations
         )
+
+
+def _record_output_contract_ablation_event(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    gate_id: str,
+    blocked_tool: str,
+    fingerprint: str,
+) -> bool:
+    reason_code = str(
+        evaluation.payload.get("reason_code") or evaluation.reason_code or _OUTPUT_CONTRACT_REJECT_REASON_CODE
+    )
+    payload: AuthorTimeGateAblationPayload = {
+        "block_label": evaluation.block_label,
+        "canonical_output_contract_signature": evaluation.canonical_signature,
+        "canonical_required_child_paths": sorted(evaluation.required_paths),
+        "missing_metadata_paths": list(evaluation.missing_metadata_paths),
+        "missing_schema_paths": list(evaluation.missing_schema_paths),
+        "missing_return_paths": list(evaluation.missing_return_paths),
+        "shape_violations": list(evaluation.shape_violations),
+        "can_attempt_run": evaluation.can_attempt_run,
+    }
+    return record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=gate_id,
+        reason_code=reason_code,
+        fingerprint=fingerprint,
+        blocked_tool=blocked_tool,
+        payload=payload,
+    )
 
 
 @dataclass(frozen=True)
@@ -3267,6 +3307,23 @@ def _stash_output_source_unobservable_terminal(
 ) -> None:
     if ctx.turn_halt is not None:
         return
+    payload: AuthorTimeGateAblationPayload = {
+        "block_label": block_label,
+        "canonical_output_contract_signature": signature,
+        "canonical_required_child_paths": sorted(required_paths),
+        "spine_split_blockers": list(blockers),
+    }
+    if copilot_author_time_gate_log_only_enabled() and ctx.output_contract_bail_actuated_this_call:
+        return
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+        reason_code=reason_code,
+        fingerprint=signature,
+        blocked_tool="update_workflow",
+        payload=payload,
+    ):
+        return
     signal = build_output_source_unobservable_blocker_signal(
         reason_code=reason_code,
         required_paths=required_paths,
@@ -3482,7 +3539,24 @@ def _actuate_output_contract_bail(
     )
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN and not _run_authority_permits_dispatch(ctx):
         actuation = OutputContractActuation(OutputContractActuationKind.STRUCTURE_DIRECTIVE, actuation.family)
+    payload: AuthorTimeGateAblationPayload = {
+        "actuation_kind": actuation.kind.value,
+        "family": actuation.family.value,
+        "blockers": list(blockers),
+        "canonical_required_child_paths": sorted(required_paths),
+        "advisory_state": evidence.advisory_state.value,
+        "advisory_run_grantable": evidence.advisory_run_grantable,
+    }
     ctx.output_contract_bail_actuated_this_call = True
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+        reason_code=actuation.reason_code or actuation.kind.value,
+        fingerprint=current_fingerprint,
+        blocked_tool="update_workflow",
+        payload=payload,
+    ):
+        return actuation
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
         _grant_output_contract_advisory_run(ctx, signature)
     elif actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE and not evidence.prior_directive_unconsumed:
@@ -3616,6 +3690,8 @@ def _impose_output_contract_envelope_after_steering(
                 return workflow_yaml, raw_code_artifact_metadata, False
             if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
                 return workflow_yaml, raw_code_artifact_metadata, False
+            if copilot_author_time_gate_log_only_enabled():
+                return workflow_yaml, raw_code_artifact_metadata, False
             attempt_key = _output_contract_spine_directive_attempt_key(
                 signature=signature, block_label=label, workflow_yaml=workflow_yaml
             )
@@ -3730,18 +3806,25 @@ def _metadata_contract_run_preflight_reject(
     )
     if evaluation is None or not evaluation.has_deficiencies:
         return None
+    authored_fingerprint = _output_contract_structural_fingerprint(workflow_yaml, evaluation.canonical_signature)
     advisory_granted = _output_contract_advisory_granted(ctx, evaluation.canonical_signature)
     # A granted advisory must arm run-output evidence before the grant is consumed, even when the
     # workflow is otherwise run-attemptable — otherwise the dispatched run records no evidence.
     if evaluation.can_attempt_run and not advisory_granted:
         return None
+    if _record_output_contract_ablation_event(
+        ctx,
+        evaluation,
+        gate_id=_METADATA_PREFLIGHT_ABLATION_GATE_ID,
+        blocked_tool="update_and_run_blocks",
+        fingerprint=authored_fingerprint,
+    ):
+        return None
     payload = _record_output_contract_reject(
         ctx,
         evaluation,
         summary="Submitted workflow does not satisfy the requested output contract before run.",
-        authored_structural_fingerprint=_output_contract_structural_fingerprint(
-            workflow_yaml, evaluation.canonical_signature
-        ),
+        authored_structural_fingerprint=authored_fingerprint,
         workflow_yaml=workflow_yaml,
     )
     if advisory_granted:
@@ -8118,27 +8201,35 @@ async def _update_workflow(
         and output_contract_evaluation.has_deficiencies
         and not output_contract_static_advisory_allowed
     ):
-        payload = _record_output_contract_reject(
+        authored_fingerprint = _output_contract_structural_fingerprint(
+            workflow_yaml, output_contract_evaluation.canonical_signature
+        )
+        if not _record_output_contract_ablation_event(
             ctx,
             output_contract_evaluation,
-            summary="Submitted workflow does not satisfy the requested output contract.",
-            authored_structural_fingerprint=_output_contract_structural_fingerprint(
-                workflow_yaml, output_contract_evaluation.canonical_signature
-            ),
-            workflow_yaml=workflow_yaml,
-        )
-        reject_result = _output_contract_reject_result(
-            output_contract_evaluation,
-            payload=payload,
-            tool_name="update_workflow",
-        )
-        return reject(
-            error=str(reject_result["error"]),
-            user_facing_summary=str(reject_result.get("user_facing_summary") or _compiled_authoring_user_summary()),
-            data=reject_result.get("data") if isinstance(reject_result.get("data"), dict) else None,
-            repair_context=output_contract_evaluation.repair_context,
-            record_repair_context_outcome=False,
-        )
+            gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+            blocked_tool="update_workflow",
+            fingerprint=authored_fingerprint,
+        ):
+            payload = _record_output_contract_reject(
+                ctx,
+                output_contract_evaluation,
+                summary="Submitted workflow does not satisfy the requested output contract.",
+                authored_structural_fingerprint=authored_fingerprint,
+                workflow_yaml=workflow_yaml,
+            )
+            reject_result = _output_contract_reject_result(
+                output_contract_evaluation,
+                payload=payload,
+                tool_name="update_workflow",
+            )
+            return reject(
+                error=str(reject_result["error"]),
+                user_facing_summary=str(reject_result.get("user_facing_summary") or _compiled_authoring_user_summary()),
+                data=reject_result.get("data") if isinstance(reject_result.get("data"), dict) else None,
+                repair_context=output_contract_evaluation.repair_context,
+                record_repair_context_outcome=False,
+            )
     missing_metadata_error = _missing_code_artifact_metadata_error(
         workflow_yaml,
         ctx,

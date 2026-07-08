@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
@@ -65,6 +66,16 @@ CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
+AuthorTimeGateAblationPayloadValue: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | Sequence["AuthorTimeGateAblationPayloadValue"]
+    | dict[str, "AuthorTimeGateAblationPayloadValue"]
+)
+AuthorTimeGateAblationPayload: TypeAlias = dict[str, AuthorTimeGateAblationPayloadValue]
 SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
@@ -142,6 +153,16 @@ class RegisteredArtifactEntry:
 class RegisteredArtifactEvidence:
     entries: tuple[RegisteredArtifactEntry, ...]
     workflow_run_id: str
+
+
+@dataclass(frozen=True)
+class AuthorTimeGateAblationEvent:
+    gate_id: str
+    reason_code: str
+    fingerprint: str
+    log_only: bool
+    blocked_tool: str | None = None
+    payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
 
 
 class ScoutedInteraction(TypedDict):
@@ -423,6 +444,43 @@ class AgentContext:
     # extraction_schema declares fields that map to no output the block produces.
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
+    author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
+
+
+def copilot_author_time_gate_log_only_enabled() -> bool:
+    return not settings.is_cloud_environment() and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+
+
+def record_author_time_gate_ablation_event(
+    ctx: AgentContext,
+    *,
+    gate_id: str,
+    reason_code: str,
+    fingerprint: str,
+    blocked_tool: str | None = None,
+    payload: AuthorTimeGateAblationPayload | None = None,
+) -> bool:
+    if not copilot_author_time_gate_log_only_enabled():
+        return False
+    event = AuthorTimeGateAblationEvent(
+        gate_id=gate_id,
+        reason_code=reason_code,
+        fingerprint=fingerprint,
+        blocked_tool=blocked_tool,
+        payload=dict(payload or {}),
+        log_only=True,
+    )
+    ctx.author_time_gate_ablation_events.append(event)
+    LOG.info(
+        "copilot_author_time_gate_ablation_event",
+        gate_id=event.gate_id,
+        reason_code=event.reason_code,
+        fingerprint=event.fingerprint,
+        blocked_tool=event.blocked_tool,
+        log_only=event.log_only,
+        payload=event.payload,
+    )
+    return True
 
 
 def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:

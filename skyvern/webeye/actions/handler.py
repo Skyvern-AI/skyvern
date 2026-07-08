@@ -61,6 +61,7 @@ from skyvern.exceptions import (
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
     PhoneNumberInputMismatch,
+    SkyvernException,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -3748,6 +3749,12 @@ async def handle_select_option_action(
             return results
         suggested_value = result.value
 
+    except SkyvernException as e:
+        # Expected selection outcomes on non-standard dropdowns (no matching option,
+        # no incremental elements); recorded as ActionFailure like any other miss.
+        LOG.warning("Custom select error", exc_info=True)
+        results.append(ActionFailure(exception=e))
+        return results
     except Exception as e:
         LOG.exception("Custom select error")
         results.append(ActionFailure(exception=e))
