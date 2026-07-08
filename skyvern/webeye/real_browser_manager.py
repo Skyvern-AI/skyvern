@@ -301,6 +301,7 @@ class RealBrowserManager(BrowserManager):
                 await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
+                    organization_id=task.organization_id,
                 )
 
         self.pages[task.task_id] = browser_state
@@ -470,6 +471,7 @@ class RealBrowserManager(BrowserManager):
                 await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
+                    organization_id=workflow_run.organization_id,
                 )
 
         self.pages[workflow_run_id] = browser_state
