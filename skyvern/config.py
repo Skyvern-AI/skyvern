@@ -353,6 +353,7 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096

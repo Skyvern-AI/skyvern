@@ -92,6 +92,7 @@ class ForgeApp:
     WORKFLOW_COPILOT_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_COPILOT_FAST_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_LITE_LLM_API_HANDLER: LLMAPIHandler | None
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -273,6 +274,11 @@ def create_forge_app() -> ForgeApp:
         LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_FAST_LLM_KEY)
         if settings.WORKFLOW_COPILOT_FAST_LLM_KEY
         else app.SECONDARY_LLM_API_HANDLER
+    )
+    app.WORKFLOW_COPILOT_LITE_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_LITE_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_LITE_LLM_KEY
+        else None
     )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
