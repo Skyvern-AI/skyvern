@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, unquote, urlparse
@@ -17,9 +18,20 @@ from yarl import URL
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
-from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime, SkyvernHTTPException
 from skyvern.forge import app
-from skyvern.utils.url_validators import encode_url
+from skyvern.forge.sdk.core.aiohttp_helper import (
+    SSRFGuardedResolver,
+    ssrf_guarded_tcp_connector,
+    strip_cross_origin_redirect_credentials,
+    validate_and_pin_fetch_url,
+    validate_and_pin_redirect_url,
+)
+from skyvern.utils.url_validators import (
+    MAX_SAFE_REDIRECTS,
+    SAFE_REDIRECT_STATUS_CODES,
+    encode_url,
+)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -209,70 +221,93 @@ async def download_file(
                 LOG.info("Downloading file from local file system", url=url)
                 return local_path
 
-        async with aiohttp.ClientSession(raise_for_status=True) as session:
+        resolver = SSRFGuardedResolver()
+        current_url = await validate_and_pin_fetch_url(url, resolver)
+        request_headers = dict(headers or {})
+        async with aiohttp.ClientSession(
+            raise_for_status=True, connector=ssrf_guarded_tcp_connector(resolver)
+        ) as session:
             LOG.info("Starting to download file", url=url)
-            encoded_url = encode_url(url)
-            async with session.get(URL(encoded_url, encoded=True), headers=headers) as response:
-                # Check the content length if available
-                if max_size_mb and response.content_length and response.content_length > max_size_mb * 1024 * 1024:
-                    # todo: move to root exception.py
-                    raise DownloadFileMaxSizeExceeded(max_size_mb)
+            for _ in range(MAX_SAFE_REDIRECTS + 1):
+                encoded_url = encode_url(current_url)
+                async with session.get(
+                    URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
+                ) as response:
+                    if response.status in SAFE_REDIRECT_STATUS_CODES and response.headers.get("Location"):
+                        next_url = await validate_and_pin_redirect_url(
+                            current_url, response.headers["Location"], resolver
+                        )
+                        request_headers, _ = strip_cross_origin_redirect_credentials(
+                            request_headers, None, current_url, next_url
+                        )
+                        current_url = next_url
+                        continue
 
-                # Get the file name
-                if output_dir:
-                    download_dir_path = Path(output_dir)
-                    download_dir_path.mkdir(parents=True, exist_ok=True)
-                else:
-                    download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
+                    # Check the content length if available
+                    if max_size_mb and response.content_length and response.content_length > max_size_mb * 1024 * 1024:
+                        # todo: move to root exception.py
+                        raise DownloadFileMaxSizeExceeded(max_size_mb)
 
-                download_dir_resolved = download_dir_path.resolve()
-                # response.headers stays a CIMultiDictProxy: dict() would make header
-                # lookups case-sensitive and miss lowercase wire headers.
-                file_name = _determine_download_filename(filename, response.headers, url)
-                allowed_dir = os.path.realpath(download_dir_resolved)
-                resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
-                # sanitize_filename strips separators but keeps dots, so a dots-only name can
-                # still resolve outside the download dir; require a direct child. Checked
-                # before streaming so a rejected name downloads zero bytes.
-                if (
-                    resolved_final_path == allowed_dir
-                    or not resolved_final_path.startswith(allowed_dir + os.sep)
-                    or os.path.dirname(resolved_final_path) != allowed_dir
-                ):
-                    raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
-                final_path = Path(resolved_final_path)
+                    # Get the file name
+                    if output_dir:
+                        download_dir_path = Path(output_dir)
+                        download_dir_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        download_dir_path = Path(make_temp_directory(prefix="skyvern_downloads_"))
 
-                temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
-                file_path = Path(temp_file.name).resolve()
-                if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
-                    temp_file.close()
-                    raise ValueError("Unsafe temporary file path created for download")
+                    download_dir_resolved = download_dir_path.resolve()
+                    # response.headers stays a CIMultiDictProxy: dict() would make header
+                    # lookups case-sensitive and miss lowercase wire headers.
+                    file_name = _determine_download_filename(filename, response.headers, url)
+                    allowed_dir = os.path.realpath(download_dir_resolved)
+                    resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
+                    # sanitize_filename strips separators but keeps dots, so a dots-only name can
+                    # still resolve outside the download dir; require a direct child. Checked
+                    # before streaming so a rejected name downloads zero bytes.
+                    if (
+                        resolved_final_path == allowed_dir
+                        or not resolved_final_path.startswith(allowed_dir + os.sep)
+                        or os.path.dirname(resolved_final_path) != allowed_dir
+                    ):
+                        raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                    final_path = Path(resolved_final_path)
 
-                LOG.info("Downloading file to temporary path", file_path=str(file_path))
-                try:
-                    with temp_file as f:
-                        # Write the content of the request into the file
-                        total_bytes_downloaded = 0
-                        async for chunk in response.content.iter_chunked(1024):
-                            f.write(chunk)
-                            total_bytes_downloaded += len(chunk)
-                            if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
-                                raise DownloadFileMaxSizeExceeded(max_size_mb)
+                    temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
+                    file_path = Path(temp_file.name).resolve()
+                    if file_path != download_dir_resolved and not file_path.is_relative_to(download_dir_resolved):
+                        temp_file.close()
+                        raise ValueError("Unsafe temporary file path created for download")
 
-                    file_path.replace(final_path)
-                except BaseException:
-                    # An orphaned temp file in a run download dir would get synced to storage
-                    # under the tmpXXXX name; drop it on any failure (incl. cancellation).
-                    file_path.unlink(missing_ok=True)
-                    raise
+                    LOG.info("Downloading file to temporary path", file_path=str(file_path))
+                    try:
+                        with temp_file as f:
+                            # Write the content of the request into the file
+                            total_bytes_downloaded = 0
+                            async for chunk in response.content.iter_chunked(1024):
+                                f.write(chunk)
+                                total_bytes_downloaded += len(chunk)
+                                if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
+                                    raise DownloadFileMaxSizeExceeded(max_size_mb)
 
-                LOG.info(f"File downloaded successfully to {final_path}")
-                return str(final_path)
+                        file_path.replace(final_path)
+                    except BaseException:
+                        # An orphaned temp file in a run download dir would get synced to storage
+                        # under the tmpXXXX name; drop it on any failure (incl. cancellation).
+                        file_path.unlink(missing_ok=True)
+                        raise
+
+                    LOG.info(f"File downloaded successfully to {final_path}")
+                    return str(final_path)
+            raise SkyvernHTTPException(
+                message=f"Too many redirects while downloading file: {current_url}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
     except aiohttp.ClientResponseError as e:
-        LOG.exception(f"Failed to download file, status code: {e.status}")
+        # Re-raised and handled at the action/block boundary; server rejections are external.
+        LOG.warning(f"Failed to download file, status code: {e.status}", exc_info=True)
         raise
     except DownloadFileMaxSizeExceeded as e:
-        LOG.exception(f"Failed to download file, max size exceeded: {e.max_size}")
+        LOG.warning(f"Failed to download file, max size exceeded: {e.max_size}", exc_info=True)
         raise
     except PermissionError as e:
         LOG.warning(
@@ -281,6 +316,10 @@ async def download_file(
             organization_id=organization_id,
             reason=str(e),
         )
+        raise
+    except aiohttp.InvalidURL:
+        # Malformed customer-provided URL - a client-data error, not a platform fault.
+        LOG.warning("Failed to download file, invalid URL", exc_info=True)
         raise
     except Exception:
         LOG.exception("Failed to download file")

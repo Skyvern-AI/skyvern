@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
     run_outcome_display_reason,
 )
+from skyvern.forge.sdk.copilot.runtime import AuthorTimeGateAblationPayload, record_author_time_gate_ablation_event
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
@@ -2384,7 +2385,7 @@ def _uncovered_output_reject_rescout_key(canonical_paths: set[str], structural_f
 def _active_uncovered_output_reject_paths(ctx: AgentContext) -> set[str]:
     canonical = {
         _canonical_output_path(path)
-        for path in author_time_reject_missing_output_paths(ctx.latest_recorded_build_test_outcome)
+        for path in author_time_reject_missing_output_paths(getattr(ctx, "latest_recorded_build_test_outcome", None))
     }
     return canonical & uncovered_requested_output_paths(ctx) if canonical else set()
 
@@ -2424,6 +2425,19 @@ def uncovered_output_reject_scout_steer_signal(ctx: AgentContext, tool_name: str
         return None
     key = _uncovered_output_reject_rescout_key(active, latest.structural_failure_identity)
     if ctx.uncovered_output_rescout_steer_key == key:
+        return None
+    payload: AuthorTimeGateAblationPayload = {
+        "uncovered_output_paths": sorted(active),
+        "structural_failure_identity": latest.structural_failure_identity,
+    }
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id="uncovered_output_rescout_steer",
+        reason_code=UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
+        fingerprint=key,
+        blocked_tool=tool_name,
+        payload=payload,
+    ):
         return None
     ctx.uncovered_output_rescout_steer_key = key
     named_paths = ", ".join(sorted(active))
