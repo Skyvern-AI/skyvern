@@ -5776,7 +5776,7 @@ wheels = [
 
 [[package]]
 name = "skyvern"
-version = "1.0.46"
+version = "1.0.45"
 source = { editable = "." }
 dependencies = [
     { name = "cachetools" },
