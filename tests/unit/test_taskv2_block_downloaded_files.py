@@ -11,8 +11,8 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
-from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models import block_base as block_base_module
+from skyvern.forge.sdk.workflow.models import misc_blocks as block_module
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 

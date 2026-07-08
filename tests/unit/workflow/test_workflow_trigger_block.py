@@ -17,8 +17,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     PayloadTemplateRenderError,
     PayloadTemplateSyntaxError,
 )
+from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.block import (
-    _JSON_TYPE_MARKER,
     FailedToFormatJinjaStyleParameter,
     WorkflowTriggerBlock,
     jinja_sandbox_env,
@@ -323,7 +323,7 @@ class TestCheckTriggerDepth:
         block = _make_block()
         mock_run = MagicMock()
         mock_run.parent_workflow_run_id = None
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=mock_run)
             depth = await block._check_trigger_depth("wr_current")
         assert depth == 0
@@ -336,7 +336,7 @@ class TestCheckTriggerDepth:
         run_no_parent = MagicMock()
         run_no_parent.parent_workflow_run_id = None
 
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=[run_with_parent, run_no_parent])
             depth = await block._check_trigger_depth("wr_current")
         assert depth == 1
@@ -350,7 +350,7 @@ class TestCheckTriggerDepth:
             run.parent_workflow_run_id = f"wr_parent_{i}" if i < block.MAX_TRIGGER_DEPTH else None
             runs.append(run)
 
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=runs)
             with pytest.raises(InvalidWorkflowDefinition, match="depth exceeds maximum"):
                 await block._check_trigger_depth("wr_current")
@@ -364,7 +364,7 @@ class TestCheckTriggerDepth:
             run.parent_workflow_run_id = f"wr_parent_{i}" if i < block.MAX_TRIGGER_DEPTH - 1 else None
             runs.append(run)
 
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=runs)
             depth = await block._check_trigger_depth("wr_current")
         assert depth == block.MAX_TRIGGER_DEPTH - 1
@@ -372,7 +372,7 @@ class TestCheckTriggerDepth:
     @pytest.mark.asyncio
     async def test_run_not_found_returns_zero(self) -> None:
         block = _make_block()
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
             depth = await block._check_trigger_depth("wr_nonexistent")
         assert depth == 0
@@ -437,7 +437,7 @@ async def test_sync_trigger_preserves_parent_feature_flag_summary(monkeypatch: p
     monkeypatch.setattr(WorkflowTriggerBlock, "build_block_result", AsyncMock(return_value=MagicMock()))
 
     try:
-        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+        with patch("skyvern.forge.sdk.workflow.models.misc_blocks.app") as mock_app:
             mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
             mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(side_effect=_setup_workflow_run)
             mock_app.WORKFLOW_SERVICE.execute_workflow = AsyncMock(side_effect=_execute_workflow)

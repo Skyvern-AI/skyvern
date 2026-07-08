@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
-from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models import misc_blocks as block_module
 from skyvern.forge.sdk.workflow.models.block import (
     SECRET_RESPONSE_BODY_REDACTED,
     HttpRequestBlock,

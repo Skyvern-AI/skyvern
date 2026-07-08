@@ -16,6 +16,7 @@ BLOCK_MODEL_FILES = (
     _MODELS_DIR / "block_base.py",
     _MODELS_DIR / "code_block.py",
     _MODELS_DIR / "parser_blocks.py",
+    _MODELS_DIR / "misc_blocks.py",
 )
 
 # Methods that make block-scoped LLM calls. Each must pass

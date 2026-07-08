@@ -11,7 +11,7 @@ import pytest
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
-from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models import misc_blocks as block_module
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 

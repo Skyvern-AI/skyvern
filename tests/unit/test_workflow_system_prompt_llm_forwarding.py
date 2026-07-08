@@ -250,7 +250,7 @@ def test_extraction_cache_key_changes_with_system_prompt() -> None:
 
 
 def test_text_prompt_block_forwards_system_prompt(monkeypatch) -> None:
-    from skyvern.forge.sdk.workflow.models import block as block_module
+    from skyvern.forge.sdk.workflow.models import misc_blocks as block_module
 
     captured: dict = {}
 
