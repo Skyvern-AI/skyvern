@@ -173,6 +173,10 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import {
+  useDiscoverCopilotPromptRecovery,
+  withoutDiscoverViaParam,
+} from "../discoverCopilotHandoff";
+import {
   initialEditorAutoOpenState,
   shouldAutoOpenEditor,
 } from "./editorAutoOpen";
@@ -365,23 +369,39 @@ function Workspace({
   );
   const location = useLocation();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
     copilotFixOrigin?: unknown;
   } | null;
-  const initialCopilotMessage =
+  const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
       : null;
+  const { storedInitialCopilotMessage, clearStoredInitialCopilotMessage } =
+    useDiscoverCopilotPromptRecovery({
+      shouldRead: searchParams.get("via") === "discover",
+      workflowPermanentId,
+    });
+  const initialCopilotMessage = useMemo(
+    () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
+    [routeInitialCopilotMessage, storedInitialCopilotMessage],
+  );
   const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
-    navigate(location.pathname + location.search, {
+    clearStoredInitialCopilotMessage();
+    navigate(location.pathname + withoutDiscoverViaParam(location.search), {
       replace: true,
       state: null,
     });
-  }, [initialCopilotMessage, location.pathname, location.search, navigate]);
-  const [searchParams] = useSearchParams();
+  }, [
+    initialCopilotMessage,
+    clearStoredInitialCopilotMessage,
+    location.pathname,
+    location.search,
+    navigate,
+  ]);
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const headlessTurnDrainEnabled = ["1", "true"].includes(
     (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
