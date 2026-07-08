@@ -32,6 +32,8 @@ from urllib.parse import unquote, urlparse
 import structlog
 from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
+from skyvern.webeye.utils.page import SkyvernFrame
+
 LOG = structlog.get_logger()
 
 # Chunk size for IO.read streaming
@@ -455,22 +457,21 @@ class CDPDownloadInterceptor:
                 LOG.warning("Empty download URL, skipping")
                 return
 
-            # Skip if already downloaded via CDP Fetch interception.
-            # Fetch always fires before Browser.downloadWillBegin (Fetch intercepts at
-            # response stage, browser download manager fires after fulfillRequest), so
-            # this check is purely one-directional: only _handle_download writes the set.
+            # Skip if this exact URL was already captured. Both the Fetch path
+            # (_handle_download) and the blob path (_download_blob_url, after a successful save)
+            # record URLs here. We record only AFTER a successful save — not before the read — so
+            # a transient failure can't block a later retry of the same URL; a rare duplicate
+            # downloadWillBegin for the same blob URL is a benign re-save/overwrite.
             if url in self._downloaded_urls:
                 LOG.debug("URL already captured via Fetch, skipping direct download", url=url)
                 return
 
             if url.startswith("blob:"):
-                # blob: URLs are in-memory browser references — not fetchable over HTTP.
-                # They are already handled by the Fetch path which intercepts the resolved blob.
-                # TODO: handle the edge case where Fetch doesn't catch a blob download.
-                LOG.warning(
-                    "blob: URL download not yet supported, skipping", url=url, suggested_filename=suggested_filename
-                )
-                return
+                # blob: URLs are in-memory browser references — not fetchable over HTTP. When the
+                # page builds the file client-side (e.g. Blob + createObjectURL), the CDP Fetch
+                # path never sees a network response, so read the bytes back from a same-origin
+                # page instead of dropping the download.
+                await self._download_blob_url(url, suggested_filename)
             elif url.startswith("http"):
                 await self._download_url_directly(url, suggested_filename)
             else:
@@ -554,6 +555,57 @@ class CDPDownloadInterceptor:
             save_path=str(save_path),
             download_index=self._download_index,
             method=method,
+        )
+
+    async def _download_blob_url(self, url: str, suggested_filename: str) -> None:
+        """Save a blob: URL download by reading its bytes back from a same-origin page.
+
+        blob: URLs are in-memory references owned by the document that created them, so they
+        can't be fetched over HTTP. ``SkyvernFrame.read_blob_url_bytes`` runs the shared blob
+        read-back script inside a same-origin frame. Best-effort: a page may revoke the object
+        URL before we read it.
+        """
+        if not self._output_dir or self._browser_context is None:
+            LOG.warning("Cannot read blob download: no output dir or browser context", url=url)
+            return
+
+        # probe=True: this fans out over every open page as a best-effort fallback, so the
+        # shared reader must not emit ERROR logs for pages that don't own the blob's origin.
+        data: bytes | None = None
+        for page in list(self._browser_context.pages):
+            data = await SkyvernFrame.read_blob_url_bytes(
+                page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True
+            )
+            if data is not None:
+                break
+
+        if data is None:
+            LOG.warning(
+                "Could not read blob download from any page",
+                url=url,
+                suggested_filename=suggested_filename,
+            )
+            return
+        # Defense-in-depth: read_blob_url_bytes already rejects oversized blobs in-page before
+        # serialization, but guard again in case a caller passes no limit.
+        if len(data) > MAX_FILE_SIZE_BYTES:
+            LOG.warning(
+                "Blob download exceeds size limit, discarding",
+                url=url,
+                size=len(data),
+                max_size=MAX_FILE_SIZE_BYTES,
+            )
+            return
+        save_path, filename = self._resolve_save_path(suggested_filename)
+        with open(save_path, "wb") as f:
+            f.write(data)
+        self._downloaded_urls.add(url)
+        LOG.info(
+            "CDP download saved (blob)",
+            filename=filename,
+            size=len(data),
+            save_path=str(save_path),
+            download_index=self._download_index,
         )
 
     async def disable(self) -> None:
