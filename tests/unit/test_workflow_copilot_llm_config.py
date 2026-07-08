@@ -3,7 +3,8 @@
 Optional settings give operators independent control over the main Copilot lane,
 agent-specific lane, and fast-consumer lane:
 ``WORKFLOW_COPILOT_LLM_KEY``, ``WORKFLOW_COPILOT_AGENT_LLM_KEY``, and
-``WORKFLOW_COPILOT_FAST_LLM_KEY``.
+``WORKFLOW_COPILOT_FAST_LLM_KEY``. ``WORKFLOW_COPILOT_LITE_LLM_KEY`` controls
+the dedicated RequestPolicy lite lane for local/dev fallback.
 These tests cover the public contract: defaults, fallback chains, and
 PostHog → env-specific → default resolution order.
 """
@@ -34,6 +35,10 @@ def test_workflow_copilot_agent_llm_key_default_is_none() -> None:
 
 def test_workflow_copilot_fast_llm_key_default_is_none() -> None:
     assert Settings.model_fields["WORKFLOW_COPILOT_FAST_LLM_KEY"].default is None
+
+
+def test_workflow_copilot_lite_llm_key_default_is_none() -> None:
+    assert Settings.model_fields["WORKFLOW_COPILOT_LITE_LLM_KEY"].default is None
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +364,30 @@ async def test_resolve_lite_copilot_handler_falls_back_to_workflow_copilot(
 
     handler = await copilot_llm_config.resolve_lite_copilot_handler("wpid_1", "org_1")
     assert handler is workflow_handler
+
+
+@pytest.mark.asyncio
+async def test_resolve_lite_copilot_handler_prefers_dedicated_key_before_workflow_copilot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lite_handler = object()
+
+    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def _workflow_lookup(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("workflow fallback should not run when lite key is set")
+
+    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
+    monkeypatch.setattr(copilot_llm_config, "resolve_workflow_copilot_handler", _workflow_lookup)
+    monkeypatch.setattr(
+        copilot_llm_config,
+        "app",
+        SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=lite_handler),
+    )
+
+    handler = await copilot_llm_config.resolve_lite_copilot_handler("wpid_1", "org_1")
+    assert handler is lite_handler
 
 
 @pytest.mark.asyncio
