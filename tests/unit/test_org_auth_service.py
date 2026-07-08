@@ -145,10 +145,10 @@ def test_debug_fields_handles_none_inputs() -> None:
 async def test_resolve_org_from_api_key_logs_decode_error_reason(monkeypatch) -> None:
     logged: dict[str, object] = {}
 
-    def fake_error(_message: str, **kwargs: object) -> None:
+    def fake_warning(_message: str, **kwargs: object) -> None:
         logged.update(kwargs)
 
-    monkeypatch.setattr(org_auth_service.LOG, "error", fake_error)
+    monkeypatch.setattr(org_auth_service.LOG, "warning", fake_warning)
 
     with pytest.raises(HTTPException) as exc_info:
         await org_auth_service.resolve_org_from_api_key("definitely-not-a-jwt", SimpleNamespace(), ())
