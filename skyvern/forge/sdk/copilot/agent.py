@@ -153,6 +153,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     _INVOLUNTARY_BLOCKER_REASON_CODES,
     CopilotTurnHalt,
     TurnHalt,
+    TurnHaltKind,
     raise_if_turn_halt,
     turn_halt_to_trace_data,
 )
@@ -1900,6 +1901,16 @@ def _build_turn_halt_exit_result(
     global_llm_context: str | None,
     halt: TurnHalt,
 ) -> AgentResult:
+    if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
+        reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
+        return _build_wip_exit_result(
+            ctx,
+            global_llm_context,
+            default_reply=reply,
+            unvalidated_reply=reply,
+            tested_reply=reply,
+            terminal_reason=f"turn_halt:{halt.kind.value}",
+        )
     signal = halt.blocker_signal
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
@@ -2029,6 +2040,33 @@ def _terminal_summary_scalar(value: Any) -> str | None:
     if len(cleaned) > _VERIFIED_TERMINAL_VALUE_MAX_CHARS:
         cleaned = cleaned[: _VERIFIED_TERMINAL_VALUE_MAX_CHARS - 1].rstrip() + "..."
     return cleaned
+
+
+def _delivered_unverified_reply(ctx: CopilotContext) -> str | None:
+    if getattr(ctx, "delivered_unverified_terminal", False) is not True:
+        return None
+    parts: list[str] = []
+    observed_outputs = getattr(ctx, "delivered_unverified_observed_outputs", {})
+    if not isinstance(observed_outputs, dict):
+        observed_outputs = {}
+    for key, value in observed_outputs.items():
+        rendered = _terminal_summary_scalar(value)
+        if rendered is None and isinstance(value, list | dict):
+            try:
+                rendered = redact_raw_secrets_for_prompt(json.dumps(value, sort_keys=True))
+            except TypeError:
+                rendered = None
+        if isinstance(key, str) and key.strip() and rendered and not contains_internal_machinery_leak(rendered):
+            parts.append(f"{key}: {rendered[:_VERIFIED_TERMINAL_VALUE_MAX_CHARS]}")
+    if parts:
+        return (
+            "I built and ran the workflow. The latest run returned "
+            f"{'; '.join(parts[:4])}. That value was not independently verified, so review the draft before using it."
+        )
+    return (
+        "I built and ran the workflow, and the latest run returned the requested output. "
+        "That output was not independently verified, so review the draft before using it."
+    )
 
 
 def _verified_output_value(ctx: CopilotContext, output_key: str | None) -> Any:
@@ -2756,7 +2794,11 @@ def _build_wip_exit_result(
     ):
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
-        if unvalidated and recorded_failure_reply:
+        delivered_reply = _delivered_unverified_reply(ctx)
+        if delivered_reply is not None:
+            reply = delivered_reply
+            unvalidated = True
+        elif unvalidated and recorded_failure_reply:
             reply = recorded_failure_reply
             if halted_mid_progress:
                 reply = _ensure_unvalidated_proposal_affordance(reply)

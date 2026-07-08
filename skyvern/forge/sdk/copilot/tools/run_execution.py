@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -49,6 +49,8 @@ from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
+    DeliveredUnverifiedTerminalState,
+    degraded_contract_delivered_unverified_terminal_state,
     only_structural_requested_output_abstentions,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
@@ -115,6 +117,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
+    stash_delivered_unverified_turn_halt,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
@@ -2480,6 +2483,43 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
         evidence.failure_reason = " ".join(failure_reason.split())[:240]
 
 
+def _read_mapping_path(payload: dict[str, Any], path: str) -> Any:
+    current: Any = payload
+    for part in path.split("."):
+        if not part or not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _delivered_unverified_single_block_outputs(
+    result: dict[str, Any],
+    terminal_state: DeliveredUnverifiedTerminalState,
+) -> dict[str, Any]:
+    data = result.get("data")
+    blocks = data.get("blocks") if isinstance(data, dict) else None
+    outputs: list[dict[str, Any]] = []
+    if isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, dict) and isinstance(block.get("extracted_data"), dict):
+                outputs.append(cast(dict[str, Any], block["extracted_data"]))
+    if len(outputs) != 1:
+        return {}
+    block_output = outputs[0]
+    observed: dict[str, Any] = {}
+    for verdict in terminal_state.observed_verdicts:
+        output_path = verdict.output_path or ""
+        normalized_path = output_path.removeprefix("output.").strip()
+        if not normalized_path or normalized_path.split(".")[-1] == "evidence_text":
+            continue
+        value = _read_mapping_path(block_output, normalized_path)
+        if value is None:
+            value = _read_mapping_path(block_output, output_path)
+        if value is not None:
+            observed[normalized_path] = value
+    return observed
+
+
 def _record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
 ) -> RecordedRunOutcome | None:
@@ -2513,6 +2553,9 @@ def _record_run_blocks_result(
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
     copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
+    copilot_ctx.delivered_unverified_terminal = False
+    copilot_ctx.delivered_unverified_workflow_run_id = None
+    copilot_ctx.delivered_unverified_observed_outputs = {}
     # Watchdog cancels normally count as ok=False; only a coincident total
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
     cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
@@ -2693,6 +2736,37 @@ def _record_run_blocks_result(
             copilot_ctx.last_test_suspicious_success = False
             copilot_ctx.last_test_failure_reason = None
             copilot_ctx.suspicious_success_nudge_count = 0
+        delivered_unverified = degraded_contract_delivered_unverified_terminal_state(
+            completion_verification,
+            run_ok=run_ok,
+            workflow_run_id=run_id if isinstance(run_id, str) else None,
+            latest_workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id,
+            artifact_health_blocked=artifact_reason is not None,
+            terminal_blocked=terminal_challenge is not None or bool(copilot_ctx.last_test_anti_bot),
+        )
+        if delivered_unverified is not None:
+            observed_outputs = _delivered_unverified_single_block_outputs(result, delivered_unverified)
+            if observed_outputs:
+                workflow_run_id = run_id if isinstance(run_id, str) else None
+                copilot_ctx.last_test_suspicious_success = False
+                copilot_ctx.last_test_failure_reason = None
+                copilot_ctx.suspicious_success_nudge_count = 0
+                copilot_ctx.last_full_workflow_test_ok = False
+                copilot_ctx.delivered_unverified_terminal = True
+                copilot_ctx.delivered_unverified_workflow_run_id = workflow_run_id
+                copilot_ctx.delivered_unverified_observed_outputs = observed_outputs
+                stash_delivered_unverified_turn_halt(copilot_ctx, workflow_run_id=workflow_run_id)
+                update_repeated_failure_state(copilot_ctx, result)
+                _update_verification_evidence_from_run_result(copilot_ctx, result)
+                recorded_outcome = RecordedRunOutcome(
+                    verdict="not_evaluated",
+                    display_reason=run_outcome_display_reason(
+                        "The latest run returned the requested output, but it was not independently verified."
+                    ),
+                    workflow_run_id=workflow_run_id,
+                )
+                _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+                return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
         if empty_data_blocks and not completion_verification_evaluated:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
