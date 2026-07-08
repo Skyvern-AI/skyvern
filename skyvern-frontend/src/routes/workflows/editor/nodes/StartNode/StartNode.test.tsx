@@ -46,6 +46,7 @@ const startNodeData: WorkflowStartNodeData = {
   webhookCallbackUrl: "",
   proxyLocation: null,
   persistBrowserSession: false,
+  pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
   model: null,

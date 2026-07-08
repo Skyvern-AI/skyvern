@@ -10,16 +10,25 @@ import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
+    build_output_source_unobservable_blocker_signal,
     clear_tool_blocker_signals_for_reason_codes,
+    stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.output_contracts import (
+    OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+    OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+    OutputContractAdvisoryState,
+)
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.runtime import output_contract_ladder_unresolved
 from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_REASON_CODE
 
 LOG = structlog.get_logger()
 
 REPAIR_CEILING_REASON_CODE = "repair_ceiling_reached"
+ADVISORY_DISPATCH_STALLED_REASON_CODE = "advisory_dispatch_stalled"
 
 
 class TurnHaltKind(StrEnum):
@@ -28,6 +37,7 @@ class TurnHaltKind(StrEnum):
     PROBABLE_SITE_BLOCK = "probable_site_block"
     REPAIR_CEILING_REACHED = "repair_ceiling_reached"
     SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
+    OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -57,6 +67,13 @@ _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
 )
 _PROBABLE_SITE_BLOCK_REASON_CODES = frozenset({"probable_site_block_stop"})
 _SCHEMA_INCOMPATIBILITY_REASON_CODES = frozenset({SCHEMA_INCOMPATIBILITY_REASON_CODE})
+_OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
+    {
+        OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+        ADVISORY_DISPATCH_STALLED_REASON_CODE,
+    }
+)
 
 # A held blocker whose reason code is in this set must win both the rendered
 # reply and the typed halt kind over a later non-terminal trip (e.g. the
@@ -65,6 +82,7 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES = (
     _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES
     | _PROBABLE_SITE_BLOCK_REASON_CODES
     | _SCHEMA_INCOMPATIBILITY_REASON_CODES
+    | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
     | frozenset({"repair_ceiling_reached"})
 )
 
@@ -82,12 +100,14 @@ _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
         TurnHaltKind.PROBABLE_SITE_BLOCK,
         TurnHaltKind.REPAIR_CEILING_REACHED,
         TurnHaltKind.SCHEMA_INCOMPATIBILITY,
+        TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE,
     }
 )
 _INVOLUNTARY_BLOCKER_REASON_CODES = (
     _LOOP_TERMINAL_REASON_CODES
     | _PROBABLE_SITE_BLOCK_REASON_CODES
     | _SCHEMA_INCOMPATIBILITY_REASON_CODES
+    | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
     | frozenset({REPAIR_CEILING_REASON_CODE})
 )
 _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
@@ -120,6 +140,8 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.PROBABLE_SITE_BLOCK
     if reason in _SCHEMA_INCOMPATIBILITY_REASON_CODES:
         return TurnHaltKind.SCHEMA_INCOMPATIBILITY
+    if reason in _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES:
+        return TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
     return None
 
 
@@ -139,10 +161,94 @@ def turn_halt_from_blocker_signal(signal: object, *, source: str) -> TurnHalt | 
     )
 
 
+_ADVISORY_STATE_PROGRESS_ORDINAL = {
+    OutputContractAdvisoryState.UNUSED: 0,
+    OutputContractAdvisoryState.EXPIRED: 0,
+    OutputContractAdvisoryState.GRANTED: 1,
+    OutputContractAdvisoryState.CONSUMED: 2,
+}
+
+
+def _output_contract_defer_progress_token(ctx: Any) -> tuple[int, int, int, int]:
+    states = getattr(ctx, "output_contract_actuation_by_signature", {}) or {}
+    counts = getattr(ctx, "output_contract_actuation_count_by_signature", {}) or {}
+    observed = getattr(ctx, "output_contract_run_output_observed_by_signature", {}) or {}
+    imposed = getattr(ctx, "output_contract_page_extraction_imposed_by_signature", {}) or {}
+    return (
+        sum(_ADVISORY_STATE_PROGRESS_ORDINAL.get(state, 0) for state in states.values()),
+        sum(int(count or 0) for count in counts.values()),
+        sum(1 for value in observed.values() if value),
+        sum(1 for value in imposed.values() if value),
+    )
+
+
+def _expire_stalled_output_contract_ladder(ctx: Any) -> None:
+    if getattr(ctx, "turn_halt", None) is not None:
+        return
+    states = ctx.output_contract_actuation_by_signature
+    # A GRANTED grant is awaiting its forced run dispatch, not stalled: the dispatch lane consumes it
+    # next iteration, so expiring it here would false-fire arm-D on a source-producible shape and re-arm
+    # the loop guards before the granted run runs. Only a directive ladder with no live grant expires here.
+    if any(state == OutputContractAdvisoryState.GRANTED for state in states.values()):
+        return
+    counts = getattr(ctx, "output_contract_actuation_count_by_signature", {}) or {}
+    resolved = {OutputContractAdvisoryState.CONSUMED, OutputContractAdvisoryState.EXPIRED}
+    expired: list[str] = []
+    for signature in set(states) | set(counts):
+        state = states.get(signature)
+        if int(counts.get(signature, 0) or 0) >= 1 and state not in resolved:
+            states[signature] = OutputContractAdvisoryState.EXPIRED
+            expired.append(signature)
+    if not expired:
+        return
+    required_paths = sorted(
+        {path for paths in getattr(ctx, "output_contract_pending_run_evidence", {}).values() for path in paths}
+    )
+    signal = build_output_source_unobservable_blocker_signal(
+        reason_code=ADVISORY_DISPATCH_STALLED_REASON_CODE,
+        required_paths=required_paths,
+        block_label="",
+    )
+    stash_blocker_signal(ctx, signal)
+    halt = turn_halt_from_blocker_signal(signal, source="turn_halt_defer_expiry")
+    if halt is not None:
+        ctx.turn_halt = halt
+        LOG.info("copilot_output_contract_advisory_dispatch_stalled", canonical_output_contract_signatures=expired)
+
+
+def _defer_loop_detected_while_output_contract_ladder_unresolved(ctx: Any, signal: object) -> bool:
+    """The single choke-point every loop_detected emitter (enforcement backstop, hook re-raise, tool-loop
+    guards, MCP) flows through: while a typed output-contract actuation ladder is live the bounded ladder
+    owns the turn, so a loop/churn stop is not promoted, while genuinely-terminal and non-loop signals are.
+    The defer carries its own termination proof: each swallow must show a lifecycle-progress advance since
+    the last one. A GRANTED grant is owned by the forced run dispatch and is never stall-expired here; only a
+    directive ladder with no live grant expires on a second swallow with no advance, so it cannot ride to the
+    timeout wall."""
+    if not isinstance(signal, CopilotToolBlockerSignal):
+        return False
+    if blocker_signal_is_genuinely_terminal(signal):
+        return False
+    if _kind_for_blocker_signal(signal) != TurnHaltKind.LOOP_DETECTED:
+        return False
+    if not hasattr(ctx, "output_contract_actuation_by_signature"):
+        return False
+    if not output_contract_ladder_unresolved(ctx):
+        return False
+    token = _output_contract_defer_progress_token(ctx)
+    last_token = getattr(ctx, "output_contract_defer_progress_token", None)
+    if last_token is not None and token == last_token:
+        _expire_stalled_output_contract_ladder(ctx)
+        return True
+    ctx.output_contract_defer_progress_token = token
+    return True
+
+
 def stash_turn_halt_from_blocker_signal(ctx: Any, signal: object, *, source: str) -> TurnHalt | None:
     existing = getattr(ctx, "turn_halt", None)
     if isinstance(existing, TurnHalt):
         return existing
+    if _defer_loop_detected_while_output_contract_ladder_unresolved(ctx, signal):
+        return None
     halt = turn_halt_from_blocker_signal(signal, source=source)
     if halt is None:
         return None

@@ -348,6 +348,8 @@ def _build_engine(database_string: str) -> AsyncEngine:
         pool_pre_ping=True,
         pool_size=settings.DATABASE_POOL_SIZE,
         max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+        pool_timeout=settings.DATABASE_POOL_TIMEOUT,
+        pool_recycle=settings.DATABASE_POOL_RECYCLE,
     )
 
 

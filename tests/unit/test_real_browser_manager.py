@@ -480,6 +480,28 @@ async def test_popup_video_listener_multiple_popups() -> None:
 
 
 @pytest.mark.asyncio
+async def test_popup_video_listener_skips_page_discarded_before_it_registers() -> None:
+    """RealBrowserState.discard_page_video() may tombstone a page while
+    set_popup_video_listener's fire-and-forget _on_page for that same page is still awaiting
+    video.path() — the late registration must not re-append after the discard."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    orphan = _make_page_mock("/tmp/videos/orphan.webm")
+
+    # Simulate the discard landing first (RealBrowserState._close_all_other_pages tombstones
+    # synchronously, before it ever awaits anything), then the listener's registration resolving.
+    artifacts.discard_page_video(orphan)
+    await handler(orphan)
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == ["/tmp/videos/main.webm"]
+
+
+@pytest.mark.asyncio
 async def test_set_working_page_does_not_touch_video_artifacts() -> None:
     """set_working_page only sets the working page; video tracking is handled by the listener."""
 

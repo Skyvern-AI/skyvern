@@ -10,7 +10,7 @@ from .workflow_run_request_output_proxy_location import WorkflowRunRequestOutput
 class WorkflowRunRequestOutput(UniversalBaseModel):
     workflow_id: str = pydantic.Field()
     """
-    ID of the workflow to run. Workflow ID starts with `wpid_`.
+    ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.
     """
 
     parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)

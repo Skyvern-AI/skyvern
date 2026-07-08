@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _make_agent_result
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _make_agent_result
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract
@@ -117,3 +119,44 @@ def test_backfill_tolerates_missing_payload() -> None:
 def test_missing_payload_is_allowed_without_ctx() -> None:
     result = _result(None, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=None)
     assert result.narrative_payload is None
+
+
+def test_backfill_adds_credential_prompt_for_typed_clarification_reason() -> None:
+    ctx = _ctx(request_policy=RequestPolicy(clarification_reason="credential_name_unresolved"))
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.CLARIFY), narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialPrompt"] == {"reason": "credential_name_unresolved"}
+
+
+def test_blocker_override_path_adds_credential_prompt_from_request_policy() -> None:
+    ctx = _ctx(request_policy=RequestPolicy(clarification_reason="workflow_credential_inputs_unbound"))
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Reply to the user without updating the workflow.",
+        user_facing_reason="I couldn't find the required credentials for the existing workflow.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="turn_intent_no_mutation_run_blocked",
+        blocked_tool="update_workflow",
+    )
+    pre_override = AgentResult(user_response="agent reply", updated_workflow=None, global_llm_context=None)
+
+    overridden = _finalize_result_with_blocker_override(ctx, pre_override)
+
+    assert overridden.narrative_payload is not None
+    assert overridden.narrative_payload["credentialPrompt"] == {"reason": "workflow_credential_inputs_unbound"}
+
+
+def test_backfill_adds_credential_prompt_from_text_marker_when_no_policy_signal() -> None:
+    result = _result(
+        _ctx(),
+        user_response="You can add one at https://app.skyvern.com/credentials.",
+        narrative_payload=_payload(),
+    )
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["credentialPrompt"] == {"reason": "assistant_directed"}
+
+
+def test_backfill_omits_credential_prompt_when_no_signal_present() -> None:
+    result = _result(_ctx(), user_response="Done, the workflow is ready.", narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert "credentialPrompt" not in result.narrative_payload

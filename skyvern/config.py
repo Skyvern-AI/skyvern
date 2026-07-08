@@ -155,6 +155,11 @@ class Settings(BaseSettings):
     DISABLE_CONNECTION_POOL: bool = False
     DATABASE_POOL_SIZE: int = 5
     DATABASE_POOL_MAX_OVERFLOW: int = 10
+    # Timeout/recycle defaults mirror SQLAlchemy's QueuePool. Size pools per service
+    # via env vars: raising defaults here multiplies across every engine and replica
+    # and can exhaust pgbouncer client connections.
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_RECYCLE: int = -1
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -200,13 +205,9 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
-    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
-    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
-    # already-authenticated session (the first run and every login-replaying repair re-run alike).
-    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
-    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000
@@ -349,8 +350,10 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096

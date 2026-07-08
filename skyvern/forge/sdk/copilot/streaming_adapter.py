@@ -478,6 +478,8 @@ def _update_enforcement_from_tool(
         ctx.post_update_nudge_count = 0
     if tool_name in ("update_workflow", "update_and_run_blocks") and has_blocks:
         ctx.synthesized_block_reopened_after_failed_run = False
+        ctx.synthesized_block_reopened_for_output_coverage = False
+        ctx.uncovered_output_rescout_steer_key = None
 
     if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks"):
         ctx.test_after_update_done = True

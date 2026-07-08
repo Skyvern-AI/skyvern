@@ -8,6 +8,7 @@ import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
 from .action_block_data_schema import ActionBlockDataSchema
 from .action_block_parameters_item import ActionBlockParametersItem
+from .ai_fallback_mode import AiFallbackMode
 from .output_parameter import OutputParameter
 from .run_engine import RunEngine
 
@@ -50,6 +51,8 @@ class ActionBlock(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
+    selector: typing.Optional[str] = None
+    ai_fallback: typing.Optional[AiFallbackMode] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

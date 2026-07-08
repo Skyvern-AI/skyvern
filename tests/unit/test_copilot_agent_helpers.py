@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from agents import GuardrailFunctionOutput, InputGuardrail
+from agents.run_context import RunContextWrapper
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
@@ -937,7 +939,7 @@ workflow_definition:
         assert "phase: persisted_block_run" in prompt
         assert "reason_code: runtime_block_failure" in prompt
         assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
-        assert "Do not re-emit the same plan against the same structural key" in prompt
+        assert "change the next authored step, selector, extraction, or binding based on" in prompt
 
     def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
         ctx = _ctx(
@@ -965,6 +967,53 @@ workflow_definition:
         assert "output_root=output" in prompt
         assert "Use the exact output_path values in goal_value_paths and returned output" in prompt
         assert "output_root is diagnostic grouping only" in prompt
+
+    def test_recorded_build_test_outcome_prompt_surfaces_observed_page_values(self) -> None:
+        long_value = "Request WTR-1842-DEMO for account 100245 confirmed. " + "detail " * 40
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="scout_evaluate",
+                attempted_tool="scout_interaction",
+                attempted_target="#submit",
+                verdict="repairable_failure",
+                reason_code="scout_act_observe_hollow_after_interaction",
+                structural_failure_identity="scout_act_observe:hollow",
+                page_evidence_refs=["origin:https://example.com"],
+                observed_page_value_excerpt=long_value.strip(),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        value_line = next(line for line in prompt.splitlines() if line.startswith("observed_page_values:"))
+        assert "WTR-1842-DEMO" in value_line
+        assert "100245" in value_line
+        assert len(value_line) > 200
+
+    def test_recorded_build_test_outcome_prompt_binds_observed_values_on_metadata_reject(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="author_time_reject",
+                attempted_tool="update_workflow",
+                verdict="authoring_rejected",
+                reason_code="metadata_reject",
+                structural_failure_identity="author_time:metadata_reject",
+                observed_page_value_excerpt="Request WTR-1842-DEMO for account 100245 confirmed.",
+                missing_requested_output_facts=[
+                    {"output_root": "output", "output_path": "output.confirmation_number"},
+                    {"output_root": "output", "output_path": "output.account_number"},
+                ],
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "OBSERVED PAGE VALUES CONTRACT" in prompt
+        assert "observed_values: Request WTR-1842-DEMO for account 100245 confirmed." in prompt
+        assert "- output.confirmation_number: <observed value>" in prompt
+        assert "- output.account_number: <observed value>" in prompt
 
 
 class TestVerifiedWorkflowOrNone:
@@ -1523,11 +1572,6 @@ class TestSupersededAgentIntentGates:
 class TestRequestPolicyInputGuardrail:
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             testing_intent="skip_test",
             credential_input_kind="credential_name",
@@ -1544,7 +1588,8 @@ class TestRequestPolicyInputGuardrail:
             chat_history_messages=_history(("user", "build the login workflow")),
             global_llm_context="",
             organization_id="org-1",
-            handler=object(),
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
             previous_user_message="build the login workflow",
         )
 
@@ -1569,19 +1614,48 @@ class TestRequestPolicyInputGuardrail:
             chat_history=policy_inputs.chat_history_messages,
             global_llm_context="",
             organization_id="org-1",
-            handler=policy_inputs.handler,
+            handler=policy_inputs.request_policy_handler,
             active_criteria=None,
             config=None,
         )
 
     @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_routes_request_policy_to_fast_handler_and_turn_intent_to_main(
+        self, monkeypatch
+    ) -> None:
+        request_policy_handler = object()
+        turn_intent_handler = object()
+        policy = RequestPolicy()
+        build_request_policy = AsyncMock(return_value=policy)
+        classify_turn_intent = AsyncMock(return_value=None)
+        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        monkeypatch.setattr(agent_module, "classify_turn_intent", classify_turn_intent)
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="build and test it",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=request_policy_handler,
+            turn_intent_handler=turn_intent_handler,
+        )
+
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )
+
+        await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=_ctx()))
+
+        assert build_request_policy.await_args is not None
+        assert build_request_policy.await_args.kwargs["handler"] is request_policy_handler
+        assert classify_turn_intent.await_args is not None
+        assert classify_turn_intent.await_args.kwargs["handler"] is turn_intent_handler
+
+    @pytest.mark.asyncio
     async def test_sdk_input_guardrail_forwards_stored_active_criteria(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.completion_criteria_store import StoredCriteriaSet, StoredCriteriaSnapshot
-        from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-
         stored = StoredCriteriaSet(
             set_id="wccs_1",
             goal_epoch=1,
@@ -1596,7 +1670,8 @@ class TestRequestPolicyInputGuardrail:
             chat_history_messages=[],
             global_llm_context="",
             organization_id="org-1",
-            handler=object(),
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
             stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
         )
         guardrails = agent_module._build_copilot_input_guardrails(
@@ -1611,11 +1686,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             credential_input_kind="raw_secret",
             user_response_policy="ask_clarification",
@@ -1637,7 +1707,8 @@ class TestRequestPolicyInputGuardrail:
                 chat_history_messages=[],
                 global_llm_context="",
                 organization_id="org-1",
-                handler=None,
+                request_policy_handler=None,
+                turn_intent_handler=None,
             ),
         )
 
@@ -1651,11 +1722,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_request_policy_proceeds_on_workflow_behavior_question(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             credential_input_kind="none",
             testing_intent="unspecified",
@@ -1679,7 +1745,8 @@ class TestRequestPolicyInputGuardrail:
                 ),
                 global_llm_context="",
                 organization_id="org-1",
-                handler=object(),
+                request_policy_handler=object(),
+                turn_intent_handler=object(),
             ),
         )
 
@@ -1694,11 +1761,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_request_policy_proceeds_on_bare_keyvault_slotfill(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             credential_input_kind="none",
             testing_intent="unspecified",
@@ -1718,7 +1780,8 @@ class TestRequestPolicyInputGuardrail:
                 ),
                 global_llm_context="",
                 organization_id="org-1",
-                handler=object(),
+                request_policy_handler=object(),
+                turn_intent_handler=object(),
             ),
         )
 
@@ -1732,11 +1795,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_raw_secret_redacted_draft_policy_sanitizes_agent_input(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         raw_message = (
             "Convert this SDK snippet into a workflow:\n"
             "client = DemoClient(api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890')"
@@ -1761,7 +1819,8 @@ class TestRequestPolicyInputGuardrail:
                 chat_history_messages=[],
                 global_llm_context="",
                 organization_id="org-1",
-                handler=None,
+                request_policy_handler=None,
+                turn_intent_handler=None,
             ),
         )
 
@@ -6451,6 +6510,7 @@ class TestDeclaredEqualsGradedCompletionCriteria:
             verified_prefix_labels=[],
             verified_block_outputs={},
             post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
             completion_criteria_turn_state=None,
         )
 
@@ -6691,6 +6751,7 @@ class TestDeclaredEqualsGradedCompletionCriteria:
             verified_prefix_labels=[],
             verified_block_outputs={},
             post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
             completion_criteria_turn_state=None,
         )
 

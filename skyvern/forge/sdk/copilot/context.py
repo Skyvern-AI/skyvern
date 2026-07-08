@@ -82,6 +82,8 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
+    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    credentialPrompt: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -99,6 +101,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
+        RecordedOutcomeBindingConstraint,
         RecordedOutcomeGroundingRequirement,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
@@ -152,6 +155,9 @@ class LoadedResultTargetContext(BaseModel):
     structure_signature: str = ""
 
 
+OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
+
+
 class CodeAuthoringRepairContext(BaseModel):
     block_label: str
     reason_code: str
@@ -187,6 +193,10 @@ class CodeAuthoringRepairContext(BaseModel):
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
+    required_block_structure: str = ""
+    spine_stage_count: int | None = None
+    spine_split_blockers: list[str] = Field(default_factory=list)
+    output_owner_candidate_labels: list[str] = Field(default_factory=list)
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
@@ -636,6 +646,7 @@ class CopilotContext(AgentContext):
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
+    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of
     # completion criteria the judge confirmed satisfied so far this turn, and the
     # high-water length of the verified block prefix. A repair that grows either
@@ -733,3 +744,35 @@ class CopilotContext(AgentContext):
     block_ended_at_map: dict[str, str] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+
+    def has_genuine_workflow_attempt(self) -> bool:
+        """This turn persisted a workflow proposal or executed a real build-test run; excludes
+        ``test_after_update_done``, which is stamped for any ``run_blocks_and_collect_debug`` scout
+        probe (including early-return probes that record no run) and so is not a genuine-attempt signal."""
+        if self.update_workflow_called:
+            return True
+        if self.last_update_block_count is not None:
+            return True
+        if self.last_test_ok is not None:
+            return True
+        for run_id in (
+            self.last_run_blocks_workflow_run_id,
+            self.last_successful_run_blocks_workflow_run_id,
+            self.last_outcome_gate_workflow_run_id,
+        ):
+            if run_id is not None and run_id.strip():
+                return True
+        return False
+
+    def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
+        return {
+            "has_genuine_workflow_attempt": self.has_genuine_workflow_attempt(),
+            "update_workflow_called": self.update_workflow_called,
+            "test_after_update_done": self.test_after_update_done,
+            "last_update_block_count": self.last_update_block_count,
+            "last_test_ok": self.last_test_ok,
+            "last_run_blocks_workflow_run_id": self.last_run_blocks_workflow_run_id,
+            "last_successful_run_blocks_workflow_run_id": self.last_successful_run_blocks_workflow_run_id,
+            "last_outcome_gate_workflow_run_id": self.last_outcome_gate_workflow_run_id,
+            "ctx_last_workflow_present": self.last_workflow is not None,
+        }

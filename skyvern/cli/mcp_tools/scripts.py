@@ -15,6 +15,7 @@ from pydantic import Field, ValidationError
 
 from skyvern.client.errors import NotFoundError
 from skyvern.client.types import ScriptFileCreate
+from skyvern.utils.script_file_paths import normalize_script_file_path
 
 from ._common import ErrorCode, Timer, make_error, make_result, raw_http_get
 from ._session import get_skyvern
@@ -247,8 +248,11 @@ async def skyvern_script_deploy(
         parsed_files = json.loads(files)
         if not isinstance(parsed_files, list):
             raise ValueError("files must be a JSON array")
-        typed_files = [ScriptFileCreate(**file_data) for file_data in parsed_files]
-    except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as e:
+        typed_files = [
+            ScriptFileCreate(**{**file_data, "path": normalize_script_file_path(file_data["path"])})
+            for file_data in parsed_files
+        ]
+    except (json.JSONDecodeError, TypeError, ValueError, ValidationError, KeyError) as e:
         return make_result(
             "skyvern_script_deploy",
             ok=False,

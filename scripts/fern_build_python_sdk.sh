@@ -7,6 +7,9 @@ rm -fr skyvern/client
 mkdir -p skyvern/client
 cp -rf fern/.preview/fern-python-sdk/src/skyvern/* skyvern/client/
 
+# Post-processing: Reapply manual patches (circular imports, forward-ref KeyError)
+python3 scripts/patch_generated_client.py || exit 1
+
 # Post-processing: Patch version.py to handle missing metadata gracefully
 VERSION_FILE="skyvern/client/version.py"
 if [ -f "$VERSION_FILE" ]; then

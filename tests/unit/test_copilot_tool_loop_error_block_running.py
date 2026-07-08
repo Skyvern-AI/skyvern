@@ -15,6 +15,7 @@ from typing import Any
 
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import compute_action_sequence_fingerprint
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.tools import (
     BLOCK_RUNNING_TOOLS,
     COPILOT_FINAL_REPLY_RESERVE_SECONDS,
@@ -42,6 +43,12 @@ def _ctx(**overrides: Any) -> Any:
         "staged_workflow": None,
         "staged_workflow_yaml": None,
         "has_staged_proposal": False,
+        "synthesized_block_reopened_for_output_coverage": False,
+        "output_contract_actuation_by_signature": {},
+        "output_contract_reject_count_by_signature": {},
+        "output_contract_actuation_count_by_signature": {},
+        "output_contract_armed_directive_fingerprint_by_signature": {},
+        "output_contract_dispatch_reopened_by_signature": {},
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -119,6 +126,24 @@ def test_block_running_tool_is_not_blocked_by_name_only_streak() -> None:
 
 def test_planning_tool_still_trips_name_only_streak() -> None:
     ctx = _ctx()
+    assert _tool_loop_error(ctx, "update_workflow") is None
+    assert _tool_loop_error(ctx, "update_workflow") is None
+    msg = _tool_loop_error(ctx, "update_workflow")
+    assert msg is not None
+    assert "LOOP DETECTED" in msg
+
+
+def test_unresolved_output_contract_ladder_skips_name_only_streak_for_authoring_tool() -> None:
+    ctx = _ctx(output_contract_actuation_count_by_signature={"sig_active": 1})
+    for _ in range(5):
+        assert _tool_loop_error(ctx, "update_workflow") is None
+
+
+def test_resolved_output_contract_ladder_re_enables_name_only_streak() -> None:
+    ctx = _ctx(
+        output_contract_actuation_count_by_signature={"sig_done": 3},
+        output_contract_actuation_by_signature={"sig_done": OutputContractAdvisoryState.CONSUMED},
+    )
     assert _tool_loop_error(ctx, "update_workflow") is None
     assert _tool_loop_error(ctx, "update_workflow") is None
     msg = _tool_loop_error(ctx, "update_workflow")

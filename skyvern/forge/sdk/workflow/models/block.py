@@ -109,6 +109,8 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
+from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
+from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -3647,98 +3649,11 @@ class CodeBlock(Block):
     prompt: str | None = None
     steps: list[CodeBlockStep] | None = None
 
-    # Dangerous attribute names that must never be accessed in user code.
-    # This blocks subprocess creation, OS access, and sandbox-escape primitives.
-    # NOTE: This is a blocklist-based sandbox, not real process-level isolation.
-    # It is inherently incomplete — a determined attacker may find bypasses.
-    # Long-term we should run user code in a proper sandbox. This blocklist is
-    # a defense-in-depth layer, not a security boundary.
-    # NOTE: Do not add names that collide with safe module methods (e.g. re.compile).
-    # Builtin functions like compile(), eval(), exec() are already blocked via __builtins__: {}.
-    BLOCKED_ATTRS: ClassVar[frozenset[str]] = frozenset(
-        {
-            # Subprocess / OS execution
-            "create_subprocess_exec",
-            "create_subprocess_shell",
-            "system",
-            "popen",
-            "Popen",
-            "exec",
-            "spawn",
-            "spawnl",
-            "spawnle",
-            "spawnlp",
-            "spawnlpe",
-            "check_call",
-            "check_output",
-            "execv",
-            "execve",
-            "execvp",
-            "execvpe",
-            "execl",
-            "execlp",
-            "execlpe",
-            "fork",
-            # Network primitives
-            "open_connection",
-            "start_server",
-            "create_connection",
-            "create_server",
-            # Frame / code object internals (classic RestrictedPython escape vectors)
-            "f_globals",
-            "f_locals",
-            "f_builtins",
-            "f_code",
-            "co_code",
-            "co_consts",
-            "co_names",
-            "co_varnames",
-            "gi_frame",
-            "gi_code",
-            "cr_frame",
-            "cr_code",
-            "tb_frame",
-            "tb_next",
-            # Class hierarchy escape
-            "mro",
-            # Filesystem operations (unambiguous — these only appear on os/pathlib, not user objects)
-            "listdir",
-            "makedirs",
-            "rmdir",
-            # Module traversal (json.codecs.sys.modules etc.)
-            "codecs",
-            "modules",
-            "builtins",
-            "stdout",
-            "stderr",
-            "stdin",
-            # Sandbox-escape helpers (builtin equivalents already blocked via __builtins__: {})
-            "getattr",
-            "setattr",
-            "delattr",
-            "globals",
-            "eval",
-            "vars",
-            "format",
-            "format_map",
-        }
-    )
+    BLOCKED_ATTRS: ClassVar[frozenset[str]] = CODE_BLOCK_BLOCKED_ATTRS
 
     @staticmethod
     def is_safe_code(code: str) -> None:
-        tree = ast.parse(code)
-        for node in ast.walk(tree):
-            # Block dunder attribute access (obj.__foo__)
-            if hasattr(node, "attr") and str(node.attr).startswith("__"):
-                raise InsecureCodeDetected("Not allowed to access private methods or attributes")
-            # Block bare dunder identifiers (__capture_locals, __builtins__, etc.)
-            if isinstance(node, ast.Name) and node.id.startswith("__"):
-                raise InsecureCodeDetected("Not allowed to access private methods or attributes")
-            if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
-                raise InsecureCodeDetected("Not allowed to import modules")
-            # Block dangerous method/attribute access on any object
-            if hasattr(node, "attr") and node.attr in CodeBlock.BLOCKED_ATTRS:
-                raise InsecureCodeDetected(f"Not allowed to access '{node.attr}'")
+        _shared_is_safe_code(code)
 
     @staticmethod
     def build_safe_vars() -> dict[str, Any]:
@@ -4837,7 +4752,6 @@ class TextPromptBlock(Block):
     async def send_prompt(
         self,
         prompt: str,
-        parameter_values: dict[str, Any],
         workflow_run_id: str,
         organization_id: str | None = None,
         workflow_run_block_id: str | None = None,
@@ -4850,7 +4764,9 @@ class TextPromptBlock(Block):
         )
         schema_to_use = json_schema or self.json_schema or _default_text_prompt_schema()
 
-        prompt = prompt_engine.load_prompt_from_string(prompt, **parameter_values)
+        # `prompt` is already fully rendered by format_potential_template_parameters().
+        # Keep send_prompt focused on delivery/retry formatting so parameter values
+        # stay literal after that render.
         if schema_validation_failure:
             prompt = _build_schema_validation_retry_prompt(prompt, schema_validation_failure)
         prompt += (
@@ -4950,8 +4866,6 @@ class TextPromptBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        # get all parameters into a dictionary
-        parameter_values = {}
         for parameter in self.parameters:
             if not workflow_run_context.has_value(parameter.key):
                 LOG.warning(
@@ -4971,12 +4885,6 @@ class TextPromptBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
-            value = workflow_run_context.get_value(parameter.key)
-            secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-            if secret_value:
-                continue
-            else:
-                parameter_values[parameter.key] = value
 
         response: dict[str, Any] | list | str | None = None
         schema_to_use = self.json_schema or _default_text_prompt_schema()
@@ -4995,7 +4903,6 @@ class TextPromptBlock(Block):
             try:
                 response = await self.send_prompt(
                     self.prompt,
-                    parameter_values,
                     workflow_run_id,
                     organization_id,
                     workflow_run_block_id=workflow_run_block_id,

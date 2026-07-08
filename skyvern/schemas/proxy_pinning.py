@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from hashlib import sha256
 from typing import Any
 
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocation, ProxyLocationInput
@@ -29,6 +30,12 @@ def generate_proxy_session_id(source_id: str) -> str:
     if not is_proxy_session_id(proxy_session_id):
         raise RuntimeError("Generated proxy session id does not match the expected format")
     return proxy_session_id
+
+
+def derive_proxy_session_id(*parts: str) -> str:
+    if not parts or any(not part or not part.strip() for part in parts):
+        raise ValueError("Cannot derive proxy session id from empty parts")
+    return sha256(":".join(parts).encode("utf-8")).hexdigest()[:10]
 
 
 def redact_proxy_session_id(value: str | None) -> str | None:

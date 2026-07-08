@@ -1994,6 +1994,7 @@ function getElements(
     startNode(startNodeId, {
       withWorkflowSettings: true,
       persistBrowserSession: settings.persistBrowserSession,
+      pinSavedSessionIp: settings.pinSavedSessionIp,
       browserProfileId: settings.browserProfileId,
       browserProfileKey: settings.browserProfileKey,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
@@ -3416,6 +3417,7 @@ function getWorkflowBlocks(
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
     browserProfileKey: null,
     proxyLocation: ProxyLocation.Residential,
@@ -3447,6 +3449,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   if (isWorkflowStartNodeData(data)) {
     return {
       persistBrowserSession: data.persistBrowserSession,
+      pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
       proxyLocation: data.proxyLocation,
@@ -4542,6 +4545,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
+    pin_saved_session_ip: workflow.pin_saved_session_ip,
     browser_profile_id: workflow.browser_profile_id ?? null,
     browser_profile_key: workflow.browser_profile_key ?? null,
     model: workflow.model,

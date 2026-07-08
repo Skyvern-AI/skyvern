@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     note_adjudication_on_turn_state,
     plan_persistence,
     reconcile_completion_criteria,
+    split_requested_output_criteria,
 )
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -1063,7 +1064,8 @@ def _policy_inputs(snapshot: StoredCriteriaSnapshot | None) -> RequestPolicyGuar
         chat_history_messages=[],
         global_llm_context="",
         organization_id="org-1",
-        handler=None,
+        request_policy_handler=None,
+        turn_intent_handler=None,
         stored_completion_criteria=snapshot,
     )
 
@@ -1088,12 +1090,100 @@ def test_reconcile_on_context_skips_without_snapshot() -> None:
     assert ctx.completion_criteria_turn_state is None
 
 
+def test_reconcile_on_context_floors_presence_only_requested_output_on_degraded_snapshot() -> None:
+    policy = RequestPolicy(completion_criteria=[_presence_only_requested_output()])
+    ctx = _ctx()
+    _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(None))
+    assert ctx.completion_criteria_turn_state is None
+    assert [c.output_path for c in policy.completion_criteria] == [None]
+    assert [c.kind for c in policy.completion_criteria] == ["outcome"]
+    requested, _remaining = split_requested_output_criteria(list(policy.completion_criteria))
+    assert requested == []
+
+
 def test_stored_active_criteria_forwarded_only_with_active_set() -> None:
     stored = _stored("the item is in the cart")
     snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
     assert _stored_active_completion_criteria(_policy_inputs(snapshot)) == list(stored.criteria)
     assert _stored_active_completion_criteria(_policy_inputs(StoredCriteriaSnapshot())) is None
     assert _stored_active_completion_criteria(_policy_inputs(None)) is None
+
+
+def _presence_only_requested_output() -> CompletionCriterion:
+    return _criterion(
+        "c_conf",
+        "the confirmation number is returned",
+        output_path="output.confirmation_number",
+        kind="terminal_action",
+        terminal_action_family="request",
+    )
+
+
+def test_reconcile_floors_grading_plane_but_persists_typed_originals() -> None:
+    policy = RequestPolicy(completion_criteria=[_presence_only_requested_output()])
+    ctx = _ctx()
+
+    _reconcile_completion_criteria_on_context(
+        ctx, policy, _policy_inputs(StoredCriteriaSnapshot(active=None, next_epoch=1))
+    )
+
+    assert [c.output_path for c in policy.completion_criteria] == [None]
+    assert [c.kind for c in policy.completion_criteria] == ["outcome"]
+    turn_state = ctx.completion_criteria_turn_state
+    assert turn_state is not None and turn_state.decision is not None
+    assert [c.output_path for c in turn_state.decision.criteria] == ["output.confirmation_number"]
+    assert [c.kind for c in turn_state.decision.criteria] == ["terminal_action"]
+    plan = plan_persistence(turn_state)
+    assert plan is not None and plan.creates_set is True
+    assert [c.output_path for c in plan.create_criteria] == ["output.confirmation_number"]
+    assert [c.kind for c in plan.create_criteria] == ["terminal_action"]
+
+
+def test_reconcile_presence_only_floor_does_not_churn_across_turns() -> None:
+    policy1 = RequestPolicy(completion_criteria=[_presence_only_requested_output()])
+    ctx1 = _ctx()
+    _reconcile_completion_criteria_on_context(
+        ctx1, policy1, _policy_inputs(StoredCriteriaSnapshot(active=None, next_epoch=1))
+    )
+    plan1 = plan_persistence(ctx1.completion_criteria_turn_state)
+    assert plan1 is not None and plan1.create_epoch == 1
+
+    stored = StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=plan1.create_criteria)
+    policy2 = RequestPolicy(completion_criteria=[_presence_only_requested_output()])
+    ctx2 = _ctx()
+    _reconcile_completion_criteria_on_context(
+        ctx2, policy2, _policy_inputs(StoredCriteriaSnapshot(active=stored, next_epoch=2))
+    )
+
+    turn_state2 = ctx2.completion_criteria_turn_state
+    assert turn_state2 is not None and turn_state2.decision is not None
+    assert turn_state2.decision.action == "adopt_stored"
+    assert turn_state2.decision.reason == "kept"
+    assert plan_persistence(turn_state2) is None
+    assert [c.output_path for c in policy2.completion_criteria] == [None]
+    assert [c.kind for c in policy2.completion_criteria] == ["outcome"]
+
+
+def test_reconcile_clarification_turn_floors_grading_but_never_persists() -> None:
+    presence_only = _presence_only_requested_output()
+    stored = StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(presence_only,))
+    policy = RequestPolicy(
+        completion_criteria=[presence_only],
+        user_response_policy="ask_clarification",
+    )
+    ctx = _ctx()
+
+    _reconcile_completion_criteria_on_context(
+        ctx, policy, _policy_inputs(StoredCriteriaSnapshot(active=stored, next_epoch=2))
+    )
+
+    turn_state = ctx.completion_criteria_turn_state
+    assert turn_state is not None and turn_state.decision is not None
+    assert turn_state.decision.action == "adopt_stored"
+    assert [c.output_path for c in policy.completion_criteria] == [None]
+    assert [c.kind for c in policy.completion_criteria] == ["outcome"]
+    assert [c.output_path for c in turn_state.decision.criteria] == ["output.confirmation_number"]
+    assert plan_persistence(turn_state) is None
 
 
 def test_plan_persistence_for_supersede_creates_new_epoch_and_points_back() -> None:

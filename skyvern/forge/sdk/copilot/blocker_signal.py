@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -12,6 +12,10 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.output_contracts import (
+    OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+    OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 
@@ -140,6 +144,53 @@ class CopilotToolBlockerSignal(BaseModel):
     @field_serializer("extra")
     def _serialize_extra(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
+
+
+def build_output_source_unobservable_blocker_signal(
+    *,
+    reason_code: str,
+    required_paths: Iterable[str],
+    block_label: str,
+) -> CopilotToolBlockerSignal:
+    """Honest pre-run terminal for an output contract whose requested values have no
+    observable extraction source at build time (a click-only trajectory, or an
+    actuation ladder exhausted without a keyable structure). The draft is preserved."""
+    paths = sorted({str(path).strip() for path in required_paths if str(path).strip()})
+    path_text = ", ".join(paths)
+    if reason_code == OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE:
+        user_facing = (
+            "I can build the steps for this workflow, but the values you asked me to return"
+            f"{f' ({path_text})' if path_text else ''} are not observable on the pages this run "
+            "visits, so there is nothing for the workflow to read them from. I've kept the draft; "
+            "tell me where those values appear and I'll wire them up."
+        )
+    else:
+        user_facing = (
+            "I couldn't shape this workflow so it reliably returns the values you asked for"
+            f"{f' ({path_text})' if path_text else ''}. I've kept the current draft; let me know "
+            "where those values show up and I'll try a different structure."
+        )
+    agent_steer = (
+        "STOP: the requested output contract has no observable extraction source in the current "
+        f"trajectory for required path(s) [{path_text or '(unknown)'}]. This is not repairable by "
+        "re-authoring the same draft. Report the missing source to the user and ask where the "
+        "values appear. The prior draft is preserved; do not rerun the blocks."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steer,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=reason_code,
+        extra={
+            "output_contract_terminal_reason_code": reason_code,
+            "canonical_required_child_paths": paths,
+            "block_label": block_label,
+        },
+    )
 
 
 def build_llm_tool_error_payload(signal: CopilotToolBlockerSignal) -> str:
@@ -277,7 +328,11 @@ _LOOP_PROGRESS_TOOLS = frozenset(
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
+UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
 _RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
+_OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
+    {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
+)
 
 
 def _should_stash_over_existing(
@@ -285,6 +340,11 @@ def _should_stash_over_existing(
     incoming: CopilotToolBlockerSignal,
 ) -> bool:
     if not isinstance(existing, CopilotToolBlockerSignal):
+        return True
+    if (
+        incoming.internal_reason_code in _OUTPUT_CONTRACT_TERMINAL_REASON_CODES
+        and existing.blocker_kind == "loop_detected"
+    ):
         return True
     if (
         incoming.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE

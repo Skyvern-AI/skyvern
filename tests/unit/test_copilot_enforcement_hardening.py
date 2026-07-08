@@ -454,10 +454,25 @@ def _ceiling_reached_contract() -> DiagnosisRepairContract:
     )
 
 
-def test_repair_ceiling_precedes_code_authoring_churn_backstop() -> None:
+def test_zero_run_ceiling_yields_to_code_authoring_churn_backstop() -> None:
     ctx = _fresh_context()
     ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def test_run_backed_ceiling_precedes_code_authoring_churn_backstop() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+    ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -492,11 +507,27 @@ def test_credential_priority_churn_defers_below_higher_bound() -> None:
     assert ctx.blocker_signal is None
 
 
-def test_credential_priority_churn_defers_to_repair_ceiling() -> None:
+def test_zero_run_ceiling_yields_to_credential_priority_churn() -> None:
     ctx = _fresh_context()
     ctx.code_authoring_guardrail_reject_count = MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
     ctx.last_code_authoring_reject_was_credential_priority = True
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "credential_priority_authoring_churn"
+
+
+def test_run_backed_ceiling_precedes_credential_priority_churn() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS
+    ctx.last_code_authoring_reject_was_credential_priority = True
+    ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -530,10 +561,25 @@ def test_no_progress_interaction_floor_does_not_raise_below_ceiling() -> None:
     assert ctx.blocker_signal is None
 
 
-def test_no_progress_interaction_floor_defers_to_repair_ceiling() -> None:
+def test_zero_run_ceiling_yields_to_no_progress_interaction_floor() -> None:
     ctx = _fresh_context()
     ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "loop_detected_no_forward_progress_interaction"
+
+
+def test_run_backed_ceiling_precedes_no_progress_interaction_floor() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+    ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)

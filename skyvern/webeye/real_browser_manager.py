@@ -221,6 +221,7 @@ class RealBrowserManager(BrowserManager):
             page=None,
             browser_artifacts=browser_artifacts,
             browser_cleanup=browser_cleanup,
+            release_driver_on_close=browser_address is not None,
         )
 
     def evict_page(self, page_id: str) -> None:
@@ -300,6 +301,7 @@ class RealBrowserManager(BrowserManager):
                 await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
+                    organization_id=task.organization_id,
                 )
 
         self.pages[task.task_id] = browser_state
@@ -469,6 +471,7 @@ class RealBrowserManager(BrowserManager):
                 await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
+                    organization_id=workflow_run.organization_id,
                 )
 
         self.pages[workflow_run_id] = browser_state
@@ -656,7 +659,12 @@ class RealBrowserManager(BrowserManager):
             # honest signal — it hits ``{task_id}.png`` for standalone tasks
             # and is a deliberate no-op for workflow tasks.
             await self._stop_frame_publisher(task_id=task_id)
-            await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
+            # A state backing a persistent session stays cached in the sessions
+            # manager for reuse; its driver is released when the session closes.
+            await browser_state_to_close.close(
+                close_browser_on_completion=close_browser_on_completion,
+                release_driver=False if browser_session_id else None,
+            )
         LOG.info("Task is cleaned up")
 
         if browser_session_id:
@@ -744,7 +752,10 @@ class RealBrowserManager(BrowserManager):
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
                 await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
-                await browser_state_to_close.close(close_browser_on_completion=effective_close)
+                await browser_state_to_close.close(
+                    close_browser_on_completion=effective_close,
+                    release_driver=False if (shared or browser_session_id) else None,
+                )
 
         if not streams_active:
             self.pages.pop(workflow_run_id, None)
@@ -763,7 +774,10 @@ class RealBrowserManager(BrowserManager):
                     workflow_run_id=workflow_run_id,
                 )
             try:
-                await task_browser_state.close(close_browser_on_completion=effective_close)
+                await task_browser_state.close(
+                    close_browser_on_completion=effective_close,
+                    release_driver=False if (shared or browser_session_id) else None,
+                )
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",

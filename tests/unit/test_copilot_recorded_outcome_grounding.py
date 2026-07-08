@@ -5,14 +5,18 @@ from types import SimpleNamespace
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import _recorded_build_test_outcome_prompt
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
     arm_recorded_outcome_grounding_requirement,
+    authored_block_signatures_from_workflow,
     maybe_satisfy_recorded_outcome_grounding_requirement,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -21,10 +25,68 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     VerificationResult,
 )
+from skyvern.forge.sdk.copilot.enforcement import MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.run_execution import _update_repair_loop_state
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _commit_recorded_outcome_early_terminal,
+    _record_author_time_reject_outcome,
+    _record_code_authoring_guardrail_reject,
+    _recorded_outcome_convergence_reject,
+)
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+
+_OWNING_BLOCK_WORKFLOW = """
+title: Registry lookup
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: search_records
+    code: |
+      return {"records": [{"npi": "123"}]}
+"""
+
+_OWNING_BLOCK_WORKFLOW_DESCRIPTION_EDIT = """
+title: Registry lookup
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: search_records
+    description: Human-facing note adjusted; steps identical
+    code: |
+      return {"records": [{"npi": "123"}]}
+"""
+
+_OWNING_BLOCK_WORKFLOW_RENAMED = """
+title: Registry lookup
+workflow_definition:
+  blocks:
+  - block_type: code
+    label: renamed_records
+    code: |
+      return {"records": [{"npi": "123"}]}
+"""
+
+_OWNING_BLOCK_WORKFLOW_SIBLING_MOVE = """
+title: Registry lookup
+workflow_definition:
+  parameters:
+  - key: added_param
+    parameter_type: workflow
+  blocks:
+  - block_type: code
+    label: search_records
+    code: |
+      return {"records": [{"npi": "123"}]}
+"""
+
+
+@pytest.fixture(autouse=True)
+def _disable_author_time_gate_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", False)
 
 
 def _outcome(**updates: object) -> RecordedBuildTestOutcome:
@@ -43,14 +105,26 @@ def _outcome(**updates: object) -> RecordedBuildTestOutcome:
     return RecordedBuildTestOutcome(**base)  # type: ignore[arg-type]
 
 
-def _ctx(outcome: RecordedBuildTestOutcome | None = None) -> SimpleNamespace:
+def _ctx(outcome: RecordedBuildTestOutcome | None = None) -> CopilotContext:
     history = []
     if outcome is not None:
         history = [
             {"structural_key": outcome.structural_key, "is_authoritative": True},
             {"structural_key": outcome.structural_key, "is_authoritative": True},
         ]
-    return SimpleNamespace(
+    return CopilotContext(
+        organization_id="o",
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=SimpleNamespace(),  # type: ignore[arg-type]
+        user_message="Fix the workflow",
+        turn_intent=TurnIntent(
+            mode=TurnIntentMode.EDIT,
+            user_goal="Fix the workflow",
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+        ),
         latest_recorded_build_test_outcome=outcome,
         recorded_build_test_outcome_history=history,
         recorded_outcome_grounding_requirement=None,
@@ -66,12 +140,10 @@ def _ctx(outcome: RecordedBuildTestOutcome | None = None) -> SimpleNamespace:
         turn_halt=None,
         observed_browser_urls=["https://example.com/results"],
         consecutive_tool_tracker=[],
-        tool_failure_history=[],
         tool_activity=[],
         pending_reconciliation_run_id=None,
         pending_reconciliation_requires_user_input=False,
         post_budget_page_inspection_required=False,
-        workflow_verification_evidence=SimpleNamespace(active_run_terminal_evidence_detected=False),
         last_failure_category_top=None,
         repeated_action_fingerprint_streak_count=0,
         last_test_non_retriable_nav_error=None,
@@ -122,6 +194,29 @@ def test_repeated_authoritative_outcome_arms_grounding_before_repair_ceiling() -
     assert requirement.required_target_url == "current_page"
     assert requirement.workflow_run_id == "wr_123"
     assert ctx.blocker_signal is None
+
+
+def test_log_only_recorded_outcome_grounding_records_without_stashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    result = _tool_loop_error(ctx, "update_workflow")
+
+    assert result is None
+    assert ctx.blocker_signal is None
+    assert ctx.latest_tool_blocker_signal is None
+    assert ctx.turn_halt is None
+    event = ctx.author_time_gate_ablation_events[-1]
+    assert event.gate_id == "recorded_outcome_grounding"
+    assert event.reason_code == "recorded_outcome_grounding_required"
+    assert event.blocked_tool == "update_workflow"
+    assert event.fingerprint == outcome.structural_key
+    assert event.log_only is True
 
 
 def test_authoritative_persisted_outcome_arms_without_recorded_signature_prefix(
@@ -256,7 +351,27 @@ def test_grounding_rejection_logs_reason_and_run_id_fields(
     assert event["current_url_present"] is (reject_reason != "no_url")
 
 
-def test_no_run_degraded_grounding_remains_unsatisfied_and_logs_degraded_page() -> None:
+def test_evaluate_grounding_payload_requires_inspect_recovery() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = _bounded_inspect_evidence(
+        source_tool="evaluate",
+        workflow_run_id=None,
+        observed_after_workflow_run=False,
+    )
+
+    with capture_logs() as logs:
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
+    assert event["reject_reason"] == "not_inspect_source"
+    assert event["source_tool"] == "evaluate"
+
+    assert _tool_loop_error(ctx, "evaluate", {}) is None
+
+
+def test_no_run_degraded_grounding_satisfies_with_typed_capture_degraded_payload() -> None:
     outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
     ctx = _ctx(outcome)
     arm_recorded_outcome_grounding_requirement(ctx)
@@ -269,11 +384,14 @@ def test_no_run_degraded_grounding_remains_unsatisfied_and_logs_degraded_page() 
         challenge_controls=[],
     )
 
-    with capture_logs() as logs:
-        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
 
-    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
-    assert event["reject_reason"] == "degraded_page"
+    requirement = ctx.recorded_outcome_grounding_requirement
+    assert requirement is not None
+    payload = requirement.payload
+    assert payload is not None
+    assert payload.capture_degraded is True
+    assert payload.payload_workflow_run_id is None
 
 
 def test_persisted_degraded_empty_grounding_satisfies_and_reaches_prompt() -> None:
@@ -490,3 +608,304 @@ def test_grounding_payload_reaches_recorded_outcome_prompt() -> None:
     assert f"repeated_structural_key: {outcome.structural_key}" in prompt
     assert "source_tool: inspect_page_for_composition" in prompt
     assert "observed_after_workflow_run: false" in prompt
+
+
+def _binding_ctx() -> SimpleNamespace:
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    ctx.workflow_yaml = _OWNING_BLOCK_WORKFLOW
+    ctx.code_artifact_metadata = None
+    ctx.recorded_outcome_binding_constraint = None
+    return ctx
+
+
+def test_satisfy_binds_typed_constraint_with_frontier_facet_and_owning_blocks() -> None:
+    ctx = _binding_ctx()
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = _bounded_inspect_evidence()
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+
+    constraint = ctx.recorded_outcome_binding_constraint
+    assert isinstance(constraint, RecordedOutcomeBindingConstraint)
+    assert constraint.repeated_structural_key == ctx.latest_recorded_build_test_outcome.structural_key
+    assert constraint.frontier_facet == "selector_frontier"
+    assert constraint.owning_block_labels == ["search_records"]
+    assert constraint.diagnostic_reason == "none"
+    assert constraint.frontier_uncrossable is False
+    assert constraint.recorded_block_signatures == {
+        "search_records": authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW, None)["search_records"]
+    }
+
+    prompt = _recorded_build_test_outcome_prompt(ctx)  # type: ignore[arg-type]
+    assert "RECORDED OUTCOME BINDING CONSTRAINT:" in prompt
+    assert "frontier_facet: selector_frontier" in prompt
+
+
+def test_degraded_capture_binds_uncrossable_constraint() -> None:
+    ctx = _binding_ctx()
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = _bounded_inspect_evidence(
+        forms=[], result_containers=[], navigation_targets=[], challenge_controls=[]
+    )
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+
+    constraint = ctx.recorded_outcome_binding_constraint
+    assert isinstance(constraint, RecordedOutcomeBindingConstraint)
+    assert constraint.diagnostic_reason == "capture_degraded"
+    assert constraint.frontier_uncrossable is True
+
+
+def test_convergence_reject_only_when_owning_block_frontier_unchanged() -> None:
+    outcome = _outcome(authored_structure_signature="different_whole_signature")
+    recorded_sig = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW, None)["search_records"]
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=outcome.structural_key or "",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_records"],
+        recorded_block_signatures={"search_records": recorded_sig},
+    )
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_binding_constraint=constraint,
+    )
+
+    unchanged = _recorded_outcome_convergence_reject(
+        ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW, code_artifact_metadata=None
+    )
+    assert unchanged is not None
+    assert unchanged.reason == "frontier_unchanged"
+    assert unchanged.commit_early_terminal is False
+
+    moved_yaml = _OWNING_BLOCK_WORKFLOW.replace('"123"', '"456"')
+    assert _recorded_outcome_convergence_reject(ctx, workflow_yaml=moved_yaml, code_artifact_metadata=None) is None
+
+
+def test_convergence_reject_identical_authored_structure() -> None:
+    signature = run_execution_module.authored_structure_signature_from_workflow(_OWNING_BLOCK_WORKFLOW, None)
+    outcome = _outcome(authored_structure_signature=signature)
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_binding_constraint=None,
+    )
+
+    decision = _recorded_outcome_convergence_reject(
+        ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW, code_artifact_metadata=None
+    )
+    assert decision is not None
+    assert decision.reason == "identical_authored_structure"
+
+
+def test_convergence_reject_uncrossable_frontier_commits_early_terminal() -> None:
+    outcome = _outcome(authored_structure_signature="different_whole_signature")
+    recorded_sig = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW, None)["search_records"]
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=outcome.structural_key or "",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_records"],
+        diagnostic_reason="challenge_gated",
+        recorded_block_signatures={"search_records": recorded_sig},
+    )
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_binding_constraint=constraint,
+        blocker_signal=None,
+        turn_halt=None,
+        consecutive_non_converging_repair_count=2,
+    )
+
+    decision = _recorded_outcome_convergence_reject(
+        ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW, code_artifact_metadata=None
+    )
+    assert decision is not None
+    assert decision.reason == "frontier_unchanged"
+    assert decision.commit_early_terminal is True
+
+    _commit_recorded_outcome_early_terminal(ctx)
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.REPAIR_CEILING_REACHED
+    assert ctx.blocker_signal.internal_reason_code == "repair_ceiling_reached"
+    assert ctx.blocker_signal.renders_final_reply is True
+    assert ctx.blocker_signal.preserves_workflow_draft is True
+    assert ctx.blocker_signal.user_facing_reason.strip()
+    assert "can't get past this page" in ctx.blocker_signal.user_facing_reason
+    assert ctx.turn_halt.blocker_signal is ctx.blocker_signal
+
+
+def test_block_signature_keys_on_code_not_label_or_description() -> None:
+    base = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW, None)
+    described = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW_DESCRIPTION_EDIT, None)
+    renamed = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW_RENAMED, None)
+    code_moved = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW.replace('"123"', '"456"'), None)
+
+    assert described["search_records"] == base["search_records"]
+    assert renamed["renamed_records"] == base["search_records"]
+    assert code_moved["search_records"] != base["search_records"]
+
+
+def test_description_only_edit_reads_as_identical_authored_structure() -> None:
+    signature = run_execution_module.authored_structure_signature_from_workflow(_OWNING_BLOCK_WORKFLOW, None)
+    outcome = _outcome(authored_structure_signature=signature)
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_binding_constraint=None,
+    )
+
+    decision = _recorded_outcome_convergence_reject(
+        ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW_DESCRIPTION_EDIT, code_artifact_metadata=None
+    )
+    assert decision is not None
+    assert decision.reason == "identical_authored_structure"
+
+
+def test_frontier_unchanged_reject_fires_when_whole_signature_moves_but_owning_block_holds() -> None:
+    outcome = _outcome(authored_structure_signature="whole_signature_from_prior_attempt")
+    recorded_sig = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW, None)["search_records"]
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=outcome.structural_key or "",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_records"],
+        recorded_block_signatures={"search_records": recorded_sig},
+    )
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=outcome,
+        recorded_outcome_binding_constraint=constraint,
+    )
+
+    decision = _recorded_outcome_convergence_reject(
+        ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW_SIBLING_MOVE, code_artifact_metadata=None
+    )
+    assert decision is not None
+    assert decision.reason == "frontier_unchanged"
+    assert decision.commit_early_terminal is False
+
+
+def test_binding_enforces_across_consecutive_author_time_rejects() -> None:
+    run_outcome = _outcome(authored_structure_signature="run_whole_signature")
+    recorded_sig = authored_block_signatures_from_workflow(_OWNING_BLOCK_WORKFLOW, None)["search_records"]
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=run_outcome.structural_key or "",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_records"],
+        recorded_block_signatures={"search_records": recorded_sig},
+    )
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=run_outcome,
+        recorded_outcome_binding_constraint=constraint,
+    )
+
+    first = _recorded_outcome_convergence_reject(ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW, code_artifact_metadata=None)
+    assert first is not None
+    assert first.reason == "frontier_unchanged"
+
+    # The first reject re-keys `latest` to an author-time reject outcome whose structural key
+    # differs from the bound run outcome; the binding must still enforce on the next
+    # different-structure-but-frontier-unchanged submit.
+    author_time_latest = _outcome(
+        phase="author_time_reject",
+        reason_code="unchanged_after_recorded_outcome",
+        structural_failure_identity="author_time:rekeyed",
+        authored_structure_signature="author_time_reject_whole_signature",
+    )
+    assert author_time_latest.structural_key != constraint.repeated_structural_key
+    ctx.latest_recorded_build_test_outcome = author_time_latest
+
+    second = _recorded_outcome_convergence_reject(
+        ctx, workflow_yaml=_OWNING_BLOCK_WORKFLOW_SIBLING_MOVE, code_artifact_metadata=None
+    )
+    assert second is not None
+    assert second.reason == "frontier_unchanged"
+
+
+def test_sibling_churn_frontier_unchanged_rejects_reach_honest_churn_stop() -> None:
+    ctx = _ctx()
+
+    for index in range(MAX_CODE_AUTHORING_GUARDRAIL_REJECTS):
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="unchanged_after_recorded_outcome",
+            summary="The authored code and output structure are unchanged after the last recorded test outcome.",
+            structural_payload={
+                "reason_code": "unchanged_after_recorded_outcome",
+                "authored_structure_signature": f"moving_whole_signature_{index}",
+                "block_labels": ["search_records"],
+            },
+            authored_structure_signature=f"moving_whole_signature_{index}",
+            block_labels=["search_records"],
+        )
+        _record_code_authoring_guardrail_reject(ctx, frontier_unchanged=True)
+
+    # Sibling churn moves the whole-signature key every turn, so each recorded outcome reads as a
+    # non-repeat; the frontier-unchanged flag keeps the churn counter climbing to the honest stop
+    # instead of resetting and riding to max_turns.
+    assert (
+        ctx.recorded_build_test_outcome_history[-1]["structural_key"]
+        != ctx.recorded_build_test_outcome_history[-2]["structural_key"]
+    )
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+    assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def test_early_terminal_renders_typed_final_reply_and_preserves_draft() -> None:
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key="repeated_key",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+        owning_block_labels=["search_records"],
+        diagnostic_reason="challenge_gated",
+    )
+    ctx = SimpleNamespace(
+        recorded_outcome_binding_constraint=constraint,
+        blocker_signal=None,
+        turn_halt=None,
+        consecutive_non_converging_repair_count=3,
+    )
+
+    _commit_recorded_outcome_early_terminal(ctx)
+
+    signal = ctx.blocker_signal
+    assert signal.renders_final_reply is True
+    assert signal.recovery_hint == "report_blocker_to_user"
+    assert signal.blocked_tool == "update_workflow"
+    assert signal.cleared_by_tools == frozenset()
+    assert signal.preserves_workflow_draft is True
+    assert signal.internal_reason_code == "repair_ceiling_reached"
+    assert "can't get past this page" in signal.user_facing_reason
+    assert signal.internal_reason_code not in signal.user_facing_reason
+
+    assert ctx.turn_halt.kind == TurnHaltKind.REPAIR_CEILING_REACHED
+    assert ctx.turn_halt.blocker_signal is signal
+    assert ctx.turn_halt.draft_state == {"preserves_workflow_draft": True}
+    assert ctx.turn_halt.extra["consecutive_identical_repair_count"] == 3
+
+
+def test_update_repair_loop_state_clears_stale_requirement_when_outcome_not_authoritative() -> None:
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    assert ctx.recorded_outcome_grounding_requirement is not None
+    ctx.recorded_outcome_binding_constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=outcome.structural_key or "",
+        phase="persisted_block_run",
+        reason_code="runtime_block_failure",
+        frontier_facet="selector_frontier",
+    )
+
+    ctx.latest_recorded_build_test_outcome = None
+    ctx.recorded_build_test_outcome_history = []
+
+    _update_repair_loop_state(ctx, _contract())
+
+    assert ctx.recorded_outcome_grounding_requirement is None
+    assert ctx.recorded_outcome_binding_constraint is None

@@ -24,6 +24,8 @@ export interface CredentialResponse {
     user_context?: string;
     /** Whether the user intends to save a browser session, regardless of test outcome */
     save_browser_session_intent?: boolean;
+    /** ID of the credential folder this credential belongs to, if any */
+    folder_id?: string;
 }
 
 export namespace CredentialResponse {

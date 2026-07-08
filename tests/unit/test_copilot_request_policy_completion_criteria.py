@@ -9,6 +9,7 @@ import pytest
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
+    _criterion_reconcile_key,
     criteria_from_json,
     criteria_to_json,
     reconcile_completion_criteria,
@@ -18,7 +19,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
     _apply_requested_output_completion_criteria,
+    _apply_validation_classification_completion_criteria,
     _classify_request,
+    _criterion_grounding_mode,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
     build_classifier_fallback_floor,
@@ -1680,3 +1683,202 @@ def test_requested_output_criteria_can_exceed_cap_without_dropping_requested_fie
         "output.specialty",
         "output.date",
     }
+
+
+def test_parser_preserves_boolean_expected_value_and_promotes_independent_source() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record selects the highest-priority document.",
+                "output_path": "output.selected_highest_priority",
+                "expected_output_value": True,
+            }
+        ]
+    )
+
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_value is True
+    assert criteria[0].requested_output_evidence_source == "independent_run_evidence"
+    assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
+
+
+def test_parser_promotes_goal_judgment_boolean_shape_without_explicit_value() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports whether the highest-priority item was selected.",
+                "output_path": "output.selected_highest_priority",
+                "expected_output_shape": "goal_judgment_boolean",
+            }
+        ]
+    )
+
+    assert criteria[0].expected_output_shape == "goal_judgment_boolean"
+    assert criteria[0].requested_output_evidence_source == "independent_run_evidence"
+    assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
+
+
+def test_parser_dedup_keeps_runtime_string_and_judgment_boolean_on_same_path() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes the selection label.",
+                "output_path": "output.selection",
+                "expected_output_value": "true",
+            },
+            {
+                "outcome": "The returned record reports the selection judgment.",
+                "output_path": "output.selection",
+                "expected_output_value": True,
+            },
+        ]
+    )
+
+    assert len(criteria) == 2
+    modes = {_criterion_grounding_mode(criterion) for criterion in criteria}
+    assert modes == {"exact_value", "judgment_boolean"}
+
+
+def test_declared_judgment_coerces_stringy_boolean_to_typed_bool() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports the highest-priority selection judgment.",
+                "output_path": "output.selected_highest_priority",
+                "expected_output_value": "true",
+                "requested_output_evidence_source": "independent_run_evidence",
+            }
+        ]
+    )
+
+    assert criteria[0].expected_output_value is True
+    assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
+
+
+def test_bare_stringy_boolean_without_judgment_signal_stays_exact_value() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes the selection label.",
+                "output_path": "output.selection",
+                "expected_output_value": "true",
+            }
+        ]
+    )
+
+    assert criteria[0].expected_output_value == "true"
+    assert _criterion_grounding_mode(criteria[0]) == "exact_value"
+
+
+def test_store_round_trip_preserves_boolean_expected_value_and_source() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports the false judgment.",
+                "output_path": "output.is_duplicate",
+                "expected_output_value": False,
+            }
+        ]
+    )
+
+    round_tripped = criteria_from_json(criteria_to_json(list(criteria)))
+
+    assert round_tripped[0].expected_output_value is False
+    assert round_tripped[0].requested_output_evidence_source == "independent_run_evidence"
+    assert _criterion_grounding_mode(round_tripped[0]) == "judgment_boolean"
+
+
+def test_expected_false_survives_active_criteria_rendering() -> None:
+    criterion = _criterion(
+        "c_bool",
+        "The returned record reports the false judgment.",
+        output_path="output.is_duplicate",
+        expected_output_value=False,
+        requested_output_evidence_source="independent_run_evidence",
+    )
+
+    rendered = json.loads(_render_active_criteria_for_prompt([criterion]))
+
+    assert rendered[0]["expected_output_value"] is False
+
+
+def test_reconcile_key_distinguishes_false_from_absent_and_string_false() -> None:
+    false_bool = _criterion(
+        "c_false_bool",
+        "outcome",
+        output_path="output.flag",
+        expected_output_value=False,
+        requested_output_evidence_source="independent_run_evidence",
+    )
+    absent = _criterion("c_absent", "outcome", output_path="output.flag")
+    string_false = _criterion(
+        "c_string_false",
+        "outcome",
+        output_path="output.flag",
+        expected_output_value="false",
+    )
+
+    keys = {
+        _criterion_reconcile_key(false_bool),
+        _criterion_reconcile_key(absent),
+        _criterion_reconcile_key(string_false),
+    }
+    assert len(keys) == 3
+
+
+def test_criteria_from_json_coerces_stored_stringy_judgment_boolean_to_typed_bool() -> None:
+    raw_outcome = "The returned record reports the highest-priority selection judgment."
+    raw_criterion = {
+        "outcome": raw_outcome,
+        "output_path": "output.selected_highest_priority",
+        "expected_output_value": "true",
+        "requested_output_evidence_source": "independent_run_evidence",
+    }
+    restored = criteria_from_json([{"id": "c0", **raw_criterion}])
+    parsed = _parse_completion_criteria([raw_criterion])
+
+    assert restored[0].expected_output_value is True
+    assert _criterion_reconcile_key(restored[0]) == _criterion_reconcile_key(parsed[0])
+
+
+def test_scope_boundary_boolean_on_login_only_rekinds_and_drops_judgment_invariant() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_login_only",
+                "The workflow only reaches the login page.",
+                output_path="output.login_only",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_validation_classification_completion_criteria(policy)
+
+    promoted = policy.completion_criteria[0]
+    assert promoted.kind == "validation_classification"
+    assert promoted.classification_output_key == "login_only"
+    assert promoted.expected_output_value is None
+    assert promoted.requested_output_evidence_source == "runtime_output"
+
+
+def test_scope_boundary_boolean_on_non_enumerated_path_keeps_judgment_invariant() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion(
+                "c_judgment",
+                "The returned record reports the selection judgment.",
+                output_path="output.selected_highest_priority",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            )
+        ]
+    )
+
+    _apply_validation_classification_completion_criteria(policy)
+
+    kept = policy.completion_criteria[0]
+    assert kept.kind == "outcome"
+    assert kept.expected_output_value is True
+    assert kept.requested_output_evidence_source == "independent_run_evidence"

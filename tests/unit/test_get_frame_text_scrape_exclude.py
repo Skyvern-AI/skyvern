@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 import pytest
 
 from skyvern.webeye.scraper import scraper
+from skyvern.webeye.scraper.scraped_page import ScrapeFrameDecision
 
 
 def _make_frame(url: str, child_frames: list | None = None) -> MagicMock:
@@ -64,9 +65,9 @@ async def test_get_frame_text_skips_excluded_child_and_its_subtree() -> None:
     child_real = _make_frame("https://example.com/embed")
     main = _make_frame("https://example.com/", child_frames=[child_ad, child_real])
 
-    async def _exclude(page, frame) -> bool:
+    async def _exclude(page, frame) -> ScrapeFrameDecision:
         hostname = urlparse(frame.url or "").hostname or ""
-        return hostname == "ads.example.invalid"
+        return ScrapeFrameDecision(exclude=hostname == "ads.example.invalid")
 
     visited: list[str] = []
 
@@ -96,9 +97,9 @@ async def test_get_frame_text_keeps_child_when_exclude_returns_false() -> None:
 
     exclude_calls: list[tuple[object, object]] = []
 
-    async def _exclude(page, frame) -> bool:
+    async def _exclude(page, frame) -> ScrapeFrameDecision:
         exclude_calls.append((page, frame))
-        return False
+        return ScrapeFrameDecision(exclude=False)
 
     visited: list[str] = []
 
@@ -127,7 +128,7 @@ async def test_get_frame_text_still_skips_detached_children_before_predicate() -
     detached_child.is_detached = MagicMock(return_value=True)
     main = _make_frame("https://example.com/", child_frames=[detached_child])
 
-    async def _exclude(page, frame) -> bool:
+    async def _exclude(page, frame) -> ScrapeFrameDecision:
         raise AssertionError("predicate must not run for detached frames")
 
     with patch.object(scraper.SkyvernFrame, "evaluate", new=AsyncMock(return_value="root")):
