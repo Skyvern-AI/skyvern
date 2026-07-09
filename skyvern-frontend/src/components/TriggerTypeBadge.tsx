@@ -1,6 +1,7 @@
 import { TriggerType } from "@/api/types";
 import {
   CalendarIcon,
+  CubeIcon,
   CursorArrowIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
@@ -17,6 +18,10 @@ const triggerConfig: Record<
   [TriggerType.Manual]: {
     icon: <CursorArrowIcon className="size-3.5 text-slate-400" />,
     label: "Manual",
+  },
+  [TriggerType.Mcp]: {
+    icon: <CubeIcon className="size-3.5 text-emerald-400" />,
+    label: "MCP",
   },
   [TriggerType.Api]: {
     icon: <LightningBoltIcon className="size-3.5 text-amber-400" />,
