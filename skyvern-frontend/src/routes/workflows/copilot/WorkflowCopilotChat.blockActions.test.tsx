@@ -99,8 +99,15 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return {
     ...actual,
     useParams: () => routeParams.current,
+    useSearchParams: () => [new URLSearchParams(), vi.fn()],
   };
 });
+
+// Unrelated to this file's tests; the real hook needs a QueryClientProvider
+// this harness doesn't set up.
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: undefined }),
+}));
 
 const saveData = {
   title: "Test WF",
