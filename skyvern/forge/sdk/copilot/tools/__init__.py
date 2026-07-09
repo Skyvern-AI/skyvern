@@ -252,6 +252,9 @@ from .workflow_update import _record_workflow_proxy_location_span as _record_wor
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
 from .workflow_update import _scaffold_metadata_contract_for_update as _scaffold_metadata_contract_for_update
 from .workflow_update import _update_workflow as _update_workflow
+from .workflow_update import (
+    consume_output_contract_advisory_grant_for_run_result as consume_output_contract_advisory_grant_for_run_result,
+)
 
 LOG = structlog.get_logger()
 
@@ -482,6 +485,7 @@ async def run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
+        consume_output_contract_advisory_grant_for_run_result(copilot_ctx, result)
         completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         tool_visible_result = _tool_visible_result_after_completion_verification(
             copilot_ctx,
@@ -697,6 +701,7 @@ async def update_and_run_blocks_tool(
                 "raw_code_artifact_metadata": serialized_code_artifact_metadata
                 if scaffold_applied or envelope_imposed
                 else code_artifact_metadata,
+                "block_labels": block_labels,
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
@@ -779,6 +784,7 @@ async def update_and_run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
+        consume_output_contract_advisory_grant_for_run_result(copilot_ctx, run_result)
         completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         tool_visible_result = _tool_visible_result_after_completion_verification(
             copilot_ctx,

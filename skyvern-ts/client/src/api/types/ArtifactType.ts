@@ -2,6 +2,8 @@
 
 export const ArtifactType = {
     Recording: "recording",
+    Audio: "audio",
+    SessionReplay: "session_replay",
     BrowserConsoleLog: "browser_console_log",
     SkyvernLog: "skyvern_log",
     SkyvernLogRaw: "skyvern_log_raw",

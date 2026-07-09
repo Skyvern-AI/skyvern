@@ -11,6 +11,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
     CompletionCriterion,
+    JudgmentTruthCondition,
     _classifier_fallback_policy,
     _classify_request,
     _credential_ids,
@@ -91,7 +92,7 @@ class TestRequestPolicyPromptStructure:
             "{outcome, contingent_on, contingent_antecedent_output_path, "
             "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
             "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
-            "classification_output_key, expected_classification}"
+            "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
         ) in rendered
         assert "never hide it in outcome prose" in rendered
         assert (
@@ -107,6 +108,17 @@ class TestRequestPolicyPromptStructure:
         ) in rendered
         assert "classification_output_key=login_only and expected_classification=true" in rendered
         assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_completion_criteria_schema_exposes_judgment_truth_condition_fields(self) -> None:
+        rendered = _render()
+        assert "judgment_predicate: null unless expected_output_shape=goal_judgment_boolean" in rendered
+        assert "Use only the closed-vocabulary value login_gate_blocks_target" in rendered
+        assert "judgment_polarity_when_holds: null unless judgment_predicate is non-null" in rendered
+        assert "kind=outcome" in rendered
+        assert "output_path=output.login_gate_blocks_target" in rendered
+        assert "judgment_predicate=login_gate_blocks_target" in rendered
+        assert "judgment_polarity_when_holds=true" in rendered
+        assert "Do not use kind=validation_classification for this returned field" in rendered
 
     def test_priority_requested_output_evidence_source_guidance_is_present(self) -> None:
         rendered = _render()
@@ -139,6 +151,28 @@ class TestRequestPolicyPromptStructure:
         assert '"terminal_action_family": "request"' in rendered
         assert '"expected_output_value": "WTR-1842-DEMO"' in rendered
         assert '"expected_output_shape": "reference_code"' in rendered
+
+    def test_active_completion_criteria_render_judgment_truth_condition(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="the returned record reports whether the login gate blocks the target",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                    judgment_truth_condition=JudgmentTruthCondition(
+                        predicate="login_gate_blocks_target", polarity_when_holds=True
+                    ),
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"judgment_predicate": "login_gate_blocks_target"' in rendered
+        assert '"judgment_polarity_when_holds": true' in rendered
 
 
 class TestRawSecretBackstop:

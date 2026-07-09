@@ -98,6 +98,7 @@ const saveData = {
     proxyLocation: null,
     webhookCallbackUrl: null,
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
     browserProfileKey: null,
     model: null,

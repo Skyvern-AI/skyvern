@@ -20,7 +20,7 @@ def test_truncate_short_string_returns_unchanged() -> None:
 def test_truncate_long_string_keeps_tail() -> None:
     from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
 
-    value = "HEAD" + ("x" * 500_000) + "TAIL"
+    value = "HEAD" + ("x" * 800) + "TAIL"
     result = truncate_previous_extracted_information(value, max_tokens=100)
     assert isinstance(result, str)
     assert result.endswith("TAIL")

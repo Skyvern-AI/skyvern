@@ -25,4 +25,5 @@ export interface LoginBlockYaml {
     complete_criterion?: string;
     terminate_criterion?: string;
     complete_verification?: boolean;
+    skip_saved_profile?: boolean;
 }

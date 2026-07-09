@@ -374,7 +374,7 @@ class Skyvern(AsyncSkyvern):
         request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
-            workflow_id=workflow_id,
+            agent_id=workflow_id,
             parameters=parameters,
             template=template,
             title=title,

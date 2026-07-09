@@ -214,3 +214,37 @@ def test_keyword_match_ignores_fallback() -> None:
     result_without = _classify("browser crash detected", fallback_to_unknown=False)
 
     assert result_with[0]["category"] == result_without[0]["category"] == "BROWSER_ERROR"
+
+
+def test_activity_heartbeat_timeout_classifies_as_infrastructure() -> None:
+    reason = "Workflow run timed out: the workflow activity became unresponsive (activity heartbeat timeout)."
+    categories = _categories_for(reason)
+
+    assert categories[0] == "INFRASTRUCTURE_ERROR"
+    # An infra-level activity timeout must not masquerade as site/page-load slowness.
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+
+
+def test_generic_activity_timeout_classifies_as_infrastructure() -> None:
+    reason = "Workflow run timed out: the workflow activity became unresponsive (activity timeout)."
+    categories = _categories_for(reason)
+
+    assert categories[0] == "INFRASTRUCTURE_ERROR"
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+
+
+def test_page_load_timeout_still_classifies_without_activity_context() -> None:
+    categories = _categories_for("Navigation timeout while waiting for page load")
+
+    assert "PAGE_LOAD_TIMEOUT" in categories
+    assert "INFRASTRUCTURE_ERROR" not in categories
+
+
+def test_inactivity_timeout_is_not_infrastructure() -> None:
+    # "inactivity timeout" is a session/page-level reason; a naive substring match on
+    # "activity timeout" would wrongly reclassify it as INFRASTRUCTURE_ERROR and drop
+    # PAGE_LOAD_TIMEOUT. The word-anchored match must leave it alone.
+    categories = _categories_for("Session ended: inactivity timeout on the page")
+
+    assert "INFRASTRUCTURE_ERROR" not in categories
+    assert "PAGE_LOAD_TIMEOUT" in categories

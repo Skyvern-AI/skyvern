@@ -22,14 +22,15 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 
 
 class FakeLLMResponse:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, content: str | None = '{"actions": []}', finish_reason: str | None = None) -> None:
         self.model = model
-        self._content = '{"actions": []}'
+        self._content = content
         self.choices = [
             SimpleNamespace(
+                finish_reason=finish_reason,
                 message=SimpleNamespace(
-                    content=self._content,
-                )
+                    content=content,
+                ),
             )
         ]
         self.usage = SimpleNamespace(

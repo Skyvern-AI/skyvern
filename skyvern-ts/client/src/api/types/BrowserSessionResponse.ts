@@ -28,6 +28,8 @@ export interface BrowserSessionResponse {
     browser_type?: Skyvern.PersistentBrowserType;
     /** ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`. */
     browser_profile_id?: string;
+    /** Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile. */
+    generate_browser_profile?: boolean;
     /** Whether the browser session supports VNC streaming */
     vnc_streaming_supported?: boolean;
     /** The path where the browser session downloads files */

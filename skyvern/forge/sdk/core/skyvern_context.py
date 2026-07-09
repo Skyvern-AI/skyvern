@@ -91,6 +91,7 @@ class SkyvernContext:
     copilot_session_id: str | None = None
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
+    download_suffix: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
@@ -162,6 +163,10 @@ class SkyvernContext:
     last_classify_meta: dict[str, Any] | None = None
     current_step_actions: list[dict[str, Any]] | None = None
     skip_complete_verification: bool = False
+
+    # Set by ValidationBlock.execute() for the duration of the block so the prompt builder
+    # can drop page DOM/URL/screenshots from the validation prompt. Restored after the block.
+    validation_without_page_information: bool = False
 
     # v3 agentic reviewer — per-run cumulative budget. Initialized at workflow
     # run start for v3-cohort workflows; None for v2-cohort runs. SKY-7676.

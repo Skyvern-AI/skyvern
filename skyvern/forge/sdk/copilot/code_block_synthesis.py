@@ -1073,6 +1073,8 @@ def build_artifact_metadata_skeleton(
                 "text": _FILL_CRITERION_TEXT,
                 "level": "terminal",
                 "terminal": True,
+                "judgment_predicate": None,
+                "judgment_polarity_when_holds": None,
             }
         ],
         "terminal_verifier_expectations": [

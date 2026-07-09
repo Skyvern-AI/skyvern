@@ -20,6 +20,11 @@ export interface TagsResponse {
   tags: Array<TagResponse>;
 }
 
+export interface RunTagsResponse {
+  workflow_run_id: string;
+  tags: Array<TagResponse>;
+}
+
 export interface TagKey {
   key: string;
   description: string | null;
@@ -44,6 +49,10 @@ export interface TagValue {
 // metadata). Descriptions come from the tag-key registry (GET /tag-keys).
 export interface WorkflowTagsBatchResponse {
   workflow_tags: Record<string, Array<Tag>>;
+}
+
+export interface RunTagsBatchResponse {
+  run_tags: Record<string, Array<Tag>>;
 }
 
 // Body for POST /workflows/{wpid}/tags. `tags` sets/overwrites ({key?, value});

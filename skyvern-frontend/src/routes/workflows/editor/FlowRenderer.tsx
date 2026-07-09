@@ -69,7 +69,6 @@ import {
   WorkflowApiResponse,
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
-  WorkflowParameterValueType,
 } from "../types/workflowTypes";
 import {
   BitwardenCreditCardDataParameterYAML,
@@ -123,6 +122,7 @@ import {
   parameterIsBitwardenCredential,
   parameterIsAzureVaultCredential,
 } from "./types";
+import { skyvernCredentialToParameterYAML } from "./utils";
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
@@ -316,29 +316,7 @@ function convertToParametersYAML(
                 BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
             };
           } else if (parameterIsSkyvernCredential(parameter)) {
-            const hasCredentialRotation =
-              (parameter.credentialIds?.length ?? 0) >= 2;
-            if (
-              parameter.dataType === WorkflowParameterValueType.CredentialId &&
-              !hasCredentialRotation
-            ) {
-              return {
-                parameter_type: WorkflowParameterTypes.Workflow,
-                workflow_parameter_type:
-                  WorkflowParameterValueType.CredentialId,
-                default_value: parameter.credentialId,
-                key: parameter.key,
-                description: parameter.description || null,
-              };
-            }
-            return {
-              parameter_type: WorkflowParameterTypes.Credential,
-              credential_id: parameter.credentialId,
-              credential_ids: parameter.credentialIds ?? null,
-              selection_strategy: parameter.selectionStrategy ?? null,
-              key: parameter.key,
-              description: parameter.description || null,
-            };
+            return skyvernCredentialToParameterYAML(parameter);
           } else if (parameterIsOnePasswordCredential(parameter)) {
             return {
               parameter_type: WorkflowParameterTypes.OnePassword,

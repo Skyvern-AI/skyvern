@@ -52,6 +52,8 @@ export interface CreateBrowserSessionRequest {
     browser_type?: Skyvern.PersistentBrowserType;
     /** ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`. */
     browser_profile_id?: string;
+    /** When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag. */
+    generate_browser_profile?: boolean;
 }
 
 export namespace CreateBrowserSessionRequest {

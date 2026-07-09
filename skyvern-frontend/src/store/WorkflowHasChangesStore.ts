@@ -192,6 +192,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         proxy_location: saveData.settings.proxyLocation,
         webhook_callback_url: saveData.settings.webhookCallbackUrl,
         persist_browser_session: saveData.settings.persistBrowserSession,
+        pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
         browser_profile_id: saveData.settings.browserProfileId,
         browser_profile_key: saveData.settings.browserProfileKey,
         model: saveData.settings.model,

@@ -23,6 +23,19 @@ class WorkflowRunCredentialSelectionsRepository(BaseRepository):
             ).first()
             return selection.credential_id if selection else None
 
+    @db_operation("get_workflow_run_credential_selections_for_run")
+    async def get_selections_for_run(self, workflow_run_id: str) -> dict[str, str]:
+        async with self.Session() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        WorkflowRunCredentialSelectionModel.parameter_key,
+                        WorkflowRunCredentialSelectionModel.credential_id,
+                    ).where(WorkflowRunCredentialSelectionModel.workflow_run_id == workflow_run_id)
+                )
+            ).all()
+            return {parameter_key: credential_id for parameter_key, credential_id in rows}
+
     async def _get_selection(self, session: AsyncSession, workflow_run_id: str, parameter_key: str) -> str | None:
         selection = (
             await session.scalars(

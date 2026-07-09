@@ -4,6 +4,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .ai_fallback_mode import AiFallbackMode
 from .run_engine import RunEngine
 
 
@@ -26,6 +27,8 @@ class ActionBlockYaml(UniversalBaseModel):
     title: typing.Optional[str] = None
     engine: typing.Optional[RunEngine] = None
     navigation_goal: typing.Optional[str] = None
+    selector: typing.Optional[str] = None
+    ai_fallback: typing.Optional[AiFallbackMode] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     max_retries: typing.Optional[int] = None
     parameter_keys: typing.Optional[typing.List[str]] = None

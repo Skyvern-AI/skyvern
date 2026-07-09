@@ -9,6 +9,7 @@ export interface WorkflowSettingsState {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  pinSavedSessionIp: boolean;
   browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
@@ -32,6 +33,7 @@ const defaultState: Omit<
   webhookCallbackUrl: "",
   proxyLocation: ProxyLocation.Residential,
   persistBrowserSession: false,
+  pinSavedSessionIp: false,
   browserProfileKey: null,
   model: null,
   maxScreenshotScrollingTimes: null,

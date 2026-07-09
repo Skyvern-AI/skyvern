@@ -12,6 +12,7 @@ from agents import GuardrailFunctionOutput, OutputGuardrail, ToolInputGuardrailD
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
@@ -200,6 +201,19 @@ workflow_definition:
 
 
 def test_rejects_raw_secret_echo_in_user_response() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        user_response="I used password: hunter2 to test the login.",
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+
+def test_output_policy_still_blocks_with_author_time_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+
     verdict = evaluate_output_policy(
         request_policy=_policy(),
         user_response="I used password: hunter2 to test the login.",
@@ -576,6 +590,22 @@ def test_allows_sensitive_jinja_placeholder_in_navigation_goal() -> None:
 
 
 def test_rejects_reply_when_request_policy_required_clarification() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
+        response_type="REPLY",
+        user_response="I created the workflow with the credential.",
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
+
+
+def test_request_policy_clarification_still_blocks_with_author_time_log_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+
     verdict = evaluate_output_policy(
         request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
         response_type="REPLY",
@@ -1184,6 +1214,19 @@ def test_allows_approved_credential_id_in_workflow_yaml() -> None:
 
 
 def test_rejects_approved_credential_on_different_login_origin() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_credential_scope_still_blocks_with_author_time_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
+
     verdict = evaluate_output_policy(
         request_policy=_policy(),
         workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),

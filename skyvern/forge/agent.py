@@ -167,6 +167,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
 
@@ -518,8 +519,21 @@ class ForgeAgent:
                 continue
 
             if download_suffix:
-                final_file_name = download_suffix
-            elif randomize_if_missing:
+                # local_file_name is a bare basename for session (s3/gs) files but an absolute path for
+                # run-dir files; compare on basenames so a file already named by download_suffix is not
+                # treated as its own collision and bumped to ``<name>_1``.
+                local_basename = Path(local_file_name).name
+                existing_names = {
+                    Path(f).name
+                    for f in list_files_in_directory(workflow_download_directory)
+                    if Path(f).name != local_basename
+                }
+                desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                if local_basename != desired_name:
+                    rename_file(os.path.join(workflow_download_directory, local_file_name), desired_name)
+                continue
+
+            if randomize_if_missing:
                 random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                 final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
             else:
@@ -758,6 +772,7 @@ class ForgeAgent:
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
+        context.download_suffix = task_block.download_suffix if task_block else None
 
         # do not need to do complete verification when it's a CUA task
         # 1. CUA executes only one action step by step -- it's pretty less likely to have a hallucination for completion or forget to return a complete
@@ -3128,6 +3143,14 @@ class ForgeAgent:
                 verified=True,
             )
 
+        except SkyvernException:
+            # Expected transient failures (LLM response/scrape errors); the check re-runs next step.
+            LOG.warning(
+                "Failed to check user goal complete, skipping",
+                workflow_run_id=task.workflow_run_id,
+                exc_info=True,
+            )
+            return None
         except Exception:
             LOG.exception(
                 "Failed to check user goal complete, skipping",
@@ -3941,7 +3964,9 @@ class ForgeAgent:
                 error_code_mapping_str=error_code_mapping_str,
                 local_datetime=local_datetime,
             )
-            without_page_information = router_result.effective_without_page_information
+            without_page_information = (
+                router_result.effective_without_page_information or context.validation_without_page_information
+            )
 
             _prompt_build_span = otel_trace.get_current_span()
             _prompt_build_span.set_attribute("validation.router.mode", str(router_result.mode))
@@ -5500,10 +5525,16 @@ class ForgeAgent:
                     error_codes=[e.error_code for e in failure_response.errors],
                 )
 
-            failure_reason = (
-                f"Max retries per step ({max_retries_per_step}) exceeded."
-                f" Possible failure reasons: {failure_response.reasoning}"
-            )
+            summary_reasoning = (failure_response.reasoning or "").strip()
+            if summary_reasoning:
+                failure_reason = (
+                    f"Max retries per step ({max_retries_per_step}) exceeded."
+                    f" Possible failure reasons: {summary_reasoning}"
+                )
+            else:
+                failure_reason = (
+                    f"Max retries per step ({max_retries_per_step}) exceeded. {ReachMaxRetriesError().reasoning}"
+                )
             failure_category = failure_response.failure_categories or classify_from_failure_reason(
                 failure_reason, fallback_to_unknown=True
             )

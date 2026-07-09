@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -49,6 +49,8 @@ from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
+    DeliveredUnverifiedTerminalState,
+    degraded_contract_delivered_unverified_terminal_state,
     only_structural_requested_output_abstentions,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
@@ -115,6 +117,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
+    stash_delivered_unverified_turn_halt,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
@@ -178,6 +181,7 @@ from .credentials import (
 from .frontier import (
     _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS,
     _blocks_by_label,
+    _frontier_label_shape_hashes,
     _workflow_with_runtime_block_goal_context,
     _workflow_with_runtime_frontier_anchor,
     _workflow_with_runtime_frontier_starter_url_seed,
@@ -187,6 +191,7 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_page_inspected, _mark_post_run_page_observed
+from .workflow_update import record_output_contract_run_output_evidence
 
 LOG = structlog.get_logger()
 
@@ -812,22 +817,22 @@ def _should_use_fresh_session_for_login_first_replay(
     """Fresh session when this run replays a login fill into the scout's authenticated session.
 
     Keyed on two planes the agent cannot edit between runs — the scout trajectory authenticated
-    via a credential fill and this run's leading block fills one; frontier re-runs seeded past
-    login carry no leading credential fill and keep reusing the scout session.
+    via a credential fill and any executed block in this run fills one; frontier re-runs seeded
+    past login carry no credential fill and keep reusing the scout session.
     """
-    if not SettingsManager.get_settings().COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN:
-        return False
     if not trajectory_has_credential_fill(ctx.scout_trajectory):
         return False
     return _labels_replay_login_fill(labels_to_execute, workflow)
 
 
 def _labels_replay_login_fill(labels_to_execute: list[str], workflow: Workflow | None) -> bool:
-    if not labels_to_execute:
+    if not labels_to_execute or workflow is None:
         return False
-    by_label = _blocks_by_label(workflow.workflow_definition if workflow else None)
-    code = getattr(by_label.get(labels_to_execute[0]), "code", None)
-    return isinstance(code, str) and code_contains_credential_fill(code)
+    code_inputs = _selected_code_security_inputs(
+        _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+        selected_labels=set(labels_to_execute),
+    )
+    return any(code_contains_credential_fill(code_input.code) for code_input in code_inputs)
 
 
 def _runtime_code_security_failure_for_selected_labels(
@@ -1524,6 +1529,13 @@ async def _run_blocks_and_collect_debug(
         run_session_id = ctx.browser_session_id
         ctx.browser_session_id = debug_session_id
         used_fresh_run_session = True
+        LOG.info(
+            "copilot_login_replay_fresh_session_minted",
+            labels_to_execute=labels_to_execute,
+            frontier_start_label=frontier_start_label,
+            run_session_id=run_session_id,
+            debug_session_id=debug_session_id,
+        )
     else:
         session_err = await ensure_browser_session(ctx)
         if session_err is not None:
@@ -1535,6 +1547,7 @@ async def _run_blocks_and_collect_debug(
         ctx,
         labels_to_execute=labels_to_execute,
         runtime_frontier_anchor_url=runtime_frontier_anchor_url,
+        session_id_override=run_session_id,
     )
     runtime_frontier_starter_url_seeded = seeded_runtime_workflow is not runtime_workflow
     runtime_workflow = seeded_runtime_workflow
@@ -2345,9 +2358,8 @@ def _terminal_challenge_completion_verification(
     criterion_ids = list(completion_verification.criterion_ids)
     if not criterion_ids:
         return completion_verification
-    return CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=criterion_ids,
+    return replace(
+        completion_verification,
         verdicts=[
             CriterionVerdict(
                 criterion_id=criterion_id,
@@ -2471,11 +2483,49 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
         evidence.failure_reason = " ".join(failure_reason.split())[:240]
 
 
+def _read_mapping_path(payload: dict[str, Any], path: str) -> Any:
+    current: Any = payload
+    for part in path.split("."):
+        if not part or not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _delivered_unverified_single_block_outputs(
+    result: dict[str, Any],
+    terminal_state: DeliveredUnverifiedTerminalState,
+) -> dict[str, Any]:
+    data = result.get("data")
+    blocks = data.get("blocks") if isinstance(data, dict) else None
+    outputs: list[dict[str, Any]] = []
+    if isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, dict) and isinstance(block.get("extracted_data"), dict):
+                outputs.append(cast(dict[str, Any], block["extracted_data"]))
+    if len(outputs) != 1:
+        return {}
+    block_output = outputs[0]
+    observed: dict[str, Any] = {}
+    for verdict in terminal_state.observed_verdicts:
+        output_path = verdict.output_path or ""
+        normalized_path = output_path.removeprefix("output.").strip()
+        if not normalized_path or normalized_path.split(".")[-1] == "evidence_text":
+            continue
+        value = _read_mapping_path(block_output, normalized_path)
+        if value is None:
+            value = _read_mapping_path(block_output, output_path)
+        if value is not None:
+            observed[normalized_path] = value
+    return observed
+
+
 def _record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
 ) -> RecordedRunOutcome | None:
     """Record the run adjudication on ctx; for an ok run, return the typed
     per-run outcome verdict mirroring exactly what was recorded."""
+    record_output_contract_run_output_evidence(copilot_ctx, result)
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
@@ -2503,6 +2553,9 @@ def _record_run_blocks_result(
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
     copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
+    copilot_ctx.delivered_unverified_terminal = False
+    copilot_ctx.delivered_unverified_workflow_run_id = None
+    copilot_ctx.delivered_unverified_observed_outputs = {}
     # Watchdog cancels normally count as ok=False; only a coincident total
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
     cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
@@ -2683,6 +2736,37 @@ def _record_run_blocks_result(
             copilot_ctx.last_test_suspicious_success = False
             copilot_ctx.last_test_failure_reason = None
             copilot_ctx.suspicious_success_nudge_count = 0
+        delivered_unverified = degraded_contract_delivered_unverified_terminal_state(
+            completion_verification,
+            run_ok=run_ok,
+            workflow_run_id=run_id if isinstance(run_id, str) else None,
+            latest_workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id,
+            artifact_health_blocked=artifact_reason is not None,
+            terminal_blocked=terminal_challenge is not None or bool(copilot_ctx.last_test_anti_bot),
+        )
+        if delivered_unverified is not None:
+            observed_outputs = _delivered_unverified_single_block_outputs(result, delivered_unverified)
+            if observed_outputs:
+                workflow_run_id = run_id if isinstance(run_id, str) else None
+                copilot_ctx.last_test_suspicious_success = False
+                copilot_ctx.last_test_failure_reason = None
+                copilot_ctx.suspicious_success_nudge_count = 0
+                copilot_ctx.last_full_workflow_test_ok = False
+                copilot_ctx.delivered_unverified_terminal = True
+                copilot_ctx.delivered_unverified_workflow_run_id = workflow_run_id
+                copilot_ctx.delivered_unverified_observed_outputs = observed_outputs
+                stash_delivered_unverified_turn_halt(copilot_ctx, workflow_run_id=workflow_run_id)
+                update_repeated_failure_state(copilot_ctx, result)
+                _update_verification_evidence_from_run_result(copilot_ctx, result)
+                recorded_outcome = RecordedRunOutcome(
+                    verdict="not_evaluated",
+                    display_reason=run_outcome_display_reason(
+                        "The latest run returned the requested output, but it was not independently verified."
+                    ),
+                    workflow_run_id=workflow_run_id,
+                )
+                _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
+                return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
         if empty_data_blocks and not completion_verification_evaluated:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
@@ -2831,6 +2915,19 @@ def _record_adjudicated_build_test_outcome(
     )
     workflow_yaml = copilot_ctx.workflow_yaml
     code_artifact_metadata = copilot_ctx.code_artifact_metadata
+    workflow_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
+    raw_requested_block_labels = getattr(copilot_ctx, "last_requested_block_labels", None)
+    result_requested_block_labels = result_data.get("requested_block_labels") if isinstance(result_data, dict) else None
+    raw_requested_values: list[Any] = (
+        raw_requested_block_labels
+        if isinstance(raw_requested_block_labels, list)
+        else (result_requested_block_labels if isinstance(result_requested_block_labels, list) else [])
+    )
+    requested_block_labels = [label for label in raw_requested_values if isinstance(label, str)]
+    block_shape_hashes = _frontier_label_shape_hashes(
+        requested_block_labels,
+        workflow_definition,
+    )
     record_build_test_outcome(
         copilot_ctx,
         recorded_outcome_from_run_blocks_result(
@@ -2848,6 +2945,7 @@ def _record_adjudicated_build_test_outcome(
                 workflow_yaml,
                 code_artifact_metadata,
             ),
+            block_shape_hashes=block_shape_hashes or {},
         ),
     )
 
