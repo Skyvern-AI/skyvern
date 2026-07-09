@@ -322,6 +322,7 @@ async def skyvern_click(
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+    skip_element_prep = selector is not None and ai_mode is None and not deterministic
     used_ai_path = False
     native_option_selection = None
     resolved: str | None = None
@@ -347,7 +348,7 @@ async def skyvern_click(
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
-                resolved = await page.click(selector=selector, **kwargs)
+                resolved = await page.click(selector=selector, _skip_element_prep=skip_element_prep, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
@@ -866,6 +867,7 @@ async def skyvern_type(
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+    skip_element_prep = selector is not None and ai_mode is None and not deterministic
 
     with Timer() as timer:
         try:
@@ -880,7 +882,7 @@ async def skyvern_type(
                     await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=action_timeout)  # type: ignore[arg-type]
                 else:
                     assert selector is not None
-                    await page.fill(selector, text, timeout=action_timeout)
+                    await page.fill(selector, text, timeout=action_timeout, _skip_element_prep=skip_element_prep)
             else:
                 kwargs: dict[str, Any] = {"timeout": action_timeout}
                 if delay is not None:
@@ -892,7 +894,7 @@ async def skyvern_type(
                     await loc.type(text, **kwargs)
                 else:
                     assert selector is not None
-                    await page.type(selector, text, **kwargs)
+                    await page.type(selector, text, _skip_element_prep=skip_element_prep, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
