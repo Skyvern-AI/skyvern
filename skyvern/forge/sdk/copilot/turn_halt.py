@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -27,6 +27,9 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBIL
 
 LOG = structlog.get_logger()
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
+
 REPAIR_CEILING_REASON_CODE = "repair_ceiling_reached"
 ADVISORY_DISPATCH_STALLED_REASON_CODE = "advisory_dispatch_stalled"
 
@@ -38,10 +41,12 @@ class TurnHaltKind(StrEnum):
     REPAIR_CEILING_REACHED = "repair_ceiling_reached"
     SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
     OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
+    DELIVERED_UNVERIFIED = "delivered_unverified"
 
 
 class TurnHaltVerdict(StrEnum):
     BLOCKED = "blocked"
+    DELIVERED_UNVERIFIED = "delivered_unverified"
 
 
 _LOOP_TERMINAL_REASON_CODES = frozenset(
@@ -274,6 +279,21 @@ def stash_repair_ceiling_turn_halt(
             "source": "enforcement",
             "consecutive_identical_repair_count": consecutive_identical_repair_count,
         },
+    )
+    ctx.turn_halt = halt
+    LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
+    return halt
+
+
+def stash_delivered_unverified_turn_halt(ctx: AgentContext, *, workflow_run_id: str | None) -> TurnHalt | None:
+    if isinstance(ctx.turn_halt, TurnHalt):
+        return ctx.turn_halt
+    run_refs = {"workflow_run_id": workflow_run_id} if workflow_run_id else {}
+    halt = TurnHalt(
+        kind=TurnHaltKind.DELIVERED_UNVERIFIED,
+        verdict=TurnHaltVerdict.DELIVERED_UNVERIFIED,
+        run_refs=run_refs,
+        extra={"source": "run_execution"},
     )
     ctx.turn_halt = halt
     LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))

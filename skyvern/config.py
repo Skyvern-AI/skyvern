@@ -212,6 +212,7 @@ class Settings(BaseSettings):
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
+    ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
 

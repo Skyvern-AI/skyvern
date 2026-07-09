@@ -48,6 +48,8 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         browser_session_id="pbs_1",
         scouted_interactions=[],
         scout_trajectory=[],
+        prior_fill_carry=[],
+        fill_carry_rebound_done=False,
         observed_browser_urls=[],
         pending_scout_source_url=None,
         pending_browser_interaction_observation=None,

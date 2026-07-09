@@ -18,7 +18,12 @@ from yarl import URL
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
-from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime, SkyvernHTTPException
+from skyvern.exceptions import (
+    BlockedHost,
+    DownloadFileMaxSizeExceeded,
+    DownloadFileMaxWaitingTime,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
@@ -114,6 +119,19 @@ def _determine_download_filename(
         file_name = file_name + file_suffix
 
     return sanitize_filename(file_name)
+
+
+def _raise_download_response_for_status(response: aiohttp.ClientResponse) -> None:
+    if response.status < HTTPStatus.BAD_REQUEST:
+        return
+
+    raise aiohttp.ClientResponseError(
+        request_info=response.request_info,
+        history=response.history,
+        status=response.status,
+        message=response.reason,
+        headers=response.headers,
+    )
 
 
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
@@ -224,9 +242,7 @@ async def download_file(
         resolver = SSRFGuardedResolver()
         current_url = await validate_and_pin_fetch_url(url, resolver)
         request_headers = dict(headers or {})
-        async with aiohttp.ClientSession(
-            raise_for_status=True, connector=ssrf_guarded_tcp_connector(resolver)
-        ) as session:
+        async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
             LOG.info("Starting to download file", url=url)
             for _ in range(MAX_SAFE_REDIRECTS + 1):
                 encoded_url = encode_url(current_url)
@@ -242,6 +258,8 @@ async def download_file(
                         )
                         current_url = next_url
                         continue
+
+                    _raise_download_response_for_status(response)
 
                     # Check the content length if available
                     if max_size_mb and response.content_length and response.content_length > max_size_mb * 1024 * 1024:
@@ -301,7 +319,7 @@ async def download_file(
             )
     except aiohttp.ClientResponseError as e:
         # Re-raised and handled at the action/block boundary; server rejections are external.
-        LOG.warning(f"Failed to download file, status code: {e.status}", exc_info=True)
+        LOG.warning("Failed to download file", status_code=e.status)
         raise
     except DownloadFileMaxSizeExceeded as e:
         LOG.warning(f"Failed to download file, max size exceeded: {e.max_size}", exc_info=True)
@@ -317,6 +335,10 @@ async def download_file(
     except aiohttp.InvalidURL:
         # Malformed customer-provided URL - a client-data error, not a platform fault.
         LOG.warning("Failed to download file, invalid URL", exc_info=True)
+        raise
+    except BlockedHost:
+        # SSRF guard rejected the customer-provided host; policy outcome, kept at warning.
+        LOG.warning("Failed to download file, blocked host", exc_info=True)
         raise
     except Exception:
         LOG.exception("Failed to download file")

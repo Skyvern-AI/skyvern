@@ -440,6 +440,23 @@ async def _take_workflow_run_block_screenshot(
             )
 
 
+def _build_fallback_navigation_payload(context: skyvern_context.SkyvernContext) -> dict[str, Any] | None:
+    """Navigation payload for a cached block's agent fallback task.
+
+    Beyond the workflow-level ``script_run_parameters``, this threads the current loop
+    iteration's value (``current_value`` / ``current_index`` / ``current_item``) into the
+    payload. Without it the fallback agent only sees the rendered goal prose, so select/search
+    interactions inside a loop resolve to a page-visible label instead of the intended value
+    (SKY-10708).
+    """
+    payload: dict[str, Any] = dict(context.script_run_parameters or {})
+    if context.loop_metadata:
+        for key in ("current_value", "current_index", "current_item"):
+            if key in context.loop_metadata:
+                payload[key] = context.loop_metadata[key]
+    return payload or None
+
+
 async def _create_workflow_block_run_and_task(
     block_type: BlockType,
     prompt: str | None = None,
@@ -499,8 +516,9 @@ async def _create_workflow_block_run_and_task(
             if url:
                 url = _render_template_with_label(url, label)
             # Include script parameters as navigation_payload so handlers
-            # (e.g. file upload) can find URLs like resume_link in the payload.
-            nav_payload = context.script_run_parameters or None
+            # (e.g. file upload) can find URLs like resume_link in the payload,
+            # plus the current loop value so a fallback search uses the intended value.
+            nav_payload = _build_fallback_navigation_payload(context)
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",

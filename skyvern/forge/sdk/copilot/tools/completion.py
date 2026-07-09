@@ -1520,10 +1520,17 @@ def _tool_visible_result_after_completion_verification(
     outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
     if outcome_unverified_reason is None:
         return result
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if (
+        copilot_ctx.delivered_unverified_terminal
+        and isinstance(run_id, str)
+        and run_id == copilot_ctx.delivered_unverified_workflow_run_id
+    ):
+        return result
     if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
         return result
 
-    data = result.get("data")
     copied_data = dict(data) if isinstance(data, dict) else {}
     copied_data["failure_reason"] = outcome_unverified_reason
     copied_data["completion_verification"] = (

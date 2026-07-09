@@ -31,10 +31,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionVerificationResult,
     CriterionVerdict,
+    DeliveredUnverifiedTerminalState,
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
     combine_verification_results,
+    degraded_contract_delivered_unverified_terminal_state,
     evaluate_completion_criteria,
     grade_definition_criteria,
     grade_fallback_floor_reached_end_state_criteria,
@@ -3128,6 +3130,122 @@ def test_record_run_blocks_keeps_clean_structural_abstention_as_built_unverified
     assert outcome is not None
     assert outcome.verdict == "not_authoritative"
     assert outcome.is_authoritative is False
+
+
+def _degraded_delivered_result(*verdicts: CriterionVerdict) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["__copilot_fallback_floor__run", *[verdict.criterion_id for verdict in verdicts]],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="__copilot_fallback_floor__run",
+                state="unsatisfied",
+                reason_code="no_evidence",
+            ),
+            *verdicts,
+        ],
+        degraded_criterion_ids=["__copilot_fallback_floor__run"],
+    )
+
+
+def _observed_structural_abstention(
+    criterion_id: str = "requested_output",
+    *,
+    evidence_source: str = "runtime_output",
+    reason_code: str = "structurally_abstained",
+    output_path: str = "output.document_name",
+    grounding_mode: str | None = "missing",
+) -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=criterion_id,
+        state="unsatisfied",
+        reason_code=reason_code,
+        evidence_ref="block_outputs:extract.document_name",
+        output_path=output_path,
+        grounding_mode=grounding_mode,
+        evidence_source=evidence_source,
+    )
+
+
+def _delivered_terminal_state(
+    result: CompletionVerificationResult,
+    *,
+    run_ok: bool = True,
+    workflow_run_id: str | None = "wr_x",
+    latest_workflow_run_id: str | None = "wr_x",
+    artifact_health_blocked: bool = False,
+    terminal_blocked: bool = False,
+) -> DeliveredUnverifiedTerminalState | None:
+    return degraded_contract_delivered_unverified_terminal_state(
+        result,
+        run_ok=run_ok,
+        workflow_run_id=workflow_run_id,
+        latest_workflow_run_id=latest_workflow_run_id,
+        artifact_health_blocked=artifact_health_blocked,
+        terminal_blocked=terminal_blocked,
+    )
+
+
+def test_degraded_delivered_unverified_terminal_state_allows_observed_runtime_output() -> None:
+    terminal_state = _delivered_terminal_state(_degraded_delivered_result(_observed_structural_abstention()))
+
+    assert terminal_state is not None
+    assert [verdict.criterion_id for verdict in terminal_state.observed_verdicts] == ["requested_output"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"run_ok": False},
+        {"workflow_run_id": "wr_old"},
+        {"latest_workflow_run_id": "wr_old"},
+        {"artifact_health_blocked": True},
+        {"terminal_blocked": True},
+    ],
+)
+def test_degraded_delivered_unverified_terminal_state_rejects_run_and_blocker_exclusions(
+    kwargs: dict[str, bool | str | None],
+) -> None:
+    assert _delivered_terminal_state(_degraded_delivered_result(_observed_structural_abstention()), **kwargs) is None
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        CriterionVerdict(
+            criterion_id="requested_output",
+            state="unsatisfied",
+            reason_code="missing_exact_field",
+            evidence_ref="block_outputs:extract.document_name",
+            output_path="output.document_name",
+            evidence_source="runtime_output",
+        ),
+        _observed_structural_abstention(output_path="output.evidence_text"),
+        _observed_structural_abstention(grounding_mode="shape"),
+        _observed_structural_abstention(evidence_source="independent_page_evidence"),
+    ],
+)
+def test_degraded_delivered_unverified_terminal_state_rejects_non_value_output(verdict: CriterionVerdict) -> None:
+    assert _delivered_terminal_state(_degraded_delivered_result(verdict)) is None
+
+
+def test_degraded_delivered_unverified_terminal_state_is_not_verified_success() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    result = _clean_success_result()
+    result["data"]["blocks"][0]["label"] = "extract"
+    result["data"]["blocks"][0]["extracted_data"] = {"document_name": "Resale Demand Package"}
+    verification = _degraded_delivered_result(_observed_structural_abstention())
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=verification)
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"document_name": "Resale Demand Package"}
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_test_suspicious_success is False
 
 
 def test_record_run_blocks_verifies_structural_requested_output_with_run_corroborator() -> None:

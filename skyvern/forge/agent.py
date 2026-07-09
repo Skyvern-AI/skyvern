@@ -3964,7 +3964,9 @@ class ForgeAgent:
                 error_code_mapping_str=error_code_mapping_str,
                 local_datetime=local_datetime,
             )
-            without_page_information = router_result.effective_without_page_information
+            without_page_information = (
+                router_result.effective_without_page_information or context.validation_without_page_information
+            )
 
             _prompt_build_span = otel_trace.get_current_span()
             _prompt_build_span.set_attribute("validation.router.mode", str(router_result.mode))
@@ -5523,10 +5525,16 @@ class ForgeAgent:
                     error_codes=[e.error_code for e in failure_response.errors],
                 )
 
-            failure_reason = (
-                f"Max retries per step ({max_retries_per_step}) exceeded."
-                f" Possible failure reasons: {failure_response.reasoning}"
-            )
+            summary_reasoning = (failure_response.reasoning or "").strip()
+            if summary_reasoning:
+                failure_reason = (
+                    f"Max retries per step ({max_retries_per_step}) exceeded."
+                    f" Possible failure reasons: {summary_reasoning}"
+                )
+            else:
+                failure_reason = (
+                    f"Max retries per step ({max_retries_per_step}) exceeded. {ReachMaxRetriesError().reasoning}"
+                )
             failure_category = failure_response.failure_categories or classify_from_failure_reason(
                 failure_reason, fallback_to_unknown=True
             )
