@@ -39,7 +39,12 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    AuthorTimeGateAblationPayload,
+    output_contract_ladder_unresolved,
+    record_author_time_gate_ablation_event,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
@@ -72,6 +77,7 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
     | PAGE_INSPECTION_TOOLS
     | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
 )
+_OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
 _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
     {
         "update_workflow",
@@ -1497,12 +1503,20 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
             return _emit_tool_blocker_signal(ctx, grounding_signal)
         return _emit_tool_blocker_signal(ctx, persistence_signal)
 
-    detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
-    if detected is not None:
-        return _emit_tool_blocker_signal(
-            ctx,
-            _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
-        )
+    # While a typed output-contract actuation ladder is still unresolved for the authoring tools, the
+    # bounded ladder (not a generic loop backstop) owns the turn's outcome; the guards re-engage the moment
+    # the ladder reaches an advisory-consumed run or a typed terminal.
+    output_contract_owns_turn = (
+        tool_name in _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS and output_contract_ladder_unresolved(ctx)
+    )
+
+    if not output_contract_owns_turn:
+        detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
+        if detected is not None:
+            return _emit_tool_blocker_signal(
+                ctx,
+                _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
+            )
 
     # Consecutive same-name guard: false-positives on the intended iterative
     # build (one new block per update_and_run_blocks). Block-running tools
@@ -1510,7 +1524,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     # exempt because a username+password+TOTP form legitimately needs three
     # consecutive calls; its failed-step guard above stays argument-aware.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list) and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS:
+    if (
+        isinstance(tracker, list)
+        and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
+        and not output_contract_owns_turn
+    ):
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
             return _emit_tool_blocker_signal(
@@ -1649,6 +1667,26 @@ def _recorded_outcome_grounding_signal(ctx: AgentContext, tool_name: str) -> Cop
     if maybe_satisfy_recorded_outcome_grounding_requirement(ctx):
         return None
     if not recorded_outcome_grounding_requires_current_page(ctx):
+        return None
+    requirement = ctx.recorded_outcome_grounding_requirement
+    if requirement is None:
+        return None
+    payload: AuthorTimeGateAblationPayload = {
+        "phase": requirement.phase,
+        "outcome_reason_code": requirement.reason_code,
+        "workflow_run_id": requirement.workflow_run_id,
+        "block_labels": list(requirement.block_labels),
+        "required_tool": requirement.required_tool,
+        "required_target_url": requirement.required_target_url,
+    }
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id="recorded_outcome_grounding",
+        reason_code="recorded_outcome_grounding_required",
+        fingerprint=requirement.structural_key,
+        blocked_tool=tool_name,
+        payload=payload,
+    ):
         return None
     return CopilotToolBlockerSignal(
         blocker_kind="missing_required_context",

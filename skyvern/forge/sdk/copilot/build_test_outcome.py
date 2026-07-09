@@ -56,6 +56,8 @@ BuildTestOutcomeReasonCode = Literal[
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
     "fallback_floor_turn_unsatisfiable",
+    "output_source_unobservable",
+    "actuation_exhausted",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
@@ -85,6 +87,8 @@ class RecordedBuildTestOutcome(BaseModel):
     observed_evidence_summary: str = ""
     workflow_run_id: str | None = None
     block_labels: list[str] = Field(default_factory=list)
+    requested_block_labels: list[str] = Field(default_factory=list)
+    block_shape_hashes: dict[str, str] = Field(default_factory=dict)
     structural_failure_identity: str = ""
     verified_progress_marker: str = ""
     page_evidence_refs: list[str] = Field(default_factory=list)
@@ -535,8 +539,7 @@ def _grounding_payload_from_evidence(
     challenge_gated = _challenge_gated_page_evidence(evidence)
     capture_degraded = not has_bounded_page_schema(evidence)
     observed_empty_page = _observed_empty_page_evidence(evidence)
-    if (challenge_gated or capture_degraded or observed_empty_page) and not (isinstance(run_id, str) and run_id):
-        return None
+    # No-run degraded captures are typed grounding evidence; downstream binding remains a separate gate.
     diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = "none"
     if challenge_gated:
         diagnostic_reason = "challenge_gated"
@@ -849,6 +852,8 @@ def _required_input_unbound_identity(
 def _required_input_unbound_outcome(
     failed_block: Mapping[str, object] | None,
     block_labels: list[str],
+    requested_block_labels: list[str],
+    block_shape_hashes: Mapping[str, str],
     workflow_run_id: str | None,
     authored_structure_signature: str | None,
     referenced_unbound_keys: Sequence[str],
@@ -861,6 +866,8 @@ def _required_input_unbound_outcome(
         reason_code="required_input_unbound",
         workflow_run_id=workflow_run_id or None,
         block_labels=block_labels,
+        requested_block_labels=requested_block_labels,
+        block_shape_hashes=dict(block_shape_hashes),
         structural_failure_identity=_required_input_unbound_identity(failed_block, referenced_unbound_keys),
         authored_structure_signature=authored_structure_signature,
         observed_evidence_summary=_bounded_text(
@@ -884,12 +891,18 @@ def recorded_outcome_from_run_blocks_result(
     registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
     unbound_required_parameter_keys: Sequence[str] | None = None,
     block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
+    block_shape_hashes: Mapping[str, str] | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
     failed_block = _first_failed_block(blocks)
     block_labels = [_safe_str(block.get("label")) for block in blocks if _safe_str(block.get("label"))]
+    requested = data.get("requested_block_labels")
+    requested_block_labels = (
+        _clean_list([label for label in requested if isinstance(label, str)]) if isinstance(requested, list) else []
+    )
+    block_shape_hashes = dict(block_shape_hashes or {})
     referenced_unbound_keys = _referenced_unbound_input_keys(
         result,
         failed_block,
@@ -919,6 +932,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "terminal blocker precedence suppresses repair prompt"},
@@ -931,6 +946,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code="verified_success",
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 verified_progress_marker=verification_identity or "run_completed_verified",
                 evidence_refs=output_refs,
                 authored_structure_signature=authored_structure_signature,
@@ -948,6 +965,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
@@ -956,6 +975,8 @@ def recorded_outcome_from_run_blocks_result(
             return _required_input_unbound_outcome(
                 failed_block,
                 block_labels,
+                requested_block_labels,
+                block_shape_hashes,
                 recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 authored_structure_signature,
                 referenced_unbound_keys,
@@ -970,6 +991,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "no typed verification/page/output identity available"},
@@ -986,6 +1009,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code="fallback_floor_turn_unsatisfiable",
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "turn-unsatisfiable fallback floor, no reachable route"},
@@ -997,6 +1022,8 @@ def recorded_outcome_from_run_blocks_result(
             reason_code=reason_code,
             workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
             block_labels=block_labels,
+            requested_block_labels=requested_block_labels,
+            block_shape_hashes=block_shape_hashes,
             structural_failure_identity=structural_identity,
             page_evidence_refs=page_refs,
             evidence_refs=evidence_refs,
@@ -1021,6 +1048,8 @@ def recorded_outcome_from_run_blocks_result(
         return _required_input_unbound_outcome(
             failed_block,
             block_labels,
+            requested_block_labels,
+            block_shape_hashes,
             workflow_run_id or None,
             authored_structure_signature,
             referenced_unbound_keys,
@@ -1060,6 +1089,8 @@ def recorded_outcome_from_run_blocks_result(
         reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
         block_labels=block_labels,
+        requested_block_labels=requested_block_labels,
+        block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,
         evidence_refs=output_refs,
@@ -1530,7 +1561,7 @@ def _runtime_output_repair_facts(
         return []
     facts: list[dict[str, object]] = []
     for verdict in completion_verification.verdicts:
-        if verdict.satisfied or not verdict.output_path:
+        if not verdict.output_path:
             continue
         output_path = _bounded_ref(verdict.output_path)
         if not _output_path_has_child(output_path):
@@ -1544,7 +1575,13 @@ def _runtime_output_repair_facts(
             workflow_run_id,
             output_path,
         )
-        value_status = _runtime_output_value_status(values, verdict)
+        owner_labels = _runtime_output_owner_labels(blocks, block_labels, verdict)
+        if verdict.satisfied:
+            if not owner_labels:
+                continue
+            value_status = "satisfied"
+        else:
+            value_status = _runtime_output_value_status(values, verdict)
         fact: dict[str, object] = {
             "workflow_run_id": _bounded_ref(workflow_run_id),
             "output_path": output_path,
@@ -1553,8 +1590,10 @@ def _runtime_output_repair_facts(
             "reason_code": _bounded_ref(verdict.reason_code),
             "value_status": value_status,
         }
-        if len(block_labels) == 1:
-            fact["block_label"] = block_labels[0]
+        if verdict.satisfied or len(owner_labels) > 1:
+            fact["owner_labels"] = owner_labels
+        if len(owner_labels) == 1:
+            fact["block_label"] = owner_labels[0]
         if verdict.grounding_mode:
             fact["grounding_mode"] = verdict.grounding_mode
         if verdict.expected_output_shape:
@@ -1615,6 +1654,7 @@ def _runtime_output_values_for_path(
     values: list[object] = []
     evidence_refs: list[str] = []
     block_labels: list[str] = []
+    current_labels = {label for block in blocks for label in [_bounded_ref(block.get("label"))] if label}
     for item in registered_output_parameter_payloads:
         item_run_id = _safe_str(item.get("workflow_run_id"))
         if item_run_id != workflow_run_id:
@@ -1623,7 +1663,7 @@ def _runtime_output_values_for_path(
         if not present:
             continue
         values.append(value)
-        label = _bounded_ref(item.get("block_label"))
+        label = _registered_output_owner_label(item, current_labels)
         key = _bounded_ref(item.get("output_parameter_key"))
         if label:
             block_labels.append(label)
@@ -1644,6 +1684,34 @@ def _runtime_output_values_for_path(
     return values, list(dict.fromkeys(evidence_refs)), sorted(dict.fromkeys(block_labels))
 
 
+def _registered_output_owner_label(item: Mapping[str, object], current_labels: set[str]) -> str:
+    label = _bounded_ref(item.get("block_label"))
+    if label in current_labels:
+        return label
+    return ""
+
+
+def _runtime_output_owner_labels(
+    blocks: Sequence[Mapping[str, object]],
+    block_labels: Sequence[str],
+    verdict: CriterionVerdict,
+) -> list[str]:
+    if not verdict.satisfied and verdict.requested_output_evidence_source == "independent_run_evidence":
+        return []
+    current_labels = {label for block in blocks for label in [_bounded_ref(block.get("label"))] if label}
+    labels = {label for label in block_labels if label in current_labels}
+    evidence_label = _block_output_evidence_ref_label(verdict.evidence_ref)
+    if evidence_label in current_labels:
+        labels.add(evidence_label)
+    return sorted(labels)
+
+
+def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
+    if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
+        return ""
+    return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
+
+
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:
     value = item.get("value")
     key = _safe_str(item.get("output_parameter_key"))
@@ -1652,6 +1720,10 @@ def _registered_output_value_for_path(item: Mapping[str, object], output_path: s
     if output_path.startswith("output.") and key == output_path.split(".", 1)[1]:
         return value, True
     if isinstance(value, Mapping):
+        if output_path.startswith("output."):
+            unwrapped_value, unwrapped_present = _value_at_output_path(value, output_path.split(".", 1)[1])
+            if unwrapped_present:
+                return unwrapped_value, True
         return _value_at_output_path(value, output_path)
     return None, False
 

@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot import llm_config
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -135,6 +136,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
     build_request_policy,
+    credential_prompt_reason,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
@@ -151,6 +153,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     _INVOLUNTARY_BLOCKER_REASON_CODES,
     CopilotTurnHalt,
     TurnHalt,
+    TurnHaltKind,
     raise_if_turn_halt,
     turn_halt_to_trace_data,
 )
@@ -257,7 +260,17 @@ def _copilot_turn_span(
         yield span
 
 
-def _resolve_request_policy_handler(llm_api_handler: Any) -> Any:
+async def _resolve_request_policy_handler(
+    llm_api_handler: LLMAPIHandler | None, workflow_permanent_id: str | None, organization_id: str | None
+) -> Any:
+    lite_handler = await llm_config.resolve_lite_copilot_handler(workflow_permanent_id, organization_id)
+    if lite_handler is not None:
+        return lite_handler
+    LOG.warning(
+        "copilot request policy lite handler unavailable, falling back to main handler",
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
     return llm_api_handler
 
 
@@ -269,7 +282,8 @@ class RequestPolicyGuardrailInputs:
     chat_history_messages: list[WorkflowCopilotChatHistoryMessage]
     global_llm_context: str
     organization_id: str
-    handler: Any
+    request_policy_handler: Any
+    turn_intent_handler: LLMAPIHandler | None
     previous_user_message: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
@@ -998,6 +1012,16 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if is_optional_dismissal_only_trajectory(ctx.scout_trajectory):
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="optional_dismissal_only")
         return ""
+    fill_step_count = sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if str(interaction.get("tool_name") or "") in {"type_text", "select_option", "fill_credential_field"}
+    )
+    LOG.info(
+        "copilot_synthesis_input_fill_steps",
+        trajectory_len=len(ctx.scout_trajectory),
+        fill_step_count=fill_step_count,
+    )
     synthesized = synthesize_code_block(ctx.scout_trajectory, reached_download_target=ctx.reached_download_target)
     if synthesized is None:
         LOG.debug(
@@ -1512,6 +1536,11 @@ def _make_agent_result(
             payload_updates["proposalDisposition"] = proposal_disposition
         if turn_outcome is not None and "responseKind" not in narrative_payload:
             payload_updates["responseKind"] = turn_outcome.response_kind.value
+        if "credentialPrompt" not in narrative_payload:
+            policy = ctx.request_policy if ctx is not None else None
+            reason = credential_prompt_reason(policy, kwargs.get("user_response"))
+            if reason:
+                payload_updates["credentialPrompt"] = {"reason": reason}
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
             payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
         if ctx is not None and "outcomeAdjudication" not in narrative_payload:
@@ -1882,6 +1911,16 @@ def _build_turn_halt_exit_result(
     global_llm_context: str | None,
     halt: TurnHalt,
 ) -> AgentResult:
+    if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
+        reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
+        return _build_wip_exit_result(
+            ctx,
+            global_llm_context,
+            default_reply=reply,
+            unvalidated_reply=reply,
+            tested_reply=reply,
+            terminal_reason=f"turn_halt:{halt.kind.value}",
+        )
     signal = halt.blocker_signal
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
@@ -2011,6 +2050,33 @@ def _terminal_summary_scalar(value: Any) -> str | None:
     if len(cleaned) > _VERIFIED_TERMINAL_VALUE_MAX_CHARS:
         cleaned = cleaned[: _VERIFIED_TERMINAL_VALUE_MAX_CHARS - 1].rstrip() + "..."
     return cleaned
+
+
+def _delivered_unverified_reply(ctx: CopilotContext) -> str | None:
+    if getattr(ctx, "delivered_unverified_terminal", False) is not True:
+        return None
+    parts: list[str] = []
+    observed_outputs = getattr(ctx, "delivered_unverified_observed_outputs", {})
+    if not isinstance(observed_outputs, dict):
+        observed_outputs = {}
+    for key, value in observed_outputs.items():
+        rendered = _terminal_summary_scalar(value)
+        if rendered is None and isinstance(value, list | dict):
+            try:
+                rendered = redact_raw_secrets_for_prompt(json.dumps(value, sort_keys=True))
+            except TypeError:
+                rendered = None
+        if isinstance(key, str) and key.strip() and rendered and not contains_internal_machinery_leak(rendered):
+            parts.append(f"{key}: {rendered[:_VERIFIED_TERMINAL_VALUE_MAX_CHARS]}")
+    if parts:
+        return (
+            "I built and ran the workflow. The latest run returned "
+            f"{'; '.join(parts[:4])}. That value was not independently verified, so review the draft before using it."
+        )
+    return (
+        "I built and ran the workflow, and the latest run returned the requested output. "
+        "That output was not independently verified, so review the draft before using it."
+    )
 
 
 def _verified_output_value(ctx: CopilotContext, output_key: str | None) -> Any:
@@ -2738,7 +2804,11 @@ def _build_wip_exit_result(
     ):
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
-        if unvalidated and recorded_failure_reply:
+        delivered_reply = _delivered_unverified_reply(ctx)
+        if delivered_reply is not None:
+            reply = delivered_reply
+            unvalidated = True
+        elif unvalidated and recorded_failure_reply:
             reply = recorded_failure_reply
             if halted_mid_progress:
                 reply = _ensure_unvalidated_proposal_affordance(reply)
@@ -3647,7 +3717,7 @@ def _build_copilot_input_guardrails(
                 chat_history=policy_inputs.chat_history_messages,
                 global_llm_context=policy_inputs.global_llm_context,
                 organization_id=policy_inputs.organization_id,
-                handler=policy_inputs.handler,
+                handler=policy_inputs.request_policy_handler,
                 active_criteria=_stored_active_completion_criteria(policy_inputs),
                 config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
             )
@@ -3660,7 +3730,7 @@ def _build_copilot_input_guardrails(
                         chat_history=policy_inputs.chat_history_messages,
                         global_llm_context=policy_inputs.global_llm_context,
                         request_policy=policy,
-                        handler=policy_inputs.handler,
+                        handler=policy_inputs.turn_intent_handler,
                     )
                 _store_request_policy_on_context(
                     ctx,
@@ -4128,7 +4198,12 @@ async def _run_copilot_turn_impl(
         chat_history_messages=list(chat_history),
         global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
-        handler=_resolve_request_policy_handler(llm_api_handler),
+        request_policy_handler=await _resolve_request_policy_handler(
+            llm_api_handler,
+            chat_request.workflow_permanent_id,
+            organization_id,
+        ),
+        turn_intent_handler=llm_api_handler,
         previous_user_message=previous_user_message,
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
@@ -4194,6 +4269,7 @@ async def _run_copilot_turn_impl(
     ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
+    ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",

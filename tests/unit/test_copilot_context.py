@@ -10,9 +10,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.copilot.context import (
+    FillCarry,
     LoadedResultTargetContext,
     ObservedPage,
     StructuredContext,
+    _fill_carry_from_scout_trajectory,
     _merge_observed_acted_pages,
     finalize_discovery_counter_in_global_llm_context,
     render_loaded_result_context_for_prompt,
@@ -272,6 +274,117 @@ def test_finalize_context_clears_stale_loaded_result_targets_when_no_current_ste
     assert payload["loaded_result_targets"] == []
     assert StructuredContext.from_json_str(raw).loaded_result_targets == []
     assert render_loaded_result_context_for_prompt(raw) == ""
+
+
+def test_fill_carry_from_scout_trajectory_scrubs_raw_values_and_credential_names() -> None:
+    carry = _fill_carry_from_scout_trajectory(
+        [
+            {
+                "tool_name": "type_text",
+                "selector": "#lookup",
+                "source_url": "https://example.com/form",
+                "typed_length": 8,
+                "typed_value": "SKU-1234",
+                "raw_typed_value": "not-persisted",
+                "role": "textbox",
+                "accessible_name": "Product search",
+            },
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#password",
+                "source_url": "https://example.com/form",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "password",
+                "credential_name": "Saved Login",
+            },
+        ]
+    )
+
+    assert carry == [
+        FillCarry(
+            source_url="https://example.com/form",
+            selector="#lookup",
+            tool_name="type_text",
+            role="textbox",
+            accessible_name="Product search",
+            typed_length=8,
+            typed_value="SKU-1234",
+        ),
+        FillCarry(
+            source_url="https://example.com/form",
+            selector="#password",
+            tool_name="fill_credential_field",
+            typed_length=10,
+            credential_id="cred_123",
+            credential_field="password",
+        ),
+    ]
+    dumped = json.dumps([item.model_dump() for item in carry])
+    assert "not-persisted" not in dumped
+    assert "Saved Login" not in dumped
+
+
+def test_finalize_context_persists_fill_carry() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+        scout_trajectory=[
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/form",
+                "typed_length": 8,
+                "typed_value": "SKU-1234",
+            }
+        ],
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
+
+    assert raw is not None
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.fill_carry == [
+        FillCarry(
+            source_url="https://example.com/form",
+            selector="#search",
+            tool_name="type_text",
+            typed_length=8,
+            typed_value="SKU-1234",
+        )
+    ]
+
+
+def test_finalize_context_clears_fill_carry_when_current_turn_has_no_fills() -> None:
+    inbound = StructuredContext(
+        fill_carry=[
+            FillCarry(
+                source_url="https://example.com/form",
+                selector="#search",
+                tool_name="type_text",
+                typed_length=8,
+                typed_value="SKU-1234",
+            )
+        ]
+    ).to_json_str()
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=1,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+        scout_trajectory=[{"tool_name": "click", "selector": "#go", "source_url": "https://example.com/form"}],
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+
+    assert raw is not None
+    assert StructuredContext.from_json_str(raw).fill_carry == []
 
 
 def test_merge_turn_summary_falls_back_to_summary_without_structured_credentials() -> None:

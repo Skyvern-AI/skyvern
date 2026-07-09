@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
@@ -27,6 +28,7 @@ from skyvern.cli.core.session_manager import (
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -64,6 +66,16 @@ CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
+AuthorTimeGateAblationPayloadValue: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | Sequence["AuthorTimeGateAblationPayloadValue"]
+    | dict[str, "AuthorTimeGateAblationPayloadValue"]
+)
+AuthorTimeGateAblationPayload: TypeAlias = dict[str, AuthorTimeGateAblationPayloadValue]
 SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
@@ -143,6 +155,16 @@ class RegisteredArtifactEvidence:
     workflow_run_id: str
 
 
+@dataclass(frozen=True)
+class AuthorTimeGateAblationEvent:
+    gate_id: str
+    reason_code: str
+    fingerprint: str
+    log_only: bool
+    blocked_tool: str | None = None
+    payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
+
+
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
@@ -157,6 +179,7 @@ class ScoutedInteraction(TypedDict):
     role: NotRequired[str]
     accessible_name: NotRequired[str]
     trajectory_index: NotRequired[int]
+    carried: NotRequired[bool]
     # Credential fills carry references and metadata only — never secret values.
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
@@ -307,6 +330,8 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
+    prior_fill_carry: list[dict[str, str | int]] = field(default_factory=list)
+    fill_carry_rebound_done: bool = False
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
     post_budget_page_inspection_run_id: str | None = None
@@ -335,11 +360,50 @@ class AgentContext:
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
     output_contract_deferral_count_by_signature: dict[str, int] = field(default_factory=dict)
     runtime_output_repair_attempt_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Progress-gated reset ledger: the last rejected draft's structural fingerprint and
+    # whether an imposition landed since, so a genuinely-changed re-attempt resets the
+    # steering-reject streak instead of counting cosmetic churn toward the cap.
+    output_contract_last_reject_fingerprint_by_signature: dict[str, str] = field(default_factory=dict)
+    output_contract_imposed_since_last_reject_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Structural fingerprint captured when a structure directive was armed; a re-entry whose
+    # fingerprint still matches means the directive went unconsumed (cosmetic churn), which
+    # escalates the actuation lattice instead of re-arming the same directive forever.
+    output_contract_armed_directive_fingerprint_by_signature: dict[str, str] = field(default_factory=dict)
     # Armed when a collapsed-spine violation cannot be split; carries split blockers and stage count to the
     # next authoring prompt, keyed by a composite {signature, label, authored-YAML hash} so a new draft re-arms.
     output_contract_spine_directive_blockers_by_attempt_key: dict[str, list[str]] = field(default_factory=dict)
     output_contract_spine_directive_stage_count_by_attempt_key: dict[str, int] = field(default_factory=dict)
     output_contract_output_owner_directive_candidates_by_signature: dict[str, list[str]] = field(default_factory=dict)
+    # Two-phase advisory grant per output-contract signature (any family, gated on observable source):
+    # the resolver GRANTs one adjudicating run, the run-dispatch seam CONSUMEs it, and a terminal requires
+    # CONSUMED so a double preflight pass cannot burn it.
+    output_contract_actuation_by_signature: dict[str, OutputContractAdvisoryState] = field(default_factory=dict)
+    # Liveness gate distinct from the reject counter: actuations (directive arms) landed since the last
+    # executed run, reset only by a run dispatch, so a never-converging draft still reaches arm-D in bounded steps.
+    output_contract_actuation_count_by_signature: dict[str, int] = field(default_factory=dict)
+    # Set when a de-click-only actuation (imposition/directive carrying the requested output paths) left the
+    # spine click-only; the no-observable-source terminal fires only after such an attempt, never on a lone
+    # flaky scout pass. Cleared when the spine gains a source, on imposition, or on run dispatch.
+    output_contract_declick_attempted_by_signature: dict[str, bool] = field(default_factory=dict)
+    # One-shot per signature: a consumed advisory run whose observed output bound no required path may
+    # re-enter the ladder once so the stronger page-source extraction can be imposed before any terminal.
+    output_contract_dispatch_reopened_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Set once a page-source extraction (page.extract keyed to the required paths) has been imposed on a
+    # signature; the exhaustion terminal requires this so a code static-return never terminals a producible shape.
+    output_contract_page_source_required_by_signature: dict[str, bool] = field(default_factory=dict)
+    output_contract_page_extraction_imposed_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Run-output evidence recorded at the run-result seam: a dispatched run's output-contract signatures
+    # mapped to their required paths (armed at seam-admit and page-source imposition), then the observed
+    # result — whether the run's registered output was seen at all, and whether it covered any required path.
+    output_contract_pending_run_evidence: dict[str, list[str]] = field(default_factory=dict)
+    output_contract_run_output_observed_by_signature: dict[str, bool] = field(default_factory=dict)
+    output_contract_run_bound_required_path_by_signature: dict[str, bool] = field(default_factory=dict)
+    # Lifecycle-progress token the loop-defer choke-point snapshots on each swallowed loop signal; a second
+    # swallow with no advance expires the grant into a typed terminal instead of holding to the timeout wall.
+    output_contract_defer_progress_token: tuple[int, int, int, int] | None = None
+    # Per tool-call latch: the imposition seam already ran the actuation ladder this call, so the shared
+    # reject-counting seam does not adjudicate the same signature twice. Reset at each imposition entry.
+    output_contract_bail_actuated_this_call: bool = False
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
@@ -383,6 +447,59 @@ class AgentContext:
     # extraction_schema declares fields that map to no output the block produces.
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
+    author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
+
+
+def copilot_author_time_gate_log_only_enabled() -> bool:
+    return not settings.is_cloud_environment() and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+
+
+def record_author_time_gate_ablation_event(
+    ctx: AgentContext,
+    *,
+    gate_id: str,
+    reason_code: str,
+    fingerprint: str,
+    blocked_tool: str | None = None,
+    payload: AuthorTimeGateAblationPayload | None = None,
+) -> bool:
+    if not copilot_author_time_gate_log_only_enabled():
+        return False
+    event = AuthorTimeGateAblationEvent(
+        gate_id=gate_id,
+        reason_code=reason_code,
+        fingerprint=fingerprint,
+        blocked_tool=blocked_tool,
+        payload=dict(payload or {}),
+        log_only=True,
+    )
+    ctx.author_time_gate_ablation_events.append(event)
+    LOG.info(
+        "copilot_author_time_gate_ablation_event",
+        gate_id=event.gate_id,
+        reason_code=event.reason_code,
+        fingerprint=event.fingerprint,
+        blocked_tool=event.blocked_tool,
+        log_only=event.log_only,
+        payload=event.payload,
+    )
+    return True
+
+
+def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:
+    """True while an output-contract signature has a live actuation ladder — a landed actuation or a GRANTED
+    advisory — that has not yet reached a typed terminal or a dispatched (CONSUMED) run. Loop and churn detectors
+    defer to this state so the bounded actuation ladder, not a generic max-turn backstop, owns the turn's outcome.
+    Keyed on actuation state, not the reject counter, so a bail with no live actuation path cannot defer forever;
+    a CONSUMED or EXPIRED signature is resolved and re-enables the detectors."""
+    resolved_states = {OutputContractAdvisoryState.CONSUMED, OutputContractAdvisoryState.EXPIRED}
+    actuation_states = ctx.output_contract_actuation_by_signature
+    if any(state == OutputContractAdvisoryState.GRANTED for state in actuation_states.values()):
+        return True
+    return any(
+        int(count or 0) >= 1 and actuation_states.get(sig) not in resolved_states
+        for sig, count in ctx.output_contract_actuation_count_by_signature.items()
+    )
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:

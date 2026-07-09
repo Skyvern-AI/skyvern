@@ -38,6 +38,7 @@ REAP_GRACE_SECONDS = 120
 @dataclass
 class BrowserSession:
     browser_state: BrowserState
+    organization_id: str | None = None
     cdp_port: int | None = None
 
 
@@ -301,8 +302,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
 
-    async def set_browser_state(self, session_id: str, browser_state: BrowserState) -> None:
-        browser_session = BrowserSession(browser_state=browser_state)
+    async def set_browser_state(
+        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
+    ) -> None:
+        browser_session = BrowserSession(browser_state=browser_state, organization_id=organization_id)
         self._browser_sessions[session_id] = browser_session
 
     async def evict_cached_browser_state(
@@ -349,6 +352,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
+        inherit_profile_proxy: bool = False,
         wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
@@ -367,6 +371,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
             generate_browser_profile=generate_browser_profile,
+            inherit_profile_proxy=inherit_profile_proxy,
         )
 
         # Launch the browser immediately for standalone sessions so the
@@ -434,7 +439,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 await browser_state.close()
                 return
 
-            self._browser_sessions[session_id] = BrowserSession(browser_state=browser_state)
+            self._browser_sessions[session_id] = BrowserSession(
+                browser_state=browser_state,
+                organization_id=organization_id,
+            )
 
             result = await self.update_status(session_id, organization_id, PersistentBrowserSessionStatus.running)
             if result is None:
@@ -507,6 +515,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
         browser_session = self._browser_sessions.get(browser_session_id)
+        if browser_session and browser_session.organization_id != organization_id:
+            LOG.warning(
+                "Skipping in-memory browser session close for organization mismatch",
+                organization_id=organization_id,
+                cached_organization_id=browser_session.organization_id,
+                session_id=browser_session_id,
+            )
+            browser_session = None
         if browser_session:
             LOG.info(
                 "Closing browser session",

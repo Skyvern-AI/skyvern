@@ -173,6 +173,10 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import {
+  useDiscoverCopilotPromptRecovery,
+  withoutDiscoverViaParam,
+} from "../discoverCopilotHandoff";
+import {
   initialEditorAutoOpenState,
   shouldAutoOpenEditor,
 } from "./editorAutoOpen";
@@ -365,23 +369,39 @@ function Workspace({
   );
   const location = useLocation();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
     copilotFixOrigin?: unknown;
   } | null;
-  const initialCopilotMessage =
+  const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
       ? locationState.copilotMessage
       : null;
+  const { storedInitialCopilotMessage, clearStoredInitialCopilotMessage } =
+    useDiscoverCopilotPromptRecovery({
+      shouldRead: searchParams.get("via") === "discover",
+      workflowPermanentId,
+    });
+  const initialCopilotMessage = useMemo(
+    () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
+    [routeInitialCopilotMessage, storedInitialCopilotMessage],
+  );
   const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
-    navigate(location.pathname + location.search, {
+    clearStoredInitialCopilotMessage();
+    navigate(location.pathname + withoutDiscoverViaParam(location.search), {
       replace: true,
       state: null,
     });
-  }, [initialCopilotMessage, location.pathname, location.search, navigate]);
-  const [searchParams] = useSearchParams();
+  }, [
+    initialCopilotMessage,
+    clearStoredInitialCopilotMessage,
+    location.pathname,
+    location.search,
+    navigate,
+  ]);
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const headlessTurnDrainEnabled = ["1", "true"].includes(
     (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
@@ -1540,6 +1560,7 @@ function Workspace({
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
+      pinSavedSessionIp: workflowData.pin_saved_session_ip ?? false,
       browserProfileId: workflowData.browser_profile_id ?? null,
       browserProfileKey: workflowData.browser_profile_key ?? null,
       model: workflowData.model ?? null,
@@ -1846,6 +1867,7 @@ function Workspace({
         selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
+      pinSavedSessionIp: selectedVersion.pin_saved_session_ip ?? false,
       browserProfileId: selectedVersion.browser_profile_id ?? null,
       browserProfileKey: selectedVersion.browser_profile_key ?? null,
       model: selectedVersion.model,
@@ -2867,6 +2889,7 @@ function Workspace({
               extra_http_headers: extraHttpHeaders,
               cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
+              pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
               browser_profile_id: saveData.settings.browserProfileId,
               browser_profile_key: saveData.settings.browserProfileKey,
               model: saveData.settings.model,

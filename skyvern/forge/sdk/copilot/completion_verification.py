@@ -255,6 +255,11 @@ class CompletionVerificationResult:
 
 
 @dataclass(frozen=True)
+class DeliveredUnverifiedTerminalState:
+    observed_verdicts: tuple[CriterionVerdict, ...]
+
+
+@dataclass(frozen=True)
 class RunEvidenceSnapshot:
     workflow_run_id: str | None = None
     block_outputs: dict[str, Any] = field(default_factory=dict)
@@ -330,6 +335,7 @@ _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
 _MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
 _INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT = "incomplete typed classification contract"
 _MISSING_REGISTERED_DOWNLOAD_EVIDENCE = "run output did not include a non-empty registered browser download"
+_DELIVERED_UNVERIFIED_OUTPUT_SOURCES = frozenset({"runtime_output", "registered_output_parameter"})
 
 
 def registered_download_completion_criterion() -> CompletionCriterion:
@@ -2240,6 +2246,70 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
     if not blocking:
         return False
     return blocking <= degraded
+
+
+def _delivered_unverified_observed_verdict(verdict: CriterionVerdict) -> bool:
+    if not verdict.evidence_ref or not verdict.output_path:
+        return False
+    normalized_path = verdict.output_path.removeprefix("output.").strip()
+    if normalized_path.split(".")[-1] == "evidence_text":
+        return False
+    if verdict.evidence_source not in _DELIVERED_UNVERIFIED_OUTPUT_SOURCES:
+        return False
+    if verdict.self_emitted_judgment_not_independent:
+        return False
+    if verdict.requested_output_evidence_source == "independent_run_evidence":
+        return False
+    if verdict.grounding_mode in {"shape", "judgment_boolean"}:
+        return False
+    if verdict.satisfied:
+        return (
+            verdict.reason_code == "evidence_confirms"
+            and verdict.grounding_mode == "exact_value"
+            and verdict.has_exact_value
+        )
+    return _is_structural_requested_output_abstention(verdict) and not verdict.has_exact_value
+
+
+def degraded_contract_delivered_unverified_terminal_state(
+    result: CompletionVerificationResult | None,
+    *,
+    run_ok: bool,
+    workflow_run_id: str | None,
+    latest_workflow_run_id: str | None,
+    artifact_health_blocked: bool,
+    terminal_blocked: bool,
+) -> DeliveredUnverifiedTerminalState | None:
+    if (
+        result is None
+        or result.status != "evaluated"
+        or result.is_fully_satisfied()
+        or not run_ok
+        or not workflow_run_id
+        or workflow_run_id != latest_workflow_run_id
+        or artifact_health_blocked
+        or terminal_blocked
+    ):
+        return None
+    degraded = set(result.degraded_criterion_ids)
+    if not degraded:
+        return None
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    observed: list[CriterionVerdict] = []
+    blocking: set[str] = set()
+    for criterion_id in result.criterion_ids:
+        verdict = verdict_by_id.get(criterion_id)
+        if verdict is not None and _delivered_unverified_observed_verdict(verdict):
+            observed.append(verdict)
+            continue
+        if verdict is not None and verdict.satisfied:
+            continue
+        if verdict is not None and result.is_structural_contingent_abstention(verdict):
+            continue
+        blocking.add(criterion_id)
+    if not observed or not blocking or not blocking <= degraded:
+        return None
+    return DeliveredUnverifiedTerminalState(observed_verdicts=tuple(observed))
 
 
 def carry_degraded_criterion_ids(

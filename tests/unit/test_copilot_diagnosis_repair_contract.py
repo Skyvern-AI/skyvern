@@ -1399,6 +1399,132 @@ def test_unverified_completion_evidence_does_not_suppress_suspicious_success(
     assert contract.verification_result.user_goal_satisfied is False
 
 
+def test_degraded_delivered_unverified_completion_does_not_route_repair() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.last_run_blocks_workflow_run_id = "wr_unverified"
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_workflow_run_id = "wr_unverified"
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["__copilot_fallback_floor__run", "requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="__copilot_fallback_floor__run",
+                state="unsatisfied",
+                reason_code="no_evidence",
+            ),
+            CriterionVerdict(
+                criterion_id="requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:extract.document_name",
+                output_path="output.document_name",
+                grounding_mode="missing",
+                evidence_source="runtime_output",
+            ),
+        ],
+        degraded_criterion_ids=["__copilot_fallback_floor__run"],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is False
+
+
+def test_delivered_unverified_does_not_mask_failed_blocks() -> None:
+    ctx = _ctx()
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_workflow_run_id = "wr_unverified"
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "failed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+
+
+def test_degraded_path_without_terminal_state_still_routes_repair() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.last_run_blocks_workflow_run_id = "wr_unverified"
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["__copilot_fallback_floor__run", "requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="__copilot_fallback_floor__run",
+                state="unsatisfied",
+                reason_code="no_evidence",
+            ),
+            CriterionVerdict(
+                criterion_id="requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:extract.document_name",
+                output_path="output.document_name",
+                grounding_mode="missing",
+                evidence_source="runtime_output",
+            ),
+        ],
+        degraded_criterion_ids=["__copilot_fallback_floor__run"],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+
+
 @pytest.mark.parametrize(
     "completion_verification",
     [

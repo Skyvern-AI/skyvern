@@ -64,21 +64,19 @@ export class SkyvernBrowserPageAgent {
 
         const taskRun = await this._browser.skyvern.runTask({
             "x-user-agent": "skyvern-sdk",
-            body: {
-                prompt: prompt,
-                engine: options?.engine,
-                model: options?.model,
-                url: options?.url ?? this._getPageUrl(),
-                webhook_url: options?.webhookUrl,
-                totp_identifier: options?.totpIdentifier,
-                totp_url: options?.totpUrl,
-                title: options?.title,
-                error_code_mapping: options?.errorCodeMapping,
-                data_extraction_schema: options?.dataExtractionSchema,
-                max_steps: options?.maxSteps,
-                browser_session_id: this._browser.browserSessionId,
-                browser_address: this._browser.browserAddress,
-            },
+            prompt: prompt,
+            engine: options?.engine,
+            model: options?.model,
+            url: options?.url ?? this._getPageUrl(),
+            webhook_url: options?.webhookUrl,
+            totp_identifier: options?.totpIdentifier,
+            totp_url: options?.totpUrl,
+            title: options?.title,
+            error_code_mapping: options?.errorCodeMapping,
+            data_extraction_schema: options?.dataExtractionSchema,
+            max_steps: options?.maxSteps,
+            browser_session_id: this._browser.browserSessionId,
+            browser_address: this._browser.browserAddress,
         });
 
         if (this._browser.skyvern.environment === SkyvernEnvironment.Cloud) {
@@ -191,7 +189,7 @@ export class SkyvernBrowserPageAgent {
         },
     ): Promise<Skyvern.WorkflowRunResponse>;
     async login(
-        credentialType: Skyvern.SkyvernSchemasRunBlocksCredentialType,
+        credentialType: Skyvern.SkyvernSchemasCredentialTypeCredentialType,
         options: {
             url?: string;
             credentialId?: string;
@@ -350,16 +348,14 @@ export class SkyvernBrowserPageAgent {
             {
                 "x-user-agent": "skyvern-sdk",
                 template: options?.template,
-                body: {
-                    workflow_id: workflowId,
-                    parameters: options?.parameters,
-                    title: options?.title,
-                    webhook_url: options?.webhookUrl,
-                    totp_url: options?.totpUrl,
-                    totp_identifier: options?.totpIdentifier,
-                    browser_session_id: this._browser.browserSessionId,
-                    browser_address: this._browser.browserAddress,
-                },
+                agent_id: workflowId,
+                parameters: options?.parameters,
+                title: options?.title,
+                webhook_url: options?.webhookUrl,
+                totp_url: options?.totpUrl,
+                totp_identifier: options?.totpIdentifier,
+                browser_session_id: this._browser.browserSessionId,
+                browser_address: this._browser.browserAddress,
             },
             {
                 headers: { "x-user-agent": "skyvern-sdk" },

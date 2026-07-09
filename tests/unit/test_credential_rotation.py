@@ -18,8 +18,10 @@ from skyvern.forge.sdk.db.models import Base, WorkflowRunCredentialSelectionMode
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
 )
+from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile_key_digest
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
@@ -269,6 +271,45 @@ async def test_round_robin_repository_idempotent_recall_returns_existing(sqlite_
 
 
 @pytest.mark.asyncio
+async def test_repository_get_selections_for_run_returns_mapping(sqlite_db: AgentDB) -> None:
+    repo = sqlite_db.workflow_run_credential_selections
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                WorkflowRunCredentialSelectionModel(
+                    organization_id="org_test",
+                    workflow_run_id="wr_test",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="login_cred",
+                    credential_id="cred_a",
+                ),
+                WorkflowRunCredentialSelectionModel(
+                    organization_id="org_test",
+                    workflow_run_id="wr_test",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="backup_cred",
+                    credential_id="cred_b",
+                ),
+                WorkflowRunCredentialSelectionModel(
+                    organization_id="org_test",
+                    workflow_run_id="wr_other",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="login_cred",
+                    credential_id="cred_other",
+                ),
+            ]
+        )
+        await session.commit()
+
+    assert await repo.get_selections_for_run("wr_test") == {
+        "backup_cred": "cred_b",
+        "login_cred": "cred_a",
+    }
+    assert await repo.get_selections_for_run("wr_missing") == {}
+
+
+@pytest.mark.asyncio
 async def test_rotation_advisory_lock_skips_non_postgres_dialect() -> None:
     repo = WorkflowRunCredentialSelectionsRepository(MagicMock())
     session = MagicMock()
@@ -421,3 +462,154 @@ async def test_resolve_login_block_credential_ids_returns_selected_rotating_id()
 
     assert credential_ids == ["cred_b"]
     context.resolve_credential_parameter_id.assert_awaited_once_with(parameter, "org_test")
+
+
+def _setup_workflow_with_rotating_credential(browser_profile_key: str | None = "{{ login_cred }}") -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        proxy_location=None,
+        webhook_callback_url=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        browser_profile_id=None,
+        persist_browser_session=True,
+        pin_saved_session_ip=False,
+        browser_profile_key=browser_profile_key,
+        title="Workflow",
+        max_elapsed_time_minutes=None,
+        run_with="agent",
+        code_version=None,
+        adaptive_caching=False,
+        sequential_key=None,
+        workflow_definition=SimpleNamespace(parameters=[_credential_parameter(credential_ids=["cred_a", "cred_b"])]),
+    )
+
+
+def _setup_workflow_run() -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        browser_profile_id=None,
+        proxy_location=None,
+    )
+
+
+async def _setup_rotation_profile_run(
+    *,
+    select_side_effect: str | Exception,
+    profile_id: str,
+) -> tuple[SimpleNamespace, MagicMock]:
+    result, mock_app, _, caught = await _attempt_setup_rotation_profile_run(
+        select_side_effect=select_side_effect,
+        profile_id=profile_id,
+    )
+    if caught:
+        raise caught
+    assert result is not None
+    return result, mock_app
+
+
+async def _attempt_setup_rotation_profile_run(
+    *,
+    select_side_effect: str | Exception,
+    profile_id: str,
+    browser_profile_key: str | None = "{{ login_cred }}",
+) -> tuple[SimpleNamespace | None, MagicMock, WorkflowService, Exception | None]:
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential(browser_profile_key=browser_profile_key)
+    workflow_run = _setup_workflow_run()
+    updated_run_values = dict(workflow_run.__dict__)
+    updated_run_values["browser_profile_id"] = profile_id
+    updated_run = SimpleNamespace(**updated_run_values)
+    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+
+    service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
+    service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    service.get_workflow_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    service.create_workflow_run_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+
+    select_mock = (
+        AsyncMock(side_effect=select_side_effect)
+        if isinstance(select_side_effect, Exception)
+        else AsyncMock(return_value=select_side_effect)
+    )
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile = AsyncMock(
+            return_value=(
+                SimpleNamespace(browser_profile_id=profile_id, is_managed=True, proxy_session_id=None),
+                False,
+            )
+        )
+        mock_app.DATABASE.workflow_runs.update_workflow_run = AsyncMock(return_value=updated_run)
+
+        result = None
+        caught = None
+        try:
+            result = await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=WorkflowRequestBody(data={}),
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+        except Exception as exc:
+            caught = exc
+
+    return result, mock_app, service, caught
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_uses_selected_rotating_credential_for_profile_key() -> None:
+    result, mock_app = await _setup_rotation_profile_run(select_side_effect="cred_b", profile_id="bp_selected")
+
+    assert result.browser_profile_id == "bp_selected"
+    mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile.assert_awaited_once_with(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        browser_profile_key_digest=build_browser_profile_key_digest("cred_b"),
+        name="Workflow (auto-saved: cred_b)",
+    )
+
+
+@pytest.mark.asyncio
+async def test_keyed_setup_workflow_run_fails_when_rotation_selection_fails() -> None:
+    result, _, service, caught = await _attempt_setup_rotation_profile_run(
+        select_side_effect=RuntimeError("selection failed"),
+        profile_id="bp_keyless",
+    )
+
+    assert result is None
+    assert isinstance(caught, RuntimeError)
+    assert str(caught) == "selection failed"
+    service.mark_workflow_run_as_failed.assert_awaited_once()
+    assert service.mark_workflow_run_as_failed.await_args.kwargs["workflow_run_id"] == "wr_test"
+    assert service.mark_workflow_run_as_failed.await_args.kwargs["failure_reason"].startswith(
+        "Setup workflow failed. failure reason:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_keyless_setup_workflow_run_falls_back_to_keyless_profile_when_rotation_selection_fails() -> None:
+    result, mock_app, _, caught = await _attempt_setup_rotation_profile_run(
+        select_side_effect=RuntimeError("selection failed"),
+        profile_id="bp_keyless",
+        browser_profile_key=None,
+    )
+
+    assert caught is None
+    assert result is not None
+    assert result.browser_profile_id == "bp_keyless"
+    mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile.assert_awaited_once_with(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        browser_profile_key_digest="",
+        name="Workflow (auto-saved session)",
+    )
