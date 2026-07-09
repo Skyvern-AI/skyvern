@@ -815,10 +815,35 @@ class TestActObserveToolGate:
             ctx,
         )
 
-        server.call_internal_tool.assert_not_awaited()
+        awaited_tools = [call.args[0] for call in server.call_internal_tool.await_args_list]
+        assert awaited_tools == ["skyvern_get_value"]
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+
+    @pytest.mark.asyncio
+    async def test_bare_css_selector_probes_control_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def passes(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        server = _server_returning(_bounded_extractor_payload())
+        ctx = _ctx(server=server, source_url=_SOURCE_URL)
+
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#electricDate", "text_length": 10}},
+            {"browser_context": {"url": _LANDING_URL, "title": "Results"}},
+            ctx,
+        )
+
+        probed = [
+            call
+            for call in server.call_internal_tool.await_args_list
+            if call.args and call.args[0] == "skyvern_evaluate" and "readonly" in call.args[1]["expression"]
+        ]
+        assert len(probed) == 1
 
 
 def _np_ctx(*, server: Any = None, counter: int = 0) -> SimpleNamespace:
