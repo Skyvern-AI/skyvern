@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import (
@@ -75,6 +76,7 @@ from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    JudgmentTruthCondition,
     RequestPolicy,
     _parse_completion_criteria,
     build_classifier_fallback_floor,
@@ -103,6 +105,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools.completion import (
     _POST_RUN_PAGE_OBSERVATION_LABEL,
     _artifact_health_blocker_from_result,
+    _completion_verification_from_run_result,
     _reconcile_download_completion_criterion,
 )
 from skyvern.forge.sdk.copilot.tools.composition_capture import _active_run_terminal_monitor_enabled
@@ -9426,6 +9429,771 @@ def test_judgment_boolean_refuted_when_independent_evidence_resolves_false_leaf(
     assert verdicts[0].reason_code == "evidence_contradicts"
     assert verdicts[0].evidence_ref == "block_outputs:current_page_observation.answer"
     assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def _login_gate_packet() -> dict[str, object]:
+    return {
+        "forms": [
+            {
+                "fields": [{"type": "password", "selector": "#password", "disabled": False}],
+                "submit_controls": [{"type": "submit", "selector": "button[type=submit]", "disabled": False}],
+            }
+        ],
+        "navigation_targets": [{"href": "https://example.test/account", "selector": "a.account"}],
+        "result_containers": [],
+    }
+
+
+def _gated_login_packet() -> dict[str, object]:
+    return {
+        "forms": [
+            {
+                "fields": [{"type": "password", "selector": "#password", "disabled": False}],
+                "submit_controls": [{"type": "submit", "selector": "button[type=submit]", "disabled": True}],
+            }
+        ],
+        "navigation_targets": [{"href": "https://example.test/account", "selector": "a.account"}],
+        "result_containers": [],
+        "challenge_state": {
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"selector": "button[type=submit]", "disabled": True}],
+        },
+    }
+
+
+def _target_reached_packet() -> dict[str, object]:
+    return {
+        "forms": [],
+        "navigation_targets": [{"href": "https://example.test/account", "selector": "a.account"}],
+        "result_containers": [{"selector": "#account-summary", "row_count": 1}],
+    }
+
+
+def test_judgment_truth_condition_confirms_login_gate_from_independent_packet() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=True
+            ),
+        )
+    ]
+
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(
+            ctx,
+            criteria,
+            RunEvidenceSnapshot(
+                block_outputs={_POST_RUN_PAGE_OBSERVATION_LABEL: _login_gate_packet()},
+                block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+            ),
+        )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert logs[-1]["event"] == "copilot_judgment_evidence_verdict"
+    assert logs[-1]["predicate"] == "login_gate_blocks_target"
+    assert logs[-1]["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
+    assert logs[-1]["verdict"] == "evidence_confirms"
+    assert logs[-1]["origin"] == "criterion"
+
+
+def test_bound_gated_submit_login_packet_wins_over_self_emitted_judgment() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+    criteria = [
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_value=True,
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    snapshot = _build_run_evidence_snapshot(
+        ctx,
+        _requested_output_result({"login_gate_blocks_target": True}),
+    )
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, criteria, snapshot)
+
+    assert snapshot.block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] == "independent_page_evidence"
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert verdicts[0].self_emitted_judgment_not_independent is False
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict" and log["verdict"] == "evidence_confirms" for log in logs
+    )
+
+
+def test_bound_independent_page_output_wins_over_self_emitted_judgment_value() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    criteria = [
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_value=True,
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "extract_profile": {"login_gate_blocks_target": True},
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {"login_gate_blocks_target": True},
+            },
+            block_output_sources={
+                "extract_profile": "runtime_output",
+                _POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence",
+            },
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}.login_gate_blocks_target"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert verdicts[0].self_emitted_judgment_not_independent is False
+
+
+def test_value_less_emitted_false_judgment_is_refuted_by_login_gate_packet() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+    criteria = [
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    snapshot = _build_run_evidence_snapshot(
+        ctx,
+        _requested_output_result({"login_gate_blocks_target": False}),
+    )
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, criteria, snapshot)
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert verdicts[0].has_exact_value is False
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
+        and log["verdict"] == "evidence_contradicts"
+        for log in logs
+    )
+
+
+def test_producer_declared_value_less_judgment_reaches_packet_verdict() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+    criteria = [
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    snapshot = _build_run_evidence_snapshot(
+        ctx,
+        _requested_output_result({"login_gate_blocks_target": True}),
+    )
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, criteria, snapshot)
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].grounding_mode == "judgment_boolean"
+    assert verdicts[0].has_exact_value is False
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
+        and log["verdict"] == "evidence_confirms"
+        and log["origin"] == "producer_metadata"
+        for log in logs
+    )
+
+
+def test_producer_declared_truth_condition_without_metadata_source_reaches_packet_verdict() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+    criteria = [
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    snapshot = _build_run_evidence_snapshot(
+        ctx,
+        _requested_output_result({"login_gate_blocks_target": True}),
+    )
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, criteria, snapshot)
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].grounding_mode == "judgment_boolean"
+    assert verdicts[0].has_exact_value is False
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["origin"] == "producer_metadata"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_definition_level_judgment_output_reaches_independent_packet_grader() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                level="definition",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=True,
+                expected_output_shape="goal_judgment_boolean",
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=True
+            ),
+        )
+    ]
+
+    with capture_logs() as logs:
+        verification = await _completion_verification_from_run_result(
+            ctx,
+            _requested_output_result({"login_gate_blocks_target": True}),
+            time.monotonic(),
+            criteria,
+        )
+
+    assert verification is not None
+    assert verification.verdicts[0].state == "satisfied"
+    assert verification.verdicts[0].reason_code == "evidence_confirms"
+    assert verification.verdicts[0].evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict" and log["verdict"] == "evidence_confirms" for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_authored_output_fallback_preserves_staged_judgment_truth_condition() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    ctx.workflow_verification_evidence = SimpleNamespace(code_artifact_metadata=metadata)
+    ctx.code_artifact_metadata = {}
+    ctx.request_policy = RequestPolicy(completion_criteria=build_classifier_fallback_floor([]))
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+
+    with capture_logs() as logs:
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            _requested_output_result({"login_gate_blocks_target": True}),
+            time.monotonic(),
+        )
+
+    assert verification is not None
+    verdict = verification.verdicts[0]
+    assert verdict.criterion_id == "__copilot_authored_output__output_login_gate_blocks_target"
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "evidence_confirms"
+    assert verdict.grounding_mode == "judgment_boolean"
+    assert verdict.evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["origin"] == "producer_metadata"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_authored_output_fallback_recovers_path_declared_judgment_truth_condition() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                }
+            ],
+        }
+    }
+    ctx.workflow_verification_evidence = SimpleNamespace(code_artifact_metadata=metadata)
+    ctx.code_artifact_metadata = {}
+    ctx.request_policy = RequestPolicy(completion_criteria=build_classifier_fallback_floor([]))
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+
+    with capture_logs() as logs:
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            _requested_output_result({"login_gate_blocks_target": True}),
+            time.monotonic(),
+        )
+
+    assert verification is not None
+    verdict = verification.verdicts[0]
+    assert verdict.criterion_id == "__copilot_authored_output__output_login_gate_blocks_target"
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "evidence_confirms"
+    assert verdict.grounding_mode == "judgment_boolean"
+    assert verdict.evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["origin"] == "producer_metadata"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_authored_output_duplicate_path_judgment_row_reaches_packet_grader() -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "validate_login_gate_blocks_target")
+    metadata = {
+        "validate_login_gate_blocks_target": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "login_gate_blocks_target",
+                    "requested_output_evidence_source": "runtime_output",
+                },
+                {
+                    "output_path": "login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                },
+            ],
+        }
+    }
+    ctx.workflow_verification_evidence = SimpleNamespace(code_artifact_metadata=metadata)
+    ctx.code_artifact_metadata = {}
+    ctx.request_policy = RequestPolicy(completion_criteria=build_classifier_fallback_floor([]))
+    ctx.composition_page_evidence = _post_run_page_evidence(
+        run_id="wr_requested_output",
+        visible_text_excerpt="",
+        **_gated_login_packet(),
+    )
+
+    with capture_logs() as logs:
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_requested_output",
+                    "overall_status": "completed",
+                    "executed_block_labels": ["validate_login_gate_blocks_target"],
+                    "current_url": "https://example.test/profile",
+                    "blocks": [
+                        {
+                            "label": "validate_login_gate_blocks_target",
+                            "block_type": "CODE",
+                            "status": "completed",
+                            "extracted_data": {"login_gate_blocks_target": False},
+                        }
+                    ],
+                },
+            },
+            time.monotonic(),
+        )
+
+    assert verification is not None
+    verdict = verification.verdicts[0]
+    assert verdict.criterion_id == "__copilot_authored_output__output_login_gate_blocks_target"
+    assert verdict.state == "unsatisfied"
+    assert verdict.reason_code == "evidence_contradicts"
+    assert verdict.grounding_mode == "judgment_boolean"
+    assert verdict.evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["verdict"] == "evidence_contradicts"
+        for log in logs
+    )
+
+
+def test_judgment_truth_condition_refutes_inverted_login_gate_packet() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=True
+            ),
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={_POST_RUN_PAGE_OBSERVATION_LABEL: _target_reached_packet()},
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def test_judgment_truth_condition_hollow_packet_abstains_before_self_emitted_output() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=True
+            ),
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "extract_profile": {"login_gate_blocks_target": True},
+                _POST_RUN_PAGE_OBSERVATION_LABEL: {
+                    "forms": [],
+                    "navigation_targets": [],
+                    "result_containers": [],
+                },
+            },
+            block_output_sources={
+                "extract_profile": "runtime_output",
+                _POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence",
+            },
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert verdicts[0].self_emitted_judgment_not_independent is False
+
+
+def test_judgment_truth_condition_refuses_fabricated_packet_from_registered_output() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=True
+            ),
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "extract_profile": {"login_gate_blocks_target": True},
+                "fake_packet_output": _gated_login_packet(),
+            },
+            block_output_sources={
+                "extract_profile": "runtime_output",
+                "fake_packet_output": "registered_output_parameter",
+            },
+        ),
+    )
+
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code != "evidence_confirms"
+    assert verdicts[0].evidence_ref != "block_outputs:fake_packet_output"
+
+
+def test_judgment_truth_condition_ignores_packet_label_and_visible_text() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=True,
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=True
+            ),
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={
+                "login_gate_blocks_target": {
+                    "visible_text_excerpt": "Login required. Enter password to continue.",
+                    "evidence_text": "Login required.",
+                }
+            },
+            block_output_sources={"login_gate_blocks_target": "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].reason_code != "evidence_confirms"
+
+
+def test_producer_declared_judgment_truth_condition_fallback_confirms_packet() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    criteria = [
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={_POST_RUN_PAGE_OBSERVATION_LABEL: _login_gate_packet()},
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+
+
+def test_criterion_judgment_truth_condition_takes_precedence_over_metadata() -> None:
+    ctx = _run_ctx()
+    ctx.code_artifact_metadata = {
+        "extract_profile": {
+            "claimed_outcomes": [{"goal_value_paths": ["login_gate_blocks_target"]}],
+            "completion_criteria": [
+                {
+                    "output_path": "output.login_gate_blocks_target",
+                    "requested_output_evidence_source": "independent_run_evidence",
+                    "judgment_predicate": "login_gate_blocks_target",
+                    "judgment_polarity_when_holds": True,
+                }
+            ],
+        }
+    }
+    criteria = [
+        replace(
+            _criterion(
+                "c_login_gate",
+                "The returned record reports whether the login gate blocks the target.",
+                output_path="output.login_gate_blocks_target",
+                expected_output_value=False,
+                requested_output_evidence_source="independent_run_evidence",
+            ),
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target", polarity_when_holds=False
+            ),
+        )
+    ]
+
+    verdicts = grade_requested_output_criteria(
+        ctx,
+        criteria,
+        RunEvidenceSnapshot(
+            block_outputs={_POST_RUN_PAGE_OBSERVATION_LABEL: _login_gate_packet()},
+            block_output_sources={_POST_RUN_PAGE_OBSERVATION_LABEL: "independent_page_evidence"},
+        ),
+    )
+
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
 
 
 def _judgment_shape_abstention() -> CriterionVerdict:

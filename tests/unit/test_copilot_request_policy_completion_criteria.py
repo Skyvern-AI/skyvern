@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    JudgmentTruthCondition,
     RequestPolicy,
     _apply_requested_output_completion_criteria,
     _apply_validation_classification_completion_criteria,
@@ -1718,6 +1720,56 @@ def test_parser_promotes_goal_judgment_boolean_shape_without_explicit_value() ->
     assert _criterion_grounding_mode(criteria[0]) == "judgment_boolean"
 
 
+def test_parser_mints_login_gate_judgment_truth_condition_from_classifier_fields() -> None:
+    criteria = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record reports whether the login gate blocks the target.",
+                "output_path": "output.login_gate_blocks_target",
+                "expected_output_shape": "goal_judgment_boolean",
+                "requested_output_evidence_source": "independent_run_evidence",
+                "judgment_predicate": "login_gate_blocks_target",
+                "judgment_polarity_when_holds": True,
+            }
+        ]
+    )
+
+    assert criteria[0].judgment_truth_condition == JudgmentTruthCondition(
+        predicate="login_gate_blocks_target", polarity_when_holds=True
+    )
+
+
+def test_backticked_named_output_mints_login_gate_requested_output_truth_condition() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            replace(
+                _criterion(
+                    "c_login_gate",
+                    "The returned record reports login gate blocks target.",
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                ),
+                judgment_truth_condition=JudgmentTruthCondition(
+                    predicate="login_gate_blocks_target", polarity_when_holds=True
+                ),
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(
+        policy,
+        "Create a validation workflow and return the named output `login_gate_blocks_target`.",
+    )
+
+    criteria = _criteria_for_path(policy, "output.login_gate_blocks_target")
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_shape == "goal_judgment_boolean"
+    assert criteria[0].requested_output_evidence_source == "independent_run_evidence"
+    assert criteria[0].judgment_truth_condition == JudgmentTruthCondition(
+        predicate="login_gate_blocks_target", polarity_when_holds=True
+    )
+
+
 def test_parser_dedup_keeps_runtime_string_and_judgment_boolean_on_same_path() -> None:
     criteria = _parse_completion_criteria(
         [
@@ -1786,6 +1838,26 @@ def test_store_round_trip_preserves_boolean_expected_value_and_source() -> None:
     assert round_tripped[0].expected_output_value is False
     assert round_tripped[0].requested_output_evidence_source == "independent_run_evidence"
     assert _criterion_grounding_mode(round_tripped[0]) == "judgment_boolean"
+
+
+def test_store_round_trip_preserves_judgment_truth_condition() -> None:
+    criterion = replace(
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        ),
+        judgment_truth_condition=JudgmentTruthCondition(predicate="login_gate_blocks_target", polarity_when_holds=True),
+    )
+
+    round_tripped = criteria_from_json(criteria_to_json([criterion]))
+
+    assert round_tripped[0].judgment_truth_condition == JudgmentTruthCondition(
+        predicate="login_gate_blocks_target", polarity_when_holds=True
+    )
+    assert _criterion_reconcile_key(round_tripped[0]) == _criterion_reconcile_key(criterion)
 
 
 def test_expected_false_survives_active_criteria_rendering() -> None:
