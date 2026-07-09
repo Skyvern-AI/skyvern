@@ -535,13 +535,14 @@ function NodeHeader({
         browserSessionId: debugSession.browser_session_id,
       });
 
-      return await client.post<Payload, { data: { run_id: string } }>(
+      const response = await client.post<Payload, { data: { run_id: string } }>(
         "/run/workflows/blocks",
         body,
       );
+      return { response, mergedParameters };
     },
-    onSuccess: (response) => {
-      if (!response) {
+    onSuccess: (result) => {
+      if (!result?.response) {
         log.error("Run block: no response", {
           workflowPermanentId,
           blockLabel,
@@ -554,6 +555,14 @@ function NodeHeader({
           description: "No response",
         });
         return;
+      }
+
+      const { response, mergedParameters } = result;
+
+      if (workflowPermanentId) {
+        useDebuggerLastRunValuesStore
+          .getState()
+          .setLastRunValues(workflowPermanentId, mergedParameters);
       }
 
       log.info("Run block: run started", {
@@ -1125,12 +1134,8 @@ function NodeHeader({
             },
             {
               onSuccess: () => {
-                if (workflowPermanentId) {
-                  useDebuggerLastRunValuesStore
-                    .getState()
-                    .setLastRunValues(workflowPermanentId, values);
-                }
-                // Close dialog on success - navigation also happens in mutation's onSuccess
+                // Close dialog on success - navigation and last-run-value
+                // persistence happen in the mutation's onSuccess.
                 setShowParamsDialog(false);
               },
               // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.

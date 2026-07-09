@@ -172,7 +172,7 @@ export const helpTooltips = {
   wait: {
     ...baseHelpTooltipContent,
     waitInSeconds:
-      "Specify a number for how many seconds to wait. Value must be between 0 and 300 seconds.",
+      "Specify a number for how many seconds to wait. Value must be between 1 and 1800 seconds.",
   },
   pdfParser: {
     ...baseHelpTooltipContent,
