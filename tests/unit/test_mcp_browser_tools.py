@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.cli.core.result import BrowserContext
+from skyvern.cli.core.result import BrowserContext, set_concise_responses
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
@@ -137,6 +137,38 @@ async def test_skyvern_login_success_returns_run_data(monkeypatch: pytest.Monkey
     assert result["ok"] is True
     assert result["data"]["run_id"] == "wr_123"
     assert result["data"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_login_null_recording_url_stays_stripped_in_concise_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """skyvern_browser_session_get/close preserve a null recording_url in concise mode via an
+    action-scoped allowlist — unrelated tools like skyvern_login must keep stripping it."""
+    response = SimpleNamespace(
+        run_id="wr_124",
+        status="completed",
+        output={"ok": True},
+        failure_reason=None,
+        recording_url=None,
+        app_url="https://app.example.com/wr_124",
+    )
+    page = _login_page_mock(None)
+    page.agent.login = AsyncMock(return_value=response)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    set_concise_responses(True)
+    try:
+        result = await mcp_browser.skyvern_login(
+            credential_type="skyvern",
+            credential_id="cred_123",
+        )
+    finally:
+        set_concise_responses(False)
+
+    assert result["ok"] is True
+    assert "recording_url" not in result["data"]
 
 
 @pytest.mark.asyncio
