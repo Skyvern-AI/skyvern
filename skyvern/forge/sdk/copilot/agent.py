@@ -10,7 +10,7 @@ import contextlib
 import json
 import re
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
+    trajectory_has_browser_fill_interaction,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSnapshot,
@@ -106,19 +107,33 @@ from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     record_criteria_lifecycle,
     record_gate_decision,
 )
+from skyvern.forge.sdk.copilot.output_contracts import (
+    OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+    OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    ACTUATION_OBLIGATION_UNMET_REASON_CODE,
     UNVALIDATED_DISCLOSURE_PHRASES,
     WORKFLOW_PRESENT_SENTINEL,
+    ActuationObligationEvaluation,
+    ActuationObligationStatus,
+    CannotActReason,
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
+    actuation_obligation_key,
     build_output_policy_diagnostics,
     derive_output_kind,
+    evaluate_actuation_obligation,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
     normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
+    prior_turn_satisfies_actuation_terminal_condition,
+    request_policy_requires_durable_fill,
+    turn_intent_requires_actuation,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
@@ -481,16 +496,7 @@ def _store_request_policy_on_context(
         chat_history_text=policy_inputs.chat_history_text,
         previous_user_message=policy_inputs.previous_user_message,
     )
-    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
-    ctx.request_policy = policy
-    ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
-    ctx.user_message = agent_user_message
-    ctx.block_goal_main_goal = _build_block_goal_main_goal(
-        user_message=agent_user_message,
-        chat_history_text=policy_chat_history_text,
-        global_llm_context=policy_inputs.global_llm_context,
-    )
-    ctx.turn_intent = build_turn_intent(
+    turn_intent = build_turn_intent(
         user_message=policy_inputs.user_message,
         workflow_yaml=policy_inputs.workflow_yaml,
         chat_history=policy_inputs.chat_history_messages,
@@ -503,6 +509,16 @@ def _store_request_policy_on_context(
         classifier_result=turn_intent_classifier_result,
         fix_origin=policy_inputs.fix_origin,
     )
+    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
+    ctx.request_policy = policy
+    ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
+    ctx.user_message = agent_user_message
+    ctx.block_goal_main_goal = _build_block_goal_main_goal(
+        user_message=agent_user_message,
+        chat_history_text=policy_chat_history_text,
+        global_llm_context=policy_inputs.global_llm_context,
+    )
+    ctx.turn_intent = turn_intent
 
 
 def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
@@ -1237,6 +1253,18 @@ _DRAFT_ONLY_MCP_TOOL_ALLOWLIST = frozenset({"get_block_schema", "validate_block"
 _DRAFT_ONLY_NATIVE_TOOL_DENYLIST = frozenset(
     {"discover_workflow_entrypoint", "inspect_page_for_composition", "fill_credential_field"}
 )
+_MUTATING_BROWSER_SCOUT_TOOLS = frozenset({"click", "press_key", "type_text", "select_option", "fill_credential_field"})
+_STRUCTURAL_CANNOT_ACT_REASON_CODES = frozenset(
+    {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
+)
+_FinalActionDataValue = str | int | float | bool | None
+_ACTUATION_OBLIGATION_STEER_REPLY = (
+    "I need to act in the browser for this request. Please let me try the browser action, or tell me what blocks it."
+)
+_ACTUATION_OBLIGATION_UNMET_REPLY = (
+    "I still did not act in the browser for this request, so I cannot treat the task as completed. "
+    "Please retry or tell me what prevented the browser action."
+)
 
 
 def _request_policy_disables_browser_scout_tools(request_policy: RequestPolicy | None) -> bool:
@@ -1246,6 +1274,108 @@ def _request_policy_disables_browser_scout_tools(request_policy: RequestPolicy |
         and not request_policy.allow_run_blocks
         and (request_policy.testing_intent == "skip_test" or request_policy.allow_missing_credentials_in_draft)
     )
+
+
+def _turn_intent_requires_browser_state(turn_intent: TurnIntent | None) -> bool:
+    return isinstance(turn_intent, TurnIntent) and RequiredContextKey.BROWSER_STATE in turn_intent.required_context
+
+
+def _turn_intent_browser_only_tools(turn_intent: TurnIntent | None) -> bool:
+    return (
+        isinstance(turn_intent, TurnIntent)
+        and turn_intent.mode == TurnIntentMode.BUILD
+        and RequiredContextKey.BROWSER_STATE in turn_intent.required_context
+        and not turn_intent.authority.may_update_workflow
+        and not turn_intent.authority.may_run_blocks
+    )
+
+
+def _successful_mutating_browser_action_count(ctx: CopilotContext) -> int:
+    return sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if isinstance(interaction, Mapping) and interaction.get("tool_name") in _MUTATING_BROWSER_SCOUT_TOOLS
+    )
+
+
+def _successful_durable_fill_count(ctx: CopilotContext) -> int:
+    return int(trajectory_has_browser_fill_interaction(ctx.scout_trajectory))
+
+
+def _typed_cannot_act_reason(ctx: CopilotContext) -> CannotActReason | None:
+    signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
+    if signal is None:
+        return None
+    if signal.blocker_kind == "authority_denied":
+        return None
+    if signal.blocker_kind == "missing_required_context":
+        return CannotActReason.MISSING_FIELD_VALUE
+    if signal.recovery_hint == "ask_user_clarifying":
+        return CannotActReason.AMBIGUOUS_TARGET
+    if signal.internal_reason_code in _STRUCTURAL_CANNOT_ACT_REASON_CODES:
+        return CannotActReason.STRUCTURAL_BLOCKER
+    return None
+
+
+def _evaluate_actuation_obligation_for_output(
+    ctx: CopilotContext,
+    action_data: Mapping[str, _FinalActionDataValue],
+    response_type: str,
+    output_kind: CopilotOutputKind,
+) -> ActuationObligationEvaluation:
+    cannot_act_reason = _typed_cannot_act_reason(ctx)
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=ctx.turn_intent,
+        response_type=response_type,
+        output_kind=output_kind,
+        successful_mutating_browser_actions=_successful_mutating_browser_action_count(ctx),
+        cannot_act_reason=cannot_act_reason,
+        prior_turn_outcome=ctx.prior_turn_outcome,
+    )
+    if evaluation.status != ActuationObligationStatus.ALLOWED:
+        return evaluation
+    if (
+        not _turn_intent_browser_only_tools(ctx.turn_intent)
+        or not request_policy_requires_durable_fill(ctx.request_policy)
+        or response_type != "REPLY"
+        or output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER
+    ):
+        return evaluation
+    if _successful_durable_fill_count(ctx) > 0 or cannot_act_reason is not None:
+        return evaluation
+    obligation_key = actuation_obligation_key(ctx.turn_intent)
+    if prior_turn_satisfies_actuation_terminal_condition(ctx.prior_turn_outcome, obligation_key):
+        return ActuationObligationEvaluation(
+            status=ActuationObligationStatus.TERMINAL,
+            reason_code=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+            obligation_key=obligation_key,
+        )
+    return ActuationObligationEvaluation(
+        status=ActuationObligationStatus.STEER,
+        reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+        obligation_key=obligation_key,
+    )
+
+
+def _actuation_obligation_diagnostics(
+    ctx: CopilotContext,
+    evaluation: ActuationObligationEvaluation,
+) -> dict[str, str | int | bool | None]:
+    if (
+        not turn_intent_requires_actuation(ctx.turn_intent)
+        and evaluation.status == ActuationObligationStatus.ALLOWED
+        and evaluation.cannot_act_reason is None
+    ):
+        return {}
+    return {
+        "actuation_obligation_status": evaluation.status.value,
+        "actuation_obligation_reason_code": evaluation.reason_code or None,
+        "actuation_obligation_key": evaluation.obligation_key or None,
+        "cannot_act_reason": evaluation.cannot_act_reason.value if evaluation.cannot_act_reason is not None else None,
+        "successful_mutating_browser_actions": _successful_mutating_browser_action_count(ctx),
+        "durable_fill_required": request_policy_requires_durable_fill(ctx.request_policy),
+        "successful_durable_browser_fills": _successful_durable_fill_count(ctx),
+    }
 
 
 def _mcp_tool_surface_for_turn(
@@ -3303,6 +3433,15 @@ async def _translate_to_agent_result(
         unvalidated=unvalidated,
         output_kind=output_kind,
     )
+    actuation_obligation = _evaluate_actuation_obligation_for_output(ctx, action_data, resp_type, output_kind)
+    if actuation_obligation.status == ActuationObligationStatus.STEER:
+        raw_output_policy_verdict.add(OutputPolicyReason.ACTUATION_OBLIGATION_STEER)
+    actuation_obligation_terminal = actuation_obligation.status == ActuationObligationStatus.TERMINAL
+    if actuation_obligation_terminal:
+        resp_type = "REPLY"
+        user_response = _ACTUATION_OBLIGATION_UNMET_REPLY
+        last_workflow = None
+        last_workflow_yaml = None
     output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
     unbacked_workflow_delivery_rewritten = False
@@ -3356,6 +3495,7 @@ async def _translate_to_agent_result(
         hard_block_reason_codes=list(output_policy_verdict.reason_codes),
         soft_rewrite_reason_codes=soft_rewrite_reasons,
     )
+    output_policy_diagnostics.update(_actuation_obligation_diagnostics(ctx, actuation_obligation))
     trace_data = output_policy_verdict_to_trace_data(
         output_policy_verdict,
         surface="final_translation",
@@ -3386,15 +3526,22 @@ async def _translate_to_agent_result(
         else []
     )
     reason_code = ",".join(reason_codes)
+    terminal_reason = None
+    if actuation_obligation_terminal:
+        reason_code = ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        terminal_reason = ACTUATION_OBLIGATION_UNMET_REASON_CODE
 
     final_user_response, turn_outcome = apply_repeated_reply_guard(
         final_text=final_user_response,
         attempted_kind=attempted_kind,
         blocked_signatures=ctx.blocked_reply_signatures,
         reason_code=reason_code,
+        terminal_reason=terminal_reason,
         turn_intent=ctx.turn_intent,
         tool_calls=[name for name in tool_call_names if name],
     )
+    if actuation_obligation.reason_code:
+        turn_outcome = turn_outcome.model_copy(update={"actuation_obligation_key": actuation_obligation.obligation_key})
 
     return _finalize_result_with_blocker_override(
         ctx,
@@ -3595,6 +3742,7 @@ def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKin
         OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS,
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+        OutputPolicyReason.ACTUATION_OBLIGATION_STEER,
     }
     if any(reason in clarification_reasons for reason in verdict.reason_codes):
         return CopilotOutputKind.CLARIFICATION_REQUEST
@@ -3661,6 +3809,16 @@ def _evaluate_copilot_final_output_policy(
         workflow_attempted=workflow_attempted,
         output_kind=output_kind,
     )
+    actuation_obligation = _evaluate_actuation_obligation_for_output(
+        ctx,
+        action_data,
+        policy_response_type,
+        output_kind,
+    )
+    if actuation_obligation.status == ActuationObligationStatus.STEER:
+        raw_verdict.add(OutputPolicyReason.ACTUATION_OBLIGATION_STEER)
+    elif actuation_obligation.status == ActuationObligationStatus.TERMINAL:
+        raw_verdict.add(OutputPolicyReason.ACTUATION_OBLIGATION_UNMET)
     hard_verdict = hard_block_output_policy_verdict(raw_verdict)
     deferred_reason_codes = _defer_avoidable_ask_to_recycle(ctx, hard_verdict, response_type)
     if deferred_reason_codes is not None:
@@ -3674,6 +3832,7 @@ def _evaluate_copilot_final_output_policy(
         hard_block_reason_codes=list(hard_verdict.reason_codes),
         soft_rewrite_reason_codes=[],
     )
+    diagnostics.update(_actuation_obligation_diagnostics(ctx, actuation_obligation))
     if deferred_reason_codes is not None:
         diagnostics["deferred_to_recycle"] = True
         diagnostics["deferred_reason_codes"] = [reason.value for reason in deferred_reason_codes]
@@ -3878,6 +4037,10 @@ def _build_output_policy_blocked_result(
             "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
         )
         add_saved_draft_copy = True
+    elif OutputPolicyReason.ACTUATION_OBLIGATION_UNMET in verdict.reason_codes:
+        user_response = _ACTUATION_OBLIGATION_UNMET_REPLY
+    elif OutputPolicyReason.ACTUATION_OBLIGATION_STEER in verdict.reason_codes:
+        user_response = _ACTUATION_OBLIGATION_STEER_REPLY
     elif preserved_workflow is not None:
         user_response = (
             "I could not safely return that chat reply, but the workflow draft is still saved. "
@@ -3908,13 +4071,37 @@ def _build_output_policy_blocked_result(
                 composed_from_recorded_evidence = True
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+    has_non_actuation_hard_block = any(
+        reason
+        not in {
+            OutputPolicyReason.ACTUATION_OBLIGATION_STEER,
+            OutputPolicyReason.ACTUATION_OBLIGATION_UNMET,
+        }
+        for reason in verdict.reason_codes
+    )
+    if has_non_actuation_hard_block:
+        blocked_reason_code = "output_policy_block"
+        blocked_terminal_reason: str | None = "output_policy_block"
+    elif OutputPolicyReason.ACTUATION_OBLIGATION_UNMET in verdict.reason_codes:
+        blocked_reason_code = ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        blocked_terminal_reason = ACTUATION_OBLIGATION_UNMET_REASON_CODE
+    else:
+        blocked_reason_code = ACTUATION_OBLIGATION_STEER_REASON_CODE
+        blocked_terminal_reason = None
     final_user_response, output_policy_outcome = apply_repeated_reply_guard(
         final_text=user_response,
         attempted_kind=ResponseKind.CLARIFY,
         blocked_signatures=ctx.blocked_reply_signatures,
-        reason_code="output_policy_block",
-        terminal_reason="output_policy_block",
+        reason_code=blocked_reason_code,
+        terminal_reason=blocked_terminal_reason,
     )
+    if blocked_reason_code in {ACTUATION_OBLIGATION_STEER_REASON_CODE, ACTUATION_OBLIGATION_UNMET_REASON_CODE}:
+        key = ""
+        if output_policy_diagnostics is not None:
+            key = str(output_policy_diagnostics.get("actuation_obligation_key") or "")
+        output_policy_outcome = output_policy_outcome.model_copy(
+            update={"actuation_obligation_key": key or actuation_obligation_key(ctx.turn_intent)}
+        )
     if composed_from_recorded_evidence and fallback_user_response is not None:
         composed_verdict = evaluate_output_policy(
             request_policy=ctx.request_policy,
@@ -3997,6 +4184,7 @@ async def run_copilot_agent(
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
+    prior_turn_outcome: TurnOutcome | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4034,6 +4222,7 @@ async def run_copilot_agent(
                     prior_block_count=prior_block_count,
                     ctx_sink=ctx_sink,
                     stored_completion_criteria=stored_completion_criteria,
+                    prior_turn_outcome=prior_turn_outcome,
                 )
             except Exception as exc:
                 LOG.error(
@@ -4102,6 +4291,7 @@ async def _run_copilot_turn_impl(
     prior_block_count: int | None = None,
     ctx_sink: list[CopilotContext] | None = None,
     stored_completion_criteria: StoredCriteriaSnapshot | None = None,
+    prior_turn_outcome: TurnOutcome | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
@@ -4166,6 +4356,7 @@ async def _run_copilot_turn_impl(
         turn_index=turn_index,
         prior_block_count=prior_block_count,
         prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+        prior_turn_outcome=prior_turn_outcome,
         block_authoring_policy=copilot_config.block_authoring_policy,
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
         copilot_config=copilot_config,

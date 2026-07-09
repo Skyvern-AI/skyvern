@@ -1101,6 +1101,21 @@ def trajectory_has_credential_fill(trajectory: Sequence[Mapping[str, Any]]) -> b
     return False
 
 
+def trajectory_has_browser_fill_interaction(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    for interaction in trajectory:
+        tool_name = str(interaction.get("tool_name") or "")
+        typed_length = interaction.get("typed_length")
+        if tool_name == "type_text" and (
+            (isinstance(typed_length, int) and typed_length > 0) or str(interaction.get("typed_value") or "").strip()
+        ):
+            return True
+        if tool_name == "select_option" and str(interaction.get("value") or "").strip():
+            return True
+        if tool_name == CREDENTIAL_FILL_TOOL_NAME and str(interaction.get("credential_field") or "").strip():
+            return True
+    return False
+
+
 def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return build_artifact_metadata_skeleton(trajectory, block_label=_SYNTHESIZED_BLOCK_LABEL)
 

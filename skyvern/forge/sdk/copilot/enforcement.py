@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
+    trajectory_has_browser_fill_interaction,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
@@ -76,7 +77,10 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
-from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
+from skyvern.forge.sdk.copilot.output_policy import (
+    completion_criterion_requires_browser_fill_delivery,
+    normalize_response_scaffolding,
+)
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     looks_like_workflow_delivery_claim,
@@ -116,7 +120,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -188,6 +192,7 @@ SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 _SYNTHESIZED_BLOCK_PERSISTENCE_ALLOWED_TOOLS = frozenset(
     {SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "fill_credential_field", "update_workflow"}
 )
+_ACTUATION_OBLIGATION_REQUIRED_FILL_TOOL = "type_text"
 _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
     {"click", "press_key", "type_text", "select_option", "navigate_browser"}
 )
@@ -2394,6 +2399,39 @@ def _uncovered_output_reject_admits_evaluate(ctx: CopilotContext, tool_name: str
     return tool_name == "evaluate" and bool(_active_uncovered_output_reject_paths(ctx))
 
 
+def _actuation_obligation_live_fill_delivery_required(ctx: CopilotContext) -> bool:
+    turn_intent = getattr(ctx, "turn_intent", None)
+    if (
+        not isinstance(turn_intent, TurnIntent)
+        or turn_intent.mode != TurnIntentMode.BUILD
+        or RequiredContextKey.BROWSER_STATE not in turn_intent.required_context
+    ):
+        return False
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return False
+    request_policy = getattr(ctx, "request_policy", None)
+    criteria: list[CompletionCriterion] = []
+    if isinstance(request_policy, RequestPolicy):
+        criteria.extend(request_policy.completion_criteria)
+    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    if turn_state is not None and turn_state.decision is not None:
+        criteria.extend(turn_state.decision.criteria)
+    if any(completion_criterion_requires_browser_fill_delivery(criterion) for criterion in criteria):
+        return True
+    trajectory = getattr(ctx, "scout_trajectory", None)
+    return trajectory_has_browser_fill_interaction(trajectory) if isinstance(trajectory, list) else False
+
+
+def _actuation_obligation_required_fill_tool(ctx: CopilotContext) -> str | None:
+    if _actuation_obligation_live_fill_delivery_required(ctx):
+        return _ACTUATION_OBLIGATION_REQUIRED_FILL_TOOL
+    return None
+
+
+def _actuation_obligation_admits_required_fill_tool(ctx: CopilotContext, tool_name: str) -> bool:
+    return tool_name == _actuation_obligation_required_fill_tool(ctx)
+
+
 def consume_uncovered_output_reopen_event(ctx: CopilotContext) -> bool:
     """Arm a one-shot scout-window reopen for the first author-time reject citing an uncovered
     requested-output path. Returns True only on that first reject per structural identity; a
@@ -2500,6 +2538,8 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
     if ambiguous_selector_rescout_state == "allow":
         return None
     if _uncovered_output_reject_admits_evaluate(ctx, tool_name):
+        return None
+    if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
         return None
     if (
         ambiguous_selector_rescout_state != "block"
