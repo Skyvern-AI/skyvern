@@ -21,6 +21,7 @@ from skyvern.schemas.runs import proxy_location_to_request
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
 from ._session import (
     SessionState,
+    clear_session_ref_map,
     close_current_session,
     get_current_session,
     get_skyvern,
@@ -284,6 +285,7 @@ async def skyvern_browser_session_close(
                 close_error: Exception | None = None
                 try:
                     result = await do_session_close(skyvern, session_id)
+                    clear_session_ref_map(session_id=session_id)
                 except Exception as e:
                     close_error = e
 
