@@ -164,6 +164,10 @@ class SkyvernContext:
     current_step_actions: list[dict[str, Any]] | None = None
     skip_complete_verification: bool = False
 
+    # Set by ValidationBlock.execute() for the duration of the block so the prompt builder
+    # can drop page DOM/URL/screenshots from the validation prompt. Restored after the block.
+    validation_without_page_information: bool = False
+
     # v3 agentic reviewer — per-run cumulative budget. Initialized at workflow
     # run start for v3-cohort workflows; None for v2-cohort runs. SKY-7676.
     v3_run_budget: RunBudget | None = None

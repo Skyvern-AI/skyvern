@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 import skyvern.forge.sdk.workflow.models.block as _block_mod
 from skyvern.config import settings as base_settings
@@ -824,6 +825,193 @@ async def test_text_prompt_block_execute_retries_response_format_failure(monkeyp
     assert raw_bad_response not in retry_failures[1]
     assert "customer-private-value" not in retry_failures[1]
     record_output_parameter_value.assert_awaited_once_with(workflow_run_context, "workflow-run", good_response)
+
+
+def _patch_send_prompt_deps(monkeypatch, *, handler) -> None:
+    async def fake_resolve(*args, **kwargs):
+        return handler
+
+    monkeypatch.setattr(TextPromptBlock, "_resolve_default_llm_handler", fake_resolve, raising=False)
+    monkeypatch.setattr(
+        block_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        lambda llm_key, *, default: default,
+        raising=False,
+    )
+    monkeypatch.setattr(block_module.asyncio, "sleep", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_retries_transient_llm_provider_error(monkeypatch):
+    """A transient provider error retries with backoff and recovers instead of failing."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    calls = {"n": 0}
+
+    async def flaky(*, prompt, prompt_name, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise block_module.LLMProviderErrorRetryableTask("transient provider error")
+        return {"llm_response": "recovered"}
+
+    _patch_send_prompt_deps(monkeypatch, handler=flaky)
+
+    response = await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert calls["n"] == 3
+    assert response == {"llm_response": "recovered"}
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_retries_transient_db_failure(monkeypatch):
+    """A transient DB connection error (OperationalError) during the LLM call is retried."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    calls = {"n": 0}
+
+    async def flaky(*, prompt, prompt_name, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OperationalError("SELECT 1", None, Exception("server closed the connection"))
+        return {"llm_response": "ok-after-db-retry"}
+
+    _patch_send_prompt_deps(monkeypatch, handler=flaky)
+
+    response = await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert calls["n"] == 2
+    assert response == {"llm_response": "ok-after-db-retry"}
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_retries_empty_response(monkeypatch):
+    """A bad/empty first response no longer fails on the first attempt; a retry recovers."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    calls = {"n": 0}
+
+    async def flaky(*, prompt, prompt_name, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise block_module.EmptyLLMResponseError("")
+        return {"llm_response": "second-attempt"}
+
+    _patch_send_prompt_deps(monkeypatch, handler=flaky)
+
+    response = await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert calls["n"] == 2
+    assert response == {"llm_response": "second-attempt"}
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_raises_after_exhausting_retries(monkeypatch):
+    """A persistently failing retriable error propagates after the max attempts."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    calls = {"n": 0}
+
+    async def always_fails(*, prompt, prompt_name, **kwargs):
+        calls["n"] += 1
+        raise block_module.EmptyLLMResponseError("still empty")
+
+    _patch_send_prompt_deps(monkeypatch, handler=always_fails)
+
+    with pytest.raises(block_module.EmptyLLMResponseError):
+        await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert calls["n"] == block_module.TEXT_PROMPT_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_non_retriable_error_not_retried(monkeypatch):
+    """A non-retriable error propagates on the first attempt without re-issuing the call."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    calls = {"n": 0}
+
+    async def value_fail(*, prompt, prompt_name, **kwargs):
+        calls["n"] += 1
+        raise ValueError("non-retriable")
+
+    _patch_send_prompt_deps(monkeypatch, handler=value_fail)
+
+    with pytest.raises(ValueError):
+        await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_non_transient_db_error_not_retried(monkeypatch):
+    """A non-transient DB error (IntegrityError) is not retried into a re-issued paid LLM call."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    calls = {"n": 0}
+
+    async def integrity_fail(*, prompt, prompt_name, **kwargs):
+        calls["n"] += 1
+        raise IntegrityError("INSERT ...", None, Exception("duplicate key value"))
+
+    _patch_send_prompt_deps(monkeypatch, handler=integrity_fail)
+
+    with pytest.raises(IntegrityError):
+        await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_uses_fallback_llm_key_when_available(monkeypatch):
+    """send_prompt upgrades the block's key to a fallback-capable key when one exists."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    block.llm_key = "VERTEX_GEMINI_2.5_FLASH"
+    captured: dict[str, str | None] = {}
+    handler = AsyncMock(return_value={"llm_response": "ok"})
+
+    async def fake_resolve(*args, **kwargs):
+        return handler
+
+    def fake_override(llm_key, *, default):
+        captured["llm_key"] = llm_key
+        return default
+
+    monkeypatch.setattr(TextPromptBlock, "_resolve_default_llm_handler", fake_resolve, raising=False)
+    monkeypatch.setattr(block_module.LLMAPIHandlerFactory, "get_override_llm_api_handler", fake_override, raising=False)
+    monkeypatch.setattr(
+        block_module.app.AGENT_FUNCTION,
+        "get_fallback_llm_key",
+        lambda llm_key: "GEMINI_2_5_FLASH_WITH_FALLBACK",
+        raising=False,
+    )
+
+    await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert captured["llm_key"] == "GEMINI_2_5_FLASH_WITH_FALLBACK"
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_block_org_default_derives_key_for_fallback(monkeypatch):
+    """Org-default runs (block sets no llm_key) derive the effective key from the resolved handler."""
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    block.llm_key = None
+    captured: dict[str, str | None] = {}
+    handler = AsyncMock(return_value={"llm_response": "ok"})
+    handler.llm_key = "VERTEX_GEMINI_2.5_FLASH"
+
+    async def fake_resolve(*args, **kwargs):
+        return handler
+
+    def fake_override(llm_key, *, default):
+        captured["llm_key"] = llm_key
+        return default
+
+    monkeypatch.setattr(TextPromptBlock, "_resolve_default_llm_handler", fake_resolve, raising=False)
+    monkeypatch.setattr(block_module.LLMAPIHandlerFactory, "get_override_llm_api_handler", fake_override, raising=False)
+    monkeypatch.setattr(
+        block_module.app.AGENT_FUNCTION,
+        "get_fallback_llm_key",
+        lambda llm_key: f"{llm_key}_WITH_FALLBACK" if llm_key else None,
+        raising=False,
+    )
+
+    await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
+
+    assert captured["llm_key"] == "VERTEX_GEMINI_2.5_FLASH_WITH_FALLBACK"
 
 
 def test_workflow_request_deserialization_strips_invalid_text_prompt_llm_key() -> None:

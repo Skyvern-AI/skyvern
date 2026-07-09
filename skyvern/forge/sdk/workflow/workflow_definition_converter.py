@@ -678,6 +678,7 @@ def block_yaml_to_block(
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             error_code_mapping=block_yaml.error_code_mapping,
+            without_page_information=block_yaml.without_page_information,
             # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
             max_steps_per_run=2,
         )

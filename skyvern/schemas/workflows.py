@@ -959,6 +959,7 @@ class ValidationBlockYAML(BlockYAML):
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
+    without_page_information: bool = False
 
 
 class ActionBlockYAML(BlockYAML):

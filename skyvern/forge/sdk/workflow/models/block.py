@@ -40,6 +40,7 @@ from opentelemetry import trace as otel_trace
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -88,7 +89,12 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
-from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, InvalidLLMResponseType
+from skyvern.forge.sdk.api.llm.exceptions import (
+    EmptyLLMResponseError,
+    InvalidLLMResponseFormat,
+    InvalidLLMResponseType,
+    LLMProviderErrorRetryableTask,
+)
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
@@ -4556,6 +4562,22 @@ def _default_text_prompt_schema() -> dict[str, Any]:
     }
 
 
+# Transient failures where a single bad response/connection should not fail the whole run.
+# Mirrors the extraction-path treatment (SKY-8264): empty responses and retryable provider
+# errors usually succeed on a second attempt, as do transient DB connection drops.
+# DB errors are narrowed to the connection-loss family (OperationalError/InterfaceError) so a
+# non-transient DB error (IntegrityError, DataError, ...) is not retried into a re-issued
+# paid LLM call. Response-format errors are intentionally excluded — execute() already
+# re-prompts on those with the validation feedback, which beats a blind retry.
+TEXT_PROMPT_RETRIABLE_LLM_EXCEPTIONS: tuple[type[Exception], ...] = (
+    EmptyLLMResponseError,
+    LLMProviderErrorRetryableTask,
+    OperationalError,
+    InterfaceError,
+)
+TEXT_PROMPT_MAX_ATTEMPTS = 3
+
+
 def _json_type_name(value: Any) -> str:
     if value is None:
         return "null"
@@ -4759,8 +4781,28 @@ class TextPromptBlock(Block):
         json_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
+        selected_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
+        # When the block sets no key (org-default path), derive the effective key from the
+        # resolved default handler (mirrors get_override_llm_api_handler) so the fallback
+        # upgrade still fires for default-configured Gemini runs. Used for the lookup only —
+        # selected_llm_key is overwritten solely when a fallback twin exists, so the
+        # no-fallback path stays identical to passing the original key/None.
+        fallback_lookup_key = (
+            selected_llm_key
+            or getattr(default_llm_handler, "llm_key", None)
+            or getattr(getattr(default_llm_handler, "__self__", None), "llm_key", None)
+        )
+        fallback_llm_key = app.AGENT_FUNCTION.get_fallback_llm_key(fallback_lookup_key)
+        if fallback_llm_key:
+            LOG.info(
+                "TextPromptBlock upgrading to fallback-capable LLM config",
+                block_label=self.label,
+                original_llm_key=fallback_lookup_key,
+                fallback_llm_key=fallback_llm_key,
+            )
+            selected_llm_key = fallback_llm_key
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key_for_organization(organization_id) or self.llm_key, default=default_llm_handler
+            selected_llm_key, default=default_llm_handler
         )
         schema_to_use = json_schema or self.json_schema or _default_text_prompt_schema()
 
@@ -4794,15 +4836,38 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(
-            prompt=prompt,
-            prompt_name="text-prompt",
-            system_prompt=self.workflow_system_prompt,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-            force_dict=False,
-        )
+        response: dict[str, Any] | list | str | None = None
+        for attempt in range(TEXT_PROMPT_MAX_ATTEMPTS):
+            try:
+                response = await llm_api_handler(
+                    prompt=prompt,
+                    prompt_name="text-prompt",
+                    system_prompt=self.workflow_system_prompt,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                    force_dict=False,
+                )
+                break
+            except TEXT_PROMPT_RETRIABLE_LLM_EXCEPTIONS as e:
+                if attempt >= TEXT_PROMPT_MAX_ATTEMPTS - 1:
+                    LOG.warning(
+                        "TextPromptBlock LLM call failed after all retries",
+                        block_label=self.label,
+                        attempts=attempt + 1,
+                        error=str(e),
+                    )
+                    raise
+                backoff_time = 0.2 * (2**attempt)
+                LOG.warning(
+                    "Transient TextPromptBlock LLM/DB failure, retrying",
+                    block_label=self.label,
+                    attempt=attempt + 1,
+                    max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
+                    backoff_time=backoff_time,
+                    error=str(e),
+                )
+                await asyncio.sleep(backoff_time)
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -7796,6 +7861,11 @@ class ValidationBlock(BaseTaskBlock):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
+    # Opt-in: when True, the validation prompt excludes the page DOM/URL/screenshots and
+    # evaluates the criterion against durable data only (prior block outputs, workflow inputs).
+    # Default False keeps today's page-aware behavior.
+    without_page_information: bool = False
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -7822,12 +7892,20 @@ class ValidationBlock(BaseTaskBlock):
                 organization_id=organization_id,
             )
 
-        return await super().execute(
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            kwargs=kwargs,
-        )
+        context = skyvern_context.current()
+        prev_without_page_information = context.validation_without_page_information if context else False
+        if context:
+            context.validation_without_page_information = self.without_page_information
+        try:
+            return await super().execute(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                kwargs=kwargs,
+            )
+        finally:
+            if context:
+                context.validation_without_page_information = prev_without_page_information
 
 
 class ActionBlock(BaseTaskBlock):
