@@ -45,7 +45,7 @@ from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -883,9 +883,9 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
         """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
-        default for its non-flex twin when `trigger_type == manual` (UI/MCP)."""
+        default for its non-flex twin when `trigger_type` is manual-like."""
         ctx = skyvern_context.current()
-        if ctx is None or ctx.trigger_type != WorkflowRunTriggerType.manual:
+        if ctx is None or not is_manual_like_workflow_run_trigger_type(ctx.trigger_type):
             return None
         effective_key = (
             getattr(default, "llm_key", None)

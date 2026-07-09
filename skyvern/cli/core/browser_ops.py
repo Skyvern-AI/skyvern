@@ -1129,6 +1129,14 @@ class ExecuteStep:
     params: dict[str, Any] = field(default_factory=dict)
 
 
+class ToolStepError(RuntimeError):
+    """Step failure that preserves the failing tool's structured error payload."""
+
+    def __init__(self, error: dict[str, Any]) -> None:
+        super().__init__(error.get("message", "Tool execution failed"))
+        self.error = error
+
+
 @dataclass
 class StepResult:
     step: int
@@ -1136,7 +1144,7 @@ class StepResult:
     ok: bool
     wall_ms: int = 0
     data: dict[str, Any] | None = None
-    error: str | None = None
+    error: str | dict[str, Any] | None = None
 
 
 @dataclass
@@ -1186,7 +1194,8 @@ async def do_execute(
 
         except Exception as e:
             wall_ms = int((time.monotonic() - t0) * 1000)
-            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=str(e)))
+            error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
+            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:
