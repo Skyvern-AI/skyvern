@@ -16,7 +16,7 @@ from skyvern.schemas.runs import ProxyLocation
 
 USER_AGENT_CASES = [
     ("skyvern-ui", WorkflowRunTriggerType.manual),
-    ("skyvern-mcp", WorkflowRunTriggerType.manual),
+    ("skyvern-mcp", WorkflowRunTriggerType.mcp),
     (None, WorkflowRunTriggerType.api),
     ("python-sdk/1.0", WorkflowRunTriggerType.api),
 ]
@@ -212,7 +212,7 @@ def _auth_override() -> SimpleNamespace:
     "headers, expected",
     [
         ({"x-user-agent": "skyvern-ui"}, WorkflowRunTriggerType.manual),
-        ({"X-User-Agent": "skyvern-mcp"}, WorkflowRunTriggerType.manual),
+        ({"X-User-Agent": "skyvern-mcp"}, WorkflowRunTriggerType.mcp),
         ({}, WorkflowRunTriggerType.api),
         ({"x-user-agent": "python-sdk/1.0"}, WorkflowRunTriggerType.api),
     ],
