@@ -27,7 +27,12 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
-from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPolicyReason, OutputPolicyVerdict
+from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    CopilotOutputKind,
+    OutputPolicyReason,
+    OutputPolicyVerdict,
+)
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
@@ -336,6 +341,18 @@ def test_output_policy_specific_branches_bypass_recorded_terminal_fallback() -> 
     assert result.narrative_payload is not None
     assert result.narrative_payload["terminalMessage"] == result.user_response
     assert result.narrative_payload["responseType"] == "ASK_QUESTION"
+
+
+def test_output_policy_hard_block_priority_over_actuation_steer() -> None:
+    ctx = _ctx()
+
+    result = _blocked_result(ctx, OutputPolicyReason.RAW_SECRET_LEAK, OutputPolicyReason.ACTUATION_OBLIGATION_STEER)
+
+    assert result.user_response == _RAW_SECRET_LEAK_REFUSAL
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.reason_code == "output_policy_block"
+    assert result.turn_outcome.terminal_reason == "output_policy_block"
+    assert result.turn_outcome.reason_code != ACTUATION_OBLIGATION_STEER_REASON_CODE
 
 
 def test_shim_preserves_workflow_draft_when_signal_opts_in() -> None:
