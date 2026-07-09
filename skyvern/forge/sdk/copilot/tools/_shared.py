@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskV2Block
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -57,19 +58,30 @@ _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
 _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
 
 
+def _task_output_envelope_block_types() -> frozenset[str]:
+    # Almost every envelope block extends BaseTaskBlock; TaskV2Block subclasses Block
+    # directly but emits the same TaskOutput envelope, so seed the walk with both roots.
+    block_types: set[str] = set()
+    pending: list[type[Block]] = [BaseTaskBlock, TaskV2Block]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.__subclasses__())
+        field = cls.model_fields.get("block_type")
+        default = field.default if field is not None else None
+        if isinstance(default, BlockType):
+            block_types.add(default.value.upper())
+    return frozenset(block_types)
+
+
 # Block types whose ``block.output`` is a ``TaskOutput.from_task()`` envelope
-# (schemas/tasks.py:TaskOutput) rather than the raw payload. The
-# meaningful-data check must unwrap these via ``_block_data_payload`` before
-# judging output, because envelope fields (task_id, status, artifact IDs) are
-# always populated on a completed run and would otherwise mask empty
-# extractions. This is a subset of ``_DATA_PRODUCING_BLOCK_TYPES`` — keep the
-# two in sync when adding a new task-backed type. ``TEXT_PROMPT`` is
-# deliberately excluded: its block.output is the raw LLM response dict (see
-# ``TextPromptBlock.execute``), no envelope to strip.
-_TASK_ENVELOPE_BLOCK_TYPES = frozenset({"EXTRACTION"})
-assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
-    "_TASK_ENVELOPE_BLOCK_TYPES must be a subset of _DATA_PRODUCING_BLOCK_TYPES"
-)
+# (schemas/tasks.py:TaskOutput) rather than the raw payload; the meaningful-data
+# check slices these to ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so always-populated
+# envelope metadata (task_id, status, artifact IDs) can't read a reach-state task
+# (login, navigation) that produced no content as meaningful. Envelope shape is
+# orthogonal to data production, so a raw-value block (CODE, TEXT_PROMPT) whose
+# value happens to carry a ``task_id`` is excluded here and passes through unsliced.
+# Derived from the envelope block roots so a newly added task-backed block can't fall out of sync.
+_TASK_ENVELOPE_BLOCK_TYPES: frozenset[str] = _task_output_envelope_block_types()
 
 
 # Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
@@ -241,6 +253,26 @@ def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
         payload.update(_workflow_output_parameter_payloads(extracted_data))
         return payload
     return extracted_data
+
+
+def _registered_output_payload_view(value: Any, block_type: str | None) -> Any:
+    """Slice a registered task-envelope value (``_TASK_ENVELOPE_BLOCK_TYPES``) down to
+    ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so always-populated envelope metadata can't read a
+    reach-state task that produced no content as meaningful; non-envelope values (e.g. a
+    code block emitting a user schema that happens to carry a ``task_id``) pass through
+    unsliced. Registered block types arrive lowercased, so normalize before matching."""
+    if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(value, Mapping):
+        payload = {field: value.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+        payload.update(_workflow_output_parameter_payloads(value))
+        return payload
+    return value
+
+
+def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
+    return any(
+        _is_meaningful_extracted_data(_registered_output_payload_view(item.get("value"), item.get("block_type")))
+        for item in _registered_output_parameter_payloads(data)
+    )
 
 
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})

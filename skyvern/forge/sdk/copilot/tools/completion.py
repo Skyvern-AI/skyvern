@@ -477,6 +477,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                     contingent_criterion_ids=contingent_ids,
                     contingent_on_by_criterion_id=contingent_on_by_id,
                     contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    requested_output_criteria_count=len(requested_output_criteria),
                 )
                 if run_result is not None
                 else CompletionVerificationResult(
@@ -564,6 +565,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                 contingent_criterion_ids=contingent_ids,
                 contingent_on_by_criterion_id=contingent_on_by_id,
                 contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                requested_output_criteria_count=len(requested_output_criteria),
             )
 
     verification = carry_degraded_criterion_ids(verification, criteria)
@@ -1263,6 +1265,7 @@ async def _completion_verification_from_run_result(
                 contingent_criterion_ids=contingent_ids,
                 contingent_on_by_criterion_id=contingent_on_by_id,
                 contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                requested_output_criteria_count=len(requested_output_criteria),
             )
         if not definition_verdicts:
             return None
@@ -1325,6 +1328,7 @@ async def _completion_verification_from_run_result(
                         contingent_criterion_ids=contingent_ids,
                         contingent_on_by_criterion_id=contingent_on_by_id,
                         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                        requested_output_criteria_count=len(requested_output_criteria),
                     )
                 return CompletionVerificationResult(
                     status="unavailable",
@@ -1355,6 +1359,7 @@ async def _completion_verification_from_run_result(
                         contingent_criterion_ids=contingent_ids,
                         contingent_on_by_criterion_id=contingent_on_by_id,
                         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                        requested_output_criteria_count=len(requested_output_criteria),
                     )
                 return CompletionVerificationResult(
                     status="unavailable",
@@ -1416,6 +1421,7 @@ async def _completion_verification_from_run_result(
         contingent_criterion_ids=contingent_ids,
         contingent_on_by_criterion_id=contingent_on_by_id,
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        requested_output_criteria_count=len(requested_output_criteria),
     )
 
 
