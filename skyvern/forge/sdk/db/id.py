@@ -77,6 +77,8 @@ WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
 WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX = "wccs"
 WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX = "wrcs"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
+HEAL_EPISODE_PREFIX = "he"
+HEAL_PROPOSAL_PREFIX = "hp"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
 TAG_EVENT_PREFIX = "tge"
 RUN_TAG_EVENT_PREFIX = "rtge"
@@ -337,6 +339,16 @@ def generate_workflow_run_credential_selection_id() -> str:
 def generate_script_fallback_episode_id() -> str:
     int_id = generate_id()
     return f"{SCRIPT_FALLBACK_EPISODE_PREFIX}_{int_id}"
+
+
+def generate_heal_episode_id() -> str:
+    int_id = generate_id()
+    return f"{HEAL_EPISODE_PREFIX}_{int_id}"
+
+
+def generate_heal_proposal_id() -> str:
+    int_id = generate_id()
+    return f"{HEAL_PROPOSAL_PREFIX}_{int_id}"
 
 
 def generate_workflow_schedule_id() -> str:
