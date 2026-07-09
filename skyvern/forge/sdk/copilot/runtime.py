@@ -31,11 +31,20 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_origin import (
+    HealAdoptionFailed,
+    TurnOrigin,
+    is_self_heal_session_id,
+    make_self_heal_session_id,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
+from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
+    from playwright.async_api import Page
+
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
@@ -195,6 +204,9 @@ class AgentContext:
     browser_session_id: str | None
     stream: EventSourceStream
     api_key: str | None = None
+    turn_origin: TurnOrigin = TurnOrigin.interactive
+    injected_browser_state: BrowserState | None = None
+    heal_workflow_run_id: str | None = None
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -530,12 +542,42 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, BrowserState, Page]:
+    browser_state = ctx.injected_browser_state
+    if browser_state is None:
+        raise HealAdoptionFailed("injected_browser_state_missing")
+    if not _browser_context_is_attachable(browser_state.browser_context):
+        raise HealAdoptionFailed("injected_browser_context_unusable")
+    try:
+        page = await browser_state.get_working_page()
+    except Exception as exc:
+        LOG.warning(
+            "Self-heal browser adoption failed while probing working page",
+            organization_id=ctx.organization_id,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        raise HealAdoptionFailed("injected_working_page_unavailable") from exc
+    if page is None:
+        raise HealAdoptionFailed("injected_working_page_unavailable")
+    workflow_run_id = ctx.heal_workflow_run_id
+    if not workflow_run_id:
+        raise HealAdoptionFailed("self_heal_workflow_run_id_missing")
+    session_id = make_self_heal_session_id(workflow_run_id)
+    return session_id, browser_state, page
+
+
 @asynccontextmanager
 async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
-    if not ctx.browser_session_id:
-        raise RuntimeError("No browser_session_id set on agent context")
     browser_session_id = ctx.browser_session_id
+    # Equality, not identity: a plain-string origin must still route to the fail-closed heal branch.
+    if ctx.turn_origin != TurnOrigin.runtime_self_heal and not browser_session_id:
+        raise RuntimeError("No browser_session_id set on agent context")
+    if browser_session_id is None:
+        # Self-heal only; always overwritten below before use. Just satisfies the
+        # str-tuple typing of sdk_action_workflow_run_cache_key.
+        browser_session_id = ""
     sdk_action_workflow_run_cache_key: SdkActionWorkflowRunCacheKey = (ctx.organization_id, browser_session_id)
     # Validate api_key at the boundary, before touching any backend.
     #
@@ -554,19 +596,26 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         )
         raise RuntimeError("Copilot agent context missing api_key")
 
-    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-        session_id=browser_session_id,
-        organization_id=ctx.organization_id,
-    )
-    if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
-        # Keep the session id out of the raised message -- it can propagate
-        # to LLM- or user-visible output -- but log it for operators.
-        LOG.warning(
-            "No browser context for copilot session",
+    browser_state: BrowserState | None
+    working_page: Page | None = None
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        browser_session_id, browser_state, working_page = await _resolve_self_heal_browser_state(ctx)
+        ctx.browser_session_id = browser_session_id
+        sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
+    else:
+        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
             session_id=browser_session_id,
             organization_id=ctx.organization_id,
         )
-        raise RuntimeError("No browser context for copilot session")
+        if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
+            # Keep the session id out of the raised message -- it can propagate
+            # to LLM- or user-visible output -- but log it for operators.
+            LOG.warning(
+                "No browser context for copilot session",
+                session_id=browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+            raise RuntimeError("No browser context for copilot session")
 
     override_token = set_api_key_override(ctx.api_key)
     try:
@@ -590,6 +639,11 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
         )
+        if working_page is not None:
+            # Seed the tab pin from the already-probed page (mirrors what skyvern_tab_switch
+            # sets interactively) so self-heal tools land on the adopted tab instead of the
+            # new SkyvernBrowser's pages[-1] fallback.
+            state._active_page = working_page
         register_copilot_session(browser_session_id, state)
         try:
             async with scoped_session(state):
@@ -607,7 +661,25 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
 
 
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    """Create a browser session if needed. Returns None on success, error dict on failure."""
+    """Create a browser session if needed. Returns None on success, error dict on failure.
+
+    Exception: the self-heal path raises HealAdoptionFailed instead of returning an
+    error dict, so a failed adoption aborts the turn rather than degrading to a normal
+    tool-level error. Callers must let it propagate.
+    """
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
+        ctx.browser_session_id = browser_session_id
+        return None
+
+    if is_self_heal_session_id(ctx.browser_session_id):
+        LOG.warning(
+            "Supplied self-heal browser_session_id on interactive path; auto-creating",
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        ctx.browser_session_id = None
+
     if ctx.browser_session_id:
         persistent = await _get_persistent_browser_session(ctx.browser_session_id, ctx.organization_id)
         if persistent is not None and _browser_session_status_is_final(persistent.status):
