@@ -4404,6 +4404,7 @@ async def wrapper({default_args}):
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,
+            browser_state=browser_state,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
