@@ -3,6 +3,7 @@
 // component without re-evaluating reducer state, and so the reducer can be
 // exercised under vitest without a JSX runtime.
 
+import { buildRevealOffsets } from "./actionReveal";
 import {
   CopilotResponseType,
   ProposalDisposition,
@@ -19,6 +20,28 @@ import {
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
 
+// A code block's recorded actions, fetched once from the run timeline after
+// a run_outcome frame arrives (block_progress carries no action detail).
+export interface RecordedActionSummary {
+  actionId: string;
+  label: string;
+  summary: string | null;
+  durationMs: number | null;
+  failed: boolean;
+}
+
+// Client-synthesized event (never sent by the backend) that carries the
+// fetched recorded actions into the reducer so the reveal schedule can be
+// derived the same way as every other narrative update.
+export interface CopilotBlockActionsEvent {
+  type: "client_block_actions";
+  blocks: Array<{
+    workflowRunBlockId: string;
+    actions: RecordedActionSummary[];
+  }>;
+  receivedAtMs: number;
+}
+
 // Discriminated union of every event the reducer below consumes. The bubble
 // derives all of its rendering from these payloads.
 export type NarrativeEvent =
@@ -32,7 +55,8 @@ export type NarrativeEvent =
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
-  | WorkflowCopilotToolResultUpdate;
+  | WorkflowCopilotToolResultUpdate
+  | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
 // failed-style states (failed, terminated, timed_out, canceled) under one
@@ -70,6 +94,12 @@ export interface BlockState {
   // ``done · 0:14``-style elapsed pill in the card.
   startedAt: string | null;
   endedAt: string | null;
+  // Recorded actions fetched post-run for progressive reveal. Undefined
+  // until the one-shot fetch resolves; set at most once (idempotent).
+  recordedActions?: RecordedActionSummary[];
+  // Epoch ms this block's reveal schedule starts counting from — staggered
+  // past preceding blocks' schedules so a multi-block run reveals in order.
+  recordedActionsAt?: number;
 }
 
 export interface ActivityEntry {
@@ -418,10 +448,13 @@ export function applyNarrativeEvent(
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
-        // A late or replayed block_progress must not wipe a recorded verdict;
-        // lifecycle frames never carry outcome, so always keep the prior one.
+        // A late or replayed block_progress must not wipe a recorded verdict
+        // or an already-fetched action replay; lifecycle frames never carry
+        // either, so always keep the prior values.
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
+        recordedActions: previousBlock?.recordedActions,
+        recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
         activity: previousBlock?.activity ?? [],
         startedAt,
@@ -449,6 +482,30 @@ export function applyNarrativeEvent(
           : b,
       );
       return { ...prev, blocks };
+    }
+
+    case "client_block_actions": {
+      // Idempotent merge: a block's recordedActions is set at most once, so
+      // a duplicate fetch response (or a re-dispatched event) is a no-op.
+      // Stagger each matched block's reveal start past the running total of
+      // its predecessors' own schedules, so a multi-block run replays in
+      // execution order instead of all at once.
+      let carry = 0;
+      let changed = false;
+      const blocks = prev.blocks.map((b) => {
+        if (b.recordedActions !== undefined) return b;
+        const match = event.blocks.find(
+          (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
+        );
+        if (!match || match.actions.length === 0) return b;
+        changed = true;
+        const recordedActionsAt = event.receivedAtMs + carry;
+        const durations = match.actions.map((a) => a.durationMs);
+        const offsets = buildRevealOffsets(durations);
+        carry += offsets[offsets.length - 1] ?? 0;
+        return { ...b, recordedActions: match.actions, recordedActionsAt };
+      });
+      return changed ? { ...prev, blocks } : prev;
     }
 
     case "tool_call": {
@@ -486,8 +543,28 @@ export function applyNarrativeEvent(
     case "response": {
       const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
       if (hydrated) {
+        // The backend payload never carries recordedActions/recordedActionsAt
+        // (client-only replay data); carry them over from the prior live
+        // blocks so a fetch that resolved before this terminal frame
+        // survives hydration instead of being silently dropped.
+        const recordedById = new Map(
+          prev.blocks
+            .filter((b) => b.recordedActions !== undefined)
+            .map((b) => [b.workflowRunBlockId, b] as const),
+        );
+        const blocks = hydrated.blocks.map((b) => {
+          const carried = recordedById.get(b.workflowRunBlockId);
+          return carried
+            ? {
+                ...b,
+                recordedActions: carried.recordedActions,
+                recordedActionsAt: carried.recordedActionsAt,
+              }
+            : b;
+        });
         return {
           ...hydrated,
+          blocks,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
