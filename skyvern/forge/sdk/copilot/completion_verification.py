@@ -113,6 +113,7 @@ class CompletionVerificationResult:
     contingent_antecedent_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
     structural_unfired_criterion_ids: list[str] = field(default_factory=list)
     degraded_criterion_ids: list[str] = field(default_factory=list)
+    requested_output_criteria_count: int = 0
 
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
@@ -196,6 +197,7 @@ class CompletionVerificationResult:
             "unknown_count": sum(1 for verdict in self.verdicts if verdict.state == "unknown"),
             "fully_satisfied": self.is_fully_satisfied(),
             "no_gradeable_run_plane": self.no_gradeable_run_plane,
+            "requested_output_criteria_count": self.requested_output_criteria_count,
             "reason_codes": [verdict.reason_code for verdict in self.verdicts],
             "unmet_criterion_ids": [verdict.criterion_id for verdict in unmet],
             "missing_evidence": missing_evidence,
@@ -2164,6 +2166,7 @@ def combine_verification_results(
     contingent_on_by_criterion_id: dict[str, str] | None = None,
     contingent_antecedent_output_path_by_criterion_id: dict[str, str] | None = None,
     structural_unfired_criterion_ids: Iterable[str] = (),
+    requested_output_criteria_count: int = 0,
 ) -> CompletionVerificationResult:
     """One result spanning both evidence planes; a judge that could not evaluate
     keeps the whole result unavailable so fail-closed messaging is preserved."""
@@ -2190,6 +2193,7 @@ def combine_verification_results(
             contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
             structural_unfired_criterion_ids=structural_unfired_ids,
             degraded_criterion_ids=degraded_ids,
+            requested_output_criteria_count=requested_output_criteria_count,
         )
     if run_result is not None:
         run_result = replace(
@@ -2219,6 +2223,7 @@ def combine_verification_results(
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
         structural_unfired_criterion_ids=structural_unfired_ids,
         degraded_criterion_ids=degraded_ids,
+        requested_output_criteria_count=requested_output_criteria_count,
     )
 
 
@@ -2310,6 +2315,25 @@ def degraded_contract_delivered_unverified_terminal_state(
     if not observed or not blocking or not blocking <= degraded:
         return None
     return DeliveredUnverifiedTerminalState(observed_verdicts=tuple(observed))
+
+
+def zero_requested_output_criteria_credit(
+    result: CompletionVerificationResult | None,
+    *,
+    has_meaningful_registered_output: bool,
+) -> bool:
+    """A satisfied run-plane verdict crediting completion when no requested-output
+    criterion formed to grade the delivered payload is an unverified deliverable,
+    not a verified success. Keying on meaningful produced content (not mere payload
+    presence) lets a reach-state goal whose only registered output is an empty
+    task-output envelope (e.g. login-only) keep crediting normally."""
+    return (
+        result is not None
+        and result.status == "evaluated"
+        and result.requested_output_criteria_count == 0
+        and has_meaningful_registered_output
+        and result.is_fully_satisfied()
+    )
 
 
 def carry_degraded_criterion_ids(

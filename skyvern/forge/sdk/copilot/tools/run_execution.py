@@ -52,6 +52,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     DeliveredUnverifiedTerminalState,
     degraded_contract_delivered_unverified_terminal_state,
     only_structural_requested_output_abstentions,
+    zero_requested_output_criteria_credit,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_html
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
@@ -140,6 +141,9 @@ from ._shared import (
     _completed_run_block_labels,
     _failed_run_block_labels,
     _fallback_page_info,
+    _has_meaningful_registered_output_payload,
+    _registered_output_parameter_payloads,
+    _registered_output_payload_view,
     _unverified_current_workflow_labels,
     _valid_runtime_anchor_url,
     _workflow_verification_evidence,
@@ -2623,6 +2627,18 @@ def _delivered_unverified_single_block_outputs(
     return observed
 
 
+def _delivered_unverified_registered_outputs(data: Mapping[str, Any]) -> dict[str, Any]:
+    observed: dict[str, Any] = {}
+    for item in _registered_output_parameter_payloads(data):
+        view = _registered_output_payload_view(item.get("value"), item.get("block_type"))
+        if view is None:
+            continue
+        key = item.get("output_parameter_key") or item.get("block_label")
+        if isinstance(key, str) and key:
+            observed.setdefault(key, view)
+    return observed
+
+
 def _record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
 ) -> RecordedRunOutcome | None:
@@ -2958,7 +2974,12 @@ def _record_run_blocks_result(
             )
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        recorded_outcome = _adjudicated_run_outcome(copilot_ctx, completion_verification)
+        recorded_outcome = _adjudicated_run_outcome(
+            copilot_ctx,
+            completion_verification,
+            data=data if isinstance(data, dict) else {},
+            workflow_run_id=run_id if isinstance(run_id, str) else None,
+        )
         _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
         return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
@@ -2975,7 +2996,12 @@ def _record_run_blocks_result(
         copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        recorded_outcome = _adjudicated_run_outcome(copilot_ctx, completion_verification)
+        recorded_outcome = _adjudicated_run_outcome(
+            copilot_ctx,
+            completion_verification,
+            data=data if isinstance(data, dict) else {},
+            workflow_run_id=run_id if isinstance(run_id, str) else None,
+        )
         _record_adjudicated_build_test_outcome(copilot_ctx, result, completion_verification, recorded_outcome)
         return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
@@ -3089,8 +3115,47 @@ def _same_run_committed_demonstrated_outcome(
     return outcome
 
 
+def _zero_requested_output_criteria_delivered_unverified(
+    copilot_ctx: Any,
+    completion_verification: CompletionVerificationResult,
+    data: Mapping[str, Any],
+    workflow_run_id: str | None,
+) -> RecordedRunOutcome | None:
+    if not zero_requested_output_criteria_credit(
+        completion_verification,
+        has_meaningful_registered_output=_has_meaningful_registered_output_payload(data),
+    ):
+        return None
+    copilot_ctx.last_test_suspicious_success = False
+    copilot_ctx.last_test_failure_reason = None
+    copilot_ctx.suspicious_success_nudge_count = 0
+    copilot_ctx.last_full_workflow_test_ok = False
+    copilot_ctx.verified_terminal_proposal_ready = False
+    copilot_ctx.delivered_unverified_terminal = True
+    copilot_ctx.delivered_unverified_workflow_run_id = workflow_run_id
+    copilot_ctx.delivered_unverified_observed_outputs = _delivered_unverified_registered_outputs(data)
+    stash_delivered_unverified_turn_halt(copilot_ctx, workflow_run_id=workflow_run_id)
+    LOG.info(
+        "copilot.completion.zero_requested_output_credit_withheld",
+        workflow_run_id=workflow_run_id,
+        requested_output_criteria_count=0,
+        registered_output_meaningful=True,
+    )
+    return RecordedRunOutcome(
+        verdict="not_evaluated",
+        display_reason=run_outcome_display_reason(
+            "The latest run returned output, but it was not independently verified."
+        ),
+        workflow_run_id=workflow_run_id,
+    )
+
+
 def _adjudicated_run_outcome(
-    copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
+    copilot_ctx: Any,
+    completion_verification: CompletionVerificationResult | None,
+    *,
+    data: Mapping[str, Any] | None = None,
+    workflow_run_id: str | None = None,
 ) -> RecordedRunOutcome:
     committed = _same_run_committed_demonstrated_outcome(copilot_ctx)
     if committed is not None:
@@ -3109,6 +3174,11 @@ def _adjudicated_run_outcome(
                     _outcome_unverified_reason(copilot_ctx, completion_verification)
                 ),
             )
+        gated = _zero_requested_output_criteria_delivered_unverified(
+            copilot_ctx, completion_verification, data or {}, workflow_run_id
+        )
+        if gated is not None:
+            return gated
         return RecordedRunOutcome(verdict="demonstrated")
     if copilot_ctx.last_test_suspicious_success:
         return RecordedRunOutcome(

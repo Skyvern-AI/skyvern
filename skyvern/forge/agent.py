@@ -764,6 +764,7 @@ class ForgeAgent:
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
+        pre_resolved_browser_state: BrowserState | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
@@ -887,7 +888,13 @@ class ForgeAgent:
                 step,
                 browser_state,
                 detailed_output,
-            ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id)
+            ) = await self.initialize_execution_state(
+                task,
+                step,
+                workflow_run,
+                browser_session_id,
+                pre_resolved_browser_state=pre_resolved_browser_state,
+            )
 
             # mark step as completed and mark task as completed
             if (
@@ -3346,8 +3353,11 @@ class ForgeAgent:
         step: Step,
         workflow_run: WorkflowRun | None = None,
         browser_session_id: str | None = None,
+        pre_resolved_browser_state: BrowserState | None = None,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
-        if workflow_run:
+        if pre_resolved_browser_state is not None:
+            browser_state = pre_resolved_browser_state
+        elif workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
                 url=task.url,

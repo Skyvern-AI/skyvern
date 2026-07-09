@@ -21,7 +21,7 @@ from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
+from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -159,6 +159,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -179,6 +180,9 @@ from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
+
+if TYPE_CHECKING:
+    from skyvern.forge.agent_functions import CodeBlockEngineFailure
 
 LOG = structlog.get_logger()
 
@@ -4132,15 +4136,21 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
         browser_session_id: str | None,
-        browser_state: BrowserState,
-        page: Page,
+        browser_state: BrowserState | None = None,
+        page: Page | None = None,
+        classification: HealClassification | None = None,
+        record_output_parameter: bool = True,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         if not await self._self_heal_enabled(workflow_run_context):
             return None
-        if not self._is_healable_page_failure(exception, recording_page):
+        effective_classification = classification or HealClassification(
+            healable=self._is_healable_page_failure(exception, recording_page),
+            skip_reason=None,
+        )
+        if not effective_classification.healable:
             return None
         if not self.prompt:
             return None
@@ -4190,7 +4200,7 @@ async def wrapper({default_args}):
             escalation_url = (
                 self._derive_escalation_navigation_url(failing_line, recording_page) if failing_line is not None else ""
             )
-            if escalation_url:
+            if escalation_url and browser_state is not None and page is not None:
                 # BROWSER_MANAGER can early-return a cached browser state without ever reading
                 # task.url, so escalation_task.url alone is not reliable navigation recourse.
                 # Drive the live browser_state/page the heal will run on directly instead.
@@ -4260,6 +4270,7 @@ async def wrapper({default_args}):
                     task_block=None,
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=False,
+                    pre_resolved_browser_state=browser_state,
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -4294,7 +4305,10 @@ async def wrapper({default_args}):
                 )
                 task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
+                if record_output_parameter:
+                    await self.record_output_parameter_value(
+                        workflow_run_context, workflow_run_id, output_parameter_value
+                    )
                 await self._finalize_recovery_block(recovery_block_id, BlockStatus.completed, organization_id)
                 return await self.build_block_result(
                     success=True,
@@ -4332,6 +4346,106 @@ async def wrapper({default_args}):
             )
             await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
             return None
+
+    @staticmethod
+    def _is_playwright_exception_class_name(exception_class: str | None) -> bool:
+        if exception_class is None:
+            return False
+        lowered = exception_class.lower()
+        if not lowered.startswith("playwright."):
+            return False
+        return lowered.rsplit(".", 1)[-1].endswith("error")
+
+    @staticmethod
+    def _secure_skip_reason_for_error_code(error_code: str | None) -> HealSkipReason:
+        if error_code == "timeout":
+            return HealSkipReason.timeout_class
+        if error_code == "insecure_code_detected":
+            return HealSkipReason.insecure_code
+        return HealSkipReason.unclassifiable
+
+    def _classify_secure_runner_failure(self, failure: CodeBlockEngineFailure | None) -> HealClassification:
+        if failure is None:
+            return HealClassification(healable=False, skip_reason=HealSkipReason.unclassifiable)
+        has_structured = (
+            failure.exception_class is not None
+            or failure.failing_line is not None
+            or failure.healability_hint is not None
+        )
+        if not has_structured:
+            # No healability_hint to disambiguate, so only the page-class code heals blind;
+            # user_code_error is ambiguous (could be a bare `raise`) and stays fail-closed.
+            if failure.error_code == "unsupported_page_operation":
+                return HealClassification(healable=True, skip_reason=None)
+            return HealClassification(
+                healable=False,
+                skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
+            )
+        if failure.healability_hint is True:
+            return HealClassification(healable=True, skip_reason=None)
+        if failure.healability_hint is None and self._is_playwright_exception_class_name(failure.exception_class):
+            return HealClassification(healable=True, skip_reason=None)
+        return HealClassification(
+            healable=False,
+            skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
+        )
+
+    async def _resolve_failure_with_heal(
+        self,
+        *,
+        exception: Exception | None,
+        failing_line: int | None,
+        build_failure_result: Callable[[], Awaitable[BlockResult]],
+        classification: HealClassification,
+        recorder: CodeBlockActionRecording,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        browser_state: BrowserState | None = None,
+        page: Page | None = None,
+    ) -> BlockResult:
+        healed: BlockResult | None = None
+        if classification.healable:
+            live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(
+                workflow_run_id=workflow_run_id
+            )
+            exception_for_heal = exception or RuntimeError("CodeBlock failed")
+            healed = await self._attempt_self_heal(
+                exception=exception_for_heal,
+                failing_line=failing_line,
+                recording_page=recorder.recording_page,
+                classification=classification,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                browser_state=live_browser_state,
+                page=page,
+                record_output_parameter=False,
+            )
+        if healed is not None:
+            output_obligation = OutputObligation.none
+            if healed.success:
+                output_obligation = (
+                    OutputObligation.observed
+                    if healed.output_parameter_value is not None
+                    else OutputObligation.vestigial
+                )
+            # Record output before finalizing so a failed write fails closed, never leaving a
+            # completed block without the output downstream consumers require.
+            if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
+                await self.record_output_parameter_value(
+                    workflow_run_context,
+                    workflow_run_id,
+                    healed.output_parameter_value,
+                )
+            await recorder.finalize(success=healed.success)
+            return healed
+        await recorder.finalize(success=False)
+        return await build_failure_result()
 
     async def execute(
         self,
@@ -4484,26 +4598,6 @@ async def wrapper({default_args}):
             workflow_run_block_id=workflow_run_block_id,
             block_label=self.label,
         )
-        if use_codeblock_runner:
-            secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
-                block=self,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-                workflow_run_context=workflow_run_context,
-                parameter_values=parameter_values,
-                credential_parameter_keys=credential_parameter_keys,
-            )
-            LOG.info(
-                "Secure CodeBlock override returned",
-                override_returned_none=secure_code_block_result is None,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                block_label=self.label,
-            )
-            if secure_code_block_result is not None:
-                return secure_code_block_result
 
         # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
         # the standard action/artifact timeline and the agent can later take over on failure.
@@ -4521,6 +4615,87 @@ async def wrapper({default_args}):
 
         try:
             await recorder.link_block()
+            if use_codeblock_runner:
+                secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
+                    block=self,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    workflow_run_context=workflow_run_context,
+                    parameter_values=parameter_values,
+                    credential_parameter_keys=credential_parameter_keys,
+                    recording_page=recording_page,
+                )
+                LOG.info(
+                    "Secure CodeBlock override returned",
+                    override_returned_none=secure_code_block_result is None,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                )
+                if secure_code_block_result is not None:
+                    await recorder.persist(recorder.recorded_actions())
+                    if secure_code_block_result.failure is not None:
+                        secure_failure = secure_code_block_result.failure
+                        secure_classification = self._classify_secure_runner_failure(secure_failure)
+
+                        async def build_secure_failure_result() -> BlockResult:
+                            if secure_code_block_result.block_result is not None:
+                                return secure_code_block_result.block_result
+                            return await self.build_block_result(
+                                success=False,
+                                failure_reason=(
+                                    secure_failure.failure_reason or "Code block failed in the secure runner"
+                                ),
+                                output_parameter_value=None,
+                                status=BlockStatus.failed,
+                                workflow_run_block_id=workflow_run_block_id,
+                                organization_id=organization_id,
+                            )
+
+                        return await self._resolve_failure_with_heal(
+                            exception=None,
+                            failing_line=secure_failure.failing_line,
+                            build_failure_result=build_secure_failure_result,
+                            classification=secure_classification,
+                            recorder=recorder,
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            browser_state=browser_state,
+                            page=page,
+                        )
+                    if secure_code_block_result.block_result is None:
+                        LOG.warning(
+                            "Secure CodeBlock runner returned success without block result",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            block_label=self.label,
+                        )
+                        await recorder.finalize(success=False)
+                        return await self.build_block_result(
+                            success=False,
+                            failure_reason="Secure code block runner returned no result",
+                            output_parameter_value=None,
+                            status=BlockStatus.failed,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    # failure=None does not imply success: infra arms (no browser/page, runner raise,
+                    # invalid output) return a failed block_result with no healable failure metadata.
+                    if not secure_code_block_result.block_result.success:
+                        await recorder.finalize(success=False)
+                        return secure_code_block_result.block_result
+                    await recorder.finalize(success=True)
+                    await self.record_output_parameter_value(
+                        workflow_run_context,
+                        workflow_run_id,
+                        secure_code_block_result.block_result.output_parameter_value,
+                    )
+                    return secure_code_block_result.block_result
             user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
             result = await self.execute_user_function_with_timeout(
                 user_function,
@@ -4571,10 +4746,28 @@ async def wrapper({default_args}):
                     )
                 )
             await recorder.persist(recorded)
-            healed = await self._attempt_self_heal(
+            legacy_healable = self._is_healable_page_failure(e, recording_page)
+            legacy_classification = HealClassification(
+                healable=legacy_healable,
+                skip_reason=None if legacy_healable else HealSkipReason.unclassifiable,
+            )
+
+            async def build_legacy_failure_result() -> BlockResult:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=failure_reason,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            return await self._resolve_failure_with_heal(
                 exception=e,
                 failing_line=failing_line,
-                recording_page=recording_page,
+                build_failure_result=build_legacy_failure_result,
+                classification=legacy_classification,
+                recorder=recorder,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
@@ -4582,20 +4775,6 @@ async def wrapper({default_args}):
                 browser_session_id=browser_session_id,
                 browser_state=browser_state,
                 page=page,
-            )
-            if healed is not None:
-                # Finalize the seat task to the heal outcome before the idempotent `finally` no-ops it,
-                # so a healed success no longer leaves the seat row failed under a completed block.
-                await recorder.finalize(success=healed.success)
-                return healed
-            await recorder.finalize(success=False)
-            return await self.build_block_result(
-                success=False,
-                failure_reason=failure_reason,
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
             )
 
         else:
