@@ -10,10 +10,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 
-import { TaskRunType } from "@/api/types";
+import { TaskRunType, TriggerType, type TaskRunListItem } from "@/api/types";
 import { RunHistory } from "./RunHistory";
 
-const workflowRun = {
+const workflowRun: TaskRunListItem = {
   task_run_id: "tr_1",
   task_run_type: TaskRunType.WorkflowRun,
   run_id: "wr_123",
@@ -25,6 +25,7 @@ const workflowRun = {
   workflow_permanent_id: "wpid_1",
   workflow_deleted: false,
   script_run: false,
+  trigger_type: null,
   searchable_text: "city Paris",
 };
 
@@ -56,6 +57,12 @@ vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
 
 vi.mock("@/components/StatusFilterDropdown", () => ({
   StatusFilterDropdown: () => <div data-testid="status-filter" />,
+}));
+
+vi.mock("@/components/TriggerTypeBadge", () => ({
+  TriggerTypeBadge: ({ triggerType }: { triggerType: string }) => (
+    <span data-testid={`trigger-type-${triggerType}`}>{triggerType}</span>
+  ),
 }));
 
 vi.mock("@/components/onboarding/OnboardingEmptyState", () => ({
@@ -116,6 +123,7 @@ function activateSearch() {
 }
 
 afterEach(() => {
+  runsData.splice(0, runsData.length, workflowRun);
   cleanup();
   vi.clearAllMocks();
 });
@@ -142,5 +150,16 @@ describe("RunHistory inputs during filtering", () => {
 
     expect(await screen.findByText("Run Inputs")).toBeTruthy();
     expect(screen.getByText("Paris")).toBeTruthy();
+  });
+
+  it("renders the MCP trigger badge from persisted trigger_type", () => {
+    runsData.splice(0, runsData.length, {
+      ...workflowRun,
+      trigger_type: TriggerType.Mcp,
+    });
+
+    renderRunHistory();
+
+    expect(screen.getByTestId("trigger-type-mcp")).toBeTruthy();
   });
 });

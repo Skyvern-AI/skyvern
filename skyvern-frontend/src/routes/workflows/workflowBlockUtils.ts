@@ -11,18 +11,35 @@ export function findWorkflowBlockByLabel(
   blocks: Array<WorkflowBlock>,
   label: string,
 ): WorkflowBlock | null {
-  for (const block of blocks) {
-    if (block.label === label) {
-      return block;
+  let found: WorkflowBlock | null = null;
+
+  visitWorkflowBlocks(blocks, (block) => {
+    if (!found && block.label === label) {
+      found = block;
+      return false;
     }
+  });
+
+  return found;
+}
+
+export function visitWorkflowBlocks(
+  blocks: Array<WorkflowBlock>,
+  visit: (block: WorkflowBlock) => void | false,
+) {
+  for (const block of blocks) {
+    if (visit(block) === false) {
+      return false;
+    }
+
     if (isNestedLoopWorkflowBlock(block) && block.loop_blocks.length > 0) {
-      const nested = findWorkflowBlockByLabel(block.loop_blocks, label);
-      if (nested) {
-        return nested;
+      if (visitWorkflowBlocks(block.loop_blocks, visit) === false) {
+        return false;
       }
     }
   }
-  return null;
+
+  return true;
 }
 
 export function isBlockOfType<T extends WorkflowBlockType>(
@@ -41,21 +58,13 @@ export function buildCodeStepsByLabel(
   blocks: Array<WorkflowBlock>,
 ): Map<string, Array<CodeBlockStep>> {
   const stepsByLabel = new Map<string, Array<CodeBlockStep>>();
-  const visit = (items: Array<WorkflowBlock>) => {
-    for (const block of items) {
-      if (
-        block.block_type === "code" &&
-        block.steps &&
-        block.steps.length > 0
-      ) {
-        stepsByLabel.set(block.label, block.steps);
-      }
-      if (isNestedLoopWorkflowBlock(block) && block.loop_blocks.length > 0) {
-        visit(block.loop_blocks);
-      }
+
+  visitWorkflowBlocks(blocks, (block) => {
+    if (block.block_type === "code" && block.steps && block.steps.length > 0) {
+      stepsByLabel.set(block.label, block.steps);
     }
-  };
-  visit(blocks);
+  });
+
   return stepsByLabel;
 }
 
