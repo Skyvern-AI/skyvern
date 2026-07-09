@@ -4,6 +4,7 @@ import {
   buildCodeStepsByLabel,
   findCodeStepForLine,
   getCodeStepPlainText,
+  visitWorkflowBlocks,
 } from "./workflowBlockUtils";
 import type {
   CodeBlock,
@@ -70,6 +71,41 @@ describe("buildCodeStepsByLabel", () => {
       forLoop("loop", []),
     ]);
     expect(map.size).toBe(0);
+  });
+});
+
+describe("visitWorkflowBlocks", () => {
+  it("visits top-level and loop body blocks in display order", () => {
+    const visited: Array<string> = [];
+
+    visitWorkflowBlocks(
+      [
+        codeBlock("top", []),
+        forLoop("loop", [codeBlock("nested", []), codeBlock("nested_2", [])]),
+      ],
+      (block) => {
+        visited.push(block.label);
+      },
+    );
+
+    expect(visited).toEqual(["top", "loop", "nested", "nested_2"]);
+  });
+
+  it("stops walking when the visitor returns false", () => {
+    const visited: Array<string> = [];
+
+    visitWorkflowBlocks(
+      [
+        codeBlock("top", []),
+        forLoop("loop", [codeBlock("nested", []), codeBlock("nested_2", [])]),
+      ],
+      (block) => {
+        visited.push(block.label);
+        return block.label === "nested" ? false : undefined;
+      },
+    );
+
+    expect(visited).toEqual(["top", "loop", "nested"]);
   });
 });
 
