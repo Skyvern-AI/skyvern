@@ -718,6 +718,15 @@ class AgentFunction:
         """
         return None
 
+    def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a provider-fallback router twin for the given LLM key, or None if none exists.
+
+        Cloud overrides this with the bare-Gemini-key → *_WITH_FALLBACK mapping so a
+        provider-specific failure falls over to another provider. OSS has no fallback
+        routers, so the default no-op leaves the caller's key untouched.
+        """
+        return None
+
     async def should_use_flex_llm_routing(
         self,
         *,
