@@ -167,6 +167,12 @@ from .workflow import (
     skyvern_workflow_update_folder,
 )
 
+_RUN_TASK_TOOL_DESCRIPTION = (
+    "Run a one-off autonomous trial via the highest-cost AI path. "
+    "Not for production or reusable automations. "
+    "Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute."
+)
+
 
 def _add_telemetry_middleware() -> None:
     if _FASTMCP_IMPORT_ERROR is not None:
@@ -370,7 +376,11 @@ mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
-mcp.tool(tags={"ai_powered"}, annotations=_web_dest("Run Autonomous Browser Task (AI)"))(skyvern_run_task)
+mcp.tool(
+    description=_RUN_TASK_TOOL_DESCRIPTION,
+    tags={"ai_powered"},
+    annotations=_web_dest("Run Autonomous Browser Task (AI)"),
+)(skyvern_run_task)
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
