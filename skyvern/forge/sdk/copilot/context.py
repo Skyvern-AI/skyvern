@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+import structlog
 from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
@@ -21,6 +22,8 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+
+LOG = structlog.get_logger()
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
@@ -82,6 +85,8 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
+    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    credentialPrompt: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -143,6 +148,22 @@ class ObservedPage(BaseModel):
     url: str = ""
     had_bounded_schema: bool = False
     reached_via: str = ""
+
+
+FillCarryToolName = Literal["type_text", "select_option", "fill_credential_field"]
+
+
+class FillCarry(BaseModel):
+    source_url: str = ""
+    selector: str = ""
+    tool_name: FillCarryToolName
+    role: str = ""
+    accessible_name: str = ""
+    typed_length: int = 0
+    typed_value: str = ""
+    value: str = ""
+    credential_id: str = ""
+    credential_field: str = ""
 
 
 class LoadedResultTargetContext(BaseModel):
@@ -212,6 +233,7 @@ class StructuredContext(BaseModel):
     page_inspection_calls_made: int = 0
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
     loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
+    fill_carry: list[FillCarry] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
@@ -363,6 +385,82 @@ def render_loaded_result_context_for_prompt(global_llm_context: str) -> str:
 
 
 _MAX_OBSERVED_ACTED_PAGES = 20
+_MAX_FILL_CARRY = 20
+_FILL_CARRY_TEXT_CAP = 240
+_FILL_CARRY_TOOLS = frozenset({"type_text", "select_option", "fill_credential_field"})
+_FILL_CARRY_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+FillCarryPrimitive = str | int | bool | None
+
+
+def _carry_text(value: FillCarryPrimitive, *, max_chars: int = _FILL_CARRY_TEXT_CAP) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:max_chars]
+
+
+def _carry_int(value: FillCarryPrimitive) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarryPrimitive]]) -> list[FillCarry]:
+    carry: list[FillCarry] = []
+    for interaction in trajectory:
+        tool_name = _carry_text(interaction.get("tool_name"), max_chars=40)
+        selector = _carry_text(interaction.get("selector"))
+        source_url = _carry_text(interaction.get("source_url"), max_chars=2048)
+        if tool_name not in _FILL_CARRY_TOOLS or not selector or not source_url:
+            continue
+        role = _carry_text(interaction.get("role"), max_chars=80)
+        accessible_name = _carry_text(interaction.get("accessible_name"), max_chars=160)
+        typed_length = _carry_int(interaction.get("typed_length"))
+        if tool_name == "type_text":
+            carry.append(
+                FillCarry(
+                    source_url=source_url,
+                    selector=selector,
+                    tool_name="type_text",
+                    role=role,
+                    accessible_name=accessible_name,
+                    typed_length=typed_length,
+                    typed_value=_carry_text(interaction.get("typed_value")),
+                )
+            )
+        elif tool_name == "select_option":
+            value = _carry_text(interaction.get("value"))
+            if value:
+                carry.append(
+                    FillCarry(
+                        source_url=source_url,
+                        selector=selector,
+                        tool_name="select_option",
+                        role=role,
+                        accessible_name=accessible_name,
+                        value=value,
+                    )
+                )
+        elif tool_name == "fill_credential_field":
+            credential_id = _carry_text(interaction.get("credential_id"))
+            credential_field = _carry_text(interaction.get("credential_field"), max_chars=20)
+            if credential_id and credential_field in _FILL_CARRY_CREDENTIAL_FIELDS:
+                carry.append(
+                    FillCarry(
+                        source_url=source_url,
+                        selector=selector,
+                        tool_name="fill_credential_field",
+                        role=role,
+                        accessible_name=accessible_name,
+                        typed_length=typed_length,
+                        credential_id=credential_id,
+                        credential_field=credential_field,
+                    )
+                )
+    return carry[-_MAX_FILL_CARRY:]
 
 
 def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[dict[str, Any]]) -> list[ObservedPage]:
@@ -424,12 +522,18 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     loaded_result_targets = _loaded_result_targets_from_steer(
         getattr(ctx, "latest_evaluate_result_composition_steer", None)
     )
+    raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
+    fill_carry = _fill_carry_from_scout_trajectory(
+        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)]
+    )
     if (
         not raw_context
         and this_turn == 0
         and inspections_this_turn == 0
         and not flow_evidence
         and not loaded_result_targets
+        and not fill_carry
     ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
@@ -438,6 +542,13 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
     # Replace with this turn's targets so stale extraction hints do not persist.
     sc.loaded_result_targets = loaded_result_targets
+    sc.fill_carry = fill_carry
+    if fill_carry:
+        LOG.info(
+            "copilot_fill_carry_persisted",
+            source_url=fill_carry[0].source_url,
+            field_count=len(fill_carry),
+        )
     return sc.to_json_str()
 
 
@@ -590,6 +701,9 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
+    delivered_unverified_terminal: bool = False
+    delivered_unverified_workflow_run_id: str | None = None
+    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=dict)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape

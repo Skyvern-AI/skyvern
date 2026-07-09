@@ -254,6 +254,9 @@ class _TerminalEvidenceResetCtx(Protocol):
     last_outcome_gate_reason: str | None
     last_outcome_gate_workflow_run_id: str | None
     last_test_anti_bot: str | None
+    delivered_unverified_terminal: bool
+    delivered_unverified_workflow_run_id: str | None
+    delivered_unverified_observed_outputs: dict[str, Any]
     completion_verification_result: Any | None
     outcome_verification_trace_snapshot: dict[str, Any]
 
@@ -286,6 +289,9 @@ def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> 
     ctx.last_outcome_gate_reason = None
     ctx.last_outcome_gate_workflow_run_id = None
     ctx.last_test_anti_bot = None
+    ctx.delivered_unverified_terminal = False
+    ctx.delivered_unverified_workflow_run_id = None
+    ctx.delivered_unverified_observed_outputs = {}
     ctx.completion_verification_result = None
     ctx.outcome_verification_trace_snapshot = {}
 

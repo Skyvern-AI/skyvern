@@ -3,5 +3,6 @@
 export const FileStorageType = {
     S3: "s3",
     Azure: "azure",
+    GoogleDrive: "google_drive",
 } as const;
 export type FileStorageType = (typeof FileStorageType)[keyof typeof FileStorageType];

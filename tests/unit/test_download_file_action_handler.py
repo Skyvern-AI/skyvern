@@ -864,7 +864,7 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
-                return_value=MagicMock(run_id="pbs-1"),
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -964,7 +964,7 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
-                return_value=MagicMock(run_id="pbs-1"),
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -1067,7 +1067,7 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
-                return_value=MagicMock(run_id="pbs-1"),
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -1166,7 +1166,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
-                return_value=MagicMock(run_id="pbs-1"),
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -1266,7 +1266,7 @@ async def test_handle_action_removes_late_zero_byte_duplicate_after_download_wai
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
-                return_value=MagicMock(run_id="pbs-1"),
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
             ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
@@ -1342,7 +1342,7 @@ async def test_handle_action_removes_download_listener_when_inner_action_raises(
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
-                return_value=MagicMock(run_id="pbs-1"),
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
@@ -1398,7 +1398,10 @@ async def test_handle_action_discards_xhr_staging_when_native_file_present(
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -1451,7 +1454,10 @@ async def test_handle_action_uses_xhr_staging_fallback_when_no_native_file(
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -1507,7 +1513,10 @@ async def test_handle_action_moves_multiple_staged_xhr_files_as_fallback(
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -1559,7 +1568,10 @@ async def test_handle_action_cleans_staging_on_exception(
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -1624,7 +1636,10 @@ async def test_handle_action_logs_warning_when_late_native_appears_after_xhr_fal
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="pbs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(side_effect=mock_settle),
@@ -1729,7 +1744,10 @@ async def test_handle_action_adopted_session_lands_download_via_eager_save(
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="bs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=wait_for_downloads,
@@ -1831,7 +1849,10 @@ async def test_handle_action_adopted_session_refetches_when_save_as_target_close
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="bs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=wait_for_downloads,
@@ -1947,7 +1968,10 @@ async def test_handle_action_adopted_session_falls_through_to_session_folder_whe
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="bs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=wait_for_downloads,
@@ -2046,7 +2070,10 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="bs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=wait_for_downloads,
@@ -2155,7 +2182,10 @@ async def test_handle_action_adopted_session_xhr_staging_recovered_when_helper_f
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging_dir),
             patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=mock_xhr),
-            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=MagicMock(run_id="bs-1")),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="bs-1", download_suffix=None),
+            ),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=wait_for_downloads,

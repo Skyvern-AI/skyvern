@@ -51,7 +51,11 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
     derive_from_block_outputs,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, is_fallback_floor_criterion
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    _is_judgment_boolean_criterion,
+    is_fallback_floor_criterion,
+)
 from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -294,9 +298,16 @@ def _authored_output_contract_path(value: object) -> str:
     return f"output.{path}"
 
 
-def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
-    run_criteria = [c for c in criteria if getattr(c, "level", "run") != "definition"]
-    definition_criteria = [c for c in criteria if getattr(c, "level", "run") == "definition"]
+def _split_criteria_by_plane(
+    criteria: list[CompletionCriterion],
+) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
+    run_criteria: list[CompletionCriterion] = []
+    definition_criteria: list[CompletionCriterion] = []
+    for criterion in criteria:
+        if criterion.level != "definition" or (criterion.output_path and _is_judgment_boolean_criterion(criterion)):
+            run_criteria.append(criterion)
+        else:
+            definition_criteria.append(criterion)
     return run_criteria, definition_criteria
 
 
@@ -589,15 +600,23 @@ def _download_file_name(value: Any) -> str | None:
 
 
 def _completion_evidence_payload(output: Any) -> Any:
-    if not isinstance(output, dict) or not any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS):
+    if not isinstance(output, dict):
         return output
+    nested_output = output.get("output")
+    has_download_output = any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+    has_nested_download_output = isinstance(nested_output, dict) and any(
+        nested_output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
+    )
+    if not has_download_output and not has_nested_download_output:
+        return output
+    download_output = output if has_download_output or not isinstance(nested_output, dict) else nested_output
     names: list[str] = []
-    if name := _download_file_name(output.get("downloaded_file_name")):
+    if name := _download_file_name(download_output.get("downloaded_file_name")):
         names.append(name)
-    files = output.get("downloaded_files")
+    files = download_output.get("downloaded_files")
     if isinstance(files, list):
         names.extend(name for item in files[:_MAX_EVIDENCE_FILE_NAMES] if (name := _download_file_name(item)))
-    urls = output.get("downloaded_file_urls")
+    urls = download_output.get("downloaded_file_urls")
     if isinstance(urls, list):
         names.extend(name for item in urls[:_MAX_EVIDENCE_FILE_NAMES] if (name := _download_file_name(item)))
     payload: dict[str, Any] = {"download_registered": True}
@@ -605,11 +624,19 @@ def _completion_evidence_payload(output: Any) -> Any:
         payload["downloaded_file_count"] = len(files)
     if isinstance(urls, list):
         payload["downloaded_file_url_count"] = len(urls)
-    artifacts = output.get("downloaded_file_artifact_ids")
+    artifacts = download_output.get("downloaded_file_artifact_ids")
     if isinstance(artifacts, list):
         payload["downloaded_file_artifact_count"] = len(artifacts)
     if names:
         payload["downloaded_file_names"] = list(dict.fromkeys(names))[:_MAX_EVIDENCE_FILE_NAMES]
+    if has_nested_download_output and not has_download_output and isinstance(nested_output, dict):
+        preserved_output = {
+            key: value
+            for key, value in nested_output.items()
+            if key not in REGISTERED_DOWNLOAD_OUTPUT_KEYS and key not in {"page", "download"}
+        }
+        if preserved_output:
+            payload["output"] = preserved_output
     return payload
 
 
@@ -776,6 +803,15 @@ def _bind_independent_post_run_page_evidence(
         key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS
     }
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
+    LOG.info(
+        "copilot_post_run_page_evidence_snapshot_binding",
+        workflow_run_id=run_id,
+        packet_label=_POST_RUN_PAGE_OBSERVATION_LABEL,
+        evidence_source="independent_page_evidence",
+        evidence_workflow_run_id=evidence.get("workflow_run_id"),
+        evidence_observed_after_workflow_run=evidence.get("observed_after_workflow_run"),
+        evidence_source_tool=evidence.get("source_tool"),
+    )
 
 
 def _bind_registered_artifact_evidence(
@@ -1504,10 +1540,17 @@ def _tool_visible_result_after_completion_verification(
     outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
     if outcome_unverified_reason is None:
         return result
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if (
+        copilot_ctx.delivered_unverified_terminal
+        and isinstance(run_id, str)
+        and run_id == copilot_ctx.delivered_unverified_workflow_run_id
+    ):
+        return result
     if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
         return result
 
-    data = result.get("data")
     copied_data = dict(data) if isinstance(data, dict) else {}
     copied_data["failure_reason"] = outcome_unverified_reason
     copied_data["completion_verification"] = (

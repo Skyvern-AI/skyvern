@@ -61,6 +61,7 @@ from skyvern.exceptions import (
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
     PhoneNumberInputMismatch,
+    SkyvernException,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -126,6 +127,7 @@ from skyvern.webeye.browser_factory import initialize_download_dir
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
+    download_filename_from_suffix,
     extract_filename,
     is_download_response,
     normalize_download_filename,
@@ -615,6 +617,13 @@ def _log_select_shadow_match(
 def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
     filename = Path(suggested_filename or "download").name
     stem, suffix = os.path.splitext(filename)
+    context = skyvern_context.current()
+    download_suffix = context.download_suffix if context else None
+    if download_suffix:
+        # Name the file by the block-configured download_suffix so the watcher syncs the
+        # request-based name instead of the site's suggested name.
+        existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
+        return download_dir / download_filename_from_suffix(download_suffix, suffix, existing)
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
@@ -1464,7 +1473,10 @@ class ScopedXhrDownloadCapture:
                 headers = response.headers
                 if not self._is_xhr_download(headers, response.status):
                     return
-                raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+                response_url = response.url
+                raw_filename = extract_filename(
+                    {"content-disposition": headers.get("content-disposition", "")}, response_url
+                )
                 filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
                 if not filename or filename in self._saved:
                     return
@@ -3737,6 +3749,12 @@ async def handle_select_option_action(
             return results
         suggested_value = result.value
 
+    except SkyvernException as e:
+        # Expected selection outcomes on non-standard dropdowns (no matching option,
+        # no incremental elements); recorded as ActionFailure like any other miss.
+        LOG.warning("Custom select error", exc_info=True)
+        results.append(ActionFailure(exception=e))
+        return results
     except Exception as e:
         LOG.exception("Custom select error")
         results.append(ActionFailure(exception=e))
@@ -6813,6 +6831,10 @@ async def select_from_dropdown(
         return single_select_result
 
 
+def _no_element_matched_failure(value: str, reason: str) -> ActionFailure:
+    return ActionFailure(NoElementMatchedForTargetOption(target=value, reason=reason))
+
+
 @traced(name="skyvern.agent.dropdown.select_by_value")
 async def select_from_dropdown_by_value(
     value: str,
@@ -6846,7 +6868,7 @@ async def select_from_dropdown_by_value(
         )
 
     if not dropdown_menu_element:
-        raise NoElementMatchedForTargetOption(target=value, reason="No value matched")
+        return _no_element_matched_failure(value=value, reason="No value matched")
 
     potential_scrollable_element = await try_to_find_potential_scrollable_element(
         skyvern_element=dropdown_menu_element,
@@ -6855,8 +6877,9 @@ async def select_from_dropdown_by_value(
         step=step,
     )
     if not await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
-        raise NoElementMatchedForTargetOption(
-            target=value, reason="No value matched and element can't scroll to find more options"
+        return _no_element_matched_failure(
+            value=value,
+            reason="No value matched and element can't scroll to find more options",
         )
 
     selected: bool = False
@@ -6891,7 +6914,7 @@ async def select_from_dropdown_by_value(
     if selected:
         return ActionSuccess()
 
-    raise NoElementMatchedForTargetOption(target=value, reason="No value matched after scrolling")
+    return _no_element_matched_failure(value=value, reason="No value matched after scrolling")
 
 
 async def locate_dropdown_menu(

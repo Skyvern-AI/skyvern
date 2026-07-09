@@ -4,10 +4,13 @@ that names 1Password as the failing dependency rather than leaking the raw SDK e
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.exceptions import (
@@ -17,6 +20,11 @@ from skyvern.exceptions import (
     OnePasswordSessionExpiredError,
 )
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.routes.credentials import list_onepassword_items
+from skyvern.forge.sdk.services.credentials import (
+    extract_onepassword_upstream_5xx_status,
+    is_onepassword_credential_error,
+)
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import OnePasswordCredentialParameter
 
@@ -210,3 +218,112 @@ async def test_onepassword_status_keyword_5xx_classified_as_service_unavailable(
             await ctx.register_onepassword_credential_parameter_value(_make_parameter(), _make_organization())
 
     assert "504" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("Server error: 503 Service Unavailable", 503),
+        ("upstream returned 502 bad gateway", 502),
+        ("request failed with status: 504", 504),
+        ("HTTP 500 internal server error", 500),
+    ],
+)
+def test_extract_onepassword_upstream_5xx_status_matches(message: str, expected: int) -> None:
+    assert extract_onepassword_upstream_5xx_status(message) == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "invalid service account token",
+        "authentication failed: token is not valid",
+        "vault has 500 items, exceeded soft limit",
+        "could not parse token",
+    ],
+)
+def test_extract_onepassword_upstream_5xx_status_ignores_credential_errors(message: str) -> None:
+    # Bad-token / non-upstream failures must not look like a 5xx. The route only
+    # maps them to 4xx when the credential-error classifier has positive evidence.
+    assert extract_onepassword_upstream_5xx_status(message) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "invalid service account token",
+        "authentication failed: token is not valid",
+        "request forbidden for this service account",
+        "malformed credential payload",
+        "could not parse token",
+    ],
+)
+def test_is_onepassword_credential_error_matches_auth_failures(message: str) -> None:
+    assert is_onepassword_credential_error(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "",
+        "request timed out",
+        "rate limit hit",
+        "vault has 500 items, exceeded soft limit",
+        "unexpected parser bug",
+    ],
+)
+def test_is_onepassword_credential_error_ignores_unknown_failures(message: str) -> None:
+    assert not is_onepassword_credential_error(message)
+
+
+@pytest.fixture
+def mocked_route_app_database():
+    original = getattr(forge_app, "DATABASE", None)
+    forge_app.DATABASE = MagicMock()
+    forge_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(
+        return_value=SimpleNamespace(token="org-token")
+    )
+    yield forge_app.DATABASE
+    if original is None:
+        del forge_app.DATABASE
+    else:
+        forge_app.DATABASE = original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sdk_error, expected_status, expected_detail",
+    [
+        (
+            Exception("invalid service account token"),
+            400,
+            "service account token appears to be invalid or expired",
+        ),
+        (
+            Exception("authentication failed, error code: 500"),
+            400,
+            "service account token appears to be invalid or expired",
+        ),
+        (Exception("Server error: 503 Service Unavailable"), 502, "temporarily unavailable"),
+        (asyncio.TimeoutError(), 502, "temporarily unavailable"),
+        (RateLimitExceededException("rate limit hit"), 429, "rate limit exceeded"),
+        (DesktopSessionExpiredException("session expired"), 400, "session appears to be expired"),
+        (Exception("unexpected parser bug"), 500, "Failed to list 1Password items"),
+    ],
+)
+async def test_list_onepassword_items_classifies_failures(
+    mocked_route_app_database,
+    sdk_error: Exception,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    with patch(
+        "skyvern.forge.sdk.routes.credentials.OnePasswordClient.authenticate",
+        new_callable=AsyncMock,
+        side_effect=sdk_error,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await list_onepassword_items(_make_organization())
+
+    assert exc_info.value.status_code == expected_status
+    assert expected_detail in exc_info.value.detail

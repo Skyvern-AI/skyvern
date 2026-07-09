@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
@@ -65,6 +66,16 @@ CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
+AuthorTimeGateAblationPayloadValue: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | Sequence["AuthorTimeGateAblationPayloadValue"]
+    | dict[str, "AuthorTimeGateAblationPayloadValue"]
+)
+AuthorTimeGateAblationPayload: TypeAlias = dict[str, AuthorTimeGateAblationPayloadValue]
 SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
@@ -144,6 +155,16 @@ class RegisteredArtifactEvidence:
     workflow_run_id: str
 
 
+@dataclass(frozen=True)
+class AuthorTimeGateAblationEvent:
+    gate_id: str
+    reason_code: str
+    fingerprint: str
+    log_only: bool
+    blocked_tool: str | None = None
+    payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
+
+
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
@@ -158,6 +179,7 @@ class ScoutedInteraction(TypedDict):
     role: NotRequired[str]
     accessible_name: NotRequired[str]
     trajectory_index: NotRequired[int]
+    carried: NotRequired[bool]
     # Credential fills carry references and metadata only — never secret values.
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
@@ -308,6 +330,8 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
+    prior_fill_carry: list[dict[str, str | int]] = field(default_factory=list)
+    fill_carry_rebound_done: bool = False
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
     post_budget_page_inspection_run_id: str | None = None
@@ -423,6 +447,43 @@ class AgentContext:
     # extraction_schema declares fields that map to no output the block produces.
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
+    author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
+
+
+def copilot_author_time_gate_log_only_enabled() -> bool:
+    return not settings.is_cloud_environment() and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+
+
+def record_author_time_gate_ablation_event(
+    ctx: AgentContext,
+    *,
+    gate_id: str,
+    reason_code: str,
+    fingerprint: str,
+    blocked_tool: str | None = None,
+    payload: AuthorTimeGateAblationPayload | None = None,
+) -> bool:
+    if not copilot_author_time_gate_log_only_enabled():
+        return False
+    event = AuthorTimeGateAblationEvent(
+        gate_id=gate_id,
+        reason_code=reason_code,
+        fingerprint=fingerprint,
+        blocked_tool=blocked_tool,
+        payload=dict(payload or {}),
+        log_only=True,
+    )
+    ctx.author_time_gate_ablation_events.append(event)
+    LOG.info(
+        "copilot_author_time_gate_ablation_event",
+        gate_id=event.gate_id,
+        reason_code=event.reason_code,
+        fingerprint=event.fingerprint,
+        blocked_tool=event.blocked_tool,
+        log_only=event.log_only,
+        payload=event.payload,
+    )
+    return True
 
 
 def output_contract_ladder_unresolved(ctx: AgentContext) -> bool:

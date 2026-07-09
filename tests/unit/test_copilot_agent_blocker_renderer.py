@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_goal_satisfied_exit_result,
     _build_output_policy_blocked_result,
     _build_turn_halt_exit_result,
+    _build_wip_exit_result,
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
     _verified_workflow_success_reply,
@@ -814,6 +815,30 @@ def test_unverified_blocker_still_renders_blocker_text() -> None:
 
     assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
     assert overridden.proposal_disposition != "review_tested"
+
+
+def test_delivered_unverified_exit_renders_observed_output_as_unvalidated() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert "document_name: Resale Demand Package" in result.user_response
+    assert "not independently verified" in result.user_response
+    assert result.proposal_disposition == "review_untested"
+    assert result.workflow_yaml == ctx.last_workflow_yaml
 
 
 def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:

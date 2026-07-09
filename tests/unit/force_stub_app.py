@@ -34,6 +34,9 @@ def create_forge_stub_app() -> ForgeApp:
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
+    # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
+    # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
+    fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
     fake_app_module.agent = _LazyNamespace()
     fake_app_module.DATABASE.observer.update_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.observer.create_workflow_run_block = AsyncMock()

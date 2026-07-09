@@ -110,10 +110,20 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    JudgmentPredicate,
     RequestedOutputEvidenceSource,
     _coerce_requested_output_evidence_source,
+    _is_judgment_boolean_criterion,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction, output_contract_ladder_unresolved
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    AuthorTimeGateAblationPayload,
+    ScoutedInteraction,
+    copilot_author_time_gate_log_only_enabled,
+    output_contract_ladder_unresolved,
+    record_author_time_gate_ablation_event,
+)
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_FAILURE_TYPE,
     SchemaIncompatibility,
@@ -245,6 +255,17 @@ class CodeArtifactCompletionCriterion(BaseModel):
     terminal: bool | None = None
     output_path: str | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource | None = None
+    judgment_predicate: JudgmentPredicate | None = Field(
+        default=None,
+        description=(
+            "For a judgment-boolean criterion, the closed-vocabulary page-evidence predicate the "
+            "independent post-run packet decides this boolean by (e.g. `login_gate_blocks_target`)."
+        ),
+    )
+    judgment_polarity_when_holds: bool | None = Field(
+        default=None,
+        description="The emitted boolean value that corresponds to `judgment_predicate` holding on the packet.",
+    )
 
 
 class CodeArtifactScopedRef(BaseModel):
@@ -1113,7 +1134,18 @@ def _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml: str
     if not isinstance(parsed, dict):
         return workflow_yaml
     declared_string_keys = _declared_string_workflow_parameter_keys(parsed)
-    if not declared_string_keys:
+    workflow_definition = parsed.get("workflow_definition")
+    parameters = workflow_definition.get("parameters") if isinstance(workflow_definition, dict) else None
+    declared_credential_keys: set[str] = set()
+    if isinstance(parameters, list):
+        declared_credential_keys = {
+            str(parameter.get("key") or "").strip()
+            for parameter in parameters
+            if isinstance(parameter, dict)
+            if str(parameter.get("key") or "").strip() and _is_credential_parameter(parameter)
+        }
+    declared_adoptable_keys = declared_string_keys | declared_credential_keys
+    if not declared_adoptable_keys:
         return workflow_yaml
     available_binding_keys_by_label = _code_block_available_binding_keys_by_label(workflow_yaml)
     adopted_by_label: dict[str, list[str]] = {}
@@ -1125,7 +1157,9 @@ def _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml: str
         if not code.strip():
             continue
         parameter_keys = _code_block_parameter_keys(block)
-        available_declared_keys = set(available_binding_keys_by_label.get(label, [])) & declared_string_keys
+        available_declared_keys = (
+            set(available_binding_keys_by_label.get(label, [])) & declared_string_keys
+        ) | declared_credential_keys
         if not available_declared_keys:
             continue
         diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
@@ -1546,7 +1580,7 @@ def _recorded_outcome_convergence_reject(
     workflow_yaml: str,
     code_artifact_metadata: object,
 ) -> _ConvergenceReject | None:
-    latest = ctx.latest_recorded_build_test_outcome
+    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
     if not isinstance(latest, RecordedBuildTestOutcome) or not latest.is_authoritative:
         return None
     candidate_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
@@ -1554,7 +1588,7 @@ def _recorded_outcome_convergence_reject(
         return None
     if candidate_signature == latest.authored_structure_signature:
         return _ConvergenceReject(candidate_signature, "identical_authored_structure", False)
-    constraint = ctx.recorded_outcome_binding_constraint
+    constraint = getattr(ctx, "recorded_outcome_binding_constraint", None)
     if not isinstance(constraint, RecordedOutcomeBindingConstraint):
         return None
     # An author-time reject re-keys `latest` without an executed run, so keep the binding
@@ -1636,13 +1670,10 @@ def _recorded_outcome_missing_output_paths(ctx: AgentContext) -> set[str]:
 def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return set()
-    request_policy = getattr(ctx, "request_policy", None)
-    criteria_source = getattr(request_policy, "graded_completion_criteria", None)
-    criteria = criteria_source() if callable(criteria_source) else getattr(request_policy, "completion_criteria", [])
-    if not isinstance(criteria, list):
-        return set()
     paths: set[str] = set()
-    for criterion in criteria:
+    for criterion in _active_completion_criteria(ctx):
+        if isinstance(criterion, CompletionCriterion) and _independent_judgment_output_criterion(criterion):
+            continue
         if getattr(criterion, "level", None) == "definition":
             continue
         if getattr(criterion, "method_mandated", False):
@@ -1650,6 +1681,32 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
         if getattr(criterion, "kind", None) == "validation_classification":
             continue
         path = _canonical_requested_output_path(getattr(criterion, "output_path", None))
+        if path and _output_path_has_child(path):
+            paths.add(path)
+    return paths
+
+
+def _active_completion_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
+    request_policy = ctx.request_policy
+    if request_policy is None:
+        return []
+    return request_policy.graded_completion_criteria()
+
+
+def _independent_judgment_output_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.requested_output_evidence_source == "independent_run_evidence" and _is_judgment_boolean_criterion(
+        criterion
+    )
+
+
+def _independent_judgment_output_paths(ctx: AgentContext) -> set[str]:
+    paths: set[str] = set()
+    for criterion in _active_completion_criteria(ctx):
+        if not isinstance(criterion, CompletionCriterion):
+            continue
+        if not _independent_judgment_output_criterion(criterion):
+            continue
+        path = _canonical_requested_output_path(criterion.output_path)
         if path and _output_path_has_child(path):
             paths.add(path)
     return paths
@@ -1762,6 +1819,8 @@ _MAX_OUTPUT_CONTRACT_REJECTS = 4
 _MAX_OUTPUT_CONTRACT_DEFERRALS = 3
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
 _OUTPUT_CONTRACT_PAGE_EXTRACT_VAR = "output_contract_page_values"
+_OUTPUT_CONTRACT_ABLATION_GATE_ID = "output_contract_actuation"
+_METADATA_PREFLIGHT_ABLATION_GATE_ID = "metadata_run_preflight_reject"
 
 
 @dataclass(frozen=True)
@@ -1790,11 +1849,44 @@ class _OutputContractEvaluation:
         )
 
 
+def _record_output_contract_ablation_event(
+    ctx: AgentContext,
+    evaluation: _OutputContractEvaluation,
+    *,
+    gate_id: str,
+    blocked_tool: str,
+    fingerprint: str,
+) -> bool:
+    reason_code = str(
+        evaluation.payload.get("reason_code") or evaluation.reason_code or _OUTPUT_CONTRACT_REJECT_REASON_CODE
+    )
+    payload: AuthorTimeGateAblationPayload = {
+        "block_label": evaluation.block_label,
+        "canonical_output_contract_signature": evaluation.canonical_signature,
+        "canonical_required_child_paths": sorted(evaluation.required_paths),
+        "missing_metadata_paths": list(evaluation.missing_metadata_paths),
+        "missing_schema_paths": list(evaluation.missing_schema_paths),
+        "missing_return_paths": list(evaluation.missing_return_paths),
+        "shape_violations": list(evaluation.shape_violations),
+        "can_attempt_run": evaluation.can_attempt_run,
+    }
+    return record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=gate_id,
+        reason_code=reason_code,
+        fingerprint=fingerprint,
+        blocked_tool=blocked_tool,
+        payload=payload,
+    )
+
+
 @dataclass(frozen=True)
 class _RuntimeOutputRepairContract:
     required_paths: set[str]
     facts: list[dict[str, Any]]
     workflow_run_id: str
+    owner_labels: list[str]
+    owner_labels_by_path: dict[str, list[str]]
     source: str = "runtime_output_repair"
     reason_code: str = "runtime_output_repair_required"
 
@@ -2092,6 +2184,8 @@ def _runtime_output_contract_signature(runtime_contract: _RuntimeOutputRepairCon
     payload = {
         "workflow_run_id": runtime_contract.workflow_run_id,
         "required_paths": sorted(runtime_contract.required_paths),
+        "owner_labels": runtime_contract.owner_labels,
+        "owner_labels_by_path": runtime_contract.owner_labels_by_path,
         "facts": runtime_contract.facts,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -2146,6 +2240,35 @@ def _target_output_contract_block_label(
     raw_code_artifact_metadata: object,
     required_paths: set[str],
 ) -> tuple[str, list[str]]:
+    runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
+    if runtime_contract is not None:
+        code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+        runtime_owner_labels: set[str] = set()
+        missing_owner = False
+        ambiguous_owner = False
+        for path in sorted(runtime_contract.required_paths):
+            raw_path_owners = sorted(runtime_contract.owner_labels_by_path.get(path, []))
+            path_owner_labels = sorted(label for label in raw_path_owners if label in code_blocks)
+            # Ambiguity is judged before filtering: dropping stale labels must not resolve a
+            # contested path down to a lone survivor.
+            if len(raw_path_owners) > 1:
+                ambiguous_owner = True
+                runtime_owner_labels.update(path_owner_labels)
+                continue
+            if len(path_owner_labels) != 1:
+                missing_owner = missing_owner or not path_owner_labels
+                runtime_owner_labels.update(path_owner_labels)
+                continue
+            runtime_owner_labels.add(path_owner_labels[0])
+        if missing_owner:
+            return "", []
+        current_owner_labels = sorted(runtime_owner_labels)
+        if ambiguous_owner:
+            return "", current_owner_labels
+        if len(current_owner_labels) == 1:
+            _pin_output_contract_block_label(ctx, workflow_yaml, required_paths, current_owner_labels[0])
+            return current_owner_labels[0], current_owner_labels
+        return "", current_owner_labels
     pinned_label = _pinned_output_contract_block_label(ctx, workflow_yaml, required_paths)
     if pinned_label:
         return pinned_label, [pinned_label]
@@ -2173,7 +2296,8 @@ def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> 
         return None
     facts: list[dict[str, Any]] = []
     required_paths: set[str] = set()
-    block_labels: set[str] = set()
+    owner_labels: set[str] = set()
+    owner_labels_by_path: dict[str, set[str]] = {}
     for raw_fact in outcome.runtime_output_repair_facts:
         if not isinstance(raw_fact, Mapping):
             return None
@@ -2185,24 +2309,35 @@ def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> 
         fact = dict(raw_fact)
         fact["output_path"] = path
         fact["output_root"] = _output_path_root(path)
+        path_owner_labels = owner_labels_by_path.setdefault(path, set())
+        raw_owner_labels = fact.get("owner_labels")
+        if isinstance(raw_owner_labels, list):
+            path_owner_labels.update(str(label).strip() for label in raw_owner_labels if str(label).strip())
         label = str(fact.get("block_label") or "").strip()
         if label:
-            block_labels.add(label)
+            path_owner_labels.add(label)
+        owner_labels.update(path_owner_labels)
         required_paths.add(path)
         facts.append(fact)
-    if not facts or not required_paths or len(block_labels) > 1:
+    if not facts or not required_paths:
         return None
     return _RuntimeOutputRepairContract(
         required_paths=required_paths,
         facts=sorted(facts, key=lambda item: str(item.get("output_path") or "")),
         workflow_run_id=outcome.workflow_run_id,
+        owner_labels=sorted(owner_labels),
+        owner_labels_by_path={path: sorted(labels) for path, labels in sorted(owner_labels_by_path.items())},
     )
 
 
 def _output_contract_required_paths_source(ctx: AgentContext) -> tuple[set[str], str, str]:
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     if runtime_contract is not None:
-        return runtime_contract.required_paths, runtime_contract.source, runtime_contract.reason_code
+        return (
+            runtime_contract.required_paths - _independent_judgment_output_paths(ctx),
+            runtime_contract.source,
+            runtime_contract.reason_code,
+        )
     required_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
     repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
     if required_paths or not isinstance(repair_context, CodeAuthoringRepairContext):
@@ -2216,6 +2351,7 @@ def _output_contract_required_paths_source(ctx: AgentContext) -> tuple[set[str],
             *repair_context.required_code_return_paths,
         ]
     )
+    required_paths -= _independent_judgment_output_paths(ctx)
     source = str(repair_context.metadata_contract_source or "").strip() or "metadata_reject"
     reason_code = (
         str(repair_context.metadata_contract_reason_code or "").strip()
@@ -2489,6 +2625,7 @@ def _adjudicate_output_contract_ladder_after_reject(
         required_paths=evaluation.required_paths,
         signature=signature,
         current_fingerprint=current_fingerprint,
+        advisory_run_grantable=blockers == [_OUTPUT_CONTRACT_REJECT_REASON_CODE],
     )
     if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
         _stash_output_source_unobservable_terminal(
@@ -3141,8 +3278,6 @@ def _observed_required_output_values(ctx: AgentContext, required_paths: set[str]
         return False
     if covered & required_paths:
         return True
-    # Match on ancestor/descendant lineage, not the top-level root: every requested-output path
-    # shares the ``output`` root, so a root-only match would credit any coverage as the required value.
     return any(_output_paths_share_lineage(str(path), required) for path in covered for required in required_paths)
 
 
@@ -3225,7 +3360,9 @@ def _grant_output_contract_advisory_run(ctx: AgentContext, signature: str) -> No
     )
 
 
-def consume_output_contract_advisory_grant_for_run(ctx: AgentContext) -> list[str]:
+def consume_output_contract_advisory_grant_for_run(
+    ctx: AgentContext, *, workflow_run_id: str | None = None
+) -> list[str]:
     consumed: list[str] = []
     for signature, state in list(ctx.output_contract_actuation_by_signature.items()):
         if state == OutputContractAdvisoryState.GRANTED:
@@ -3235,12 +3372,44 @@ def consume_output_contract_advisory_grant_for_run(ctx: AgentContext) -> list[st
         LOG.info(
             "copilot_output_contract_advisory_run_consumed",
             canonical_output_contract_signature=signature,
+            workflow_run_id=workflow_run_id,
         )
     if ctx.output_contract_actuation_count_by_signature:
         ctx.output_contract_actuation_count_by_signature.clear()
     if ctx.output_contract_declick_attempted_by_signature:
         ctx.output_contract_declick_attempted_by_signature.clear()
     return consumed
+
+
+def consume_output_contract_advisory_grant_for_run_result(
+    ctx: AgentContext, run_result: Mapping[str, object]
+) -> list[str]:
+    workflow_run_id = _workflow_run_id_from_run_result(run_result)
+    if workflow_run_id is None:
+        data = run_result.get("data")
+        if isinstance(data, Mapping):
+            LOG.warning(
+                "copilot_output_contract_advisory_run_result_missing_workflow_run_id",
+                data_keys=sorted(str(key) for key in data),
+            )
+        return []
+    consumed = consume_output_contract_advisory_grant_for_run(ctx, workflow_run_id=workflow_run_id)
+    for signature in consumed:
+        LOG.info(
+            "copilot_output_contract_advisory_run_dispatched_at_seam",
+            canonical_output_contract_signature=signature,
+            workflow_run_id=workflow_run_id,
+        )
+    return consumed
+
+
+def _workflow_run_id_from_run_result(run_result: Mapping[str, object]) -> str | None:
+    data = run_result.get("data")
+    if isinstance(data, Mapping):
+        workflow_run_id = data.get("workflow_run_id")
+        if isinstance(workflow_run_id, str) and workflow_run_id.strip():
+            return workflow_run_id
+    return None
 
 
 def _stash_output_source_unobservable_terminal(
@@ -3253,6 +3422,23 @@ def _stash_output_source_unobservable_terminal(
     blockers: list[str],
 ) -> None:
     if ctx.turn_halt is not None:
+        return
+    payload: AuthorTimeGateAblationPayload = {
+        "block_label": block_label,
+        "canonical_output_contract_signature": signature,
+        "canonical_required_child_paths": sorted(required_paths),
+        "spine_split_blockers": list(blockers),
+    }
+    if copilot_author_time_gate_log_only_enabled() and ctx.output_contract_bail_actuated_this_call:
+        return
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+        reason_code=reason_code,
+        fingerprint=signature,
+        blocked_tool="update_workflow",
+        payload=payload,
+    ):
         return
     signal = build_output_source_unobservable_blocker_signal(
         reason_code=reason_code,
@@ -3319,7 +3505,7 @@ def _registered_output_paths(result: object) -> set[str]:
         if isinstance(value, dict) and value:
             for key, child in value.items():
                 absorb(f"{prefix}.{key}" if prefix else str(key), child)
-        elif prefix:
+        elif prefix and _runtime_output_value_is_meaningful(value):
             paths.add(prefix)
 
     for block in data.get("blocks") or []:
@@ -3347,9 +3533,8 @@ def record_output_contract_run_output_evidence(ctx: AgentContext, result: object
     observed_paths = {_strip_output_namespace_root(path) for path in _registered_output_paths(result)}
     for signature, paths in list(pending.items()):
         required_paths = {_strip_output_namespace_root(str(path)) for path in paths}
-        bound = any(
-            _output_paths_share_lineage(observed, required)
-            for observed in observed_paths
+        bound = bool(required_paths) and all(
+            any(_output_paths_share_lineage(observed, required) for observed in observed_paths)
             for required in required_paths
         )
         ctx.output_contract_run_output_observed_by_signature[signature] = True
@@ -3391,15 +3576,6 @@ def _reopen_dispatch_lacked_bound_extraction(ctx: AgentContext, signature: str) 
     return True
 
 
-def _page_source_extraction_prompt(required_paths: set[str]) -> str:
-    fields = ", ".join(sorted(_metadata_contract_required_paths(required_paths))) or "the requested values"
-    return (
-        "Read the values currently shown on the page and return them keyed exactly to the requested output "
-        f"structure. Required output path(s): {fields}. Return only values visible on the page; if a value is "
-        "not present, return an empty string for it."
-    )
-
-
 def _strip_top_level_returns(code: str) -> str:
     try:
         tree = ast.parse(code)
@@ -3411,6 +3587,14 @@ def _strip_top_level_returns(code: str) -> str:
     return ast.unparse(ast.Module(body=kept, type_ignores=[]))
 
 
+def _page_source_extraction_prompt(required_paths: set[str]) -> str:
+    paths = ", ".join(sorted(_metadata_contract_required_paths(required_paths)))
+    return (
+        "Extract the requested output values visible on the current page. "
+        f"Populate these output paths when visible: {paths}."
+    )
+
+
 def _page_source_extraction_code(target_code: str, required_paths: set[str]) -> str:
     body = _strip_top_level_returns(textwrap.dedent(target_code).strip())
     schema = _schema_template_for_required_paths(required_paths)
@@ -3418,7 +3602,7 @@ def _page_source_extraction_code(target_code: str, required_paths: set[str]) -> 
         f"{_OUTPUT_CONTRACT_PAGE_EXTRACT_VAR} = await page.extract(\n"
         f"    prompt={json.dumps(_page_source_extraction_prompt(required_paths))},\n"
         f"    schema={schema!r},\n"
-        f")\n"
+        ")\n"
         f"return {_OUTPUT_CONTRACT_PAGE_EXTRACT_VAR}"
     )
     return f"{body}\n{extract_block}" if body else extract_block
@@ -3469,9 +3653,27 @@ def _actuate_output_contract_bail(
     )
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN and not _run_authority_permits_dispatch(ctx):
         actuation = OutputContractActuation(OutputContractActuationKind.STRUCTURE_DIRECTIVE, actuation.family)
+    payload: AuthorTimeGateAblationPayload = {
+        "actuation_kind": actuation.kind.value,
+        "family": actuation.family.value,
+        "blockers": list(blockers),
+        "canonical_required_child_paths": sorted(required_paths),
+        "advisory_state": evidence.advisory_state.value,
+        "advisory_run_grantable": evidence.advisory_run_grantable,
+    }
     ctx.output_contract_bail_actuated_this_call = True
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+        reason_code=actuation.reason_code or actuation.kind.value,
+        fingerprint=current_fingerprint,
+        blocked_tool="update_workflow",
+        payload=payload,
+    ):
+        return actuation
     if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
         _grant_output_contract_advisory_run(ctx, signature)
+        _arm_pending_run_evidence(ctx, signature, required_paths)
     elif actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE and not evidence.prior_directive_unconsumed:
         _record_output_contract_actuation_progress(ctx, signature)
     if (
@@ -3603,6 +3805,8 @@ def _impose_output_contract_envelope_after_steering(
                 return workflow_yaml, raw_code_artifact_metadata, False
             if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
                 return workflow_yaml, raw_code_artifact_metadata, False
+            if copilot_author_time_gate_log_only_enabled():
+                return workflow_yaml, raw_code_artifact_metadata, False
             attempt_key = _output_contract_spine_directive_attempt_key(
                 signature=signature, block_label=label, workflow_yaml=workflow_yaml
             )
@@ -3709,6 +3913,45 @@ def _metadata_contract_run_preflight_reject(
         workflow_yaml,
         raw_code_artifact_metadata,
     )
+    convergence_reject = _recorded_outcome_convergence_reject(
+        ctx,
+        workflow_yaml=workflow_yaml,
+        code_artifact_metadata=raw_code_artifact_metadata,
+    )
+    if convergence_reject is not None:
+        block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+        _record_author_time_reject_outcome(
+            ctx,
+            reason_code="unchanged_after_recorded_outcome",
+            summary="The authored code and output structure are unchanged after the last recorded test outcome.",
+            structural_payload={
+                "reason_code": "unchanged_after_recorded_outcome",
+                "authored_structure_signature": convergence_reject.authored_structure_signature,
+                "block_labels": block_labels,
+            },
+            authored_structure_signature=convergence_reject.authored_structure_signature,
+            block_labels=block_labels,
+        )
+        _record_code_authoring_guardrail_reject(
+            ctx, frontier_unchanged=convergence_reject.reason == "frontier_unchanged"
+        )
+        LOG.info(
+            "copilot recorded outcome convergence behavior",
+            convergence_reason=convergence_reject.reason,
+            commit_early_terminal=convergence_reject.commit_early_terminal,
+            block_labels=block_labels,
+        )
+        if convergence_reject.commit_early_terminal:
+            _commit_recorded_outcome_early_terminal(ctx)
+        return {
+            "ok": False,
+            "error": (
+                "Submitted workflow left the frontier the last recorded test outcome named unchanged. "
+                "Revise the code block or output metadata that owns that frontier before testing again."
+            ),
+            "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": _code_repair_progress_data(),
+        }
     evaluation = _evaluate_output_contract_for_code_block(
         ctx,
         workflow_yaml,
@@ -3717,33 +3960,31 @@ def _metadata_contract_run_preflight_reject(
     )
     if evaluation is None or not evaluation.has_deficiencies:
         return None
+    authored_fingerprint = _output_contract_structural_fingerprint(workflow_yaml, evaluation.canonical_signature)
     advisory_granted = _output_contract_advisory_granted(ctx, evaluation.canonical_signature)
     # A granted advisory must arm run-output evidence before the grant is consumed, even when the
     # workflow is otherwise run-attemptable — otherwise the dispatched run records no evidence.
     if evaluation.can_attempt_run and not advisory_granted:
         return None
+    if _record_output_contract_ablation_event(
+        ctx,
+        evaluation,
+        gate_id=_METADATA_PREFLIGHT_ABLATION_GATE_ID,
+        blocked_tool="update_and_run_blocks",
+        fingerprint=authored_fingerprint,
+    ):
+        return None
     payload = _record_output_contract_reject(
         ctx,
         evaluation,
         summary="Submitted workflow does not satisfy the requested output contract before run.",
-        authored_structural_fingerprint=_output_contract_structural_fingerprint(
-            workflow_yaml, evaluation.canonical_signature
-        ),
+        authored_structural_fingerprint=authored_fingerprint,
         workflow_yaml=workflow_yaml,
     )
     if advisory_granted:
         _arm_pending_run_evidence(ctx, evaluation.canonical_signature, set(evaluation.required_paths))
-        consume_output_contract_advisory_grant_for_run(ctx)
-        LOG.info(
-            "copilot_output_contract_advisory_run_dispatched_at_seam",
-            block_label=evaluation.block_label,
-            canonical_output_contract_signature=evaluation.canonical_signature,
-        )
         return None
-    if evaluation.repair_context is not None and (
-        evaluation.repair_context.required_block_structure
-        or evaluation.repair_context.reason_code == OUTPUT_OWNER_AMBIGUITY_REASON_CODE
-    ):
+    if evaluation.repair_context is not None:
         ctx.last_code_authoring_repair_context = evaluation.repair_context
     payload = dict(payload)
     payload["output_contract_reason_code"] = payload.get("reason_code")
@@ -5015,21 +5256,48 @@ def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
 
 def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> bool:
     latest = ctx.latest_recorded_build_test_outcome
-    return (
+    if not (
         isinstance(latest, RecordedBuildTestOutcome)
         and latest.is_authoritative
         and latest.phase == "author_time_reject"
-        and latest.reason_code in {"metadata_reject", "synthesized_parameter_binding_ambiguous"}
+    ):
+        return False
+    if latest.reason_code in {"metadata_reject", "synthesized_parameter_binding_ambiguous"}:
+        return True
+    repair_context = ctx.last_code_authoring_repair_context
+    # Ambiguous bare selectors are repaired by the same strict imposition path as metadata gaps.
+    return (
+        latest.reason_code == "code_safety_reject"
+        and isinstance(repair_context, CodeAuthoringRepairContext)
+        and repair_context.reason_code == "ambiguous_bare_selector"
     )
+
+
+def _recorded_outcome_imposition_block_labels(ctx: AgentContext) -> frozenset[str]:
+    constraint = ctx.recorded_outcome_binding_constraint
+    if isinstance(constraint, RecordedOutcomeBindingConstraint):
+        return frozenset(label.strip() for label in constraint.owning_block_labels if label.strip())
+    latest = ctx.latest_recorded_build_test_outcome
+    if isinstance(latest, RecordedBuildTestOutcome) and latest.is_authoritative:
+        return frozenset(label.strip() for label in latest.block_labels if label.strip())
+    return frozenset()
 
 
 def _select_synthesized_imposition_code_block(
     code_blocks: list[dict[str, Any]],
     *,
     prior_yaml: str | None,
+    preferred_labels: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     if len(code_blocks) == 1:
         return code_blocks[0]
+
+    if preferred_labels:
+        preferred_matches = [
+            block for block in code_blocks if str(block.get("label") or "").strip() in preferred_labels
+        ]
+        if len(preferred_matches) == 1:
+            return preferred_matches[0]
 
     synthesized_label_matches = [
         block for block in code_blocks if str(block.get("label") or "").strip() == _SYNTHESIZED_BLOCK_LABEL
@@ -5384,12 +5652,15 @@ def _whole_trajectory_browser_surface_violations(
     selected_code_block: dict[str, Any],
     submitted_selected_code: str,
     synthesized_code: str,
+    prior_yaml: str | None = None,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
     scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
     scouted_signatures = set(scouted_mutations)
     for block in code_blocks:
         if block is selected_code_block:
+            continue
+        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
             continue
         label = _code_block_label(block)
         block_code = str(block.get("code") or "")
@@ -6674,7 +6945,11 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     code_blocks = _workflow_code_blocks(parsed)
     prior_source, prior_yaml = _prior_yaml_source(ctx)
-    code_block = _select_synthesized_imposition_code_block(code_blocks, prior_yaml=prior_yaml)
+    code_block = _select_synthesized_imposition_code_block(
+        code_blocks,
+        prior_yaml=prior_yaml,
+        preferred_labels=_recorded_outcome_imposition_block_labels(ctx),
+    )
     if code_block is None:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     submitted_code = str(code_block.get("code") or "")
@@ -6734,6 +7009,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         selected_code_block=code_block,
         submitted_selected_code=submitted_code,
         synthesized_code=synthesized.code,
+        prior_yaml=prior_yaml,
     )
     violations.extend(surface_validation.violations)
     extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
@@ -7783,6 +8059,8 @@ def _artifact_string_list(value: Any) -> list[str]:
 def _credentialed_code_block_scout_gate_errors(
     workflow_yaml: str | None,
     ctx: AgentContext,
+    *,
+    block_labels: Iterable[str] | None = None,
 ) -> list[str]:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return []
@@ -7797,9 +8075,25 @@ def _credentialed_code_block_scout_gate_errors(
     credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return []
+    prior_blocks_by_label = {}
+    prior_credential_params_by_key = {}
+    prior_workflow_yaml = ctx.workflow_yaml
+    if isinstance(prior_workflow_yaml, str) and prior_workflow_yaml.strip():
+        prior_parsed = parse_workflow_yaml(prior_workflow_yaml)
+        if isinstance(prior_parsed, dict):
+            prior_workflow_definition = prior_parsed.get("workflow_definition")
+            if isinstance(prior_workflow_definition, dict):
+                prior_credential_params_by_key = credential_param_ids(prior_workflow_definition.get("parameters"))
+                for prior_block in workflow_blocks(prior_parsed):
+                    if _enum_or_string_name(prior_block.get("block_type")) != BlockType.CODE.value:
+                        continue
+                    prior_label = str(prior_block.get("label") or "").strip()
+                    if prior_label:
+                        prior_blocks_by_label[prior_label] = prior_block
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     if not isinstance(scout_trajectory, list):
         scout_trajectory = []
+    selected_block_labels = {label.strip() for label in block_labels or [] if label.strip()}
 
     errors: list[str] = []
     for block in workflow_blocks(parsed):
@@ -7808,6 +8102,23 @@ def _credentialed_code_block_scout_gate_errors(
         code = str(block.get("code") or "")
         if not code.strip():
             continue
+        block_label = str(block.get("label") or "").strip()
+        if selected_block_labels and block_label not in selected_block_labels:
+            continue
+        matching_prior_block = prior_blocks_by_label.get(block_label) if block_label else None
+        if (
+            isinstance(matching_prior_block, dict)
+            and str(matching_prior_block.get("code") or "") == code
+            and _code_block_parameter_keys(matching_prior_block) == _code_block_parameter_keys(block)
+        ):
+            accessed_parameter_keys = {
+                access.parameter_key for access in _credential_field_accesses(code) if access.requires_live_scout
+            }
+            if accessed_parameter_keys and all(
+                prior_credential_params_by_key.get(parameter_key) == credential_params_by_key.get(parameter_key)
+                for parameter_key in accessed_parameter_keys
+            ):
+                continue
         required_fields_by_parameter: dict[str, tuple[set[str], set[str]]] = {}
         for access in _credential_field_accesses(code):
             if not access.requires_live_scout:
@@ -7864,7 +8175,7 @@ def _credentialed_code_block_scout_gate_errors(
         if not missing_fields and not missing_submit:
             continue
 
-        block_label = str(block.get("label") or "").strip() or "this code block"
+        block_label = block_label or "this code block"
         requirements: list[str] = []
         if missing_fields:
             joined_fields = ", ".join(f"`{field}`" for field in missing_fields)
@@ -8044,27 +8355,35 @@ async def _update_workflow(
         and output_contract_evaluation.has_deficiencies
         and not output_contract_static_advisory_allowed
     ):
-        payload = _record_output_contract_reject(
+        authored_fingerprint = _output_contract_structural_fingerprint(
+            workflow_yaml, output_contract_evaluation.canonical_signature
+        )
+        if not _record_output_contract_ablation_event(
             ctx,
             output_contract_evaluation,
-            summary="Submitted workflow does not satisfy the requested output contract.",
-            authored_structural_fingerprint=_output_contract_structural_fingerprint(
-                workflow_yaml, output_contract_evaluation.canonical_signature
-            ),
-            workflow_yaml=workflow_yaml,
-        )
-        reject_result = _output_contract_reject_result(
-            output_contract_evaluation,
-            payload=payload,
-            tool_name="update_workflow",
-        )
-        return reject(
-            error=str(reject_result["error"]),
-            user_facing_summary=str(reject_result.get("user_facing_summary") or _compiled_authoring_user_summary()),
-            data=reject_result.get("data") if isinstance(reject_result.get("data"), dict) else None,
-            repair_context=output_contract_evaluation.repair_context,
-            record_repair_context_outcome=False,
-        )
+            gate_id=_OUTPUT_CONTRACT_ABLATION_GATE_ID,
+            blocked_tool="update_workflow",
+            fingerprint=authored_fingerprint,
+        ):
+            payload = _record_output_contract_reject(
+                ctx,
+                output_contract_evaluation,
+                summary="Submitted workflow does not satisfy the requested output contract.",
+                authored_structural_fingerprint=authored_fingerprint,
+                workflow_yaml=workflow_yaml,
+            )
+            reject_result = _output_contract_reject_result(
+                output_contract_evaluation,
+                payload=payload,
+                tool_name="update_workflow",
+            )
+            return reject(
+                error=str(reject_result["error"]),
+                user_facing_summary=str(reject_result.get("user_facing_summary") or _compiled_authoring_user_summary()),
+                data=reject_result.get("data") if isinstance(reject_result.get("data"), dict) else None,
+                repair_context=output_contract_evaluation.repair_context,
+                record_repair_context_outcome=False,
+            )
     missing_metadata_error = _missing_code_artifact_metadata_error(
         workflow_yaml,
         ctx,
@@ -8184,7 +8503,7 @@ async def _update_workflow(
     credential_scout_errors = (
         []
         if _request_policy_allows_untested_code_block_draft(ctx)
-        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+        else _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx, block_labels=params.get("block_labels"))
     )
     unresolved_symbol_priority_reject = _is_unresolved_symbol_repair_context(code_authoring_repair_context)
     credential_priority_reject = (
@@ -8573,6 +8892,7 @@ async def _update_workflow(
                 totp_verification_url=workflow.totp_verification_url,
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
+                pin_saved_session_ip=workflow.pin_saved_session_ip,
                 browser_profile_id=workflow.browser_profile_id,
                 browser_profile_key=workflow.browser_profile_key,
                 model=workflow.model,

@@ -251,6 +251,230 @@ class TestDoObserve:
         assert result.elements[0].options == ["US", "UK", "CA"]
 
     @pytest.mark.asyncio
+    async def test_dom_interactables_are_merged_with_selectors(self) -> None:
+        page = _make_page(_make_a11y_tree(children=[{"role": "textbox", "name": "City", "value": ""}]))
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "option",
+                    "name": "Lakewood",
+                    "tag": "div",
+                    "selector": "#city-list > div:nth-of-type(1)",
+                }
+            ]
+        )
+
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+
+        city_option = next(element for element in serialized if element["name"] == "Lakewood")
+        assert city_option["selector"] == "#city-list > div:nth-of-type(1)"
+        assert ref_to_selector(city_option) == "#city-list > div:nth-of-type(1)"
+
+    @pytest.mark.asyncio
+    async def test_dom_interactables_work_without_accessibility_snapshot(self) -> None:
+        page = SimpleNamespace(
+            url="https://example.com/form",
+            title=AsyncMock(return_value="Form"),
+            evaluate=AsyncMock(
+                return_value=[
+                    {
+                        "role": "option",
+                        "name": "Music",
+                        "tag": "div",
+                        "selector": "#category-options > div:nth-of-type(2)",
+                    }
+                ]
+            ),
+        )
+
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+
+        assert len(serialized) == 1
+        assert serialized[0]["name"] == "Music"
+        assert serialized[0]["selector"] == "#category-options > div:nth-of-type(2)"
+
+    @pytest.mark.asyncio
+    async def test_dom_selector_is_attached_to_matching_a11y_option(self) -> None:
+        tree = _make_a11y_tree(
+            children=[
+                {
+                    "role": "combobox",
+                    "name": "Region",
+                    "children": [
+                        {"role": "option", "name": "North"},
+                        {"role": "option", "name": "East"},
+                    ],
+                },
+            ]
+        )
+        page = _make_page(tree)
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "option",
+                    "name": "East",
+                    "tag": "option",
+                    "selector": "#region > option:nth-of-type(2)",
+                    "value": "east",
+                }
+            ]
+        )
+
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+
+        east_option = next(element for element in serialized if element["name"] == "East")
+        assert east_option["selector"] == "#region > option:nth-of-type(2)"
+        assert east_option["value"] == "east"
+        assert ref_to_selector(east_option) == "#region > option:nth-of-type(2)"
+
+    @pytest.mark.asyncio
+    async def test_dom_password_field_value_redacted_by_type_not_name(self) -> None:
+        # A password input whose accessible name is NOT password-like must still be redacted
+        # when the DOM scan flags it (is_password); its raw value must never surface.
+        page = _make_page(_make_a11y_tree(children=[]))
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "textbox",
+                    "name": "Current",
+                    "tag": "input",
+                    "value": "",
+                    "is_password": True,
+                    "selector": "#pw",
+                }
+            ]
+        )
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+        pw = next(element for element in serialized if element["name"] == "Current")
+        assert pw["value"] == "***"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_label_options_do_not_get_wrong_selector(self) -> None:
+        # Two a11y options share a label and two DOM options share it too. The merge must NOT
+        # attach a DOM selector to an a11y option (ambiguous) — that would risk a confidently
+        # wrong deterministic action.
+        tree = _make_a11y_tree(
+            children=[
+                {
+                    "role": "combobox",
+                    "name": "Region",
+                    "children": [
+                        {"role": "option", "name": "North"},
+                        {"role": "option", "name": "North"},
+                    ],
+                },
+            ]
+        )
+        page = _make_page(tree)
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "option",
+                    "name": "North",
+                    "tag": "option",
+                    "selector": "#r > option:nth-of-type(1)",
+                    "value": "n1",
+                },
+                {
+                    "role": "option",
+                    "name": "North",
+                    "tag": "option",
+                    "selector": "#r > option:nth-of-type(2)",
+                    "value": "n2",
+                },
+            ]
+        )
+        result = await do_observe(page)
+        serialized = serialize_elements(result.elements)
+        a11y_norths = [e for e in serialized if e["name"] == "North" and not e.get("selector")]
+        assert len(a11y_norths) == 2
+
+    @pytest.mark.asyncio
+    async def test_duplicate_name_password_redacts_all_a11y_values(self) -> None:
+        # A password field whose accessible name is shared with another textbox must have its
+        # a11y value redacted even when the DOM match is ambiguous (duplicate name).
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "textbox", "name": "Current", "value": "s3cr3t"},
+                {"role": "textbox", "name": "Current", "value": ""},
+            ]
+        )
+        page = _make_page(tree)
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "textbox",
+                    "name": "Current",
+                    "tag": "input",
+                    "value": "",
+                    "is_password": True,
+                    "selector": "#pw",
+                },
+            ]
+        )
+        result = await do_observe(page, max_elements=100)
+        serialized = serialize_elements(result.elements)
+        currents = [element for element in serialized if element["name"] == "Current"]
+        assert currents, serialized
+        for element in currents:
+            assert element["value"] in ("***", "", None), element
+        assert all("s3cr3t" not in str(element.get("value") or "") for element in serialized)
+
+    @pytest.mark.asyncio
+    async def test_match_index_stable_when_cap_reorders(self) -> None:
+        # A selector-bearing duplicate reordered ahead of the cap must NOT shift the nth ordinal
+        # of a selectorless duplicate sharing its (role, name). The a11y duplicate must keep its
+        # original ordinal (0), so its `nth=N` fallback ref points at the right element.
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "combobox", "name": "Dup", "value": ""},
+                {"role": "combobox", "name": "Dup", "value": ""},
+            ]
+        )
+        page = _make_page(tree)
+        page.evaluate = AsyncMock(
+            return_value=[
+                {"role": "combobox", "name": "Dup", "tag": "select", "selector": "#dup3"},
+            ]
+        )
+        result = await do_observe(page, max_elements=2)
+        selectorless_dups = [e for e in result.elements if e.name == "Dup" and not e.selector]
+        assert selectorless_dups, result.elements
+        assert selectorless_dups[0].match_index == 0
+
+    @pytest.mark.asyncio
+    async def test_divergent_name_dom_password_fails_closed(self) -> None:
+        # If a DOM password field's accessible name diverges from the a11y name (so it cannot be
+        # mapped), fail closed: redact every a11y textbox value rather than leak the a11y value.
+        tree = _make_a11y_tree(
+            children=[
+                {"role": "textbox", "name": "Account", "value": "s3cr3t"},
+            ]
+        )
+        page = _make_page(tree)
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "textbox",
+                    "name": "DifferentName",
+                    "tag": "input",
+                    "value": "",
+                    "is_password": True,
+                    "selector": "#pw",
+                },
+            ]
+        )
+        result = await do_observe(page, max_elements=100)
+        serialized = serialize_elements(result.elements)
+        account = next(element for element in serialized if element["name"] == "Account")
+        assert account["value"] == "***"
+        assert all("s3cr3t" not in str(element.get("value") or "") for element in serialized)
+
+    @pytest.mark.asyncio
     async def test_role_to_tag_mapping(self) -> None:
         page = _make_page()
         result = await do_observe(page)
@@ -614,6 +838,60 @@ class TestSkyvernExecuteMCP:
         # Verify click was called with selector resolved from ref
         click_call = mcp_browser.skyvern_click.call_args
         assert 'role=button[name="Sign In"]' in str(click_call)
+
+    @pytest.mark.asyncio
+    async def test_execute_observe_then_click_native_option_ref_selects_parent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        option_selector = "#region > option:nth-of-type(4)"
+        option_locator = SimpleNamespace(
+            evaluate=AsyncMock(
+                return_value={
+                    "select_selector": "#region",
+                    "value": "east",
+                    "label": "East",
+                }
+            )
+        )
+        option_locator.first = option_locator
+        select_option = AsyncMock()
+        select_locator = SimpleNamespace(select_option=select_option)
+        page = SimpleNamespace(
+            url="https://example.com/form",
+            title=AsyncMock(return_value="Form"),
+            accessibility=None,
+            evaluate=AsyncMock(
+                return_value=[
+                    {
+                        "role": "option",
+                        "name": "East",
+                        "tag": "option",
+                        "selector": option_selector,
+                        "value": "east",
+                    }
+                ]
+            ),
+            locator=MagicMock(
+                side_effect=lambda selector: option_locator if selector == option_selector else select_locator
+            ),
+            click=AsyncMock(return_value="#unexpected-click"),
+        )
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        result = await mcp_browser.skyvern_execute(
+            steps=[
+                {"tool": "observe", "params": {}},
+                {"tool": "click", "params": {"ref": "e0"}},
+            ]
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["steps_completed"] == 2
+        page.click.assert_not_awaited()
+        select_option.assert_awaited_once_with(value="east", timeout=30000)
+        assert result["data"]["results"][1]["data"]["resolved_selector"] == "#region"
 
     @pytest.mark.asyncio
     async def test_execute_unknown_ref_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:

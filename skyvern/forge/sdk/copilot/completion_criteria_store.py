@@ -28,10 +28,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_expected_classification,
     _coerce_expected_output_shape,
     _coerce_expected_output_value,
+    _coerce_judgment_truth_condition,
     _coerce_requested_output_evidence_source,
     _normalize_contingent_antecedent_output_path,
     _normalize_deliverable_kind,
     is_fallback_floor_criterion,
+    judgment_truth_condition_key,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
     typed_expected_output_value_key,
@@ -147,6 +149,9 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             item["requested_output_corroborator"] = True
         if criterion.mint_degrade is not None:
             item["mint_degrade"] = criterion.mint_degrade
+        if criterion.judgment_truth_condition is not None:
+            item["judgment_predicate"] = criterion.judgment_truth_condition.predicate
+            item["judgment_polarity_when_holds"] = criterion.judgment_truth_condition.polarity_when_holds
         items.append(item)
     return items
 
@@ -222,6 +227,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 mint_degrade="turn_unsatisfiable_fallback"
                 if item.get("mint_degrade") == "turn_unsatisfiable_fallback"
                 else None,
+                judgment_truth_condition=_coerce_judgment_truth_condition(
+                    item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
+                ),
             )
         )
     return tuple(criteria)
@@ -230,7 +238,10 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
 def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
-    deliverable_kind_key = f"{criterion.deliverable_kind or ''}\x1fmint_degrade:{criterion.mint_degrade or ''}"
+    deliverable_kind_key = (
+        f"{criterion.deliverable_kind or ''}\x1fmint_degrade:{criterion.mint_degrade or ''}"
+        f"\x1fjudgment:{judgment_truth_condition_key(criterion.judgment_truth_condition)}"
+    )
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
     expected_output_shape_key = criterion.expected_output_shape or ""
     requested_output_evidence_source_key = criterion.requested_output_evidence_source

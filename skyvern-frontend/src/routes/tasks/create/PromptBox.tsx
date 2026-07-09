@@ -45,6 +45,7 @@ import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { cn } from "@/util/utils";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { rememberDiscoverCopilotPrompt } from "@/routes/workflows/discoverCopilotHandoff";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
 const exampleCases = [
@@ -280,6 +281,11 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     onSuccess: ({ data: workflow, prompt }) => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
+      // Only the studio handoff writes the recovery key. The legacy /build path
+      // can mount Workspace, but it never consumes this stored discover seed.
+      if (studioEnabled) {
+        rememberDiscoverCopilotPrompt(workflow.workflow_permanent_id, prompt);
+      }
       // `?via=discover` is what makes WorkflowEditor fire
       // `copilot.discover.started` with entry_point=discover on mount.
       navigate(

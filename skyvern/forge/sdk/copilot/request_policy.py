@@ -78,8 +78,13 @@ ClarificationReason = Literal[
 ]
 RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
+# Gates guardrails.py's deferred-draft tool authority — narrower than the prompt set below.
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
+)
+# Broader: any reason credential_prompt_reason() should surface an add-credential CTA for.
+CREDENTIAL_PROMPT_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"raw_secret", "credential_name_unresolved", "credential_invention_requested", "workflow_credential_inputs_unbound"}
 )
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "credential_invention_requested",
@@ -97,6 +102,9 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
+# Matches any final reply containing these substrings, not just credential-blocking
+# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
+_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 _RAW_SECRET_QUESTION = (
@@ -195,6 +203,8 @@ RequestedOutputEvidenceSource = Literal[
     "registered_output_parameter",
     "registered_artifact_content",
 ]
+JudgmentPredicate = Literal["login_gate_blocks_target"]
+_JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
@@ -222,8 +232,11 @@ _OUTPUT_NEGATED_INTENT_PREFIX_RE = re.compile(
 )
 _OUTPUT_EXPLICIT_FIELD_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OUTPUT_NAMED_FIELD_RE = re.compile(
-    r"\b(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+"
-    r"(?:named|called)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+    r"\b(?:"
+    r"(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+(?:named|called)"
+    r"|(?:requested[-\s]+)?output\s+(?:named|called)"
+    r"|named\s+(?:requested[-\s]+)?output"
+    r")\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
     re.I,
 )
 _OUTPUT_ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,10}\b")
@@ -244,6 +257,15 @@ _OUTPUT_INPUT_ONLY_WORDS = frozenset({"input", "inputs", "parameter", "parameter
 _OUTPUT_OUTCOME_WORDS = frozenset(
     "capture captured extract extracted final include included includes output read record result return returned".split()
 )
+
+
+@dataclass(frozen=True)
+class JudgmentTruthCondition:
+    """Per-polarity page-evidence predicate a judgment boolean is decidable by. ``polarity_when_holds``
+    is the emitted boolean value that corresponds to the predicate holding on the independent packet."""
+
+    predicate: JudgmentPredicate
+    polarity_when_holds: bool
 
 
 @dataclass(frozen=True)
@@ -268,6 +290,7 @@ class CompletionCriterion:
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
     mint_degrade: Literal["turn_unsatisfiable_fallback"] | None = None
+    judgment_truth_condition: JudgmentTruthCondition | None = None
 
 
 @dataclass
@@ -280,6 +303,10 @@ class RequestPolicy:
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
     allow_missing_credentials_in_draft: bool = False
+    # Narrower than the flag above: True only when a credential-specific path (an explicit
+    # code-block credential draft, or a redacted raw secret) set it, not the generic
+    # skip_test fallthrough that fires for any untested draft regardless of credentials.
+    credential_draft_deferred_explicitly: bool = False
     user_response_policy: str = "proceed"
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
@@ -313,6 +340,7 @@ class RequestPolicy:
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
+            "credential_draft_deferred_explicitly": self.credential_draft_deferred_explicitly,
             "resolved_credential_count": len(self.resolved_credentials),
             "has_completion_contract": bool(self.completion_contract),
             "completion_criteria_count": len(self.graded_completion_criteria()),
@@ -405,6 +433,21 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
 
 
+def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
+    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
+    # allow_missing_credentials_in_draft alone also covers the generic skip_test
+    # fallthrough with no credential involvement — then a text marker.
+    if isinstance(policy, RequestPolicy):
+        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+            return policy.clarification_reason
+        if policy.credential_draft_deferred_explicitly:
+            return "credential_deferred_draft"
+    normalized = " ".join((final_text or "").lower().split())
+    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
+        return "assistant_directed"
+    return None
+
+
 def _is_judgment_boolean_criterion(criterion: CompletionCriterion) -> bool:
     return (
         isinstance(criterion.expected_output_value, bool) or criterion.expected_output_shape == "goal_judgment_boolean"
@@ -417,6 +460,12 @@ def typed_expected_output_value_key(value: ExpectedOutputValue | None) -> str:
     if isinstance(value, str):
         return f"str:{value}"
     return ""
+
+
+def judgment_truth_condition_key(condition: JudgmentTruthCondition | None) -> str:
+    if condition is None:
+        return ""
+    return f"{condition.predicate}:{'t' if condition.polarity_when_holds else 'f'}"
 
 
 def _criterion_grounding_mode(
@@ -656,6 +705,14 @@ def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
     return None
 
 
+def _coerce_judgment_truth_condition(predicate: Any, polarity: Any) -> JudgmentTruthCondition | None:
+    if not isinstance(predicate, str) or predicate not in _JUDGMENT_PREDICATES:
+        return None
+    if not isinstance(polarity, bool):
+        return None
+    return JudgmentTruthCondition(predicate=cast(JudgmentPredicate, predicate), polarity_when_holds=polarity)
+
+
 def _coerce_requested_output_evidence_source(value: Any) -> RequestedOutputEvidenceSource:
     if isinstance(value, str) and value in _REQUESTED_OUTPUT_EVIDENCE_SOURCES:
         return cast(RequestedOutputEvidenceSource, value)
@@ -777,6 +834,9 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             coerced_judgment_bool = _canonical_bool_string(expected_output_value)
             if coerced_judgment_bool is not None:
                 expected_output_value = coerced_judgment_bool
+        judgment_truth_condition = _coerce_judgment_truth_condition(
+            item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
+        )
         contingent_on_raw = item.get("contingent_on")
         contingent_on = (
             " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
@@ -816,6 +876,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             typed_expected_output_value_key(expected_output_value),
             expected_output_shape or "",
             requested_output_evidence_source,
+            judgment_truth_condition_key(judgment_truth_condition),
         )
         if key in seen:
             continue
@@ -841,8 +902,17 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
+                judgment_truth_condition=judgment_truth_condition,
             )
         )
+        if judgment_truth_condition is not None:
+            LOG.info(
+                "copilot_judgment_truth_condition_minted",
+                mint_source="classifier",
+                predicate=judgment_truth_condition.predicate,
+                polarity_when_holds=judgment_truth_condition.polarity_when_holds,
+                criterion_id=criteria[-1].id,
+            )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
             break
     return criteria
@@ -1180,6 +1250,23 @@ def _requested_output_evidence_sources_from_criteria(
     return sources
 
 
+def _requested_output_judgment_conditions_from_criteria(
+    criteria: list[CompletionCriterion],
+    requested_specs: list[tuple[str, str, str]],
+) -> dict[str, JudgmentTruthCondition]:
+    conditions: dict[str, JudgmentTruthCondition] = {}
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated or criterion.judgment_truth_condition is None:
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path != output_path and not _criterion_text_covers_requested_output(
+                criterion, field_name
+            ):
+                continue
+            conditions.setdefault(output_path, criterion.judgment_truth_condition)
+    return conditions
+
+
 def _requested_output_criterion_id(output_path: str) -> str:
     slug = "_".join(_word_tokens(output_path)) or "field"
     return f"{_REQUESTED_OUTPUT_CRITERION_ID_PREFIX}{slug}"
@@ -1401,6 +1488,9 @@ def _apply_requested_output_completion_criteria(
     source_by_output_path = _requested_output_evidence_sources_from_criteria(
         policy.completion_criteria, requested_specs
     )
+    judgment_condition_by_output_path = _requested_output_judgment_conditions_from_criteria(
+        policy.completion_criteria, requested_specs
+    )
 
     metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
     for criterion in policy.completion_criteria:
@@ -1449,6 +1539,7 @@ def _apply_requested_output_completion_criteria(
             contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
             contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
             deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+            judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
         )
         for _field_name, output_path, field_label in requested_specs
     ]
@@ -1543,6 +1634,9 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["expected_output_shape"] = criterion.expected_output_shape
         if criterion.requested_output_evidence_source != "runtime_output":
             item["requested_output_evidence_source"] = criterion.requested_output_evidence_source
+        if criterion.judgment_truth_condition is not None:
+            item["judgment_predicate"] = criterion.judgment_truth_condition.predicate
+            item["judgment_polarity_when_holds"] = criterion.judgment_truth_condition.polarity_when_holds
         if criterion.classification_output_key:
             item["classification_output_key"] = criterion.classification_output_key
         if criterion.expected_classification is not None:
@@ -1793,6 +1887,7 @@ def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, us
     policy.allow_update_workflow = True
     policy.allow_run_blocks = False
     policy.allow_missing_credentials_in_draft = True
+    policy.credential_draft_deferred_explicitly = True
     policy.requires_user_clarification = False
     policy.user_response_policy = "proceed"
     policy.clarification_reason = "none"
@@ -2485,6 +2580,7 @@ async def build_request_policy(
         policy.allow_update_workflow = True
         policy.allow_run_blocks = False
         policy.allow_missing_credentials_in_draft = True
+        policy.credential_draft_deferred_explicitly = True
         policy.clarification_reason = "none"
         policy.clarification_question = None
 

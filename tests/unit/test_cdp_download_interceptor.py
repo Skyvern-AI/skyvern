@@ -1,7 +1,7 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -126,8 +126,64 @@ class TestIsDownloadResponse:
                 {"content-disposition": "attachment", "content-type": "text/csv"},
                 200,
                 "XHR",
+                True,
+                id="xhr_attachment_csv_is_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/csv"},
+                200,
+                "XHR",
+                True,
+                id="xhr_attachment_application_csv_is_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "46681129"},
+                200,
+                "XHR",
+                True,
+                id="xhr_generic_binary_with_bytes_is_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*"},
+                200,
+                "XHR",
                 False,
-                id="xhr_attachment_csv_not_download",
+                id="xhr_generic_binary_no_length_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "6"},
+                200,
+                "XHR",
+                False,
+                id="xhr_generic_binary_small_body_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*"},
+                200,
+                "",
+                False,
+                id="non_xhr_generic_binary_no_length_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*"},
+                200,
+                "Document",
+                False,
+                id="non_xhr_generic_binary_document_no_length_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "9999999"},
+                200,
+                "Other",
+                False,
+                id="non_xhr_generic_binary_other_large_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "2048"},
+                200,
+                "Fetch",
+                True,
+                id="fetch_generic_binary_with_bytes_is_download",
             ),
             pytest.param(
                 {"content-type": "application/pdf"},
@@ -649,3 +705,120 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
+
+
+class TestBlobDownloadCapture:
+    """Browser-initiated blob: URL downloads (e.g. a page that builds the file client-side and
+    triggers a blob download) must be read back via SkyvernFrame and saved, not dropped."""
+
+    _READ_BLOB = "skyvern.webeye.cdp_download_interceptor.SkyvernFrame.read_blob_url_bytes"
+
+    @staticmethod
+    def _context(num_pages: int = 1) -> MagicMock:
+        context = MagicMock()
+        context.pages = [MagicMock() for _ in range(num_pages)]
+        return context
+
+    @pytest.mark.asyncio
+    async def test_blob_download_read_and_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        pdf_bytes = b"%PDF-1.4 fake blob invoice bytes"
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/abc-123", "suggestedFilename": "invoice.pdf"}
+            )
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == "invoice.pdf"
+        assert saved[0].read_bytes() == pdf_bytes
+
+    @pytest.mark.asyncio
+    async def test_blob_download_falls_through_pages_until_readable(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(num_pages=2)
+        pdf_bytes = b"%PDF blob"
+        read = AsyncMock(side_effect=[None, pdf_bytes])
+
+        with patch(self._READ_BLOB, new=read):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/xyz", "suggestedFilename": "bill.pdf"}
+            )
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == pdf_bytes
+        assert read.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_blob_download_threads_max_size_and_guards_oversize(self, tmp_path: Path) -> None:
+        import skyvern.webeye.cdp_download_interceptor as mod
+
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        read = AsyncMock(return_value=b"x" * 2048)  # exceeds the patched limit (defense-in-depth)
+
+        with patch.object(mod, "MAX_FILE_SIZE_BYTES", 1024), patch(self._READ_BLOB, new=read):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/big", "suggestedFilename": "huge.pdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        # the in-page size limit is threaded to the shared reader, and probe mode quiets the
+        # per-page fallback so non-owning pages don't spam ERROR logs
+        assert read.await_args.kwargs["max_size_bytes"] == 1024
+        assert read.await_args.kwargs["probe"] is True
+
+    @pytest.mark.asyncio
+    async def test_blob_download_unreadable_is_noop(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=None)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/gone", "suggestedFilename": "x.pdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blob_download_saves_distinct_file_with_identical_bytes(self, tmp_path: Path) -> None:
+        # Two independent downloads can share bytes but differ by name — the second must not be
+        # dropped just because matching bytes already exist on disk.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        pdf_bytes = b"%PDF identical bytes, different download"
+        (tmp_path / "prior.pdf").write_bytes(pdf_bytes)
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/second", "suggestedFilename": "invoice.pdf"}
+            )
+
+        names = sorted(p.name for p in tmp_path.iterdir())
+        assert names == ["invoice.pdf", "prior.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_blob_download_no_context_is_noop(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        with patch(self._READ_BLOB, new=AsyncMock()) as read:
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/none", "suggestedFilename": "x.pdf"}
+            )
+        read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blob_download_already_captured_via_fetch_is_skipped(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        url = "blob:https://example.com/dup"
+        interceptor._downloaded_urls.add(url)
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock()) as read:
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "x.pdf"})
+
+        read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []

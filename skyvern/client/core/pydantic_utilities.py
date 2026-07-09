@@ -209,6 +209,7 @@ def update_forward_refs(model: Type["Model"], **localns: Any) -> None:
         try:
             model.model_rebuild(raise_errors=False)  # type: ignore[attr-defined]
         except KeyError as exc:
+            # Manual patch (reapplied by scripts/patch_generated_client.py):
             # Pydantic v2 can still raise internal schema-gathering KeyErrors
             # for Fern-generated recursive unions even with raise_errors=False.
             # Match on the "definitions" key rather than the exact args tuple so a

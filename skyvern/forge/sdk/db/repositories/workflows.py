@@ -102,6 +102,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
@@ -137,6 +138,7 @@ class WorkflowsRepository(BaseRepository):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
+                pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
                 model=model,
@@ -670,6 +672,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -720,6 +723,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if pin_saved_session_ip is not None:
+                    workflow.pin_saved_session_ip = pin_saved_session_ip
                 if browser_profile_id is not _UNSET:
                     workflow.browser_profile_id = cast(str | None, browser_profile_id)
                 if browser_profile_key is not _UNSET:
@@ -986,6 +991,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -1072,6 +1078,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if pin_saved_session_ip is not None:
+                workflow.pin_saved_session_ip = pin_saved_session_ip
             if browser_profile_id is not _UNSET:
                 workflow.browser_profile_id = cast(str | None, browser_profile_id)
             if browser_profile_key is not _UNSET:

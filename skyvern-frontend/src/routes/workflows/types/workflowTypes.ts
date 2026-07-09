@@ -666,6 +666,7 @@ export type WorkflowApiResponse = {
   extra_http_headers: Record<string, string> | null;
   cdp_connect_headers: Record<string, string> | null;
   persist_browser_session: boolean;
+  pin_saved_session_ip: boolean;
   browser_profile_id?: string | null;
   browser_profile_key?: string | null;
   model: WorkflowModel | null;
@@ -696,6 +697,7 @@ export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
+  pinSavedSessionIp: boolean;
   browserProfileId: string | null;
   browserProfileKey: string | null;
   model: WorkflowModel | null;

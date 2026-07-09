@@ -14,7 +14,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.runs import ScriptRunResponse
 
 
-def _fake_block_model(script_run_value: dict | None) -> MagicMock:
+def _fake_block_model(script_run_value: dict | None, prompt_value: str | None = None) -> MagicMock:
     """Build a `WorkflowRunBlockModel` stub that only carries the attrs
     `convert_to_workflow_run_block` touches. Avoids standing up a DB or
     constructing the SQLAlchemy model (which requires a session)."""
@@ -52,6 +52,8 @@ def _fake_block_model(script_run_value: dict | None) -> MagicMock:
     model.executed_branch_result = None
     model.executed_branch_next_block = None
     model.script_run = script_run_value
+    model.prompt = prompt_value
+    model.downloaded_file_count = None
     return model
 
 
@@ -122,3 +124,19 @@ def test_converter_preserves_unknown_future_script_run_keys() -> None:
     block = convert_to_workflow_run_block(model)
     assert block.script_run is not None
     assert block.script_run.ai_fallback_triggered is False
+
+
+def test_converter_passes_prompt_when_set() -> None:
+    """`prompt` is written by TextPromptBlock/ForLoopBlock (observer.py's
+    `update_workflow_run_block`); the converter must round-trip it."""
+    model = _fake_block_model(script_run_value=None, prompt_value="Summarize the page")
+    block = convert_to_workflow_run_block(model)
+    assert block.prompt == "Summarize the page"
+
+
+def test_converter_propagates_null_prompt() -> None:
+    """Block types that never write `prompt` (e.g. FileDownloadBlock) keep
+    the column NULL — the converter must not invent a value."""
+    model = _fake_block_model(script_run_value=None, prompt_value=None)
+    block = convert_to_workflow_run_block(model)
+    assert block.prompt is None
