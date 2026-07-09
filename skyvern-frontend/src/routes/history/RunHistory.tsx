@@ -97,6 +97,9 @@ function parseStatusParam(raw: string | null): Array<Status> {
 
 // Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
 function inferTriggerType(run: TaskRunListItem): TriggerType | null {
+  if (run.trigger_type) {
+    return run.trigger_type;
+  }
   if (
     run.task_run_type === TaskRunType.WorkflowRun &&
     run.run_id.startsWith("wr_sched_")

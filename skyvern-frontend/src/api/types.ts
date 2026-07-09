@@ -31,6 +31,7 @@ export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
 
 export const TriggerType = {
   Manual: "manual",
+  Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
 } as const;
@@ -695,6 +696,7 @@ export type TaskRunListItem = {
   workflow_permanent_id: string | null;
   workflow_deleted: boolean;
   script_run: boolean;
+  trigger_type?: TriggerType | null;
   searchable_text: string | null;
 };
 
