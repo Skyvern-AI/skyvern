@@ -13,7 +13,13 @@ import structlog
 from pydantic import BaseModel, Field
 
 from ._common import ErrorCode, Timer, make_error, make_result
-from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
+from ._session import (
+    BrowserNotAvailableError,
+    clear_session_ref_map,
+    get_current_session,
+    get_page,
+    no_browser_error,
+)
 
 LOG = structlog.get_logger(__name__)
 
@@ -143,6 +149,7 @@ async def skyvern_tab_new(
             state._active_page = new_page
             # New tab has no iframes yet — clear stale frame reference
             state._working_frame = None
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
             # Drain the event that _on_new_page() buffered for this explicitly
             # created page, so tab_wait_for_new doesn't return it as a popup.
             state._page_events = deque(
@@ -241,6 +248,7 @@ async def skyvern_tab_switch(
     state._active_page = target
     # Switching tabs invalidates any iframe frame reference from the old tab
     state._working_frame = None
+    clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     # bring_to_front is a no-op in headless but helps in headed mode
     try:
@@ -325,6 +333,7 @@ async def skyvern_tab_close(
         state._active_page = None
         # Closed tab's frame reference is no longer valid
         state._working_frame = None
+        clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     # Clean up inspection hooks for the closed page
     state._hooked_page_ids.discard(target_id)
