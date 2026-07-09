@@ -34,6 +34,7 @@ export interface LoginBlock {
     include_action_history_in_verification?: boolean;
     download_timeout?: number;
     include_extracted_text?: boolean;
+    skip_saved_profile?: boolean;
 }
 
 export namespace LoginBlock {

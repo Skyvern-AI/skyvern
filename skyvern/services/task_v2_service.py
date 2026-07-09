@@ -749,8 +749,10 @@ async def run_task_v2_helper(
 
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
+        url=str(task_v2.url) if task_v2.url else None,
         browser_session_id=browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        navigate=False,
     )
 
     page = await browser_state.get_working_page()
@@ -1370,7 +1372,8 @@ async def handle_block_result(
         )
 
     elif block_result.status == BlockStatus.failed:
-        LOG.error(
+        # Run-level outcome, surfaced via the run's failure handling below; not a platform fault.
+        LOG.warning(
             f"Block with type {block.block_type} failed for workflow run {workflow_run_id}",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,

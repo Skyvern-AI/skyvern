@@ -17,60 +17,62 @@ import {
 } from "./tagTypes";
 
 describe("parseTagInput", () => {
-  it("parses a bare label as a standalone tag", () => {
-    expect(parseTagInput("production")).toEqual({
-      key: null,
-      value: "production",
-    });
-  });
-
-  it("splits group:label on the first colon, keeping later colons in the value", () => {
-    expect(parseTagInput("env:prod")).toEqual({ key: "env", value: "prod" });
-    expect(parseTagInput("url:http://x:8000")).toEqual({
-      key: "url",
-      value: "http://x:8000",
-    });
-  });
-
-  it("trims surrounding whitespace", () => {
-    expect(parseTagInput("  env : prod  ")).toEqual({
-      key: "env",
-      value: "prod",
-    });
+  it.each([
+    [
+      "parses a bare label as a standalone tag",
+      [["production", { key: null, value: "production" }]],
+    ],
+    [
+      "splits group:label on the first colon, keeping later colons in the value",
+      [
+        ["env:prod", { key: "env", value: "prod" }],
+        ["url:http://x:8000", { key: "url", value: "http://x:8000" }],
+      ],
+    ],
+    [
+      "trims surrounding whitespace",
+      [["  env : prod  ", { key: "env", value: "prod" }]],
+    ],
+  ] as const)("%s", (_, cases) => {
+    for (const [raw, expected] of cases) {
+      expect(parseTagInput(raw)).toEqual(expected);
+    }
   });
 
   it("returns null for empty or partial input", () => {
-    expect(parseTagInput("")).toBeNull();
-    expect(parseTagInput("   ")).toBeNull();
-    expect(parseTagInput("env:")).toBeNull();
-    expect(parseTagInput(":prod")).toBeNull();
+    for (const raw of ["", "   ", "env:", ":prod"]) {
+      expect(parseTagInput(raw)).toBeNull();
+    }
   });
 });
 
 describe("parseTagFilterTerm", () => {
   it("parses the three term shapes", () => {
-    expect(parseTagFilterTerm("prod")).toEqual({ key: null, value: "prod" });
-    expect(parseTagFilterTerm("env:*")).toEqual({ key: "env", value: null });
-    expect(parseTagFilterTerm("env:prod")).toEqual({
-      key: "env",
-      value: "prod",
-    });
+    for (const [raw, expected] of [
+      ["prod", { key: null, value: "prod" }],
+      ["env:*", { key: "env", value: null }],
+      ["env:prod", { key: "env", value: "prod" }],
+    ] as const) {
+      expect(parseTagFilterTerm(raw)).toEqual(expected);
+    }
   });
 
   it("returns null for malformed terms", () => {
-    expect(parseTagFilterTerm("")).toBeNull();
-    expect(parseTagFilterTerm(":prod")).toBeNull();
-    expect(parseTagFilterTerm("env:")).toBeNull();
+    for (const raw of ["", ":prod", "env:"]) {
+      expect(parseTagFilterTerm(raw)).toBeNull();
+    }
   });
 });
 
 describe("serializeTagFilterTerm", () => {
   it("serializes each shape", () => {
-    expect(serializeTagFilterTerm({ key: null, value: "prod" })).toBe("prod");
-    expect(serializeTagFilterTerm({ key: "env", value: null })).toBe("env:*");
-    expect(serializeTagFilterTerm({ key: "env", value: "prod" })).toBe(
-      "env:prod",
-    );
+    for (const [term, expected] of [
+      [{ key: null, value: "prod" }, "prod"],
+      [{ key: "env", value: null }, "env:*"],
+      [{ key: "env", value: "prod" }, "env:prod"],
+    ] as const) {
+      expect(serializeTagFilterTerm(term)).toBe(expected);
+    }
   });
 });
 
@@ -122,8 +124,9 @@ describe("parseTagFilter", () => {
   });
 
   it("returns [] for empty input", () => {
-    expect(parseTagFilter(null)).toEqual([]);
-    expect(parseTagFilter("")).toEqual([]);
+    for (const raw of [null, ""]) {
+      expect(parseTagFilter(raw)).toEqual([]);
+    }
   });
 });
 
@@ -201,32 +204,40 @@ describe("tagElementKey", () => {
 });
 
 describe("parseTypedTagQuery", () => {
-  it("returns a null key for a bare query", () => {
-    expect(parseTypedTagQuery("prod")).toEqual({
-      typedKey: null,
-      typedValuePartial: "",
-    });
-  });
-
-  it("splits group:partial and lowercases the value fragment", () => {
-    expect(parseTypedTagQuery("env:PR")).toEqual({
-      typedKey: "env",
-      typedValuePartial: "pr",
-    });
-  });
-
-  it("treats a leading colon as no group", () => {
-    expect(parseTypedTagQuery(":prod")).toEqual({
-      typedKey: null,
-      typedValuePartial: "",
-    });
+  it.each([
+    [
+      "returns a null key for a bare query",
+      "prod",
+      { typedKey: null, typedValuePartial: "" },
+    ],
+    [
+      "splits group:partial and lowercases the value fragment",
+      "env:PR",
+      { typedKey: "env", typedValuePartial: "pr" },
+    ],
+    [
+      "treats a leading colon as no group",
+      ":prod",
+      { typedKey: null, typedValuePartial: "" },
+    ],
+  ] as const)("%s", (_, raw, expected) => {
+    expect(parseTypedTagQuery(raw)).toEqual(expected);
   });
 });
 
 describe("tag validation", () => {
   it("rejects a colon in a standalone label but allows it in a grouped value", () => {
-    expect(validateTagValue("a:b", { hasKey: false })).not.toBeNull();
-    expect(validateTagValue("a:b", { hasKey: true })).toBeNull();
+    for (const [hasKey, expected] of [
+      [false, "invalid"],
+      [true, "valid"],
+    ] as const) {
+      const result = validateTagValue("a:b", { hasKey });
+      if (expected === "valid") {
+        expect(result).toBeNull();
+      } else {
+        expect(result).not.toBeNull();
+      }
+    }
   });
 
   it("rejects a grouped value of exactly the wildcard", () => {
@@ -234,8 +245,9 @@ describe("tag validation", () => {
   });
 
   it("rejects an empty key and the reserved prefix", () => {
-    expect(validateTagKey("")).not.toBeNull();
-    expect(validateTagKey("skyvern.foo")).not.toBeNull();
+    for (const key of ["", "skyvern.foo"]) {
+      expect(validateTagKey(key)).not.toBeNull();
+    }
     expect(validateTagKey("env")).toBeNull();
   });
 });

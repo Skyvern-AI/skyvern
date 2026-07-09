@@ -5,6 +5,7 @@ import typing
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .create_credential_request_credential import CreateCredentialRequestCredential
+from .create_credential_request_proxy_location import CreateCredentialRequestProxyLocation
 from .credential_vault_type import CredentialVaultType
 from .skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 
@@ -32,6 +33,21 @@ class CreateCredentialRequest(UniversalBaseModel):
     vault_type: typing.Optional[CredentialVaultType] = pydantic.Field(default=None)
     """
     Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
+    """
+
+    proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = pydantic.Field(default=None)
+    """
+    Optional proxy location for this credential's pinned proxy identity.
+    """
+
+    proxy_session_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional advanced reuse key for this credential's pinned proxy identity.
+    """
+
+    rotate_proxy_session_id: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
     """
 
     if IS_PYDANTIC_V2:

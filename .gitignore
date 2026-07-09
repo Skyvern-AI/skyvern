@@ -190,6 +190,7 @@ tags.temp.tmp
 
 # copy of Chrome user profile from Chrome >= 136
 tmp/user_data_dir
+tmp/
 
 # Claude
 .claude/*

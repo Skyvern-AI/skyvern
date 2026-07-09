@@ -29,5 +29,7 @@ export interface GetWorkflowsRequest {
     /** Filter workflows by folder ID */
     folder_id?: string;
     status?: Skyvern.WorkflowStatus | Skyvern.WorkflowStatus[];
+    /** Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`. */
+    tags?: string | string[];
     template?: boolean;
 }

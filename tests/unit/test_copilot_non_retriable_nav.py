@@ -38,6 +38,9 @@ _DNS_FAILURE_REASON = (
     "Failed to navigate to url https://www.example.invalid/path. Error message: net::ERR_NAME_NOT_RESOLVED"
 )
 _CERT_FAILURE_REASON = "Failed to navigate to url https://expired.example. Error message: net::ERR_CERT_DATE_INVALID"
+_TUNNEL_FAILURE_REASON = (
+    "Failed to navigate to url https://proxy.example. Error message: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
 _GENERIC_FAILURE_REASON = "Timeout waiting for element #submit"
 
 
@@ -67,6 +70,7 @@ def _fresh_context() -> CopilotContext:
         ),
         pytest.param("net::ERR_NAME_RESOLUTION_FAILED happened mid-flight", id="name_resolution_mid_string"),
         pytest.param("SSL error: net::ERR_SSL_PROTOCOL_ERROR", id="ssl_prefixed"),
+        pytest.param(_TUNNEL_FAILURE_REASON, id="tunnel_connection_failed"),
     ],
 )
 def test_detect_matches_error_in_block_failure_reason(reason: str) -> None:

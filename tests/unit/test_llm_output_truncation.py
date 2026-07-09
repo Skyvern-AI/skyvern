@@ -3,7 +3,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMOutputTruncatedError
-from skyvern.forge.sdk.api.llm.utils import is_truncated_response, parse_api_response
+from skyvern.forge.sdk.api.llm.utils import (
+    is_content_filtered_response,
+    is_truncated_response,
+    parse_api_response,
+)
 
 
 def _make_response(finish_reason: str, content: str | None, model: str = "gemini-3-flash-preview") -> MagicMock:
@@ -45,6 +49,29 @@ class TestIsTruncatedResponse:
         resp = MagicMock()
         resp.choices = []
         assert is_truncated_response(resp) is False
+
+
+class TestIsContentFilteredResponse:
+    def test_content_filter_finish_with_none_content(self) -> None:
+        resp = _make_response(finish_reason="content_filter", content=None)
+        assert is_content_filtered_response(resp) is True
+
+    def test_content_filter_finish_with_content(self) -> None:
+        resp = _make_response(finish_reason="content_filter", content='{"ok": true}')
+        assert is_content_filtered_response(resp) is False
+
+    def test_stop_finish_with_none_content(self) -> None:
+        resp = _make_response(finish_reason="stop", content=None)
+        assert is_content_filtered_response(resp) is False
+
+    def test_length_finish_with_none_content(self) -> None:
+        resp = _make_response(finish_reason="length", content=None)
+        assert is_content_filtered_response(resp) is False
+
+    def test_empty_choices(self) -> None:
+        resp = MagicMock()
+        resp.choices = []
+        assert is_content_filtered_response(resp) is False
 
 
 class TestParseApiResponseTruncation:

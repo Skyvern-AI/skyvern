@@ -188,6 +188,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -264,6 +265,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -336,6 +338,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -426,6 +429,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -522,6 +526,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -695,6 +700,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -785,6 +791,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -881,6 +888,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",

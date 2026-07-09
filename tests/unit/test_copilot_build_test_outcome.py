@@ -49,6 +49,28 @@ def test_structural_key_changes_when_page_or_result_structure_changes() -> None:
     assert first.structural_key != second.structural_key
 
 
+def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
+    outcome = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "requested_block_labels": ["open", "search", "extract"],
+                "blocks": [
+                    {"label": "search", "status": "failed", "failure_type": "runtime_error"},
+                ],
+                "overall_status": "failed",
+                "failure_type": "runtime_error",
+            },
+        },
+        block_shape_hashes={"open": "h1", "search": "h2", "extract": "h3"},
+    )
+
+    assert outcome is not None
+    assert outcome.requested_block_labels == ["open", "search", "extract"]
+    assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
+
+
 def test_structural_key_ignores_display_prose_and_workflow_run_id() -> None:
     first = RecordedBuildTestOutcome(
         phase="persisted_block_run",

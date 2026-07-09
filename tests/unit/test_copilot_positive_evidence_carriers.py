@@ -35,6 +35,7 @@ _FLOOR_ID = "__copilot_fallback_floor__run"
 class _GroundingCtx:
     def __init__(self) -> None:
         self.code_artifact_metadata: dict[str, object] = {}
+        self.workflow_verification_evidence: SimpleNamespace | None = None
         self.last_workflow_yaml: str | None = None
         self.workflow_yaml: str | None = None
 

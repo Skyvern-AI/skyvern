@@ -23,6 +23,10 @@ const { mockNavigate, mockPost, mockSetAutoplay } = vi.hoisted(() => ({
   mockSetAutoplay: vi.fn(),
 }));
 
+const { studioState } = vi.hoisted(() => ({
+  studioState: { enabled: false },
+}));
+
 vi.mock("@/api/AxiosClient", () => ({
   getClient: async () => ({
     post: mockPost,
@@ -31,6 +35,10 @@ vi.mock("@/api/AxiosClient", () => ({
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => undefined,
+}));
+
+vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
+  useWorkflowStudioEnabled: () => studioState.enabled,
 }));
 
 vi.mock("@/store/useAutoplayStore", () => ({
@@ -136,6 +144,8 @@ function renderPromptBox(enableCopilotHandoff = false) {
 
 afterEach(() => {
   cleanup();
+  sessionStorage.clear();
+  studioState.enabled = false;
   mockNavigate.mockReset();
   mockPost.mockReset();
   mockSetAutoplay.mockReset();
@@ -170,7 +180,7 @@ describe("PromptBox", () => {
     expect(body.request.url).toBe("https://google.com");
   });
 
-  test("hands Discover prompts to workflow copilot with agent execution", async () => {
+  test("hands Discover prompts to the legacy build path via route state only", async () => {
     mockPost.mockResolvedValue({
       data: {
         workflow_permanent_id: "wpid_copilot",
@@ -199,5 +209,39 @@ describe("PromptBox", () => {
         state: { copilotMessage: "Build this workflow" },
       },
     );
+    // The legacy /build (Debugger) surface never mounts the recovery hook, so
+    // no session-scoped copy is written — writing one would strand a dead entry.
+    expect(
+      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_copilot"),
+    ).toBeNull();
+  });
+
+  test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {
+    studioState.enabled = true;
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_studio",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(true);
+
+    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      target: { value: "Build this in studio" },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+
+    expect(mockNavigate).toHaveBeenCalledWith(
+      "/agents/wpid_studio/studio?via=discover",
+      {
+        state: { copilotMessage: "Build this in studio" },
+      },
+    );
+    expect(
+      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_studio"),
+    ).toBe("Build this in studio");
   });
 });

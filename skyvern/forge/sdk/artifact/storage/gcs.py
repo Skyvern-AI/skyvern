@@ -17,6 +17,7 @@ from skyvern.forge.sdk.api.files import (
     get_skyvern_temp_dir,
     make_temp_directory,
     unzip_files,
+    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.api.gcp import STORAGE_CLASS_STANDARD, GcsUri
 from skyvern.forge.sdk.api.real_gcp import RealAsyncGcsStorageClient
@@ -37,6 +38,7 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.utils.script_file_paths import build_script_file_storage_uri
 
 LOG = structlog.get_logger()
 
@@ -121,7 +123,12 @@ class GcsStorage(BaseStorage):
         self, *, organization_id: str, script_id: str, script_version: int, file_path: str
     ) -> str:
         """Build the GCS URI for a script file."""
-        return f"{self._build_base_uri(organization_id)}/scripts/{script_id}/{script_version}/{file_path}"
+        return build_script_file_storage_uri(
+            self._build_base_uri(organization_id),
+            script_id=script_id,
+            script_version=script_version,
+            file_path=file_path,
+        )
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         storage_class = await self._get_storage_class_for_org(artifact.organization_id)
@@ -546,6 +553,10 @@ class GcsStorage(BaseStorage):
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         for file in files:
+            fpath = os.path.join(download_dir, file)
+            if not os.path.isfile(fpath):
+                continue
+            file = await wait_for_pending_extension_rename(download_dir, file)
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue

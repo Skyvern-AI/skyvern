@@ -46,6 +46,7 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_run_tag_event_id,
     generate_script_block_id,
     generate_script_fallback_episode_id,
     generate_script_file_id,
@@ -417,6 +418,78 @@ class WorkflowTagEventModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class WorkflowRunTagEventModel(Base):
+    __tablename__ = "workflow_run_tag_events"
+    __table_args__ = (
+        Index("workflow_run_tag_events_org_wr_set_at_idx", "organization_id", "workflow_run_id", "set_at"),
+        Index(
+            "workflow_run_tag_events_org_key_value_active_idx",
+            "organization_id",
+            "key",
+            "value",
+            postgresql_include=["workflow_run_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index(
+            "workflow_run_tag_events_org_value_active_idx",
+            "organization_id",
+            "value",
+            postgresql_include=["workflow_run_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_run_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        Index(
+            "workflow_run_tag_events_active_grouped_unique",
+            "organization_id",
+            "workflow_run_id",
+            "key",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+        ),
+        Index(
+            "workflow_run_tag_events_active_label_unique",
+            "organization_id",
+            "workflow_run_id",
+            "value",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+        ),
+        CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_run_tag_events_event_type"),
+        CheckConstraint(
+            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import', 'system')",
+            name="ck_workflow_run_tag_events_source",
+        ),
+        CheckConstraint(
+            "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
+            name="ck_workflow_run_tag_events_caller_type",
+        ),
+        CheckConstraint("event_type != 'set' OR value IS NOT NULL", name="ck_workflow_run_tag_events_set_has_value"),
+    )
+
+    tag_event_id = Column(String, primary_key=True, default=generate_run_tag_event_id)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=True)
+    value = Column(String, nullable=True)
+    event_type = Column(String, nullable=False)
+    set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    set_by = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    caller_type = Column(String, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+    inherited_from_tag_event_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
 class TagKeyModel(Base):
     """Org-scoped registry of tag keys and their descriptions. Auto-registered
     on first use; partial UNIQUE on (org, key) WHERE deleted_at IS NULL races
@@ -514,6 +587,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    pin_saved_session_ip = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_id = Column(String, nullable=True)
     browser_profile_key = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
@@ -1243,8 +1317,8 @@ class BrowserProfileModel(Base):
             "organization_id",
             "name",
             unique=True,
-            postgresql_where=text("is_managed = false"),
-            sqlite_where=text("is_managed = false"),
+            postgresql_where=text("is_managed = false AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = false AND deleted_at IS NULL"),
         ),
         Index(
             "uq_browser_profiles_managed_segment",

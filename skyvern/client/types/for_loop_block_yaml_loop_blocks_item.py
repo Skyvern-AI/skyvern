@@ -8,6 +8,7 @@ import pydantic
 import typing_extensions
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
 from ..core.serialization import FieldMetadata
+from .ai_fallback_mode import AiFallbackMode
 from .branch_condition_yaml import BranchConditionYaml
 from .branch_criteria_yaml import BranchCriteriaYaml
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
@@ -308,6 +309,8 @@ class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     title: typing.Optional[str] = None
     engine: typing.Optional[RunEngine] = None
     navigation_goal: typing.Optional[str] = None
+    selector: typing.Optional[str] = None
+    ai_fallback: typing.Optional[AiFallbackMode] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     max_retries: typing.Optional[int] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
@@ -413,6 +416,7 @@ class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     complete_verification: typing.Optional[bool] = None
+    skip_saved_profile: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -751,23 +755,7 @@ ForLoopBlockYamlLoopBlocksItem = typing.Union[
     ForLoopBlockYamlLoopBlocksItem_GoogleSheetsRead,
     ForLoopBlockYamlLoopBlocksItem_GoogleSheetsWrite,
 ]
-# Manual patch: see for_loop_block.py header note.
-try:
-    from .while_loop_block_yaml_loop_blocks_item import WhileLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
-except ImportError:
-    pass
-else:
-    update_forward_refs(ForLoopBlockYamlLoopBlocksItem_ForLoop)
-    update_forward_refs(ForLoopBlockYamlLoopBlocksItem_WhileLoop)
-    from . import while_loop_block_yaml_loop_blocks_item as _wlylb
-    _wlylb.ForLoopBlockYamlLoopBlocksItem = ForLoopBlockYamlLoopBlocksItem  # type: ignore[attr-defined]
-    update_forward_refs(_wlylb.WhileLoopBlockYamlLoopBlocksItem_ForLoop)
-    update_forward_refs(_wlylb.WhileLoopBlockYamlLoopBlocksItem_WhileLoop)
-    from . import for_loop_block_yaml as _flby
-    _flby.ForLoopBlockYamlLoopBlocksItem = ForLoopBlockYamlLoopBlocksItem  # type: ignore[attr-defined]
-    _flby.WhileLoopBlockYamlLoopBlocksItem = WhileLoopBlockYamlLoopBlocksItem  # type: ignore[attr-defined]
-    update_forward_refs(_flby.ForLoopBlockYaml)
-    from . import while_loop_block_yaml as _wlby
-    _wlby.ForLoopBlockYamlLoopBlocksItem = ForLoopBlockYamlLoopBlocksItem  # type: ignore[attr-defined]
-    _wlby.WhileLoopBlockYamlLoopBlocksItem = WhileLoopBlockYamlLoopBlocksItem  # type: ignore[attr-defined]
-    update_forward_refs(_wlby.WhileLoopBlockYaml)
+from .while_loop_block_yaml_loop_blocks_item import WhileLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
+
+update_forward_refs(ForLoopBlockYamlLoopBlocksItem_ForLoop)
+update_forward_refs(ForLoopBlockYamlLoopBlocksItem_WhileLoop)

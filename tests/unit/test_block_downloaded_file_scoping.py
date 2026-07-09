@@ -27,6 +27,12 @@ def _make_file_info(url: str, filename: str, checksum: str | None = None) -> Fil
     return FileInfo(url=url, filename=filename, checksum=checksum)
 
 
+def test_downloaded_file_signature_strips_query_params():
+    file_info = _make_file_info("https://files/a.pdf?sig=x", "a.pdf", "abc")
+
+    assert to_downloaded_file_signature(file_info) == ("a.pdf", "abc", "https://files/a.pdf")
+
+
 def test_second_block_excludes_first_blocks_files():
     """
     Simulate two sequential task blocks that each download a file.

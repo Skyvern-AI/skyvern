@@ -14,6 +14,8 @@ from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
+from skyvern.forge.sdk.db.models import ActionModel
+from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -30,7 +32,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus, ClickAction, GotoUrlAction, InputTextAction
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
@@ -127,6 +129,13 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert [a.action_order for a in recorded] == [0, 1, 2]
     assert all(a.status == ActionStatus.completed for a in recorded)
     assert recorded[0].description == "page.goto https://example.com"
+    assert isinstance(recorded[0], GotoUrlAction)
+    assert recorded[0].url == "https://example.com"
+    assert isinstance(recorded[1], InputTextAction)
+    assert recorded[1].element_id == "#q"
+    assert recorded[1].text == ""
+    assert isinstance(recorded[2], ClickAction)
+    assert recorded[2].element_id == "#go"
 
 
 @pytest.mark.asyncio
@@ -651,17 +660,42 @@ async def test_goalless_code_block_skips_screenshots(monkeypatch: pytest.MonkeyP
 async def test_recorded_calls_persist_as_actions_on_the_step(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each recorded playwright call becomes a real Action row tied to the task/step."""
     page = FakePage()
-    context = FakeWorkflowRunContext()
+    context = FakeWorkflowRunContext(secrets={"pw": "secret-password"})
     mocks = _patch_execute_environment(monkeypatch, page, context)
 
-    block = _make_code_block("await page.goto('https://example.com')\nawait page.locator('#go').click()", goal="go")
+    block = _make_code_block(
+        "await page.goto('https://example.com')\n"
+        "await page.locator('#pw').fill('secret-password')\n"
+        "await page.locator('#go').click()",
+        goal="go",
+    )
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
     actions = _created_actions(mocks)
-    assert [a.action_type for a in actions] == [ActionType.GOTO_URL, ActionType.CLICK]
+    assert [a.action_type for a in actions] == [ActionType.GOTO_URL, ActionType.INPUT_TEXT, ActionType.CLICK]
     assert all(a.task_id == "tsk_code" and a.step_id == "stp_code" and a.step_order == 0 for a in actions)
-    assert [a.action_order for a in actions] == [0, 1]
+    assert [a.action_order for a in actions] == [0, 1, 2]
+    assert isinstance(actions[0], GotoUrlAction)
+    assert actions[0].url == "https://example.com"
+    assert isinstance(actions[1], InputTextAction)
+    assert actions[1].element_id == "#pw"
+    assert actions[1].text == ""
+    assert isinstance(actions[2], ClickAction)
+    assert actions[2].element_id == "#go"
+    dumped = json.dumps([a.model_dump(mode="json") for a in actions])
+    assert "secret-password" not in dumped
+    hydrated = [
+        hydrate_action(
+            ActionModel(
+                action_type=action.action_type,
+                status=action.status,
+                action_json=action.model_dump(mode="json"),
+            )
+        )
+        for action in actions
+    ]
+    assert [type(action) for action in hydrated] == [GotoUrlAction, InputTextAction, ClickAction]
 
 
 @pytest.mark.asyncio

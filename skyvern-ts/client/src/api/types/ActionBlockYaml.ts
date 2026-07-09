@@ -15,6 +15,8 @@ export interface ActionBlockYaml {
     title?: string;
     engine?: Skyvern.RunEngine;
     navigation_goal?: string;
+    selector?: string;
+    ai_fallback?: Skyvern.AiFallbackMode;
     error_code_mapping?: Record<string, string | undefined>;
     max_retries?: number;
     parameter_keys?: string[];

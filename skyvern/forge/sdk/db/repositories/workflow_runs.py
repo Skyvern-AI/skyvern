@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.models import (
+    PersistentBrowserSessionModel,
     TaskModel,
     TaskRunModel,
     WorkflowModel,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.db.utils import (
     truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -726,10 +728,12 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_permanent_id: str,
         organization_id: str | None = None,
         sequential_key: str | None = None,
+        include_browser_session_rows: bool = False,
     ) -> WorkflowRun | None:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
-            query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+            if not include_browser_session_rows:
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(status=WorkflowRunStatus.queued)
@@ -761,10 +765,12 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_permanent_id: str,
         organization_id: str | None = None,
         sequential_key: str | None = None,
+        include_browser_session_rows: bool = False,
     ) -> WorkflowRun | None:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
-            query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+            if not include_browser_session_rows:
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(status=WorkflowRunStatus.running)
@@ -792,11 +798,35 @@ class WorkflowRunsRepository(BaseRepository):
             if run is None:
                 return None
 
-            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
-            # > sequential_key > whole workflow. A debug-session run carries a browser_session_id
-            # but is excluded from the session lane (as at enqueue), so it serializes on its key.
-            query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
+            self_forced = False
             if run.browser_session_id and not run.debug_session_id:
+                try:
+                    persistent_browser_session = (
+                        await session.scalars(
+                            select(PersistentBrowserSessionModel).filter_by(
+                                persistent_browser_session_id=run.browser_session_id,
+                                organization_id=run.organization_id,
+                            )
+                        )
+                    ).first()
+                    self_forced = (
+                        persistent_browser_session is not None
+                        and persistent_browser_session.runnable_type == FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to fetch persistent browser session for runtime lane selection",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=run.browser_session_id,
+                        organization_id=run.organization_id,
+                        exc_info=True,
+                    )
+
+            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
+            # > sequential_key > whole workflow. Debug and forced-session runs carry a
+            # browser_session_id but are excluded from the session lane as they are at enqueue.
+            query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
+            if run.browser_session_id and not run.debug_session_id and not self_forced:
                 query = query.filter_by(browser_session_id=run.browser_session_id)
             elif run.browser_address:
                 query = query.filter_by(browser_address=run.browser_address)
@@ -804,11 +834,13 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter_by(
                     workflow_permanent_id=run.workflow_permanent_id,
                     sequential_key=run.sequential_key,
-                ).filter(WorkflowRunModel.browser_session_id.is_(None))
-            else:
-                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id).filter(
-                    WorkflowRunModel.browser_session_id.is_(None)
                 )
+                if not self_forced:
+                    query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+            else:
+                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id)
+                if not self_forced:
+                    query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
 
             # Sequential runs are stamped queued_at before Temporal submission; the fallback
             # only guards hand-created rows (e.g. tests) from comparing against None.

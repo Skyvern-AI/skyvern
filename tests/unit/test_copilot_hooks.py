@@ -1110,6 +1110,8 @@ class TestScoutedInteractionCapture:
             scout_trajectory=[],
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
+            prior_fill_carry=[],
+            fill_carry_rebound_done=False,
         )
         if policy is not None:
             ns.block_authoring_policy = policy
@@ -1331,7 +1333,13 @@ class TestScoutedInteractionCapture:
             {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
             ctx,
         )
-        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q", "typed_length": 8}]
+        assert ctx.scouted_interactions == [
+            {
+                "tool_name": "type_text",
+                "selector": "#q",
+                "typed_length": 8,
+            }
+        ]
         # the raw typed text is never captured (PII)
         assert all("text" not in item for item in ctx.scouted_interactions)
 
@@ -1367,7 +1375,11 @@ class TestScoutedInteractionCapture:
             ctx,
         )
         assert ctx.scouted_interactions == [
-            {"tool_name": "select_option", "selector": "#sort", "value": "price_asc"},
+            {
+                "tool_name": "select_option",
+                "selector": "#sort",
+                "value": "price_asc",
+            },
             {"tool_name": "press_key", "selector": "#q", "key": "Enter"},
         ]
 

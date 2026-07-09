@@ -75,6 +75,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
@@ -101,6 +102,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
     run_outcome_display_reason,
 )
+from skyvern.forge.sdk.copilot.runtime import AuthorTimeGateAblationPayload, record_author_time_gate_ablation_event
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
@@ -2265,6 +2267,30 @@ def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
     )
 
 
+def _has_unconsumed_output_contract_advisory_grant(ctx: Any) -> bool:
+    states = getattr(ctx, "output_contract_actuation_by_signature", None)
+    if not isinstance(states, dict):
+        return False
+    return any(state == OutputContractAdvisoryState.GRANTED for state in states.values())
+
+
+def _should_force_advisory_run_dispatch(ctx: Any) -> bool:
+    """Actuate a granted output-contract advisory run through the same tool_choice forcing lane as the
+    synthesized-persistence force, rather than leaving dispatch to the model. Fires only while a grant is
+    unconsumed, authority permits running blocks, and no genuinely-terminal blocker holds."""
+    if not _has_unconsumed_output_contract_advisory_grant(ctx):
+        return False
+    if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):
+        return False
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return False
+    if getattr(ctx, "turn_halt", None) is not None:
+        return False
+    return not blocker_signal_is_genuinely_terminal(getattr(ctx, "blocker_signal", None))
+
+
 def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
     if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
         return False
@@ -2399,6 +2425,19 @@ def uncovered_output_reject_scout_steer_signal(ctx: AgentContext, tool_name: str
         return None
     key = _uncovered_output_reject_rescout_key(active, latest.structural_failure_identity)
     if ctx.uncovered_output_rescout_steer_key == key:
+        return None
+    payload: AuthorTimeGateAblationPayload = {
+        "uncovered_output_paths": sorted(active),
+        "structural_failure_identity": latest.structural_failure_identity,
+    }
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id="uncovered_output_rescout_steer",
+        reason_code=UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
+        fingerprint=key,
+        blocked_tool=tool_name,
+        payload=payload,
+    ):
         return None
     ctx.uncovered_output_rescout_steer_key = key
     named_paths = ", ".join(sorted(active))
@@ -2572,9 +2611,11 @@ async def run_with_enforcement(
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
             force_synthesized_block_persistence = _should_force_synthesized_block_persistence(ctx)
+            force_advisory_run_dispatch = _should_force_advisory_run_dispatch(ctx)
+            force_run_dispatch = force_synthesized_block_persistence or force_advisory_run_dispatch
             current_runner_kwargs = (
                 _runner_kwargs_with_forced_tool_choice(runner_kwargs, SYNTHESIZED_BLOCK_PERSISTENCE_TOOL)
-                if force_synthesized_block_persistence
+                if force_run_dispatch
                 else runner_kwargs
             )
             effective_run_config = current_runner_kwargs.get("run_config")
@@ -2586,8 +2627,9 @@ async def run_with_enforcement(
             LOG.info(
                 "copilot synthesized persistence force decision",
                 force_synthesized_block_persistence=force_synthesized_block_persistence,
-                forced_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_synthesized_block_persistence else None),
-                chosen_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_synthesized_block_persistence else None),
+                force_advisory_run_dispatch=force_advisory_run_dispatch,
+                forced_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_run_dispatch else None),
+                chosen_tool_name=(SYNTHESIZED_BLOCK_PERSISTENCE_TOOL if force_run_dispatch else None),
                 turn_intent_mode=getattr(getattr(turn_intent, "mode", None), "value", None),
                 turn_intent_may_update_workflow=getattr(turn_intent_authority, "may_update_workflow", None),
                 turn_intent_may_run_blocks=getattr(turn_intent_authority, "may_run_blocks", None),

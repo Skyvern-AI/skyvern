@@ -999,8 +999,13 @@ function CredentialsModal({
       }
       setAuthenticatorSaveError(null);
 
-      // If test passed, rename the temp credential instead of creating a new one
-      if (testAndSave && testStatus === "completed" && testCredentialId) {
+      const hasCompletedInlineTest =
+        testAndSave && testStatus === "completed" && !!testCredentialId;
+
+      // Create mode: the temp credential created by the inline test already holds
+      // the entered secret and the saved browser profile, so rename it in place
+      // instead of creating a duplicate.
+      if (!isEditMode && hasCompletedInlineTest && testCredentialId) {
         const url = testUrl.trim();
         const ctx = userContext.trim();
         renameCredentialMutation.mutate({
@@ -1014,6 +1019,22 @@ function CredentialsModal({
         return;
       }
 
+      // Any remaining temp credential is an orphan we're not reusing — either
+      // we're in edit mode (the real credential gets updated below instead),
+      // or "Save browser session" got unchecked after a completed test. Key
+      // this on testCredentialId alone, not hasCompletedInlineTest: the
+      // checkbox is togglable post-test with no side effect on testStatus, so
+      // gating on testAndSave here silently leaked the temp credential (and
+      // the secret it holds) whenever the box was unchecked before saving.
+      if (testCredentialId) {
+        const tempCredentialId = testCredentialId;
+        getClient(credentialGetter)
+          .then((client) => client.delete(`/credentials/${tempCredentialId}`))
+          .catch(() => {
+            // Best-effort cleanup
+          });
+      }
+
       // Capture intent before mutation — state will be reset in onSuccess
       // In edit mode, only trigger a background test if the user actually changed
       // credentials, user_context, or URL — not just because the checkbox was pre-checked.
@@ -1025,7 +1046,8 @@ function CredentialsModal({
       saveIntentRef.current = {
         shouldTestAfterSave:
           testAndSave &&
-          testStatus !== "completed" &&
+          (testStatus !== "completed" ||
+            (isEditMode && hasCompletedInlineTest)) &&
           testUrl.trim() !== "" &&
           hasEditModeChanges,
         saveBrowserSessionIntent: testAndSave,
