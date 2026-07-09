@@ -1,44 +1,30 @@
 import { create } from "zustand";
 
-// Which tab takes over the hero center. "default" leaves the live stream /
-// recording / screenshot logic in charge; the rest are explicit center tabs.
-export type RunCenterView =
-  | "default"
-  | "screenshots"
-  | "code"
-  | "inputs"
-  | "outputs";
-
 type RunViewState = {
   // The frame the user is inspecting. null means "follow the live edge" while
-  // running, or the recording once finalized.
+  // running, or the final frame once finalized.
   pinnedFrameId: string | null;
-  centerView: RunCenterView;
-  // True when the run-tab header is too narrow for labels (set by RunHero); the
-  // toggles and externally-rendered dropdown triggers then collapse to icons.
-  headerCompact: boolean;
-  pinFrame: (id: string) => void;
+  // Bumped on every pinFrame so the Browser pane can react to a re-pin of the
+  // already-selected frame (the id alone wouldn't change).
+  pinNonce: number;
+  // Loop-iteration scope of a pinned container block. Not carried in ?active=,
+  // so the Browser pane reads it here to resolve the iteration's screenshot.
+  activeIteration: number | null;
+  pinFrame: (id: string, iteration?: number | null) => void;
   jumpToLive: () => void;
-  setCenterView: (view: RunCenterView) => void;
-  setHeaderCompact: (compact: boolean) => void;
   reset: () => void;
 };
 
 export const useRunViewStore = create<RunViewState>((set) => ({
   pinnedFrameId: null,
-  centerView: "default",
-  headerCompact: false,
-  // Inspecting a frame or jumping to live/recording always drops any override.
-  pinFrame: (id) => set({ pinnedFrameId: id, centerView: "default" }),
-  jumpToLive: () => set({ pinnedFrameId: null, centerView: "default" }),
-  setCenterView: (view) =>
+  pinNonce: 0,
+  activeIteration: null,
+  pinFrame: (id, iteration = null) =>
     set((state) => ({
-      centerView: view,
-      pinnedFrameId:
-        view === "screenshots" && state.pinnedFrameId === "stream"
-          ? null
-          : state.pinnedFrameId,
+      pinnedFrameId: id,
+      activeIteration: iteration,
+      pinNonce: state.pinNonce + 1,
     })),
-  setHeaderCompact: (compact) => set({ headerCompact: compact }),
-  reset: () => set({ pinnedFrameId: null, centerView: "default" }),
+  jumpToLive: () => set({ pinnedFrameId: null, activeIteration: null }),
+  reset: () => set({ pinnedFrameId: null, activeIteration: null }),
 }));

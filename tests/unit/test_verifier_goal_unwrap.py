@@ -134,16 +134,43 @@ def test_render_without_context_is_byte_identical_to_golden(prompt_engine: Promp
 @pytest.mark.parametrize("template_name", list(_TEMPLATE_KWARGS))
 def test_render_with_context_scopes_judgment_to_mini_goal(prompt_engine: PromptEngine, template_name: str) -> None:
     kwargs = {**_TEMPLATE_KWARGS[template_name], "navigation_goal": MINI_GOAL}
-    rendered = prompt_engine.load_prompt(template_name, big_goal_context=MAIN_GOAL, **kwargs)
+    rendered = prompt_engine.load_prompt(
+        template_name, big_goal_context=MAIN_GOAL, action_history_evidence=True, **kwargs
+    )
     assert MINI_GOAL in rendered
     assert MAIN_GOAL in rendered
     assert "The user goal above is one step of a larger objective" in rendered
     assert "Achieve the following mini goal" not in rendered
-    assert "Action History shows that action completed successfully" in rendered
+    # Compound heal goals: the evidence shortcut must demand every described action.
+    assert "every described action (including each 'Then:' step)" in rendered
+    assert "never after only the first of several actions" in rendered
     if template_name == "check-user-goal":
         assert "Do NOT require the larger objective to be complete" in rendered
     else:
         assert "NEVER a reason to continue or to terminate" in rendered
+
+
+@pytest.mark.parametrize("template_name", list(_TEMPLATE_KWARGS))
+def test_history_evidence_instruction_renders_without_context(prompt_engine: PromptEngine, template_name: str) -> None:
+    # Bare-prompt heals: history evidence must not depend on the goal being wrapped.
+    kwargs = {**_TEMPLATE_KWARGS[template_name], "navigation_goal": MINI_GOAL}
+    rendered = prompt_engine.load_prompt(template_name, action_history_evidence=True, **kwargs)
+    assert "every described action (including each 'Then:' step)" in rendered
+    assert "The user goal above is one step of a larger objective" not in rendered
+    without = prompt_engine.load_prompt(template_name, big_goal_context=MAIN_GOAL, **kwargs)
+    assert "every described action" not in without
+
+
+@pytest.mark.parametrize("template_name", list(_TEMPLATE_KWARGS))
+def test_history_evidence_stays_subordinate_to_complete_criterion(
+    prompt_engine: PromptEngine, template_name: str
+) -> None:
+    kwargs = {**_TEMPLATE_KWARGS[template_name], "navigation_goal": MINI_GOAL, "complete_criterion": CRITERION_MINI}
+    rendered = prompt_engine.load_prompt(template_name, action_history_evidence=True, **kwargs)
+    assert "The complete criterion still governs" in rendered
+    without_criterion = {**_TEMPLATE_KWARGS[template_name], "navigation_goal": MINI_GOAL}
+    rendered_no_criterion = prompt_engine.load_prompt(template_name, action_history_evidence=True, **without_criterion)
+    assert "The complete criterion still governs" not in rendered_no_criterion
 
 
 def test_render_with_context_and_complete_criterion_mentions_criterion(prompt_engine: PromptEngine) -> None:

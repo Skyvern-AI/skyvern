@@ -226,7 +226,8 @@ def test_fill_prompts_noop_without_sources():
     assert "prompt" not in out["workflow_definition"]["blocks"][0]
 
 
-def test_process_workflow_yaml_derives_code_block_steps_for_replace_path():
+@pytest.mark.asyncio
+async def test_process_workflow_yaml_derives_code_block_steps_for_replace_path():
     # Regression: the inline REPLACE_WORKFLOW path (v1 and v2) builds the
     # frontend-facing workflow via _process_workflow_yaml without first deriving
     # steps, so a generated code block surfaced as "No steps yet" in the plain
@@ -245,8 +246,9 @@ def test_process_workflow_yaml_derives_code_block_steps_for_replace_path():
         "      await page.goto('https://example.com/')\n"
         "      await page.get_by_role('link', name='login').click()\n"
     )
-    wf = _process_workflow_yaml(
+    wf = await _process_workflow_yaml(
         workflow_id="w_1",
+        settings_fallback_yaml="enable_self_healing: false",
         workflow_permanent_id="wpid_1",
         organization_id="o_1",
         workflow_yaml=yaml_str,

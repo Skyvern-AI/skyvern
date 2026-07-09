@@ -6,6 +6,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { Status } from "@/api/types";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const { workflowRunQueryMock } = vi.hoisted(() => ({
   workflowRunQueryMock: vi.fn(),
@@ -23,7 +24,12 @@ import { RunStopButton } from "./StudioTopBar";
 
 function LocationProbe() {
   const location = useLocation();
-  return <div data-testid="location">{location.pathname}</div>;
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
+  );
 }
 
 function renderAt(path: string) {
@@ -32,18 +38,20 @@ function renderAt(path: string) {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[path]}>
-        <Routes>
-          <Route
-            path="/workflows/:workflowPermanentId/studio"
-            element={<RunStopButton />}
-          />
-          <Route
-            path="/agents/:workflowPermanentId/run"
-            element={<LocationProbe />}
-          />
-        </Routes>
-      </MemoryRouter>
+      <TooltipProvider delayDuration={0}>
+        <MemoryRouter initialEntries={[path]}>
+          <Routes>
+            <Route
+              path="/workflows/:workflowPermanentId/studio"
+              element={<RunStopButton />}
+            />
+            <Route
+              path="/agents/:workflowPermanentId/run"
+              element={<LocationProbe />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }
@@ -75,6 +83,8 @@ describe("RunStopButton concurrency with a live block run", () => {
     expect(screen.queryByTestId("location")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
+    // The form carries nothing: the post-start navigation resets the layout
+    // to the run mapping (copilot, browser, overview).
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
     );
@@ -103,6 +113,17 @@ describe("RunStopButton concurrency with a live block run", () => {
     fireEvent.click(screen.getByRole("button", { name: /Run/ }));
 
     expect(screen.queryByText("Start a full run?")).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("an editor-open layout is NOT carried into the run form (full runs reset)", () => {
+    mockRun(Status.Completed);
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,copilot");
+
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
     );

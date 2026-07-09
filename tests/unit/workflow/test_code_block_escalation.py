@@ -51,7 +51,13 @@ def _make_code_block(steps: list[CodeBlockStep] | None = None, prompt: str | Non
     )
 
 
-def _make_context(*, with_secret: bool = False) -> WorkflowRunContext:
+def _make_context(
+    *,
+    with_secret: bool = False,
+    enable_self_healing: bool | None = None,
+    created_by: str | None = "copilot",
+    edited_by: str | None = None,
+) -> WorkflowRunContext:
     context = WorkflowRunContext(
         workflow_title="wf",
         workflow_id="w_test",
@@ -62,6 +68,15 @@ def _make_context(*, with_secret: bool = False) -> WorkflowRunContext:
     if with_secret:
         context.secrets["k_secret"] = SECRET_VALUE
         context.include_secrets_in_templates = True
+    if enable_self_healing is not None:
+        context.workflow = SimpleNamespace(
+            enable_self_healing=enable_self_healing,
+            workflow_definition=None,
+            created_by=created_by,
+            edited_by=edited_by,
+            workflow_permanent_id="wpid_test",
+            organization_id="o_test",
+        )
     return context
 
 
@@ -91,6 +106,7 @@ def _install_db_fakes(
     organization: object | None = SimpleNamespace(organization_id="o_test", max_steps_per_run=None),
     downloaded_files: list[FileInfo] | None = None,
     extracted_information: ExtractedInformation = None,
+    copilot_lineage: bool = False,
 ) -> dict[str, Any]:
     created_task = _FakeTask("tsk_escalation", TaskStatus.running)
     updated_after_run = _FakeTask("tsk_escalation", final_status, extracted_information=extracted_information)
@@ -139,6 +155,7 @@ def _install_db_fakes(
     monkeypatch.setattr(app.DATABASE.tasks, "create_step", AsyncMock(side_effect=_create_step))
     monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(side_effect=_get_task))
     monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(side_effect=_get_organization))
+    monkeypatch.setattr(app.DATABASE.workflows, "is_workflow_copilot_authored", AsyncMock(return_value=copilot_lineage))
     monkeypatch.setattr(
         "skyvern.forge.sdk.workflow.models.block.BaseTaskBlock.get_task_order",
         AsyncMock(side_effect=_get_task_order),
@@ -193,55 +210,114 @@ async def _heal(
         )
 
 
-@pytest.fixture(autouse=True)
-def _self_heal_flag_resolves_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Unit stub provider returns a truthy AsyncMock for every flag; pin self-heal resolution to the
-    # env default so per-test settings govern. PostHog-specific tests override the provider explicitly.
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
-
-
 @pytest.mark.asyncio
-async def test_flag_off_is_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_everything_off_is_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
 
-    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+    result = await _heal(block, _make_context(enable_self_healing=False), exc, _recording_page(exc))
 
     assert result is None
     assert state["execute_step_calls"] == 0
 
 
 @pytest.mark.asyncio
-async def test_posthog_flag_enables_heal_when_env_off(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_workflow_setting_enables_heal_when_env_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    fake_provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True))
-    monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", fake_provider)
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
 
-    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+    result = await _heal(block, _make_context(enable_self_healing=True), exc, _recording_page(exc))
 
     assert result is not None
     assert state["execute_step_calls"] == 1
-    assert fake_provider.is_feature_enabled_cached.await_args.args[0] == "ENABLE_CODE_BLOCK_SELF_HEALING"
 
 
 @pytest.mark.asyncio
-async def test_posthog_resolution_failure_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_non_copilot_workflow_never_heals_from_the_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
-    fake_provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(side_effect=RuntimeError("posthog down")))
-    monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", fake_provider)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    exc = RuntimeError("rotted selector")
+    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by=None)
+
+    result = await _heal(block, context, exc, _recording_page(exc))
+
+    assert result is None
+    assert state["execute_step_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_user_saved_copilot_workflow_heals_via_lineage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """User saves re-stamp created_by/edited_by with the user id; the lineage scan must still
+    recognize a copilot-authored workflow."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed, copilot_lineage=True)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    exc = RuntimeError("rotted selector")
+    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by="user@example.com")
+
+    result = await _heal(block, context, exc, _recording_page(exc))
+
+    assert result is not None
+    assert state["execute_step_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_lineage_lookup_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lineage scan runs inside the block's exception handler; a DB failure there must
+    fail closed (no heal) instead of masking the original block failure with a new raise."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    monkeypatch.setattr(
+        app.DATABASE.workflows,
+        "is_workflow_copilot_authored",
+        AsyncMock(side_effect=RuntimeError("db unavailable")),
+    )
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    exc = RuntimeError("rotted selector")
+    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by="user@example.com")
+
+    result = await _heal(block, context, exc, _recording_page(exc))
+
+    assert result is None
+    assert state["execute_step_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_copilot_edited_workflow_heals_from_the_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    exc = RuntimeError("rotted selector")
+    context = _make_context(enable_self_healing=True, created_by="user@example.com", edited_by="copilot")
+
+    result = await _heal(block, context, exc, _recording_page(exc))
+
+    assert result is not None
+    assert state["execute_step_calls"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_enabled", [True, False])
+async def test_missing_workflow_on_context_falls_back_to_env(
+    monkeypatch: pytest.MonkeyPatch, env_enabled: bool
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", env_enabled, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
     state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
     block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
     exc = RuntimeError("rotted selector")
 
     result = await _heal(block, _make_context(), exc, _recording_page(exc))
 
-    assert result is None
-    assert state["execute_step_calls"] == 0
+    assert (result is not None) is env_enabled
+    assert state["execute_step_calls"] == (1 if env_enabled else 0)
 
 
 # --- The spine fix: a rotted page failure heals on block.prompt even with no covering step. ---
@@ -678,3 +754,115 @@ async def test_recovery_block_finalized_to_non_completed_status(monkeypatch: pyt
 
     assert result is not None and result.success is False
     assert any(u.get("status") == BlockStatus.terminated for u in state["recovery_block_updates"])
+
+
+@pytest.mark.asyncio
+async def test_mid_block_failure_composes_remaining_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="open the portal", line_start=1, line_end=1),
+            CodeBlockStep(description="click the invoices tab", line_start=2, line_end=2),
+            CodeBlockStep(description="download the latest invoice", line_start=3, line_end=3),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "click the invoices tab" in goal
+    assert "Then: download the latest invoice" in goal
+    # steps before the failure already ran as code — they must not be re-demanded.
+    assert "open the portal" not in goal
+    assert DEFAULT_PROMPT in goal
+
+
+@pytest.mark.asyncio
+async def test_last_step_failure_keeps_single_step_goal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="open the portal", line_start=1, line_end=1),
+            CodeBlockStep(description="download the latest invoice", line_start=2, line_end=2),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "download the latest invoice" in goal
+    assert "Then:" not in goal
+
+
+@pytest.mark.asyncio
+async def test_remaining_steps_without_descriptions_are_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="click the invoices tab", line_start=1, line_end=1),
+            CodeBlockStep(description=None, line_start=2, line_end=2),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "click the invoices tab" in goal
+    assert "Then:" not in goal
+
+
+@pytest.mark.asyncio
+async def test_remaining_step_descriptions_are_masked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[
+            CodeBlockStep(description="open the portal", line_start=1, line_end=1),
+            CodeBlockStep(description=f"submit token {SECRET_VALUE}", line_start=2, line_end=2),
+        ]
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(with_secret=True), exc, _recording_page(exc), failing_line=1)
+
+    assert result is not None and result.success is True
+    goal = state["create_task_kwargs"]["navigation_goal"]
+    assert "open the portal" in goal
+    assert "Then:" in goal
+    assert SECRET_VALUE not in goal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "steps",
+    [
+        pytest.param([CodeBlockStep(description="download", line_start=1, line_end=1)], id="matched_step"),
+        pytest.param(None, id="bare_prompt"),
+    ],
+)
+async def test_escalation_task_verifies_with_action_history(
+    monkeypatch: pytest.MonkeyPatch, steps: list[CodeBlockStep] | None
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=steps)
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["include_action_history_in_verification"] is True

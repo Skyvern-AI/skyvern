@@ -16,7 +16,7 @@ from skyvern.cli.core.browser_ops import (
     do_network_unroute,
 )
 
-from ._common import ErrorCode, make_error, make_result
+from ._common import DIRECT_TARGET_DESCRIPTION, ErrorCode, make_error, make_result
 from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
 
 # Query param keys whose values are redacted from captured URLs.
@@ -759,7 +759,7 @@ async def skyvern_har_stop(
 
 
 async def skyvern_get_html(
-    selector: Annotated[str, Field(description="CSS or XPath selector for the element.")],
+    selector: Annotated[str, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS or XPath selector for the element.")],
     outer: Annotated[
         bool,
         Field(description="If true, return outerHTML (includes the element itself). Default false (innerHTML)."),
@@ -797,7 +797,9 @@ async def skyvern_get_html(
 
 
 async def skyvern_get_value(
-    selector: Annotated[str, Field(description="CSS or XPath selector for the input element.")],
+    selector: Annotated[
+        str, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS or XPath selector for the input element.")
+    ],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
@@ -831,7 +833,7 @@ async def skyvern_get_value(
 
 
 async def skyvern_get_styles(
-    selector: Annotated[str, Field(description="CSS or XPath selector for the element.")],
+    selector: Annotated[str, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS or XPath selector for the element.")],
     properties: Annotated[
         list[str] | None,
         Field(description="Specific CSS properties to retrieve (e.g. ['color', 'font-size']). Omit for all (max 100)."),

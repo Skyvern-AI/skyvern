@@ -40,6 +40,7 @@ import pyotp
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
 from onepassword.client import Client as OnePasswordClient
+from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
 from skyvern.exceptions import HttpException as SkyvernHttpException
@@ -115,9 +116,12 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import Crede
 from skyvern.forge.sdk.services.credentials import (
     AuthenticatorTotpErrorCode,
     AuthenticatorTotpParseResult,
+    extract_onepassword_upstream_5xx_status,
+    is_onepassword_credential_error,
     normalize_totp_config,
     parse_totp_config,
 )
+from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -934,9 +938,10 @@ async def test_login(
             organization_id=organization_id,
         )
         try:
-            await app.DATABASE.credentials.delete_credential(
+            await _delete_temporary_test_login_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
+                reason="workflow setup error",
             )
         except Exception:
             LOG.warning(
@@ -1374,20 +1379,11 @@ async def cancel_credential_test(
     # Only clean up temporary credentials after successful cancellation.
     # The background task may also try to delete — that's fine, it handles NotFound gracefully.
     try:
-        credential = await app.DATABASE.credentials.get_credential(
+        await _delete_temporary_test_login_credential(
             credential_id=credential_id,
             organization_id=organization_id,
+            reason="test cancellation",
         )
-        if credential and credential.name.startswith("_test_login_"):
-            await app.DATABASE.credentials.delete_credential(
-                credential_id=credential_id,
-                organization_id=organization_id,
-            )
-            LOG.info(
-                "Cleaned up temporary credential after test cancellation",
-                credential_id=credential_id,
-                organization_id=organization_id,
-            )
     except Exception:
         LOG.warning(
             "Failed to clean up temporary credential after test cancellation",
@@ -1441,14 +1437,10 @@ async def _create_browser_profile_after_workflow(
                 # Clean up temporary credentials created by test-login
                 if credential_name.startswith("_test_login_"):
                     try:
-                        await app.DATABASE.credentials.delete_credential(
+                        await _delete_temporary_test_login_credential(
                             credential_id=credential_id,
                             organization_id=organization_id,
-                        )
-                        LOG.info(
-                            "Deleted temporary credential after failed test",
-                            credential_id=credential_id,
-                            organization_id=organization_id,
+                            reason="failed test",
                         )
                     except Exception:
                         LOG.warning(
@@ -1473,16 +1465,13 @@ async def _create_browser_profile_after_workflow(
                     workflow_permanent_id=workflow_permanent_id,
                 )
                 return
-            browser_session_storage_key = await app.WORKFLOW_SERVICE.get_workflow_browser_session_storage_key(
-                workflow=workflow,
-                workflow_run=workflow_run,
-            )
             session_dir = None
             max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
-                session_dir = await app.STORAGE.retrieve_browser_session(
+                session_dir = await retrieve_persisted_workflow_browser_state_dir(
                     organization_id=organization_id,
-                    workflow_permanent_id=browser_session_storage_key,
+                    workflow=workflow,
+                    workflow_run=workflow_run,
                 )
                 if session_dir:
                     break
@@ -1601,9 +1590,10 @@ async def _create_browser_profile_after_workflow(
         # Clean up temporary credentials on poll timeout
         if credential_name.startswith("_test_login_"):
             try:
-                await app.DATABASE.credentials.delete_credential(
+                await _delete_temporary_test_login_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
+                    reason="poll timeout",
                 )
             except Exception:
                 LOG.warning(
@@ -1620,9 +1610,10 @@ async def _create_browser_profile_after_workflow(
         # Clean up temporary credentials on unexpected error
         if credential_name.startswith("_test_login_"):
             try:
-                await app.DATABASE.credentials.delete_credential(
+                await _delete_temporary_test_login_credential(
                     credential_id=credential_id,
                     organization_id=organization_id,
+                    reason="profile persistence error",
                 )
             except Exception:
                 LOG.warning(
@@ -1838,7 +1829,8 @@ async def get_credential_totp_code(
     if cached_response is not None:
         return cached_response
 
-    credential_service = await _get_credential_vault_service(vault_type_override=credential.vault_type)
+    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
     try:
         credential_item = await credential_service.get_credential_item(credential)
     except SkyvernHttpException as e:
@@ -1981,7 +1973,7 @@ async def get_credentials(
     ),
     vault_type: CredentialVaultType | None = Query(
         default=None,
-        description="Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+        description="Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
     ),
     credential_type: CredentialType | None = Query(
         default=None,
@@ -2334,14 +2326,72 @@ async def list_onepassword_items(
                 )
 
         return OnePasswordItemsResponse(configured=True, items=items)
-    except Exception as e:
-        LOG.error(
-            "Failed to list 1Password items",
+    except asyncio.TimeoutError as e:
+        LOG.warning(
+            "Timed out while listing 1Password items",
             organization_id=current_org.organization_id,
-            error=str(e),
             exc_info=True,
         )
-        raise HTTPException(status_code=502, detail="Failed to list 1Password items") from e
+        raise HTTPException(
+            status_code=502,
+            detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+        ) from e
+    except RateLimitExceededException as e:
+        LOG.warning(
+            "1Password rate limit exceeded while listing items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="1Password rate limit exceeded. Please retry in a few minutes.",
+        ) from e
+    except DesktopSessionExpiredException as e:
+        LOG.warning(
+            "1Password session expired while listing items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Your 1Password session appears to be expired. Please update your token in Settings and try again."
+            ),
+        ) from e
+    except Exception as e:
+        raw = str(e)
+        # The 1Password SDK exposes these as plain string exceptions; credential
+        # evidence takes precedence over embedded status text.
+        if is_onepassword_credential_error(raw):
+            LOG.warning(
+                "Invalid 1Password service account token while listing items",
+                organization_id=current_org.organization_id,
+                error=raw,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Your 1Password service account token appears to be invalid or expired. "
+                    "Please update it in Settings and try again."
+                ),
+            ) from e
+        upstream_status = extract_onepassword_upstream_5xx_status(raw)
+        if upstream_status is not None:
+            LOG.warning(
+                "1Password is temporarily unavailable while listing items",
+                organization_id=current_org.organization_id,
+                upstream_status=upstream_status,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+            ) from e
+        LOG.error(
+            "Unexpected failure while listing 1Password items",
+            organization_id=current_org.organization_id,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to list 1Password items.") from e
 
 
 @base_router.get(
@@ -2886,7 +2936,13 @@ async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
 ) -> CredentialVaultService:
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
-    if vault_type == CredentialVaultType.BITWARDEN:
+    if vault_type == CredentialVaultType.SKYVERN:
+        if not settings.is_local_credential_vault_enabled():
+            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not enabled")
+        if not app.SKYVERN_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not configured")
+        return app.SKYVERN_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
@@ -2902,6 +2958,30 @@ async def _get_credential_vault_service(
         return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+
+async def _delete_temporary_test_login_credential(
+    *,
+    credential_id: str,
+    organization_id: str,
+    reason: str,
+) -> None:
+    credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id,
+        organization_id=organization_id,
+    )
+    if not credential or not credential.name.startswith("_test_login_"):
+        return
+
+    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
+    await credential_service.delete_credential(credential)
+    LOG.info(
+        "Deleted temporary credential",
+        credential_id=credential_id,
+        organization_id=organization_id,
+        reason=reason,
+    )
 
 
 def _convert_to_response(credential: Credential) -> CredentialResponse:

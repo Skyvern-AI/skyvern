@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -12,6 +13,7 @@ const startNodeData: WorkflowStartNodeData = {
   webhookCallbackUrl: "",
   proxyLocation: null,
   persistBrowserSession: true,
+  pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
   model: null,
@@ -24,10 +26,12 @@ const startNodeData: WorkflowStartNodeData = {
   codeVersion: null,
   scriptCacheKey: null,
   aiFallback: true,
+  enableSelfHealing: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
   label: "__start_block__",
   showCode: false,
 };
@@ -149,7 +153,14 @@ function renderSettings(overrides: Partial<WorkflowStartNodeData> = {}) {
     ...startNodeData,
     ...overrides,
   };
-  return render(<WorkflowSettingsEditor blockId="start" />);
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <WorkflowSettingsEditor blockId="start" />
+    </QueryClientProvider>,
+  );
 }
 
 beforeEach(() => {

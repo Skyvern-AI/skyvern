@@ -4,6 +4,9 @@
 **/traces
 **/inputs
 **/har
+**/downloads
+**/browser_sessions
+**/credential_vault
 **/.git
 **/.github
 **/.mypy_cache

@@ -102,6 +102,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
@@ -113,6 +114,7 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
+        enable_self_healing: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
         run_sequentially: bool = False,
@@ -136,6 +138,7 @@ class WorkflowsRepository(BaseRepository):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
+                pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
                 model=model,
@@ -145,6 +148,7 @@ class WorkflowsRepository(BaseRepository):
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
                 run_sequentially=run_sequentially,
@@ -192,6 +196,20 @@ class WorkflowsRepository(BaseRepository):
             )
             await session.execute(update_deleted_at_query)
             await session.commit()
+
+    @db_operation("is_workflow_copilot_authored")
+    async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
+        """Any version ever stamped by copilot marks the lineage. The latest row alone is not a
+        durable signal: user saves re-stamp created_by/edited_by, while copilot back-stamps v1 on
+        copilot-born workflows. Deleted versions still count — provenance is historical."""
+        copilot_version_exists = (
+            select(WorkflowModel.workflow_id)
+            .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
+            .filter(or_(WorkflowModel.created_by == "copilot", WorkflowModel.edited_by == "copilot"))
+            .limit(1)
+        )
+        async with self.Session() as session:
+            return (await session.scalar(copilot_version_exists)) is not None
 
     @db_operation("get_workflow")
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow | None:
@@ -654,6 +672,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -663,6 +682,7 @@ class WorkflowsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -703,6 +723,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if pin_saved_session_ip is not None:
+                    workflow.pin_saved_session_ip = pin_saved_session_ip
                 if browser_profile_id is not _UNSET:
                     workflow.browser_profile_id = cast(str | None, browser_profile_id)
                 if browser_profile_key is not _UNSET:
@@ -721,6 +743,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.ai_fallback = ai_fallback
                 if adaptive_caching is not _UNSET:
                     workflow.adaptive_caching = cast(bool, adaptive_caching)
+                if enable_self_healing is not _UNSET:
+                    workflow.enable_self_healing = cast(bool, enable_self_healing)
                 if run_sequentially is not None:
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
@@ -967,6 +991,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -976,6 +1001,7 @@ class WorkflowsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -1052,6 +1078,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if pin_saved_session_ip is not None:
+                workflow.pin_saved_session_ip = pin_saved_session_ip
             if browser_profile_id is not _UNSET:
                 workflow.browser_profile_id = cast(str | None, browser_profile_id)
             if browser_profile_key is not _UNSET:
@@ -1070,6 +1098,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.ai_fallback = ai_fallback
             if adaptive_caching is not _UNSET:
                 workflow.adaptive_caching = cast(bool, adaptive_caching)
+            if enable_self_healing is not _UNSET:
+                workflow.enable_self_healing = cast(bool, enable_self_healing)
             if run_sequentially is not None:
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:

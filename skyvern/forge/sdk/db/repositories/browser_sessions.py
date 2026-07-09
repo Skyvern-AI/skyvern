@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
+from typing import cast
 
 import structlog
 from sqlalchemy import case, desc, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
@@ -26,7 +28,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
-from skyvern.schemas.proxy_pinning import generate_proxy_session_id
+from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
 LOG = structlog.get_logger()
@@ -67,6 +69,51 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
 
+    @db_operation("get_or_create_managed_browser_profile")
+    async def get_or_create_managed_browser_profile(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        browser_profile_key_digest: str,
+        name: str,
+    ) -> tuple[BrowserProfile, bool]:
+        digest = browser_profile_key_digest or ""
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    browser_profile_key_digest=digest,
+                    is_managed=True,
+                )
+                .filter(BrowserProfileModel.deleted_at.is_(None))
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if browser_profile:
+                return BrowserProfile.model_validate(browser_profile), False
+
+            browser_profile = BrowserProfileModel(
+                browser_profile_id=generate_browser_profile_id(),
+                organization_id=organization_id,
+                name=name,
+                is_managed=True,
+                workflow_permanent_id=workflow_permanent_id,
+                browser_profile_key_digest=digest,
+            )
+            session.add(browser_profile)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                browser_profile = (await session.scalars(query)).first()
+                if browser_profile:
+                    return BrowserProfile.model_validate(browser_profile), False
+                raise
+            await session.refresh(browser_profile)
+            return BrowserProfile.model_validate(browser_profile), True
+
     @db_operation("get_browser_profile")
     async def get_browser_profile(
         self,
@@ -88,6 +135,25 @@ class BrowserSessionsRepository(BaseRepository):
                 return None
             return BrowserProfile.model_validate(browser_profile)
 
+    @db_operation("list_managed_browser_profiles_for_workflow")
+    async def list_managed_browser_profiles_for_workflow(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        include_deleted: bool = False,
+    ) -> list[BrowserProfile]:
+        async with self.Session() as session:
+            query = select(BrowserProfileModel).filter_by(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                is_managed=True,
+            )
+            if not include_deleted:
+                query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+            browser_profiles = await session.scalars(query)
+            return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
+
     @db_operation("list_browser_profiles")
     async def list_browser_profiles(
         self,
@@ -96,6 +162,7 @@ class BrowserSessionsRepository(BaseRepository):
         page: int = 1,
         page_size: int = 10,
         search_key: str | None = None,
+        managed: bool | None = None,
     ) -> list[BrowserProfile]:
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -104,6 +171,8 @@ class BrowserSessionsRepository(BaseRepository):
             query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
             if not include_deleted:
                 query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+            if managed is not None:
+                query = query.filter(BrowserProfileModel.is_managed.is_(managed))
             if search_key:
                 search_like = f"%{search_key}%"
                 query = query.filter(
@@ -319,17 +388,34 @@ class BrowserSessionsRepository(BaseRepository):
         browser_type: PersistentBrowserType | None = None,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
+        inherit_profile_proxy: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
-        proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
-            proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
-        )
         extensions_str: list[str] | None = (
             [extension.value for extension in extensions] if extensions is not None else None
         )
-        serialized_proxy_location = serialize_proxy_location(proxy_location)
         async with self.Session() as session:
+            if inherit_profile_proxy and browser_profile_id and proxy_session_id is None:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=browser_profile_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(BrowserProfileModel.deleted_at.is_(None))
+                )
+                browser_profile = (await session.scalars(query)).first()
+                if browser_profile and browser_profile.proxy_session_id:
+                    proxy_session_id = browser_profile.proxy_session_id
+                    # The ORM column stores the serialized string; deserialize before it flows
+                    # into serialize_proxy_location, which rejects a bare str.
+                    proxy_location = cast(
+                        ProxyLocationInput, parse_proxy_location_input(browser_profile.proxy_location)
+                    )
+
+            proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+            )
+            serialized_proxy_location = serialize_proxy_location(proxy_location)
             browser_session = PersistentBrowserSessionModel(
                 organization_id=organization_id,
                 runnable_type=runnable_type,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
     CompletionCriterion,
+    JudgmentTruthCondition,
     _classifier_fallback_policy,
     _classify_request,
     _credential_ids,
@@ -25,6 +25,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from tests.unit.copilot_test_helpers import make_raw_loaded_result_context
 
 
 def _render(**overrides: str) -> str:
@@ -90,14 +91,45 @@ class TestRequestPolicyPromptStructure:
         assert (
             "{outcome, contingent_on, contingent_antecedent_output_path, "
             "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
-            "expected_output_shape, kind, terminal_action_family, classification_output_key, expected_classification}"
+            "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
+            "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
         ) in rendered
         assert "never hide it in outcome prose" in rendered
-        assert "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label" in rendered
+        assert (
+            "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, "
+            "goal_judgment_boolean" in rendered
+        )
+        assert "goal_judgment_boolean declares that the field is an artifact-computed true/false judgment" in rendered
         assert "kind=outcome|terminal_action|validation_classification" in rendered
         assert "terminal_action_family=request|application|form|order|null" in rendered
+        assert (
+            "requested_output_evidence_source: "
+            "runtime_output|independent_run_evidence|registered_output_parameter|registered_artifact_content"
+        ) in rendered
         assert "classification_output_key=login_only and expected_classification=true" in rendered
         assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_completion_criteria_schema_exposes_judgment_truth_condition_fields(self) -> None:
+        rendered = _render()
+        assert "judgment_predicate: null unless expected_output_shape=goal_judgment_boolean" in rendered
+        assert "Use only the closed-vocabulary value login_gate_blocks_target" in rendered
+        assert "judgment_polarity_when_holds: null unless judgment_predicate is non-null" in rendered
+        assert "kind=outcome" in rendered
+        assert "output_path=output.login_gate_blocks_target" in rendered
+        assert "judgment_predicate=login_gate_blocks_target" in rendered
+        assert "judgment_polarity_when_holds=true" in rendered
+        assert "Do not use kind=validation_classification for this returned field" in rendered
+
+    def test_priority_requested_output_evidence_source_guidance_is_present(self) -> None:
+        rendered = _render()
+        assert (
+            "selection, priority, ranking, or superlative criterion governs a returned requested-output field"
+            in rendered
+        )
+        assert "selected or highest-priority document name" in rendered
+        assert "output_path=output.document_name" in rendered
+        assert "requested_output_evidence_source=independent_run_evidence" in rendered
+        assert "the selected value cannot prove its own correctness" in rendered
 
     def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
         active = _render_active_criteria_for_prompt(
@@ -120,38 +152,113 @@ class TestRequestPolicyPromptStructure:
         assert '"expected_output_value": "WTR-1842-DEMO"' in rendered
         assert '"expected_output_shape": "reference_code"' in rendered
 
+    def test_active_completion_criteria_render_judgment_truth_condition(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="the returned record reports whether the login gate blocks the target",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                    judgment_truth_condition=JudgmentTruthCondition(
+                        predicate="login_gate_blocks_target", polarity_when_holds=True
+                    ),
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"judgment_predicate": "login_gate_blocks_target"' in rendered
+        assert '"judgment_polarity_when_holds": true' in rendered
+
 
 class TestRawSecretBackstop:
-    def test_keyvault_handle_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass") is False
-        assert _raw_secret_detected("customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-user") is False
-
-    def test_azure_keyvault_url_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("https://example-vault.vault.azure.net/secrets/my-secret") is False
-
-    def test_workflow_behavior_question_does_not_trip_backstop(self) -> None:
-        message = (
-            "trigger_login appears to have worked as anticipated but next_step "
-            "is not receiving an active browser session to work with."
-        )
-        assert _raw_secret_detected(message) is False
-
-    def test_actual_raw_password_still_trips_backstop(self) -> None:
-        assert _raw_secret_detected("Use this password: hunter2 to sign in.") is True
-
-    def test_colon_delimited_email_password_pair_trips_backstop(self) -> None:
-        assert _raw_secret_detected("Use qa.user@example.test:FakePass123! to sign in.") is True
-        assert contains_email_password_pair("Use qa.user@example.test:FakePass123! to sign in.") is True
-
-    def test_bulk_colon_delimited_email_password_pairs_trip_backstop(self) -> None:
-        message = """
+    @pytest.mark.parametrize(
+        ("message", "detected", "email_pair_expected"),
+        [
+            pytest.param(
+                "customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass",
+                False,
+                None,
+                id="keyvault-handle-pass",
+            ),
+            pytest.param(
+                "customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-user",
+                False,
+                None,
+                id="keyvault-handle-user",
+            ),
+            pytest.param(
+                "https://example-vault.vault.azure.net/secrets/my-secret",
+                False,
+                None,
+                id="azure-keyvault-url",
+            ),
+            pytest.param(
+                "trigger_login appears to have worked as anticipated but next_step "
+                "is not receiving an active browser session to work with.",
+                False,
+                None,
+                id="workflow-behavior-question",
+            ),
+            pytest.param(
+                "Use this password: hunter2 to sign in.",
+                True,
+                None,
+                id="actual-raw-password",
+            ),
+            pytest.param(
+                "Use qa.user@example.test:FakePass123! to sign in.",
+                True,
+                True,
+                id="colon-delimited-email-password-pair",
+            ),
+            pytest.param(
+                """
         Use these accounts:
         alpha@example.test:FakePass123!
         beta@example.test:AnotherFakePass456!
         gamma@example.test:ThirdFakePass789!
-        """
-        assert _raw_secret_detected(message) is True
-        assert contains_email_password_pair(message) is True
+        """,
+                True,
+                True,
+                id="bulk-colon-delimited-email-password-pairs",
+            ),
+            pytest.param(
+                "Email: qa.user@example.test",
+                False,
+                None,
+                id="plain-email-label",
+            ),
+            pytest.param(
+                "Clone git@github.com:skyvern-ai/skyvern.git before running tests.",
+                False,
+                False,
+                id="scp-style-repo-path",
+            ),
+            pytest.param(
+                "Use https://qa.user@example.test:8080?org=1 for local testing.",
+                False,
+                False,
+                id="url-port-with-query",
+            ),
+            pytest.param(
+                "The api_key = sk-abcdefghijklmnopqrstuvwxyz1234567890.",
+                True,
+                None,
+                id="actual-api-key",
+            ),
+        ],
+    )
+    def test_raw_secret_backstop_detection(
+        self, message: str, detected: bool, email_pair_expected: bool | None
+    ) -> None:
+        assert _raw_secret_detected(message) is detected
+        if email_pair_expected is not None:
+            assert contains_email_password_pair(message) is email_pair_expected
 
     def test_bulk_colon_delimited_email_password_pairs_are_redacted(self) -> None:
         redacted = redact_raw_secrets_for_prompt(
@@ -161,22 +268,6 @@ class TestRawSecretBackstop:
         assert "FakePass123" not in redacted
         assert "AnotherFakePass456" not in redacted
         assert redacted.count("[REDACTED_SECRET]") == 2
-
-    def test_plain_email_label_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("Email: qa.user@example.test") is False
-
-    def test_scp_style_repository_path_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("Clone git@github.com:skyvern-ai/skyvern.git before running tests.") is False
-        assert (
-            contains_email_password_pair("Clone git@github.com:skyvern-ai/skyvern.git before running tests.") is False
-        )
-
-    def test_url_port_with_query_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("Use https://qa.user@example.test:8080?org=1 for local testing.") is False
-        assert contains_email_password_pair("Use https://qa.user@example.test:8080?org=1 for local testing.") is False
-
-    def test_actual_api_key_still_trips_backstop(self) -> None:
-        assert _raw_secret_detected("The api_key = sk-abcdefghijklmnopqrstuvwxyz1234567890.") is True
 
 
 class TestRawSecretRefusalSentinelConsistency:
@@ -413,19 +504,7 @@ class TestLoadedResultContextPromptSanitization:
     @pytest.mark.asyncio
     async def test_request_policy_classifier_sanitizes_loaded_result_context_before_prompt(self) -> None:
         captured: dict[str, str] = {}
-        raw_context = json.dumps(
-            {
-                "loaded_result_targets": [
-                    {
-                        "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
-                        "is_table": True,
-                        "row_selector": 'tr[data-account="987654321"]',
-                        "row_count": 2,
-                        "structure_signature": "legacy-selector-derived-sig",
-                    }
-                ]
-            }
-        )
+        raw_context = make_raw_loaded_result_context()
 
         await _classify_request(
             user_message="build from the loaded results",

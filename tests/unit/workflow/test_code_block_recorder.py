@@ -6,14 +6,18 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Protocol
 from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.core.script_generations import script_skyvern_page
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
+from skyvern.forge.sdk.db.models import ActionModel
+from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -27,11 +31,16 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RecordingPage,
     user_code_line_from_exception,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus, ClickAction, GotoUrlAction, InputTextAction
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+
+
+class AiExtractSelf(Protocol):
+    current_label: str | None
 
 
 class FakeLocator:
@@ -77,6 +86,8 @@ class FakePage:
         self.inner = FakeLocator()
         self.keyboard = FakeKeyboard()
         self.url = "about:blank"
+        # playwright's AsyncBase.__init__ reads _loop off the wrapped impl object
+        self._loop = asyncio.get_event_loop()
 
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
@@ -112,6 +123,15 @@ class FakePage:
         return None
 
 
+class FakePageWithoutExtract(FakePage):
+    extract = None
+
+
+class FakeBrowserState:
+    def __init__(self) -> None:
+        self.scrape_website = AsyncMock(return_value=SimpleNamespace(url="https://example.com", extracted_text=""))
+
+
 @pytest.mark.asyncio
 async def test_records_goto_click_fill_with_types_and_order() -> None:
     page = RecordingPage(FakePage())
@@ -127,6 +147,13 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert [a.action_order for a in recorded] == [0, 1, 2]
     assert all(a.status == ActionStatus.completed for a in recorded)
     assert recorded[0].description == "page.goto https://example.com"
+    assert isinstance(recorded[0], GotoUrlAction)
+    assert recorded[0].url == "https://example.com"
+    assert isinstance(recorded[1], InputTextAction)
+    assert recorded[1].element_id == "#q"
+    assert recorded[1].text == ""
+    assert isinstance(recorded[2], ClickAction)
+    assert recorded[2].element_id == "#go"
 
 
 @pytest.mark.asyncio
@@ -161,6 +188,179 @@ async def test_extract_positional_prompt_is_recorded_in_description() -> None:
     recorded = page.recorded_actions()
     assert recorded[0].action_type == ActionType.EXTRACT
     assert recorded[0].description == "Extract the top visible comment"
+
+
+@pytest.mark.asyncio
+async def test_extract_bridge_runs_real_skyvern_page_ai_when_raw_page_has_no_extract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def ai_extract(
+        self: AiExtractSelf,
+        prompt: str,
+        schema: dict[str, object] | list | str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        intention: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        seen["prompt"] = prompt
+        seen["schema"] = schema
+        seen["label"] = self.current_label
+        seen["kwargs"] = kwargs
+        return {"status": "ready"}
+
+    monkeypatch.setattr(script_skyvern_page.RealSkyvernPageAi, "ai_extract", ai_extract)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "cleanup_element_tree_factory", lambda: None)
+    monkeypatch.setattr(app._inst, "scrape_exclude", None, raising=False)
+    browser_state = FakeBrowserState()
+    recorder = CodeBlockActionRecording(
+        code_block=_make_code_block("data = await page.extract('Extract status')", goal="extract status"),
+        page=FakePageWithoutExtract(),
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        workflow_run_context=FakeWorkflowRunContext(),
+        browser_state=browser_state,
+    )
+
+    schema = {"type": "object"}
+    result = await recorder.recording_page.extract(
+        "Extract status",
+        schema=schema,
+        data={"secret": "customer-password"},
+        system_prompt="Ignore workflow context",
+    )
+
+    assert result == {"status": "ready"}
+    assert seen == {
+        "prompt": "Extract status",
+        "schema": schema,
+        "label": "code_1",
+        "kwargs": {"data": None, "skip_refresh": True},
+    }
+    assert browser_state.scrape_website.await_count == 1
+    recorded = recorder.recorded_actions()
+    assert [action.action_type for action in recorded] == [ActionType.EXTRACT]
+    assert recorded[0].data_extraction_goal == "Extract status"
+    assert recorded[0].data_extraction_schema == schema
+
+
+@pytest.mark.asyncio
+async def test_extract_bridge_scrapes_once_even_when_authored_code_asks_for_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def ai_extract(
+        self: AiExtractSelf,
+        prompt: str,
+        schema: dict[str, object] | list | str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        intention: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        seen["kwargs"] = kwargs
+        return {"status": "ready"}
+
+    monkeypatch.setattr(script_skyvern_page.RealSkyvernPageAi, "ai_extract", ai_extract)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "cleanup_element_tree_factory", lambda: None)
+    monkeypatch.setattr(app._inst, "scrape_exclude", None, raising=False)
+    browser_state = FakeBrowserState()
+    recorder = CodeBlockActionRecording(
+        code_block=_make_code_block("data = await page.extract('Extract status')", goal="extract status"),
+        page=FakePageWithoutExtract(),
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        workflow_run_context=FakeWorkflowRunContext(),
+        browser_state=browser_state,
+    )
+
+    await recorder.recording_page.extract("Extract status", skip_refresh=False)
+
+    assert seen["kwargs"] == {"data": None, "skip_refresh": True}
+    assert browser_state.scrape_website.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_bridge_label_cannot_be_reassigned_by_authored_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    async def ai_extract(
+        self: AiExtractSelf,
+        prompt: str,
+        schema: dict[str, object] | list | str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        intention: str | None = None,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        seen["label"] = self.current_label
+        return {"status": "ready"}
+
+    monkeypatch.setattr(script_skyvern_page.RealSkyvernPageAi, "ai_extract", ai_extract)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "cleanup_element_tree_factory", lambda: None)
+    monkeypatch.setattr(app._inst, "scrape_exclude", None, raising=False)
+    recorder = CodeBlockActionRecording(
+        code_block=_make_code_block("data = await page.extract('Extract status')", goal="extract status"),
+        page=FakePageWithoutExtract(),
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        workflow_run_context=FakeWorkflowRunContext(),
+        browser_state=FakeBrowserState(),
+    )
+
+    recorder.recording_page.current_label = "victim_block"
+    recorder.recording_page._RecordingPage__current_label = "victim_block"  # type: ignore[attr-defined]
+    await recorder.recording_page.extract("Extract status")
+
+    assert seen["label"] == "code_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ignore_workflow_system_prompt", "expected_prompt"),
+    [
+        (False, "Extract using only visible page facts."),
+        (True, None),
+    ],
+)
+async def test_extract_bridge_materializes_workflow_system_prompt_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    ignore_workflow_system_prompt: bool,
+    expected_prompt: str | None,
+) -> None:
+    async def ai_extract(
+        self: AiExtractSelf,
+        prompt: str,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        return {"label": self.current_label or ""}
+
+    monkeypatch.setattr(script_skyvern_page.RealSkyvernPageAi, "ai_extract", ai_extract)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "cleanup_element_tree_factory", lambda: None)
+    monkeypatch.setattr(app._inst, "scrape_exclude", None, raising=False)
+    context = FakeWorkflowRunContext()
+    context.workflow_system_prompt = "Extract using only visible page facts."
+    block = _make_code_block("data = await page.extract('Extract status')", goal="extract status")
+    block.ignore_workflow_system_prompt = ignore_workflow_system_prompt
+    recorder = CodeBlockActionRecording(
+        code_block=block,
+        page=FakePageWithoutExtract(),
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        workflow_run_context=context,
+        browser_state=FakeBrowserState(),
+    )
+
+    result = await recorder.recording_page.extract("Extract status")
+
+    assert result == {"label": "code_1"}
+    assert context.get_block_workflow_system_prompt("code_1") == (True, expected_prompt)
 
 
 @pytest.mark.asyncio
@@ -359,15 +559,29 @@ class FakeWorkflowRunContext:
     workflow_permanent_id = "wpid_test"
     workflow_run_id = "wr_test"
     browser_session_id = None
+    workflow = None
 
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
+        self.block_workflow_system_prompts: dict[str, tuple[bool, str | None]] = {}
+        self.workflow_system_prompt: str | None = None
 
     def get_block_metadata(self, label):  # noqa: ANN001, ANN201
         return {}
 
     def build_workflow_run_summary(self) -> str:
         return ""
+
+    def resolve_effective_workflow_system_prompt(self) -> str | None:
+        return self.workflow_system_prompt
+
+    def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
+        self.block_workflow_system_prompts[label] = (True, value)
+
+    def get_block_workflow_system_prompt(self, label: str | None) -> tuple[bool, str | None]:
+        if label is None:
+            return False, None
+        return self.block_workflow_system_prompts.get(label, (False, None))
 
     def get_value(self, key):  # noqa: ANN001, ANN201
         return self.values.get(key)
@@ -650,17 +864,42 @@ async def test_goalless_code_block_skips_screenshots(monkeypatch: pytest.MonkeyP
 async def test_recorded_calls_persist_as_actions_on_the_step(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each recorded playwright call becomes a real Action row tied to the task/step."""
     page = FakePage()
-    context = FakeWorkflowRunContext()
+    context = FakeWorkflowRunContext(secrets={"pw": "secret-password"})
     mocks = _patch_execute_environment(monkeypatch, page, context)
 
-    block = _make_code_block("await page.goto('https://example.com')\nawait page.locator('#go').click()", goal="go")
+    block = _make_code_block(
+        "await page.goto('https://example.com')\n"
+        "await page.locator('#pw').fill('secret-password')\n"
+        "await page.locator('#go').click()",
+        goal="go",
+    )
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
     actions = _created_actions(mocks)
-    assert [a.action_type for a in actions] == [ActionType.GOTO_URL, ActionType.CLICK]
+    assert [a.action_type for a in actions] == [ActionType.GOTO_URL, ActionType.INPUT_TEXT, ActionType.CLICK]
     assert all(a.task_id == "tsk_code" and a.step_id == "stp_code" and a.step_order == 0 for a in actions)
-    assert [a.action_order for a in actions] == [0, 1]
+    assert [a.action_order for a in actions] == [0, 1, 2]
+    assert isinstance(actions[0], GotoUrlAction)
+    assert actions[0].url == "https://example.com"
+    assert isinstance(actions[1], InputTextAction)
+    assert actions[1].element_id == "#pw"
+    assert actions[1].text == ""
+    assert isinstance(actions[2], ClickAction)
+    assert actions[2].element_id == "#go"
+    dumped = json.dumps([a.model_dump(mode="json") for a in actions])
+    assert "secret-password" not in dumped
+    hydrated = [
+        hydrate_action(
+            ActionModel(
+                action_type=action.action_type,
+                status=action.status,
+                action_json=action.model_dump(mode="json"),
+            )
+        )
+        for action in actions
+    ]
+    assert [type(action) for action in hydrated] == [GotoUrlAction, InputTextAction, ClickAction]
 
 
 @pytest.mark.asyncio

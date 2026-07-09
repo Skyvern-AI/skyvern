@@ -40,6 +40,7 @@ class ForLoopBlockYaml(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+
 # Manual patch: Fern v4.31.1 emits bottom-cross-imports that deadlock at module
 # load. See for_loop_block.py for the explanation.
 try:

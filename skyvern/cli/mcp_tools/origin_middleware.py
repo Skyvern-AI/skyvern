@@ -24,6 +24,7 @@ client surfaces emerge; do not expand it to third-party integrators.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from urllib.parse import urlsplit
 
 import structlog
@@ -34,20 +35,20 @@ LOG = structlog.get_logger(__name__)
 _MAX_LOGGED_ORIGIN_CHARS = 200
 
 
-_ALLOWED_MCP_ORIGIN_HOSTS = frozenset(
-    {
-        "claude.ai",
-        "www.claude.ai",
-        "claude.com",
-        "www.claude.com",
-    }
+MCP_ORIGIN_HOSTS: tuple[str, ...] = (
+    "claude.ai",
+    "www.claude.ai",
+    "claude.com",
+    "www.claude.com",
 )
+_ALLOWED_MCP_ORIGIN_HOSTS = frozenset(MCP_ORIGIN_HOSTS)
 
 # `urlsplit("http://[::1]:3000").hostname` returns bare `::1` (no brackets).
-_ALLOWED_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+MCP_LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
+_ALLOWED_LOOPBACK_HOSTS = frozenset(MCP_LOOPBACK_HOSTS)
 
 
-def is_allowed_origin(origin: str | None) -> bool:
+def is_allowed_origin(origin: str | None, extra_allowed_origins: Collection[str] = ()) -> bool:
     """Return True if `origin` is permitted to invoke the MCP endpoint."""
     if origin is None or origin == "":
         return True
@@ -61,7 +62,9 @@ def is_allowed_origin(origin: str | None) -> bool:
         return False
     if host in _ALLOWED_LOOPBACK_HOSTS:
         return True
-    return host in _ALLOWED_MCP_ORIGIN_HOSTS
+    if host in _ALLOWED_MCP_ORIGIN_HOSTS:
+        return True
+    return f"{parts.scheme}://{parts.netloc}".lower() in extra_allowed_origins
 
 
 def _sanitize_origin_for_log(origin: str | None) -> str | None:
@@ -83,8 +86,9 @@ class OriginValidationMiddleware:
     before any API key or OAuth validation work is performed.
     """
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, extra_allowed_origins: Collection[str] = ()) -> None:
         self.app = app
+        self.extra_allowed_origins = frozenset(origin.strip().lower().rstrip("/") for origin in extra_allowed_origins)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # FastMCP currently mounts streamable-HTTP only, but WebSocket scopes
@@ -101,7 +105,7 @@ class OriginValidationMiddleware:
                 origin = value.decode("latin-1")
                 break
 
-        if not is_allowed_origin(origin):
+        if not is_allowed_origin(origin, self.extra_allowed_origins):
             # The offending origin is captured in the structured log; do not
             # echo it back in the response body to avoid reflecting
             # attacker-controlled input.
@@ -127,4 +131,4 @@ class OriginValidationMiddleware:
         await self.app(scope, receive, send)
 
 
-__all__ = ["OriginValidationMiddleware", "is_allowed_origin"]
+__all__ = ["MCP_LOOPBACK_HOSTS", "MCP_ORIGIN_HOSTS", "OriginValidationMiddleware", "is_allowed_origin"]

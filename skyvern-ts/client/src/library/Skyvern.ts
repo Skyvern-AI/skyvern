@@ -17,12 +17,12 @@ export interface SkyvernOptions extends BaseClientOptions {
     apiKey: string;
 }
 
-export interface RunTaskOptions extends SkyvernApi.RunTaskRequest {
+export interface RunTaskOptions extends SkyvernApi.TaskRunRequestInput {
     waitForCompletion?: boolean;
     timeout?: number;
 }
 
-export interface RunWorkflowOptions extends SkyvernApi.RunWorkflowRequest {
+export interface RunWorkflowOptions extends SkyvernApi.WorkflowRunRequestInput {
     waitForCompletion?: boolean;
     timeout?: number;
 }

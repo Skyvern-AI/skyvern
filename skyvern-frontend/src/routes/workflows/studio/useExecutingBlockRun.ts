@@ -8,9 +8,9 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 
 /**
  * True while a block-scoped run (?wr= + ?bl=) is executing inside the current
- * debug session: the agent owns the shared debug browser, so user take-control
- * stays off until the run finalizes. Paused runs release the gate — a pause
- * can be waiting on human input (2FA, verification).
+ * debug session: the agent is driving the shared debug browser, so the stream
+ * flags that the user is co-driving. Paused runs don't count — a pause can be
+ * waiting on human input (2FA, verification).
  */
 export function useExecutingBlockRun(): boolean {
   const { workflowPermanentId } = useParams();
@@ -18,8 +18,8 @@ export function useExecutingBlockRun(): boolean {
   const isBlockRun = searchParams.has("bl");
   const urlRunId = searchParams.get("wr");
   const workflowRunId = isBlockRun && urlRunId ? urlRunId : undefined;
-  // Shares the run cache RunView/StudioSpine poll (5s while not finalized), so
-  // the gate releases on terminal status even with the Run pane closed.
+  // Shares the run cache RunView/StudioPaneToggles poll (5s while not finalized), so
+  // the gate releases on terminal status even with the Overview pane closed.
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     workflowRunId ? { workflowRunId } : undefined,
   );

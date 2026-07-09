@@ -1,11 +1,18 @@
 import ipaddress
+import socket
 from http import HTTPStatus
-from urllib.parse import quote, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 from pydantic import HttpUrl, ValidationError
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException
+
+SAFE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+MAX_SAFE_REDIRECTS = 10
+
+_BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
+_BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
 
 
 def strip_query_params(url: str) -> str:
@@ -65,32 +72,146 @@ def prepend_scheme_and_validate_url(url: str) -> str:
     return url
 
 
-def is_blocked_host(host: str) -> bool:
+def _normalize_host(host: str) -> str:
     # RFC 3986 wraps IPv6 literals in [...]; ip_address() only accepts the bare form.
-    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    return (host[1:-1] if host.startswith("[") and host.endswith("]") else host).strip().lower().rstrip(".")
+
+
+def _normalize_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    ip = _normalize_ip(ip)
+    return bool(
+        ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def _is_allowed_host(host: str) -> bool:
+    normalized = _normalize_host(host)
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:
-        ip = ipaddress.ip_address(bare)
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
+        ip = _normalize_ip(ipaddress.ip_address(normalized))
     except ValueError:
         ip = None
     except Exception:
         return False
 
-    candidate_forms = {host.lower(), bare.lower()}
+    candidate_forms = {host.lower(), normalized}
     if ip is not None:
         candidate_forms.add(str(ip).lower())
 
     allowed = {h.lower() for h in settings.ALLOWED_HOSTS}
-    if candidate_forms & allowed:
+    return bool(candidate_forms & allowed)
+
+
+def _is_internal_hostname(host: str) -> bool:
+    normalized = _normalize_host(host)
+    if normalized in _BLOCKED_INTERNAL_HOSTNAMES:
+        return True
+    if normalized.endswith(_BLOCKED_INTERNAL_SUFFIXES):
+        return True
+    return normalized.endswith(".svc")
+
+
+def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
+    normalized = _normalize_host(host)
+    if not normalized:
+        return True
+
+    if _is_allowed_host(host):
         return False
 
-    if ip is not None:
-        return ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved
+    blocked = {b.lower().rstrip(".") for b in settings.BLOCKED_HOSTS}
+    if normalized in blocked or _is_internal_hostname(normalized):
+        return True
 
-    blocked = {b.lower() for b in settings.BLOCKED_HOSTS}
-    return host.lower() in blocked
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
+    try:
+        ip = ipaddress.ip_address(normalized)
+    except ValueError:
+        ip = None
+    except Exception:
+        return True
+
+    if ip is not None:
+        return _is_blocked_ip(ip)
+
+    if not resolve_dns:
+        return False
+
+    try:
+        infos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return True
+
+    resolved_any = False
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0] if sockaddr else None
+        if not ip_str:
+            continue
+        try:
+            resolved_ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        resolved_any = True
+        if _is_blocked_ip(resolved_ip):
+            return True
+    return not resolved_any
+
+
+def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
+    normalized = _normalize_host(host)
+    if not normalized:
+        raise BlockedHost(host=host)
+
+    allowed = _is_allowed_host(host)
+    if not allowed and (normalized in {b.lower().rstrip(".") for b in settings.BLOCKED_HOSTS}):
+        raise BlockedHost(host=host)
+    if not allowed and _is_internal_hostname(normalized):
+        raise BlockedHost(host=host)
+
+    try:
+        ip = ipaddress.ip_address(normalized)
+    except ValueError:
+        ip = None
+    except Exception:
+        raise BlockedHost(host=host)
+
+    if ip is not None:
+        normalized_ip = _normalize_ip(ip)
+        if not allowed and _is_blocked_ip(normalized_ip):
+            raise BlockedHost(host=host)
+        return (str(normalized_ip),)
+
+    try:
+        infos = socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+    except OSError:
+        raise BlockedHost(host=host)
+
+    resolved_ips: list[str] = []
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0] if sockaddr else None
+        if not ip_str:
+            continue
+        try:
+            resolved_ip = _normalize_ip(ipaddress.ip_address(ip_str))
+        except ValueError:
+            continue
+        if not allowed and _is_blocked_ip(resolved_ip):
+            raise BlockedHost(host=host)
+        resolved_ip_str = str(resolved_ip)
+        if resolved_ip_str not in resolved_ips:
+            resolved_ips.append(resolved_ip_str)
+
+    if not resolved_ips:
+        raise BlockedHost(host=host)
+    return tuple(resolved_ips)
 
 
 def validate_url(url: str) -> str | None:
@@ -107,6 +228,30 @@ def validate_url(url: str) -> str | None:
     if blocked:
         raise BlockedHost(host=host)
     return str(v)
+
+
+def validate_fetch_url_with_resolved_ips(url: str) -> tuple[str, tuple[str, ...]]:
+    try:
+        url = prepend_scheme_and_validate_url(url=url)
+        v = HttpUrl(url=url)
+    except Exception as e:
+        raise SkyvernHTTPException(message=str(e), status_code=HTTPStatus.BAD_REQUEST)
+
+    if not v.host:
+        raise InvalidUrl(url=url)
+    return str(v), resolve_fetch_host_ips(v.host)
+
+
+def validate_fetch_url(url: str) -> str:
+    return validate_fetch_url_with_resolved_ips(url)[0]
+
+
+def validate_redirect_url_with_resolved_ips(url: str, location: str) -> tuple[str, tuple[str, ...]]:
+    return validate_fetch_url_with_resolved_ips(urljoin(url, location))
+
+
+def validate_redirect_url(url: str, location: str) -> str:
+    return validate_redirect_url_with_resolved_ips(url, location)[0]
 
 
 def encode_url(url: str) -> str:

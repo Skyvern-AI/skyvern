@@ -15,8 +15,10 @@ from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
+from .types.create_browser_profile_request_proxy_location import CreateBrowserProfileRequestProxyLocation
 from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
+from .types.create_credential_request_proxy_location import CreateCredentialRequestProxyLocation
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.credential_vault_type import CredentialVaultType
@@ -36,11 +38,18 @@ from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_credential_type_credential_type import SkyvernSchemasCredentialTypeCredentialType
+from .types.tag_delete_input import TagDeleteInput
+from .types.tag_history_response import TagHistoryResponse
+from .types.tag_input import TagInput
+from .types.tag_key import TagKey
+from .types.tag_key_delete_response import TagKeyDeleteResponse
+from .types.tags_response import TagsResponse
 from .types.task_run_list_item import TaskRunListItem
 from .types.task_run_request_input_data_extraction_schema import TaskRunRequestInputDataExtractionSchema
 from .types.task_run_request_input_proxy_location import TaskRunRequestInputProxyLocation
 from .types.task_run_response import TaskRunResponse
 from .types.totp_code import TotpCode
+from .types.update_browser_profile_request_proxy_location import UpdateBrowserProfileRequestProxyLocation
 from .types.upload_file_response import UploadFileResponse
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
@@ -50,13 +59,13 @@ from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_status import WorkflowRunStatus
 from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.workflow_status import WorkflowStatus
+from .types.workflow_tags_batch_response import WorkflowTagsBatchResponse
 
 if typing.TYPE_CHECKING:
+    from .agents.client import AgentsClient, AsyncAgentsClient
     from .artifacts.client import ArtifactsClient, AsyncArtifactsClient
     from .schedules.client import AsyncSchedulesClient, SchedulesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
-    from .server.client import AsyncServerClient, ServerClient
-    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -128,10 +137,9 @@ class Skyvern:
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[ArtifactsClient] = None
-        self._server: typing.Optional[ServerClient] = None
-        self._workflows: typing.Optional[WorkflowsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
         self._schedules: typing.Optional[SchedulesClient] = None
+        self._agents: typing.Optional[AgentsClient] = None
 
     @property
     def with_raw_response(self) -> RawSkyvern:
@@ -331,7 +339,7 @@ class Skyvern:
     def run_workflow(
         self,
         *,
-        workflow_id: str,
+        agent_id: str,
         template: typing.Optional[bool] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
@@ -354,12 +362,12 @@ class Skyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
-        Run a workflow
+        Run an agent
 
         Parameters
         ----------
-        workflow_id : str
-            ID of the workflow to run. Workflow ID starts with `wpid_`.
+        agent_id : str
+            ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.
 
         template : typing.Optional[bool]
 
@@ -457,7 +465,7 @@ class Skyvern:
         Returns
         -------
         WorkflowRunResponse
-            Successfully run workflow
+            Successfully ran agent
 
         Examples
         --------
@@ -470,11 +478,11 @@ class Skyvern:
             max_steps_override=1,
             user_agent="x-user-agent",
             template=True,
-            workflow_id="wpid_123",
+            agent_id="wpid_123",
         )
         """
         _response = self._raw_client.run_workflow(
-            workflow_id=workflow_id,
+            agent_id=agent_id,
             template=template,
             max_steps_override=max_steps_override,
             user_agent=user_agent,
@@ -607,6 +615,7 @@ class Skyvern:
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
         status: typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]] = None,
+        tags: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[Workflow]:
@@ -642,6 +651,9 @@ class Skyvern:
             Filter workflows by folder ID
 
         status : typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]]
+
+        tags : typing.Optional[typing.Union[str, typing.Sequence[str]]]
+            Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`.
 
         template : typing.Optional[bool]
 
@@ -682,6 +694,7 @@ class Skyvern:
             title=title,
             folder_id=folder_id,
             status=status,
+            tags=tags,
             template=template,
             request_options=request_options,
         )
@@ -696,7 +709,7 @@ class Skyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Create a new workflow
+        Create a new agent
 
         Parameters
         ----------
@@ -715,7 +728,7 @@ class Skyvern:
         Returns
         -------
         Workflow
-            Successfully created workflow
+            Successfully created agent
 
         Examples
         --------
@@ -745,12 +758,12 @@ class Skyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Update a workflow
+        Update an agent
 
         Parameters
         ----------
         workflow_id : str
-            The ID of the workflow to update. Workflow ID starts with `wpid_`.
+            The ID of the agent to update. Starts with `wpid_`.
 
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
@@ -764,7 +777,7 @@ class Skyvern:
         Returns
         -------
         Workflow
-            Successfully updated workflow
+            Successfully updated agent
 
         Examples
         --------
@@ -789,12 +802,12 @@ class Skyvern:
         self, workflow_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
         """
-        Delete a workflow
+        Delete an agent
 
         Parameters
         ----------
         workflow_id : str
-            The ID of the workflow to delete. Workflow ID starts with `wpid_`.
+            The ID of the agent to delete. Starts with `wpid_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -802,7 +815,7 @@ class Skyvern:
         Returns
         -------
         typing.Optional[typing.Any]
-            Successfully deleted workflow
+            Successfully deleted agent
 
         Examples
         --------
@@ -1028,31 +1041,19 @@ class Skyvern:
         )
         return _response.data
 
-    def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        *,
-        folder_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Workflow:
+    def list_tag_keys(self, *, request_options: typing.Optional[RequestOptions] = None) -> typing.List[TagKey]:
         """
-        Update a workflow's folder assignment for the latest version
+        List all tag keys registered for the organization with their descriptions.
 
         Parameters
         ----------
-        workflow_permanent_id : str
-            Workflow permanent ID
-
-        folder_id : typing.Optional[str]
-            Folder ID to assign workflow to. Set to null to remove from folder.
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
         Returns
         -------
-        Workflow
-            Successfully updated workflow folder
+        typing.List[TagKey]
+            Successfully retrieved tag keys
 
         Examples
         --------
@@ -1061,12 +1062,155 @@ class Skyvern:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        client.update_workflow_folder(
-            workflow_permanent_id="wpid_123",
+        client.list_tag_keys()
+        """
+        _response = self._raw_client.list_tag_keys(request_options=request_options)
+        return _response.data
+
+    def delete_tag_key(
+        self, key: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> TagKeyDeleteResponse:
+        """
+        Delete a tag key from the organization registry and remove that tag from every workflow that currently has it (cascade). Returns how many workflows the tag was removed from.
+
+        Parameters
+        ----------
+        key : str
+            Tag key to delete
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagKeyDeleteResponse
+            Successfully deleted tag key
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.delete_tag_key(
+            key="env",
         )
         """
-        _response = self._raw_client.update_workflow_folder(
-            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        _response = self._raw_client.delete_tag_key(key, request_options=request_options)
+        return _response.data
+
+    def update_tag_key(
+        self,
+        key: str,
+        *,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TagKey:
+        """
+        Update the description for a tag key.
+
+        Parameters
+        ----------
+        key : str
+            Tag key to update
+
+        description : typing.Optional[str]
+            Free-form description (max 500 chars). Pass null to clear.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagKey
+            Successfully updated tag key
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_tag_key(
+            key="key",
+        )
+        """
+        _response = self._raw_client.update_tag_key(key, description=description, request_options=request_options)
+        return _response.data
+
+    def batch_get_workflow_tags(
+        self,
+        *,
+        workflow_permanent_ids: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowTagsBatchResponse:
+        """
+        Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.
+
+        Parameters
+        ----------
+        workflow_permanent_ids : typing.Optional[str]
+            Comma-separated workflow permanent IDs
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowTagsBatchResponse
+            Successfully retrieved tags
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.batch_get_workflow_tags(
+            workflow_permanent_ids="workflow_permanent_ids",
+        )
+        """
+        _response = self._raw_client.batch_get_workflow_tags(
+            workflow_permanent_ids=workflow_permanent_ids, request_options=request_options
+        )
+        return _response.data
+
+    def batch_get_workflow_tags_post(
+        self,
+        *,
+        workflow_permanent_ids: typing.Optional[typing.Sequence[str]] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowTagsBatchResponse:
+        """
+        Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).
+
+        Parameters
+        ----------
+        workflow_permanent_ids : typing.Optional[typing.Sequence[str]]
+            Workflow permanent IDs to fetch tags for.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowTagsBatchResponse
+            Successfully retrieved tags
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.batch_get_workflow_tags_post()
+        """
+        _response = self._raw_client.batch_get_workflow_tags_post(
+            workflow_permanent_ids=workflow_permanent_ids, request_options=request_options
         )
         return _response.data
 
@@ -1184,33 +1328,19 @@ class Skyvern:
         _response = self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
-    def retry_workflow_run(
-        self,
-        workflow_run_id: str,
-        *,
-        max_steps_override: typing.Optional[int] = None,
-        user_agent: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunResponse:
+    def get_version(self, *, request_options: typing.Optional[RequestOptions] = None) -> typing.Dict[str, str]:
         """
-        Retry a workflow run using the original run parameters.
+        Returns the current Skyvern server version (git SHA for official builds).
 
         Parameters
         ----------
-        workflow_run_id : str
-            The id of the workflow run to retry.
-
-        max_steps_override : typing.Optional[int]
-
-        user_agent : typing.Optional[str]
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
         Returns
         -------
-        WorkflowRunResponse
-            Successfully retried workflow run
+        typing.Dict[str, str]
+            Current server version
 
         Examples
         --------
@@ -1219,18 +1349,9 @@ class Skyvern:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        client.retry_workflow_run(
-            workflow_run_id="wr_123",
-            max_steps_override=1,
-            user_agent="x-user-agent",
-        )
+        client.get_version()
         """
-        _response = self._raw_client.retry_workflow_run(
-            workflow_run_id,
-            max_steps_override=max_steps_override,
-            user_agent=user_agent,
-            request_options=request_options,
-        )
+        _response = self._raw_client.get_version(request_options=request_options)
         return _response.data
 
     def get_runs_v2(
@@ -1277,256 +1398,6 @@ class Skyvern:
         """
         _response = self._raw_client.get_runs_v2(
             page=page, page_size=page_size, status=status, search_key=search_key, request_options=request_options
-        )
-        return _response.data
-
-    def get_workflow_runs(
-        self,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
-        search_key: typing.Optional[str] = None,
-        error_code: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[WorkflowRun]:
-        """
-        List workflow runs across all workflows for the current organization.
-
-        Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
-
-        ### search_key
-
-        A case-insensitive substring search that matches against **any** of the following fields:
-
-        | Searched field | Description |
-        |---|---|
-        | `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
-        | Parameter **key** | The `key` of any workflow parameter definition associated with the run |
-        | Parameter **description** | The `description` of any workflow parameter definition |
-        | Run parameter **value** | The actual value supplied for any parameter when the run was created |
-        | `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
-
-        Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
-
-        ### error_code
-
-        An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
-
-        ### Combining filters
-
-        All query parameters use AND logic:
-        - `?status=failed` — only failed runs
-        - `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
-        - `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
-
-        Parameters
-        ----------
-        page : typing.Optional[int]
-            Page number for pagination.
-
-        page_size : typing.Optional[int]
-            Number of runs to return per page.
-
-        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
-            Filter by one or more run statuses.
-
-        search_key : typing.Optional[str]
-            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
-
-        error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[WorkflowRun]
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_workflow_runs(
-            page=1,
-            page_size=1,
-            search_key="search_key",
-            error_code="error_code",
-        )
-        """
-        _response = self._raw_client.get_workflow_runs(
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            request_options=request_options,
-        )
-        return _response.data
-
-    def get_workflow_runs_by_id(
-        self,
-        workflow_id: str,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
-        search_key: typing.Optional[str] = None,
-        error_code: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[WorkflowRun]:
-        """
-        List runs for a specific workflow.
-
-        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
-
-        ### search_key
-
-        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
-
-        ### error_code
-
-        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
-
-        Parameters
-        ----------
-        workflow_id : str
-
-        page : typing.Optional[int]
-            Page number for pagination.
-
-        page_size : typing.Optional[int]
-            Number of runs to return per page.
-
-        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
-            Filter by one or more run statuses.
-
-        search_key : typing.Optional[str]
-            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
-
-        error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[WorkflowRun]
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_workflow_runs_by_id(
-            workflow_id="workflow_id",
-            page=1,
-            page_size=1,
-            search_key="search_key",
-            error_code="error_code",
-        )
-        """
-        _response = self._raw_client.get_workflow_runs_by_id(
-            workflow_id,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            request_options=request_options,
-        )
-        return _response.data
-
-    def get_workflow(
-        self,
-        workflow_permanent_id: str,
-        *,
-        version: typing.Optional[int] = None,
-        template: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Workflow:
-        """
-        Parameters
-        ----------
-        workflow_permanent_id : str
-
-        version : typing.Optional[int]
-
-        template : typing.Optional[bool]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Workflow
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_workflow(
-            workflow_permanent_id="workflow_permanent_id",
-            version=1,
-            template=True,
-        )
-        """
-        _response = self._raw_client.get_workflow(
-            workflow_permanent_id, version=version, template=template, request_options=request_options
-        )
-        return _response.data
-
-    def get_workflow_versions(
-        self,
-        workflow_permanent_id: str,
-        *,
-        template: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[Workflow]:
-        """
-        Get all versions of a workflow by its permanent ID.
-
-        Parameters
-        ----------
-        workflow_permanent_id : str
-
-        template : typing.Optional[bool]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[Workflow]
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_workflow_versions(
-            workflow_permanent_id="workflow_permanent_id",
-            template=True,
-        )
-        """
-        _response = self._raw_client.get_workflow_versions(
-            workflow_permanent_id, template=template, request_options=request_options
         )
         return _response.data
 
@@ -1620,7 +1491,7 @@ class Skyvern:
         description: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserProfileRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
@@ -1640,6 +1511,12 @@ class Skyvern:
 
         workflow_run_id : typing.Optional[str]
             Workflow run whose persisted session should be captured. Omit for a blank profile.
+
+        proxy_location : typing.Optional[CreateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Explicit sticky-session id for this profile's pinned proxy identity.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1742,7 +1619,7 @@ class Skyvern:
         *,
         name: typing.Optional[str] = OMIT,
         description: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[UpdateBrowserProfileRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -1761,8 +1638,14 @@ class Skyvern:
         description : typing.Optional[str]
             New description for the browser profile
 
+        proxy_location : typing.Optional[UpdateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Opaque Skyvern-managed proxy sticky-session id.
+
         rotate_proxy_session_id : typing.Optional[bool]
-            Rotate the Skyvern-managed proxy sticky-session id for this browser profile.
+            Rotate the Skyvern-managed proxy sticky-session id for this profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1828,10 +1711,10 @@ class Skyvern:
         url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
-        proxy_session_id: typing.Optional[str] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
+        generate_browser_profile: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
@@ -1882,9 +1765,6 @@ class Skyvern:
             For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
-        proxy_session_id : typing.Optional[str]
-            Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
-
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
@@ -1893,6 +1773,9 @@ class Skyvern:
 
         browser_profile_id : typing.Optional[str]
             ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.
+
+        generate_browser_profile : typing.Optional[bool]
+            When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1915,10 +1798,10 @@ class Skyvern:
             url=url,
             timeout=timeout,
             proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
             extensions=extensions,
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
+            generate_browser_profile=generate_browser_profile,
             request_options=request_options,
         )
         return _response.data
@@ -1987,6 +1870,49 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_browser_session(browser_session_id, request_options=request_options)
+        return _response.data
+
+    def update_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        generate_browser_profile: bool,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserSessionResponse:
+        """
+        Update a live browser session. Currently supports toggling generate_browser_profile, which is read when the session ends to decide whether to save its browser profile.
+
+        Parameters
+        ----------
+        browser_session_id : str
+            The ID of the browser session. browser_session_id starts with `pbs_`
+
+        generate_browser_profile : bool
+            Enable or disable saving this session's browser profile when it ends. Can be toggled while the session is still alive; the value is read at session teardown.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserSessionResponse
+            Successfully updated browser session
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_browser_session(
+            browser_session_id="pbs_123456",
+            generate_browser_profile=True,
+        )
+        """
+        _response = self._raw_client.update_browser_session(
+            browser_session_id, generate_browser_profile=generate_browser_profile, request_options=request_options
+        )
         return _response.data
 
     def send_totp_code(
@@ -2070,6 +1996,8 @@ class Skyvern:
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
         vault_type: typing.Optional[CredentialVaultType] = None,
+        credential_type: typing.Optional[SkyvernForgeSdkSchemasCredentialsCredentialType] = None,
+        search: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[CredentialResponse]:
         """
@@ -2084,7 +2012,13 @@ class Skyvern:
             Number of items per page
 
         vault_type : typing.Optional[CredentialVaultType]
-            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
+            Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')
+
+        credential_type : typing.Optional[SkyvernForgeSdkSchemasCredentialsCredentialType]
+            Filter credentials by type (e.g. 'password', 'credit_card', 'secret')
+
+        search : typing.Optional[str]
+            Case-insensitive search across credential name, username, secret label, and card details
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2104,11 +2038,18 @@ class Skyvern:
         client.get_credentials(
             page=1,
             page_size=10,
-            vault_type="bitwarden",
+            vault_type="skyvern",
+            credential_type="password",
+            search="search",
         )
         """
         _response = self._raw_client.get_credentials(
-            page=page, page_size=page_size, vault_type=vault_type, request_options=request_options
+            page=page,
+            page_size=page_size,
+            vault_type=vault_type,
+            credential_type=credential_type,
+            search=search,
+            request_options=request_options,
         )
         return _response.data
 
@@ -2119,7 +2060,7 @@ class Skyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -2141,8 +2082,14 @@ class Skyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
         rotate_proxy_session_id : typing.Optional[bool]
-            Rotate the Skyvern-managed proxy sticky-session id for this credential.
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2188,7 +2135,7 @@ class Skyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -2213,8 +2160,14 @@ class Skyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
         rotate_proxy_session_id : typing.Optional[bool]
-            Rotate the Skyvern-managed proxy sticky-session id for this credential.
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2802,6 +2755,520 @@ class Skyvern:
         )
         return _response.data
 
+    def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow's folder assignment for the latest version
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        folder_id : typing.Optional[str]
+            Folder ID to assign workflow to. Set to null to remove from folder.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow folder
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.update_workflow_folder(
+            workflow_permanent_id="wpid_123",
+        )
+        """
+        _response = self._raw_client.update_workflow_folder(
+            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        )
+        return _response.data
+
+    def get_workflow_tags(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> TagsResponse:
+        """
+        Get the current tag state for a workflow.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagsResponse
+            Successfully retrieved tags
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_tags(
+            workflow_permanent_id="wpid_123",
+        )
+        """
+        _response = self._raw_client.get_workflow_tags(workflow_permanent_id, request_options=request_options)
+        return _response.data
+
+    def apply_workflow_tags(
+        self,
+        workflow_permanent_id: str,
+        *,
+        tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
+        tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TagsResponse:
+        """
+        Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        tags : typing.Optional[typing.Sequence[TagInput]]
+            Tags to set (overwrite). List of {key?, value} objects.
+
+        tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
+            Tags to soft-delete. List of {key?, value?} targets.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagsResponse
+            Successfully applied tag changes
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.apply_workflow_tags(
+            workflow_permanent_id="wpid_123",
+        )
+        """
+        _response = self._raw_client.apply_workflow_tags(
+            workflow_permanent_id, tags=tags, tags_to_delete=tags_to_delete, request_options=request_options
+        )
+        return _response.data
+
+    def delete_workflow_tag(
+        self, workflow_permanent_id: str, key: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> TagsResponse:
+        """
+        Soft-delete a single tag from a workflow. Writes a DELETE event row.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        key : str
+            Tag key to delete
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagsResponse
+            Successfully deleted tag (or no-op if absent)
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.delete_workflow_tag(
+            workflow_permanent_id="wpid_123",
+            key="env",
+        )
+        """
+        _response = self._raw_client.delete_workflow_tag(workflow_permanent_id, key, request_options=request_options)
+        return _response.data
+
+    def get_workflow_tag_history(
+        self,
+        workflow_permanent_id: str,
+        *,
+        limit: typing.Optional[int] = None,
+        since: typing.Optional[dt.datetime] = None,
+        key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TagHistoryResponse:
+        """
+        Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        limit : typing.Optional[int]
+            Max events to return
+
+        since : typing.Optional[dt.datetime]
+            Only return events at or after this timestamp
+
+        key : typing.Optional[str]
+            Filter to events for a single tag key
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagHistoryResponse
+            Successfully retrieved tag history
+
+        Examples
+        --------
+        import datetime
+
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_tag_history(
+            workflow_permanent_id="wpid_123",
+            limit=1,
+            since=datetime.datetime.fromisoformat(
+                "2024-01-15 09:30:00+00:00",
+            ),
+            key="key",
+        )
+        """
+        _response = self._raw_client.get_workflow_tag_history(
+            workflow_permanent_id, limit=limit, since=since, key=key, request_options=request_options
+        )
+        return _response.data
+
+    def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successfully retried workflow run
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.retry_workflow_run(
+            workflow_run_id="wr_123",
+            max_steps_override=1,
+            user_agent="x-user-agent",
+        )
+        """
+        _response = self._raw_client.retry_workflow_run(
+            workflow_run_id,
+            max_steps_override=max_steps_override,
+            user_agent=user_agent,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def get_workflow_runs(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List workflow runs across all workflows for the current organization.
+
+        Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
+
+        ### search_key
+
+        A case-insensitive substring search that matches against **any** of the following fields:
+
+        | Searched field | Description |
+        |---|---|
+        | `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
+        | Parameter **key** | The `key` of any workflow parameter definition associated with the run |
+        | Parameter **description** | The `description` of any workflow parameter definition |
+        | Run parameter **value** | The actual value supplied for any parameter when the run was created |
+        | `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
+
+        Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
+
+        ### error_code
+
+        An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
+
+        ### Combining filters
+
+        All query parameters use AND logic:
+        - `?status=failed` — only failed runs
+        - `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
+        - `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_runs(
+            page=1,
+            page_size=1,
+            search_key="search_key",
+            error_code="error_code",
+        )
+        """
+        _response = self._raw_client.get_workflow_runs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def get_workflow_runs_by_id(
+        self,
+        workflow_id: str,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List runs for a specific workflow.
+
+        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+        ### search_key
+
+        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+        ### error_code
+
+        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
+        Parameters
+        ----------
+        workflow_id : str
+
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_runs_by_id(
+            workflow_id="workflow_id",
+            page=1,
+            page_size=1,
+            search_key="search_key",
+            error_code="error_code",
+        )
+        """
+        _response = self._raw_client.get_workflow_runs_by_id(
+            workflow_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow(
+            workflow_permanent_id="workflow_permanent_id",
+            version=1,
+            template=True,
+        )
+        """
+        _response = self._raw_client.get_workflow(
+            workflow_permanent_id, version=version, template=template, request_options=request_options
+        )
+        return _response.data
+
+    def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.get_workflow_versions(
+            workflow_permanent_id="workflow_permanent_id",
+            template=True,
+        )
+        """
+        _response = self._raw_client.get_workflow_versions(
+            workflow_permanent_id, template=template, request_options=request_options
+        )
+        return _response.data
+
     @property
     def artifacts(self):
         if self._artifacts is None:
@@ -2809,22 +3276,6 @@ class Skyvern:
 
             self._artifacts = ArtifactsClient(client_wrapper=self._client_wrapper)
         return self._artifacts
-
-    @property
-    def server(self):
-        if self._server is None:
-            from .server.client import ServerClient  # noqa: E402
-
-            self._server = ServerClient(client_wrapper=self._client_wrapper)
-        return self._server
-
-    @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import WorkflowsClient  # noqa: E402
-
-            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
 
     @property
     def scripts(self):
@@ -2841,6 +3292,14 @@ class Skyvern:
 
             self._schedules = SchedulesClient(client_wrapper=self._client_wrapper)
         return self._schedules
+
+    @property
+    def agents(self):
+        if self._agents is None:
+            from .agents.client import AgentsClient  # noqa: E402
+
+            self._agents = AgentsClient(client_wrapper=self._client_wrapper)
+        return self._agents
 
 
 class AsyncSkyvern:
@@ -2910,10 +3369,9 @@ class AsyncSkyvern:
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
         self._artifacts: typing.Optional[AsyncArtifactsClient] = None
-        self._server: typing.Optional[AsyncServerClient] = None
-        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
         self._schedules: typing.Optional[AsyncSchedulesClient] = None
+        self._agents: typing.Optional[AsyncAgentsClient] = None
 
     @property
     def with_raw_response(self) -> AsyncRawSkyvern:
@@ -3121,7 +3579,7 @@ class AsyncSkyvern:
     async def run_workflow(
         self,
         *,
-        workflow_id: str,
+        agent_id: str,
         template: typing.Optional[bool] = None,
         max_steps_override: typing.Optional[int] = None,
         user_agent: typing.Optional[str] = None,
@@ -3144,12 +3602,12 @@ class AsyncSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
-        Run a workflow
+        Run an agent
 
         Parameters
         ----------
-        workflow_id : str
-            ID of the workflow to run. Workflow ID starts with `wpid_`.
+        agent_id : str
+            ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.
 
         template : typing.Optional[bool]
 
@@ -3247,7 +3705,7 @@ class AsyncSkyvern:
         Returns
         -------
         WorkflowRunResponse
-            Successfully run workflow
+            Successfully ran agent
 
         Examples
         --------
@@ -3265,14 +3723,14 @@ class AsyncSkyvern:
                 max_steps_override=1,
                 user_agent="x-user-agent",
                 template=True,
-                workflow_id="wpid_123",
+                agent_id="wpid_123",
             )
 
 
         asyncio.run(main())
         """
         _response = await self._raw_client.run_workflow(
-            workflow_id=workflow_id,
+            agent_id=agent_id,
             template=template,
             max_steps_override=max_steps_override,
             user_agent=user_agent,
@@ -3429,6 +3887,7 @@ class AsyncSkyvern:
         title: typing.Optional[str] = None,
         folder_id: typing.Optional[str] = None,
         status: typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]] = None,
+        tags: typing.Optional[typing.Union[str, typing.Sequence[str]]] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[Workflow]:
@@ -3464,6 +3923,9 @@ class AsyncSkyvern:
             Filter workflows by folder ID
 
         status : typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]]
+
+        tags : typing.Optional[typing.Union[str, typing.Sequence[str]]]
+            Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`.
 
         template : typing.Optional[bool]
 
@@ -3512,6 +3974,7 @@ class AsyncSkyvern:
             title=title,
             folder_id=folder_id,
             status=status,
+            tags=tags,
             template=template,
             request_options=request_options,
         )
@@ -3526,7 +3989,7 @@ class AsyncSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Create a new workflow
+        Create a new agent
 
         Parameters
         ----------
@@ -3545,7 +4008,7 @@ class AsyncSkyvern:
         Returns
         -------
         Workflow
-            Successfully created workflow
+            Successfully created agent
 
         Examples
         --------
@@ -3583,12 +4046,12 @@ class AsyncSkyvern:
         request_options: typing.Optional[RequestOptions] = None,
     ) -> Workflow:
         """
-        Update a workflow
+        Update an agent
 
         Parameters
         ----------
         workflow_id : str
-            The ID of the workflow to update. Workflow ID starts with `wpid_`.
+            The ID of the agent to update. Starts with `wpid_`.
 
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
@@ -3602,7 +4065,7 @@ class AsyncSkyvern:
         Returns
         -------
         Workflow
-            Successfully updated workflow
+            Successfully updated agent
 
         Examples
         --------
@@ -3635,12 +4098,12 @@ class AsyncSkyvern:
         self, workflow_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
         """
-        Delete a workflow
+        Delete an agent
 
         Parameters
         ----------
         workflow_id : str
-            The ID of the workflow to delete. Workflow ID starts with `wpid_`.
+            The ID of the agent to delete. Starts with `wpid_`.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3648,7 +4111,7 @@ class AsyncSkyvern:
         Returns
         -------
         typing.Optional[typing.Any]
-            Successfully deleted workflow
+            Successfully deleted agent
 
         Examples
         --------
@@ -3922,31 +4385,19 @@ class AsyncSkyvern:
         )
         return _response.data
 
-    async def update_workflow_folder(
-        self,
-        workflow_permanent_id: str,
-        *,
-        folder_id: typing.Optional[str] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Workflow:
+    async def list_tag_keys(self, *, request_options: typing.Optional[RequestOptions] = None) -> typing.List[TagKey]:
         """
-        Update a workflow's folder assignment for the latest version
+        List all tag keys registered for the organization with their descriptions.
 
         Parameters
         ----------
-        workflow_permanent_id : str
-            Workflow permanent ID
-
-        folder_id : typing.Optional[str]
-            Folder ID to assign workflow to. Set to null to remove from folder.
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
         Returns
         -------
-        Workflow
-            Successfully updated workflow folder
+        typing.List[TagKey]
+            Successfully retrieved tag keys
 
         Examples
         --------
@@ -3960,15 +4411,190 @@ class AsyncSkyvern:
 
 
         async def main() -> None:
-            await client.update_workflow_folder(
-                workflow_permanent_id="wpid_123",
+            await client.list_tag_keys()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.list_tag_keys(request_options=request_options)
+        return _response.data
+
+    async def delete_tag_key(
+        self, key: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> TagKeyDeleteResponse:
+        """
+        Delete a tag key from the organization registry and remove that tag from every workflow that currently has it (cascade). Returns how many workflows the tag was removed from.
+
+        Parameters
+        ----------
+        key : str
+            Tag key to delete
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagKeyDeleteResponse
+            Successfully deleted tag key
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.delete_tag_key(
+                key="env",
             )
 
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.update_workflow_folder(
-            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        _response = await self._raw_client.delete_tag_key(key, request_options=request_options)
+        return _response.data
+
+    async def update_tag_key(
+        self,
+        key: str,
+        *,
+        description: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TagKey:
+        """
+        Update the description for a tag key.
+
+        Parameters
+        ----------
+        key : str
+            Tag key to update
+
+        description : typing.Optional[str]
+            Free-form description (max 500 chars). Pass null to clear.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagKey
+            Successfully updated tag key
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_tag_key(
+                key="key",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_tag_key(key, description=description, request_options=request_options)
+        return _response.data
+
+    async def batch_get_workflow_tags(
+        self,
+        *,
+        workflow_permanent_ids: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowTagsBatchResponse:
+        """
+        Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.
+
+        Parameters
+        ----------
+        workflow_permanent_ids : typing.Optional[str]
+            Comma-separated workflow permanent IDs
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowTagsBatchResponse
+            Successfully retrieved tags
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.batch_get_workflow_tags(
+                workflow_permanent_ids="workflow_permanent_ids",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.batch_get_workflow_tags(
+            workflow_permanent_ids=workflow_permanent_ids, request_options=request_options
+        )
+        return _response.data
+
+    async def batch_get_workflow_tags_post(
+        self,
+        *,
+        workflow_permanent_ids: typing.Optional[typing.Sequence[str]] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowTagsBatchResponse:
+        """
+        Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).
+
+        Parameters
+        ----------
+        workflow_permanent_ids : typing.Optional[typing.Sequence[str]]
+            Workflow permanent IDs to fetch tags for.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowTagsBatchResponse
+            Successfully retrieved tags
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.batch_get_workflow_tags_post()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.batch_get_workflow_tags_post(
+            workflow_permanent_ids=workflow_permanent_ids, request_options=request_options
         )
         return _response.data
 
@@ -4110,33 +4736,19 @@ class AsyncSkyvern:
         _response = await self._raw_client.get_run_timeline(run_id, request_options=request_options)
         return _response.data
 
-    async def retry_workflow_run(
-        self,
-        workflow_run_id: str,
-        *,
-        max_steps_override: typing.Optional[int] = None,
-        user_agent: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> WorkflowRunResponse:
+    async def get_version(self, *, request_options: typing.Optional[RequestOptions] = None) -> typing.Dict[str, str]:
         """
-        Retry a workflow run using the original run parameters.
+        Returns the current Skyvern server version (git SHA for official builds).
 
         Parameters
         ----------
-        workflow_run_id : str
-            The id of the workflow run to retry.
-
-        max_steps_override : typing.Optional[int]
-
-        user_agent : typing.Optional[str]
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
         Returns
         -------
-        WorkflowRunResponse
-            Successfully retried workflow run
+        typing.Dict[str, str]
+            Current server version
 
         Examples
         --------
@@ -4150,21 +4762,12 @@ class AsyncSkyvern:
 
 
         async def main() -> None:
-            await client.retry_workflow_run(
-                workflow_run_id="wr_123",
-                max_steps_override=1,
-                user_agent="x-user-agent",
-            )
+            await client.get_version()
 
 
         asyncio.run(main())
         """
-        _response = await self._raw_client.retry_workflow_run(
-            workflow_run_id,
-            max_steps_override=max_steps_override,
-            user_agent=user_agent,
-            request_options=request_options,
-        )
+        _response = await self._raw_client.get_version(request_options=request_options)
         return _response.data
 
     async def get_runs_v2(
@@ -4219,288 +4822,6 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.get_runs_v2(
             page=page, page_size=page_size, status=status, search_key=search_key, request_options=request_options
-        )
-        return _response.data
-
-    async def get_workflow_runs(
-        self,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
-        search_key: typing.Optional[str] = None,
-        error_code: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[WorkflowRun]:
-        """
-        List workflow runs across all workflows for the current organization.
-
-        Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
-
-        ### search_key
-
-        A case-insensitive substring search that matches against **any** of the following fields:
-
-        | Searched field | Description |
-        |---|---|
-        | `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
-        | Parameter **key** | The `key` of any workflow parameter definition associated with the run |
-        | Parameter **description** | The `description` of any workflow parameter definition |
-        | Run parameter **value** | The actual value supplied for any parameter when the run was created |
-        | `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
-
-        Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
-
-        ### error_code
-
-        An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
-
-        ### Combining filters
-
-        All query parameters use AND logic:
-        - `?status=failed` — only failed runs
-        - `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
-        - `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
-
-        Parameters
-        ----------
-        page : typing.Optional[int]
-            Page number for pagination.
-
-        page_size : typing.Optional[int]
-            Number of runs to return per page.
-
-        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
-            Filter by one or more run statuses.
-
-        search_key : typing.Optional[str]
-            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
-
-        error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[WorkflowRun]
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_workflow_runs(
-                page=1,
-                page_size=1,
-                search_key="search_key",
-                error_code="error_code",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_workflow_runs(
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            request_options=request_options,
-        )
-        return _response.data
-
-    async def get_workflow_runs_by_id(
-        self,
-        workflow_id: str,
-        *,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
-        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
-        search_key: typing.Optional[str] = None,
-        error_code: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[WorkflowRun]:
-        """
-        List runs for a specific workflow.
-
-        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
-
-        ### search_key
-
-        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
-
-        ### error_code
-
-        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
-
-        Parameters
-        ----------
-        workflow_id : str
-
-        page : typing.Optional[int]
-            Page number for pagination.
-
-        page_size : typing.Optional[int]
-            Number of runs to return per page.
-
-        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
-            Filter by one or more run statuses.
-
-        search_key : typing.Optional[str]
-            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
-
-        error_code : typing.Optional[str]
-            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[WorkflowRun]
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_workflow_runs_by_id(
-                workflow_id="workflow_id",
-                page=1,
-                page_size=1,
-                search_key="search_key",
-                error_code="error_code",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_workflow_runs_by_id(
-            workflow_id,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            request_options=request_options,
-        )
-        return _response.data
-
-    async def get_workflow(
-        self,
-        workflow_permanent_id: str,
-        *,
-        version: typing.Optional[int] = None,
-        template: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> Workflow:
-        """
-        Parameters
-        ----------
-        workflow_permanent_id : str
-
-        version : typing.Optional[int]
-
-        template : typing.Optional[bool]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        Workflow
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_workflow(
-                workflow_permanent_id="workflow_permanent_id",
-                version=1,
-                template=True,
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_workflow(
-            workflow_permanent_id, version=version, template=template, request_options=request_options
-        )
-        return _response.data
-
-    async def get_workflow_versions(
-        self,
-        workflow_permanent_id: str,
-        *,
-        template: typing.Optional[bool] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> typing.List[Workflow]:
-        """
-        Get all versions of a workflow by its permanent ID.
-
-        Parameters
-        ----------
-        workflow_permanent_id : str
-
-        template : typing.Optional[bool]
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[Workflow]
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_workflow_versions(
-                workflow_permanent_id="workflow_permanent_id",
-                template=True,
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_workflow_versions(
-            workflow_permanent_id, template=template, request_options=request_options
         )
         return _response.data
 
@@ -4612,7 +4933,7 @@ class AsyncSkyvern:
         description: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateBrowserProfileRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserProfile:
@@ -4632,6 +4953,12 @@ class AsyncSkyvern:
 
         workflow_run_id : typing.Optional[str]
             Workflow run whose persisted session should be captured. Omit for a blank profile.
+
+        proxy_location : typing.Optional[CreateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Explicit sticky-session id for this profile's pinned proxy identity.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4758,7 +5085,7 @@ class AsyncSkyvern:
         *,
         name: typing.Optional[str] = OMIT,
         description: typing.Optional[str] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[UpdateBrowserProfileRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -4777,8 +5104,14 @@ class AsyncSkyvern:
         description : typing.Optional[str]
             New description for the browser profile
 
+        proxy_location : typing.Optional[UpdateBrowserProfileRequestProxyLocation]
+            Optional proxy location for this profile's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Opaque Skyvern-managed proxy sticky-session id.
+
         rotate_proxy_session_id : typing.Optional[bool]
-            Rotate the Skyvern-managed proxy sticky-session id for this browser profile.
+            Rotate the Skyvern-managed proxy sticky-session id for this profile.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4860,10 +5193,10 @@ class AsyncSkyvern:
         url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
-        proxy_session_id: typing.Optional[str] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
+        generate_browser_profile: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
@@ -4914,9 +5247,6 @@ class AsyncSkyvern:
             For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
-        proxy_session_id : typing.Optional[str]
-            Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
-
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
@@ -4925,6 +5255,9 @@ class AsyncSkyvern:
 
         browser_profile_id : typing.Optional[str]
             ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.
+
+        generate_browser_profile : typing.Optional[bool]
+            When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -4955,10 +5288,10 @@ class AsyncSkyvern:
             url=url,
             timeout=timeout,
             proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
             extensions=extensions,
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
+            generate_browser_profile=generate_browser_profile,
             request_options=request_options,
         )
         return _response.data
@@ -5043,6 +5376,57 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_browser_session(browser_session_id, request_options=request_options)
+        return _response.data
+
+    async def update_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        generate_browser_profile: bool,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> BrowserSessionResponse:
+        """
+        Update a live browser session. Currently supports toggling generate_browser_profile, which is read when the session ends to decide whether to save its browser profile.
+
+        Parameters
+        ----------
+        browser_session_id : str
+            The ID of the browser session. browser_session_id starts with `pbs_`
+
+        generate_browser_profile : bool
+            Enable or disable saving this session's browser profile when it ends. Can be toggled while the session is still alive; the value is read at session teardown.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        BrowserSessionResponse
+            Successfully updated browser session
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_browser_session(
+                browser_session_id="pbs_123456",
+                generate_browser_profile=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_browser_session(
+            browser_session_id, generate_browser_profile=generate_browser_profile, request_options=request_options
+        )
         return _response.data
 
     async def send_totp_code(
@@ -5134,6 +5518,8 @@ class AsyncSkyvern:
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
         vault_type: typing.Optional[CredentialVaultType] = None,
+        credential_type: typing.Optional[SkyvernForgeSdkSchemasCredentialsCredentialType] = None,
+        search: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[CredentialResponse]:
         """
@@ -5148,7 +5534,13 @@ class AsyncSkyvern:
             Number of items per page
 
         vault_type : typing.Optional[CredentialVaultType]
-            Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')
+            Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')
+
+        credential_type : typing.Optional[SkyvernForgeSdkSchemasCredentialsCredentialType]
+            Filter credentials by type (e.g. 'password', 'credit_card', 'secret')
+
+        search : typing.Optional[str]
+            Case-insensitive search across credential name, username, secret label, and card details
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5173,14 +5565,21 @@ class AsyncSkyvern:
             await client.get_credentials(
                 page=1,
                 page_size=10,
-                vault_type="bitwarden",
+                vault_type="skyvern",
+                credential_type="password",
+                search="search",
             )
 
 
         asyncio.run(main())
         """
         _response = await self._raw_client.get_credentials(
-            page=page, page_size=page_size, vault_type=vault_type, request_options=request_options
+            page=page,
+            page_size=page_size,
+            vault_type=vault_type,
+            credential_type=credential_type,
+            search=search,
+            request_options=request_options,
         )
         return _response.data
 
@@ -5191,7 +5590,7 @@ class AsyncSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -5213,8 +5612,14 @@ class AsyncSkyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
         rotate_proxy_session_id : typing.Optional[bool]
-            Rotate the Skyvern-managed proxy sticky-session id for this credential.
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5268,7 +5673,7 @@ class AsyncSkyvern:
         credential_type: SkyvernForgeSdkSchemasCredentialsCredentialType,
         credential: CreateCredentialRequestCredential,
         vault_type: typing.Optional[CredentialVaultType] = OMIT,
-        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -5293,8 +5698,14 @@ class AsyncSkyvern:
         vault_type : typing.Optional[CredentialVaultType]
             Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.
 
+        proxy_location : typing.Optional[CreateCredentialRequestProxyLocation]
+            Optional proxy location for this credential's pinned proxy identity.
+
+        proxy_session_id : typing.Optional[str]
+            Optional advanced reuse key for this credential's pinned proxy identity.
+
         rotate_proxy_session_id : typing.Optional[bool]
-            Rotate the Skyvern-managed proxy sticky-session id for this credential.
+            Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5964,6 +6375,601 @@ class AsyncSkyvern:
         )
         return _response.data
 
+    async def update_workflow_folder(
+        self,
+        workflow_permanent_id: str,
+        *,
+        folder_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Update a workflow's folder assignment for the latest version
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        folder_id : typing.Optional[str]
+            Folder ID to assign workflow to. Set to null to remove from folder.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successfully updated workflow folder
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.update_workflow_folder(
+                workflow_permanent_id="wpid_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.update_workflow_folder(
+            workflow_permanent_id, folder_id=folder_id, request_options=request_options
+        )
+        return _response.data
+
+    async def get_workflow_tags(
+        self, workflow_permanent_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> TagsResponse:
+        """
+        Get the current tag state for a workflow.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagsResponse
+            Successfully retrieved tags
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_tags(
+                workflow_permanent_id="wpid_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_tags(workflow_permanent_id, request_options=request_options)
+        return _response.data
+
+    async def apply_workflow_tags(
+        self,
+        workflow_permanent_id: str,
+        *,
+        tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
+        tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TagsResponse:
+        """
+        Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        tags : typing.Optional[typing.Sequence[TagInput]]
+            Tags to set (overwrite). List of {key?, value} objects.
+
+        tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
+            Tags to soft-delete. List of {key?, value?} targets.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagsResponse
+            Successfully applied tag changes
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.apply_workflow_tags(
+                workflow_permanent_id="wpid_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.apply_workflow_tags(
+            workflow_permanent_id, tags=tags, tags_to_delete=tags_to_delete, request_options=request_options
+        )
+        return _response.data
+
+    async def delete_workflow_tag(
+        self, workflow_permanent_id: str, key: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> TagsResponse:
+        """
+        Soft-delete a single tag from a workflow. Writes a DELETE event row.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        key : str
+            Tag key to delete
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagsResponse
+            Successfully deleted tag (or no-op if absent)
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.delete_workflow_tag(
+                workflow_permanent_id="wpid_123",
+                key="env",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.delete_workflow_tag(
+            workflow_permanent_id, key, request_options=request_options
+        )
+        return _response.data
+
+    async def get_workflow_tag_history(
+        self,
+        workflow_permanent_id: str,
+        *,
+        limit: typing.Optional[int] = None,
+        since: typing.Optional[dt.datetime] = None,
+        key: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> TagHistoryResponse:
+        """
+        Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+            Workflow permanent ID
+
+        limit : typing.Optional[int]
+            Max events to return
+
+        since : typing.Optional[dt.datetime]
+            Only return events at or after this timestamp
+
+        key : typing.Optional[str]
+            Filter to events for a single tag key
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        TagHistoryResponse
+            Successfully retrieved tag history
+
+        Examples
+        --------
+        import asyncio
+        import datetime
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_tag_history(
+                workflow_permanent_id="wpid_123",
+                limit=1,
+                since=datetime.datetime.fromisoformat(
+                    "2024-01-15 09:30:00+00:00",
+                ),
+                key="key",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_tag_history(
+            workflow_permanent_id, limit=limit, since=since, key=key, request_options=request_options
+        )
+        return _response.data
+
+    async def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successfully retried workflow run
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.retry_workflow_run(
+                workflow_run_id="wr_123",
+                max_steps_override=1,
+                user_agent="x-user-agent",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.retry_workflow_run(
+            workflow_run_id,
+            max_steps_override=max_steps_override,
+            user_agent=user_agent,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def get_workflow_runs(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List workflow runs across all workflows for the current organization.
+
+        Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
+
+        ### search_key
+
+        A case-insensitive substring search that matches against **any** of the following fields:
+
+        | Searched field | Description |
+        |---|---|
+        | `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
+        | Parameter **key** | The `key` of any workflow parameter definition associated with the run |
+        | Parameter **description** | The `description` of any workflow parameter definition |
+        | Run parameter **value** | The actual value supplied for any parameter when the run was created |
+        | `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
+
+        Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
+
+        ### error_code
+
+        An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
+
+        ### Combining filters
+
+        All query parameters use AND logic:
+        - `?status=failed` — only failed runs
+        - `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
+        - `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_runs(
+                page=1,
+                page_size=1,
+                search_key="search_key",
+                error_code="error_code",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_runs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def get_workflow_runs_by_id(
+        self,
+        workflow_id: str,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List runs for a specific workflow.
+
+        Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+        ### search_key
+
+        Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+        ### error_code
+
+        Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
+        Parameters
+        ----------
+        workflow_id : str
+
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_runs_by_id(
+                workflow_id="workflow_id",
+                page=1,
+                page_size=1,
+                search_key="search_key",
+                error_code="error_code",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_runs_by_id(
+            workflow_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def get_workflow(
+        self,
+        workflow_permanent_id: str,
+        *,
+        version: typing.Optional[int] = None,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> Workflow:
+        """
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        version : typing.Optional[int]
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Workflow
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow(
+                workflow_permanent_id="workflow_permanent_id",
+                version=1,
+                template=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow(
+            workflow_permanent_id, version=version, template=template, request_options=request_options
+        )
+        return _response.data
+
+    async def get_workflow_versions(
+        self,
+        workflow_permanent_id: str,
+        *,
+        template: typing.Optional[bool] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+
+        Parameters
+        ----------
+        workflow_permanent_id : str
+
+        template : typing.Optional[bool]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Workflow]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_workflow_versions(
+                workflow_permanent_id="workflow_permanent_id",
+                template=True,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.get_workflow_versions(
+            workflow_permanent_id, template=template, request_options=request_options
+        )
+        return _response.data
+
     @property
     def artifacts(self):
         if self._artifacts is None:
@@ -5971,22 +6977,6 @@ class AsyncSkyvern:
 
             self._artifacts = AsyncArtifactsClient(client_wrapper=self._client_wrapper)
         return self._artifacts
-
-    @property
-    def server(self):
-        if self._server is None:
-            from .server.client import AsyncServerClient  # noqa: E402
-
-            self._server = AsyncServerClient(client_wrapper=self._client_wrapper)
-        return self._server
-
-    @property
-    def workflows(self):
-        if self._workflows is None:
-            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
-
-            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
-        return self._workflows
 
     @property
     def scripts(self):
@@ -6003,6 +6993,14 @@ class AsyncSkyvern:
 
             self._schedules = AsyncSchedulesClient(client_wrapper=self._client_wrapper)
         return self._schedules
+
+    @property
+    def agents(self):
+        if self._agents is None:
+            from .agents.client import AsyncAgentsClient  # noqa: E402
+
+            self._agents = AsyncAgentsClient(client_wrapper=self._client_wrapper)
+        return self._agents
 
 
 def _get_base_url(*, base_url: typing.Optional[str] = None, environment: SkyvernEnvironment) -> str:

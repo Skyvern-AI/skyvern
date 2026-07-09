@@ -19,6 +19,7 @@ from sse_starlette import EventSourceResponse
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
+from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -645,6 +646,9 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
         proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
+    code_artifact_metadata = getattr(agent_result, "code_artifact_metadata", None)
+    if code_artifact_metadata:
+        proposed_data["_copilot_code_artifact_metadata"] = code_artifact_metadata
     if _proposal_disposition(agent_result) == "review_untested":
         proposed_data["_copilot_unvalidated"] = True
     return proposed_data
@@ -928,6 +932,7 @@ async def _commit_staged_workflow(
         totp_verification_url=staged_workflow.totp_verification_url,
         totp_identifier=staged_workflow.totp_identifier,
         persist_browser_session=staged_workflow.persist_browser_session,
+        pin_saved_session_ip=staged_workflow.pin_saved_session_ip,
         browser_profile_id=staged_workflow.browser_profile_id,
         browser_profile_key=staged_workflow.browser_profile_key,
         model=staged_workflow.model,
@@ -938,6 +943,7 @@ async def _commit_staged_workflow(
         ai_fallback=staged_workflow.ai_fallback,
         cache_key=staged_workflow.cache_key,
         adaptive_caching=staged_workflow.adaptive_caching,
+        enable_self_healing=staged_workflow.enable_self_healing,
         code_version=staged_workflow.code_version,
         run_sequentially=staged_workflow.run_sequentially,
         sequential_key=staged_workflow.sequential_key,
@@ -965,6 +971,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         totp_verification_url=original_workflow.totp_verification_url,
         totp_identifier=original_workflow.totp_identifier,
         persist_browser_session=original_workflow.persist_browser_session,
+        pin_saved_session_ip=original_workflow.pin_saved_session_ip,
         browser_profile_id=original_workflow.browser_profile_id,
         browser_profile_key=original_workflow.browser_profile_key,
         model=original_workflow.model,
@@ -975,6 +982,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         ai_fallback=original_workflow.ai_fallback,
         cache_key=original_workflow.cache_key,
         adaptive_caching=original_workflow.adaptive_caching,
+        enable_self_healing=original_workflow.enable_self_healing,
         code_version=original_workflow.code_version,
         run_sequentially=original_workflow.run_sequentially,
         sequential_key=original_workflow.sequential_key,
@@ -1191,11 +1199,12 @@ async def copilot_call_llm(
         )
         applied_workflow_yaml = llm_workflow_yaml
         try:
-            updated_workflow = _process_workflow_yaml(
+            updated_workflow = await _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 organization_id=organization_id,
                 workflow_yaml=llm_workflow_yaml,
+                settings_fallback_yaml=chat_request.workflow_yaml,
             )
         except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
             await stream.send(
@@ -1218,11 +1227,12 @@ async def copilot_call_llm(
                 ),
                 chat_request.workflow_yaml,
             )
-            updated_workflow = _process_workflow_yaml(
+            updated_workflow = await _process_workflow_yaml(
                 workflow_id=chat_request.workflow_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 organization_id=organization_id,
                 workflow_yaml=corrected_workflow_yaml,
+                settings_fallback_yaml=chat_request.workflow_yaml,
             )
             applied_workflow_yaml = corrected_workflow_yaml
 
@@ -1559,11 +1569,33 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
     return workflow_yaml_request
 
 
-def _process_workflow_yaml(
+def _yaml_bool_setting(workflow_yaml: str | None, setting_name: str) -> bool | None:
+    if not workflow_yaml:
+        return None
+    try:
+        parsed = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get(setting_name)
+    return value if isinstance(value, bool) else None
+
+
+def _yaml_enable_self_healing(workflow_yaml: str | None) -> bool | None:
+    return _yaml_bool_setting(workflow_yaml, "enable_self_healing")
+
+
+def _yaml_pin_saved_session_ip(workflow_yaml: str | None) -> bool | None:
+    return _yaml_bool_setting(workflow_yaml, "pin_saved_session_ip")
+
+
+async def _process_workflow_yaml(
     workflow_id: str,
     workflow_permanent_id: str,
     organization_id: str,
     workflow_yaml: str,
+    settings_fallback_yaml: str | None = None,
 ) -> Workflow:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
@@ -1576,6 +1608,33 @@ def _process_workflow_yaml(
         workflow_definition_yaml=workflow_yaml_request.workflow_definition,
         workflow_id=workflow_id,
     )
+
+    enable_self_healing = workflow_yaml_request.enable_self_healing
+    if enable_self_healing is None:
+        # Copilot YAML routinely omits settings it didn't touch; omission must inherit —
+        # the canonical-persist comparison would otherwise read the schema default as an
+        # explicit disable. The submitted draft YAML wins over persisted state so an
+        # unsaved editor toggle survives an unrelated copilot edit. A persisted-lookup
+        # failure propagates: failing the save is safer than writing an implicit disable.
+        enable_self_healing = _yaml_enable_self_healing(settings_fallback_yaml)
+
+    pin_saved_session_ip = _yaml_pin_saved_session_ip(workflow_yaml)
+    if pin_saved_session_ip is None:
+        pin_saved_session_ip = _yaml_pin_saved_session_ip(settings_fallback_yaml)
+
+    current_workflow: Workflow | None = None
+    if enable_self_healing is None or pin_saved_session_ip is None:
+        try:
+            current_workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        except WorkflowNotFound:
+            current_workflow = None
+    if enable_self_healing is None:
+        enable_self_healing = bool(current_workflow and getattr(current_workflow, "enable_self_healing", False))
+    if pin_saved_session_ip is None:
+        pin_saved_session_ip = bool(current_workflow and getattr(current_workflow, "pin_saved_session_ip", False))
 
     now = datetime.now(timezone.utc)
     return Workflow(
@@ -1592,6 +1651,7 @@ def _process_workflow_yaml(
         totp_verification_url=workflow_yaml_request.totp_verification_url,
         totp_identifier=workflow_yaml_request.totp_identifier,
         persist_browser_session=workflow_yaml_request.persist_browser_session or False,
+        pin_saved_session_ip=pin_saved_session_ip,
         browser_profile_id=workflow_yaml_request.browser_profile_id,
         browser_profile_key=workflow_yaml_request.browser_profile_key,
         model=workflow_yaml_request.model,
@@ -1602,6 +1662,7 @@ def _process_workflow_yaml(
         ai_fallback=workflow_yaml_request.ai_fallback,
         cache_key=workflow_yaml_request.cache_key,
         adaptive_caching=workflow_yaml_request.adaptive_caching,
+        enable_self_healing=enable_self_healing,
         code_version=workflow_yaml_request.code_version,
         run_sequentially=workflow_yaml_request.run_sequentially,
         sequential_key=workflow_yaml_request.sequential_key,

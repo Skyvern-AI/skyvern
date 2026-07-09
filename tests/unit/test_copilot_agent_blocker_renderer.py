@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_goal_satisfied_exit_result,
     _build_output_policy_blocked_result,
     _build_turn_halt_exit_result,
+    _build_wip_exit_result,
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
     _verified_workflow_success_reply,
@@ -30,6 +31,7 @@ from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPol
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
+from tests.unit.conftest import make_copilot_context as _ctx
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
 # (instead of hand-copying) guarantees the test stays in sync if a new token
@@ -41,17 +43,6 @@ _LEAK_TOKENS_FULL = _LEAK_DENY_TOKENS
 # automatically rather than silently passing with stale values.
 _ALL_BLOCKER_KINDS: tuple[BlockerKind, ...] = get_args(BlockerKind)
 _ALL_RECOVERY_HINTS: tuple[RecoveryHint, ...] = get_args(RecoveryHint)
-
-
-def _ctx() -> CopilotContext:
-    return CopilotContext(
-        organization_id="org",
-        workflow_id="wf",
-        workflow_permanent_id="wfp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
 
 
 def _signal(
@@ -824,6 +815,30 @@ def test_unverified_blocker_still_renders_blocker_text() -> None:
 
     assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
     assert overridden.proposal_disposition != "review_tested"
+
+
+def test_delivered_unverified_exit_renders_observed_output_as_unvalidated() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert "document_name: Resale Demand Package" in result.user_response
+    assert "not independently verified" in result.user_response
+    assert result.proposal_disposition == "review_untested"
+    assert result.workflow_yaml == ctx.last_workflow_yaml
 
 
 def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:

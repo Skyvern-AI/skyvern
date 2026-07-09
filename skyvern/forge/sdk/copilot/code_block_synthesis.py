@@ -156,6 +156,9 @@ class SynthesisDiagnostics:
     truncated: bool = False
     dropped_interactions: list[dict[str, Any]] = field(default_factory=list)
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
+    # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
+    # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
+    typed_param_bindings: list[tuple[int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -907,6 +910,7 @@ def synthesize_code_block(
                 parameters.append(parameter)
                 if typed_identity is not None:
                     typed_param_keys[typed_identity] = param_key
+            diagnostics.typed_param_bindings.append((trajectory_index, param_key))
             lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
             append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
@@ -1069,6 +1073,8 @@ def build_artifact_metadata_skeleton(
                 "text": _FILL_CRITERION_TEXT,
                 "level": "terminal",
                 "terminal": True,
+                "judgment_predicate": None,
+                "judgment_polarity_when_holds": None,
             }
         ],
         "terminal_verifier_expectations": [

@@ -91,11 +91,6 @@ export default {
           cta: "hsl(var(--brand-cta))",
           "cta-foreground": "hsl(var(--brand-cta-foreground))",
         },
-        studio: {
-          accent: "hsl(var(--studio-accent))",
-          "accent-foreground": "hsl(var(--studio-accent-foreground))",
-          "accent-2": "hsl(var(--studio-accent-2))",
-        },
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -147,6 +142,10 @@ export default {
           "0%, 100%": { boxShadow: "0 0 8px 2px rgba(234, 179, 8, 0.3)" },
           "50%": { boxShadow: "0 0 24px 8px rgba(234, 179, 8, 0.6)" },
         },
+        "analytics-pulse-ring": {
+          from: { boxShadow: "0 0 0 0 hsl(var(--foreground) / 0.35)" },
+          to: { boxShadow: "0 0 0 8px hsl(var(--foreground) / 0)" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
@@ -159,6 +158,7 @@ export default {
         "collapsible-up-fade":
           "collapsible-up-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
         glow: "glow 2.5s ease-in-out infinite",
+        "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
       },
     },
   },

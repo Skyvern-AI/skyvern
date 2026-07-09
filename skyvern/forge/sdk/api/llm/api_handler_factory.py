@@ -34,6 +34,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
+    is_content_filtered_response,
     is_image_message,
     is_truncated_response,
     llm_messages_builder,
@@ -88,6 +89,16 @@ VISION_FALLBACK_PROMPT_NAMES = {
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
+
+# Gemini's default safety filters reject legitimate automation content, returning
+# finish_reason=content_filter with empty output that breaks downstream JSON parsing.
+# Disable them for agent LLM calls; drop_params=True strips this on non-Gemini providers.
+GEMINI_SAFETY_SETTINGS: list[dict[str, str]] = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
 
 
 def _set_llm_context_attrs(
@@ -288,6 +299,21 @@ def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any
             if model_dict.get("model_name") == main_model_group:
                 return model_dict
     return None
+
+
+def _inject_gemini_safety_settings(model_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach safety_settings to Gemini deployments only, in place.
+
+    Setting it as a request-level param instead rides along to whichever deployment the
+    router selects, so a non-Gemini fallback (e.g. Azure) 400s on the unknown `safety_settings`
+    param and the fallback hop dies. Per-deployment keeps it off the fallback. SKY-11766.
+    """
+    for deployment in model_list:
+        litellm_params = deployment.get("litellm_params") or {}
+        if "gemini" in str(litellm_params.get("model", "")).lower():
+            litellm_params.setdefault("safety_settings", GEMINI_SAFETY_SETTINGS)
+            deployment["litellm_params"] = litellm_params
+    return model_list
 
 
 class LLMCallStats(BaseModel):
@@ -966,7 +992,7 @@ class LLMAPIHandlerFactory:
         fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
 
         router = litellm.Router(
-            model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
+            model_list=_inject_gemini_safety_settings([dataclasses.asdict(model) for model in llm_config.model_list]),
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
@@ -1352,6 +1378,43 @@ class LLMAPIHandlerFactory:
                                     (getattr(_fb_detail, "reasoning_tokens", 0) or 0) if _fb_detail else 0
                                 ),
                             )
+
+                    # A content_filter response with empty content is a valid ModelResponse,
+                    # so litellm's router fallback (which only fires on exceptions) never
+                    # recovers it. Gemini's non-configurable safety filters block PII-heavy
+                    # prompts that safety_settings=BLOCK_NONE cannot recover, so retrying on
+                    # another Gemini tier hits the same block — jump straight to the first
+                    # non-Gemini fallback group. Fires for any Gemini model that produced the
+                    # block, including a standard tier litellm already fell back to (SKY-11766).
+                    non_gemini_fallback = next(
+                        (group for group in fallback_groups if "gemini" not in group.lower()), None
+                    )
+                    if (
+                        is_content_filtered_response(response)
+                        and non_gemini_fallback is not None
+                        and "gemini" in (model_used or "").lower()
+                    ):
+                        fallback_model = non_gemini_fallback
+                        LOG.warning(
+                            "LLM response blocked by content filter on Gemini, retrying with non-Gemini fallback",
+                            llm_key=llm_key,
+                            prompt_name=prompt_name,
+                            filtered_model=model_used,
+                            fallback_model=fallback_model,
+                        )
+                        _llm_call_start = time.perf_counter()
+                        try:
+                            # No timeout= kwarg here either; see SKY-10200 note on
+                            # the primary call site above.
+                            response = await router.acompletion(
+                                model=fallback_model,
+                                messages=messages,
+                                drop_params=True,
+                                **parameters,
+                            )
+                        finally:
+                            llm_duration_seconds += time.perf_counter() - _llm_call_start
+                        model_used = response.model or fallback_model
 
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
@@ -2217,6 +2280,13 @@ class LLMAPIHandlerFactory:
 
         if llm_config.reasoning_effort is not None:
             params["reasoning_effort"] = llm_config.reasoning_effort
+
+        # Direct (non-router) Gemini configs carry safety_settings at the request level.
+        # Router configs inject per-deployment at build time (see _inject_gemini_safety_settings)
+        # so the param never rides along to a non-Gemini fallback deployment, which would 400 on
+        # the unknown `safety_settings` param and break the fallback hop. SKY-11766.
+        if not isinstance(llm_config, LLMRouterConfig) and "gemini" in llm_config.model_name.lower():
+            params["safety_settings"] = GEMINI_SAFETY_SETTINGS
 
         return params
 

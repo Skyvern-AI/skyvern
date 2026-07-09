@@ -188,6 +188,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -228,6 +229,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", execute_workflow_blocks)
     monkeypatch.setattr(svc, "generate_script_if_needed", generate_script_if_needed)
@@ -263,6 +265,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -306,6 +309,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", execute_workflow_blocks)
     monkeypatch.setattr(svc, "clean_up_workflow", clean_up_workflow)
@@ -334,6 +338,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -390,6 +395,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(completed_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock(return_value=running_run))
@@ -423,6 +429,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -479,6 +486,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(running_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock(return_value=running_run))
@@ -518,6 +526,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -572,6 +581,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(running_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", generate_script_if_needed)
@@ -690,6 +700,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -747,6 +758,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(completed_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
@@ -779,6 +791,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -836,6 +849,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(failed_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
@@ -874,6 +888,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
 
     workflow = SimpleNamespace(
         workflow_id="wf_1",
+        persist_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -923,6 +938,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "mark_workflow_run_as_timed_out", mark_workflow_run_as_timed_out)
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(timed_out_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())

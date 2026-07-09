@@ -155,6 +155,11 @@ class Settings(BaseSettings):
     DISABLE_CONNECTION_POOL: bool = False
     DATABASE_POOL_SIZE: int = 5
     DATABASE_POOL_MAX_OVERFLOW: int = 10
+    # Timeout/recycle defaults mirror SQLAlchemy's QueuePool. Size pools per service
+    # via env vars: raising defaults here multiplies across every engine and replica
+    # and can exhaust pgbouncer client connections.
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_RECYCLE: int = -1
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -200,15 +205,14 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    # Any copilot test-run whose leading block replays a login fill on a scout-authenticated
-    # workflow runs in a fresh browser session, so that fill is not replayed into the scout's
-    # already-authenticated session (the first run and every login-replaying repair re-run alike).
-    # Off (default) reuses the scout debug session (SKY-9328) for every run as today.
-    COPILOT_FRESH_SESSION_FIRST_SYNTHESIZED_TEST_RUN: bool = False
+    WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    # Default code_only for MCP block/workflow tools. Off = permissive.
+    MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
+    ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
 
@@ -347,8 +351,10 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
     WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
+    WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -560,8 +566,11 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
-    # Where credentials are stored: bitwarden, azure_vault, gcp, or custom
+    # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
     CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
+    LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
+    LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
 
     # GCP Secret Manager credential vault settings
     GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
@@ -885,6 +894,11 @@ class Settings(BaseSettings):
         :return: True if env is not local, else False
         """
         return self.ENV != "local"
+
+    def is_local_credential_vault_enabled(self) -> bool:
+        if self.ENABLE_LOCAL_CREDENTIAL_VAULT is not None:
+            return self.ENABLE_LOCAL_CREDENTIAL_VAULT
+        return not self.is_cloud_environment()
 
     def execute_all_steps(self) -> bool:
         """

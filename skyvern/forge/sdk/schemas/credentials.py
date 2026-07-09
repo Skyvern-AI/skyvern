@@ -12,6 +12,7 @@ from skyvern.utils.url_validators import validate_url
 
 
 class CredentialVaultType(StrEnum):
+    SKYVERN = "skyvern"
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
     GCP = "gcp"
@@ -220,7 +221,7 @@ class CreateCredentialRequest(BaseModel):
         default=None,
         description="Which vault to store this credential in. If omitted, uses the instance default. "
         "Use this to mix Skyvern-hosted and custom credentials within the same organization.",
-        examples=["custom", "azure_vault", "bitwarden"],
+        examples=["skyvern", "custom", "azure_vault", "bitwarden"],
     )
     proxy_location: ProxyLocationInput = Field(
         default=None,
@@ -257,7 +258,7 @@ class CredentialResponse(BaseModel):
     name: str = Field(..., description="Name of the credential", examples=["Amazon Login"])
     vault_type: CredentialVaultType | None = Field(
         default=None,
-        description="Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')",
+        description="Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')",
     )
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
@@ -337,7 +338,7 @@ class Credential(BaseModel):
         ..., description="ID of the organization that owns the credential", examples=["o_1234567890"]
     )
     name: str = Field(..., description="Name of the credential", examples=["Skyvern Login"])
-    vault_type: CredentialVaultType | None = Field(..., description="Where the secret is stored: Bitwarden vs Azure")
+    vault_type: CredentialVaultType | None = Field(..., description="Where the secret is stored")
     item_id: str = Field(..., description="ID of the associated credential item", examples=["item_1234567890"])
     credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
     username: str | None = Field(..., description="For password credentials: the username")

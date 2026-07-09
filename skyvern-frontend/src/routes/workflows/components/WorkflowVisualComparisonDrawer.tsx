@@ -103,6 +103,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
+    pinSavedSessionIp: version.pin_saved_session_ip ?? false,
     browserProfileId: version.browser_profile_id ?? null,
     browserProfileKey: version.browser_profile_key ?? null,
     model: version.model,
@@ -118,11 +119,13 @@ function getWorkflowElements(version: WorkflowVersion) {
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
+    enableSelfHealing: version.enable_self_healing ?? false,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       version.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: version.workflow_definition?.error_code_mapping ?? null,
   };
 
   return getElements(

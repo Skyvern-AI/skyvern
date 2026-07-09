@@ -7,6 +7,7 @@ type StreamPresenterProps = {
   interactive?: boolean;
   showControlButtons?: boolean;
   isRecording?: boolean;
+  hideRecordingIndicator?: boolean;
   // Only the CDP transport carries the page URL; VNC is pixels-only and never
   // calls this.
   onUrlChange?: (url: string) => void;
@@ -22,6 +23,7 @@ export function StreamPresenter({
   interactive = false,
   showControlButtons = false,
   isRecording = false,
+  hideRecordingIndicator = false,
   onUrlChange,
   onActivity,
 }: StreamPresenterProps) {
@@ -48,6 +50,11 @@ export function StreamPresenter({
       interactive={interactive}
       showControlButtons={showControlButtons}
       exfiltrate={isRecording}
+      hideRecordingIndicator={hideRecordingIndicator}
+      // The studio swaps CDP<->VNC when recording toggles and StrictMode remounts
+      // this component; the recording must survive those. StudioBrowserStream owns
+      // the session-level reset instead.
+      resetRecordingOnUnmount={false}
       onActivity={onActivity}
     />
   );

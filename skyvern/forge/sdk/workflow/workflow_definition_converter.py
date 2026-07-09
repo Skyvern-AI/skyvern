@@ -168,6 +168,8 @@ def convert_workflow_definition(
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 created_at=now,
                 modified_at=now,
             )
@@ -676,6 +678,7 @@ def block_yaml_to_block(
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             error_code_mapping=block_yaml.error_code_mapping,
+            without_page_information=block_yaml.without_page_information,
             # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
             max_steps_per_run=2,
         )
@@ -842,6 +845,7 @@ def block_yaml_to_block(
             follow_redirects=block_yaml.follow_redirects,
             download_filename=block_yaml.download_filename,
             save_response_as_file=block_yaml.save_response_as_file,
+            secret_response_paths=block_yaml.secret_response_paths,
             parameters=http_request_block_parameters,
         )
     elif block_yaml.block_type == BlockType.GOTO_URL:

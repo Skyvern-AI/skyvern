@@ -20,16 +20,23 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
 )
+from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
+    _capture_scout_source_url,
     _consume_pending_browser_interaction_observation,
     _mark_pending_browser_interaction_observation,
+    _maybe_rebind_prior_fill_carry,
+    _register_scout_interaction_observation,
+    _scout_act_observe_page_evidence,
     account_no_progress_interaction_click,
+    rebind_prior_fill_carry_from_current_page,
 )
 
 _SOURCE_URL = "https://example.com/product"
@@ -80,6 +87,8 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],
+        prior_fill_carry=[],
+        fill_carry_rebound_done=False,
         pending_scout_source_url=source_url,
         flow_evidence=[],
     )
@@ -89,6 +98,39 @@ def _server_returning(payload: dict[str, Any]) -> SimpleNamespace:
     server = SimpleNamespace()
     server.call_internal_tool = AsyncMock(return_value={"ok": True, "data": {"result": payload}})
     return server
+
+
+def _server_returning_sequence(payloads: list[dict[str, Any] | None | BaseException]) -> SimpleNamespace:
+    server = SimpleNamespace()
+    side_effects = [
+        payload if isinstance(payload, BaseException) else {"ok": True, "data": {"result": payload}}
+        for payload in payloads
+    ]
+    server.call_internal_tool = AsyncMock(side_effect=side_effects)
+    return server
+
+
+async def _selector_count_one(
+    _ctx: SimpleNamespace, _selector: str | None, *, timeout_seconds: float | None = None
+) -> int:
+    return 1
+
+
+async def _role_name_textbox_account(
+    _ctx: SimpleNamespace, _selector: str | None, *, allow_browser_read: bool = True
+) -> tuple[str, str]:
+    return "textbox", "Account"
+
+
+def _monotonic_sequence(values: list[float]) -> Any:
+    calls = {"n": 0}
+
+    def fake() -> float:
+        index = calls["n"]
+        calls["n"] += 1
+        return values[index] if index < len(values) else values[-1]
+
+    return fake
 
 
 async def _run_click(ctx: SimpleNamespace) -> dict[str, Any]:
@@ -101,6 +143,299 @@ async def _run_click(ctx: SimpleNamespace) -> dict[str, Any]:
 
 def _flow_by_step(ctx: SimpleNamespace) -> dict[int, tuple[dict[str, Any], str]]:
     return {entry["step"]: (entry["evidence"], entry["reached_via"]) for entry in ctx.flow_evidence}
+
+
+class TestFillCarryRebind:
+    @pytest.mark.asyncio
+    async def test_rebinds_prior_fill_carry_after_fresh_page_evidence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _role_name_textbox_account)
+        ctx = _ctx()
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "#open", "source_url": _LANDING_URL}]
+        ctx.prior_fill_carry = [
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#account",
+                tool_name="type_text",
+                role="textbox",
+                accessible_name="Account",
+                typed_length=6,
+                typed_value="ABC123",
+            ).model_dump(),
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#plan",
+                tool_name="select_option",
+                value="premium",
+            ).model_dump(),
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#password",
+                tool_name="fill_credential_field",
+                credential_id="cred_123",
+                credential_field="password",
+            ).model_dump(),
+        ]
+        ctx.fill_carry_rebound_done = False
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [
+                {
+                    "fields": [
+                        {"selector": "#account", "label": "Account"},
+                        {"selector": "#plan", "label": "Plan"},
+                        {"selector": "#password", "label": "Password"},
+                    ]
+                }
+            ],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is True
+        assert ctx.scout_trajectory[0] == {"tool_name": "click", "selector": "#open", "source_url": _LANDING_URL}
+        carried = ctx.scout_trajectory[1:]
+        assert [(item["tool_name"], item["selector"], item["trajectory_index"]) for item in carried] == [
+            ("type_text", "#account", 1),
+            ("select_option", "#plan", 2),
+            ("fill_credential_field", "#password", 3),
+        ]
+        assert [item["carried"] for item in carried] == [True, True, True]
+        assert carried[0]["typed_value"] == "ABC123"
+        assert carried[1]["value"] == "premium"
+        assert carried[2]["credential_id"] == "cred_123"
+        assert carried[2]["credential_field"] == "password"
+
+    @pytest.mark.asyncio
+    async def test_rebinds_when_page_evidence_selector_format_differs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _role_name_textbox_account)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#account",
+                tool_name="type_text",
+                role="textbox",
+                accessible_name="Account",
+                typed_length=6,
+                typed_value="ABC123",
+            ).model_dump()
+        ]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "input#account", "label": "Account"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is True
+        assert [(item["tool_name"], item["selector"], item["carried"]) for item in ctx.scout_trajectory] == [
+            ("type_text", "#account", True)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rebinds_top_level_inputs_as_field_evidence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#company",
+                tool_name="type_text",
+                role="textbox",
+                typed_length=23,
+                typed_value="Example Realty Labs Inc",
+            ).model_dump()
+        ]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "inputs": [{"selector": "input#company"}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is True
+        assert [(item["tool_name"], item["selector"], item["carried"]) for item in ctx.scout_trajectory] == [
+            ("type_text", "#company", True)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rebinds_prior_fill_carry_from_live_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_LANDING_URL))
+        monkeypatch.setattr(
+            scouting_module,
+            "_scout_act_observe_page_evidence",
+            AsyncMock(
+                return_value={
+                    "current_url": _LANDING_URL,
+                    "forms": [{"fields": [{"selector": "#account", "label": "Account"}]}],
+                }
+            ),
+        )
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _role_name_textbox_account)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#account",
+                tool_name="type_text",
+                role="textbox",
+                accessible_name="Account",
+                typed_length=6,
+                typed_value="ABC123",
+            ).model_dump()
+        ]
+        ctx.fill_carry_rebound_done = False
+
+        rebound = await rebind_prior_fill_carry_from_current_page(ctx)
+
+        assert rebound is True
+        assert ctx.fill_carry_rebound_done is True
+        assert ctx.scout_trajectory == [
+            {
+                "tool_name": "type_text",
+                "selector": "#account",
+                "source_url": _LANDING_URL,
+                "trajectory_index": 0,
+                "carried": True,
+                "role": "textbox",
+                "accessible_name": "Account",
+                "typed_length": 6,
+                "typed_value": "ABC123",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_page_mismatch_keeps_prior_fill_carry_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(
+                source_url=_LANDING_URL,
+                selector="#account",
+                tool_name="type_text",
+                typed_length=6,
+                typed_value="ABC123",
+            ).model_dump()
+        ]
+        mismatched = {
+            "current_url": _SOURCE_URL,
+            "forms": [{"fields": [{"selector": "#account", "label": "Account"}]}],
+        }
+        matched = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#account", "label": "Account"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=mismatched, url=_SOURCE_URL)
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=matched, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is True
+        assert [(item["tool_name"], item["selector"]) for item in ctx.scout_trajectory] == [("type_text", "#account")]
+        assert ctx.scout_trajectory[0]["carried"] is True
+
+    @pytest.mark.asyncio
+    async def test_source_capture_rebinds_company_and_email_before_submit_click(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_LANDING_URL))
+        monkeypatch.setattr(
+            scouting_module,
+            "_scout_act_observe_page_evidence",
+            AsyncMock(
+                return_value={
+                    "current_url": _LANDING_URL,
+                    "forms": [
+                        {
+                            "fields": [
+                                {"selector": "#company", "label": "Business name", "type": "text"},
+                                {"selector": "#email", "label": "Contact email", "type": "email"},
+                            ],
+                            "submit_controls": [{"selector": "#submit", "text": "Submit"}],
+                        }
+                    ],
+                }
+            ),
+        )
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx(source_url=None)
+        ctx.prior_fill_carry = [
+            FillCarry(
+                source_url=_LANDING_URL, selector="#company", tool_name="type_text", typed_length=24
+            ).model_dump(),
+            FillCarry(source_url=_LANDING_URL, selector="#email", tool_name="type_text", typed_length=29).model_dump(),
+        ]
+
+        await _capture_scout_source_url(ctx)
+
+        assert ctx.pending_scout_source_url == _LANDING_URL
+        assert ctx.fill_carry_rebound_done is True
+        assert [(item["tool_name"], item["selector"], item["carried"]) for item in ctx.scout_trajectory] == [
+            ("type_text", "#company", True),
+            ("type_text", "#email", True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rebind_degrades_when_selector_is_stale(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def selector_count_zero(
+            _ctx: SimpleNamespace, _selector: str | None, *, timeout_seconds: float | None = None
+        ) -> int:
+            return 0
+
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", selector_count_zero)
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _role_name_textbox_account)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(source_url=_LANDING_URL, selector="#missing", tool_name="type_text", typed_length=4).model_dump()
+        ]
+        ctx.fill_carry_rebound_done = False
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#missing", "label": "Account"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is True
+        assert ctx.scout_trajectory == []
+
+    @pytest.mark.asyncio
+    async def test_rebind_degrades_without_selector_or_role_anchor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(source_url=_LANDING_URL, selector="#account", tool_name="type_text", typed_length=4).model_dump()
+        ]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "input#account", "label": "Account"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is False
+        assert ctx.scout_trajectory == []
+
+    @pytest.mark.asyncio
+    async def test_rebind_ignores_different_page_form(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        monkeypatch.setattr(scouting_module, "_resolve_scout_role_name", _role_name_textbox_account)
+        ctx = _ctx()
+        ctx.prior_fill_carry = [
+            FillCarry(source_url=_SOURCE_URL, selector="#account", tool_name="type_text", typed_length=4).model_dump()
+        ]
+        ctx.fill_carry_rebound_done = False
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#account", "label": "Account"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.fill_carry_rebound_done is False
+        assert ctx.scout_trajectory == []
 
 
 class TestActObserveSuccess:
@@ -153,6 +488,106 @@ class TestActObserveSuccess:
 
 class TestActObserveDegrade:
     @pytest.mark.asyncio
+    async def test_first_hollow_then_bounded_recapture_attaches_schema(self) -> None:
+        ctx = _ctx(
+            server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
+        )
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert result["ok"] is True
+        assert "page" in result["data"]
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is True
+        assert ctx.flow_evidence[0]["evidence"]["forms"][0]["fields"][0]["label"] == "NPI number"
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+    @pytest.mark.asyncio
+    async def test_persistent_post_interaction_hollow_records_build_test_outcome(self) -> None:
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>", "visible_text": "Still loading"}
+        ctx = _ctx(
+            server=_server_returning_sequence([payload, payload]), source_url="https://example.com/path?secret=1"
+        )
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert result["ok"] is True
+        assert "page" not in result["data"]
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.verdict == "repairable_failure"
+        assert outcome.is_authoritative is True
+        assert outcome.attempted_tool == "scout_interaction"
+        assert outcome.attempted_target == "#open-details"
+        assert "secret" not in str(outcome.structural_key_payload)
+        assert "recapture_attempted:true" in outcome.page_evidence_refs
+        assert "recapture_result:hollow" in outcome.page_evidence_refs
+        assert ctx.recorded_build_test_outcome_history[-1]["reason_code"] == outcome.reason_code
+
+    @pytest.mark.asyncio
+    async def test_first_hollow_with_no_recapture_budget_records_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 1.0)
+        monkeypatch.setattr(scouting_module.time, "monotonic", _monotonic_sequence([0.0, 2.0, 2.0]))
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
+        ctx = _ctx(server=_server_returning_sequence([payload]))
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.is_authoritative is True
+        assert "recapture_attempted:false" in outcome.page_evidence_refs
+        assert "recapture_result:not_attempted_no_budget" in outcome.page_evidence_refs
+
+    @pytest.mark.asyncio
+    async def test_first_hollow_with_recapture_none_records_outcome(self) -> None:
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
+        ctx = _ctx(server=_server_returning_sequence([payload, None]))
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.is_authoritative is True
+        assert "recapture_attempted:true" in outcome.page_evidence_refs
+        assert "recapture_result:no_payload" in outcome.page_evidence_refs
+
+    @pytest.mark.asyncio
+    async def test_first_hollow_with_recapture_error_records_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
+        calls = {"n": 0}
+
+        async def fake_extract(
+            _ctx: Any, *, inspected_url: str, current_url: str, timeout_seconds: float
+        ) -> dict[str, Any] | None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return payload
+            raise RuntimeError("browser gone")
+
+        monkeypatch.setattr(scouting_module, "_composition_get_structured_evidence", fake_extract)
+        ctx = _ctx(server=SimpleNamespace())
+
+        result = await _run_click(ctx)
+
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+        assert outcome.is_authoritative is True
+        assert "recapture_attempted:true" in outcome.page_evidence_refs
+        assert "recapture_result:error" in outcome.page_evidence_refs
+
+    @pytest.mark.asyncio
     async def test_timeout_degrades_to_schema_less_packet_and_keeps_marker(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -183,6 +618,7 @@ class TestActObserveDegrade:
         assert ctx.pending_browser_interaction_observation is not None
         assert ctx.pending_browser_interaction_observation.tool_name == "click"
         assert ctx.pending_browser_interaction_observation.url == _LANDING_URL
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
 
     @pytest.mark.asyncio
     async def test_hollow_parse_degrades_to_schema_less_packet(self) -> None:
@@ -195,6 +631,7 @@ class TestActObserveDegrade:
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
         assert set(ctx.flow_evidence[0]["evidence"].keys()) == _SCHEMA_LESS_PACKET_KEYS
         assert ctx.pending_browser_interaction_observation is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "scout_act_observe_hollow_after_interaction"
 
     @pytest.mark.asyncio
     async def test_extractor_error_never_fails_the_click(self) -> None:
@@ -207,6 +644,32 @@ class TestActObserveDegrade:
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+    @pytest.mark.asyncio
+    async def test_initial_none_without_first_hollow_does_not_record_outcome(self) -> None:
+        ctx = _ctx(server=_server_returning_sequence([None]))
+
+        result = await _run_click(ctx)
+
+        assert result["ok"] is True
+        assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+    @pytest.mark.asyncio
+    async def test_hollow_without_interaction_proof_does_not_record_outcome(self) -> None:
+        ctx = _ctx(server=_server_returning({"page_title": "Loading", "forms": []}))
+
+        parsed = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+        step, page_evidence = await _register_scout_interaction_observation(
+            ctx, tool_name="click", selector="", source_url=_SOURCE_URL, url=_LANDING_URL
+        )
+
+        assert parsed is not None
+        assert not has_bounded_page_schema(parsed)
+        assert step is None
+        assert page_evidence is None
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
 
 
 class TestActObserveNoRace:

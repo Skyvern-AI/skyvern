@@ -20,6 +20,8 @@ import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -329,11 +331,17 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
   );
 });
 
+// `persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
+// `applied` marks a turn's accepted terminal apply; drafts and snap-backs omit it.
+export type WorkflowUpdateOptions = {
+  persisted?: boolean;
+  applied?: boolean;
+};
+
 interface WorkflowCopilotChatProps {
-  // `options.persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
   onWorkflowUpdate?: (
     workflow: WorkflowApiResponse,
-    options?: { persisted?: boolean },
+    options?: WorkflowUpdateOptions,
   ) => void;
   onReviewWorkflow?: (
     workflow: WorkflowApiResponse,
@@ -502,6 +510,7 @@ export function WorkflowCopilotChat({
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
+  const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
@@ -800,10 +809,36 @@ export function WorkflowCopilotChat({
     [loadChatInPlace],
   );
 
+  // Hand the studio's Copilot pane header its History/New-chat controls.
+  // Stable wrappers over refs keep the registration limited to value changes.
+  const headerHandlersRef = useRef({ handleSelectHistoryChat, handleNewChat });
+  headerHandlersRef.current = { handleSelectHistoryChat, handleNewChat };
+  const headerControlsDisabled = isLoading || isLoadingHistory;
+  useEffect(() => {
+    if (!docked) {
+      return;
+    }
+    const store = useCopilotHeaderStore.getState();
+    store.setControls({
+      workflowPermanentId,
+      currentChatId: workflowCopilotChatId,
+      onSelectChat: (chat) =>
+        headerHandlersRef.current.handleSelectHistoryChat(chat),
+      onNewChat: () => headerHandlersRef.current.handleNewChat(),
+      disabled: headerControlsDisabled,
+    });
+    return () => store.setControls(null);
+  }, [
+    docked,
+    workflowPermanentId,
+    workflowCopilotChatId,
+    headerControlsDisabled,
+  ]);
+
   const applyWorkflowUpdate = useCallback(
     (
       workflow: WorkflowApiResponse,
-      options?: { persisted?: boolean },
+      options?: WorkflowUpdateOptions,
     ): boolean => {
       if (!onWorkflowUpdate) {
         return true;
@@ -842,7 +877,7 @@ export function WorkflowCopilotChat({
 
     if (!chatId) {
       // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
-      if (!applyWorkflowUpdate(workflow)) {
+      if (!applyWorkflowUpdate(workflow, { applied: true })) {
         return;
       }
       setProposedWorkflow(null);
@@ -863,7 +898,9 @@ export function WorkflowCopilotChat({
         } as WorkflowCopilotApplyProposedWorkflowRequest,
       );
       // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
-      if (!applyWorkflowUpdate(response.data, { persisted: true })) {
+      if (
+        !applyWorkflowUpdate(response.data, { persisted: true, applied: true })
+      ) {
         return;
       }
       setProposedWorkflow(null);
@@ -879,7 +916,7 @@ export function WorkflowCopilotChat({
         "Atomic apply failed; falling back to client-side apply:",
         applyError,
       );
-      if (!applyWorkflowUpdate(workflow)) {
+      if (!applyWorkflowUpdate(workflow, { applied: true })) {
         toast({
           title: "Accept failed",
           description: "Could not apply the proposed agent. Please try again.",
@@ -1339,6 +1376,7 @@ export function WorkflowCopilotChat({
             proxy_location: saveData.settings.proxyLocation,
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
+            pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
             browser_profile_id: saveData.settings.browserProfileId,
             browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
@@ -1350,6 +1388,7 @@ export function WorkflowCopilotChat({
             run_with: saveData.settings.runWith,
             cache_key: normalizedKey,
             ai_fallback: saveData.settings.aiFallback ?? true,
+            enable_self_healing: saveData.settings.enableSelfHealing ?? false,
             code_version:
               saveData.settings.runWith === "code"
                 ? (saveData.settings.codeVersion ?? 2)
@@ -1377,6 +1416,7 @@ export function WorkflowCopilotChat({
             proxy_location: saveData.settings.proxyLocation,
             webhook_callback_url: saveData.settings.webhookCallbackUrl,
             persist_browser_session: saveData.settings.persistBrowserSession,
+            pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
             browser_profile_id: saveData.settings.browserProfileId,
             browser_profile_key: saveData.settings.browserProfileKey,
             model: saveData.settings.model,
@@ -1467,7 +1507,7 @@ export function WorkflowCopilotChat({
               userCancelledThisTurn,
             )
           ) {
-            applyWorkflowUpdate(response.updated_workflow);
+            applyWorkflowUpdate(response.updated_workflow, { applied: true });
           } else if (response.updated_workflow) {
             setProposedWorkflow(response.updated_workflow);
           } else if (
@@ -2076,61 +2116,62 @@ export function WorkflowCopilotChat({
             }
       }
     >
-      {/* Header */}
-      <div
-        className={
-          "flex items-center border-b border-border px-4" +
-          (docked
-            ? chromeless
-              ? " h-11 shrink-0 justify-end"
-              : " h-14 shrink-0 justify-between"
-            : " cursor-move justify-between py-2")
-        }
-        onMouseDown={docked ? undefined : handleMouseDown}
-      >
-        {chromeless ? null : (
+      {/* Header. The studio (chromeless) hosts History/New chat in its
+          Copilot pane header via useCopilotHeaderStore — no row here. */}
+      {chromeless ? null : (
+        <div
+          className={
+            "flex items-center border-b border-border px-4" +
+            (docked
+              ? " h-14 shrink-0 justify-between"
+              : " cursor-move justify-between py-2")
+          }
+          onMouseDown={docked ? undefined : handleMouseDown}
+        >
+          {chromeless ? null : (
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground">
+                {docked ? "Copilot" : "Agent Copilot (Beta)"}
+              </h3>
+              {docked ? (
+                <span className="rounded bg-slate-elevation3 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  Beta
+                </span>
+              ) : null}
+            </div>
+          )}
           <div className="flex items-center gap-2">
-            <h3 className="text-sm font-semibold text-foreground">
-              {docked ? "Copilot" : "Agent Copilot (Beta)"}
-            </h3>
-            {docked ? (
-              <span className="rounded bg-studio-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-studio-accent-2">
-                Beta
-              </span>
-            ) : null}
-          </div>
-        )}
-        <div className="flex items-center gap-2">
-          <WorkflowCopilotHistory
-            workflowPermanentId={workflowPermanentId}
-            currentChatId={workflowCopilotChatId}
-            onSelect={handleSelectHistoryChat}
-            disabled={isLoading || isLoadingHistory}
-          />
-          <button
-            type="button"
-            onClick={handleNewChat}
-            onMouseDown={(e) => e.stopPropagation()}
-            className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            New chat
-          </button>
-          <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
-          <span className="text-xs text-muted-foreground">Active</span>
-          {/* Only the floating window closes itself; docked chrome is external. */}
-          {docked ? null : (
+            <WorkflowCopilotHistory
+              workflowPermanentId={workflowPermanentId}
+              currentChatId={workflowCopilotChatId}
+              onSelect={handleSelectHistoryChat}
+              disabled={isLoading || isLoadingHistory}
+            />
             <button
               type="button"
-              onClick={() => onClose?.()}
+              onClick={handleNewChat}
               onMouseDown={(e) => e.stopPropagation()}
-              className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-              title="Close"
+              className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             >
-              <Cross2Icon className="h-4 w-4" />
+              New chat
             </button>
-          )}
+            <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
+            <span className="text-xs text-muted-foreground">Active</span>
+            {/* Only the floating window closes itself; docked chrome is external. */}
+            {docked ? null : (
+              <button
+                type="button"
+                onClick={() => onClose?.()}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Close"
+              >
+                <Cross2Icon className="h-4 w-4" />
+              </button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Messages */}
       <div className="relative min-h-0 flex-1">
@@ -2345,14 +2386,15 @@ export function WorkflowCopilotChat({
                   ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
-                    : "Message Skyvern Copilot…"
+                    : "Message Skyvern Copilot, or paste recorded steps…"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
+            onPaste={() => dismissPasteSkillHint()}
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
               minHeight: "40px",
               maxHeight: "150px",

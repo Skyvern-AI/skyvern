@@ -7,7 +7,6 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .credential_response_credential import CredentialResponseCredential
 from .credential_type_output import CredentialTypeOutput
 from .credential_vault_type import CredentialVaultType
-from .proxy_location import ProxyLocation
 
 
 class CredentialResponse(UniversalBaseModel):
@@ -37,22 +36,12 @@ class CredentialResponse(UniversalBaseModel):
 
     vault_type: typing.Optional[CredentialVaultType] = pydantic.Field(default=None)
     """
-    Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')
+    Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')
     """
 
     browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     Browser profile ID linked to this credential
-    """
-
-    proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
-    """
-    Optional proxy location for this credential's pinned proxy identity.
-    """
-
-    proxy_session_id: typing.Optional[str] = pydantic.Field(default=None)
-    """
-    Optional advanced reuse key for this credential's pinned proxy identity.
     """
 
     tested_url: typing.Optional[str] = pydantic.Field(default=None)
@@ -68,6 +57,11 @@ class CredentialResponse(UniversalBaseModel):
     save_browser_session_intent: typing.Optional[bool] = pydantic.Field(default=None)
     """
     Whether the user intends to save a browser session, regardless of test outcome
+    """
+
+    folder_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the credential folder this credential belongs to, if any
     """
 
     if IS_PYDANTIC_V2:

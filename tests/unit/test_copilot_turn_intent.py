@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,7 +12,6 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _docs_answer_turn_directive,
-    _native_tools_for_turn,
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext, StructuredContext
@@ -874,7 +872,8 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
         chat_history_messages=[],
         global_llm_context="",
         organization_id="org-1",
-        handler=None,
+        request_policy_handler=None,
+        turn_intent_handler=None,
         previous_user_message=None,
     )
 
@@ -889,22 +888,6 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
     assert ctx.turn_intent.mode == TurnIntentMode.DIAGNOSE
     assert ctx.turn_intent.authority.may_update_workflow is False
     assert ctx.turn_intent.authority.may_run_blocks is False
-
-
-def test_answer_only_turn_intent_keeps_native_tools_registered() -> None:
-    tools = [
-        SimpleNamespace(name="update_workflow"),
-        SimpleNamespace(name="get_run_results"),
-        SimpleNamespace(name="list_credentials"),
-    ]
-    intent = TurnIntent(
-        mode=TurnIntentMode.DIAGNOSE,
-        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
-    )
-
-    filtered = _native_tools_for_turn(tools, intent)
-
-    assert filtered == tools
 
 
 def test_turn_intent_classification_parser_normalizes_supported_llm_payloads() -> None:

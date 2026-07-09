@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from typing import TYPE_CHECKING
 
 import structlog
 
 from skyvern.config import settings
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage, recorded_action_from_payload
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action
 
@@ -24,8 +26,17 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import CodeBlock
+    from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+
+
+def _real_skyvern_page_ai_class() -> type:
+    # real_skyvern_page_ai and script_skyvern_page import each other; importing the latter
+    # first is the only order that resolves.
+    importlib.import_module("skyvern.core.script_generations.script_skyvern_page")
+    module = importlib.import_module("skyvern.core.script_generations.real_skyvern_page_ai")
+    return module.RealSkyvernPageAi
 
 
 class CodeBlockActionRecording:
@@ -40,9 +51,11 @@ class CodeBlockActionRecording:
         workflow_run_block_id: str,
         organization_id: str | None,
         workflow_run_context: WorkflowRunContext,
+        browser_state: BrowserState | None = None,
     ) -> None:
         self._code_block = code_block
         self._page = page
+        self._browser_state = browser_state
         self._workflow_run_id = workflow_run_id
         self._workflow_run_block_id = workflow_run_block_id
         self._organization_id = organization_id
@@ -53,7 +66,11 @@ class CodeBlockActionRecording:
         self._screenshot_tasks: list[asyncio.Task[None]] = []
         self._recording_enabled = False
         self._finalized = False
-        self.recording_page = RecordingPage(page, on_action=self._screenshot_sink)
+        self.recording_page = RecordingPage(
+            page,
+            on_action=self._screenshot_sink,
+            extract_page_factory=self._create_extract_page if browser_state is not None else None,
+        )
 
     @property
     def task(self) -> Task | None:
@@ -64,6 +81,28 @@ class CodeBlockActionRecording:
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.recording_page.last_recorded_exception()
+
+    async def _create_extract_page(self) -> SkyvernPage:
+        if self._browser_state is None:
+            raise AttributeError("page.extract is not available")
+        # Read the label here rather than off RecordingPage: it scopes the system prompt and
+        # templates to this block, and authored code can assign any attribute on objects it holds.
+        current_label = self._code_block.label
+        self._code_block._apply_workflow_system_prompt(self._workflow_run_context)
+        scraped_page = await self._browser_state.scrape_website(
+            url="",
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+            scrape_exclude=app.scrape_exclude,
+            max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
+            draw_boxes=False,
+            scroll=True,
+            support_empty_page=True,
+        )
+        ai = _real_skyvern_page_ai_class()(scraped_page, self._page)
+        ai.current_label = current_label
+        page = SkyvernPage(page=self._page, ai=ai)
+        page.current_label = current_label
+        return page
 
     async def create_task_and_step(self) -> None:
         """Create the task/step that can anchor recorded actions for prompt-bearing blocks."""
@@ -152,7 +191,7 @@ class CodeBlockActionRecording:
         try:
             masked = self._workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
             for raw in masked:
-                action = Action.model_validate(raw)
+                action = recorded_action_from_payload(raw)
                 action.task_id = self._task.task_id
                 action.step_id = self._step.step_id
                 action.step_order = self._step.order

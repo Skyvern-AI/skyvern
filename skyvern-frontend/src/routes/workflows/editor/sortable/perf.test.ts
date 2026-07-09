@@ -49,6 +49,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
   persistBrowserSession: false,
+  pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
   model: null,
@@ -60,10 +61,12 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
+  enableSelfHealing: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {

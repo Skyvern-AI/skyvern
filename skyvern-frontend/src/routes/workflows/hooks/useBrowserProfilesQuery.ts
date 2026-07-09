@@ -14,6 +14,7 @@ type Props = UseQueryOptions & {
   page?: number;
   page_size?: number;
   searchKey?: string;
+  managed?: boolean;
 };
 
 function useBrowserProfilesQuery(props: Props = {}) {
@@ -22,12 +23,20 @@ function useBrowserProfilesQuery(props: Props = {}) {
     page,
     page_size,
     searchKey,
+    managed,
     ...queryOptions
   } = props;
   const credentialGetter = useCredentialGetter();
 
   return useQuery<QueryReturnType>({
-    queryKey: ["browserProfiles", includeDeleted, page, page_size, searchKey],
+    queryKey: [
+      "browserProfiles",
+      includeDeleted,
+      page,
+      page_size,
+      searchKey,
+      managed,
+    ],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const params = new URLSearchParams();
@@ -42,6 +51,9 @@ function useBrowserProfilesQuery(props: Props = {}) {
       }
       if (searchKey) {
         params.set("search_key", searchKey);
+      }
+      if (managed !== undefined) {
+        params.set("managed", String(managed));
       }
       return client
         .get("/browser_profiles", { params })

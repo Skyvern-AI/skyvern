@@ -4,11 +4,8 @@ routes to ``DATA_EXTRACTION_FAILURE`` rather than ``ANTI_BOT_DETECTION``."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES,
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
@@ -27,6 +24,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _update_workflow,
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
+from tests.unit.conftest import make_copilot_context as _fresh_context
 
 _SCRAPE_WALL_REASON = (
     "Skyvern failed to load the website. The page may have navigated "
@@ -76,17 +74,6 @@ workflow_definition:
 """
 
 
-def _fresh_context() -> CopilotContext:
-    return CopilotContext(
-        organization_id="o",
-        workflow_id="w",
-        workflow_permanent_id="wp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
-
 def _scrape_wall_result() -> dict:
     return {
         "ok": False,
@@ -108,93 +95,91 @@ def _scrape_wall_result() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_detect_matches_completed_nav_plus_scrape_wall() -> None:
-    assert _detect_probable_site_block_wall(_scrape_wall_result()) is True
-
-
-def test_detect_matches_page_navigated_unexpectedly_phrasing() -> None:
-    result = {
-        "ok": False,
-        "data": {
-            "blocks": [
-                {"block_type": "NAVIGATION", "status": "completed"},
-                {
-                    "block_type": "EXTRACTION",
-                    "status": "failed",
-                    "failure_reason": "We think the page may have navigated unexpectedly during analysis.",
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        pytest.param(_scrape_wall_result(), True, id="completed_nav_plus_scrape_wall"),
+        pytest.param(
+            {
+                "ok": False,
+                "data": {
+                    "blocks": [
+                        {"block_type": "NAVIGATION", "status": "completed"},
+                        {
+                            "block_type": "EXTRACTION",
+                            "status": "failed",
+                            "failure_reason": "We think the page may have navigated unexpectedly during analysis.",
+                        },
+                    ]
                 },
-            ]
-        },
-    }
-    assert _detect_probable_site_block_wall(result) is True
-
-
-def test_detect_returns_false_when_run_ok() -> None:
-    result = _scrape_wall_result()
-    result["ok"] = True
-    assert _detect_probable_site_block_wall(result) is False
-
-
-def test_detect_matches_nav_only_failure_with_template_reason() -> None:
-    result = {
-        "ok": False,
-        "data": {
-            "blocks": [
-                {
-                    "block_type": "NAVIGATION",
-                    "status": "failed",
-                    "failure_reason": _SCRAPE_WALL_REASON,
+            },
+            True,
+            id="page_navigated_unexpectedly_phrasing",
+        ),
+        pytest.param({**_scrape_wall_result(), "ok": True}, False, id="run_ok"),
+        pytest.param(
+            {
+                "ok": False,
+                "data": {
+                    "blocks": [
+                        {
+                            "block_type": "NAVIGATION",
+                            "status": "failed",
+                            "failure_reason": _SCRAPE_WALL_REASON,
+                        },
+                    ]
                 },
-            ]
-        },
-    }
-    assert _detect_probable_site_block_wall(result) is True
-
-
-def test_detect_returns_false_when_non_retriable_nav() -> None:
-    result = {
-        "ok": False,
-        "data": {
-            "blocks": [
-                {
-                    "block_type": "GOTO_URL",
-                    "status": "failed",
-                    "failure_reason": (
-                        "Failed to navigate to url https://x.invalid. Error message: net::ERR_NAME_NOT_RESOLVED"
-                    ),
+            },
+            True,
+            id="nav_only_failure_with_template_reason",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "data": {
+                    "blocks": [
+                        {
+                            "block_type": "GOTO_URL",
+                            "status": "failed",
+                            "failure_reason": (
+                                "Failed to navigate to url https://x.invalid. Error message: net::ERR_NAME_NOT_RESOLVED"
+                            ),
+                        },
+                        {
+                            "block_type": "EXTRACTION",
+                            "status": "failed",
+                            "failure_reason": _SCRAPE_WALL_REASON,
+                        },
+                    ]
                 },
-                {
-                    "block_type": "EXTRACTION",
-                    "status": "failed",
-                    "failure_reason": _SCRAPE_WALL_REASON,
+            },
+            False,
+            id="non_retriable_nav",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "data": {
+                    "blocks": [
+                        {"block_type": "GOTO_URL", "status": "completed"},
+                        {
+                            "block_type": "EXTRACTION",
+                            "status": "failed",
+                            "failure_reason": "Timeout waiting for selector #submit",
+                        },
+                    ]
                 },
-            ]
-        },
-    }
-    assert _detect_probable_site_block_wall(result) is False
-
-
-def test_detect_returns_false_for_other_failure_reasons() -> None:
-    result = {
-        "ok": False,
-        "data": {
-            "blocks": [
-                {"block_type": "GOTO_URL", "status": "completed"},
-                {
-                    "block_type": "EXTRACTION",
-                    "status": "failed",
-                    "failure_reason": "Timeout waiting for selector #submit",
-                },
-            ]
-        },
-    }
-    assert _detect_probable_site_block_wall(result) is False
-
-
-def test_detect_tolerates_missing_data() -> None:
-    assert _detect_probable_site_block_wall({"ok": False}) is False
-    assert _detect_probable_site_block_wall({"ok": False, "data": "not a dict"}) is False
-    assert _detect_probable_site_block_wall({"ok": False, "data": {}}) is False
+            },
+            False,
+            id="other_failure_reasons",
+        ),
+        pytest.param({"ok": False}, False, id="missing_data"),
+        pytest.param({"ok": False, "data": "not a dict"}, False, id="data_not_a_dict"),
+        pytest.param({"ok": False, "data": {}}, False, id="empty_data"),
+    ],
+)
+def test_detect_probable_site_block_wall(result: dict, expected: bool) -> None:
+    assert _detect_probable_site_block_wall(result) is expected
 
 
 # ---------------------------------------------------------------------------

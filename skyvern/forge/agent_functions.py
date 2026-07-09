@@ -718,6 +718,15 @@ class AgentFunction:
         """
         return None
 
+    def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a provider-fallback router twin for the given LLM key, or None if none exists.
+
+        Cloud overrides this with the bare-Gemini-key → *_WITH_FALLBACK mapping so a
+        provider-specific failure falls over to another provider. OSS has no fallback
+        routers, so the default no-op leaves the caller's key untouched.
+        """
+        return None
+
     async def should_use_flex_llm_routing(
         self,
         *,
@@ -755,6 +764,13 @@ class AgentFunction:
         workflow_run: "WorkflowRun",
     ) -> bool:
         return True
+
+    async def resolve_mcp_code_only_mode(
+        self,
+        organization_id: str | None,
+        request_override: bool | None,
+    ) -> bool:
+        return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
 
     async def should_use_codeblock_runner(
         self,

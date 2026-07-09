@@ -27,6 +27,7 @@ from skyvern.cli.core.browser_ops import (
     do_screenshot,
     parse_extract_schema,
     ref_to_selector,
+    select_native_option_if_targeted,
     serialize_elements,
 )
 from skyvern.cli.core.guards import (
@@ -43,6 +44,8 @@ from skyvern.cli.core.guards import (
 from skyvern.schemas.run_blocks import CredentialType
 
 from ._common import (
+    AI_FALLBACK_DESCRIPTION,
+    DIRECT_TARGET_DESCRIPTION,
     ErrorCode,
     Timer,
     make_error,
@@ -57,12 +60,64 @@ LOG = structlog.get_logger(__name__)
 # Matches `await` as a keyword, not inside single-line comments or strings.
 _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_ERROR_MESSAGE_MAX_CHARS = 500
+_ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
 
 
 def _blank_to_none(value: str | None) -> str | None:
     """Treat a blank/whitespace string as omitted: MCP clients serialize an omitted optional
     selector/intent as "", and a "" target would route a deterministic action onto nothing."""
     return value if value is None or value.strip() else None
+
+
+def _truncate_error_message(message: str) -> str:
+    message = message.strip()
+    if len(message) <= _ERROR_MESSAGE_MAX_CHARS:
+        return message
+    return f"{message[:_ERROR_MESSAGE_MAX_CHARS]}..."
+
+
+def _message_from_error_body(body: Any) -> str | None:
+    if isinstance(body, dict):
+        for key in _ERROR_BODY_MESSAGE_KEYS:
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return _truncate_error_message(value)
+            if isinstance(value, dict):
+                nested = _message_from_error_body(value)
+                if nested:
+                    return nested
+    # Only whitelisted dict keys are surfaced. A raw string body (or any unrecognized shape)
+    # from an SDK ApiError can carry secrets/tokens, so it is never surfaced verbatim.
+    return None
+
+
+def _exception_details(exc: Exception) -> dict[str, Any]:
+    details: dict[str, Any] = {"exception_type": type(exc).__name__}
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        details["status_code"] = status_code
+    return details
+
+
+def _exception_message(exc: Exception) -> str:
+    status_code = getattr(exc, "status_code", None)
+    # 5xx bodies carry the backend's wrapped internal exception text (see
+    # get_user_facing_exception_message's "Unexpected error: {exception}" fallback in
+    # skyvern/exceptions.py) — never surface them. 4xx bodies are the API's intended
+    # client-facing feedback (typed BadRequest/NotFound/UnprocessableEntity errors).
+    surface_body = not (isinstance(status_code, int) and status_code >= 500)
+    body_message = _message_from_error_body(getattr(exc, "body", None)) if surface_body else None
+    if body_message:
+        return f"HTTP {status_code}: {body_message}" if status_code is not None else body_message
+    # API-error-shaped exceptions (SDK ApiError) have a leaky __str__ that renders headers
+    # and the raw body; never fall back to str(exc) for them — surface only status + type.
+    if status_code is not None or hasattr(exc, "body"):
+        return f"HTTP {status_code}: {type(exc).__name__}" if status_code is not None else type(exc).__name__
+    message = str(exc).strip()
+    if message:
+        return _truncate_error_message(message)
+    return type(exc).__name__
 
 
 def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
@@ -164,25 +219,17 @@ async def skyvern_navigate(
 
 
 async def skyvern_click(
-    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
-    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    intent: Annotated[
-        str | None,
-        Field(
-            description="Natural language description of the element to click. Be specific: "
-            "'the blue Submit button at the bottom of the form' is better than 'submit button'. "
-            "Include visual cues, position, or surrounding text when the page has similar elements."
-        ),
-    ] = None,
     selector: Annotated[
         str | None,
         Field(
-            description="Standard CSS selector or XPath for the element to click. "
+            description=f"{DIRECT_TARGET_DESCRIPTION} Standard CSS selector or XPath for the element to click. "
             "jQuery pseudo-selectors like :contains(), :eq(), :first are NOT valid. "
             "Use standard CSS: 'button.class', 'a[href*=\"pdf\"]', '#id', ':nth-of-type()'."
         ),
     ] = None,
     selector_mode: _SelectorMode = "resilient",
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
         int,
         Field(
@@ -193,6 +240,7 @@ async def skyvern_click(
     ] = 30000,
     button: Annotated[str | None, Field(description="Mouse button: left, right, middle")] = None,
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Click an element using AI intent, CSS/XPath selector, or both.
     For text input use skyvern_type. For dropdowns use skyvern_select_option. For multiple actions prefer skyvern_act.
@@ -224,6 +272,9 @@ async def skyvern_click(
         return make_result("skyvern_click", ok=False, error=no_browser_error())
 
     deterministic = selector is not None and selector_mode == "direct"
+    used_ai_path = False
+    native_option_selection = None
+    resolved: str | None = None
     with Timer() as timer:
         try:
             kwargs: dict[str, Any] = {"timeout": timeout}
@@ -232,11 +283,17 @@ async def skyvern_click(
             if click_count is not None:
                 kwargs["click_count"] = click_count
 
-            if deterministic:
+            if selector is not None and (deterministic or ai_mode is None or ai_mode == "fallback"):
+                native_option_selection = await select_native_option_if_targeted(page, selector, timeout=timeout)
+
+            if native_option_selection is not None:
+                resolved = native_option_selection.select_selector
+            elif deterministic:
                 # selector_mode="direct": pin the selector, no overlay-dismiss or AI re-target, so a
                 # missed target fails fast and the agent re-derives it instead of AI scout-scrolling.
                 resolved = await page.click(selector=selector, mode="direct", **kwargs)
             elif ai_mode is not None:
+                used_ai_path = True
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
@@ -255,7 +312,7 @@ async def skyvern_click(
                 ),
             )
         except Exception as e:
-            code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
+            code = ErrorCode.AI_FALLBACK_FAILED if used_ai_path else ErrorCode.ACTION_FAILED
             return make_result(
                 "skyvern_click",
                 ok=False,
@@ -263,19 +320,47 @@ async def skyvern_click(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    str(e),
+                    _exception_message(e),
                     "The element may be hidden, disabled, or intercepted by another element",
+                    details=_exception_details(e),
                 ),
             )
 
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
+    if native_option_selection is not None:
+        data["selected_option"] = {
+            "select_selector": native_option_selection.select_selector,
+            "selected_by": native_option_selection.selected_by,
+        }
+        if native_option_selection.index is not None:
+            data["selected_option"]["index"] = native_option_selection.index
+        if native_option_selection.value is not None:
+            data["selected_option"]["value"] = native_option_selection.value
+        if native_option_selection.label is not None:
+            data["selected_option"]["label"] = native_option_selection.label
     if resolved and resolved != selector:
         data["resolved_selector"] = resolved
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts.
     # resolved_selector already contains the "xpath=" prefix (e.g. "xpath=//button[@id='x']"),
     # so pass it directly as the selector positional arg.
     resolved_sel = resolved if resolved and resolved != selector else selector
-    if resolved_sel and intent:
+    if native_option_selection is not None:
+        if native_option_selection.selected_by == "label":
+            data["sdk_equivalent"] = (
+                f'await page.select_option("{native_option_selection.select_selector}", '
+                f'label="{native_option_selection.label}")'
+            )
+        elif native_option_selection.selected_by == "index":
+            data["sdk_equivalent"] = (
+                f'await page.select_option("{native_option_selection.select_selector}", '
+                f"index={native_option_selection.index})"
+            )
+        else:
+            data["sdk_equivalent"] = (
+                f'await page.select_option("{native_option_selection.select_selector}", '
+                f'value="{native_option_selection.value}")'
+            )
+    elif resolved_sel and intent:
         data["sdk_equivalent"] = f'await page.click("{resolved_sel}", prompt="{intent}")'
     elif ai_mode:
         data["sdk_equivalent"] = f'await page.click(prompt="{intent}")'
@@ -291,24 +376,16 @@ async def skyvern_click(
 
 
 async def skyvern_drag(
-    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
-    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    source_intent: Annotated[
-        str | None,
-        Field(description="Natural language description of the element to drag"),
-    ] = None,
     source_selector: Annotated[
         str | None,
-        Field(description="CSS selector or XPath of the drag source element"),
-    ] = None,
-    target_intent: Annotated[
-        str | None,
-        Field(description="Natural language description of where to drop the element"),
+        Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector or XPath of the drag source element."),
     ] = None,
     target_selector: Annotated[
         str | None,
-        Field(description="CSS selector or XPath of the drop target element"),
+        Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector or XPath of the drop target element."),
     ] = None,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
         int,
         Field(
@@ -317,6 +394,8 @@ async def skyvern_drag(
             le=60000,
         ),
     ] = 30000,
+    source_intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
+    target_intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Drag an element and drop it onto another. Supports AI intent, CSS/XPath selector, or both for source and target."""
     if not source_intent and not source_selector:
@@ -402,19 +481,12 @@ async def skyvern_file_upload(
             description="List of file paths or URLs to upload. URLs are downloaded automatically. Max 50MB per file."
         ),
     ],
-    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
-    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    intent: Annotated[
-        str | None,
-        Field(
-            description="Natural language description of the file input or upload button. "
-            "Be specific: 'the Choose File button' or 'the resume upload field'."
-        ),
-    ] = None,
     selector: Annotated[
         str | None,
-        Field(description="CSS selector or XPath of the file input or upload button"),
+        Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector or XPath of the file input or upload button."),
     ] = None,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
         int,
         Field(
@@ -423,6 +495,7 @@ async def skyvern_file_upload(
             le=60000,
         ),
     ] = 30000,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Upload files to a file input element. Accepts local paths or URLs (auto-downloaded).
     Supports AI intent, CSS/XPath selector, or both to find the input.
@@ -542,7 +615,7 @@ async def skyvern_file_upload(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(code, str(e), "File upload failed"),
+                error=make_error(code, _exception_message(e), "File upload failed", details=_exception_details(e)),
             )
 
     return make_result(
@@ -554,17 +627,11 @@ async def skyvern_file_upload(
 
 
 async def skyvern_hover(
+    selector: Annotated[
+        str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector or XPath for the element to hover.")
+    ] = None,
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    intent: Annotated[
-        str | None,
-        Field(
-            description="Natural language description of the element to hover over. Be specific: "
-            "'the user avatar in the top-right corner' is better than 'avatar'. "
-            "Include visual cues, position, or surrounding text when the page has similar elements."
-        ),
-    ] = None,
-    selector: Annotated[str | None, Field(description="CSS selector or XPath for the element to hover")] = None,
     timeout: Annotated[
         int,
         Field(
@@ -573,6 +640,7 @@ async def skyvern_hover(
             le=60000,
         ),
     ] = 30000,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Hover over an element to reveal tooltips, menus, or hidden content. Uses AI intent, CSS/XPath selector, or both."""
     ai_mode, err = _resolve_ai_mode(selector, intent)
@@ -622,8 +690,9 @@ async def skyvern_hover(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    str(e),
+                    _exception_message(e),
                     "The element may be hidden or not interactable",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -645,18 +714,12 @@ async def skyvern_hover(
 
 async def skyvern_type(
     text: Annotated[str, "Text to type into the element"],
+    selector: Annotated[
+        str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector or XPath for the input element.")
+    ] = None,
+    selector_mode: _SelectorMode = "resilient",
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    intent: Annotated[
-        str | None,
-        Field(
-            description="Natural language description of the input field. Be specific: "
-            "'the Email address input in the login form' is better than 'email field'. "
-            "Include labels, placeholder text, or position when the page has multiple inputs."
-        ),
-    ] = None,
-    selector: Annotated[str | None, Field(description="CSS selector or XPath for the input element")] = None,
-    selector_mode: _SelectorMode = "resilient",
     timeout: Annotated[
         int,
         Field(
@@ -667,6 +730,7 @@ async def skyvern_type(
     ] = 30000,
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Type text into an input field using AI intent, CSS/XPath selector, or both. Clears field by default (set clear=false to append).
     NEVER use for passwords — use skyvern_login instead. For dropdowns use skyvern_select_option.
@@ -775,8 +839,9 @@ async def skyvern_type(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    str(e),
+                    _exception_message(e),
                     "The element may not be editable or may be hidden",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -800,10 +865,12 @@ async def skyvern_type(
 
 
 async def skyvern_screenshot(
+    selector: Annotated[
+        str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector to screenshot a specific element.")
+    ] = None,
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     full_page: Annotated[bool, Field(description="Capture full scrollable page")] = False,
-    selector: Annotated[str | None, Field(description="CSS selector to screenshot specific element")] = None,
     inline: Annotated[bool, Field(description="Return base64 data instead of file path")] = False,
 ) -> dict[str, Any]:
     """Capture a visual screenshot of the current page. Use after page-changing actions to verify results.
@@ -865,13 +932,13 @@ async def skyvern_screenshot(
 
 async def skyvern_scroll(
     direction: Annotated[str, Field(description="Direction: up, down, left, right")],
+    selector: Annotated[
+        str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector of scrollable element.")
+    ] = None,
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     amount: Annotated[int | None, Field(description="Pixels to scroll (default 500)")] = None,
-    intent: Annotated[
-        str | None, Field(description="Natural language description of element to scroll into view (uses AI)")
-    ] = None,
-    selector: Annotated[str | None, Field(description="CSS selector of scrollable element")] = None,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Scroll the page or an element into view. Use intent for AI-powered scrolling, or pixel amount for manual control."""
     valid_directions = ("up", "down", "left", "right")
@@ -903,7 +970,12 @@ async def skyvern_scroll(
                     ok=False,
                     browser_context=ctx,
                     timing_ms=timer.timing_ms,
-                    error=make_error(code, str(e), "Could not find element to scroll into view"),
+                    error=make_error(
+                        code,
+                        _exception_message(e),
+                        "Could not find element to scroll into view",
+                        details=_exception_details(e),
+                    ),
                 )
 
         return make_result(
@@ -961,15 +1033,17 @@ async def skyvern_scroll(
 
 async def skyvern_select_option(
     value: Annotated[str, "Value to select"],
+    selector: Annotated[
+        str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector for the select element.")
+    ] = None,
+    selector_mode: _SelectorMode = "resilient",
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    intent: Annotated[str | None, Field(description="Natural language description of the dropdown (uses AI)")] = None,
-    selector: Annotated[str | None, Field(description="CSS selector for the select element")] = None,
-    selector_mode: _SelectorMode = "resilient",
     timeout: Annotated[
         int, Field(description="Max time to wait for the dropdown in ms. Default 30000 (30s)", ge=1000, le=60000)
     ] = 30000,
     by_label: Annotated[bool, Field(description="Select by visible label instead of value")] = False,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Select an option from a dropdown menu. Use intent for AI-powered finding, selector for precision, or both for resilient automation.
 
@@ -1018,7 +1092,12 @@ async def skyvern_select_option(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(code, str(e), "Check selector and available options"),
+                error=make_error(
+                    code,
+                    _exception_message(e),
+                    "Check selector and available options",
+                    details=_exception_details(e),
+                ),
             )
 
     # NOTE: The SDK select_option() returns the selected value, not a resolved
@@ -1042,12 +1121,12 @@ async def skyvern_select_option(
 
 async def skyvern_press_key(
     key: Annotated[str, "Key to press (e.g., Enter, Tab, Escape, ArrowDown)"],
+    selector: Annotated[
+        str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector to focus first.")
+    ] = None,
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
-    intent: Annotated[
-        str | None, Field(description="Natural language description of element to focus first (uses AI)")
-    ] = None,
-    selector: Annotated[str | None, Field(description="CSS selector to focus first")] = None,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Press a keyboard key -- Enter, Tab, Escape, arrow keys, shortcuts, etc.
 
@@ -1104,16 +1183,16 @@ async def skyvern_press_key(
 
 
 async def skyvern_wait(
+    selector: Annotated[str | None, Field(description=f"{DIRECT_TARGET_DESCRIPTION} CSS selector to wait for.")] = None,
+    state: Annotated[str | None, Field(description="Element state: visible, hidden, attached, detached")] = "visible",
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     time_ms: Annotated[int | None, Field(description="Time to wait in milliseconds")] = None,
-    intent: Annotated[str | None, Field(description="Natural language condition to wait for (uses AI polling)")] = None,
-    selector: Annotated[str | None, Field(description="CSS selector to wait for")] = None,
-    state: Annotated[str | None, Field(description="Element state: visible, hidden, attached, detached")] = "visible",
     timeout: Annotated[int, Field(description="Max wait time in milliseconds", ge=1000, le=120000)] = 30000,
     poll_interval_ms: Annotated[
         int, Field(description="Polling interval for intent-based waits in ms", ge=500, le=10000)
     ] = 5000,
+    intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Wait for a condition, element, or time delay before proceeding. Use intent for AI-powered condition checking.
 
@@ -1320,7 +1399,12 @@ async def skyvern_extract(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Check that the page has loaded and the prompt is clear"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    _exception_message(e),
+                    "Check that the page has loaded and the prompt is clear",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1357,7 +1441,12 @@ async def skyvern_validate(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Check that the page has loaded and the prompt is clear"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    _exception_message(e),
+                    "Check that the page has loaded and the prompt is clear",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1409,7 +1498,12 @@ async def skyvern_act(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.SDK_ERROR, str(e), "Simplify the prompt or break the task into steps"),
+                error=make_error(
+                    ErrorCode.SDK_ERROR,
+                    _exception_message(e),
+                    "Simplify the prompt or break the task into steps",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1439,8 +1533,8 @@ async def skyvern_run_task(
         int, Field(description="Timeout in seconds (default 180s = 3 minutes)", ge=10, le=1800)
     ] = 180,
 ) -> dict[str, Any]:
-    """Run a one-off exploratory task via autonomous AI agent. Nothing is saved — throwaway only.
-    For anything reusable, scheduled, or worth keeping, use skyvern_workflow_create instead. Always uses engine 2.0.
+    """Run a one-off autonomous trial via the highest-cost AI path. Not for production or reusable automations.
+    Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute. Always uses engine 2.0.
     """
     # Block password/credential actions — redirect to skyvern_login
     if PASSWORD_PATTERN.search(prompt):
@@ -1519,8 +1613,9 @@ async def skyvern_run_task(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    str(e) or type(e).__name__,
+                    _exception_message(e),
                     "Check the prompt, URL, and timeout settings",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -1682,8 +1777,9 @@ async def skyvern_login(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    str(e) or type(e).__name__,
+                    _exception_message(e),
                     "Check credential_type and required fields for your credential provider",
+                    details=_exception_details(e),
                 ),
             )
 
@@ -1704,16 +1800,21 @@ async def skyvern_login(
 
 
 async def skyvern_frame_switch(
-    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
-    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     selector: Annotated[
         str | None,
-        Field(description="CSS selector for the iframe element (e.g., '#payment-frame', 'iframe[name=checkout]')"),
+        Field(
+            description=(
+                f"{DIRECT_TARGET_DESCRIPTION} CSS selector for the iframe element "
+                "(e.g., '#payment-frame', 'iframe[name=checkout]')."
+            )
+        ),
     ] = None,
     name: Annotated[str | None, Field(description="Frame name attribute")] = None,
     index: Annotated[
         int | None, Field(description="Frame index (0 = main). Use skyvern_frame_list to find indices")
     ] = None,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
     """Switch into an iframe so subsequent actions target elements inside it. Use skyvern_frame_main to switch back."""
     params = sum(p is not None for p in (selector, name, index))
@@ -1991,12 +2092,17 @@ async def skyvern_clipboard_write(
 
 
 async def skyvern_observe(
-    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
-    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     selector: Annotated[
         str | None,
-        Field(description="CSS selector to scope the snapshot (e.g., 'form#login'). Omit for full page."),
+        Field(
+            description=(
+                f"{DIRECT_TARGET_DESCRIPTION} CSS selector to scope the snapshot "
+                "(e.g., 'form#login'). Omit for full page."
+            )
+        ),
     ] = None,
+    session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
+    cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     interactive_only: Annotated[
         bool,
         Field(description="Only return interactive elements (buttons, inputs, links). Default true."),
@@ -2144,7 +2250,12 @@ async def _dispatch_step(
 async def skyvern_execute(
     steps: Annotated[
         list[dict[str, Any]],
-        Field(description="Array of {tool, params} step objects to execute sequentially"),
+        Field(
+            description=(
+                "Array of {tool, params} step objects to execute sequentially. "
+                f"Within params, refs from skyvern_observe are direct targets. {DIRECT_TARGET_DESCRIPTION}"
+            )
+        ),
     ],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,

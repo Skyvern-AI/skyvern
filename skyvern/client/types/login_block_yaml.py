@@ -36,6 +36,7 @@ class LoginBlockYaml(UniversalBaseModel):
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     complete_verification: typing.Optional[bool] = None
+    skip_saved_profile: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

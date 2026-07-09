@@ -197,6 +197,96 @@ async def test_validation_routed_page_aware_keeps_page_evidence(
 
 
 @pytest.mark.asyncio
+async def test_block_opt_in_drops_page_evidence_even_when_router_page_aware(
+    patched_agent: ForgeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The block-level opt-in (``ValidationBlock.without_page_information``,
+    surfaced on the context as ``validation_without_page_information``) must
+    drop page evidence even when the router stays page-aware (e.g. mode OFF).
+    Proves the flag is OR'd into the prompt builder's decision (SKY-10593)."""
+    now = datetime.now(UTC)
+    org = make_organization(now)
+    task = make_task(
+        now,
+        org,
+        task_type=TaskType.validation,
+        complete_criterion="billing_date is within range and account_number matches",
+        terminate_criterion=None,
+        navigation_goal=None,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    async def fake_router(**_: Any) -> ValidationRouterResult:
+        return _stub_router_result(
+            effective=False,
+            decision=ValidationRouterDecision.PAGE_AWARE,
+            mode=ValidationRouterMode.OFF,
+        )
+
+    monkeypatch.setattr("skyvern.forge.agent.resolve_validation_evidence_route", fake_router)
+
+    ctx = SkyvernContext(tz_info=None)
+    ctx.validation_without_page_information = True
+    token = skyvern_context._context.set(ctx)
+    try:
+        build_result = await patched_agent._build_extract_action_prompt(
+            task,
+            step,
+            _make_browser_state(),
+            _make_scraped_page(),
+        )
+    finally:
+        skyvern_context._context.reset(token)
+
+    assert build_result.without_page_information is True
+    assert "data-skyvern" not in build_result.prompt, "element tree must not appear when block opts out of page info"
+    assert "https://example.com/path" not in build_result.prompt, "current_url must not appear when block opts out"
+
+
+@pytest.mark.asyncio
+async def test_block_opt_in_default_off_keeps_page_evidence(
+    patched_agent: ForgeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default (flag unset) keeps today's page-aware behavior: page evidence is
+    present and ``without_page_information`` stays False. Blast-radius guard."""
+    now = datetime.now(UTC)
+    org = make_organization(now)
+    task = make_task(
+        now,
+        org,
+        task_type=TaskType.validation,
+        complete_criterion="billing_date is within range and account_number matches",
+        terminate_criterion=None,
+        navigation_goal=None,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    async def fake_router(**_: Any) -> ValidationRouterResult:
+        return _stub_router_result(
+            effective=False,
+            decision=ValidationRouterDecision.PAGE_AWARE,
+            mode=ValidationRouterMode.OFF,
+        )
+
+    monkeypatch.setattr("skyvern.forge.agent.resolve_validation_evidence_route", fake_router)
+
+    ctx = SkyvernContext(tz_info=None)
+    token = skyvern_context._context.set(ctx)
+    try:
+        build_result = await patched_agent._build_extract_action_prompt(
+            task,
+            step,
+            _make_browser_state(),
+            _make_scraped_page(),
+        )
+    finally:
+        skyvern_context._context.reset(token)
+
+    assert build_result.without_page_information is False
+    assert "data-skyvern" in build_result.prompt or "<div" in build_result.prompt
+
+
+@pytest.mark.asyncio
 async def test_non_validation_task_does_not_invoke_router(
     patched_agent: ForgeAgent, monkeypatch: pytest.MonkeyPatch
 ) -> None:

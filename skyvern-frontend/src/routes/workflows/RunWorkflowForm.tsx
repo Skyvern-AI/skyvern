@@ -403,7 +403,8 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       if (studioEnabled) {
-        // Land in the studio shell; the ?wr= deep link opens the Run pane.
+        // A full-run start lands on the bare ?wr= deep link; the learned run
+        // layout (or factory copilot,browser,overview) restores via the fallback.
         navigate(
           `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
         );
@@ -989,7 +990,7 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          AI Fallback (self-healing)
+                          AI Fallback (cached scripts)
                         </div>
                         <h2 className="text-sm text-slate-400">
                           If the run fails when running with code, keep this on

@@ -92,6 +92,7 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileS
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
+from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -439,6 +440,23 @@ async def _take_workflow_run_block_screenshot(
             )
 
 
+def _build_fallback_navigation_payload(context: skyvern_context.SkyvernContext) -> dict[str, Any] | None:
+    """Navigation payload for a cached block's agent fallback task.
+
+    Beyond the workflow-level ``script_run_parameters``, this threads the current loop
+    iteration's value (``current_value`` / ``current_index`` / ``current_item``) into the
+    payload. Without it the fallback agent only sees the rendered goal prose, so select/search
+    interactions inside a loop resolve to a page-visible label instead of the intended value
+    (SKY-10708).
+    """
+    payload: dict[str, Any] = dict(context.script_run_parameters or {})
+    if context.loop_metadata:
+        for key in ("current_value", "current_index", "current_item"):
+            if key in context.loop_metadata:
+                payload[key] = context.loop_metadata[key]
+    return payload or None
+
+
 async def _create_workflow_block_run_and_task(
     block_type: BlockType,
     prompt: str | None = None,
@@ -498,8 +516,9 @@ async def _create_workflow_block_run_and_task(
             if url:
                 url = _render_template_with_label(url, label)
             # Include script parameters as navigation_payload so handlers
-            # (e.g. file upload) can find URLs like resume_link in the payload.
-            nav_payload = context.script_run_parameters or None
+            # (e.g. file upload) can find URLs like resume_link in the payload,
+            # plus the current loop value so a fallback search uses the intended value.
+            nav_payload = _build_fallback_navigation_payload(context)
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
@@ -2114,14 +2133,15 @@ async def download(
                     # Skip incomplete downloads
                     if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
-                    final_file_name = download_suffix
-                    target_path = local_download_dir / (final_file_name + file_extension)
-                    counter = 1
-                    while target_path.exists():
-                        final_file_name = f"{download_suffix}_{counter}"
-                        target_path = local_download_dir / (final_file_name + file_extension)
-                        counter += 1
-                    rename_file(file_path, final_file_name + file_extension)
+                    local_basename = Path(file_path).name
+                    existing_names = {
+                        Path(f).name
+                        for f in list_files_in_directory(local_download_dir)
+                        if Path(f).name != local_basename
+                    }
+                    desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    if local_basename != desired_name:
+                        rename_file(file_path, desired_name)
 
             # Upload downloaded files from local filesystem to remote storage
             # so that get_downloaded_files() can find them for verification.
@@ -3002,6 +3022,7 @@ async def http_request(
     follow_redirects: bool = True,
     label: str | None = None,
     parameters: list[str] | None = None,
+    secret_response_paths: list[str] | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     method = _render_template_with_label(method, label)
@@ -3013,6 +3034,7 @@ async def http_request(
         body=body,
         timeout=timeout,
         follow_redirects=follow_redirects,
+        secret_response_paths=secret_response_paths,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,

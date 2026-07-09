@@ -59,6 +59,7 @@ class RealBrowserState(BrowserState):
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
+        release_driver_on_close: bool = False,
     ):
         self.__page = page
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
@@ -72,6 +73,11 @@ class RealBrowserState(BrowserState):
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
+        # Stamped for states attached to a caller-provided remote browser
+        # (``browser_address``): the local Playwright driver exists solely for
+        # this state and must be released on close even when the remote
+        # browser is left running.
+        self.release_driver_on_close = release_driver_on_close
         # One-shot callbacks fired first inside ``close()``. Cleared after
         # firing so re-entry into ``close()`` is safe.
         self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
@@ -96,13 +102,19 @@ class RealBrowserState(BrowserState):
         LOG.error("BrowserState has no page", urls=[p.url for p in pages])
         raise MissingBrowserStatePage()
 
-    async def _close_all_other_pages(self) -> None:
+    async def _close_all_other_pages(self, discard_orphaned_videos: bool = False) -> None:
         cur_page = await self.get_working_page()
         if not self.browser_context or not cur_page:
             return
         pages = self.browser_context.pages
         for page in pages:
             if page != cur_page:
+                if discard_orphaned_videos:
+                    # Tombstone before any await: set_popup_video_listener's registration for
+                    # this same page may still be in flight, and must observe the tombstone
+                    # whenever it resolves rather than re-appending after we remove it below.
+                    self.browser_artifacts.discard_page_video(page)
+                    await self._discard_video_artifact(page)
                 try:
                     async with asyncio.timeout(2):
                         await page.close()
@@ -110,6 +122,29 @@ class RealBrowserState(BrowserState):
                     LOG.warning("Timeout to close the page. Skip closing the page", url=page.url)
                 except Exception:
                     LOG.exception("Error while closing the page", url=page.url)
+
+    async def _discard_video_artifact(self, page: Page) -> None:
+        # This page never became the working page — its video must not be registered.
+        video = page.video
+        if not video:
+            return
+        try:
+            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
+                path = str(await video.path())
+        except Exception:
+            # Best-effort: leave the artifact registered rather than raising — the
+            # near-empty video is uploaded as-is instead of silently disappearing.
+            try:
+                page_origin = urlparse(page.url).hostname or "unknown"
+            except Exception:
+                page_origin = "unknown"
+            LOG.warning("Could not get video path to discard orphaned artifact", page_origin=page_origin, exc_info=True)
+            return
+        video_artifacts = self.browser_artifacts.video_artifacts
+        filtered = [va for va in video_artifacts if va.video_path != path]
+        if len(filtered) != len(video_artifacts):
+            LOG.debug("Discarded orphaned video artifact", video_path=path)
+        self.browser_artifacts.video_artifacts = filtered
 
     async def check_and_fix_state(
         self,
@@ -171,7 +206,7 @@ class RealBrowserState(BrowserState):
 
             await self.set_working_page(page, 0)
             if not use_existing_page:
-                await self._close_all_other_pages()
+                await self._close_all_other_pages(discard_orphaned_videos=True)
 
             if url and not _same_page_ignoring_fragment(page.url, url):
                 await self.navigate_to_url(page=page, url=url)
@@ -560,7 +595,14 @@ class RealBrowserState(BrowserState):
             must_included_tags=must_included_tags,
         )
 
-    async def close(self, close_browser_on_completion: bool = True) -> None:
+    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None:
+        # ``release_driver`` decouples the local Playwright driver's lifetime
+        # from the remote browser's: callers that retain this state for reuse
+        # (persistent sessions, parent/child sharing) must pass False; None
+        # defers to ``close_browser_on_completion`` plus the creation-time
+        # ``release_driver_on_close`` marker.
+        if release_driver is None:
+            release_driver = close_browser_on_completion or self.release_driver_on_close
         LOG.info("Closing browser state", sampling=True)
         # Only fire on-close observers on a real teardown. Shared / parent-child
         # close calls pass ``close_browser_on_completion=False`` to leave the
@@ -590,7 +632,7 @@ class RealBrowserState(BrowserState):
 
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                if self.pw and close_browser_on_completion:
+                if self.pw and release_driver:
                     try:
                         LOG.info("Stopping playwright")
                         await self.pw.stop()

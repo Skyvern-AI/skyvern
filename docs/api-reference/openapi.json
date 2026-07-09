@@ -2684,6 +2684,24 @@
             "description": "Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches."
           },
           {
+            "name": "managed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.",
+              "title": "Managed"
+            },
+            "description": "Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -3645,10 +3663,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
+              "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')",
               "title": "Vault Type"
             },
-            "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+            "description": "Filter credentials by vault type (e.g. 'skyvern', 'custom', 'bitwarden', 'azure_vault')"
           },
           {
             "name": "credential_type",
@@ -5808,6 +5826,44 @@
               "title": "Error Code"
             },
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "created_at_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created at or after this UTC timestamp (ISO 8601).",
+              "title": "Created At Start"
+            },
+            "description": "Only include runs created at or after this UTC timestamp (ISO 8601)."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this UTC timestamp (ISO 8601).",
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
             "name": "x-api-key",
@@ -8919,6 +8975,33 @@
             ],
             "title": "Proxy Session Id"
           },
+          "is_managed": {
+            "type": "boolean",
+            "title": "Is Managed",
+            "default": false
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "browser_profile_key_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key Digest"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10241,6 +10324,7 @@
             ],
             "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
             "examples": [
+              "skyvern",
               "custom",
               "azure_vault",
               "bitwarden"
@@ -10447,6 +10531,31 @@
             "type": "string",
             "title": "Credential Id"
           },
+          "credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ids"
+          },
+          "selection_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Strategy"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10507,6 +10616,31 @@
           "credential_id": {
             "type": "string",
             "title": "Credential Id"
+          },
+          "credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ids"
+          },
+          "selection_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Strategy"
           }
         },
         "type": "object",
@@ -10562,7 +10696,7 @@
                 "type": "null"
               }
             ],
-            "description": "Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')"
+            "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
           "browser_profile_id": {
             "anyOf": [
@@ -10682,6 +10816,7 @@
       "CredentialVaultType": {
         "type": "string",
         "enum": [
+          "skyvern",
           "bitwarden",
           "azure_vault",
           "gcp",
@@ -12780,7 +12915,8 @@
           "excel",
           "pdf",
           "image",
-          "docx"
+          "docx",
+          "zip"
         ],
         "title": "FileType"
       },
@@ -14591,6 +14727,20 @@
             "title": "Save Response As File",
             "default": false
           },
+          "secret_response_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Response Paths"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14790,6 +14940,20 @@
             "type": "boolean",
             "title": "Save Response As File",
             "default": false
+          },
+          "secret_response_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Response Paths"
           },
           "parameter_keys": {
             "anyOf": [
@@ -23956,6 +24120,11 @@
             "title": "Persist Browser Session",
             "default": false
           },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
+            "default": false
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -24070,6 +24239,11 @@
             "title": "Adaptive Caching",
             "default": false
           },
+          "enable_self_healing": {
+            "type": "boolean",
+            "title": "Enable Self Healing",
+            "default": false
+          },
           "code_version": {
             "anyOf": [
               {
@@ -24151,6 +24325,11 @@
               }
             ],
             "title": "Edited By"
+          },
+          "copilot_authored": {
+            "type": "boolean",
+            "title": "Copilot Authored",
+            "default": false
           },
           "created_at": {
             "type": "string",
@@ -24267,6 +24446,11 @@
           "persist_browser_session": {
             "type": "boolean",
             "title": "Persist Browser Session",
+            "default": false
+          },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
             "default": false
           },
           "browser_profile_id": {
@@ -24393,6 +24577,17 @@
             "type": "boolean",
             "title": "Adaptive Caching",
             "default": false
+          },
+          "enable_self_healing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Self Healing"
           },
           "code_version": {
             "anyOf": [
@@ -25880,6 +26075,17 @@
               }
             ],
             "title": "Body"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
           },
           "instructions": {
             "anyOf": [

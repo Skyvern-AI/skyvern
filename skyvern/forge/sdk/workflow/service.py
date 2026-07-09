@@ -66,15 +66,25 @@ from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workf
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+    PersistentBrowserSession,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.browser_profile_key import (
+    build_browser_profile_key_digest,
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
+)
+from skyvern.forge.sdk.workflow.credential_selection import (
+    VALID_SELECTION_STRATEGIES,
+    normalize_selection_strategy,
+    select_credential_for_run,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
@@ -132,6 +142,11 @@ from skyvern.forge.sdk.workflow.status_mapping import (
     TASK_STATUS_MAP,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.proxy_pinning import (
+    derive_proxy_session_id,
+    redact_proxy_session_id,
+    should_generate_proxy_session_id,
+)
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
     ProxyLocation,
@@ -174,11 +189,16 @@ LOG = structlog.get_logger()
 
 DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
+MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH = 120
+MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH = 40
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
 # Skip post-run work when only a sub-millisecond budget remains; asyncio.timeout would fire on the first await.
 POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
+
+# Bound pre-finalization write-back so a stuck profile upload cannot leave the run in a non-terminal state.
+BROWSER_SESSION_WRITE_BACK_TIMEOUT = SAVE_DOWNLOADED_FILES_TIMEOUT
 
 # Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
 # run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
@@ -423,6 +443,16 @@ class CachedScriptBlocks:
     blocks_to_clear: list[ScriptBlock]
 
 
+@dataclass
+class WorkflowBrowserCleanupResult:
+    browser_state: BrowserState | None
+    tasks: list[Task]
+    all_workflow_task_ids: list[str]
+    child_workflow_run_ids: list[str]
+    close_browser_on_completion: bool
+    browser_session_write_back_attempted: bool = False
+
+
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
     """
     This function dumps the workflow definition and removes the irrelevant data to the definition, like created_at and modified_at fields inside:
@@ -508,6 +538,27 @@ def _resolve_first_block_url(
     except Exception:
         LOG.warning("Failed to resolve first block URL for proxy selection", exc_info=True)
     return None
+
+
+def _truncate_managed_browser_profile_part(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    if max_length <= 3:
+        return value[:max_length]
+    return f"{value[: max_length - 3]}..."
+
+
+def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key: str | None) -> str:
+    title = (workflow_title or DEFAULT_WORKFLOW_TITLE).strip() or DEFAULT_WORKFLOW_TITLE
+    if not rendered_key:
+        suffix = " (auto-saved session)"
+        title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
+        return f"{title}{suffix}"
+
+    key = _truncate_managed_browser_profile_part(rendered_key, MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH)
+    suffix = f" (auto-saved: {key})"
+    title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
+    return f"{title}{suffix}"
 
 
 class WorkflowService:
@@ -959,6 +1010,82 @@ class WorkflowService:
         if missing:
             raise InvalidCredentialId(", ".join(missing))
 
+    async def _validate_and_normalize_credential_rotation_parameters(
+        self,
+        parameters: list[Any],
+        organization: Organization,
+    ) -> None:
+        credential_ids_to_validate: list[str] = []
+        for parameter in parameters:
+            credential_ids = getattr(parameter, "credential_ids", None)
+            if credential_ids is None:
+                continue
+            key = getattr(parameter, "key", None) or "<unknown>"
+            if not credential_ids:
+                raise SkyvernHTTPException(
+                    message=f"credential_ids for credential parameter {key} must be non-empty.",
+                    status_code=400,
+                )
+            credential_ids = list(dict.fromkeys(credential_ids))
+            parameter.credential_ids = credential_ids
+            selection_strategy = getattr(parameter, "selection_strategy", None)
+            if normalize_selection_strategy(selection_strategy) not in VALID_SELECTION_STRATEGIES:
+                raise SkyvernHTTPException(
+                    message=(
+                        f"selection_strategy for credential parameter {key} must be one of: "
+                        f"{', '.join(sorted(VALID_SELECTION_STRATEGIES))}."
+                    ),
+                    status_code=400,
+                )
+            parameter.credential_id = credential_ids[0]
+            credential_ids_to_validate.extend(credential_ids)
+
+        await self._validate_credential_ids(credential_ids_to_validate, organization)
+
+    @staticmethod
+    def _get_rotating_credential_parameters(workflow: Workflow) -> list[CredentialParameter]:
+        workflow_definition = getattr(workflow, "workflow_definition", None)
+        if workflow_definition is None:
+            return []
+        return [
+            parameter
+            for parameter in workflow_definition.parameters
+            if isinstance(parameter, CredentialParameter) and bool(parameter.credential_ids)
+        ]
+
+    async def _select_rotating_credential_parameters_for_render(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization_id: str,
+    ) -> dict[str, str]:
+        try:
+            selections: dict[str, str] = {}
+            for parameter in self._get_rotating_credential_parameters(workflow):
+                credential_ids = parameter.credential_ids
+                if not credential_ids:
+                    continue
+                selections[parameter.key] = await select_credential_for_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    parameter_key=parameter.key,
+                    credential_ids=credential_ids,
+                    selection_strategy=parameter.selection_strategy,
+                )
+            return selections
+        except Exception:
+            LOG.warning(
+                "Failed to select rotating credentials for workflow render parameters",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            if workflow.browser_profile_key:
+                raise
+            return {}
+
     async def validate_schedule_parameters(
         self,
         workflow: Workflow,
@@ -1266,14 +1393,6 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
 
-                browser_profile_key = getattr(workflow, "browser_profile_key", None)
-                if getattr(workflow, "persist_browser_session", False) and browser_profile_key:
-                    await self.get_workflow_browser_session_storage_key(
-                        workflow=workflow,
-                        workflow_run=workflow_run,
-                        parameter_values={param.key: value for param, value in workflow_parameter_values},
-                    )
-
                 await self._validate_credential_ids(
                     [
                         value
@@ -1281,6 +1400,23 @@ class WorkflowService:
                         if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
                     ],
                     organization,
+                )
+
+                parameter_values = {param.key: value for param, value in workflow_parameter_values}
+                rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization_id=organization.organization_id,
+                )
+                parameter_values.update(rotating_credential_selections)
+                workflow_run = await self._prepare_persisted_workflow_browser_profile(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    parameter_values=parameter_values,
+                    # Keyless workflows keep best-effort rotation selection; keyed workflows re-raise above.
+                    allow_missing_browser_profile_key=(
+                        bool(self._get_rotating_credential_parameters(workflow)) and not rotating_credential_selections
+                    ),
                 )
 
                 if workflow_parameter_values:
@@ -1342,15 +1478,270 @@ class WorkflowService:
             return "value cannot be null"
         return "database error while saving parameter value"
 
-    async def get_workflow_browser_session_storage_key(
+    async def _prepare_persisted_workflow_browser_profile(
         self,
         *,
         workflow: Workflow,
         workflow_run: WorkflowRun,
-        parameter_values: dict[str, Any] | None = None,
-    ) -> str:
+        parameter_values: dict[str, Any],
+        allow_missing_browser_profile_key: bool = False,
+    ) -> WorkflowRun:
+        if not workflow.persist_browser_session:
+            return workflow_run
+
+        if workflow_run.browser_profile_id:
+            return workflow_run
+
+        try:
+            rendered_key = await self._render_workflow_browser_profile_key(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                parameter_values=parameter_values,
+            )
+        except MissingValueForParameter:
+            if not allow_missing_browser_profile_key:
+                raise
+            LOG.warning(
+                "Falling back to keyless managed browser profile after missing browser profile key",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                browser_profile_key=workflow.browser_profile_key,
+            )
+            rendered_key = None
+        digest = build_browser_profile_key_digest(rendered_key)
+        profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
+            organization_id=workflow_run.organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_profile_key_digest=digest,
+            name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+        )
+        if created:
+            try:
+                await self._seed_managed_browser_profile_from_legacy_session(
+                    workflow=workflow,
+                    organization_id=workflow_run.organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    rendered_key=rendered_key,
+                    browser_profile_id=profile.browser_profile_id,
+                )
+            except Exception:
+                # Roll back the empty row so the next run re-attempts creation + seed;
+                # this run degrades to the legacy session path instead of failing setup.
+                LOG.warning(
+                    "Failed to seed managed browser profile from legacy session; rolling back and using legacy path",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_profile_id=profile.browser_profile_id,
+                    exc_info=True,
+                )
+                await app.DATABASE.browser_sessions.hard_delete_browser_profile(
+                    profile_id=profile.browser_profile_id,
+                    organization_id=workflow_run.organization_id,
+                )
+                return workflow_run
+
+        await self._reconcile_managed_browser_profile_proxy_pin(
+            workflow=workflow,
+            profile=profile,
+            browser_profile_key_digest=digest,
+            organization_id=workflow_run.organization_id,
+            proxy_location=workflow_run.proxy_location,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+        updated_workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+            workflow_run_id=workflow_run.workflow_run_id,
+            browser_profile_id=profile.browser_profile_id,
+        )
+        LOG.info(
+            "Stamped workflow run with managed browser profile",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            browser_profile_id=profile.browser_profile_id,
+            browser_profile_key_digest=digest,
+        )
+        return updated_workflow_run
+
+    async def _reconcile_managed_browser_profile_proxy_pin(
+        self,
+        *,
+        workflow: Workflow,
+        profile: BrowserProfile,
+        browser_profile_key_digest: str,
+        organization_id: str,
+        proxy_location: ProxyLocationInput,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        should_pin = workflow.pin_saved_session_ip and should_generate_proxy_session_id(proxy_location)
+        try:
+            existing_pin = profile.proxy_session_id
+            if should_pin:
+                if browser_profile_key_digest:
+                    proxy_session_id = derive_proxy_session_id(
+                        organization_id,
+                        workflow.workflow_permanent_id,
+                        browser_profile_key_digest,
+                    )
+                else:
+                    proxy_session_id = derive_proxy_session_id(
+                        organization_id,
+                        workflow.workflow_permanent_id,
+                    )
+                # Re-derive rather than trust existing values so a drifted or corrupted
+                # pin or location self-heals to the deterministic per-segment state.
+                if existing_pin == proxy_session_id and should_generate_proxy_session_id(profile.proxy_location):
+                    return
+                await app.DATABASE.browser_sessions.update_browser_profile(
+                    profile_id=profile.browser_profile_id,
+                    organization_id=organization_id,
+                    proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+                    proxy_session_id=proxy_session_id,
+                )
+                LOG.info(
+                    "Pinned managed browser profile proxy session",
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    browser_profile_id=profile.browser_profile_id,
+                    proxy_session_id=redact_proxy_session_id(proxy_session_id),
+                )
+                return
+
+            if profile.is_managed and existing_pin:
+                await app.DATABASE.browser_sessions.update_browser_profile(
+                    profile_id=profile.browser_profile_id,
+                    organization_id=organization_id,
+                    proxy_location=None,
+                    proxy_session_id=None,
+                )
+                LOG.info(
+                    "Cleared managed browser profile proxy session pin",
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    browser_profile_id=profile.browser_profile_id,
+                    proxy_session_id=redact_proxy_session_id(existing_pin),
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to reconcile managed browser profile proxy pin",
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                browser_profile_id=profile.browser_profile_id,
+                exc_info=True,
+            )
+            if should_pin:
+                raise
+
+    async def _resolve_managed_browser_profile_for_run_request(
+        self,
+        *,
+        workflow: Workflow,
+        organization_id: str,
+        workflow_request: WorkflowRequestBody,
+        effective_proxy_location: ProxyLocationInput,
+        extra_parameter_values: dict[str, str] | None = None,
+    ) -> str | None:
+        try:
+            if not workflow.persist_browser_session or workflow_request.browser_profile_id:
+                return None
+
+            rendered_key = None
+            if workflow.browser_profile_key:
+                parameter_values: dict[str, Any] = {}
+                for parameter in workflow.workflow_definition.parameters:
+                    if isinstance(parameter, WorkflowParameter) and parameter.default_value is not None:
+                        parameter_values[parameter.key] = parameter.default_value
+                if workflow_request.data:
+                    parameter_values.update(
+                        {key: value for key, value in workflow_request.data.items() if value is not None}
+                    )
+                if extra_parameter_values:
+                    parameter_values.update(extra_parameter_values)
+                rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
+                if not rendered_key:
+                    return None
+
+            digest = build_browser_profile_key_digest(rendered_key)
+            profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                browser_profile_key_digest=digest,
+                name=_build_managed_browser_profile_name(workflow.title, rendered_key),
+            )
+            if created:
+                try:
+                    await self._seed_managed_browser_profile_from_legacy_session(
+                        workflow=workflow,
+                        organization_id=organization_id,
+                        rendered_key=rendered_key,
+                        browser_profile_id=profile.browser_profile_id,
+                    )
+                except Exception:
+                    # Roll back the empty row so the next run re-attempts creation + seed;
+                    # this run degrades to the legacy session path instead of failing setup.
+                    LOG.warning(
+                        "Failed to seed managed browser profile from legacy session; rolling back and using legacy path",
+                        workflow_run_id=None,
+                        browser_profile_id=profile.browser_profile_id,
+                        exc_info=True,
+                    )
+                    await app.DATABASE.browser_sessions.hard_delete_browser_profile(
+                        profile_id=profile.browser_profile_id,
+                        organization_id=organization_id,
+                    )
+                    return None
+            await self._reconcile_managed_browser_profile_proxy_pin(
+                workflow=workflow,
+                profile=profile,
+                browser_profile_key_digest=digest,
+                organization_id=organization_id,
+                proxy_location=effective_proxy_location,
+                workflow_run_id=None,
+            )
+            return profile.browser_profile_id
+        except Exception:
+            LOG.warning(
+                "Failed to resolve managed browser profile for workflow run request",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _seed_managed_browser_profile_from_legacy_session(
+        self,
+        *,
+        workflow: Workflow,
+        organization_id: str,
+        rendered_key: str | None,
+        browser_profile_id: str,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        # Lazy migration: carry a workflow's accumulated Save & Reuse login state onto its new
+        # managed profile the first time we create it, so the next run starts logged in. The OSS
+        # launch path has no legacy-archive fallback, so this copy must happen here, not at launch.
+        storage_key = build_workflow_browser_session_storage_key(workflow.workflow_permanent_id, rendered_key)
+        legacy_session_dir = await app.STORAGE.retrieve_browser_session(organization_id, storage_key)
+        if not legacy_session_dir:
+            return
+        await app.STORAGE.store_browser_profile(
+            organization_id,
+            profile_id=browser_profile_id,
+            directory=legacy_session_dir,
+        )
+        LOG.info(
+            "Seeded managed browser profile from legacy session archive",
+            workflow_run_id=workflow_run_id,
+            browser_profile_id=browser_profile_id,
+            browser_session_storage_key=storage_key,
+        )
+
+    async def _render_workflow_browser_profile_key(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any] | None,
+    ) -> str | None:
         if not workflow.browser_profile_key:
-            return workflow.workflow_permanent_id
+            return None
 
         if parameter_values is None:
             try:
@@ -1377,6 +1768,23 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
             )
 
+        return rendered_key
+
+    async def get_workflow_browser_session_storage_key(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        parameter_values: dict[str, Any] | None = None,
+    ) -> str:
+        if not workflow.browser_profile_key:
+            return workflow.workflow_permanent_id
+
+        rendered_key = await self._render_workflow_browser_profile_key(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            parameter_values=parameter_values,
+        )
         storage_key = build_workflow_browser_session_storage_key(workflow.workflow_permanent_id, rendered_key)
         LOG.info(
             "Resolved workflow browser session storage key",
@@ -1453,6 +1861,7 @@ class WorkflowService:
         workflow: Workflow,
         *,
         browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
         proxy_location: ProxyLocationInput = None,
     ) -> PersistentBrowserSession | None:
         if browser_session_id:  # the user has supplied an id, so no need to create one
@@ -1469,12 +1878,23 @@ class WorkflowService:
             browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=organization_id,
                 timeout_minutes=timeout_seconds // 60,
+                browser_profile_id=browser_profile_id,
                 proxy_location=proxy_location,
+                inherit_profile_proxy=True,
             )
 
             return browser_session
 
         return None
+
+    async def _browser_profile_is_managed(self, *, organization_id: str, browser_profile_id: str | None) -> bool:
+        if not browser_profile_id:
+            return False
+        profile = await app.DATABASE.browser_sessions.get_browser_profile(
+            profile_id=browser_profile_id,
+            organization_id=organization_id,
+        )
+        return bool(profile and profile.is_managed)
 
     async def auto_create_browser_session_for_code_block_if_needed(
         self,
@@ -1518,6 +1938,7 @@ class WorkflowService:
                 timeout_minutes=CODE_BLOCK_SESSION_TIMEOUT_MINUTES,
                 browser_profile_id=browser_profile_id,
                 proxy_location=proxy_location,
+                inherit_profile_proxy=True,
             )
         except Exception:
             LOG.warning(
@@ -1862,11 +2283,16 @@ class WorkflowService:
             return workflow_run
 
         browser_session = None
-        if not browser_profile_id:
+        using_managed_browser_profile = await self._browser_profile_is_managed(
+            organization_id=organization.organization_id,
+            browser_profile_id=browser_profile_id,
+        )
+        if not browser_profile_id or using_managed_browser_profile:
             browser_session = await self.auto_create_browser_session_if_needed(
                 organization.organization_id,
                 workflow,
                 browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
                 proxy_location=workflow_run.proxy_location,
             )
 
@@ -2153,7 +2579,46 @@ class WorkflowService:
             # in place of the real terminal reason. When pre_finally_status is
             # still ``None`` (cancellation landed before block execution
             # completed), there's no captured intent to restore and we skip.
+            browser_cleanup_result: WorkflowBrowserCleanupResult | None = None
             if pre_finally_status is not None:
+                if workflow.persist_browser_session and pre_finally_status not in (
+                    WorkflowRunStatus.canceled,
+                    WorkflowRunStatus.failed,
+                    WorkflowRunStatus.terminated,
+                    WorkflowRunStatus.timed_out,
+                ):
+                    try:
+                        # Sequential dependency gates clear on terminal status, so persisted profile state must land first.
+                        browser_cleanup_result = await self._clean_up_workflow_browser(
+                            workflow_run=workflow_run,
+                            close_browser_on_completion=close_browser_on_completion,
+                            browser_session_id=browser_session_id,
+                        )
+                    except BaseException:
+                        LOG.warning(
+                            "Pre-finalization browser cleanup failed during execute_workflow cleanup",
+                            workflow_run_id=workflow_run_id,
+                            exc_info=True,
+                        )
+                    if browser_cleanup_result is not None:
+                        try:
+                            async with asyncio.timeout(BROWSER_SESSION_WRITE_BACK_TIMEOUT):
+                                await self._persist_workflow_browser_session_if_needed(
+                                    workflow=workflow,
+                                    workflow_run=workflow_run,
+                                    browser_state=browser_cleanup_result.browser_state,
+                                    close_browser_on_completion=browser_cleanup_result.close_browser_on_completion,
+                                    workflow_run_status=WorkflowRunStatus.completed,
+                                )
+                            # Only suppress clean_up_workflow's write-back once this one has
+                            # actually persisted; a failed/timed-out attempt must still be retried.
+                            browser_cleanup_result.browser_session_write_back_attempted = True
+                        except BaseException:
+                            LOG.warning(
+                                "Pre-finalization browser session write-back failed during execute_workflow cleanup",
+                                workflow_run_id=workflow_run_id,
+                                exc_info=True,
+                            )
                 try:
                     workflow_run = await asyncio.shield(
                         self._finalize_workflow_run_status(
@@ -2189,6 +2654,7 @@ class WorkflowService:
                 browser_session_id=browser_session_id,
                 close_browser_on_completion=close_browser_on_completion,
                 need_call_webhook=need_call_webhook,
+                browser_cleanup_result=browser_cleanup_result,
             )
 
         return workflow_run
@@ -2913,6 +3379,7 @@ class WorkflowService:
                     block=block,
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
                 )
                 # Save the original navigation goal before any mutation so
                 # retries don't stack the browser-session prefix repeatedly.
@@ -3584,6 +4051,7 @@ class WorkflowService:
             block=block,
             workflow_run_id=None,
             organization_id=organization_id,
+            workflow_permanent_id=None,
         )
 
     async def _resolve_login_block_browser_profile_id(
@@ -3591,6 +4059,7 @@ class WorkflowService:
         block: Block,
         workflow_run_id: str | None,
         organization_id: str | None,
+        workflow_permanent_id: str | None,
     ) -> str | None:
         """Inspect the block-level parameters and return the browser_profile_id
         from the credential parameter bound to this specific block."""
@@ -3601,6 +4070,8 @@ class WorkflowService:
         credential_ids = await self._resolve_login_block_credential_ids(
             block=block,
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
         )
 
         for credential_id in credential_ids:
@@ -3645,6 +4116,8 @@ class WorkflowService:
         self,
         block: Block,
         workflow_run_id: str | None,
+        organization_id: str | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> list[str]:
         """Return credential ids bound to this block, preserving parameter order."""
         params = block.parameters
@@ -3658,7 +4131,12 @@ class WorkflowService:
 
             # Style 1: CredentialParameter (has credential_id directly)
             if isinstance(param, CredentialParameter):
-                credential_id = param.credential_id
+                credential_id = await self._resolve_credential_parameter_id(
+                    parameter=param,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
 
             # Style 2: WorkflowParameter with type CREDENTIAL_ID
             elif (
@@ -3700,6 +4178,30 @@ class WorkflowService:
 
         return credential_ids
 
+    async def _resolve_credential_parameter_id(
+        self,
+        *,
+        parameter: CredentialParameter,
+        workflow_run_id: str | None,
+        organization_id: str | None,
+        workflow_permanent_id: str | None,
+    ) -> str:
+        if not parameter.credential_ids or not workflow_run_id or not organization_id or not workflow_permanent_id:
+            return parameter.credential_id
+
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
+        if workflow_run_context:
+            return await workflow_run_context.resolve_credential_parameter_id(parameter, organization_id)
+
+        return await select_credential_for_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            parameter_key=parameter.key,
+            credential_ids=parameter.credential_ids,
+            selection_strategy=parameter.selection_strategy,
+        )
+
     async def _apply_login_block_credential_proxy_pin(
         self,
         *,
@@ -3717,6 +4219,8 @@ class WorkflowService:
         credential_ids = await self._resolve_login_block_credential_ids(
             block=block,
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=getattr(workflow_run, "workflow_permanent_id", None),
         )
         for credential_id in credential_ids:
             if not organization_id:
@@ -3754,25 +4258,16 @@ class WorkflowService:
                             workflow_run_id=workflow_run_id,
                         )
                 if proxy_session_id:
-                    updated_headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(
-                        headers, proxy_session_id
-                    )
-                    # The OSS AgentFunction stub returns the original headers; only persist when cloud injected a pin.
-                    if updated_headers == headers:
-                        return
                     proxy_location_update: ProxyLocationInput | None = None
                     if workflow_run.proxy_location is None:
                         proxy_location_update = proxy_location or ProxyLocation.RESIDENTIAL_ISP
-                    update_kwargs: dict[str, Any] = {
-                        "workflow_run_id": workflow_run_id,
-                        "extra_http_headers": updated_headers,
-                    }
-                    if proxy_location_update is not None:
-                        update_kwargs["proxy_location"] = proxy_location_update
-                    await app.DATABASE.workflow_runs.update_workflow_run(**update_kwargs)
-                    workflow_run.extra_http_headers = updated_headers
-                    if proxy_location_update is not None:
-                        workflow_run.proxy_location = proxy_location_update
+                    if not await self._persist_proxy_pin_headers(
+                        workflow_run=workflow_run,
+                        headers=headers,
+                        proxy_session_id=proxy_session_id,
+                        proxy_location_update=proxy_location_update,
+                    ):
+                        return
                     LOG.info(
                         "Applied LoginBlock credential proxy pin to workflow run",
                         credential_id=credential_id,
@@ -3787,6 +4282,30 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
+
+    async def _persist_proxy_pin_headers(
+        self,
+        *,
+        workflow_run: WorkflowRun,
+        headers: dict[str, str],
+        proxy_session_id: str,
+        proxy_location_update: ProxyLocationInput | None = None,
+    ) -> bool:
+        updated_headers = app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(headers, proxy_session_id)
+        # The OSS AgentFunction stub returns the original headers; only persist when cloud injected a pin.
+        if updated_headers == headers:
+            return False
+        update_kwargs: dict[str, Any] = {
+            "workflow_run_id": workflow_run.workflow_run_id,
+            "extra_http_headers": updated_headers,
+        }
+        if proxy_location_update is not None:
+            update_kwargs["proxy_location"] = proxy_location_update
+        await app.DATABASE.workflow_runs.update_workflow_run(**update_kwargs)
+        workflow_run.extra_http_headers = updated_headers
+        if proxy_location_update is not None:
+            workflow_run.proxy_location = proxy_location_update
+        return True
 
     async def _evaluate_debug_session_profile_decision(
         self,
@@ -3869,7 +4388,8 @@ class WorkflowService:
             workflow_run = await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run_id)
             return workflow_run, True
         if block_result.status == BlockStatus.failed:
-            LOG.error(
+            # Run-level outcome, recorded as the run's failure_reason below; not a platform fault.
+            LOG.warning(
                 f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed for workflow run {workflow_run_id}",
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,
@@ -4197,6 +4717,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
@@ -4213,6 +4734,7 @@ class WorkflowService:
         sequential_key: str | None = None,
         folder_id: str | None = None,
         adaptive_caching: bool = False,
+        enable_self_healing: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
         created_by: str | None = None,
@@ -4231,6 +4753,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
                 model=model,
@@ -4247,6 +4770,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 folder_id=folder_id,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
                 created_by=created_by,
@@ -4623,6 +5147,7 @@ class WorkflowService:
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -4634,6 +5159,7 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         cache_key: str | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         code_version: int | None | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
@@ -4641,6 +5167,13 @@ class WorkflowService:
         edited_by: str | None | object = _UNSET,
     ) -> Workflow:
         if workflow_definition is not None:
+            if organization_id is not None:
+                organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+                if organization is not None:
+                    await self._validate_and_normalize_credential_rotation_parameters(
+                        workflow_definition.parameters,
+                        organization,
+                    )
             updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
                 workflow_id=workflow_id,
                 title=title,
@@ -4652,6 +5185,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
                 model=model,
@@ -4663,6 +5197,7 @@ class WorkflowService:
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
@@ -4681,6 +5216,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
                 model=model,
@@ -4692,6 +5228,7 @@ class WorkflowService:
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
@@ -4929,6 +5466,8 @@ class WorkflowService:
         search_key: str | None = None,
         error_code: str | None = None,
         exclude_child_runs: bool = False,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -4939,6 +5478,8 @@ class WorkflowService:
             search_key=search_key,
             error_code=error_code,
             exclude_child_runs=exclude_child_runs,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
         )
 
     async def get_workflow_runs_for_browser_session(
@@ -5022,22 +5563,119 @@ class WorkflowService:
                 },
             )
             if force_browser_session:
+                workflow_run = await app.DATABASE.workflow_runs.create_workflow_run(
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    organization_id=organization_id,
+                    browser_session_id=workflow_request.browser_session_id,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=workflow_request.proxy_location,
+                    webhook_callback_url=workflow_request.webhook_callback_url,
+                    totp_verification_url=workflow_request.totp_verification_url,
+                    totp_identifier=workflow_request.totp_identifier,
+                    parent_workflow_run_id=parent_workflow_run_id,
+                    max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+                    max_elapsed_time_minutes=max_elapsed_time_minutes,
+                    extra_http_headers=workflow_request.extra_http_headers,
+                    cdp_connect_headers=workflow_request.cdp_connect_headers,
+                    browser_address=workflow_request.browser_address,
+                    sequential_key=sequential_key,
+                    run_with=workflow_request.run_with,
+                    debug_session_id=debug_session_id,
+                    ai_fallback=workflow_request.ai_fallback,
+                    code_gen=code_gen,
+                    workflow_run_id=workflow_run_id,
+                    trigger_type=trigger_type,
+                    workflow_schedule_id=workflow_schedule_id,
+                    ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+                    copilot_session_id=copilot_session_id,
+                )
                 LOG.info(
                     "Force-creating browser session for workflow run",
                     workflow_permanent_id=workflow_permanent_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization_id,
                 )
-                browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                    organization_id=organization_id,
-                    proxy_location=workflow_request.proxy_location,
-                    timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
-                )
-                browser_session_id = browser_session.persistent_browser_session_id
-                LOG.info(
-                    "Browser session created for workflow run",
-                    workflow_permanent_id=workflow_permanent_id,
-                    browser_session_id=browser_session_id,
-                )
+                forced_browser_profile_id = None
+                effective_proxy_location = workflow_request.proxy_location
+                pin_required = False
+                try:
+                    workflow = await self.get_workflow(workflow_id=workflow_id)
+                    # pin_required must be known before any awaited call that can raise, so the
+                    # except path never falls through to creating an unprofiled pinned session.
+                    effective_proxy_location = (
+                        workflow_request.proxy_location
+                        if workflow_request.proxy_location is not None
+                        else workflow.proxy_location
+                    )
+                    pin_required = (
+                        workflow.persist_browser_session
+                        and workflow.pin_saved_session_ip
+                        and should_generate_proxy_session_id(effective_proxy_location)
+                    )
+                    # Rotating credential profile keys need the persisted run id before rendering.
+                    rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        organization_id=organization_id,
+                    )
+                    forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
+                        workflow=workflow,
+                        organization_id=organization_id,
+                        workflow_request=workflow_request,
+                        effective_proxy_location=effective_proxy_location,
+                        extra_parameter_values=rotating_credential_selections,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to resolve managed browser profile for forced browser session",
+                        workflow_permanent_id=workflow_permanent_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization_id,
+                        exc_info=True,
+                    )
+                if pin_required and forced_browser_profile_id is None:
+                    LOG.info(
+                        "Skipping forced browser session without managed browser profile for pinned workflow",
+                        workflow_permanent_id=workflow_permanent_id,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization_id,
+                    )
+                    browser_session = None
+                else:
+                    try:
+                        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                            organization_id=organization_id,
+                            proxy_location=workflow_request.proxy_location,
+                            timeout_minutes=60,  # 60 minutes default timeout for forced browser sessions
+                            runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+                            browser_profile_id=forced_browser_profile_id,
+                            inherit_profile_proxy=True,
+                        )
+                        browser_session_id = browser_session.persistent_browser_session_id
+                        LOG.info(
+                            "Browser session created for workflow run",
+                            workflow_permanent_id=workflow_permanent_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            browser_session_id=browser_session_id,
+                        )
+                        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            browser_session_id=browser_session_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to force-create browser session for workflow run",
+                            workflow_permanent_id=workflow_permanent_id,
+                            workflow_id=workflow_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            organization_id=organization_id,
+                            exc_info=True,
+                        )
+
+                return workflow_run
 
         return await app.DATABASE.workflow_runs.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
@@ -5958,8 +6596,8 @@ class WorkflowService:
             workflow_parameter_tuples,
             block_errors,
         ) = await asyncio.gather(
-            app.DATABASE.workflows.get_workflow_by_permanent_id(
-                workflow_permanent_id,
+            app.DATABASE.workflows.get_workflow_for_workflow_run(
+                workflow_run_id,
                 organization_id=organization_id,
                 filter_deleted=not allow_deleted,
             ),
@@ -6092,16 +6730,12 @@ class WorkflowService:
             errors=errors,
         )
 
-    async def clean_up_workflow(
+    async def _clean_up_workflow_browser(
         self,
-        workflow: Workflow,
         workflow_run: WorkflowRun,
-        api_key: str | None = None,
         close_browser_on_completion: bool = True,
-        need_call_webhook: bool = True,
         browser_session_id: str | None = None,
-    ) -> None:
-        analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+    ) -> WorkflowBrowserCleanupResult:
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
 
         # Look up child workflow runs (e.g. from task_v2 blocks) to flatten their
@@ -6135,47 +6769,133 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             child_workflow_run_ids=child_workflow_run_ids,
         )
+        return WorkflowBrowserCleanupResult(
+            browser_state=browser_state,
+            tasks=tasks,
+            all_workflow_task_ids=all_workflow_task_ids,
+            child_workflow_run_ids=child_workflow_run_ids,
+            close_browser_on_completion=close_browser_on_completion,
+        )
+
+    async def _persist_workflow_browser_session_if_needed(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        browser_state: BrowserState | None,
+        close_browser_on_completion: bool,
+        workflow_run_status: WorkflowRunStatus | None = None,
+    ) -> None:
+        if not (
+            browser_state and workflow.persist_browser_session and browser_state.browser_artifacts.browser_session_dir
+        ):
+            return
+
+        effective_workflow_run_status = workflow_run_status or workflow_run.status
+        if effective_workflow_run_status != WorkflowRunStatus.completed:
+            LOG.info(
+                "Skipped persisting browser session for non-completed workflow run",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_run_status=effective_workflow_run_status,
+            )
+            return
+
+        browser_profile = None
+        if workflow_run.browser_profile_id:
+            browser_profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                workflow_run.browser_profile_id,
+                organization_id=workflow_run.organization_id,
+            )
+
+        if (
+            browser_profile
+            and browser_profile.is_managed
+            # Only write back to a managed profile this workflow owns; a foreign
+            # managed id supplied explicitly is treated like a user profile.
+            and browser_profile.workflow_permanent_id == workflow_run.workflow_permanent_id
+        ):
+            if not close_browser_on_completion:
+                await persist_session_cookies(
+                    browser_state.browser_context,
+                    browser_state.browser_artifacts.browser_session_dir,
+                )
+            await app.STORAGE.store_browser_profile(
+                workflow_run.organization_id,
+                profile_id=browser_profile.browser_profile_id,
+                directory=browser_state.browser_artifacts.browser_session_dir,
+            )
+            LOG.info(
+                "Persisted managed browser profile for workflow run",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_profile_id=browser_profile.browser_profile_id,
+            )
+        elif browser_profile is None:
+            # No managed profile to write back to: either none was stamped, or a
+            # stamped managed profile was deleted between setup and finalization.
+            # Persist to the legacy session archive so the run's state isn't lost —
+            # the next run reseeds a managed profile from it. Only the deleted-mid-run
+            # case is unexpected, so warn there.
+            if workflow_run.browser_profile_id:
+                LOG.warning(
+                    "Managed browser profile missing at finalization; persisting to legacy session archive instead",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+            browser_session_storage_key = await self.get_workflow_browser_session_storage_key(
+                workflow=workflow,
+                workflow_run=workflow_run,
+            )
+            if not close_browser_on_completion:
+                await persist_session_cookies(
+                    browser_state.browser_context,
+                    browser_state.browser_artifacts.browser_session_dir,
+                )
+            await app.STORAGE.store_browser_session(
+                workflow_run.organization_id,
+                browser_session_storage_key,
+                browser_state.browser_artifacts.browser_session_dir,
+            )
+            LOG.info(
+                "Persisted browser session for workflow run",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_session_storage_key=browser_session_storage_key,
+            )
+
+    async def clean_up_workflow(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        api_key: str | None = None,
+        close_browser_on_completion: bool = True,
+        need_call_webhook: bool = True,
+        browser_session_id: str | None = None,
+        browser_cleanup_result: WorkflowBrowserCleanupResult | None = None,
+    ) -> None:
+        analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        if browser_cleanup_result is None:
+            browser_cleanup_result = await self._clean_up_workflow_browser(
+                workflow_run=workflow_run,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+            )
+
+        browser_state = browser_cleanup_result.browser_state
+        tasks = browser_cleanup_result.tasks
+        all_workflow_task_ids = browser_cleanup_result.all_workflow_task_ids
+        child_workflow_run_ids = browser_cleanup_result.child_workflow_run_ids
+        close_browser_on_completion = browser_cleanup_result.close_browser_on_completion
         if browser_state:
             await self.persist_video_data(
                 browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
             )
             if tasks:
                 await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
-            # Skip workflow-scoped session save when using browser_profile_id to avoid conflicts
-            # (profile persistence is handled separately via the profile storage)
-            if (
-                workflow.persist_browser_session
-                and browser_state.browser_artifacts.browser_session_dir
-                and not workflow_run.browser_profile_id
-            ):
-                if workflow_run.status == WorkflowRunStatus.completed:
-                    browser_session_storage_key = await self.get_workflow_browser_session_storage_key(
-                        workflow=workflow,
-                        workflow_run=workflow_run,
-                    )
-                    if not close_browser_on_completion:
-                        # Browser stays alive here, so close()'s cookie snapshot never ran; capture
-                        # session cookies now or they're missing from the archived profile on reuse.
-                        await persist_session_cookies(
-                            browser_state.browser_context,
-                            browser_state.browser_artifacts.browser_session_dir,
-                        )
-                    await app.STORAGE.store_browser_session(
-                        workflow_run.organization_id,
-                        browser_session_storage_key,
-                        browser_state.browser_artifacts.browser_session_dir,
-                    )
-                    LOG.info(
-                        "Persisted browser session for workflow run",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        browser_session_storage_key=browser_session_storage_key,
-                    )
-                else:
-                    LOG.info(
-                        "Skipped persisting browser session for non-completed workflow run",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        workflow_run_status=workflow_run.status,
-                    )
+            if not browser_cleanup_result.browser_session_write_back_attempted:
+                await self._persist_workflow_browser_session_if_needed(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    browser_state=browser_state,
+                    close_browser_on_completion=close_browser_on_completion,
+                )
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
 
@@ -6225,10 +6945,15 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
             )
 
-        if not need_call_webhook:
-            return
-
-        await self.execute_workflow_webhook(workflow_run, api_key)
+        try:
+            if need_call_webhook:
+                await self.execute_workflow_webhook(workflow_run, api_key)
+        finally:
+            # Run contexts hold parameters/secrets/outputs and are keyed per
+            # run; without eviction they accumulate for the process lifetime.
+            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
+            for child_workflow_run_id in child_workflow_run_ids:
+                app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
 
     async def prepare_workflow_webhook(
         self,
@@ -6675,6 +7400,7 @@ class WorkflowService:
             totp_verification_url=runtime_workflow.totp_verification_url,
             totp_identifier=runtime_workflow.totp_identifier,
             persist_browser_session=runtime_workflow.persist_browser_session,
+            pin_saved_session_ip=runtime_workflow.pin_saved_session_ip,
             browser_profile_id=runtime_workflow.browser_profile_id,
             browser_profile_key=runtime_workflow.browser_profile_key,
             model=runtime_workflow.model,
@@ -6688,6 +7414,7 @@ class WorkflowService:
             run_sequentially=runtime_workflow.run_sequentially or False,
             sequential_key=runtime_workflow.sequential_key,
             adaptive_caching=runtime_workflow.adaptive_caching,
+            enable_self_healing=runtime_workflow.enable_self_healing,
             generate_script_on_terminal=runtime_workflow.generate_script_on_terminal,
             folder_id=runtime_workflow.folder_id,
             is_saved_task=runtime_workflow.is_saved_task,
@@ -6761,6 +7488,10 @@ class WorkflowService:
             organization_id=organization_id,
             title=title,
         )
+        await self._validate_and_normalize_credential_rotation_parameters(
+            request.workflow_definition.parameters,
+            organization,
+        )
         new_workflow_id: str | None = None
         refresh_schedule_runtime_limits = False
         effective_max_elapsed_time_minutes: int | None = None
@@ -6809,6 +7540,9 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    pin_saved_session_ip=request.pin_saved_session_ip
+                    if "pin_saved_session_ip" in request.model_fields_set
+                    else existing_latest_workflow.pin_saved_session_ip,
                     browser_profile_id=request.browser_profile_id,
                     browser_profile_key=request.browser_profile_key,
                     model=request.model,
@@ -6827,6 +7561,9 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=existing_latest_workflow.folder_id,
                     adaptive_caching=request.adaptive_caching,
+                    enable_self_healing=request.enable_self_healing
+                    if request.enable_self_healing is not None
+                    else existing_latest_workflow.enable_self_healing,
                     code_version=request.code_version
                     if request.code_version is not None
                     else existing_latest_workflow.code_version,
@@ -6850,6 +7587,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    pin_saved_session_ip=request.pin_saved_session_ip,
                     browser_profile_id=request.browser_profile_id,
                     browser_profile_key=request.browser_profile_key,
                     model=request.model,
@@ -6866,6 +7604,9 @@ class WorkflowService:
                     sequential_key=request.sequential_key,
                     folder_id=request.folder_id,
                     adaptive_caching=request.adaptive_caching,
+                    enable_self_healing=request.enable_self_healing
+                    if request.enable_self_healing is not None
+                    else False,
                     code_version=request.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
                     created_by=created_by,

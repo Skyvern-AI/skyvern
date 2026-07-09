@@ -82,6 +82,7 @@ from .browser_profiles import (
     skyvern_browser_profile_list,
     skyvern_browser_profile_update,
 )
+from .code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from .credential import (
     skyvern_credential_delete,
     skyvern_credential_get,
@@ -164,6 +165,12 @@ from .workflow import (
     skyvern_workflow_status,
     skyvern_workflow_update,
     skyvern_workflow_update_folder,
+)
+
+_RUN_TASK_TOOL_DESCRIPTION = (
+    "Run a one-off autonomous trial via the highest-cost AI path. "
+    "Not for production or reusable automations. "
+    "Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute."
 )
 
 
@@ -369,7 +376,11 @@ mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
-mcp.tool(tags={"ai_powered"}, annotations=_web_dest("Run Autonomous Browser Task (AI)"))(skyvern_run_task)
+mcp.tool(
+    description=_RUN_TASK_TOOL_DESCRIPTION,
+    tags={"ai_powered"},
+    annotations=_web_dest("Run Autonomous Browser Task (AI)"),
+)(skyvern_run_task)
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
@@ -438,6 +449,8 @@ mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern
 # -- Block discovery + validation (no browser needed) --
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Synthesize Code Block"))(skyvern_code_block_synthesize)
 
 # -- Organization settings (no browser needed) --
 mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
@@ -562,6 +575,8 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    "skyvern_code_block_lint",
+    "skyvern_code_block_synthesize",
     # Organization settings
     "skyvern_org_get",
     "skyvern_org_update",

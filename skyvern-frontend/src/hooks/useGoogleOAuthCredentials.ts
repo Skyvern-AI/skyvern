@@ -21,8 +21,25 @@ const credentialBroadcastChannel: BroadcastChannel | null =
     ? new BroadcastChannel(BROADCAST_CHANNEL_NAME)
     : null;
 
+// The channel can be disposed by the runtime (e.g. an embedded webview tearing
+// down its native bridge during auth navigation) before this fires, in which
+// case postMessage throws InvalidStateError. Cross-tab invalidation is
+// best-effort, so swallow the failure rather than surfacing it.
+export function safePostCredentialsInvalidate(
+  channel: Pick<BroadcastChannel, "postMessage"> | null,
+): void {
+  try {
+    channel?.postMessage("invalidate");
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "InvalidStateError") {
+      return;
+    }
+    throw error;
+  }
+}
+
 function broadcastCredentialsChanged() {
-  credentialBroadcastChannel?.postMessage("invalidate");
+  safePostCredentialsInvalidate(credentialBroadcastChannel);
 }
 
 export function normalizeGoogleOAuthScopes(
