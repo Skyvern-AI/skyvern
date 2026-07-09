@@ -31,7 +31,11 @@ DEFAULT_PROMPT = "Log in and download the report"
 ExtractedInformation = list[Any] | dict[str, Any] | str | None
 
 
-def _make_code_block(steps: list[CodeBlockStep] | None = None, prompt: str | None = DEFAULT_PROMPT) -> CodeBlock:
+def _make_code_block(
+    steps: list[CodeBlockStep] | None = None,
+    prompt: str | None = DEFAULT_PROMPT,
+    code: str = "await page.click('#missing')",
+) -> CodeBlock:
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
         parameter_type=ParameterType.OUTPUT,
@@ -44,7 +48,7 @@ def _make_code_block(steps: list[CodeBlockStep] | None = None, prompt: str | Non
     )
     return CodeBlock(
         label="code_1",
-        code="await page.click('#missing')",
+        code=code,
         prompt=prompt,
         steps=steps,
         output_parameter=output_parameter,
@@ -183,10 +187,17 @@ def _install_db_fakes(
     return state
 
 
-def _recording_page(exception: Exception | None) -> MagicMock:
+def _recording_page(exception: Exception | None, *, url: object = "http://example.test/home") -> MagicMock:
     page = MagicMock()
     page.last_recorded_exception = MagicMock(return_value=exception)
+    page.url = url
     return page
+
+
+def _browser_state() -> MagicMock:
+    browser_state = MagicMock()
+    browser_state.navigate_to_url = AsyncMock(return_value=None)
+    return browser_state
 
 
 async def _heal(
@@ -196,6 +207,8 @@ async def _heal(
     recording_page: MagicMock,
     *,
     failing_line: int | None = 1,
+    browser_state: MagicMock | None = None,
+    page: MagicMock | None = None,
 ) -> BlockResult | None:
     with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
         return await block._attempt_self_heal(
@@ -207,6 +220,8 @@ async def _heal(
             workflow_run_block_id="wrb_test",
             organization_id="o_test",
             browser_session_id=None,
+            browser_state=browser_state if browser_state is not None else _browser_state(),
+            page=page if page is not None else MagicMock(),
         )
 
 
@@ -365,6 +380,313 @@ async def test_matched_step_narrows_the_goal(monkeypatch: pytest.MonkeyPatch) ->
     assert goal != DEFAULT_PROMPT
     assert "click the export button" in goal
     assert DEFAULT_PROMPT in goal
+
+
+@pytest.mark.asyncio
+async def test_failing_static_goto_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_with_variable_keeps_empty_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code="""
+target = "https://dead-nav.example.com/login"
+await page.goto(target)
+""".strip()
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_with_keyword_url_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto(url="{target_url}")')
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_with_dynamic_keyword_url_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code="""
+target = "https://dead-nav.example.com/login"
+await page.goto(url=target)
+""".strip()
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_element_rot_failure_never_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code="await page.click('#download')")
+    exc = RuntimeError("click failed")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="https://app.example.com/dashboard"),
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_uses_first_static_goto_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f"""
+await page.goto("{target_url}")
+await page.click("#download")
+""".strip()
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=2,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_skips_dynamic_goto_to_reach_later_static_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f"""
+target = build_url()
+await page.goto(target)
+await page.click("#step1")
+await page.goto("{target_url}")
+await page.click("#download")
+""".strip()
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=5,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_uses_nearest_preceding_goto_not_first_in_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-navigation block must seat recovery on the page the failure actually landed on
+    (the nearest preceding goto), not the first static goto anywhere in the block — an earlier
+    stale goto and a not-yet-executed later goto are both wrong answers here."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    stale_url = "https://stale-first.example.com/old"
+    correct_url = "https://correct-recovery.example.com/target"
+    never_executed_url = "https://never-executed.example.com/later"
+    block = _make_code_block(
+        code=f"""
+await page.goto("{stale_url}")
+await page.click("#step1")
+await page.goto("{correct_url}")
+await page.click("#step2")
+await page.goto("{never_executed_url}")
+""".strip()
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=4,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == correct_url
+
+
+@pytest.mark.asyncio
+async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """escalation_task.url alone does not reliably trigger navigation (BrowserManager can early-return
+    a cached browser state without reading it), so the heal must drive the live browser_state/page
+    directly for a dead-nav seat."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+    browser_state = _browser_state()
+    live_page = MagicMock(name="live_page")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc),
+        browser_state=browser_state,
+        page=live_page,
+    )
+
+    assert result is not None and result.success is True
+    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url=target_url)
+
+
+@pytest.mark.asyncio
+async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The canonical dead-nav rot: the block's own goto url is the dead host, and the real
+    destination lives in the goal (prompt/steps). The heal must navigate to the goal's URL, not
+    re-navigate to the code's dead goto (gauntlet H7 — otherwise it just hits the dead host again)."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    real_url = "http://localhost:8900/telco_billing/northwind/"
+    block = _make_code_block(
+        code='await page.goto("http://localhost:65531/")',
+        prompt=f"Open the billing portal at {real_url} and sign in",
+    )
+    exc = RuntimeError("net::ERR_CONNECTION_REFUSED")
+    browser_state = _browser_state()
+    live_page = MagicMock(name="live_page")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc),
+        browser_state=browser_state,
+        page=live_page,
+    )
+
+    assert result is not None and result.success is True
+    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url=real_url)
+
+
+@pytest.mark.asyncio
+async def test_element_rot_seat_never_navigates_live_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Element-rot heals must preserve same-session SPA state (gauntlet H8 invariant); the direct
+    navigate call added for dead-nav seats must not fire when no recovery URL was derived."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code="await page.click('#download')")
+    exc = RuntimeError("click failed")
+    browser_state = _browser_state()
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="https://app.example.com/dashboard"),
+        browser_state=browser_state,
+    )
+
+    assert result is not None and result.success is True
+    browser_state.navigate_to_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_derived_escalation_url_is_not_added_to_goal_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+
+    state_with_url = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    result_with_url = await _heal(block, _make_context(), exc, _recording_page(exc))
+    goal_with_url = state_with_url["create_task_kwargs"]["navigation_goal"]
+
+    assert result_with_url is not None and result_with_url.success is True
+    assert target_url not in goal_with_url
+
+    element_rot_block = _make_code_block(code="await page.click('#missing')")
+    state_no_url = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    result_no_url = await _heal(
+        element_rot_block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="https://app.example.com/dashboard"),
+    )
+
+    assert result_no_url is not None and result_no_url.success is True
+    assert state_no_url["create_task_kwargs"]["url"] == ""
+    assert goal_with_url == state_no_url["create_task_kwargs"]["navigation_goal"]
+
+
+@pytest.mark.asyncio
+async def test_goto_inside_comment_or_string_never_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    for code in (
+        'await page.click("#download")  # retry via .goto("https://evil.example.com")',
+        "await page.click('.goto(\"https://evil.example.com\")')",
+    ):
+        block = _make_code_block(code=code)
+        exc = RuntimeError("click failed")
+        state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+
+        result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+        assert result is not None and result.success is True
+        assert state["create_task_kwargs"]["url"] == ""
 
 
 @pytest.mark.asyncio
