@@ -4261,6 +4261,354 @@ class TestCodeRepairProgressClassification:
         assert source == "runtime_output_repair"
         assert reason_code == "runtime_output_repair_required"
 
+    def test_runtime_output_facts_preserve_satisfied_output_owner_label(self) -> None:
+        result = {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_current",
+                "blocks": [
+                    {
+                        "label": "download_statement",
+                        "status": "completed",
+                        "extracted_data": {"output": {"statement_pdf": "statement.pdf"}},
+                    }
+                ],
+            },
+        }
+        verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["__copilot_fallback_floor__run", "requested_statement_pdf"],
+            verdicts=[
+                CriterionVerdict(
+                    criterion_id="__copilot_fallback_floor__run",
+                    state="unsatisfied",
+                    reason_code="no_evidence",
+                ),
+                CriterionVerdict(
+                    criterion_id="requested_statement_pdf",
+                    state="satisfied",
+                    reason_code="evidence_confirms",
+                    output_path="output.statement_pdf",
+                    grounding_mode="exact_value",
+                    expected_output_shape="string",
+                    has_exact_value=True,
+                    evidence_ref="block_outputs:download_statement.output.statement_pdf",
+                ),
+            ],
+        )
+
+        outcome = recorded_outcome_from_run_blocks_result(
+            result,
+            recorded_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_current",
+            ),
+            completion_verification=verification,
+        )
+
+        assert outcome is not None
+        assert outcome.reason_code == "outcome_not_demonstrated"
+        assert outcome.runtime_output_repair_facts == [
+            {
+                "workflow_run_id": "wr_current",
+                "block_label": "download_statement",
+                "owner_labels": ["download_statement"],
+                "output_path": "output.statement_pdf",
+                "output_root": "output",
+                "criterion_id": "requested_statement_pdf",
+                "reason_code": "evidence_confirms",
+                "grounding_mode": "exact_value",
+                "expected_output_shape": "string",
+                "value_status": "satisfied",
+                "evidence_refs": ["output:download_statement"],
+            }
+        ]
+
+    def test_runtime_output_facts_preserve_flat_registered_output_owner_label(self) -> None:
+        result = {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_current",
+                "blocks": [
+                    {"label": "apex_portal_login", "status": "completed", "extracted_data": {}},
+                    {"label": "apex_open_monthly_statement", "status": "completed", "extracted_data": {}},
+                    {"label": "apex_download_invoice_pdf", "status": "completed", "extracted_data": {}},
+                ],
+            },
+        }
+        verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["__copilot_authored_output__output_file_name"],
+            verdicts=[
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_file_name",
+                    state="unsatisfied",
+                    reason_code="no_evidence",
+                    output_path="output.file_name",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="runtime_output",
+                )
+            ],
+        )
+
+        outcome = recorded_outcome_from_run_blocks_result(
+            result,
+            recorded_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_current",
+            ),
+            completion_verification=verification,
+            registered_output_parameter_payloads=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "block_label": "apex_download_invoice_pdf",
+                    "output_parameter_key": "apex_download_invoice_pdf_output",
+                    "value": {
+                        "file_name": "statement.pdf",
+                        "downloaded_files": [{"filename": "statement.pdf"}],
+                    },
+                }
+            ],
+        )
+
+        assert outcome is not None
+        assert outcome.runtime_output_repair_facts == [
+            {
+                "workflow_run_id": "wr_current",
+                "block_label": "apex_download_invoice_pdf",
+                "output_path": "output.file_name",
+                "output_root": "output",
+                "criterion_id": "__copilot_authored_output__output_file_name",
+                "reason_code": "no_evidence",
+                "grounding_mode": "missing",
+                "value_status": "no_typed_value",
+                "evidence_refs": ["registered_output:apex_download_invoice_pdf:apex_download_invoice_pdf_output"],
+            }
+        ]
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = outcome
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: apex_portal_login
+                code: |
+                  return {"logged_in": True}
+              - block_type: code
+                label: apex_open_monthly_statement
+                code: |
+                  return {"matched": True}
+              - block_type: code
+                label: apex_download_invoice_pdf
+                code: |
+                  return {"file_name": "statement.pdf"}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == "apex_download_invoice_pdf"
+        assert evaluation.payload["output_owner_labels"] == ["apex_download_invoice_pdf"]
+        assert "missing_output_owner" not in evaluation.shape_violations
+
+    def test_runtime_output_facts_do_not_infer_registered_owner_from_parameter_key(self) -> None:
+        result = {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_current",
+                "blocks": [
+                    {"label": "download_invoice", "status": "completed", "extracted_data": {}},
+                ],
+            },
+        }
+        verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["__copilot_authored_output__output_file_name"],
+            verdicts=[
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_file_name",
+                    state="unsatisfied",
+                    reason_code="no_evidence",
+                    output_path="output.file_name",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="runtime_output",
+                )
+            ],
+        )
+
+        outcome = recorded_outcome_from_run_blocks_result(
+            result,
+            recorded_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_current",
+            ),
+            completion_verification=verification,
+            registered_output_parameter_payloads=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "output_parameter_key": "download_invoice_output",
+                    "value": {"file_name": "statement.pdf"},
+                }
+            ],
+        )
+
+        assert outcome is not None
+        assert outcome.runtime_output_repair_facts == [
+            {
+                "workflow_run_id": "wr_current",
+                "output_path": "output.file_name",
+                "output_root": "output",
+                "criterion_id": "__copilot_authored_output__output_file_name",
+                "reason_code": "no_evidence",
+                "grounding_mode": "missing",
+                "value_status": "no_typed_value",
+                "evidence_refs": ["registered_output:unknown:download_invoice_output"],
+            }
+        ]
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = outcome
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_invoice
+                code: |
+                  return {"file_name": "statement.pdf"}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == []
+        assert "missing_output_owner" in evaluation.shape_violations
+
+    def test_runtime_output_owner_ignores_unsatisfied_independent_self_emitted_fields(self) -> None:
+        result = {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_current",
+                "blocks": [
+                    {
+                        "label": "login_to_service",
+                        "status": "completed",
+                        "extracted_data": {"output": {"logged_in": True}},
+                    },
+                    {
+                        "label": "open_statement",
+                        "status": "completed",
+                        "extracted_data": {
+                            "output": {
+                                "matched": True,
+                                "statement_date": "2026-05",
+                                "visible_page_label": "Statement details",
+                            }
+                        },
+                    },
+                ],
+            },
+        }
+        verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=[
+                "__copilot_authored_output__output_logged_in",
+                "__copilot_authored_output__output_matched",
+                "__copilot_authored_output__output_statement_date",
+                "__copilot_authored_output__output_visible_page_label",
+                "__copilot_authored_output__output_downloaded",
+            ],
+            verdicts=[
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_logged_in",
+                    state="unsatisfied",
+                    reason_code="structurally_abstained",
+                    output_path="output.logged_in",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="independent_run_evidence",
+                    evidence_ref="block_outputs:login_to_service.output.logged_in",
+                ),
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_matched",
+                    state="unsatisfied",
+                    reason_code="structurally_abstained",
+                    output_path="output.matched",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="independent_run_evidence",
+                    evidence_ref="block_outputs:open_statement.output.matched",
+                ),
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_statement_date",
+                    state="unsatisfied",
+                    reason_code="structurally_abstained",
+                    output_path="output.statement_date",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="runtime_output",
+                    evidence_ref="block_outputs:open_statement.output.statement_date",
+                ),
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_visible_page_label",
+                    state="unsatisfied",
+                    reason_code="structurally_abstained",
+                    output_path="output.visible_page_label",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="runtime_output",
+                    evidence_ref="block_outputs:open_statement.output.visible_page_label",
+                ),
+                CriterionVerdict(
+                    criterion_id="__copilot_authored_output__output_downloaded",
+                    state="unsatisfied",
+                    reason_code="no_evidence",
+                    output_path="output.downloaded",
+                    grounding_mode="missing",
+                    requested_output_evidence_source="independent_run_evidence",
+                ),
+            ],
+        )
+
+        outcome = recorded_outcome_from_run_blocks_result(
+            result,
+            recorded_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="outcome_not_demonstrated",
+                workflow_run_id="wr_current",
+            ),
+            completion_verification=verification,
+        )
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = outcome
+        workflow_yaml = _yaml(
+            """
+            title: Statement workflow
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: login_to_service
+                code: |
+                  return {"output": {"logged_in": True}}
+              - block_type: code
+                label: open_statement
+                code: |
+                  return {"output": {"statement_date": "2026-05"}}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert outcome is not None
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == []
+        assert "missing_output_owner" in evaluation.shape_violations
+
     def test_runtime_output_facts_ignore_other_run_registered_values(self) -> None:
         result = {
             "ok": True,
@@ -4466,6 +4814,313 @@ class TestCodeRepairProgressClassification:
             ctx.latest_recorded_build_test_outcome.runtime_output_repair_facts,
             key=lambda item: str(item.get("output_path") or ""),
         )
+
+    def test_runtime_output_owner_selects_current_block_without_metadata(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["download_statement"],
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                }
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: login
+                code: |
+                  return {"logged_in": True}
+              - block_type: code
+                label: download_statement
+                code: |
+                  return {"output": {"statement_pdf": "statement.pdf"}}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == "download_statement"
+        assert evaluation.payload["output_owner_labels"] == ["download_statement"]
+        assert "missing_output_owner" not in evaluation.shape_violations
+
+    def test_runtime_output_zero_owner_does_not_fall_through_to_single_block_default(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                }
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: only_block
+                code: |
+                  return {"output": {"statement_pdf": "statement.pdf"}}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == []
+        assert "missing_output_owner" in evaluation.shape_violations
+
+    def test_runtime_output_multi_owner_rejects_without_picking_metadata_owner(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["download_a", "download_b"],
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                }
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_a
+                code: |
+                  return {"output": {"statement_pdf": "a.pdf"}}
+              - block_type: code
+                label: download_b
+                code: |
+                  return {"output": {"statement_pdf": "b.pdf"}}
+            """
+        )
+        metadata = [{"block_label": "download_a", "claimed_outcomes": [{"goal_value_paths": ["output.statement_pdf"]}]}]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, metadata)
+
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == ["download_a", "download_b"]
+        assert "ambiguous_output_owner" in evaluation.shape_violations
+
+    def test_runtime_output_stale_multi_owner_rejects_when_one_owner_current(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["current_download", "stale_download"],
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                }
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: current_download
+                code: |
+                  return {"output": {"statement_pdf": "a.pdf"}}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == ["current_download"]
+        assert "ambiguous_output_owner" in evaluation.shape_violations
+
+    def test_runtime_output_multi_owner_all_stale_rejects_as_missing_owner(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["stale_one", "stale_two"],
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                }
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: current_download
+                code: |
+                  return {"output": {"statement_pdf": "a.pdf"}}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == []
+        assert "missing_output_owner" in evaluation.shape_violations
+
+    def test_runtime_output_paths_with_disagreeing_single_owners_reject(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["download_pdf"],
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                },
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["extract_total"],
+                    "output_path": "output.statement_total",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_total",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                },
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_pdf
+                code: |
+                  return {"output": {"statement_pdf": "a.pdf"}}
+              - block_type: code
+                label: extract_total
+                code: |
+                  return {"output": {"statement_total": "12.00"}}
+            """
+        )
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == ""
+        assert evaluation.payload["output_owner_labels"] == ["download_pdf", "extract_total"]
+        assert "ambiguous_output_owner" in evaluation.shape_violations
+
+    def test_runtime_output_owner_overrides_stale_pin(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.turn_id = "runtime-owner-pin"
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "owner_labels": ["new_owner"],
+                    "output_path": "output.statement_pdf",
+                    "output_root": "output",
+                    "criterion_id": "requested_statement_pdf",
+                    "reason_code": "evidence_confirms",
+                    "value_status": "satisfied",
+                }
+            ],
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: stale_owner
+                code: |
+                  return {"output": {"statement_pdf": "old.pdf"}}
+              - block_type: code
+                label: new_owner
+                code: |
+                  return {"output": {"statement_pdf": "new.pdf"}}
+            """
+        )
+        pin_key = workflow_update_module._output_contract_pin_key(ctx, workflow_yaml, {"output.statement_pdf"})
+        ctx.output_contract_pinned_block_label_by_signature = {pin_key: "stale_owner"}
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, workflow_yaml, [])
+
+        assert evaluation is not None
+        assert evaluation.block_label == "new_owner"
+        assert evaluation.payload["output_owner_labels"] == ["new_owner"]
 
     @pytest.mark.asyncio
     async def test_runtime_output_repair_facts_trigger_one_envelope_attempt_before_budget(
