@@ -384,7 +384,7 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
 }
 
 function getActionInputValue(action: ActionsApiResponse): string | null {
-  // Mirror ActionCardCompact: script-generated input text lives in response.
+  // Script-generated input text lives in response, not text.
   if (action.action_type === ActionTypes.InputText) {
     return action.text ?? action.response;
   }
