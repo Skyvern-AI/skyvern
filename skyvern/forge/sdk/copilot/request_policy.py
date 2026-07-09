@@ -153,6 +153,7 @@ _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
 )
+_CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
 _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
@@ -2094,33 +2095,52 @@ async def _load_credentials(organization_id: str) -> list[Credential]:
         page += 1
 
 
-def _fallback_credential_name_candidates(user_message: str) -> list[str]:
+def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
+    return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
+
+
+def _exact_credential_name_candidates(user_message: str) -> list[str]:
+    text = user_message or ""
     candidates: list[str] = []
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(user_message or ""):
-        value = next((group for group in match.groups() if group), "")
-        if value.strip():
-            candidates.append(value.strip())
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(user_message or ""):
+    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
+        value = next((group for group in match.groups() if group), "").strip()
+        if value and _quote_in_credential_context(text, match.start()):
+            candidates.append(value)
+    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
         value = match.group(1).strip()
         if value:
             candidates.append(value)
     return _clean_list(candidates)
 
 
-async def _apply_fallback_credential_name_scope(
+def _exact_credential_name_scan_eligible(policy: RequestPolicy) -> bool:
+    if policy.raw_secret_detected:
+        return False
+    if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+        return False
+    if policy.credential_input_kind == "credential_name" and policy.credential_refs:
+        return False
+    return policy.credential_input_kind in ("none", "credential_name", "website_stored_credential")
+
+
+async def _apply_exact_credential_name_scope(
     policy: RequestPolicy,
     *,
     user_message: str,
     organization_id: str,
 ) -> None:
-    if policy.classifier_status != "fallback":
+    if not _exact_credential_name_scan_eligible(policy):
         return
-    if policy.raw_secret_detected or policy.credential_input_kind not in ("none", "credential_name"):
-        return
-    candidates = _fallback_credential_name_candidates(user_message)
+    candidates = _exact_credential_name_candidates(user_message)
     if not candidates:
         return
     credentials = await _load_credentials(organization_id)
+    if (
+        policy.credential_input_kind == "website_stored_credential"
+        and policy.login_page_urls
+        and _match_by_url(credentials, policy.login_page_urls)
+    ):
+        return
     matched_names = _clean_list(
         [candidate for candidate in candidates if any(credential.name == candidate for credential in credentials)]
     )
@@ -2567,14 +2587,14 @@ async def build_request_policy(
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
     try:
-        await _apply_fallback_credential_name_scope(
+        await _apply_exact_credential_name_scope(
             policy,
             user_message=user_message,
             organization_id=organization_id,
         )
     except Exception:
         LOG.warning(
-            "request-policy fallback credential-name extraction failed",
+            "request-policy exact credential-name extraction failed",
             organization_id=organization_id,
             exc_info=True,
         )
