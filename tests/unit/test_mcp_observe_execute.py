@@ -890,7 +890,7 @@ class TestSkyvernExecuteMCP:
         assert result["ok"] is True
         assert result["data"]["steps_completed"] == 2
         page.click.assert_not_awaited()
-        select_option.assert_awaited_once_with(value="east", timeout=30000)
+        select_option.assert_awaited_once_with(value="east", timeout=5000)
         assert result["data"]["results"][1]["data"]["resolved_selector"] == "#region"
 
     @pytest.mark.asyncio
@@ -902,6 +902,31 @@ class TestSkyvernExecuteMCP:
         result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"ref": "e99"}}])
         assert result["ok"] is False
         assert "unknown ref" in result["data"]["results"][0]["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_preserves_structured_direct_failure_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        click_result = {
+            "ok": False,
+            "error": {
+                "code": mcp_browser.ErrorCode.ACTION_FAILED,
+                "message": "Selector matched an element that is not visible",
+                "hint": "The element exists but is not visible.",
+                "details": {"element_state": "hidden", "selector": "#field", "actionability_timeout_ms": 5000},
+            },
+        }
+        monkeypatch.setattr(mcp_browser, "skyvern_click", AsyncMock(return_value=click_result))
+
+        result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"selector": "#field"}}])
+
+        assert result["ok"] is False
+        step_error = result["data"]["results"][0]["error"]
+        assert step_error["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+        assert step_error["details"]["element_state"] == "hidden"
+        assert step_error["details"]["selector"] == "#field"
 
     @pytest.mark.asyncio
     async def test_execute_ref_to_unnamed_duplicate_uses_nth(self, monkeypatch: pytest.MonkeyPatch) -> None:

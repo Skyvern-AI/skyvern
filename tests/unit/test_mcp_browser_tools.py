@@ -12,6 +12,7 @@ from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
+from tests.unit._mcp_browser_fakes import make_probe_locator
 
 
 @pytest.mark.asyncio
@@ -209,6 +210,25 @@ def _click_page(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     return click
 
 
+def _direct_click_page(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    count: int = 1,
+    visible: bool = True,
+    enabled: bool = True,
+    probe_side_effect: Exception | None = None,
+    click_error: Exception | None = None,
+) -> tuple[AsyncMock, MagicMock]:
+    locator = make_probe_locator(count=count, visible=visible, enabled=enabled, side_effect=probe_side_effect)
+    raw_page = MagicMock()
+    raw_page.locator = MagicMock(return_value=locator)
+    click = AsyncMock(side_effect=click_error, return_value="#target")
+    page = SimpleNamespace(page=raw_page, click=click)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return click, locator
+
+
 # Default (resilient) keeps the shared MCP surface unchanged for external callers: a selector
 # tries first, then dismisses overlays and AI-falls-back. selector_mode="direct" (which the
 # copilot binds via forced_args) opts into deterministic, no-AI behavior.
@@ -231,6 +251,236 @@ async def test_skyvern_click_selector_mode_direct_is_deterministic(monkeypatch: 
     assert result["ok"] is True
     assert click.await_args.kwargs["mode"] == "direct"
     assert "prompt" not in click.await_args.kwargs and "ai" not in click.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_only_uses_fast_direct_default_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["timeout"] == 5000
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_mode_direct_uses_fast_default_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit", selector_mode="direct")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["timeout"] == 5000
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_explicit_timeout_is_honored_on_direct_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit", timeout=1234)
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["timeout"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_plus_intent_keeps_30s_default_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit", intent="the blue submit button")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["timeout"] == 30000
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_intent_only_keeps_30s_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(intent="the blue submit button")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["timeout"] == 30000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env_value", "expected_timeout"),
+    [
+        ("2500", 2500),
+        ("42", 1000),
+        ("90000", 60000),
+        ("not-an-int", 5000),
+    ],
+)
+async def test_skyvern_click_direct_timeout_env_override_is_respected_and_clamped(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str,
+    expected_timeout: int,
+) -> None:
+    monkeypatch.setenv("SKYVERN_MCP_DIRECT_TIMEOUT_MS", env_value)
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["timeout"] == expected_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("element_state", "count", "visible", "enabled", "message", "expected_code"),
+    [
+        ("not_found", 0, False, False, "Timeout 5000ms exceeded.", mcp_browser.ErrorCode.SELECTOR_NOT_FOUND),
+        ("hidden", 1, False, True, "Timeout 5000ms exceeded.", mcp_browser.ErrorCode.ACTION_FAILED),
+        ("disabled", 1, True, False, "Timeout 5000ms exceeded.", mcp_browser.ErrorCode.ACTION_FAILED),
+        (
+            "occluded",
+            1,
+            True,
+            True,
+            "<div class='overlay'></div> intercepts pointer events",
+            mcp_browser.ErrorCode.ACTION_FAILED,
+        ),
+    ],
+)
+async def test_skyvern_click_direct_failure_reports_element_state(
+    monkeypatch: pytest.MonkeyPatch,
+    element_state: str,
+    count: int,
+    visible: bool,
+    enabled: bool,
+    message: str,
+    expected_code: str,
+) -> None:
+    click_error = mcp_browser.PlaywrightTimeoutError(message)
+    click, locator = _direct_click_page(
+        monkeypatch,
+        count=count,
+        visible=visible,
+        enabled=enabled,
+        click_error=click_error,
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == expected_code
+    assert result["error"]["details"]["element_state"] == element_state
+    assert result["error"]["hint"]
+    click.assert_awaited_once()
+    locator.count.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_probes_working_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame_locator = make_probe_locator(visible=False)
+    frame = MagicMock()
+    frame.locator = MagicMock(return_value=frame_locator)
+    main_locator = make_probe_locator(count=0)
+    raw_page = MagicMock()
+    raw_page.locator = MagicMock(return_value=main_locator)
+    click = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
+    page = SimpleNamespace(page=raw_page, click=click, _locator_scope=frame)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_click(selector="#in-iframe", selector_mode="direct")
+
+    assert result["ok"] is False
+    # Main frame has count=0: a main-frame probe would say not_found; hidden proves the frame was probed.
+    assert result["error"]["details"]["element_state"] == "hidden"
+    frame.locator.assert_called_once_with("#in-iframe")
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_reports_unknown_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click, locator = _direct_click_page(
+        monkeypatch,
+        probe_side_effect=asyncio.TimeoutError(),
+        click_error=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."),
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    assert result["ok"] is False
+    assert result["error"]["details"]["element_state"] == "unknown"
+    assert result["error"]["hint"]
+    click.assert_awaited_once()
+    locator.count.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_press_key_selector_only_uses_fast_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    press = AsyncMock()
+    locator = MagicMock()
+    locator.press = press
+    page = SimpleNamespace(locator=MagicMock(return_value=locator))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_press_key(key="Enter", selector="#field")
+
+    assert result["ok"] is True
+    press.assert_awaited_once_with("Enter", timeout=5000)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_press_key_intent_explicit_timeout_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    press = AsyncMock()
+    locator = MagicMock()
+    locator.press = press
+    page = SimpleNamespace(locator=MagicMock(return_value=locator))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_press_key(key="Enter", intent="the search box", timeout=1234)
+
+    assert result["ok"] is True
+    press.assert_awaited_once_with("Enter", timeout=1234)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_press_key_intent_keeps_30s_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    press = AsyncMock()
+    locator = MagicMock()
+    locator.press = press
+    page = SimpleNamespace(locator=MagicMock(return_value=locator))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_press_key(key="Enter", intent="the search box")
+
+    assert result["ok"] is True
+    press.assert_awaited_once_with("Enter", timeout=30000)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_press_key_direct_failure_reports_element_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe_locator = make_probe_locator(count=1, visible=False)
+    raw_page = MagicMock()
+    raw_page.locator = MagicMock(return_value=probe_locator)
+    press_locator = MagicMock()
+    press_locator.press = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
+    page = SimpleNamespace(page=raw_page, locator=MagicMock(return_value=press_locator))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_press_key(key="Enter", selector="#field")
+
+    assert result["ok"] is False
+    assert result["error"]["details"]["element_state"] == "hidden"
+    assert result["error"]["details"]["selector"] == "#field"
 
 
 @pytest.mark.asyncio
@@ -385,7 +635,7 @@ async def test_skyvern_click_native_option_selector_uses_parent_select(monkeypat
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(value="east", timeout=30000)
+    select_option.assert_awaited_once_with(value="east", timeout=5000)
     assert result["data"]["resolved_selector"] == "#region"
     assert result["data"]["selected_option"] == {
         "select_selector": "#region",
@@ -425,7 +675,7 @@ async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(index=3, timeout=30000)
+    select_option.assert_awaited_once_with(index=3, timeout=5000)
     assert result["data"]["selected_option"]["selected_by"] == "index"
     assert result["data"]["selected_option"]["index"] == 3
     assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", index=3)'

@@ -361,7 +361,6 @@ async def test_force_browser_session_rotating_profile_key_selects_after_run_crea
         monkeypatch,
         workflow=workflow,
         workflow_request=WorkflowRequestBody(
-            data={"login_cred": "cred_request"},
             proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         ),
         update_profile=update_profile,
@@ -397,6 +396,48 @@ async def test_force_browser_session_rotating_profile_key_selects_after_run_crea
         browser_session_id="pbs_forced",
     )
     assert forced.result is forced.update_workflow_run.return_value
+
+
+@pytest.mark.asyncio
+async def test_force_browser_session_rotating_profile_key_uses_run_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    select_credential_for_run = AsyncMock(return_value="cred_selected")
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.service.select_credential_for_run",
+        select_credential_for_run,
+    )
+    update_profile = AsyncMock(return_value=_profile())
+    workflow = _workflow(
+        browser_profile_key="{{ login_cred }}",
+        parameters=[
+            _credential_parameter(
+                "login_cred",
+                credential_ids=["cred_a", "cred_selected"],
+                selection_strategy="round_robin",
+            )
+        ],
+    )
+
+    forced = await _create_forced_workflow_run(
+        monkeypatch,
+        workflow=workflow,
+        workflow_request=WorkflowRequestBody(
+            data={"login_cred": "cred_selected"},
+            proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        ),
+        update_profile=update_profile,
+    )
+
+    digest = build_browser_profile_key_digest("cred_selected")
+    select_credential_for_run.assert_not_awaited()
+    forced.get_or_create_profile.assert_awaited_once_with(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        browser_profile_key_digest=digest,
+        name="Workflow (auto-saved: cred_selected)",
+    )
+    forced.create_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
