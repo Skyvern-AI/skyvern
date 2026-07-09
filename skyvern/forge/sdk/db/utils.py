@@ -318,6 +318,11 @@ def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = 
 def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
     if debug_enabled:
         LOG.debug("Converting TaskModel to Task", task_id=task_obj.task_id)
+    extracted_information = task_obj.extracted_information
+    if extracted_information is not None and not isinstance(extracted_information, (dict, list, str)):
+        # LLM extraction can store a bare JSON scalar (bool/int/float); coerce to its JSON
+        # string form so one such row can't fail Task validation and break a whole listing.
+        extracted_information = json.dumps(extracted_information, default=str)
     task = Task(
         task_id=task_obj.task_id,
         status=TaskStatus(task_obj.status),
@@ -337,7 +342,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         navigation_goal=task_obj.navigation_goal,
         data_extraction_goal=task_obj.data_extraction_goal,
         navigation_payload=task_obj.navigation_payload,
-        extracted_information=task_obj.extracted_information,
+        extracted_information=extracted_information,
         failure_reason=task_obj.failure_reason,
         organization_id=task_obj.organization_id,
         proxy_location=deserialize_proxy_location(task_obj.proxy_location),
@@ -554,7 +559,9 @@ def convert_to_workflow(
         totp_verification_url=workflow_model.totp_verification_url,
         totp_identifier=workflow_model.totp_identifier,
         persist_browser_session=workflow_model.persist_browser_session,
+        pin_saved_session_ip=workflow_model.pin_saved_session_ip,
         browser_profile_id=workflow_model.browser_profile_id,
+        browser_profile_key=workflow_model.browser_profile_key,
         model=workflow_model.model,
         proxy_location=deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
@@ -574,6 +581,7 @@ def convert_to_workflow(
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
+        enable_self_healing=workflow_model.enable_self_healing,
         code_version=workflow_model.code_version,
         generate_script_on_terminal=workflow_model.generate_script_on_terminal,
         run_sequentially=workflow_model.run_sequentially,
@@ -834,6 +842,7 @@ def convert_to_workflow_run_block(
         attachments=workflow_run_block_model.attachments,
         subject=workflow_run_block_model.subject,
         body=workflow_run_block_model.body,
+        prompt=workflow_run_block_model.prompt,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
         instructions=workflow_run_block_model.instructions,

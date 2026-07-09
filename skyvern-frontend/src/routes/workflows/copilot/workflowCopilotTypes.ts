@@ -43,6 +43,7 @@ export interface WorkflowCopilotChatRequest {
   code_block?: boolean | null;
   cancel_token?: string;
   target_block_label?: string | null;
+  fix_origin?: boolean;
 }
 
 export interface WorkflowCopilotCancelRequest {

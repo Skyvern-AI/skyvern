@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import functools
 import json
 import pathlib
 import re
@@ -16,8 +17,12 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
@@ -67,6 +72,41 @@ MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
 DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
 
 
+@functools.lru_cache(maxsize=None)
+def _resolve_enrichment_handler(key: str) -> LLMAPIHandler | None:
+    """Resolve the dedicated enrichment handler for `key`, or None if it isn't registered.
+
+    Memoized because the key is static config and the registry is populated at startup;
+    exceptions propagate uncached so a transient resolution failure isn't pinned.
+    """
+    if LLMConfigRegistry.is_registered(key):
+        return LLMAPIHandlerFactory.get_llm_api_handler(key)
+    return None
+
+
+def _recording_enrichment_llm_handler() -> LLMAPIHandler:
+    """Dedicated (fast) LLM for draft enrichment; falls back to the default handler on any resolution failure."""
+    key = settings.RECORDING_ENRICHMENT_LLM_KEY
+    if key:
+        try:
+            handler = _resolve_enrichment_handler(key)
+        except Exception:
+            LOG.warning(
+                "record_browser.enrichment_llm_fallback",
+                enrichment_llm_key=key,
+                exc_info=True,
+            )
+        else:
+            if handler is not None:
+                return handler
+    return app.LLM_API_HANDLER
+
+
+# Re-captures of one interaction land within this browser-clock (ms) window; genuine repeats fall outside it.
+DUPLICATE_ACTION_WINDOW_MS = 250
+DUPLICATE_ACTION_SCAN_DEPTH = 8
+
+
 def _action_identity(action: Action) -> tuple[str, str, str, str]:
     """Stable identity fields used for duplicate-action suppression."""
     return (
@@ -79,20 +119,20 @@ def _action_identity(action: Action) -> tuple[str, str, str, str]:
 
 def _is_duplicate_action(candidate: Action, existing_actions: list[Action]) -> bool:
     """
-    Suppress duplicate actions emitted from duplicate transport events.
-
-    We only dedupe when the latest action has the exact same identity and
-    timestamps, which keeps intentional repeated clicks intact.
+    Suppress duplicate actions from duplicate transport events: a recent action (within
+    DUPLICATE_ACTION_WINDOW_MS, by identity) marks the candidate a duplicate. The tail scan and
+    window catch non-adjacent, ms-jittered re-captures while keeping intentional repeats intact.
     """
     if not existing_actions:
         return False
 
-    previous = existing_actions[-1]
-    return (
-        _action_identity(previous) == _action_identity(candidate)
-        and previous.timestamp_start == candidate.timestamp_start
-        and previous.timestamp_end == candidate.timestamp_end
-    )
+    for previous in reversed(existing_actions[-DUPLICATE_ACTION_SCAN_DEPTH:]):
+        if _action_identity(previous) != _action_identity(candidate):
+            continue
+        if abs(candidate.timestamp_start - previous.timestamp_start) <= DUPLICATE_ACTION_WINDOW_MS:
+            return True
+
+    return False
 
 
 def deterministic_goto_url_label(url: str) -> str:
@@ -322,7 +362,30 @@ class Processor:
                     # of this event through subsequent state machines
                     break
 
+        # NOTE: append-only — the live interpreter calls this each iteration and
+        # tracks emitted actions by index, so collapsing here would shrink the list
+        # and drop a later wait. Collapsing happens in the raw process() path only.
         return actions
+
+    @staticmethod
+    def _collapse_consecutive_waits(actions: list[Action]) -> list[Action]:
+        collapsed: list[Action] = []
+
+        for action in actions:
+            previous = collapsed[-1] if collapsed else None
+            if isinstance(action, ActionWait) and isinstance(previous, ActionWait):
+                collapsed[-1] = ActionWait(
+                    kind=ActionKind.WAIT.value,
+                    target=previous.target,
+                    timestamp_start=previous.timestamp_start,
+                    timestamp_end=action.timestamp_end,
+                    url=action.url,
+                    duration_ms=previous.duration_ms + action.duration_ms,
+                )
+                continue
+            collapsed.append(action)
+
+        return collapsed
 
     def dedupe_block_labels(self, suspects: list[OutputBlock]) -> list[OutputBlock]:
         """
@@ -494,7 +557,7 @@ class Processor:
             action=action,
         )
 
-        metadata_response = await app.LLM_API_HANDLER(
+        metadata_response = await _recording_enrichment_llm_handler()(
             prompt=metadata_prompt,
             prompt_name=prompt_name,
             organization_id=self.organization_id,
@@ -569,7 +632,7 @@ class Processor:
             **summarize_exfiltrated_recording_events(events),
             **self.identity,
         )
-        actions = self.events_to_actions(events)
+        actions = self._collapse_consecutive_waits(self.events_to_actions(events))
         blocks = await self.actions_to_blocks(actions)
         parameters = self.blocks_to_parameters(blocks)
 

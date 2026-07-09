@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
@@ -14,6 +15,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     contains_email_password_pair,
+    request_policy_has_present_completion_contract,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
@@ -21,7 +23,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
-    credential_params,
+    credential_param_ids,
     parse_workflow_yaml,
     url_origin,
     workflow_blocks,
@@ -436,7 +438,7 @@ def evaluate_output_policy(
         if (
             response_type == "ASK_QUESTION"
             and request_policy.user_response_policy != "ask_clarification"
-            and _request_policy_has_present_completion_contract(request_policy)
+            and request_policy_has_present_completion_contract(request_policy)
             and not has_workflow_proposal
             and not workflow_attempted
             and _asks_to_confirm_output_fields(user_response)
@@ -450,10 +452,6 @@ def evaluate_output_policy(
         verdict.add(OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
     return verdict
-
-
-def _request_policy_has_present_completion_contract(request_policy: RequestPolicy) -> bool:
-    return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
 
 
 def _asks_to_confirm_output_fields(user_response: str | None) -> bool:
@@ -840,7 +838,7 @@ def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request
     if not isinstance(workflow_definition, dict):
         return False
 
-    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return False
 
@@ -864,7 +862,7 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
 
 def _block_broadens_credential_scope(
     block: dict[str, Any],
-    credential_params_by_key: dict[str, str],
+    credential_params_by_key: Mapping[str, str | set[str]],
     approved_origins: dict[str, set[str]],
 ) -> bool:
     credential_ids = block_credential_ids(block, credential_params_by_key)

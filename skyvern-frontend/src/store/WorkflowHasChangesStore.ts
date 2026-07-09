@@ -8,6 +8,7 @@ import { usePostHog } from "posthog-js/react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import {
   type BlockYAML,
   type ParameterYAML,
@@ -91,17 +92,22 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
     saidOkToCodeCacheDeletion,
     setHasChanges,
     setSaveIsPending,
+    setSaidOkToCodeCacheDeletion,
     setShowConfirmCodeCacheDeletion,
   } = useWorkflowHasChangesStore();
 
   const saveWorkflowMutation = useMutation({
-    mutationFn: async () => {
-      const saveData = getSaveData();
+    mutationFn: async (override?: Partial<SaveData>) => {
+      const base = getSaveData();
 
-      if (!saveData) {
+      if (!base) {
         setHasChanges(false);
         return;
       }
+      // YAML-mode saves pass the parsed draft (blocks/parameters/version, plus
+      // a corrected finally_block_label) so we persist the edit directly
+      // instead of the graph, which lags a commit's async setNodes.
+      const saveData: SaveData = override ? { ...base, ...override } : base;
 
       const client = await getClient(credentialGetter);
       const extraHttpHeaders: Record<string, string> = {};
@@ -131,7 +137,10 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } catch (error) {
           toast({
             title: "Error",
-            description: "Invalid JSON format in extra http headers",
+            description: `Invalid JSON format in extra http headers: ${getJsonParseErrorDetail(
+              saveData.settings.extraHttpHeaders ?? "",
+              error,
+            )}`,
             variant: "destructive",
           });
           return;
@@ -163,7 +172,10 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } catch (error) {
           toast({
             title: "Error",
-            description: "Invalid JSON format in cdp connect headers",
+            description: `Invalid JSON format in cdp connect headers: ${getJsonParseErrorDetail(
+              saveData.settings.cdpConnectHeaders ?? "",
+              error,
+            )}`,
             variant: "destructive",
           });
           return;
@@ -180,7 +192,9 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         proxy_location: saveData.settings.proxyLocation,
         webhook_callback_url: saveData.settings.webhookCallbackUrl,
         persist_browser_session: saveData.settings.persistBrowserSession,
+        pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
         browser_profile_id: saveData.settings.browserProfileId,
+        browser_profile_key: saveData.settings.browserProfileKey,
         model: saveData.settings.model,
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         max_elapsed_time_minutes:
@@ -191,6 +205,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
+        enable_self_healing: saveData.settings.enableSelfHealing ?? false,
         code_version:
           saveData.settings.runWith === "code"
             ? (saveData.settings.codeVersion ?? 2)
@@ -202,6 +217,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           finally_block_label: saveData.settings.finallyBlockLabel ?? undefined,
           workflow_system_prompt:
             saveData.settings.workflowSystemPrompt ?? undefined,
+          error_code_mapping: saveData.settings.errorCodeMapping ?? undefined,
         },
         is_saved_task: saveData.workflow.is_saved_task,
         status: opts?.status ?? saveData.workflow.status,
@@ -227,6 +243,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
       );
     },
     onSuccess: () => {
+      // The confirmation authorizes exactly one save. Resetting here covers
+      // every persist path (top bar, nav blocker, YAML mode), so a later save
+      // can't silently delete cached code without re-prompting.
+      setSaidOkToCodeCacheDeletion(false);
+
       const saveData = getSaveData();
 
       if (!saveData) {

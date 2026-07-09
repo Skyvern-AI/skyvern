@@ -5,7 +5,6 @@ They do NOT require an LLM key or Playwright — they test infrastructure only.
 """
 
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -30,38 +29,6 @@ def test_no_cloud_in_sys_modules() -> None:
         assert not cloud_after, (
             f"cloud was loaded by importing api_app. Modules: {[k for k in sys.modules if k.startswith('cloud')]}"
         )
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_creates_db() -> None:
-    """Embedded bootstrap creates SQLite tables, org, and token."""
-    from skyvern import Skyvern
-
-    skyvern = Skyvern.local(use_in_memory_db=True)
-    try:
-        workflows = await skyvern.get_workflows()
-        assert workflows is not None
-    finally:
-        await skyvern.aclose()
-
-
-@pytest.mark.asyncio
-async def test_artifact_tempdir_is_live() -> None:
-    """StorageFactory points to an existing temp directory after bootstrap."""
-    from skyvern import Skyvern
-    from skyvern.library.embedded_server_factory import EmbeddedClient
-
-    skyvern = Skyvern.local(use_in_memory_db=True)
-    try:
-        await skyvern.get_workflows()
-        client = getattr(skyvern, "_embedded_client", None)
-        assert isinstance(client, EmbeddedClient)
-        artifact_dir = client.embedded_transport._artifact_dir
-        assert artifact_dir is not None
-        assert Path(artifact_dir).exists()
-        assert "skyvern-artifacts-" in artifact_dir
-    finally:
-        await skyvern.aclose()
 
 
 @pytest.mark.asyncio

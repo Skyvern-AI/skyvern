@@ -6,6 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -111,7 +112,9 @@ const saveData = {
     proxyLocation: null,
     webhookCallbackUrl: null,
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
+    browserProfileKey: null,
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
@@ -161,8 +164,10 @@ const workflowDraft = () => ({
   workflow: { workflow_id: "wf_draft" },
 });
 
-async function renderChat() {
-  const view = render(<WorkflowCopilotChat />);
+async function renderChat(
+  props: ComponentProps<typeof WorkflowCopilotChat> = {},
+) {
+  const view = render(<WorkflowCopilotChat {...props} />);
   // Let the mount-time chat-history fetch settle.
   await waitFor(() =>
     expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
@@ -232,6 +237,45 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(textarea().disabled).toBe(false);
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  });
+
+  it("labels the in-flight follow-up action as the next send", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(
+      screen.getByText(
+        "Copilot is working. Your next send will wait for the next turn.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByPlaceholderText("Type a message to send next…"),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+  });
+
+  it("explains that the next send waits while the live browser is starting", async () => {
+    render(
+      <WorkflowCopilotChat requiresLiveBrowser isLiveBrowserReady={false} />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByPlaceholderText("Type a prompt to send when ready..."),
+      ).toBeTruthy(),
+    );
+
+    expect(
+      screen.getByText(
+        "Live browser is starting. Your next send will wait until it connects.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+    // The old copy conflated sending with queuing; guard against its return.
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+    expect(screen.queryByText(/Send now to queue your prompt/)).toBeNull();
+    expect(screen.queryByPlaceholderText(/Type a prompt to queue/)).toBeNull();
   });
 
   it("still sends the message when dictation audio upload fails", async () => {
@@ -655,6 +699,150 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("keeps a rejected history-loaded auto-applicable draft labeled as proposed changes", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "I drafted workflow changes for review.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: false,
+            proposalDisposition: "auto_applicable",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 1,
+              blockLabels: ["open_page"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage: "I drafted workflow changes for review.",
+            narrativeSummary: "I drafted workflow changes for review.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    await renderChat({ docked: true, portalTarget });
+
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    });
+
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Applied changes")).toBeNull();
+    portalTarget.remove();
+  });
+
+  it("relabels an auto-applicable draft as applied changes once accepted", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "I drafted workflow changes for review.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: false,
+            proposalDisposition: "auto_applicable",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 1,
+              blockLabels: ["open_page"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage: "I drafted workflow changes for review.",
+            narrativeSummary: "I drafted workflow changes for review.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    await renderChat({ docked: true, portalTarget });
+
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Applied changes")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
+    );
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+    );
+    expect(screen.getByText("Applied changes")).toBeTruthy();
+    expect(screen.queryByText("Proposed changes")).toBeNull();
+    portalTarget.remove();
   });
 
   it("renders an ASK_QUESTION response payload as a question", async () => {

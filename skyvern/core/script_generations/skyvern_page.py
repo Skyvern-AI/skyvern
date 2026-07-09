@@ -145,6 +145,8 @@ class SkyvernPage(Page):
             ) -> Any:
                 return await skyvern_page._decorate_call(fn, action, *args, **kwargs)
 
+            # Tag the wrapper so the recorder/deriver mirrors can be regression-tested against this set.
+            wrapper.__skyvern_action_type__ = action  # type: ignore[attr-defined]
             return wrapper
 
         return decorator
@@ -401,8 +403,9 @@ class SkyvernPage(Page):
                         return selector
                     except Exception:
                         pass  # retry failed too — fall through to AI
-                    LOG.warning(
+                    LOG.info(
                         "CSS selector click failed, falling back to AI",
+                        sampling=True,
                         selector=selector,
                         error=str(e),
                     )

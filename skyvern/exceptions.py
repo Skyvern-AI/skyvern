@@ -161,6 +161,16 @@ class InvalidOpenAIResponseFormat(SkyvernException):
         super().__init__(f"Invalid response format: {message}")
 
 
+class PhoneNumberInputMismatch(SkyvernException):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        self.expected_digit_count = expected_digit_count
+        self.actual_digit_count = actual_digit_count
+        super().__init__(
+            "Phone input read-back mismatch: "
+            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
@@ -779,9 +789,19 @@ class UnsupportedActionType(SkyvernException):
         super().__init__(f"Unsupport action type: {action_type}")
 
 
+_INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT = (
+    " The element appears to be a non-input segment of a custom date widget. "
+    "Look for a calendar icon, date picker trigger, or stepper button near this "
+    "element and click that instead of typing into the segment."
+)
+
+
 class InvalidElementForTextInput(SkyvernException):
-    def __init__(self, element_id: str, tag_name: str):
-        super().__init__(f"The {tag_name} element with id={element_id} doesn't support text input.")
+    def __init__(self, element_id: str, tag_name: str, *, is_date_related: bool = False):
+        message = f"The {tag_name} element with id={element_id} doesn't support text input."
+        if is_date_related:
+            message += _INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT
+        super().__init__(message)
 
 
 class ElementIsNotLabel(SkyvernException):
@@ -1292,3 +1312,11 @@ class ImaginarySecretValue(SkyvernException):
         super().__init__(
             f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )
+
+
+class CodeBlockRunnerSelectionError(SkyvernException):
+    """Raised when the secure CodeBlock runner selection policy cannot be evaluated safely.
+
+    The block-execution call site catches this and fails the block closed instead of
+    silently falling back to in-process execution.
+    """

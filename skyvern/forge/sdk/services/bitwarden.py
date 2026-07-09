@@ -35,7 +35,6 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     SecretCredential,
 )
-from skyvern.forge.sdk.services.credentials import parse_totp_secret
 from skyvern.utils.strings import is_uuid
 
 LOG = structlog.get_logger()
@@ -144,7 +143,7 @@ def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
 def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
     if item["type"] == BitwardenItemType.LOGIN:
         login = item["login"]
-        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+        totp = BitwardenService.normalize_totp_config(login.get("totp", ""))
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
@@ -520,23 +519,28 @@ class BitwardenService:
             )
 
     @staticmethod
-    def extract_totp_secret(totp_value: str) -> str:
+    def normalize_totp_config(totp_value: str) -> str:
         """
-        Extract the TOTP secret from either a raw secret or a TOTP URI.
+        Preserve the raw TOTP value from Bitwarden.
 
         Args:
-            totp_value: Raw TOTP secret or URI (otpauth://totp/...)
+            totp_value: Raw TOTP secret, URI, or provider-specific payload.
 
         Returns:
-            The extracted TOTP secret
+            The raw TOTP value
 
         Example:
-            >>> BitwardenService.extract_totp_secret("AAAAAABBBBBBB")
+            >>> BitwardenService.normalize_totp_config("AAAAAABBBBBBB")
             "AAAAAABBBBBBB"
-            >>> BitwardenService.extract_totp_secret("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
-            "AAAAAABBBBBBB"
+            >>> BitwardenService.normalize_totp_config("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
+            "otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB"
         """
-        return parse_totp_secret(totp_value)
+        return totp_value.strip()
+
+    @staticmethod
+    def extract_totp_secret(totp_value: str) -> str:
+        """Compatibility shim for callers using the old method name."""
+        return BitwardenService.normalize_totp_config(totp_value)
 
     @staticmethod
     async def _get_secret_value_from_url(
@@ -572,7 +576,7 @@ class BitwardenService:
                     raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
 
                 login = item["login"]
-                totp = BitwardenService.extract_totp_secret(login.get("totp") or "")
+                totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
 
                 return {
                     BitwardenConstants.USERNAME: login.get("username") or "",
@@ -634,7 +638,7 @@ class BitwardenService:
                     continue
 
                 login = item["login"]
-                totp = BitwardenService.extract_totp_secret(login.get("totp") or "")
+                totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
 
                 bitwarden_result.append(
                     BitwardenQueryResult(
@@ -1052,7 +1056,7 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Failed to get login item by ID: {item_id}")
 
         login = response["data"]["login"]
-        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+        totp = BitwardenService.normalize_totp_config(login.get("totp", ""))
         if not login:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 

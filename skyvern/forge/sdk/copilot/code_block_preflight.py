@@ -12,16 +12,29 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+
+SANDBOX_UNRESOLVED_NAME_REASON_CODE = "SANDBOX_UNRESOLVED_NAME"
 
 
 @dataclass(frozen=True)
 class CodeBlockPreflightDiagnostic:
     code: str
     message: str
+
+
+@dataclass(frozen=True)
+class CodeBlockSandboxNameDiagnostic:
+    code: str
+    message: str
+    unresolved_names: tuple[str, ...]
+    class_names: tuple[str, ...]
+    parameter_keys: tuple[str, ...]
+    allowed_global_names: tuple[str, ...]
+    allowed_helper_surface: dict[str, tuple[str, ...]]
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")
@@ -37,6 +50,22 @@ _BROAD_TABLE_RECORD_KEYS = frozenset(("items", "locations", "records", "rows"))
 _BROAD_TABLE_SCAN_SELECTORS = frozenset({"article", "section", ".card", "li"})
 _BROAD_TABLE_SELECTOR_METHODS = frozenset(("locator", "query_selector", "query_selector_all"))
 _LONE_LIST_ITEM_SELECTOR_EXEMPTION = frozenset({"li"})
+_GET_BY_TEXT_NARROWING_ATTRIBUTES = frozenset({"first", "last"})
+_GET_BY_TEXT_NARROWING_METHODS = frozenset({"filter", "first", "last", "nth"})
+_TABLE_WAIT_NARROWING_METHODS = frozenset(
+    {
+        "filter",
+        "get_by_alt_text",
+        "get_by_label",
+        "get_by_placeholder",
+        "get_by_role",
+        "get_by_test_id",
+        "get_by_text",
+        "get_by_title",
+        "locator",
+        "nth",
+    }
+)
 _TABLE_ROW_TAG_SELECTOR_RE = re.compile(r"(?<![a-z0-9_-])tr(?![a-z0-9_-])")
 _TABLE_ROW_ROLE_SELECTOR_RE = re.compile(r"\[role\s*=\s*(['\"]?)row\1\]")
 
@@ -55,6 +84,14 @@ def _sandbox_shim_surface() -> dict[str, frozenset[str]]:
         for name, value in CodeBlock.build_safe_vars().items()
         if isinstance(value, SimpleNamespace)
     }
+
+
+def sandbox_allowed_global_names() -> list[str]:
+    return sorted(_sandbox_global_names())
+
+
+def sandbox_allowed_helper_surface() -> dict[str, list[str]]:
+    return {name: sorted(surface) for name, surface in sorted(_sandbox_shim_surface().items())}
 
 
 def strip_redundant_sandbox_imports(code: str) -> tuple[str, list[str]]:
@@ -240,14 +277,26 @@ def sandbox_unresolved_name_diagnostics(
     ambiguous control-flow bindings do not satisfy later reads.
     """
 
+    repair_diagnostic = sandbox_unresolved_name_repair_diagnostic(code, parameter_keys=parameter_keys)
+    if repair_diagnostic is None:
+        return []
+    return [CodeBlockPreflightDiagnostic(code=repair_diagnostic.code, message=repair_diagnostic.message)]
+
+
+def sandbox_unresolved_name_repair_diagnostic(
+    code: str,
+    *,
+    parameter_keys: Iterable[str] = (),
+) -> CodeBlockSandboxNameDiagnostic | None:
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
     except SyntaxError:
-        return []
+        return None
 
-    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_keys).analyze(tree.body)
+    parameter_key_list = sorted(key for key in dict.fromkeys(parameter_keys) if _valid_python_identifier(key))
+    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_key_list).analyze(tree.body)
     if not unresolved_names and not class_names:
-        return []
+        return None
 
     names = sorted(unresolved_names)
     rejected_classes = sorted(class_names)
@@ -259,17 +308,22 @@ def sandbox_unresolved_name_diagnostics(
             "class definitions unavailable in the code sandbox: " + ", ".join(f"`{name}`" for name in rejected_classes)
         )
     detail = "; ".join(detail_parts)
-    return [
-        CodeBlockPreflightDiagnostic(
-            code="SANDBOX_UNRESOLVED_NAME",
-            message=(
-                f"Code block references names that are unavailable in the runtime code sandbox or are not "
-                f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
-                "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
-                "exception type."
-            ),
-        )
-    ]
+    return CodeBlockSandboxNameDiagnostic(
+        code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+        message=(
+            f"Code block references names that are unavailable in the runtime code sandbox or are not "
+            f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
+            "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
+            "exception type."
+        ),
+        unresolved_names=tuple(names),
+        class_names=tuple(rejected_classes),
+        parameter_keys=tuple(parameter_key_list),
+        allowed_global_names=tuple(sandbox_allowed_global_names()),
+        allowed_helper_surface={
+            helper: tuple(attributes) for helper, attributes in sandbox_allowed_helper_surface().items()
+        },
+    )
 
 
 def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
@@ -342,13 +396,116 @@ def _author_time_ast_diagnostics(tree: ast.AST) -> list[CodeBlockPreflightDiagno
     broad_table_scan = _broad_table_record_scan_diagnostic(tree)
     if broad_table_scan is not None:
         diagnostics.append(broad_table_scan)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    diagnostics.extend(_alias_wait_diagnostics(tree))
+    return diagnostics
+
+
+def _alias_wait_diagnostics(tree: ast.AST) -> list[CodeBlockPreflightDiagnostic]:
+    diagnostics: list[CodeBlockPreflightDiagnostic] = []
+    statements = [node for node in ast.iter_child_nodes(tree) if isinstance(node, ast.stmt)]
+    _alias_wait_block_diagnostics(statements, {}, {}, diagnostics)
+    return diagnostics
+
+
+def _alias_wait_block_diagnostics(
+    statements: list[ast.stmt],
+    text_aliases: dict[str, bool],
+    table_aliases: dict[str, bool],
+    diagnostics: list[CodeBlockPreflightDiagnostic],
+) -> None:
+    for statement in statements:
+        _alias_wait_statement_diagnostics(statement, text_aliases, table_aliases, diagnostics)
+
+
+def _alias_wait_statement_diagnostics(
+    node: ast.stmt,
+    text_aliases: dict[str, bool],
+    table_aliases: dict[str, bool],
+    diagnostics: list[CodeBlockPreflightDiagnostic],
+) -> None:
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        assigned_value, _targets = _assignment_value_and_targets(node)
+        if assigned_value is not None:
+            _alias_wait_expr_diagnostics(assigned_value, text_aliases, table_aliases, diagnostics)
+        _update_global_get_by_text_aliases(node, text_aliases)
+        _update_global_table_locator_aliases(node, table_aliases)
+        return
+
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        for decorator in node.decorator_list:
+            _alias_wait_expr_diagnostics(decorator, text_aliases, table_aliases, diagnostics)
+        _alias_wait_block_diagnostics(list(node.body), dict(text_aliases), dict(table_aliases), diagnostics)
+        return
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.expr):
+            _alias_wait_expr_diagnostics(child, text_aliases, table_aliases, diagnostics)
+    for child_statements in _alias_wait_child_statement_blocks(node):
+        _alias_wait_block_diagnostics(child_statements, dict(text_aliases), dict(table_aliases), diagnostics)
+
+
+def _alias_wait_child_statement_blocks(node: ast.stmt) -> list[list[ast.stmt]]:
+    blocks: list[list[ast.stmt]] = []
+    for _field_name, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            if all(isinstance(item, ast.stmt) for item in value):
+                blocks.append(value)
+            for item in value:
+                if isinstance(item, ast.ExceptHandler):
+                    blocks.append(item.body)
+    return blocks
+
+
+def _alias_wait_expr_diagnostics(
+    node: ast.expr,
+    text_aliases: Mapping[str, bool],
+    table_aliases: Mapping[str, bool],
+    diagnostics: list[CodeBlockPreflightDiagnostic],
+) -> None:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
             continue
-        body_text_wait_diagnostic = _broad_body_text_wait_for_function_diagnostic(node)
+        body_text_wait_diagnostic = _broad_body_text_wait_for_function_diagnostic(child)
         if body_text_wait_diagnostic is not None:
             diagnostics.append(body_text_wait_diagnostic)
-    return diagnostics
+        global_text_wait_diagnostic = _global_get_by_text_wait_for_diagnostic(child, text_aliases)
+        if global_text_wait_diagnostic is not None:
+            diagnostics.append(global_text_wait_diagnostic)
+        global_table_wait_diagnostic = _global_table_wait_for_diagnostic(child, table_aliases)
+        if global_table_wait_diagnostic is not None:
+            diagnostics.append(global_table_wait_diagnostic)
+
+
+def _update_global_get_by_text_aliases(node: ast.Assign | ast.AnnAssign, aliases: dict[str, bool]) -> None:
+    assigned_value, targets = _assignment_value_and_targets(node)
+    if assigned_value is None:
+        return
+    is_global_text_locator, has_narrowing = _global_get_by_text_locator_chain(assigned_value, aliases)
+    for target in targets:
+        if isinstance(target, ast.Name):
+            if is_global_text_locator:
+                aliases[target.id] = has_narrowing
+            else:
+                aliases.pop(target.id, None)
+
+
+def _update_global_table_locator_aliases(node: ast.Assign | ast.AnnAssign, aliases: dict[str, bool]) -> None:
+    assigned_value, targets = _assignment_value_and_targets(node)
+    if assigned_value is None:
+        return
+    is_global_table_locator, has_narrowing = _global_table_locator_chain(assigned_value, aliases)
+    for target in targets:
+        if isinstance(target, ast.Name):
+            if is_global_table_locator:
+                aliases[target.id] = has_narrowing
+            else:
+                aliases.pop(target.id, None)
+
+
+def _assignment_value_and_targets(node: ast.Assign | ast.AnnAssign) -> tuple[ast.expr | None, list[ast.expr]]:
+    if isinstance(node, ast.Assign):
+        return node.value, list(node.targets)
+    return node.value, [node.target]
 
 
 class _SandboxNameAnalyzer:
@@ -729,6 +886,107 @@ def _page_evaluate_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | 
     )
 
 
+def _global_get_by_text_wait_for_diagnostic(
+    node: ast.Call,
+    aliases: Mapping[str, bool],
+) -> CodeBlockPreflightDiagnostic | None:
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr != "wait_for":
+        return None
+    is_global_text_locator, has_narrowing = _global_get_by_text_locator_chain(func.value, aliases)
+    if not is_global_text_locator or has_narrowing:
+        return None
+    return CodeBlockPreflightDiagnostic(
+        code="GLOBAL_GET_BY_TEXT_WAIT_FOR",
+        message=(
+            "Code block waits on global `page.get_by_text(...).wait_for(...)`, which can collide with "
+            "multiple matching text nodes under Playwright strict mode. Scope the text lookup "
+            "through a locator/container or narrow it with `first`, `nth`, or `filter` before waiting."
+        ),
+    )
+
+
+def _global_get_by_text_locator_chain(node: ast.expr, aliases: Mapping[str, bool]) -> tuple[bool, bool]:
+    if _is_global_page_get_by_text_call(node):
+        return True, False
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return True, aliases[node.id]
+    if isinstance(node, ast.Attribute):
+        is_global_text_locator, has_narrowing = _global_get_by_text_locator_chain(node.value, aliases)
+        if is_global_text_locator and node.attr in _GET_BY_TEXT_NARROWING_ATTRIBUTES:
+            return True, True
+        return is_global_text_locator, has_narrowing
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        is_global_text_locator, has_narrowing = _global_get_by_text_locator_chain(node.func.value, aliases)
+        if is_global_text_locator and node.func.attr in _GET_BY_TEXT_NARROWING_METHODS:
+            return True, True
+        return is_global_text_locator, has_narrowing
+    return False, False
+
+
+def _global_table_wait_for_diagnostic(
+    node: ast.Call,
+    aliases: Mapping[str, bool],
+) -> CodeBlockPreflightDiagnostic | None:
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr != "wait_for":
+        return None
+    is_global_table_locator, has_narrowing = _global_table_locator_chain(func.value, aliases)
+    if not is_global_table_locator or has_narrowing:
+        return None
+    return CodeBlockPreflightDiagnostic(
+        code="BROAD_GLOBAL_TABLE_WAIT_FOR",
+        message=(
+            "Code block waits on broad `page.locator('table').wait_for(...)`. Pages can contain hidden layout "
+            "tables while the intended content region is ready. Wait on a scoped container or a row-level/narrowed "
+            "table locator before extracting output."
+        ),
+    )
+
+
+def _global_table_locator_chain(node: ast.expr, aliases: Mapping[str, bool]) -> tuple[bool, bool]:
+    if _is_global_page_table_locator_call(node):
+        return True, False
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return True, aliases[node.id]
+    if isinstance(node, ast.Attribute):
+        return _global_table_locator_chain(node.value, aliases)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        is_global_table_locator, has_narrowing = _global_table_locator_chain(node.func.value, aliases)
+        if is_global_table_locator and node.func.attr in _TABLE_WAIT_NARROWING_METHODS:
+            return True, True
+        return is_global_table_locator, has_narrowing
+    return False, False
+
+
+def _is_global_page_table_locator_call(node: ast.expr) -> bool:
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "locator"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "page"
+        and node.args
+    ):
+        return False
+    selector = node.args[0]
+    return (
+        isinstance(selector, ast.Constant)
+        and isinstance(selector.value, str)
+        and selector.value.strip().casefold() == "table"
+    )
+
+
+def _is_global_page_get_by_text_call(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_by_text"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "page"
+    )
+
+
 def _broad_body_text_wait_for_function_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
     func = node.func
     if (
@@ -756,8 +1014,8 @@ def _broad_body_text_wait_for_function_diagnostic(node: ast.Call) -> CodeBlockPr
         code="BROAD_DOCUMENT_BODY_TEXT_WAIT",
         message=(
             "Code block waits for broad `document.body` text with `page.wait_for_function`. "
-            "Loaded result/detail pages can be visible while body-level polling still times out. "
-            "Wait on a localized result/detail locator or visible field text, then extract and return "
+            "Target content can be visible while body-level polling still times out. "
+            "Wait on a localized container or visible field text, then extract and return "
             "a keyed record from that region."
         ),
     )

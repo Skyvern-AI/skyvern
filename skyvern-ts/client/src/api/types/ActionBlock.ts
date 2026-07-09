@@ -34,6 +34,8 @@ export interface ActionBlock {
     include_action_history_in_verification?: boolean;
     download_timeout?: number;
     include_extracted_text?: boolean;
+    selector?: string;
+    ai_fallback?: Skyvern.AiFallbackMode;
 }
 
 export namespace ActionBlock {

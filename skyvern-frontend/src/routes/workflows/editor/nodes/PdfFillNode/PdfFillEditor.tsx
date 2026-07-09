@@ -1,4 +1,4 @@
-import { PlusIcon } from "@radix-ui/react-icons";
+import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useCallback } from "react";
 
@@ -82,6 +82,14 @@ function PdfFillEditorBody({
 
   return (
     <div data-testid="pdf-fill-block-form" className="space-y-4">
+      <p className="flex items-start gap-1.5 text-xs text-amber-400">
+        <ExclamationTriangleIcon className="mt-0.5 size-3 shrink-0" />
+        <span>
+          Works best on fillable PDFs with form fields. Unstructured PDFs
+          (scanned or flat documents) are filled best-effort and may be less
+          reliable.
+        </span>
+      </p>
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label className="text-xs text-slate-300">File URL</Label>
@@ -152,13 +160,6 @@ function PdfFillEditorBody({
         value={data.model}
         onChange={(value) => update({ model: value })}
       />
-      <IgnoreWorkflowSystemPrompt
-        ignoreWorkflowSystemPrompt={data.ignoreWorkflowSystemPrompt ?? false}
-        editable={editable}
-        onIgnoreWorkflowSystemPromptChange={(ignoreWorkflowSystemPrompt) => {
-          update({ ignoreWorkflowSystemPrompt });
-        }}
-      />
 
       <Accordion type="single" collapsible>
         <AccordionItem value="advanced" className="border-b-0">
@@ -172,6 +173,17 @@ function PdfFillEditorBody({
                 parameters={data.parameterKeys}
                 onParametersChange={(parameterKeys) => {
                   update({ parameterKeys });
+                }}
+              />
+              <IgnoreWorkflowSystemPrompt
+                ignoreWorkflowSystemPrompt={
+                  data.ignoreWorkflowSystemPrompt ?? false
+                }
+                editable={editable}
+                onIgnoreWorkflowSystemPromptChange={(
+                  ignoreWorkflowSystemPrompt,
+                ) => {
+                  update({ ignoreWorkflowSystemPrompt });
                 }}
               />
               <div className="space-y-2">

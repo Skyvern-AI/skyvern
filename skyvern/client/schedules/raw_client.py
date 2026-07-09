@@ -108,7 +108,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules",
             method="GET",
             request_options=request_options,
         )
@@ -176,7 +176,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules",
             method="POST",
             json={
                 "cron_expression": cron_expression,
@@ -241,7 +241,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
             method="GET",
             request_options=request_options,
         )
@@ -312,7 +312,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
             method="PUT",
             json={
                 "cron_expression": cron_expression,
@@ -377,7 +377,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
             method="DELETE",
             request_options=request_options,
         )
@@ -430,7 +430,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/enable",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/enable",
             method="POST",
             request_options=request_options,
         )
@@ -483,7 +483,7 @@ class RawSchedulesClient:
             Successful Response
         """
         _response = self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/disable",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/disable",
             method="POST",
             request_options=request_options,
         )
@@ -602,7 +602,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules",
             method="GET",
             request_options=request_options,
         )
@@ -670,7 +670,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules",
             method="POST",
             json={
                 "cron_expression": cron_expression,
@@ -735,7 +735,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
             method="GET",
             request_options=request_options,
         )
@@ -806,7 +806,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
             method="PUT",
             json={
                 "cron_expression": cron_expression,
@@ -871,7 +871,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}",
             method="DELETE",
             request_options=request_options,
         )
@@ -924,7 +924,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/enable",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/enable",
             method="POST",
             request_options=request_options,
         )
@@ -977,7 +977,7 @@ class AsyncRawSchedulesClient:
             Successful Response
         """
         _response = await self._client_wrapper.httpx_client.request(
-            f"v1/workflows/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/disable",
+            f"v1/agents/{jsonable_encoder(workflow_permanent_id)}/schedules/{jsonable_encoder(workflow_schedule_id)}/disable",
             method="POST",
             request_options=request_options,
         )

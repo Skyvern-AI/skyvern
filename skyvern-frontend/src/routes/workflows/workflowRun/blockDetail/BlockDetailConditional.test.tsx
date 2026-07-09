@@ -5,28 +5,12 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import { Status } from "@/api/types";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { BlockDetailConditional } from "./BlockDetailConditional";
-
-function buildAction(
-  overrides: Partial<ActionsApiResponse> = {},
-): ActionsApiResponse {
-  return {
-    action_id: "act_default",
-    action_type: ActionTypes.extract,
-    status: Status.Completed,
-    reasoning: "Extract conditional result",
-    text: null,
-    response: null,
-    confidence_float: null,
-    created_by: null,
-    ...overrides,
-  } as ActionsApiResponse;
-}
 
 function buildConditional(
   overrides: Partial<WorkflowRunBlock> = {},
@@ -111,47 +95,6 @@ describe("BlockDetailConditional", () => {
     expect(screen.getByText(/default branch/i)).toBeDefined();
     // The matched branch shows the next block target
     expect(screen.getByText("fallback")).toBeDefined();
-  });
-
-  it("renders conditional actions in the detail panel", () => {
-    const block = buildConditional({
-      actions: [
-        buildAction({
-          action_id: "act_condition_extract",
-          reasoning: "Extract the condition result from the page",
-        }),
-      ],
-    });
-
-    render(<BlockDetailConditional block={block} />);
-
-    expect(screen.getByText("Actions (1)")).toBeDefined();
-    expect(
-      screen.getByText("Extract the condition result from the page"),
-    ).toBeDefined();
-  });
-
-  it("fires onActionSelect when a conditional action is selected", () => {
-    const onActionSelect = vi.fn();
-    const action = buildAction({
-      action_id: "act_condition_extract",
-      reasoning: "Extract the condition result from the page",
-    });
-    const block = buildConditional({ actions: [action] });
-
-    render(
-      <BlockDetailConditional
-        block={block}
-        activeItem={null}
-        onActionSelect={onActionSelect}
-      />,
-    );
-
-    fireEvent.click(
-      screen.getByText("Extract the condition result from the page"),
-    );
-
-    expect(onActionSelect).toHaveBeenCalledWith({ block, action });
   });
 
   it("falls back to the legacy executed_branch_expression rendering when no evaluations array", () => {

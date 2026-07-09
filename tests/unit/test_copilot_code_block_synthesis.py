@@ -550,22 +550,96 @@ class TestActionSynthesis:
         assert "        del _scout_entry_target" in result.code
         assert "        del _scout_optional_dismissal" not in result.code
 
-    def test_structural_cookie_button_is_conditional_when_durable_target_follows(self) -> None:
+    @pytest.mark.parametrize(
+        (
+            "click_selector",
+            "click_role",
+            "fill_selector",
+            "fill_name",
+            "fill_value",
+            "dismissal_line",
+            "forbidden_snippet",
+        ),
+        [
+            pytest.param(
+                ".btns button:nth-of-type(2)",
+                "button",
+                "#npiInput",
+                "Provider ID",
+                "ID-12345",
+                '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")',
+                'await page.locator(".btns button:nth-of-type(2)").click()',
+                id="structural-nth-of-type",
+            ),
+            pytest.param(
+                "button:not(.decline):nth-of-type(6)",
+                "button",
+                "#locInput",
+                "City, county, or ZIP code",
+                "Example City",
+                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
+                'await page.locator("button:not(.decline):nth-of-type(6)").click()',
+                id="not-decline-nth-of-type",
+            ),
+            pytest.param(
+                'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]'
+                '/*[name()="div"][2]/*[name()="div"][1]/*[name()="button"][2]',
+                "button",
+                "#locInput",
+                "City, county, or ZIP code",
+                "Example City",
+                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
+                'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]'
+                '/*[name()="div"][2]/*[name()="div"][1]/*[name()="button"][2]',
+                id="positional-xpath",
+            ),
+            pytest.param(
+                "xpath=//button[normalize-space()='Accept']",
+                "button",
+                "#locInput",
+                "City, county, or ZIP code",
+                "Example City",
+                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
+                "xpath=//button[normalize-space()='Accept']",
+                id="normalized-space-xpath",
+            ),
+            pytest.param(
+                "//button[normalize-space()='Accept']",
+                None,
+                "#locInput",
+                "City, county, or ZIP code",
+                "Example City",
+                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
+                "//button[normalize-space()='Accept']",
+                id="bare-normalized-space-xpath",
+            ),
+        ],
+    )
+    def test_optional_dismissal_is_conditional_when_durable_target_follows(
+        self,
+        click_selector: str,
+        click_role: str | None,
+        fill_selector: str,
+        fill_name: str,
+        fill_value: str,
+        dismissal_line: str,
+        forbidden_snippet: str,
+    ) -> None:
         result = synthesize_code_block(
             [
                 _interaction(
                     "click",
-                    selector=".btns button:nth-of-type(2)",
+                    selector=click_selector,
                     source_url="https://example.com/find",
-                    role="button",
+                    role=click_role,
                 ),
                 _interaction(
                     "type_text",
-                    selector="#npiInput",
+                    selector=fill_selector,
                     source_url="https://example.com/find",
                     role="textbox",
-                    accessible_name="Provider ID",
-                    typed_value="ID-12345",
+                    accessible_name=fill_name,
+                    typed_value=fill_value,
                 ),
             ],
             strict_selectors=True,
@@ -573,145 +647,53 @@ class TestActionSynthesis:
 
         assert result is not None
         lines = result.code.splitlines()
-        assert lines[0] == '    _scout_entry_target = page.locator("#npiInput")'
-        assert '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")' in lines
+        assert lines[0] == f'    _scout_entry_target = page.locator("{fill_selector}")'
+        assert dismissal_line in lines
         assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await page.locator(".btns button:nth-of-type(2)").click()' not in result.code
+        assert forbidden_snippet not in result.code
         assert result.code.index("_scout_optional_dismissal") < result.code.index(
-            'await page.locator("#npiInput").fill'
+            f'await page.locator("{fill_selector}").fill'
         )
 
-    def test_not_decline_cookie_button_is_conditional_when_durable_target_follows(self) -> None:
-        result = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector="button:not(.decline):nth-of-type(6)",
-                    source_url="https://example.com/find",
-                    role="button",
-                ),
-                _interaction(
-                    "type_text",
-                    selector="#locInput",
-                    source_url="https://example.com/find",
-                    role="textbox",
-                    accessible_name="City, county, or ZIP code",
-                    typed_value="Example City",
-                ),
-            ],
-            strict_selectors=True,
-        )
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
-        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await page.locator("button:not(.decline):nth-of-type(6)").click()' not in result.code
-
-    def test_cookie_accept_xpath_is_conditional_when_durable_target_follows(self) -> None:
-        cookie_accept_xpath = (
-            'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]'
-            '/*[name()="div"][2]/*[name()="div"][1]/*[name()="button"][2]'
-        )
-
-        result = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector=cookie_accept_xpath,
-                    source_url="https://example.com/find",
-                    role="button",
-                ),
-                _interaction(
-                    "type_text",
-                    selector="#locInput",
-                    source_url="https://example.com/find",
-                    role="textbox",
-                    accessible_name="City, county, or ZIP code",
-                    typed_value="Example City",
-                ),
-            ],
-            strict_selectors=True,
-        )
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
-        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert cookie_accept_xpath not in result.code
-        assert result.code.index("_scout_optional_dismissal") < result.code.index(
-            'await page.locator("#locInput").fill'
-        )
-
-    def test_normalized_accept_xpath_is_conditional_when_durable_target_follows(self) -> None:
-        accept_xpath = "xpath=//button[normalize-space()='Accept']"
-
-        result = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector=accept_xpath,
-                    source_url="https://example.com/find",
-                    role="button",
-                ),
-                _interaction(
-                    "type_text",
-                    selector="#locInput",
-                    source_url="https://example.com/find",
-                    role="textbox",
-                    accessible_name="City, county, or ZIP code",
-                    typed_value="Example City",
-                ),
-            ],
-            strict_selectors=True,
-        )
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
-        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert accept_xpath not in result.code
-
-    def test_bare_normalized_accept_xpath_is_conditional_when_durable_target_follows(self) -> None:
-        accept_xpath = "//button[normalize-space()='Accept']"
-
-        result = synthesize_code_block(
-            [
-                _interaction(
-                    "click",
-                    selector=accept_xpath,
-                    source_url="https://example.com/find",
-                    role=None,
-                ),
-                _interaction(
-                    "type_text",
-                    selector="#locInput",
-                    source_url="https://example.com/find",
-                    role="textbox",
-                    accessible_name="City, county, or ZIP code",
-                    typed_value="Example City",
-                ),
-            ],
-            strict_selectors=True,
-        )
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    _scout_entry_target = page.locator("#locInput")'
-        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert accept_xpath not in result.code
-
-    def test_one_step_not_decline_cookie_button_is_not_entry_target(self) -> None:
+    @pytest.mark.parametrize(
+        ("click_selector", "click_role", "dismissal_line", "forbidden_snippet"),
+        [
+            pytest.param(
+                "button:not(.decline)",
+                "button",
+                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
+                'page.locator("button:not(.decline)")',
+                id="not-decline",
+            ),
+            pytest.param(
+                ".btns button:nth-of-type(2)",
+                "button",
+                '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")',
+                'await page.locator(".btns button:nth-of-type(2)").click()',
+                id="structural-nth-of-type",
+            ),
+            pytest.param(
+                "//button[normalize-space()='Accept']",
+                None,
+                "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")",
+                "//button[normalize-space()='Accept']",
+                id="bare-accept-xpath",
+            ),
+        ],
+    )
+    def test_one_step_optional_dismissal_is_not_entry_target(
+        self,
+        click_selector: str,
+        click_role: str | None,
+        dismissal_line: str,
+        forbidden_snippet: str,
+    ) -> None:
         trajectory = [
             _interaction(
                 "click",
-                selector="button:not(.decline)",
+                selector=click_selector,
                 source_url="https://example.com/find",
-                role="button",
+                role=click_role,
             ),
         ]
         assert is_optional_dismissal_only_trajectory(trajectory) is True
@@ -721,53 +703,11 @@ class TestActionSynthesis:
         assert result is not None
         lines = result.code.splitlines()
         assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
-        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
+        assert dismissal_line in lines
         assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
         assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
-        assert 'page.locator("button:not(.decline)")' not in result.code
+        assert forbidden_snippet not in result.code
         ast.parse("async def _block(page):\n" + result.code)
-
-    def test_one_step_structural_cookie_button_is_not_entry_target(self) -> None:
-        trajectory = [
-            _interaction(
-                "click",
-                selector=".btns button:nth-of-type(2)",
-                source_url="https://example.com/find",
-                role="button",
-            ),
-        ]
-        assert is_optional_dismissal_only_trajectory(trajectory) is True
-
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
-        assert '    _scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")' in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
-        assert 'await page.locator(".btns button:nth-of-type(2)").click()' not in result.code
-
-    def test_one_step_bare_accept_xpath_is_not_entry_target(self) -> None:
-        trajectory = [
-            _interaction(
-                "click",
-                selector="//button[normalize-space()='Accept']",
-                source_url="https://example.com/find",
-                role=None,
-            ),
-        ]
-        assert is_optional_dismissal_only_trajectory(trajectory) is True
-
-        result = synthesize_code_block(trajectory, strict_selectors=True)
-
-        assert result is not None
-        lines = result.code.splitlines()
-        assert lines[0] == '    await page.goto("https://example.com/find", wait_until="domcontentloaded")'
-        assert "    _scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in lines
-        assert "            await _scout_optional_dismissal.first.click(timeout=1000)" in lines
-        assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
-        assert "//button[normalize-space()='Accept']" not in result.code
 
     def test_optional_dismissal_with_durable_target_is_offerable(self) -> None:
         trajectory = [
@@ -1414,7 +1354,7 @@ class TestPreflightSurfacesSyntaxError:
         diagnostics = preflight_code_block(code, parameter_keys=())
 
         assert sum(1 for d in diagnostics if d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT") == 1
-        assert any("localized result/detail" in d.message for d in diagnostics)
+        assert any("localized container" in d.message for d in diagnostics)
 
     def test_broad_body_text_wait_for_function_keyword_expression_surfaces_selection_diagnostic(self) -> None:
         code = (
@@ -1435,6 +1375,182 @@ class TestPreflightSurfacesSyntaxError:
         diagnostics = preflight_code_block(code, parameter_keys=())
 
         assert not any(d.code == "BROAD_DOCUMENT_BODY_TEXT_WAIT" for d in diagnostics)
+
+    def test_global_get_by_text_wait_for_surfaces_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").wait_for(timeout=5000)\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_global_get_by_text_wait_for_alias_surfaces_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\nawait target.wait_for(timeout=5000)\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "if ready:\n"
+            '    target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "    await target.wait_for(timeout=5000)\n",
+            "for _ in [1]:\n"
+            '    target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "    await target.wait_for(timeout=5000)\n",
+            "try:\n"
+            '    target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "    await target.wait_for(timeout=5000)\n"
+            "except Exception:\n"
+            "    pass\n",
+        ],
+    )
+    def test_nested_get_by_text_alias_wait_surfaces_ambiguous_locator_diagnostic(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=("ready",))
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_rebound_get_by_text_alias_does_not_surface_stale_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            'target = page.locator("#safe")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert not any(d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR" for d in diagnostics)
+
+    def test_get_by_text_alias_wait_before_rebind_surfaces_ambiguous_locator_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "await target.wait_for(timeout=5000)\n"
+            'target = page.locator("#safe")\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_nested_earlier_get_by_text_rebind_does_not_clear_later_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    def test_nested_later_get_by_text_rebind_does_not_clear_outer_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.get_by_text("NATIONAL PROVIDER IDENTIFIER")\n'
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'await page.locator("table").wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("table").first.wait_for(state="visible", timeout=15000)\n',
+            'table = page.locator("table")\nawait table.first.wait_for(state="visible", timeout=15000)\n',
+        ],
+    )
+    def test_broad_global_table_wait_for_surfaces_selection_diagnostic(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'if ready:\n    target = page.locator("table")\n    await target.wait_for(timeout=5000)\n',
+            'for _ in [1]:\n    target = page.locator("table")\n    await target.wait_for(timeout=5000)\n',
+            "try:\n"
+            '    target = page.locator("table")\n'
+            "    await target.wait_for(timeout=5000)\n"
+            "except Exception:\n"
+            "    pass\n",
+        ],
+    )
+    def test_nested_table_alias_wait_surfaces_broad_table_diagnostic(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=("ready",))
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'await page.locator("table tbody tr").first.wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("#coastalCard").locator("table").first.wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("table").get_by_role("row").first.wait_for(state="visible", timeout=15000)\n',
+            'await page.locator("table").filter(has_text="Credentialed").wait_for(timeout=15000)\n',
+            'table = page.locator("table").filter(has_text="Credentialed")\nawait table.wait_for(timeout=15000)\n',
+        ],
+    )
+    def test_scoped_or_narrowed_table_wait_for_is_allowed(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR" for d in diagnostics)
+
+    def test_rebound_table_alias_does_not_surface_stale_broad_table_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.locator("table")\ntarget = page.locator("#safe")\nawait target.wait_for(timeout=5000)\n',
+            parameter_keys=(),
+        )
+
+        assert not any(d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR" for d in diagnostics)
+
+    def test_table_alias_wait_before_rebind_surfaces_broad_table_diagnostic(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.locator("table")\nawait target.wait_for(timeout=5000)\ntarget = page.locator("#safe")\n',
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    def test_nested_earlier_table_rebind_does_not_clear_later_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            'target = page.locator("table")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    def test_nested_later_table_rebind_does_not_clear_outer_global_alias(self) -> None:
+        diagnostics = preflight_code_block(
+            'target = page.locator("table")\n'
+            "async def helper():\n"
+            '    target = page.locator("#safe")\n'
+            "await target.wait_for(timeout=5000)\n",
+            parameter_keys=(),
+        )
+
+        assert sum(1 for d in diagnostics if d.code == "BROAD_GLOBAL_TABLE_WAIT_FOR") == 1
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'await page.locator("main").get_by_text("NATIONAL PROVIDER IDENTIFIER").wait_for(timeout=5000)\n',
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").first.wait_for(timeout=5000)\n',
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").nth(0).wait_for(timeout=5000)\n',
+            'await page.get_by_text("NATIONAL PROVIDER IDENTIFIER").filter(visible=True).wait_for(timeout=5000)\n',
+        ],
+    )
+    def test_scoped_or_narrowed_get_by_text_wait_for_is_allowed(self, code: str) -> None:
+        diagnostics = preflight_code_block(code, parameter_keys=())
+
+        assert not any(d.code == "GLOBAL_GET_BY_TEXT_WAIT_FOR" for d in diagnostics)
 
     def test_non_page_wait_for_function_does_not_surface_body_text_diagnostic(self) -> None:
         code = """
@@ -1462,7 +1578,7 @@ class TestPreflightSurfacesSyntaxError:
         errors = _code_block_safety_errors(workflow_yaml, None)
 
         assert any("failed the generated-code preflight check" in str(error) for error in errors)
-        assert any("localized result/detail" in str(error) for error in errors)
+        assert any("localized container" in str(error) for error in errors)
 
     def test_broad_container_record_scan_surfaces_row_extraction_diagnostic(self) -> None:
         code = """
@@ -1729,6 +1845,11 @@ class TestSynthesizedArtifactMetadata:
         assert metadata["declared_goal"].startswith("<fill:")
         assert metadata["completion_criteria"][0]["text"].startswith("<fill:")
         assert metadata["claimed_outcomes"][0]["text"].startswith("<fill:")
+
+    def test_skeleton_marks_placeholder_schema_self_authored(self) -> None:
+        metadata = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
+        assert metadata["claimed_outcomes"][0]["extraction_schema"].startswith("<fill:")
+        assert metadata["claimed_outcomes"][0]["extraction_schema_provenance"] == "self_authored"
 
     def test_skeleton_is_byte_identical_per_trajectory(self) -> None:
         first = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)

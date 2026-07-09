@@ -17,8 +17,12 @@ delegate_methods=$(
 )
 
 if [ -z "$delegate_methods" ]; then
-    echo "ERROR: Could not extract delegate methods from $AGENT_DB" >&2
-    exit 1
+    # The AgentDB *args backward-compat facade was removed entirely (SKY-11703).
+    # With no delegate methods left, there is nothing to police: a direct
+    # delegate call is now a plain AttributeError/mypy error, caught elsewhere.
+    # Nothing to check, so pass cleanly.
+    echo "No AgentDB delegate methods defined; nothing to check."
+    exit 0
 fi
 
 # Build a grep alternation pattern for delegate method names.

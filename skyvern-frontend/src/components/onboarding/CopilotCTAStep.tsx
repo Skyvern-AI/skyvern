@@ -18,6 +18,8 @@ import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { useGlobalWorkflowsQuery } from "@/routes/workflows/hooks/useGlobalWorkflowsQuery";
 import { useCreateWorkflowMutation } from "@/routes/workflows/hooks/useCreateWorkflowMutation";
 import { convert } from "@/routes/workflows/editor/workflowEditorUtils";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import type { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import {
@@ -62,6 +64,7 @@ function CopilotCTAStep({
   onBusyChange,
 }: Readonly<CopilotCTAStepProps>) {
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -104,9 +107,12 @@ function CopilotCTAStep({
       // first_workflow_created funnel event fires for copilot-first users.
       queryClient.invalidateQueries({ queryKey: ["userOnboarding"] });
       onDismiss();
-      navigate(`/workflows/${workflow.workflow_permanent_id}/build`, {
-        state: { copilotMessage: prompt },
-      });
+      navigate(
+        workflowEditorPath(workflow.workflow_permanent_id, studioEnabled),
+        {
+          state: { copilotMessage: prompt },
+        },
+      );
     },
     onError: () => {
       setShowFallback(true);

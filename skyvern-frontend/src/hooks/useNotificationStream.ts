@@ -40,7 +40,13 @@ export function useNotificationStream() {
       // Flatten authorization query building
       let authQuery = "";
       if (credentialGetter) {
-        authQuery = `?token=Bearer ${await credentialGetter()}`;
+        // A null token (transient Clerk failure) must not become "Bearer null":
+        // the server closes it 1002, which latches authFailedRef and stops all
+        // reconnects. Skip this cycle instead and reconnect on the next trigger.
+        const token = await credentialGetter();
+        if (token) {
+          authQuery = `?token=Bearer ${token}`;
+        }
       } else if (getRuntimeApiKey()) {
         authQuery = `?apikey=${getRuntimeApiKey()}`;
       }

@@ -1,5 +1,6 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -255,44 +256,19 @@ def test_agent_db_has_typed_repo_attributes():
         assert isinstance(db.tasks, TasksRepository)
         assert isinstance(db.credentials, CredentialRepository)
         assert isinstance(db.credential_folders, CredentialFoldersRepository)
-        assert hasattr(db, "get_task")  # backward compat delegate
         # Migrated domains no longer have delegates on AgentDB:
         assert not hasattr(db, "create_workflow")
         assert not hasattr(db, "get_organization")
         assert not hasattr(db, "get_credential")
 
 
-def test_agent_db_delegates_route_to_repositories():
-    """Verify delegate methods actually forward to the correct repository."""
-    from unittest.mock import AsyncMock
-    from unittest.mock import patch as mock_patch
+def test_agent_db_defines_no_delegator_methods():
+    """All data access goes through typed repository attributes; AgentDB itself defines no forwarding methods."""
+    from skyvern.forge.sdk.db.agent_db import AgentDB
 
-    with mock_patch("skyvern.forge.sdk.db.agent_db.create_async_engine"):
-        from skyvern.forge.sdk.db.agent_db import AgentDB
-
-        db = AgentDB("postgresql+asyncpg://test", debug_enabled=False)
-
-    # Patch a method on each major repository and verify the delegate calls it
-    delegates_to_check = [
-        ("get_task", "tasks"),
-        ("create_artifact", "artifacts"),
-        ("create_workflow_run", "workflow_runs"),
-    ]
-
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    try:
-        for delegate_name, repo_attr in delegates_to_check:
-            repo = getattr(db, repo_attr)
-            mock_method = AsyncMock(return_value="sentinel")
-            original = getattr(repo, delegate_name)
-            setattr(repo, delegate_name, mock_method)
-            try:
-                result = loop.run_until_complete(getattr(db, delegate_name)("arg1", key="val"))
-                mock_method.assert_called_once_with("arg1", key="val")
-                assert result == "sentinel", f"Delegate {delegate_name} did not return repository result"
-            finally:
-                setattr(repo, delegate_name, original)
-    finally:
-        loop.close()
+    defined = {name for name, member in vars(AgentDB).items() if inspect.isfunction(member)}
+    assert defined == {"__init__", "is_retryable_error"}, (
+        f"Unexpected methods on AgentDB: {sorted(defined - {'__init__', 'is_retryable_error'})}. "
+        "Add data-access methods to the domain repository and call it via the typed attribute "
+        "(e.g. db.tasks.get_task) instead of adding delegators to AgentDB."
+    )

@@ -53,12 +53,12 @@ class _Ctx:
         self.composition_page_evidence = None
         self.last_update_block_count = None
         self.last_test_ok = None
+        self.last_full_workflow_test_ok = False
         self.last_test_failure_reason = None
         self.last_test_suspicious_success = False
         self.last_test_anti_bot = None
         self.failed_test_nudge_count = 0
         self.explore_without_workflow_nudge_count = 0
-        self.null_data_streak_count = 0
         self.repeated_failure_streak_count = 0
         self.repeated_failure_nudge_emitted_at_streak = 0
         self.last_artifact_health_blocker_reason = None

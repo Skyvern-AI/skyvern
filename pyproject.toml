@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.43"
+version = "1.0.46"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -135,7 +135,9 @@ server = [
     "json-repair>=0.59.5,<0.60",
     "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
-    "fastmcp>=3.2.0,<4",
+    # <3.4: 3.4.3 enables HostOriginGuardMiddleware by default (421 on public hosts, SKY-12003).
+    # cloud_app passes allowed_hosts/allowed_origins when supported; validate against 3.4.x before raising.
+    "fastmcp>=3.2.0,<3.4",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
     "anthropic>=0.97.0,<0.98",
@@ -281,7 +283,7 @@ constraint-dependencies = [
     "cryptography>=48.0.1",
     "flask>=3.1.3",
     "idna>=3.15",
-    "joserfc>=1.6.3",
+    "joserfc>=1.6.8",
     "jupyter-server>=2.18.0",
     "mako>=1.3.12",
     "mistune>=3.2.1",

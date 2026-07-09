@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_serializer, field_validator, model_
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
@@ -490,6 +491,7 @@ class FileType(StrEnum):
     PDF = "pdf"
     IMAGE = "image"
     DOCX = "docx"
+    ZIP = "zip"
 
 
 class PDFFormat(StrEnum):
@@ -502,6 +504,7 @@ class PDFFormat(StrEnum):
 class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
 
 
 class FileUploadDestination(BaseModel):
@@ -526,6 +529,9 @@ class FileUploadDestination(BaseModel):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_blob_name: str | None = None
+
+    google_access_token: str | None = None
+    google_drive_folder_id: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -590,6 +596,8 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
 class CredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
     credential_id: str
+    credential_ids: list[str] | None = None
+    selection_strategy: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -905,6 +913,8 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
     path: str | None = None
 
 
@@ -949,6 +959,7 @@ class ValidationBlockYAML(BlockYAML):
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
+    without_page_information: bool = False
 
 
 class ActionBlockYAML(BlockYAML):
@@ -1098,9 +1109,16 @@ class HttpRequestBlockYAML(BlockYAML):
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
+    secret_response_paths: list[str] | None = None
 
     # Parameter keys for templating
     parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_secret_response_paths_file_conflict(self) -> "HttpRequestBlockYAML":
+        if self.save_response_as_file and self.secret_response_paths:
+            raise ValueError("secret_response_paths cannot be combined with save_response_as_file")
+        return self
 
 
 class PrintPageBlockYAML(BlockYAML):
@@ -1298,7 +1316,9 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
@@ -1311,6 +1331,10 @@ class WorkflowCreateYAMLRequest(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
+    # None = inherit from the existing workflow on update (mirrors code_version);
+    # treated as False on first create. Prevents older clients that omit the field
+    # from silently disabling self-healing on save.
+    enable_self_healing: bool | None = None
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
     run_sequentially: bool = Field(default=False, title="Prevent Overlapping Runs")
@@ -1326,6 +1350,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_profile_key", mode="before")
+    @classmethod
+    def _normalize_browser_profile_key(cls, v: str | None) -> str | None:
+        return validate_browser_profile_key(v)
 
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:

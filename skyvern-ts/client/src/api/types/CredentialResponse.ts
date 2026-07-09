@@ -14,7 +14,7 @@ export interface CredentialResponse {
     credential_type: Skyvern.CredentialTypeOutput;
     /** Name of the credential */
     name: string;
-    /** Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom') */
+    /** Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom') */
     vault_type?: Skyvern.CredentialVaultType;
     /** Browser profile ID linked to this credential */
     browser_profile_id?: string;
@@ -24,6 +24,8 @@ export interface CredentialResponse {
     user_context?: string;
     /** Whether the user intends to save a browser session, regardless of test outcome */
     save_browser_session_intent?: boolean;
+    /** ID of the credential folder this credential belongs to, if any */
+    folder_id?: string;
 }
 
 export namespace CredentialResponse {

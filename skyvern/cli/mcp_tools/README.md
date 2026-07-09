@@ -77,6 +77,9 @@ Manual config for any MCP client:
 ### Browser Sessions
 `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_list`, `skyvern_browser_session_get`, `skyvern_browser_session_connect`
 
+### Browser Profiles
+`skyvern_browser_profile_create`, `skyvern_browser_profile_list`, `skyvern_browser_profile_get`, `skyvern_browser_profile_update`, `skyvern_browser_profile_delete`
+
 ### Browser Actions
 `skyvern_act` (natural language), `skyvern_navigate`, `skyvern_click`, `skyvern_type`, `skyvern_hover`, `skyvern_scroll`, `skyvern_select_option`, `skyvern_press_key`, `skyvern_drag`, `skyvern_file_upload`, `skyvern_wait`
 

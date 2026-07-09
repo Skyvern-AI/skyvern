@@ -46,6 +46,7 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_run_tag_event_id,
     generate_script_block_id,
     generate_script_fallback_episode_id,
     generate_script_file_id,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.db.id import (
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
+    generate_tag_value_id,
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
@@ -67,6 +69,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
+    generate_workflow_run_credential_selection_id,
     generate_workflow_run_id,
     generate_workflow_schedule_id,
     generate_workflow_script_id,
@@ -415,6 +418,78 @@ class WorkflowTagEventModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class WorkflowRunTagEventModel(Base):
+    __tablename__ = "workflow_run_tag_events"
+    __table_args__ = (
+        Index("workflow_run_tag_events_org_wr_set_at_idx", "organization_id", "workflow_run_id", "set_at"),
+        Index(
+            "workflow_run_tag_events_org_key_value_active_idx",
+            "organization_id",
+            "key",
+            "value",
+            postgresql_include=["workflow_run_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index(
+            "workflow_run_tag_events_org_value_active_idx",
+            "organization_id",
+            "value",
+            postgresql_include=["workflow_run_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_run_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        Index(
+            "workflow_run_tag_events_active_grouped_unique",
+            "organization_id",
+            "workflow_run_id",
+            "key",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+        ),
+        Index(
+            "workflow_run_tag_events_active_label_unique",
+            "organization_id",
+            "workflow_run_id",
+            "value",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+        ),
+        CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_run_tag_events_event_type"),
+        CheckConstraint(
+            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import', 'system')",
+            name="ck_workflow_run_tag_events_source",
+        ),
+        CheckConstraint(
+            "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
+            name="ck_workflow_run_tag_events_caller_type",
+        ),
+        CheckConstraint("event_type != 'set' OR value IS NOT NULL", name="ck_workflow_run_tag_events_set_has_value"),
+    )
+
+    tag_event_id = Column(String, primary_key=True, default=generate_run_tag_event_id)
+    workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=True)
+    value = Column(String, nullable=True)
+    event_type = Column(String, nullable=False)
+    set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    set_by = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    caller_type = Column(String, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+    inherited_from_tag_event_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
 class TagKeyModel(Base):
     """Org-scoped registry of tag keys and their descriptions. Auto-registered
     on first use; partial UNIQUE on (org, key) WHERE deleted_at IS NULL races
@@ -436,6 +511,40 @@ class TagKeyModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class TagValueModel(Base):
+    """Org-scoped registry of the color for each grouped tag ``(key, value)``, auto-registered
+    on first SET (random palette unless supplied). Partial-UNIQUE on (org, key, value)
+    WHERE deleted_at IS NULL mirrors TagKeyModel; standalone labels (no key) are not colored."""
+
+    __tablename__ = "tag_values"
+    __table_args__ = (
+        Index(
+            "ix_tag_values_org_key_value_active",
+            "organization_id",
+            "key",
+            "value",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    tag_value_id = Column(String, primary_key=True, default=generate_tag_value_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(String, nullable=False)
+    color = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -478,7 +587,9 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    pin_saved_session_ip = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_id = Column(String, nullable=True)
+    browser_profile_key = Column(String, nullable=True)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
@@ -486,6 +597,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    enable_self_healing = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     code_version = Column(Integer, nullable=True, server_default=sqlalchemy.text("2"))
     generate_script_on_terminal = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     run_sequentially = Column(Boolean, nullable=True)
@@ -786,10 +898,35 @@ class CredentialParameterModel(Base):
     description = Column(String, nullable=True)
 
     credential_id = Column(String, nullable=False)
+    credential_ids = Column(JSON, nullable=True)
+    selection_strategy = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunCredentialSelectionModel(Base):
+    __tablename__ = "workflow_run_credential_selections"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "parameter_key", name="uq_wrcs_workflow_run_parameter_key"),
+        Index(
+            "idx_wrcs_lru_lookup",
+            "organization_id",
+            "workflow_permanent_id",
+            "parameter_key",
+            "credential_id",
+            "created_at",
+        ),
+    )
+
+    selection_id = Column(String, primary_key=True, default=generate_workflow_run_credential_selection_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    parameter_key = Column(String, nullable=False)
+    credential_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
 class OnePasswordCredentialParameterModel(Base):
@@ -1152,6 +1289,7 @@ class PersistentBrowserSessionModel(Base):
     ip_address = Column(String, nullable=True)
     ecs_task_arn = Column(String, nullable=True)
     proxy_location = Column(String, nullable=True)
+    proxy_session_id = Column(String, nullable=True)
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
@@ -1174,7 +1312,24 @@ class BrowserProfileModel(Base):
     __table_args__ = (
         Index("idx_browser_profiles_org", "organization_id"),
         Index("idx_browser_profiles_org_name", "organization_id", "name"),
-        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+        Index(
+            "uq_browser_profiles_org_name_user",
+            "organization_id",
+            "name",
+            unique=True,
+            postgresql_where=text("is_managed = false AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = false AND deleted_at IS NULL"),
+        ),
+        Index(
+            "uq_browser_profiles_managed_segment",
+            "organization_id",
+            "workflow_permanent_id",
+            "browser_profile_key_digest",
+            unique=True,
+            postgresql_where=text("is_managed = true AND deleted_at IS NULL"),
+            sqlite_where=text("is_managed = true AND deleted_at IS NULL"),
+        ),
+        Index("idx_browser_profiles_wpid", "workflow_permanent_id"),
     )
 
     browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
@@ -1182,6 +1337,11 @@ class BrowserProfileModel(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     source_browser_type = Column(String, nullable=True)
+    proxy_location = Column(String, nullable=True)
+    proxy_session_id = Column(String, nullable=True)
+    is_managed = Column(Boolean, nullable=False, server_default=sqlalchemy.false(), default=False)
+    workflow_permanent_id = Column(String, nullable=True)
+    browser_profile_key_digest = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -1314,6 +1474,8 @@ class CredentialModel(Base):
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
+    proxy_location = Column(String, nullable=True)
+    proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

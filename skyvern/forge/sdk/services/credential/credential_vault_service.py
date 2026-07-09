@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import (
@@ -118,6 +119,8 @@ class CredentialVaultService(ABC):
                 totp_identifier=data.credential.totp_identifier,
                 card_last4=None,
                 card_brand=None,
+                proxy_location=data.proxy_location,
+                proxy_session_id=data.proxy_session_id,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
             return await app.DATABASE.credentials.create_credential(
@@ -131,6 +134,8 @@ class CredentialVaultService(ABC):
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
+                proxy_location=data.proxy_location,
+                proxy_session_id=data.proxy_session_id,
             )
         elif data.credential_type == CredentialType.SECRET:
             return await app.DATABASE.credentials.create_credential(
@@ -145,6 +150,8 @@ class CredentialVaultService(ABC):
                 card_brand=None,
                 totp_identifier=None,
                 secret_label=data.credential.secret_label,
+                proxy_location=data.proxy_location,
+                proxy_session_id=data.proxy_session_id,
             )
         else:
             raise Exception(f"Unsupported credential type: {data.credential_type}")
@@ -155,6 +162,14 @@ class CredentialVaultService(ABC):
         data: CreateCredentialRequest,
         item_id: str,
     ) -> Credential:
+        proxy_kwargs: dict[str, Any] = {}
+        if "proxy_location" in data.model_fields_set:
+            proxy_kwargs["proxy_location"] = data.proxy_location
+        if "proxy_session_id" in data.model_fields_set:
+            proxy_kwargs["proxy_session_id"] = data.proxy_session_id
+        if data.rotate_proxy_session_id:
+            proxy_kwargs["rotate_proxy_session_id"] = True
+
         if data.credential_type == CredentialType.PASSWORD:
             return await app.DATABASE.credentials.update_credential_vault_data(
                 credential_id=credential.credential_id,
@@ -167,6 +182,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=data.credential.totp_identifier,
                 card_last4=None,
                 card_brand=None,
+                **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
             return await app.DATABASE.credentials.update_credential_vault_data(
@@ -180,6 +196,7 @@ class CredentialVaultService(ABC):
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
+                **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.SECRET:
             return await app.DATABASE.credentials.update_credential_vault_data(
@@ -194,6 +211,7 @@ class CredentialVaultService(ABC):
                 card_brand=None,
                 totp_identifier=None,
                 secret_label=data.credential.secret_label,
+                **proxy_kwargs,
             )
         else:
             raise Exception(f"Unsupported credential type: {data.credential_type}")

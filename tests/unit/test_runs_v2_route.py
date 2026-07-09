@@ -11,6 +11,7 @@ from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
+from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 
 
 @pytest.mark.asyncio
@@ -70,6 +71,28 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_get_runs_v2_rejects_search_page_beyond_fetch_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(return_value=[]))
+    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs)
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    page_size = 100
+    page = (MAX_SEARCH_FETCH_LIMIT // page_size) + 1
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=page,
+            page_size=page_size,
+            search_key="wr_abc123",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert str(MAX_SEARCH_FETCH_LIMIT) in exc_info.value.detail
+    mock_workflow_runs.get_all_runs_v2.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("handler", "expected_exclude_child_runs"),
     [
@@ -108,6 +131,8 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         search_key="login",
         error_code="LOGIN_FAILED",
         exclude_child_runs=expected_exclude_child_runs,
+        created_at_start=None,
+        created_at_end=None,
     )
 
 

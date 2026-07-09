@@ -6,7 +6,39 @@ import {
   WorkflowParameterTypes,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
-import { ParametersState } from "./types";
+import {
+  CredentialParameterYAML,
+  WorkflowParameterYAML,
+} from "../types/workflowYamlTypes";
+import { ParametersState, SkyvernCredential } from "./types";
+
+/**
+ * A single credential serializes to an editable workflow `credential_id`
+ * parameter (overridable at run/rerun time); only a rotation pool (2+
+ * credentials) becomes a block-scoped credential parameter.
+ */
+function skyvernCredentialToParameterYAML(
+  parameter: SkyvernCredential,
+): WorkflowParameterYAML | CredentialParameterYAML {
+  const hasCredentialRotation = (parameter.credentialIds?.length ?? 0) >= 2;
+  if (!hasCredentialRotation) {
+    return {
+      parameter_type: WorkflowParameterTypes.Workflow,
+      workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+      default_value: parameter.credentialId,
+      key: parameter.key,
+      description: parameter.description || null,
+    };
+  }
+  return {
+    parameter_type: WorkflowParameterTypes.Credential,
+    credential_id: parameter.credentialId,
+    credential_ids: parameter.credentialIds ?? null,
+    selection_strategy: parameter.selectionStrategy ?? null,
+    key: parameter.key,
+    description: parameter.description || null,
+  };
+}
 
 const getInitialParameters = (workflow: WorkflowApiResponse) => {
   return workflow.workflow_definition.parameters
@@ -21,6 +53,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
             key: parameter.key,
             parameterType: WorkflowEditorParameterTypes.Credential,
             credentialId: parameter.default_value as string,
+            dataType: WorkflowParameterValueType.CredentialId,
             description: parameter.description,
           };
         }
@@ -68,6 +101,8 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           key: parameter.key,
           parameterType: WorkflowEditorParameterTypes.Credential,
           credentialId: parameter.credential_id,
+          credentialIds: parameter.credential_ids ?? null,
+          selectionStrategy: parameter.selection_strategy ?? null,
           description: parameter.description,
         };
       } else if (
@@ -170,4 +205,5 @@ export {
   constructCacheKeyValue,
   constructCacheKeyValueFromParameters,
   getInitialParameters,
+  skyvernCredentialToParameterYAML,
 };

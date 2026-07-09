@@ -38,6 +38,8 @@ CRITICAL - Do not declare success on a partially-complete multi-part goal:
 - Many goals have multiple required parts/legs (e.g. "find X AND find Y AND find Z"). The goal is achieved ONLY when ALL required parts are done.
 - If your own analysis (task_history_information, thoughts, or required_subgoals) identifies ANY required part as missing, unmet, or not yet found, you MUST set user_goal_achieved to false so the agent attempts the missing part next.
 - Setting user_goal_achieved to false here does NOT fail the task — it lets the agent keep working on the missing part. Only set should_terminate to true if a required part is genuinely IMPOSSIBLE per the termination rules above; in that case give a termination_reason.
+- A goal that fixes an exact count, selection, or required mix (e.g. "exactly N", "the N best/strongest", "top N", "at least one X and one Y", or one specifically described item) is NOT satisfied by the wrong count or a set missing a required category — keep user_goal_achieved false until the captured result covers the requested count and mix.
+- If the goal limits how many browser tabs may stay open (e.g. "keep exactly N tabs open"), compare that limit against the live "Open browser tabs" list below (count the actual tabs, not how many the agent meant to open). If more tabs are open than allowed, set user_goal_achieved to false so the agent can close the extra tabs next — UNLESS the task history already shows a tab-closing/curation attempt, in which case do NOT keep blocking on the open-tab count; decide user_goal_achieved from whether the rest of the goal is satisfied so the run can finish with its result.
 
 User goal:
 ```
@@ -48,6 +50,13 @@ Task history (the earliest task is the first in the list and the latest is the l
 ```
 {{ task_history }}
 ```
+{% if open_tabs_context %}
+
+Open browser tabs right now (the live set of tabs the agent has open; the tab marked [current] is the page in the screenshot). Use this list — not the number the agent intended to open — to judge any "keep N tabs open" constraint:
+```
+{{ open_tabs_context }}
+```
+{% endif %}
 
 Current datetime, ISO format:
 ```

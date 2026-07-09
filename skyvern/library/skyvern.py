@@ -374,7 +374,7 @@ class Skyvern(AsyncSkyvern):
         request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
-            workflow_id=workflow_id,
+            agent_id=workflow_id,
             parameters=parameters,
             template=template,
             title=title,
@@ -556,6 +556,7 @@ class Skyvern(AsyncSkyvern):
         timeout: int | None = None,
         proxy_location: ProxyLocationInput = None,
         extensions: list[Extensions] | None = None,
+        browser_profile_id: str | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
 
@@ -567,6 +568,7 @@ class Skyvern(AsyncSkyvern):
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
             extensions: Browser extensions to install in the session.
+            browser_profile_id: Browser profile ID to load into the session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
@@ -578,6 +580,8 @@ class Skyvern(AsyncSkyvern):
         }
         if extensions is not None:
             create_kwargs["extensions"] = extensions
+        if browser_profile_id is not None:
+            create_kwargs["browser_profile_id"] = browser_profile_id
         browser_session = await self.create_browser_session(**create_kwargs)
         if self._environment == SkyvernEnvironment.CLOUD:
             LOG.info(

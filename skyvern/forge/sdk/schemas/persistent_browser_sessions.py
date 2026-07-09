@@ -5,6 +5,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
+from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocationInput
 
 
@@ -59,6 +60,9 @@ class Extensions(StrEnum):
     CaptchaSolver = "captcha-solver"
 
 
+FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE = "forced_workflow_run"
+
+
 class PersistentBrowserSession(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -71,6 +75,7 @@ class PersistentBrowserSession(BaseModel):
     status: str | None = None
     timeout_minutes: int | None = None
     proxy_location: ProxyLocationInput = None
+    proxy_session_id: str | None = None
     instance_type: str | None = None
     vcpu_millicores: int | None = None
     memory_mb: int | None = None
@@ -95,6 +100,11 @@ class PersistentBrowserSession(BaseModel):
         if isinstance(value, str):
             return deserialize_proxy_location(value, raise_on_invalid_geo_target=True)
         return value
+
+    @field_validator("proxy_session_id")
+    @classmethod
+    def validate_proxy_session_id_field(cls, value: str | None) -> str | None:
+        return validate_proxy_session_id(value)
 
     def should_export_profile(self) -> bool:
         """A session persists its profile at teardown only when it opted in or is reusing a saved profile.

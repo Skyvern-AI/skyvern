@@ -1,6 +1,7 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   CodeBlockStep,
+  CredentialSelectionStrategy,
   WorkflowBlockType,
   WorkflowModel,
 } from "./workflowTypes";
@@ -11,7 +12,9 @@ export type WorkflowCreateYAMLRequest = {
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
+  pin_saved_session_ip?: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model?: WorkflowModel | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
@@ -24,6 +27,7 @@ export type WorkflowCreateYAMLRequest = {
   run_with?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
+  enable_self_healing?: boolean;
   adaptive_caching?: boolean;
   code_version?: number | null;
   run_sequentially?: boolean;
@@ -37,6 +41,7 @@ export type WorkflowDefinitionYAML = {
   blocks: Array<BlockYAML>;
   finally_block_label?: string | null;
   workflow_system_prompt?: string | null;
+  error_code_mapping?: Record<string, string> | null;
 };
 
 export type ParameterYAML =
@@ -126,6 +131,8 @@ export type OutputParameterYAML = ParameterYAMLBase & {
 export type CredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "credential";
   credential_id: string;
+  credential_ids?: Array<string> | null;
+  selection_strategy?: CredentialSelectionStrategy | null;
 };
 
 export type BlockYAML =
@@ -347,6 +354,8 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   azure_storage_account_name?: string | null;
   azure_storage_account_key?: string | null;
   azure_blob_container_name?: string | null;
+  google_credential_id?: string | null;
+  google_drive_folder_id?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {
@@ -367,7 +376,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema?: Record<string, unknown> | null;
 };
 
@@ -428,6 +437,7 @@ export type HttpRequestBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   download_filename?: string | null;
   save_response_as_file?: boolean;
+  secret_response_paths?: Array<string> | null;
 };
 
 export type PrintPageBlockYAML = BlockYAMLBase & {

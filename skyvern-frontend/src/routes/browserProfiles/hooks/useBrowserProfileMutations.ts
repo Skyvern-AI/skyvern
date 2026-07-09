@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 
 import { getClient } from "@/api/AxiosClient";
-import { BrowserProfileApiResponse } from "@/api/types";
+import { BrowserProfileApiResponse, ProxyLocation } from "@/api/types";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
@@ -10,6 +10,9 @@ type UpdateBrowserProfileInput = {
   profileId: string;
   name?: string;
   description?: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
+  rotate_proxy_session_id?: boolean;
 };
 
 function useUpdateBrowserProfileMutation() {
@@ -21,14 +24,27 @@ function useUpdateBrowserProfileMutation() {
       profileId,
       name,
       description,
+      proxy_location,
+      proxy_session_id,
+      rotate_proxy_session_id,
     }: UpdateBrowserProfileInput) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const payload: Record<string, string | null> = {};
+      const payload: Record<string, string | boolean | ProxyLocation | null> =
+        {};
       if (name !== undefined) {
         payload.name = name;
       }
       if (description !== undefined) {
         payload.description = description;
+      }
+      if (proxy_location !== undefined) {
+        payload.proxy_location = proxy_location;
+      }
+      if (proxy_session_id !== undefined) {
+        payload.proxy_session_id = proxy_session_id;
+      }
+      if (rotate_proxy_session_id !== undefined) {
+        payload.rotate_proxy_session_id = rotate_proxy_session_id;
       }
       return client
         .patch<BrowserProfileApiResponse>(

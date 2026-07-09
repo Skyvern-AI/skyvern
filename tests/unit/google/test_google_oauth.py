@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
@@ -9,8 +9,8 @@ from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
-from skyvern.forge.sdk.schemas.google_oauth import UpdateGoogleOAuthCredentialRequest
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.schemas.google_oauth import CreateGoogleOAuthAuthorizeRequest, UpdateGoogleOAuthCredentialRequest
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 
 
 def _unwrap_bind(value: Any) -> Any:
@@ -20,6 +20,20 @@ def _unwrap_bind(value: Any) -> Any:
 
 def _default_scopes_list() -> list[str]:
     return list(google_oauth_service.GOOGLE_SHEETS_SCOPES)
+
+
+def _install_google_drive_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]],
+) -> None:
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def fake_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(google_drive_service.httpx, "AsyncClient", fake_async_client)
 
 
 def test_coerce_scopes_accepts_strings_and_iterables() -> None:
@@ -43,14 +57,226 @@ def test_google_sheets_scopes_includes_drive_file_and_metadata_readonly() -> Non
     assert "https://www.googleapis.com/auth/drive.metadata.readonly" in scopes
 
 
+def test_google_drive_scope_profile_uses_full_drive_scope_for_folder_uploads() -> None:
+    scopes = google_oauth_service.scopes_for_profile("google_drive")
+    assert scopes == [
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+
+def test_google_oauth_authorize_request_accepts_google_drive_scope_profile() -> None:
+    request = CreateGoogleOAuthAuthorizeRequest(
+        redirect_uri="https://app.example.com/google/callback",
+        scope_profile="google_drive",
+    )
+
+    assert request.scope_profile == "google_drive"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("folder_123", "folder_123"),
+        ("https://drive.google.com/drive/u/0/folders/folder_123", "folder_123"),
+    ],
+)
+def test_google_drive_extract_folder_id(value: str, expected: str) -> None:
+    assert google_drive_service.extract_folder_id(value) == expected
+
+
+def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
+    with pytest.raises(ValueError, match="folder URL"):
+        google_drive_service.extract_folder_id("https://drive.google.com/file/d/file_123/view")
+
+
+def test_google_drive_extract_folder_id_rejects_non_google_folder_url() -> None:
+    with pytest.raises(ValueError, match=r"https://\*\.google\.com"):
+        google_drive_service.extract_folder_id("https://attacker.example.com/folders/folder_123")
+
+
+@pytest.mark.asyncio
+async def test_google_drive_uploads_multipart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        captured["url"] = url
+        captured["auth"] = request.headers.get("Authorization")
+        captured["content_type"] = request.headers["Content-Type"]
+        captured["body"] = await request.aread()
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "report.txt",
+                "webViewLink": "https://drive.google.com/file/d/file_123/view",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_123"
+    assert captured["auth"] == "Bearer at-1"
+    assert "/upload/drive/v3/files" in captured["url"]
+    assert "uploadType=multipart" in captured["url"]
+    assert "supportsAllDrives=true" in captured["url"]
+    assert str(captured["content_type"]).startswith("multipart/related; boundary=skyvern-")
+    body = captured["body"]
+    assert isinstance(body, bytes)
+    assert b'"parents":["folder_123"]' in body
+    assert b'"name":"report.txt"' in body
+
+
+@pytest.mark.asyncio
+async def test_google_drive_upload_does_not_retry_retryable_create_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return httpx.Response(
+                200, json={"id": "file_123", "webViewLink": "https://drive.google.com/file/d/123/view"}
+            )
+        return httpx.Response(503, headers={"Retry-After": "0"}, json={"error": {"message": "try later"}})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 503
+    assert calls == 1
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_upload_retries_connection_failures_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("connect failed", request=request)
+        return httpx.Response(200, json={"id": "file_123", "webViewLink": "https://drive.google.com/file/d/123/view"})
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    uploaded = await google_drive_service.upload_file(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id="folder_123",
+    )
+
+    assert uploaded.id == "file_123"
+    assert calls == 2
+    sleep_mock.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_upload_does_not_retry_ambiguous_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _install_google_drive_transport(monkeypatch, handler)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(google_drive_service.asyncio, "sleep", sleep_mock)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 503
+    assert exc_info.value.code == "ambiguous_upload_status"
+    assert calls == 1
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_upload_rejects_multipart_files_over_google_limit(tmp_path) -> None:
+    source = tmp_path / "large.bin"
+    source.write_bytes(b"x" * (google_drive_service.DRIVE_MULTIPART_UPLOAD_MAX_BYTES + 1))
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.upload_file(
+            access_token="at-1",
+            file_path=str(source),
+            folder_id="folder_123",
+        )
+
+    assert exc_info.value.status == 413
+    assert exc_info.value.code == "file_too_large"
+
+
+def test_google_drive_maps_insufficient_scope_to_reconnect() -> None:
+    response = httpx.Response(
+        403,
+        json={
+            "error": {
+                "message": "Request had insufficient authentication scopes.",
+                "errors": [{"reason": "insufficientPermissions"}],
+            }
+        },
+    )
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        google_drive_service._raise_for_error(response)
+
+    assert exc_info.value.status == 403
+    assert exc_info.value.code == "reconnect_required"
+
+
 def test_sheets_api_runtime_defaults_match_previous_hardcoded_values() -> None:
-    """Sheets timeout/retry settings default to known values so unset envs
+    """Google API timeout/retry settings default to known values so unset envs
     produce no behavior change for upgrading deployments."""
     from skyvern.config import Settings
 
     fresh = Settings()
     assert fresh.GOOGLE_SHEETS_API_TIMEOUT_SECONDS == 30.0
     assert fresh.GOOGLE_SHEETS_API_MAX_RETRIES == 3
+    assert fresh.GOOGLE_DRIVE_API_TIMEOUT_SECONDS == 30.0
+    assert fresh.GOOGLE_DRIVE_API_MAX_RETRIES == 3
 
 
 def test_build_authorize_url_includes_required_params(monkeypatch: pytest.MonkeyPatch) -> None:

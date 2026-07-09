@@ -13,6 +13,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
+from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels import exfiltration as streaming_exfiltration
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEventSource
 from skyvern.services.browser_recording.service import (
@@ -37,8 +38,12 @@ from skyvern.services.browser_recording.types import (
 
 LOG = structlog.get_logger(__name__)
 
-INTERPRETATION_DEBOUNCE_SECONDS = 0.4
-INTERPRETATION_MAX_WAIT_SECONDS = 2.0
+INTERPRETATION_DEBOUNCE_SECONDS = 0.15
+INTERPRETATION_MAX_WAIT_SECONDS = 0.8
+# events_to_actions is pure CPU and runs on the event loop; log when a single pass
+# is slow enough to risk starving the raw-event/WebSocket path so we can decide
+# whether to offload it to a thread.
+EVENTS_TO_ACTIONS_SLOW_MS = 50.0
 SIGNIFICANT_CONSOLE_EVENT_TYPES = {
     "blur",
     "change",
@@ -241,11 +246,18 @@ class RecordingInterpretationSession:
         on_update: OnRecordingInterpretationUpdate,
         debounce_seconds: float = INTERPRETATION_DEBOUNCE_SECONDS,
         max_wait_seconds: float = INTERPRETATION_MAX_WAIT_SECONDS,
+        deltas_enabled: bool = False,
+        recording_attempt_id: str | None = None,
     ) -> None:
         self.browser_session_id = browser_session_id
         self.organization_id = organization_id
         self.workflow_permanent_id = workflow_permanent_id
         self.on_update = on_update
+        # Identifies the client-side recording attempt. A cached session is
+        # reused across reconnects only when this matches; a new recording sends
+        # a new id, forcing a fresh session (state machines reset from scratch).
+        self.recording_attempt_id = recording_attempt_id
+        self.set_deltas_enabled(deltas_enabled)
         self.interpretation_session_id = str(uuid.uuid4())
         self.debounce_seconds = debounce_seconds
         self.max_wait_seconds = max_wait_seconds
@@ -258,6 +270,7 @@ class RecordingInterpretationSession:
         self._debounce_task: asyncio.Task[None] | None = None
         self._pending_since: float | None = None
         self._enrichment_tasks: set[asyncio.Task[None]] = set()
+        self._enrichment_semaphore = asyncio.Semaphore(settings.RECORDING_ENRICHMENT_MAX_CONCURRENCY)
         self._interpret_lock = asyncio.Lock()
         self._action_machines: list[sm.StateMachine] = [
             sm.Click(),
@@ -275,6 +288,10 @@ class RecordingInterpretationSession:
             if isinstance(machine, sm.Wait):
                 machine.reset()
 
+    def set_deltas_enabled(self, enabled: bool) -> None:
+        # Deltas require both the client capability and the server kill switch.
+        self._deltas_enabled = enabled and settings.RECORDING_INTERPRETATION_DELTAS_ENABLED
+
     def pause_capture(self) -> None:
         self._capture_paused = True
         self.reset_wait_capture()
@@ -282,6 +299,10 @@ class RecordingInterpretationSession:
     def resume_capture(self) -> None:
         self._capture_paused = False
         self.reset_wait_capture()
+        # Enrichment deltas that landed while paused were dropped client-side, so
+        # send an authoritative snapshot to resync on resume.
+        if self.session_revision > 0:
+            self._emit()
 
     def ingest_events(self, events: list[streaming_exfiltration.ExfiltratedEvent]) -> None:
         if self._capture_paused:
@@ -292,6 +313,14 @@ class RecordingInterpretationSession:
 
         self.events.extend(reified_events)
 
+        # Async materialization (e.g. console json_value round-trips) can append
+        # events out of true order under load. Re-sort only the not-yet-interpreted
+        # tail by capture order; never touch the processed prefix, whose emitted
+        # actions are tracked by index. sorted() is stable, so legacy events without
+        # a capture_seq (-1) keep their arrival order.
+        tail_start = self._processed_event_count
+        self.events[tail_start:] = sorted(self.events[tail_start:], key=lambda event: event.capture_seq)
+
         if not any(event_should_trigger_interpretation(event) for event in reified_events):
             return
 
@@ -300,7 +329,8 @@ class RecordingInterpretationSession:
 
         self.pending = True
         self.finalized = False
-        self._emit_update()
+        # Pending ping: no step changed yet, just signal interpretation is in flight.
+        self._emit(changed_steps=[])
         self._schedule_interpretation()
 
     def cancel(self) -> None:
@@ -350,36 +380,48 @@ class RecordingInterpretationSession:
 
             if self._processed_event_count < len(self.events):
                 new_events = self.events[self._processed_event_count :]
+                started_at = time.perf_counter()
                 self._all_actions = processor.events_to_actions(
                     new_events,
                     machines=self._action_machines,
                     initial_actions=self._all_actions,
                 )
+                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                if elapsed_ms >= EVENTS_TO_ACTIONS_SLOW_MS:
+                    LOG.warning(
+                        "Slow events_to_actions pass blocked the event loop",
+                        browser_session_id=self.browser_session_id,
+                        elapsed_ms=round(elapsed_ms, 1),
+                        new_event_count=len(new_events),
+                        total_action_count=len(self._all_actions),
+                    )
                 self._processed_event_count = len(self.events)
 
             new_actions = self._all_actions[self.emitted_action_count :]
 
+            new_steps: list[RecordingDraftStep] = []
             for offset, action in enumerate(new_actions):
                 action_index = self.emitted_action_count + offset
                 draft_step = await self._step_from_action(processor, action_index, action)
                 if draft_step:
                     draft_step.label = self._unique_step_label(draft_step.label, draft_step)
                     self.steps.append(draft_step)
+                    new_steps.append(draft_step)
 
             self.emitted_action_count += len(new_actions)
             self.pending = False
             self.finalized = finalized and not self._enrichment_tasks
-            self._emit_update()
+            self._emit(changed_steps=new_steps)
 
         if not finalized:
             return
 
-        # Hold the finalized signal until in-flight LLM enrichment lands, so
-        # commit paths never capture placeholder metadata.
+        # Hold the finalized signal until in-flight LLM enrichment lands, so commit
+        # paths never capture placeholder metadata. Emit a final snapshot so the
+        # client's full step list is authoritative regardless of any dropped delta.
         await self._drain_enrichment()
-        if not self.finalized:
-            self.finalized = True
-            self._emit_update()
+        self.finalized = True
+        self._emit()
 
     async def _step_from_action(
         self,
@@ -444,7 +486,8 @@ class RecordingInterpretationSession:
         enriched: RecordingDraftStep | None = None
 
         try:
-            block = await processor.create_action_block(action)
+            async with self._enrichment_semaphore:
+                block = await processor.create_action_block(action)
             enriched = _draft_step_from_block(
                 browser_session_id=self.browser_session_id,
                 action_index=action_index,
@@ -467,7 +510,7 @@ class RecordingInterpretationSession:
             step.parameter_keys = enriched.parameter_keys
 
         step.status = RecordingDraftStepStatus.READY
-        self._emit_update()
+        self._emit(changed_steps=[step])
 
     async def _drain_enrichment(self) -> None:
         while self._enrichment_tasks:
@@ -504,12 +547,21 @@ class RecordingInterpretationSession:
                 organization_id=self.organization_id,
             )
 
-    def _emit_update(self) -> None:
+    def _emit(self, *, changed_steps: list[RecordingDraftStep] | None = None) -> None:
+        # Snapshot when changed_steps is None (full steps, is_snapshot=True); delta
+        # otherwise (only the changed steps), keeping each update O(1) instead of
+        # re-sending the whole growing list. Both advance session_revision so the
+        # client's staleness guard orders them.
         self.session_revision += 1
+        # Send a delta only when the client understands them and a changed set was
+        # given; otherwise fall back to a full snapshot (legacy-compatible).
+        is_delta = self._deltas_enabled and changed_steps is not None
         update = RecordingInterpretationUpdate(
             interpretation_session_id=self.interpretation_session_id,
             session_revision=self.session_revision,
-            steps=self.steps,
+            steps=[] if is_delta else self.steps,
+            changed_steps=changed_steps if is_delta else [],
+            is_snapshot=not is_delta,
             pending=self.pending,
             finalized=self.finalized,
         )

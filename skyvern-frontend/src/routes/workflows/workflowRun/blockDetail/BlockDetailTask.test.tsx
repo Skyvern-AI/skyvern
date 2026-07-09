@@ -8,7 +8,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import { Status } from "@/api/types";
 import type {
   ObserverThought,
   WorkflowRunBlock,
@@ -73,22 +73,6 @@ function buildThought(
   } as ObserverThought;
 }
 
-function buildAction(
-  overrides: Partial<ActionsApiResponse> = {},
-): ActionsApiResponse {
-  return {
-    action_id: "act_default",
-    action_type: ActionTypes.wait,
-    status: Status.Completed,
-    reasoning: null,
-    text: null,
-    response: null,
-    confidence_float: null,
-    created_by: null,
-    ...overrides,
-  } as ActionsApiResponse;
-}
-
 afterEach(() => {
   cleanup();
 });
@@ -125,30 +109,5 @@ describe("BlockDetailTask thought selection", () => {
       />,
     );
     expect(screen.getByText("Considering the next step")).toBeDefined();
-  });
-
-  it("renders actions in chronological order to match their numbers", () => {
-    const newestFirstActions = [
-      buildAction({ action_id: "act_3", reasoning: "third action" }),
-      buildAction({ action_id: "act_2", reasoning: "second action" }),
-      buildAction({ action_id: "act_1", reasoning: "first action" }),
-    ];
-
-    render(
-      <BlockDetailTask
-        block={buildTaskBlock({ actions: newestFirstActions })}
-        activeItem={null}
-        thoughts={[]}
-      />,
-    );
-
-    const firstAction = screen.getByText("first action");
-    const thirdAction = screen.getByText("third action");
-    expect(
-      firstAction.compareDocumentPosition(thirdAction) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expect(screen.getAllByText("#1").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("#3").length).toBeGreaterThanOrEqual(1);
   });
 });

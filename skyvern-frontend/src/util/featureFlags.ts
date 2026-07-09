@@ -20,3 +20,12 @@ export const WORKFLOW_TAGGING_FLAG = "WORKFLOW_TAGGING";
 // Opt-in (0% base rollout) preview gating the workflows directory-tree view.
 // Not enrolled reads as disabled, so the default stays the flat folders/list.
 export const WORKFLOWS_DIRECTORY_TREE_FLAG = "WORKFLOWS_DIRECTORY_TREE";
+
+// Opt-in (0% base rollout) preview gating the redesigned workflow studio.
+// Not enrolled reads as disabled, so the default stays the legacy editor.
+export const WORKFLOW_STUDIO_FLAG = "workflow_studio_v2";
+
+// Opt-in (0% base rollout) gating the analytics org-zoom group-by lens
+// (run metadata / workflow tag). Off ⇒ the dashboard renders as today with no
+// group-by control. See cloud_docs/analytics/GROUP_BY_LENS_DESIGN.md.
+export const ANALYTICS_GROUP_BY_LENS_FLAG = "ANALYTICS_GROUP_BY_LENS";

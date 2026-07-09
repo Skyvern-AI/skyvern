@@ -1,12 +1,17 @@
 import {
-  CredentialApiResponse,
   isCreditCardCredential,
   isPasswordCredential,
   isSecretCredential,
+  type CredentialApiResponse,
+  type CredentialTotpCodeResponse,
 } from "@/api/types";
+import { getClient } from "@/api/AxiosClient";
 import { SelectionCheckbox } from "@/components/SelectionCheckbox";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  CopyIcon,
+  EyeNoneIcon,
+  EyeOpenIcon,
   ExclamationTriangleIcon,
   ExternalLinkIcon,
   Pencil1Icon,
@@ -26,6 +31,11 @@ import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
 import { SaveIcon } from "@/components/icons/SaveIcon";
 import { useCredentialTestStore } from "@/store/useCredentialTestStore";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { toast } from "@/components/ui/use-toast";
+import { copyText } from "@/util/copyText";
+import { cn } from "@/util/utils";
+import { getCredentialErrorMessage } from "./authenticatorSaveError";
 
 type Props = {
   credential: CredentialApiResponse;
@@ -39,6 +49,205 @@ type Props = {
   hasSelection?: boolean;
   onSelect?: (index: number, shiftKey: boolean) => void;
 };
+
+function formatTotpCode(code: string): string {
+  const splitAt = Math.ceil(code.length / 2);
+  return `${code.slice(0, splitAt)} ${code.slice(splitAt)}`;
+}
+
+function CredentialTotpCodePreview({ credentialId }: { credentialId: string }) {
+  const credentialGetter = useCredentialGetter();
+  const isMountedRef = useRef(true);
+  const [totpCode, setTotpCode] = useState<CredentialTotpCodeResponse | null>(
+    null,
+  );
+  const [secondsRemaining, setSecondsRemaining] = useState<number | null>(null);
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
+  const [isCodeVisible, setIsCodeVisible] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (expiresAt === null) {
+      return;
+    }
+
+    const updateRemaining = () => {
+      const nextSecondsRemaining = Math.max(
+        0,
+        Math.ceil((expiresAt - Date.now()) / 1000),
+      );
+      if (nextSecondsRemaining <= 0) {
+        setTotpCode(null);
+        setSecondsRemaining(null);
+        setExpiresAt(null);
+        setIsCodeVisible(false);
+        setError("2FA code expired. Refresh to load a new code.");
+        return;
+      }
+      setSecondsRemaining(nextSecondsRemaining);
+    };
+
+    updateRemaining();
+    const interval = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(interval);
+  }, [expiresAt]);
+
+  const fetchTotpCode = async ({
+    reveal = true,
+  }: { reveal?: boolean } = {}) => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.get<CredentialTotpCodeResponse>(
+        `/credentials/${credentialId}/totp-code`,
+      );
+      if (!isMountedRef.current) {
+        return;
+      }
+      setTotpCode(response.data);
+      setSecondsRemaining(response.data.seconds_remaining);
+      setExpiresAt(Date.now() + response.data.seconds_remaining * 1000);
+      setIsCodeVisible(reveal);
+    } catch (caught) {
+      if (!isMountedRef.current) {
+        return;
+      }
+      setTotpCode(null);
+      setSecondsRemaining(null);
+      setExpiresAt(null);
+      setIsCodeVisible(false);
+      setError(getCredentialErrorMessage(caught) ?? "Unable to load code");
+    } finally {
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  const hasValidTotpCode =
+    totpCode !== null && secondsRemaining !== null && secondsRemaining > 0;
+  const visibleTotpCode =
+    isCodeVisible && hasValidTotpCode ? totpCode.code : null;
+  const canCopyCode = Boolean(visibleTotpCode);
+
+  const handleToggleCodeVisibility = () => {
+    if (isCodeVisible) {
+      setIsCodeVisible(false);
+      return;
+    }
+
+    if (hasValidTotpCode) {
+      setIsCodeVisible(true);
+      return;
+    }
+
+    void fetchTotpCode();
+  };
+
+  const handleCopyCode = async () => {
+    if (!visibleTotpCode) {
+      return;
+    }
+    // Display formatting adds spacing; copy the raw code for paste targets.
+    const copied = await copyText(visibleTotpCode);
+    toast({
+      title: copied ? "Copied code" : "Copy failed",
+      description: copied
+        ? "The current 2FA code was copied to your clipboard."
+        : "Could not copy the current 2FA code.",
+      variant: copied ? "success" : "destructive",
+    });
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex min-h-6 items-center gap-2">
+        <span
+          className={cn(
+            "inline-block min-w-[5.75rem] font-mono text-sm tabular-nums text-foreground",
+            !isCodeVisible && "text-muted-foreground",
+          )}
+        >
+          {isCodeVisible && totpCode
+            ? formatTotpCode(totpCode.code)
+            : "••••••••"}
+        </span>
+        <span
+          className={cn(
+            "inline-block w-7 text-right text-xs text-slate-400",
+            (!isCodeVisible || !hasValidTotpCode) && "invisible",
+          )}
+        >
+          {secondsRemaining ?? 0}s
+        </span>
+        <TooltipProvider delayDuration={200}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="tertiary"
+                className="h-6 w-6"
+                onClick={handleToggleCodeVisibility}
+                disabled={isLoading}
+                aria-label={isCodeVisible ? "Hide 2FA code" : "Show 2FA code"}
+              >
+                {isCodeVisible ? (
+                  <EyeNoneIcon className="size-3.5" />
+                ) : (
+                  <EyeOpenIcon className="size-3.5" />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {isCodeVisible ? "Hide 2FA code" : "Show 2FA code"}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="tertiary"
+                className="h-6 w-6"
+                onClick={() => void fetchTotpCode({ reveal: isCodeVisible })}
+                disabled={isLoading}
+                aria-label="Refresh 2FA code"
+              >
+                <ReloadIcon
+                  className={cn("size-3.5", isLoading && "animate-spin")}
+                />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Refresh 2FA code</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="tertiary"
+                className="h-6 w-6"
+                onClick={handleCopyCode}
+                disabled={!canCopyCode}
+                aria-label="Copy 2FA code"
+              >
+                <CopyIcon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Copy 2FA code</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </div>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
 
 function CredentialItem({
   credential,
@@ -105,14 +314,24 @@ function CredentialItem({
                 2FA Type
               </p>
             )}
+            {credentialData.totp_type === "authenticator" && (
+              <p className="text-sm text-neutral-600 dark:text-slate-400">
+                2FA Code
+              </p>
+            )}
           </div>
           <div className="space-y-2">
             <p className="text-sm">{credentialData.username}</p>
-            <p className="text-sm">{"********"}</p>
+            <p className="text-sm">{"••••••••"}</p>
             {credentialData.totp_type !== "none" && (
-              <p className="text-sm text-blue-400">
+              <p className="text-sm">
                 {getTotpTypeDisplay(credentialData.totp_type)}
               </p>
+            )}
+            {credentialData.totp_type === "authenticator" && (
+              <CredentialTotpCodePreview
+                credentialId={credential.credential_id}
+              />
             )}
           </div>
         </div>

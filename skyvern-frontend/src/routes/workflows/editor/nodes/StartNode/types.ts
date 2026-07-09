@@ -8,7 +8,9 @@ export type WorkflowStartNodeData = {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  pinSavedSessionIp: boolean;
   browserProfileId: string | null;
+  browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   maxElapsedTimeMinutes: number | null;
@@ -19,10 +21,12 @@ export type WorkflowStartNodeData = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;
+  enableSelfHealing: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
   workflowSystemPrompt: string | null;
+  errorCodeMapping: Record<string, string> | null;
   label: "__start_block__";
   showCode: boolean;
 };
@@ -38,6 +42,10 @@ export type OtherStartNodeData = {
 export type StartNodeData = WorkflowStartNodeData | OtherStartNodeData;
 
 export type StartNode = Node<StartNodeData, "start">;
+
+// Window event asking the root start node to expand its Workflow Settings
+// accordion (dispatched from the canvas when the start node is clicked).
+export const OPEN_WORKFLOW_SETTINGS_EVENT = "open-workflow-settings";
 
 export function isStartNode(node: AppNode): node is StartNode {
   return node.type === "start";

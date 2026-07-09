@@ -137,7 +137,9 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
@@ -148,6 +150,7 @@ class Workflow(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
+    enable_self_healing: bool = False
     code_version: int | None = None
     generate_script_on_terminal: bool = False
     run_sequentially: bool | None = None
@@ -156,6 +159,9 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
+    # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
+    copilot_authored: bool = False
 
     @field_validator("run_with", mode="before")
     @classmethod

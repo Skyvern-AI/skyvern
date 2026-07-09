@@ -30,7 +30,7 @@ def _status_data() -> list[dict]:
         {
             "component": "PostgreSQL",
             "running": _check_port(db_port),
-            "start_command": "skyvern init --no-postgres false",
+            "start_command": "skyvern init",
         },
     ]
 

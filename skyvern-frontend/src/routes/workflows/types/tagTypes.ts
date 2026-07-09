@@ -20,6 +20,11 @@ export interface TagsResponse {
   tags: Array<TagResponse>;
 }
 
+export interface RunTagsResponse {
+  workflow_run_id: string;
+  tags: Array<TagResponse>;
+}
+
 export interface TagKey {
   key: string;
   description: string | null;
@@ -28,10 +33,26 @@ export interface TagKey {
   workflow_count: number;
 }
 
+// Palette color assigned to a grouped (key, value) pair (from GET /tag-values).
+// Standalone labels have no key and are not colored, so never appear here.
+// `workflow_count` (# workflows currently carrying this (key, value)) drives the
+// label-management usage column and delete blast-radius warning; it's optional so
+// color-only consumers and pre-field stubs stay valid.
+export interface TagValue {
+  key: string;
+  value: string;
+  color: string;
+  workflow_count?: number;
+}
+
 // Batch endpoint returns a list of {key, value} per workflow (no per-tag
 // metadata). Descriptions come from the tag-key registry (GET /tag-keys).
 export interface WorkflowTagsBatchResponse {
   workflow_tags: Record<string, Array<Tag>>;
+}
+
+export interface RunTagsBatchResponse {
+  run_tags: Record<string, Array<Tag>>;
 }
 
 // Body for POST /workflows/{wpid}/tags. `tags` sets/overwrites ({key?, value});
@@ -48,6 +69,9 @@ export type TagDeleteInput =
 export interface TagApplyRequest {
   tags?: Array<TagInput>;
   tags_to_delete?: Array<TagDeleteInput>;
+  // Map of grouped tag key -> palette color name for the value being set. Keys
+  // absent here keep their existing color or get a random palette color server-side.
+  colors?: Record<string, string>;
 }
 
 // Mirror skyvern/forge/sdk/workflow/models/validators.py so the editor rejects

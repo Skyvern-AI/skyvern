@@ -449,6 +449,28 @@ function isHoverOnlyElement(element) {
   return false;
 }
 
+// Walks ancestors looking for one whose own scrollLeft is non-zero AND that
+// is itself a horizontal scroll container (overflow-x: auto or scroll). Used
+// by isElementVisible to keep cells of horizontally scrolled data grids in
+// the element tree even when the current scroll position has pushed them
+// outside the viewport horizontally.
+function hasHorizontallyScrolledAncestor(element) {
+  let parent = element.parentElement;
+  while (parent) {
+    if (parent.scrollLeft && parent.scrollLeft !== 0) {
+      const parentStyle = getElementComputedStyle(parent);
+      if (parentStyle) {
+        const overflowX = parentStyle.overflowX;
+        if (overflowX === "auto" || overflowX === "scroll") {
+          return true;
+        }
+      }
+    }
+    parent = parent.parentElement;
+  }
+  return false;
+}
+
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
 function isElementVisible(element, seen) {
@@ -554,6 +576,15 @@ function isElementVisible(element, seen) {
   // FIXME: sometimes there could be an overflow element blocking the default scrolling, making Y coordinate be wrong. So we currently only check for X
   const center_x = (rect.left + rect.width) / 2 + window.scrollX;
   if (center_x < 0) {
+    // The element's center lies left of the viewport. If it sits inside a
+    // horizontally scrolled container, it is still part of the page — just
+    // outside the current scroll window. Keeping it in the element tree
+    // lets the LLM see columns that the user could reveal by scrolling. We
+    // still drop elements without a scrolled ancestor (e.g. accessibility
+    // skip links positioned at left: -9999px).
+    if (hasHorizontallyScrolledAncestor(element)) {
+      return true;
+    }
     return false;
   }
   // const center_y = (rect.top + rect.height) / 2 + window.scrollY;
@@ -896,6 +927,58 @@ function isInteractableInput(element, hoverStylesMap) {
   return isHoverPointerElement(element, hoverStylesMap) || type !== "hidden";
 }
 
+function isDatepickerNavigationElement(element) {
+  if (element.tagName.toLowerCase() !== "th") {
+    return false;
+  }
+
+  const classNames = (element.className?.toString().toLowerCase() ?? "")
+    .split(/\s+/)
+    .filter(Boolean);
+  const ariaDisabled =
+    element.getAttribute?.("aria-disabled")?.toLowerCase() === "true";
+  if (element.disabled || ariaDisabled || classNames.includes("disabled")) {
+    return false;
+  }
+
+  let current = element.parentElement;
+  let hasDatepickerAncestor = false;
+  const maxDatepickerAncestorDepth = 25;
+  for (let depth = 0; current && depth < maxDatepickerAncestorDepth; depth++) {
+    const ancestorClassNames = (
+      current.className?.toString().toLowerCase() ?? ""
+    )
+      .split(/\s+/)
+      .filter(Boolean);
+    if (
+      ancestorClassNames.some(
+        (name) =>
+          name === "datepicker" ||
+          name.startsWith("datepicker-") ||
+          name === "bootstrap-datepicker",
+      )
+    ) {
+      hasDatepickerAncestor = true;
+      break;
+    }
+    current = current.parentElement;
+  }
+  if (!hasDatepickerAncestor) {
+    return false;
+  }
+
+  if (
+    classNames.some((name) =>
+      ["prev", "next", "datepicker-switch"].includes(name),
+    )
+  ) {
+    return true;
+  }
+
+  const text = (element.textContent || "").trim();
+  return ["«", "»", "‹", "›"].includes(text);
+}
+
 function isValidCSSSelector(selector) {
   try {
     document.querySelector(selector);
@@ -940,6 +1023,10 @@ function isInteractable(element, hoverStylesMap) {
   }
 
   const tagName = element.tagName.toLowerCase();
+  if (isDatepickerNavigationElement(element)) {
+    return true;
+  }
+
   if (tagName === "html") {
     return false;
   }
@@ -1469,29 +1556,28 @@ function getElementText(element) {
     return element.data.trim();
   }
 
-  const childNodes = element.childNodes;
-  const childNodesLength = childNodes.length;
-
-  // If no child nodes, return empty string directly
-  if (childNodesLength === 0) {
-    return "";
-  }
+  // Web components can render values as bare text nodes directly in an open
+  // shadow root; the Element walker only recurses shadow Element children, so
+  // fold those text nodes here. Direct children only — no <slot>, since
+  // slotted content lives in light DOM.
+  const sources = element.shadowRoot
+    ? [element.childNodes, element.shadowRoot.childNodes]
+    : [element.childNodes];
 
   const visibleText = [];
-  let hasText = false;
-
-  for (let i = 0; i < childNodesLength; i++) {
-    const node = childNodes[i];
-    if (node.nodeType === Node.TEXT_NODE) {
-      const nodeText = node.data.trim();
-      if (nodeText.length > 0) {
-        visibleText.push(nodeText);
-        hasText = true;
+  for (const childNodes of sources) {
+    for (let i = 0; i < childNodes.length; i++) {
+      const node = childNodes[i];
+      if (node.nodeType === Node.TEXT_NODE) {
+        const nodeText = node.data.trim();
+        if (nodeText.length > 0) {
+          visibleText.push(nodeText);
+        }
       }
     }
   }
 
-  return hasText ? visibleText.join(";") : "";
+  return visibleText.length > 0 ? visibleText.join(";") : "";
 }
 
 function getSelectOptions(element) {
@@ -2758,6 +2844,10 @@ if (window.globalDomDepthMap === undefined) {
   window.globalDomDepthMap = new Map();
 }
 
+if (window.globalParsedElementCounter === undefined) {
+  window.globalParsedElementCounter = new SafeCounter();
+}
+
 function isClassNameIncludesHidden(className) {
   // some hidden elements are with the classname like `class="select-items select-hide"` or `class="dropdown-container dropdown-invisible"`
   return (
@@ -3000,8 +3090,10 @@ async function stopGlobalIncrementalObserver() {
 async function getIncrementElements(wait_until_finished = true) {
   if (wait_until_finished) {
     while (
+      window.globalParsedElementCounter &&
+      window.globalOneTimeIncrementElements &&
       (await window.globalParsedElementCounter.get()) <
-      window.globalOneTimeIncrementElements.length
+        window.globalOneTimeIncrementElements.length
     ) {
       await asyncSleepFor(100);
     }

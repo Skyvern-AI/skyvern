@@ -151,7 +151,8 @@ async def test_rename_happens_before_s3_upload(setup, tmp_path):
     refs = setup(
         get_side_effect=[[], ["invoice.pdf"]],
         save_side_effect=track_save,
-        list_files_side_effect=[[], [fake_file], [fake_file]],  # before, local verify, rename
+        # before, local verify, rename local_files_after, existing_names dedup lookup
+        list_files_side_effect=[[], [fake_file], [fake_file], [fake_file]],
         rename_mock=rename_mock,
     )
     try:
@@ -174,7 +175,8 @@ async def test_download_suffix_rename_uses_file_path_directly(setup, tmp_path):
     rename_mock = MagicMock(return_value=str(download_dir / "invoice.pdf"))
     refs = setup(
         get_side_effect=[[], ["invoice.pdf"]],
-        list_files_side_effect=[[], [abs_path], [abs_path]],  # before, local verify, rename
+        # before, local verify, rename local_files_after, existing_names dedup lookup
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
         rename_mock=rename_mock,
     )
     try:
@@ -373,7 +375,8 @@ async def test_rename_skips_crdownload_files(setup, tmp_path):
     rename_mock = MagicMock(return_value=str(download_dir / "renamed.pdf"))
     refs = setup(
         get_side_effect=[[], ["invoice.pdf"]],
-        list_files_side_effect=[[], [incomplete, complete], [incomplete, complete]],  # before, local verify, rename
+        # before, local verify, rename local_files_after, existing_names dedup lookup
+        list_files_side_effect=[[], [incomplete, complete], [incomplete, complete], [incomplete, complete]],
         rename_mock=rename_mock,
     )
     try:
@@ -398,7 +401,8 @@ async def test_rename_handles_name_collision(setup, tmp_path):
     rename_mock = MagicMock(return_value=str(download_dir / "invoice_1.pdf"))
     refs = setup(
         get_side_effect=[[], ["invoice_1.pdf"]],
-        list_files_side_effect=[[], [new_file], [new_file]],  # before, local verify, rename
+        # before, local verify, rename local_files_after, existing_names dedup lookup (already has invoice.pdf)
+        list_files_side_effect=[[], [new_file], [new_file], [new_file, str(download_dir / "invoice.pdf")]],
         rename_mock=rename_mock,
     )
     try:
