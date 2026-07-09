@@ -1,13 +1,11 @@
-import { useState } from "react";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { Status, type ActionsApiResponse } from "@/api/types";
+import { Status } from "@/api/types";
 import { CopyButton } from "@/components/CopyButton";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
 import {
   Tooltip,
   TooltipContent,
@@ -19,7 +17,6 @@ import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
 import { WorkflowBlockIcon } from "@/routes/workflows/editor/nodes/WorkflowBlockIcon";
 import { cn } from "@/util/utils";
 import {
-  isAction,
   type ObserverThought,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
@@ -320,51 +317,6 @@ function GoalText({ text }: { text: string | null | undefined }) {
   );
 }
 
-function BlockActionList({
-  block,
-  activeItem,
-  onActionSelect,
-}: {
-  block: WorkflowRunBlock;
-  activeItem: WorkflowRunOverviewActiveElement;
-  onActionSelect?: (payload: {
-    block: WorkflowRunBlock;
-    action: ActionsApiResponse;
-  }) => void;
-}) {
-  const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
-  const actions = block.actions ?? [];
-  const actionsTopDown = [...actions].reverse();
-  if (actions.length === 0) return null;
-  return (
-    <Section title={`Actions (${actions.length})`}>
-      <div className="space-y-2">
-        {actionsTopDown.map((action, index) => {
-          const isActive =
-            isAction(activeItem) && activeItem.action_id === action.action_id;
-          return (
-            <ActionCardCompact
-              key={action.action_id}
-              action={action}
-              active={isActive}
-              index={index + 1}
-              expanded={expandedActionId === action.action_id}
-              onToggleExpanded={() => {
-                setExpandedActionId((prev) =>
-                  prev === action.action_id ? null : action.action_id,
-                );
-              }}
-              onSelect={() => {
-                onActionSelect?.({ block, action });
-              }}
-            />
-          );
-        })}
-      </div>
-    </Section>
-  );
-}
-
 function BlockThoughtList({
   thoughts,
   activeItem,
@@ -400,7 +352,6 @@ function BlockThoughtList({
 }
 
 export {
-  BlockActionList,
   BlockDetailFailure,
   BlockDetailHeader,
   BlockDetailHeaderSkeleton,
