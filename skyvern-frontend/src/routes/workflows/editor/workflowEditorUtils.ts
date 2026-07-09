@@ -232,6 +232,9 @@ function serializeLoopNodeWhileBranchToYAML(
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
+// Mirrors the backend settings.WORKFLOW_WAIT_BLOCK_MAX_SEC (30 minutes).
+const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
+
 function serializeSecretResponsePaths(
   secretResponsePaths: Array<string>,
 ): Array<string> | null {
@@ -914,7 +917,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
-          dataSchema: "null",
         },
       };
     }
@@ -4782,6 +4784,17 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
     if (!isNumber) {
       errors.push(`${node.data.label}: Invalid input for wait time.`);
+      return;
+    }
+
+    // Mirror the backend bounds (InvalidWaitBlockTime rejects <= 0 or
+    // > WORKFLOW_WAIT_BLOCK_MAX_SEC) so a save fails fast instead of passing
+    // validation and then erroring at run time.
+    const waitSeconds = Number(waitTimeString);
+    if (waitSeconds < 1 || waitSeconds > WORKFLOW_WAIT_BLOCK_MAX_SEC) {
+      errors.push(
+        `${node.data.label}: Wait time must be between 1 and ${WORKFLOW_WAIT_BLOCK_MAX_SEC} seconds.`,
+      );
     }
   });
 

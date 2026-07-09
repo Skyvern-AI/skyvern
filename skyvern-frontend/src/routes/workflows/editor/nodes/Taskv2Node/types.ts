@@ -12,7 +12,6 @@ export type Taskv2NodeData = NodeBaseData & {
   totpIdentifier: string | null;
   maxSteps: number | null;
   disableCache: boolean;
-  maxScreenshotScrolls: number | null;
 };
 
 export type Taskv2Node = Node<Taskv2NodeData, "taskv2">;
@@ -29,7 +28,6 @@ export const taskv2NodeDefaultData: Taskv2NodeData = {
   maxSteps: MAX_STEPS_DEFAULT,
   disableCache: false,
   model: null,
-  maxScreenshotScrolls: null,
   ignoreWorkflowSystemPrompt: false,
 };
 
