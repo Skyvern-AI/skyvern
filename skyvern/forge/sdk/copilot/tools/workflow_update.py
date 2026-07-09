@@ -1848,6 +1848,8 @@ class _RuntimeOutputRepairContract:
     required_paths: set[str]
     facts: list[dict[str, Any]]
     workflow_run_id: str
+    owner_labels: list[str]
+    owner_labels_by_path: dict[str, list[str]]
     source: str = "runtime_output_repair"
     reason_code: str = "runtime_output_repair_required"
 
@@ -2145,6 +2147,8 @@ def _runtime_output_contract_signature(runtime_contract: _RuntimeOutputRepairCon
     payload = {
         "workflow_run_id": runtime_contract.workflow_run_id,
         "required_paths": sorted(runtime_contract.required_paths),
+        "owner_labels": runtime_contract.owner_labels,
+        "owner_labels_by_path": runtime_contract.owner_labels_by_path,
         "facts": runtime_contract.facts,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -2199,6 +2203,35 @@ def _target_output_contract_block_label(
     raw_code_artifact_metadata: object,
     required_paths: set[str],
 ) -> tuple[str, list[str]]:
+    runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
+    if runtime_contract is not None:
+        code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+        runtime_owner_labels: set[str] = set()
+        missing_owner = False
+        ambiguous_owner = False
+        for path in sorted(runtime_contract.required_paths):
+            raw_path_owners = sorted(runtime_contract.owner_labels_by_path.get(path, []))
+            path_owner_labels = sorted(label for label in raw_path_owners if label in code_blocks)
+            # Ambiguity is judged before filtering: dropping stale labels must not resolve a
+            # contested path down to a lone survivor.
+            if len(raw_path_owners) > 1:
+                ambiguous_owner = True
+                runtime_owner_labels.update(path_owner_labels)
+                continue
+            if len(path_owner_labels) != 1:
+                missing_owner = missing_owner or not path_owner_labels
+                runtime_owner_labels.update(path_owner_labels)
+                continue
+            runtime_owner_labels.add(path_owner_labels[0])
+        if missing_owner:
+            return "", []
+        current_owner_labels = sorted(runtime_owner_labels)
+        if ambiguous_owner:
+            return "", current_owner_labels
+        if len(current_owner_labels) == 1:
+            _pin_output_contract_block_label(ctx, workflow_yaml, required_paths, current_owner_labels[0])
+            return current_owner_labels[0], current_owner_labels
+        return "", current_owner_labels
     pinned_label = _pinned_output_contract_block_label(ctx, workflow_yaml, required_paths)
     if pinned_label:
         return pinned_label, [pinned_label]
@@ -2226,7 +2259,8 @@ def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> 
         return None
     facts: list[dict[str, Any]] = []
     required_paths: set[str] = set()
-    block_labels: set[str] = set()
+    owner_labels: set[str] = set()
+    owner_labels_by_path: dict[str, set[str]] = {}
     for raw_fact in outcome.runtime_output_repair_facts:
         if not isinstance(raw_fact, Mapping):
             return None
@@ -2238,17 +2272,24 @@ def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> 
         fact = dict(raw_fact)
         fact["output_path"] = path
         fact["output_root"] = _output_path_root(path)
+        path_owner_labels = owner_labels_by_path.setdefault(path, set())
+        raw_owner_labels = fact.get("owner_labels")
+        if isinstance(raw_owner_labels, list):
+            path_owner_labels.update(str(label).strip() for label in raw_owner_labels if str(label).strip())
         label = str(fact.get("block_label") or "").strip()
         if label:
-            block_labels.add(label)
+            path_owner_labels.add(label)
+        owner_labels.update(path_owner_labels)
         required_paths.add(path)
         facts.append(fact)
-    if not facts or not required_paths or len(block_labels) > 1:
+    if not facts or not required_paths:
         return None
     return _RuntimeOutputRepairContract(
         required_paths=required_paths,
         facts=sorted(facts, key=lambda item: str(item.get("output_path") or "")),
         workflow_run_id=outcome.workflow_run_id,
+        owner_labels=sorted(owner_labels),
+        owner_labels_by_path={path: sorted(labels) for path, labels in sorted(owner_labels_by_path.items())},
     )
 
 
