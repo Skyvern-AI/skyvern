@@ -1073,6 +1073,8 @@ def build_artifact_metadata_skeleton(
                 "text": _FILL_CRITERION_TEXT,
                 "level": "terminal",
                 "terminal": True,
+                "judgment_predicate": None,
+                "judgment_polarity_when_holds": None,
             }
         ],
         "terminal_verifier_expectations": [
@@ -1095,6 +1097,21 @@ def trajectory_has_credential_fill(trajectory: Sequence[Mapping[str, Any]]) -> b
         if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
             continue
         if str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS:
+            return True
+    return False
+
+
+def trajectory_has_browser_fill_interaction(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    for interaction in trajectory:
+        tool_name = str(interaction.get("tool_name") or "")
+        typed_length = interaction.get("typed_length")
+        if tool_name == "type_text" and (
+            (isinstance(typed_length, int) and typed_length > 0) or str(interaction.get("typed_value") or "").strip()
+        ):
+            return True
+        if tool_name == "select_option" and str(interaction.get("value") or "").strip():
+            return True
+        if tool_name == CREDENTIAL_FILL_TOOL_NAME and str(interaction.get("credential_field") or "").strip():
             return True
     return False
 

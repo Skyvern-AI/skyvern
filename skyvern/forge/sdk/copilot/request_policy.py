@@ -203,6 +203,8 @@ RequestedOutputEvidenceSource = Literal[
     "registered_output_parameter",
     "registered_artifact_content",
 ]
+JudgmentPredicate = Literal["login_gate_blocks_target"]
+_JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
@@ -230,8 +232,11 @@ _OUTPUT_NEGATED_INTENT_PREFIX_RE = re.compile(
 )
 _OUTPUT_EXPLICIT_FIELD_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OUTPUT_NAMED_FIELD_RE = re.compile(
-    r"\b(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+"
-    r"(?:named|called)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+    r"\b(?:"
+    r"(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+(?:named|called)"
+    r"|(?:requested[-\s]+)?output\s+(?:named|called)"
+    r"|named\s+(?:requested[-\s]+)?output"
+    r")\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
     re.I,
 )
 _OUTPUT_ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,10}\b")
@@ -252,6 +257,15 @@ _OUTPUT_INPUT_ONLY_WORDS = frozenset({"input", "inputs", "parameter", "parameter
 _OUTPUT_OUTCOME_WORDS = frozenset(
     "capture captured extract extracted final include included includes output read record result return returned".split()
 )
+
+
+@dataclass(frozen=True)
+class JudgmentTruthCondition:
+    """Per-polarity page-evidence predicate a judgment boolean is decidable by. ``polarity_when_holds``
+    is the emitted boolean value that corresponds to the predicate holding on the independent packet."""
+
+    predicate: JudgmentPredicate
+    polarity_when_holds: bool
 
 
 @dataclass(frozen=True)
@@ -276,6 +290,7 @@ class CompletionCriterion:
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
     mint_degrade: Literal["turn_unsatisfiable_fallback"] | None = None
+    judgment_truth_condition: JudgmentTruthCondition | None = None
 
 
 @dataclass
@@ -445,6 +460,12 @@ def typed_expected_output_value_key(value: ExpectedOutputValue | None) -> str:
     if isinstance(value, str):
         return f"str:{value}"
     return ""
+
+
+def judgment_truth_condition_key(condition: JudgmentTruthCondition | None) -> str:
+    if condition is None:
+        return ""
+    return f"{condition.predicate}:{'t' if condition.polarity_when_holds else 'f'}"
 
 
 def _criterion_grounding_mode(
@@ -684,6 +705,14 @@ def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
     return None
 
 
+def _coerce_judgment_truth_condition(predicate: Any, polarity: Any) -> JudgmentTruthCondition | None:
+    if not isinstance(predicate, str) or predicate not in _JUDGMENT_PREDICATES:
+        return None
+    if not isinstance(polarity, bool):
+        return None
+    return JudgmentTruthCondition(predicate=cast(JudgmentPredicate, predicate), polarity_when_holds=polarity)
+
+
 def _coerce_requested_output_evidence_source(value: Any) -> RequestedOutputEvidenceSource:
     if isinstance(value, str) and value in _REQUESTED_OUTPUT_EVIDENCE_SOURCES:
         return cast(RequestedOutputEvidenceSource, value)
@@ -805,6 +834,9 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             coerced_judgment_bool = _canonical_bool_string(expected_output_value)
             if coerced_judgment_bool is not None:
                 expected_output_value = coerced_judgment_bool
+        judgment_truth_condition = _coerce_judgment_truth_condition(
+            item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
+        )
         contingent_on_raw = item.get("contingent_on")
         contingent_on = (
             " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
@@ -844,6 +876,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             typed_expected_output_value_key(expected_output_value),
             expected_output_shape or "",
             requested_output_evidence_source,
+            judgment_truth_condition_key(judgment_truth_condition),
         )
         if key in seen:
             continue
@@ -869,8 +902,17 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
+                judgment_truth_condition=judgment_truth_condition,
             )
         )
+        if judgment_truth_condition is not None:
+            LOG.info(
+                "copilot_judgment_truth_condition_minted",
+                mint_source="classifier",
+                predicate=judgment_truth_condition.predicate,
+                polarity_when_holds=judgment_truth_condition.polarity_when_holds,
+                criterion_id=criteria[-1].id,
+            )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
             break
     return criteria
@@ -978,6 +1020,7 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not candidate:
         return None
 
+    candidate = _normalize_named_output_field_delimiter(candidate)
     named_field = _OUTPUT_NAMED_FIELD_RE.search(candidate)
     if named_field is not None:
         return named_field.group(1)
@@ -1049,6 +1092,27 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not phrase_words:
         return None
     return " ".join(phrase_words)
+
+
+def _normalize_named_output_field_delimiter(candidate: str) -> str:
+    lowered = candidate.casefold()
+    for anchor in (" named", " called"):
+        token_start = lowered.find(anchor)
+        if token_start == -1:
+            continue
+        token_start += len(anchor)
+        while token_start < len(candidate) and candidate[token_start].isspace():
+            token_start += 1
+        if token_start >= len(candidate) or candidate[token_start] not in "'\"`":
+            continue
+        quote = candidate[token_start]
+        token_end = candidate.find(quote, token_start + 1)
+        if token_end == -1:
+            continue
+        field_name = candidate[token_start + 1 : token_end]
+        if _OUTPUT_EXPLICIT_FIELD_KEY_RE.fullmatch(field_name):
+            return f"{candidate[:token_start]}{field_name}{candidate[token_end + 1 :]}"
+    return candidate
 
 
 def _matched_alias_phrase(candidate: str, alias_key: str) -> str | None:
@@ -1206,6 +1270,23 @@ def _requested_output_evidence_sources_from_criteria(
         _field_name, output_path, _field_label = requested_specs[0]
         sources.setdefault(output_path, eligible_source_criteria[0].requested_output_evidence_source)
     return sources
+
+
+def _requested_output_judgment_conditions_from_criteria(
+    criteria: list[CompletionCriterion],
+    requested_specs: list[tuple[str, str, str]],
+) -> dict[str, JudgmentTruthCondition]:
+    conditions: dict[str, JudgmentTruthCondition] = {}
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated or criterion.judgment_truth_condition is None:
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path != output_path and not _criterion_text_covers_requested_output(
+                criterion, field_name
+            ):
+                continue
+            conditions.setdefault(output_path, criterion.judgment_truth_condition)
+    return conditions
 
 
 def _requested_output_criterion_id(output_path: str) -> str:
@@ -1429,6 +1510,9 @@ def _apply_requested_output_completion_criteria(
     source_by_output_path = _requested_output_evidence_sources_from_criteria(
         policy.completion_criteria, requested_specs
     )
+    judgment_condition_by_output_path = _requested_output_judgment_conditions_from_criteria(
+        policy.completion_criteria, requested_specs
+    )
 
     metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
     for criterion in policy.completion_criteria:
@@ -1477,6 +1561,7 @@ def _apply_requested_output_completion_criteria(
             contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
             contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
             deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+            judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
         )
         for _field_name, output_path, field_label in requested_specs
     ]
@@ -1571,6 +1656,9 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["expected_output_shape"] = criterion.expected_output_shape
         if criterion.requested_output_evidence_source != "runtime_output":
             item["requested_output_evidence_source"] = criterion.requested_output_evidence_source
+        if criterion.judgment_truth_condition is not None:
+            item["judgment_predicate"] = criterion.judgment_truth_condition.predicate
+            item["judgment_polarity_when_holds"] = criterion.judgment_truth_condition.polarity_when_holds
         if criterion.classification_output_key:
             item["classification_output_key"] = criterion.classification_output_key
         if criterion.expected_classification is not None:

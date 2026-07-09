@@ -60,6 +60,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _MAX_COMPLETION_CRITERIA,
@@ -90,12 +95,14 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
 )
 from skyvern.forge.sdk.copilot.turn_intent import (
+    RequiredContextKey,
     TurnIntent,
     TurnIntentAuthority,
     TurnIntentMode,
     TurnIntentReasonCode,
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -1640,7 +1647,6 @@ class TestRequestPolicyInputGuardrail:
             request_policy_handler=request_policy_handler,
             turn_intent_handler=turn_intent_handler,
         )
-
         guardrails = agent_module._build_copilot_input_guardrails(
             InputGuardrail,
             GuardrailFunctionOutput,
@@ -1883,6 +1889,30 @@ def _chat_request() -> SimpleNamespace:
         workflow_permanent_id="wfp-1",
         workflow_copilot_chat_id="chat-1",
         workflow_yaml="",
+    )
+
+
+def _browser_actuation_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        required_context=[RequiredContextKey.BROWSER_STATE],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+
+def _unknown_browser_actuation_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.UNKNOWN,
+        required_context=[RequiredContextKey.BROWSER_STATE],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+
+def _browser_actuation_intent_without_browser_state(*, mode: TurnIntentMode) -> TurnIntent:
+    return TurnIntent(
+        mode=mode,
+        required_context=[],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
     )
 
 
@@ -2267,6 +2297,69 @@ class TestTranslateToAgentResultGating:
 
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
+
+    def test_actuation_required_reply_without_browser_mutation_returns_steer(self) -> None:
+        ctx = _ctx(turn_intent=_browser_actuation_intent())
+        result = _fake_run_result({"type": "REPLY", "user_response": "I can fill those fields for you."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.turn_outcome is not None
+        assert agent_result.turn_outcome.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+        assert agent_result.turn_outcome.actuation_obligation_key == ACTUATION_OBLIGATION_BROWSER_ACTION_KEY
+
+    def test_repeated_actuation_required_reply_without_browser_mutation_returns_terminal(self) -> None:
+        ctx = _ctx(
+            turn_intent=_browser_actuation_intent(),
+            prior_turn_outcome=TurnOutcome(
+                response_kind=ResponseKind.CLARIFY,
+                reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+                actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I can fill those fields for you."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.updated_workflow is None
+        assert agent_result.turn_outcome is not None
+        assert agent_result.turn_outcome.reason_code == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        assert agent_result.turn_outcome.terminal_reason == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        assert agent_result.turn_outcome.actuation_obligation_key == ACTUATION_OBLIGATION_BROWSER_ACTION_KEY
+
+    def test_unknown_click_with_authority_denied_blocker_returns_reply(self) -> None:
+        ctx = _ctx(turn_intent=_unknown_browser_actuation_intent())
+        ctx.scout_trajectory.append({"tool_name": "click"})
+        ctx.blocker_signal = CopilotToolBlockerSignal(
+            blocker_kind="authority_denied",
+            agent_steering_text="Use browser tools.",
+            user_facing_reason="I'll respond with the information I already have.",
+            recovery_hint="report_blocker_to_user",
+            internal_reason_code="turn_intent_no_mutation_run_blocked",
+            blocked_tool="update_and_run_blocks",
+            classifier_mode="unknown",
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I'll respond with the information I have."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.turn_outcome is not None
+        assert agent_result.turn_outcome.reason_code != ACTUATION_OBLIGATION_STEER_REASON_CODE
 
     def test_verified_terminal_state_surfaces_workflow_despite_weak_final_reply(self) -> None:
         workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))

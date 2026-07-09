@@ -525,6 +525,7 @@ def _advisory_ctx() -> SimpleNamespace:
         recorded_build_test_outcome_history=[],
         scouted_output_covered_paths=set(),
         composition_page_evidence=None,
+        recorded_outcome_binding_constraint=None,
     )
 
 

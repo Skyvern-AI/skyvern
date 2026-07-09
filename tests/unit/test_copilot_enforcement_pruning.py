@@ -65,7 +65,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     OutputContractAdvisoryState,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
 from skyvern.forge.sdk.copilot.tools import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
@@ -75,7 +75,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_workflow_update_result,
 )
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit.conftest import make_copilot_context
 
@@ -128,6 +128,7 @@ class _Ctx:
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
         self.author_time_gate_ablation_events = []
+        self.request_policy = None
 
 
 class TestSynthesizedOfferPersistenceGate:
@@ -339,6 +340,185 @@ class TestSynthesizedOfferPersistenceGate:
         assert signal.blocked_tool == "click"
         assert signal.cleared_by_tools == frozenset({"update_and_run_blocks"})
         assert signal.renders_final_reply is False
+
+    def test_actuation_obligation_admits_required_fill_tool_during_persistence_offer(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="form-submit",
+                    outcome="form fields are filled",
+                    kind="terminal_action",
+                    terminal_action_family="form",
+                )
+            ],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+        click_signal = synthesized_block_persistence_signal(ctx, "click")
+        assert isinstance(click_signal, CopilotToolBlockerSignal)
+        assert click_signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_actuation_obligation_admits_required_fill_tool_for_method_mandated_run_contract(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="visible-fill",
+                    outcome="fields are visibly filled on the live page",
+                    method_mandated=True,
+                    level="run",
+                )
+            ],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+        click_signal = synthesized_block_persistence_signal(ctx, "click")
+        assert isinstance(click_signal, CopilotToolBlockerSignal)
+        assert click_signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_actuation_obligation_blocks_type_text_for_definition_method_contract(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="definition-contract",
+                    outcome="inputs are reusable",
+                    method_mandated=True,
+                    level="definition",
+                )
+            ],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        signal = synthesized_block_persistence_signal(ctx, "type_text")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_actuation_obligation_admits_required_fill_tool_after_turn_state_reconcile(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="form-submit",
+                    outcome="form fields are filled",
+                    kind="terminal_action",
+                    terminal_action_family="form",
+                )
+            ],
+        )
+        ctx.completion_criteria_turn_state = SimpleNamespace(
+            decision=SimpleNamespace(
+                criteria=(
+                    CompletionCriterion(
+                        id="workflow-run",
+                        outcome="workflow has been tested",
+                        kind="terminal_action",
+                        terminal_action_family="workflow_run",
+                    ),
+                )
+            )
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 2
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "button.start", "accessible_name": "Start"},
+            {"tool_name": "type_text", "selector": "#company", "accessible_name": "Company"},
+        ]
+
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+
+    def test_persistence_offer_blocks_type_text_without_actuation_obligation(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        signal = synthesized_block_persistence_signal(ctx, "type_text")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+        assert signal.blocked_tool == "type_text"
+
+    def test_actuation_obligation_admits_required_fill_tool_from_fill_trajectory(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#company",
+                "typed_value": "Example Realty Labs Inc",
+                "accessible_name": "Company",
+            }
+        ]
+
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+
+    def test_fill_less_trajectory_does_not_arm_actuation_obligation(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        signal = synthesized_block_persistence_signal(ctx, "type_text")
+
+        assert isinstance(signal, CopilotToolBlockerSignal)
+        assert signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
 
     def test_prerun_ambiguous_bare_selector_repair_allows_one_evaluate(self) -> None:
         ctx = _Ctx()

@@ -8,6 +8,7 @@ import {
   memo,
 } from "react";
 import { getClient } from "@/api/AxiosClient";
+import { ActionsApiResponse, getReadableActionType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
 import {
@@ -24,6 +25,10 @@ import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import {
+  isBlockItem,
+  WorkflowRunTimelineItem,
+} from "@/routes/workflows/types/workflowRunTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
 import {
@@ -61,8 +66,10 @@ import { NarrativeView } from "./NarrativeView";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
 import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import {
+  CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
   NarrativeEvent,
+  RecordedActionSummary,
   TurnNarrativeState,
   applyNarrativeEvent,
   hydrateHistoryNarrative,
@@ -72,6 +79,8 @@ import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
+import { useFeatureFlagEnabled } from "posthog-js/react";
+import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -83,6 +92,60 @@ import { cn } from "@/util/utils";
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
+
+function normalizeInline(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function recordedActionDurationMs(action: ActionsApiResponse): number | null {
+  const output = action.output;
+  if (!output || typeof output !== "object" || Array.isArray(output)) {
+    return null;
+  }
+  const durationMs = (output as Record<string, unknown>).duration_ms;
+  return typeof durationMs === "number" ? durationMs : null;
+}
+
+function toRecordedActionSummary(
+  action: ActionsApiResponse,
+): RecordedActionSummary {
+  return {
+    actionId: action.action_id,
+    label: getReadableActionType(action.action_type),
+    summary:
+      normalizeInline(action.reasoning) ??
+      normalizeInline(action.text) ??
+      normalizeInline(action.response) ??
+      normalizeInline(action.description),
+    durationMs: recordedActionDurationMs(action),
+    failed: action.status === "failed",
+  };
+}
+
+// Timeline items nest branch/loop children; walk the whole tree so a
+// conditional or loop body's blocks are not missed.
+function collectTimelineBlockActions(
+  items: ReadonlyArray<WorkflowRunTimelineItem>,
+): Array<{ workflowRunBlockId: string; actions: ActionsApiResponse[] }> {
+  const out: Array<{
+    workflowRunBlockId: string;
+    actions: ActionsApiResponse[];
+  }> = [];
+  for (const item of items) {
+    if (isBlockItem(item)) {
+      out.push({
+        workflowRunBlockId: item.block.workflow_run_block_id,
+        actions: item.block.actions ?? [],
+      });
+    }
+    if (item.children.length > 0) {
+      out.push(...collectTimelineBlockActions(item.children));
+    }
+  }
+  return out;
+}
 
 type ComposerDefaultVariant =
   | "build"
@@ -448,6 +511,8 @@ export function WorkflowCopilotChat({
   const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
   const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
   const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
+  // Client-side PostHog eval (not the backend-served flags above).
+  const copilotUxV1Enabled = useFeatureFlagEnabled(COPILOT_UX_V1_FLAG) ?? false;
   const copilotV2Enabled = copilotV2Flag === true;
   const codeBlockModeEnabled =
     codeBlockModeFlag === true && codeBlockAccessFlag === true;
@@ -559,6 +624,10 @@ export function WorkflowCopilotChat({
   // Most recent turn_id observed via turn_start; used by Reject and by
   // legacy error frames that don't carry a turn_id.
   const latestTurnId = useRef<string | null>(null);
+  // One-shot guard for the recorded-actions timeline fetch, keyed by
+  // workflow_run_id — a run's evaluating and final verdict frames share an
+  // id, so this stops the same run from being fetched twice.
+  const fetchedActionRunIds = useRef<Set<string>>(new Set());
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -602,6 +671,71 @@ export function WorkflowCopilotChat({
   // The studio focuses a run via ?wr= (not a path param), so the route param is
   // empty there; an explicit prop grounds the chat in that run and wins.
   const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
+  // Recorded actions arrive well after block_progress (they're persisted in
+  // batch at block end), so fetch them once a run reaches adjudication
+  // instead of waiting on the narrower block_progress/tool-call cadence.
+  const maybeFetchRecordedActions = useCallback(
+    async (payload: WorkflowCopilotRunOutcomeUpdate) => {
+      if (!copilotUxV1Enabled) return;
+      const runId = payload.workflow_run_id;
+      if (
+        !runId ||
+        !workflowPermanentId ||
+        fetchedActionRunIds.current.has(runId)
+      ) {
+        return;
+      }
+      const seen = fetchedActionRunIds.current;
+      seen.add(runId);
+      while (seen.size > MAX_TURN_SNAPSHOTS) {
+        const oldest = seen.values().next().value;
+        if (oldest === undefined) break;
+        seen.delete(oldest);
+      }
+      try {
+        const client = await getClient(credentialGetter);
+        const response = await client.get<WorkflowRunTimelineItem[]>(
+          `/workflows/${workflowPermanentId}/runs/${runId}/timeline`,
+        );
+        const blocks = collectTimelineBlockActions(response.data ?? [])
+          .filter((entry) => entry.actions.length > 0)
+          .map((entry) => ({
+            workflowRunBlockId: entry.workflowRunBlockId,
+            // The API returns actions newest-first; replay must run oldest-first.
+            actions: [...entry.actions].reverse().map(toRecordedActionSummary),
+          }));
+        if (blocks.length === 0) return;
+        const event: CopilotBlockActionsEvent = {
+          type: "client_block_actions",
+          blocks,
+          receivedAtMs: Date.now(),
+        };
+        applyStoredNarrativeEvent(event);
+        // The fetch can resolve after the terminal response already froze a
+        // snapshot into an AI message; patch it in place instead of
+        // delaying the terminal render on this network call.
+        setMessages((prev) =>
+          prev.map((message) => {
+            if (!message.narrative) return message;
+            const next = applyNarrativeEvent(message.narrative, event);
+            return next === message.narrative
+              ? message
+              : { ...message, narrative: next };
+          }),
+        );
+      } catch (error) {
+        // Best-effort enrichment — the card already shows the real run
+        // outcome without a recorded-action replay if this fails.
+        console.error("Failed to fetch recorded actions:", error);
+      }
+    },
+    [
+      applyStoredNarrativeEvent,
+      copilotUxV1Enabled,
+      credentialGetter,
+      workflowPermanentId,
+    ],
+  );
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -1596,8 +1730,11 @@ export function WorkflowCopilotChat({
               case "tool_result":
               case "narration":
               case "block_progress":
+                applyStoredNarrativeEvent(payload);
+                return false;
               case "run_outcome":
                 applyStoredNarrativeEvent(payload);
+                maybeFetchRecordedActions(payload);
                 return false;
               case "turn_start": {
                 // Move the pre-submit canvas snapshot into the per-turn
@@ -1702,6 +1839,7 @@ export function WorkflowCopilotChat({
       isBuild,
       isLiveBrowserReady,
       liveBrowserSessionId,
+      maybeFetchRecordedActions,
       requiresLiveBrowser,
       stopSpeech,
       takeSpeechAudioBlob,
