@@ -21,12 +21,19 @@ from skyvern.forge.sdk.copilot.enforcement import (
     PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
     _response_coverage_nudge,
 )
+from skyvern.forge.sdk.copilot.output_contracts import OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+    ActuationObligationStatus,
+    CannotActReason,
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
     _contains_internal_tool_vocab_leak,
     derive_output_kind,
+    evaluate_actuation_obligation,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
     normalize_response_scaffolding,
@@ -36,7 +43,8 @@ from skyvern.forge.sdk.copilot.tools import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     NATIVE_TOOLS,
 )
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 
 
 def _credential(credential_id: str = "cred_safe", tested_url: str = "https://login.example.test/login") -> object:
@@ -61,6 +69,43 @@ def _ctx(**overrides: object) -> CopilotContext:
     )
     defaults.update(overrides)
     return CopilotContext(**defaults)
+
+
+def _browser_actuation_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        required_context=[RequiredContextKey.BROWSER_STATE],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+
+def _live_fill_policy() -> RequestPolicy:
+    return _policy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="The form is completed.",
+                kind="terminal_action",
+                terminal_action_family="form",
+            )
+        ]
+    )
+
+
+def _unknown_browser_actuation_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.UNKNOWN,
+        required_context=[RequiredContextKey.BROWSER_STATE],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+
+def _browser_actuation_intent_without_browser_state(*, mode: TurnIntentMode) -> TurnIntent:
+    return TurnIntent(
+        mode=mode,
+        required_context=[],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
 
 
 def _fake_run_result(payload: dict) -> SimpleNamespace:
@@ -1382,6 +1427,384 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
         "contained_failure": True,
         "final_output_policy_allowed": False,
     }
+
+
+def test_actuation_obligation_steers_zero_action_informational_reply() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=None,
+    )
+
+    assert evaluation.status == ActuationObligationStatus.STEER
+    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+
+def test_actuation_obligation_steers_unknown_browser_only_intent() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_unknown_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=None,
+    )
+
+    assert evaluation.status == ActuationObligationStatus.STEER
+    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+
+def test_actuation_obligation_allows_typed_cannot_act_reason() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=CannotActReason.MISSING_FIELD_VALUE,
+        prior_turn_outcome=None,
+    )
+
+    assert evaluation.status == ActuationObligationStatus.ALLOWED
+    assert evaluation.cannot_act_reason == CannotActReason.MISSING_FIELD_VALUE
+
+
+def test_actuation_obligation_repeats_as_terminal() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+            actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+        ),
+    )
+
+    assert evaluation.status == ActuationObligationStatus.TERMINAL
+    assert evaluation.reason_code == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+
+
+def test_actuation_obligation_prior_unmet_stays_terminal() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            reason_code=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+            terminal_reason=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+            actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+        ),
+    )
+
+    assert evaluation.status == ActuationObligationStatus.TERMINAL
+    assert evaluation.reason_code == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+
+
+def test_actuation_obligation_unrelated_prior_steer_stays_recoverable() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+            actuation_obligation_key="other",
+        ),
+    )
+
+    assert evaluation.status == ActuationObligationStatus.STEER
+    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+
+@pytest.mark.parametrize("mode", [TurnIntentMode.DOCS_ANSWER, TurnIntentMode.DIAGNOSE])
+def test_actuation_obligation_allows_non_actuation_intents(mode: TurnIntentMode) -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=TurnIntent(mode=mode, authority=TurnIntentAuthority(may_update_workflow=False)),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=None,
+    )
+
+    assert evaluation.status == ActuationObligationStatus.ALLOWED
+
+
+def test_sdk_output_guardrail_steers_actuation_required_zero_action_reply() -> None:
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=_browser_actuation_intent(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        successful_mutating_browser_actions=0,
+        cannot_act_reason=None,
+        prior_turn_outcome=None,
+    )
+
+    assert evaluation.status == ActuationObligationStatus.STEER
+    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+
+def test_sdk_output_guardrail_steers_actuation_required_reply() -> None:
+    ctx = _ctx(
+        turn_intent=_browser_actuation_intent(),
+        tool_activity=[{"tool": "evaluate"}, {"tool": "get_browser_screenshot"}],
+    )
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "I can fill those fields for you."},
+    )
+
+    assert response_type == "REPLY"
+    assert not verdict.allowed
+    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_STEER]
+    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
+    assert diagnostics["successful_mutating_browser_actions"] == 0
+    assert diagnostics.get("deferred_to_recycle", False) is False
+
+
+@pytest.mark.asyncio
+async def test_sdk_output_guardrail_trips_actuation_steer() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent())
+    output_guardrails = agent_module._build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
+    result = await output_guardrails[0].run(
+        RunContextWrapper(context=ctx),
+        SimpleNamespace(),
+        {"type": "REPLY", "user_response": "I can fill those fields for you."},
+    )
+
+    assert result.output.tripwire_triggered is True
+    assert result.output.output_info["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+
+def test_sdk_output_guardrail_repeated_actuation_steer_terminalizes() -> None:
+    ctx = _ctx(
+        turn_intent=_browser_actuation_intent(),
+        prior_turn_outcome=TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+            actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+        ),
+    )
+    output = {"type": "REPLY", "user_response": "I can fill those fields for you."}
+
+    verdict, _, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, output)
+
+    assert not verdict.allowed
+    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_UNMET]
+    assert diagnostics["actuation_obligation_status"] == ActuationObligationStatus.TERMINAL.value
+    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+
+
+def test_sdk_output_guardrail_rejects_uncorroborated_model_typed_cannot_act_reason() -> None:
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        _ctx(turn_intent=_browser_actuation_intent()),
+        {
+            "type": "REPLY",
+            "user_response": "I need the field value before I can continue.",
+            "cannot_act_reason": "missing_field_value",
+        },
+    )
+
+    assert response_type == "REPLY"
+    assert not verdict.allowed
+    assert diagnostics["cannot_act_reason"] is None
+    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+
+def test_sdk_output_guardrail_allows_structural_blocker_reason() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent())
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="missing_required_context",
+        agent_steering_text="Ask which field value to use.",
+        user_facing_reason="I need the field value before I can continue.",
+        recovery_hint="ask_user_clarifying",
+    )
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "I need the field value before I can continue."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics["cannot_act_reason"] == "missing_field_value"
+
+
+def test_sdk_output_guardrail_allows_explicit_structural_blocker_reason_code() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent())
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="Report the unavailable output source.",
+        user_facing_reason="The values are not observable on this page.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code=OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+    )
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "The values are not observable on this page."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics["cannot_act_reason"] == "structural_blocker"
+
+
+def test_sdk_output_guardrail_rejects_generic_report_blocker_reason() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent())
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="Report the blocker.",
+        user_facing_reason="The page is not ready.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="tool_error_late_block_running",
+    )
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "The page is not ready."},
+    )
+
+    assert response_type == "REPLY"
+    assert not verdict.allowed
+    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_STEER]
+    assert diagnostics["cannot_act_reason"] is None
+
+
+def test_sdk_output_guardrail_allows_successful_mutating_browser_action() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent())
+    ctx.scout_trajectory.append({"tool_name": "click"})
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "Clicked the field."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics["successful_mutating_browser_actions"] == 1
+
+
+def test_sdk_output_guardrail_rejects_form_fill_click_only_reply() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent(), request_policy=_live_fill_policy())
+    ctx.scout_trajectory.append({"tool_name": "click"})
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "The requested form interaction was completed."},
+    )
+
+    assert response_type == "REPLY"
+    assert not verdict.allowed
+    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_STEER]
+    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
+    assert diagnostics["successful_mutating_browser_actions"] == 1
+    assert diagnostics["successful_durable_browser_fills"] == 0
+    assert diagnostics["durable_fill_required"] is True
+
+
+def test_sdk_output_guardrail_requires_browser_state_for_form_fill_obligation() -> None:
+    ctx = _ctx(
+        turn_intent=_browser_actuation_intent_without_browser_state(mode=TurnIntentMode.BUILD),
+        request_policy=_live_fill_policy(),
+    )
+    ctx.scout_trajectory.append({"tool_name": "click"})
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "The requested form interaction was completed."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics.get("deferred_to_recycle", False) is False
+    assert "durable_fill_required" not in diagnostics
+
+
+def test_sdk_output_guardrail_allows_non_form_click_reply() -> None:
+    ctx = _ctx(
+        turn_intent=_browser_actuation_intent_without_browser_state(mode=TurnIntentMode.UNKNOWN),
+    )
+    ctx.scout_trajectory.append({"tool_name": "click"})
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "Clicked the requested target."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics.get("deferred_to_recycle", False) is False
+    assert "durable_fill_required" not in diagnostics
+
+
+def test_sdk_output_guardrail_allows_live_fill_after_durable_fill() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent(), request_policy=_live_fill_policy())
+    ctx.scout_trajectory.append({"tool_name": "type_text", "typed_length": 3})
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "The requested form interaction was completed."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics.get("deferred_to_recycle", False) is False
+    assert diagnostics["actuation_obligation_status"] == ActuationObligationStatus.ALLOWED.value
+    assert diagnostics["successful_durable_browser_fills"] == 1
+
+
+def test_sdk_output_guardrail_rejects_live_fill_after_noop_type_text() -> None:
+    ctx = _ctx(turn_intent=_browser_actuation_intent(), request_policy=_live_fill_policy())
+    ctx.scout_trajectory.append({"tool_name": "type_text", "typed_length": 0, "typed_value": ""})
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "The requested form interaction was completed."},
+    )
+
+    assert response_type == "REPLY"
+    assert not verdict.allowed
+    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
+    assert diagnostics["successful_durable_browser_fills"] == 0
+    assert diagnostics["durable_fill_required"] is True
+
+
+def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker() -> None:
+    ctx = _ctx(turn_intent=_unknown_browser_actuation_intent())
+    ctx.scout_trajectory.append({"tool_name": "click"})
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Use browser tools.",
+        user_facing_reason="I'll respond with the information I already have.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="turn_intent_no_mutation_run_blocked",
+        blocked_tool="update_and_run_blocks",
+        classifier_mode="unknown",
+    )
+
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        ctx,
+        {"type": "REPLY", "user_response": "I'll respond with the information I already have."},
+    )
+
+    assert response_type == "REPLY"
+    assert verdict.allowed
+    assert diagnostics.get("deferred_to_recycle", False) is False
+    assert diagnostics["actuation_obligation_status"] == ActuationObligationStatus.ALLOWED.value
+    assert diagnostics["cannot_act_reason"] is None
+    assert diagnostics["successful_mutating_browser_actions"] == 1
 
 
 @pytest.mark.parametrize(
