@@ -270,6 +270,9 @@ class WorkflowRunContext:
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
 
+    def get_resolved_credential_parameter_id(self, key: str) -> str | None:
+        return self.resolved_credential_parameter_ids.get(key)
+
     def update_block_metadata(self, label: str, metadata: BlockMetadata) -> None:
         if label in self.blocks_metadata:
             self.blocks_metadata[label].update(metadata)
@@ -641,6 +644,8 @@ class WorkflowRunContext:
         )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
+
+        self.resolved_credential_parameter_ids[parameter.key] = credential_id
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)

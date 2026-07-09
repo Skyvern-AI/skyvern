@@ -1053,16 +1053,104 @@ class WorkflowService:
             if isinstance(parameter, CredentialParameter) and bool(parameter.credential_ids)
         ]
 
+    def _get_run_credential_parameter_overrides(
+        self,
+        *,
+        workflow: Workflow,
+        request_data: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        if not request_data:
+            return {}
+
+        overrides: dict[str, str] = {}
+        for parameter in self._get_rotating_credential_parameters(workflow):
+            if parameter.key not in request_data:
+                continue
+
+            override = request_data[parameter.key]
+            if override is None or override == "":
+                continue
+            if not isinstance(override, str):
+                raise InvalidCredentialId(f"<non-string value of type {type(override).__name__}>")
+
+            credential_ids = parameter.credential_ids or []
+            if override not in credential_ids:
+                raise SkyvernHTTPException(
+                    message=(
+                        f"Credential override for parameter {parameter.key} must be one of the configured "
+                        "rotation credentials."
+                    ),
+                    status_code=400,
+                )
+
+            overrides[parameter.key] = override
+
+        return overrides
+
+    async def _apply_run_credential_parameter_overrides(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization_id: str,
+        request_data: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        overrides = self._get_run_credential_parameter_overrides(
+            workflow=workflow,
+            request_data=request_data,
+        )
+        if not overrides:
+            return {}
+
+        repo = app.DATABASE.workflow_run_credential_selections
+        for parameter_key, credential_id in overrides.items():
+            existing = await repo.get_selection(
+                workflow_run_id=workflow_run.workflow_run_id,
+                parameter_key=parameter_key,
+            )
+            if existing:
+                if existing != credential_id:
+                    raise SkyvernHTTPException(
+                        message=(
+                            f"Credential override for parameter {parameter_key} conflicts with an existing "
+                            "credential selection for this run."
+                        ),
+                        status_code=400,
+                    )
+                continue
+
+            try:
+                await repo.create_selection(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    parameter_key=parameter_key,
+                    credential_id=credential_id,
+                )
+            except IntegrityError:
+                existing = await repo.get_selection(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    parameter_key=parameter_key,
+                )
+                if existing == credential_id:
+                    continue
+                raise
+
+        return overrides
+
     async def _select_rotating_credential_parameters_for_render(
         self,
         *,
         workflow: Workflow,
         workflow_run: WorkflowRun,
         organization_id: str,
+        credential_parameter_overrides: dict[str, str] | None = None,
     ) -> dict[str, str]:
+        selections = dict(credential_parameter_overrides or {})
         try:
-            selections: dict[str, str] = {}
             for parameter in self._get_rotating_credential_parameters(workflow):
+                if parameter.key in selections:
+                    continue
                 credential_ids = parameter.credential_ids
                 if not credential_ids:
                     continue
@@ -1084,7 +1172,7 @@ class WorkflowService:
             )
             if workflow.browser_profile_key:
                 raise
-            return {}
+            return selections
 
     async def validate_schedule_parameters(
         self,
@@ -1403,10 +1491,17 @@ class WorkflowService:
                 )
 
                 parameter_values = {param.key: value for param, value in workflow_parameter_values}
+                run_credential_parameter_overrides = await self._apply_run_credential_parameter_overrides(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization_id=organization.organization_id,
+                    request_data=workflow_request.data,
+                )
                 rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
                     workflow=workflow,
                     workflow_run=workflow_run,
                     organization_id=organization.organization_id,
+                    credential_parameter_overrides=run_credential_parameter_overrides,
                 )
                 parameter_values.update(rotating_credential_selections)
                 workflow_run = await self._prepare_persisted_workflow_browser_profile(
@@ -5563,6 +5658,15 @@ class WorkflowService:
                 },
             )
             if force_browser_session:
+                workflow = await self.get_workflow(workflow_id=workflow_id)
+                # Forced session creation happens before setup_workflow_run persists
+                # run-level credential selections. This validates override inputs
+                # before best-effort profile-key rendering, then setup_workflow_run
+                # persists the same override after the workflow_run_id exists.
+                run_credential_parameter_overrides = self._get_run_credential_parameter_overrides(
+                    workflow=workflow,
+                    request_data=workflow_request.data,
+                )
                 workflow_run = await app.DATABASE.workflow_runs.create_workflow_run(
                     workflow_permanent_id=workflow_permanent_id,
                     workflow_id=workflow_id,
@@ -5600,7 +5704,6 @@ class WorkflowService:
                 effective_proxy_location = workflow_request.proxy_location
                 pin_required = False
                 try:
-                    workflow = await self.get_workflow(workflow_id=workflow_id)
                     # pin_required must be known before any awaited call that can raise, so the
                     # except path never falls through to creating an unprofiled pinned session.
                     effective_proxy_location = (
@@ -5618,6 +5721,7 @@ class WorkflowService:
                         workflow=workflow,
                         workflow_run=workflow_run,
                         organization_id=organization_id,
+                        credential_parameter_overrides=run_credential_parameter_overrides,
                     )
                     forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
                         workflow=workflow,
