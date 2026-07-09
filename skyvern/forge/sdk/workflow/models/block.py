@@ -32,7 +32,7 @@ import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, TemplateSyntaxError, nodes
 from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -10396,6 +10396,10 @@ class WorkflowTriggerBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> Any:
         """Render a single Jinja2 template string, handling the | json filter marker."""
+        credential_id = self._resolve_exact_credential_id_payload_template(value, workflow_run_context)
+        if credential_id is not None:
+            return credential_id
+
         rendered = self.format_block_parameter_template_from_workflow_run_context(
             value, workflow_run_context, env=jinja_json_finalize_strict_env
         )
@@ -10413,6 +10417,46 @@ class WorkflowTriggerBlock(Block):
                 "Remove the surrounding text or remove the '| json' filter.",
             )
         return rendered
+
+    def _resolve_exact_credential_id_payload_template(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+    ) -> str | None:
+        """Preserve raw credential IDs when a trigger payload forwards a credential input."""
+        try:
+            parsed = jinja_sandbox_env.parse(value)
+        except TemplateSyntaxError:
+            return None
+
+        if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output):
+            return None
+
+        rendered_nodes = [
+            node
+            for node in parsed.body[0].nodes
+            if not (isinstance(node, nodes.TemplateData) and not node.data.strip())
+        ]
+        if len(rendered_nodes) != 1:
+            return None
+        expression = rendered_nodes[0]
+        if isinstance(expression, nodes.Name):
+            parameter_key = expression.name
+        elif (
+            isinstance(expression, nodes.Filter)
+            and expression.name == "json"
+            and isinstance(expression.node, nodes.Name)
+        ):
+            parameter_key = expression.node.name
+        else:
+            return None
+
+        get_credential_id = getattr(workflow_run_context, "get_resolved_credential_parameter_id", None)
+        if not callable(get_credential_id):
+            return None
+
+        credential_id = get_credential_id(parameter_key)
+        return credential_id if isinstance(credential_id, str) and credential_id else None
 
     def _render_scalar_with_path(
         self,
