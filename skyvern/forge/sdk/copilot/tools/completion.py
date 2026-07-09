@@ -51,7 +51,11 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
     derive_from_block_outputs,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, is_fallback_floor_criterion
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    _is_judgment_boolean_criterion,
+    is_fallback_floor_criterion,
+)
 from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -294,9 +298,16 @@ def _authored_output_contract_path(value: object) -> str:
     return f"output.{path}"
 
 
-def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
-    run_criteria = [c for c in criteria if getattr(c, "level", "run") != "definition"]
-    definition_criteria = [c for c in criteria if getattr(c, "level", "run") == "definition"]
+def _split_criteria_by_plane(
+    criteria: list[CompletionCriterion],
+) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
+    run_criteria: list[CompletionCriterion] = []
+    definition_criteria: list[CompletionCriterion] = []
+    for criterion in criteria:
+        if criterion.level != "definition" or (criterion.output_path and _is_judgment_boolean_criterion(criterion)):
+            run_criteria.append(criterion)
+        else:
+            definition_criteria.append(criterion)
     return run_criteria, definition_criteria
 
 
@@ -792,6 +803,15 @@ def _bind_independent_post_run_page_evidence(
         key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS
     }
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
+    LOG.info(
+        "copilot_post_run_page_evidence_snapshot_binding",
+        workflow_run_id=run_id,
+        packet_label=_POST_RUN_PAGE_OBSERVATION_LABEL,
+        evidence_source="independent_page_evidence",
+        evidence_workflow_run_id=evidence.get("workflow_run_id"),
+        evidence_observed_after_workflow_run=evidence.get("observed_after_workflow_run"),
+        evidence_source_tool=evidence.get("source_tool"),
+    )
 
 
 def _bind_registered_artifact_evidence(
