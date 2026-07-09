@@ -1,8 +1,10 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 
+import { buildRevealOffsets, revealedCountAt } from "./actionReveal";
 import {
   ActivityEntry,
   BlockState,
+  RecordedActionSummary,
   TurnNarrativeState,
   TurnSummary,
   computeTurnSummary,
@@ -13,6 +15,11 @@ import {
   parseUtcIsoMs,
   toolActivityDisplayLabel,
 } from "./narrativeState";
+import { useShimmerText } from "../workflowRun/useShimmerText";
+
+// Row flashes green/red for 600ms once revealed — must match the tailwind
+// copilot-row-flash-* animation duration.
+const FLASH_WINDOW_MS = 600;
 
 interface BlockPalette {
   fg: string;
@@ -188,13 +195,57 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
   );
 }
 
-function useSecondTick(active: boolean): void {
+function useTick(active: boolean, intervalMs = 1000): void {
   const [, setTick] = useState(0);
   useEffect(() => {
     if (!active) return;
-    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    const id = setInterval(() => setTick((t) => t + 1), intervalMs);
     return () => clearInterval(id);
-  }, [active]);
+  }, [active, intervalMs]);
+}
+
+function FRecordedActionRow({
+  action,
+  revealing,
+  flash,
+}: {
+  action: RecordedActionSummary;
+  revealing: boolean;
+  flash: boolean;
+}) {
+  const shimmerRef = useShimmerText<HTMLSpanElement>(revealing);
+  if (revealing) {
+    return (
+      <FSubRow glyph={<Spinner small />} glyphClass="text-blue-300">
+        <span ref={shimmerRef} className="text-slate-200">
+          {action.label}
+        </span>
+        {action.summary ? (
+          <span className="text-slate-500"> · {action.summary}</span>
+        ) : null}
+      </FSubRow>
+    );
+  }
+  const flashClass = flash
+    ? action.failed
+      ? "animate-copilot-row-flash-error"
+      : "animate-copilot-row-flash-success"
+    : "";
+  return (
+    <FSubRow
+      glyph={action.failed ? "✕" : "✓"}
+      glyphClass={action.failed ? "text-rose-300" : "text-emerald-300"}
+    >
+      <span
+        className={`${action.failed ? "text-rose-200" : "text-slate-200"} ${flashClass}`}
+      >
+        {action.label}
+      </span>
+      {action.summary ? (
+        <span className="text-slate-500"> · {action.summary}</span>
+      ) : null}
+    </FSubRow>
+  );
 }
 
 interface FBlockRunProps {
@@ -247,11 +298,41 @@ function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
           ? "bg-rose-500/15"
           : "bg-slate-elevation3";
 
+  const recordedActions = block.recordedActions;
+  const hasActions =
+    recordedActions !== undefined && recordedActions.length > 0;
+  const durations = useMemo(
+    () => (recordedActions ?? []).map((a) => a.durationMs),
+    [recordedActions],
+  );
+  const offsets = useMemo(() => buildRevealOffsets(durations), [durations]);
+  const totalMs = offsets.length > 0 ? offsets[offsets.length - 1]! : 0;
+  // Time-derived, not timer-chained: recomputed from wall-clock time on
+  // every render/tick so collapse, remount, and StrictMode double-invoke
+  // can never restart or duplicate the reveal.
+  const elapsedReveal = hasActions
+    ? Date.now() - (block.recordedActionsAt ?? 0)
+    : 0;
+  const revealedCount = hasActions
+    ? revealedCountAt(offsets, elapsedReveal)
+    : 0;
+  const replayingAction =
+    hasActions && elapsedReveal >= 0 && revealedCount < recordedActions!.length;
+  const visibleActionCount = !hasActions
+    ? 0
+    : elapsedReveal < 0
+      ? 0
+      : Math.min(
+          revealedCount + (replayingAction ? 1 : 0),
+          recordedActions!.length,
+        );
+
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const defaultOpen = isRunning || isFail;
+  const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
   const open = userOpen === null ? defaultOpen : userOpen;
   const toggleable = isOk || isOutcomeNotShown || isVerifying || isRanNeutral;
-  useSecondTick(isRunning);
+  useTick(isRunning);
+  useTick(hasActions && (replayingAction || elapsedReveal < totalMs), 150);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
   const statusText = isOk
@@ -354,6 +435,21 @@ function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
           {block.activity.map((entry) => (
             <ActivityRow key={entry.id} entry={entry} />
           ))}
+          {hasActions
+            ? recordedActions!
+                .slice(0, visibleActionCount)
+                .map((action, i) => (
+                  <FRecordedActionRow
+                    key={action.actionId}
+                    action={action}
+                    revealing={replayingAction && i === revealedCount}
+                    flash={
+                      i < revealedCount &&
+                      elapsedReveal - offsets[i]! < FLASH_WINDOW_MS
+                    }
+                  />
+                ))
+            : null}
           {isFail ? (
             <div className="mt-1 flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
               <span className="text-[11px] font-bold text-rose-300">✕</span>
