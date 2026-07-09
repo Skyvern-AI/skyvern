@@ -400,8 +400,10 @@ def _patch_execute_environment(
     async def validate_code_block(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
         return None
 
+    browser_state = FakeBrowserState()
+
     async def get_browser_state(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        return FakeBrowserState()
+        return browser_state
 
     async def record_output(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
         return None
@@ -419,6 +421,7 @@ def _patch_execute_environment(
         "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block", validate_code_block
     )
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *args, **kwargs: browser_state)
     monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: context)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
     monkeypatch.setattr(app.DATABASE.observer, "get_workflow_run_block", mocks["get_workflow_run_block"])
@@ -587,7 +590,11 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
     context = FakeWorkflowRunContext()
     mocks = _patch_execute_environment(monkeypatch, page, context)
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the heal itself.
-    monkeypatch.setattr(CodeBlock, "_attempt_self_heal", AsyncMock(return_value=SimpleNamespace(success=True)))
+    monkeypatch.setattr(
+        CodeBlock,
+        "_attempt_self_heal",
+        AsyncMock(return_value=SimpleNamespace(success=True, output_parameter_value=None)),
+    )
 
     block = _make_code_block("await page.locator('#x').click()", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
