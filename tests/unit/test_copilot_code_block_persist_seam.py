@@ -55,7 +55,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
 )
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, JudgmentTruthCondition, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
@@ -4109,6 +4109,223 @@ class TestCodeRepairProgressClassification:
         assert scaffolded[0]["claimed_outcomes"][0]["goal_value_paths"] == ["output.recorded_value"]
         schema = json.loads(scaffolded[0]["claimed_outcomes"][0]["extraction_schema"])
         assert schema["properties"]["output"]["properties"]["recorded_value"] == {}
+
+    def test_independent_judgment_output_is_not_required_as_code_return_path(self) -> None:
+        judgment_criterion = CompletionCriterion(
+            id="login_gate",
+            outcome="the target path is blocked by a login gate",
+            output_path="output.login_gate_blocks_target",
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+            judgment_truth_condition=JudgmentTruthCondition(
+                predicate="login_gate_blocks_target",
+                polarity_when_holds=True,
+            ),
+        )
+        judgment_only_ctx = _code_only_ctx()
+        judgment_only_ctx.request_policy = RequestPolicy(completion_criteria=[judgment_criterion])
+
+        judgment_only_paths, _, _ = workflow_update_module._output_contract_required_paths_source(judgment_only_ctx)
+
+        assert judgment_only_paths == set()
+
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                judgment_criterion,
+                CompletionCriterion(
+                    id="record_id",
+                    outcome="the record id is returned",
+                    output_path="output.record_id",
+                ),
+            ]
+        )
+
+        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        assert required_paths == {"output.record_id"}
+        assert source == "requested_output_contract"
+        assert reason_code == "requested_output_contract_missing_output_coverage"
+
+    def test_independent_judgment_shape_output_is_not_required_as_code_return_path(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                )
+            ]
+        )
+
+        required_paths, _, _ = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        assert required_paths == set()
+
+    def test_independent_judgment_repair_context_is_not_rehydrated_as_code_return_path(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                    judgment_truth_condition=JudgmentTruthCondition(
+                        predicate="login_gate_blocks_target",
+                        polarity_when_holds=True,
+                    ),
+                )
+            ]
+        )
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="judge_login_gate_blocks_target",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.login_gate_blocks_target"],
+            required_extraction_schema_paths=["output.login_gate_blocks_target"],
+            required_code_return_paths=["output.login_gate_blocks_target"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+
+        required_paths, _, _ = workflow_update_module._output_contract_required_paths_source(ctx)
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, _SAFE_CODE_YAML, [])
+
+        assert required_paths == set()
+        assert result is None
+
+    def test_mixed_repair_context_keeps_non_judgment_code_return_path(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                    judgment_truth_condition=JudgmentTruthCondition(
+                        predicate="login_gate_blocks_target",
+                        polarity_when_holds=True,
+                    ),
+                )
+            ]
+        )
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.login_gate_blocks_target", "output.record_id"],
+            required_extraction_schema_paths=["output.login_gate_blocks_target", "output.record_id"],
+            required_code_return_paths=["output.login_gate_blocks_target", "output.record_id"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+
+        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        assert required_paths == {"output.record_id"}
+        assert source == "requested_output_contract"
+        assert reason_code == "requested_output_contract_missing_output_coverage"
+
+    def test_independent_judgment_runtime_repair_fact_is_not_rehydrated_as_code_return_path(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                )
+            ]
+        )
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "block_label": "judge_login_gate_blocks_target",
+                    "output_path": "output.login_gate_blocks_target",
+                    "output_root": "output",
+                    "criterion_id": "__copilot_requested_output__output_login_gate_blocks_target",
+                    "reason_code": "structurally_abstained",
+                    "grounding_mode": "judgment_boolean",
+                    "value_status": "structural_abstained",
+                }
+            ],
+        )
+
+        required_paths, _, _ = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        assert required_paths == set()
+
+    def test_mixed_runtime_repair_facts_keep_non_judgment_code_return_path(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                ),
+                CompletionCriterion(
+                    id="record_id",
+                    outcome="the record id is returned",
+                    output_path="output.record_id",
+                ),
+            ]
+        )
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="outcome_not_demonstrated",
+            workflow_run_id="wr_current",
+            structural_failure_identity="completion:runtime-output",
+            runtime_output_repair_facts=[
+                {
+                    "workflow_run_id": "wr_current",
+                    "block_label": "extract_entry_output",
+                    "output_path": "output.login_gate_blocks_target",
+                    "output_root": "output",
+                    "criterion_id": "__copilot_requested_output__output_login_gate_blocks_target",
+                    "reason_code": "structurally_abstained",
+                    "grounding_mode": "judgment_boolean",
+                    "value_status": "structural_abstained",
+                },
+                {
+                    "workflow_run_id": "wr_current",
+                    "block_label": "extract_entry_output",
+                    "output_path": "output.record_id",
+                    "output_root": "output",
+                    "criterion_id": "record_id",
+                    "reason_code": "structurally_abstained",
+                    "grounding_mode": "missing",
+                    "value_status": "structural_abstained",
+                },
+            ],
+        )
+
+        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        assert required_paths == {"output.record_id"}
+        assert source == "runtime_output_repair"
+        assert reason_code == "runtime_output_repair_required"
 
     def test_runtime_output_facts_record_same_run_null_without_evidence_text_backfill(self) -> None:
         result = {
