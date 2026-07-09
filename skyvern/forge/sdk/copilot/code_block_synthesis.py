@@ -31,6 +31,7 @@ _ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
 _ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
 _ENTRY_OPENER_VAR = "_scout_entry_opener"
 _OPTIONAL_DISMISSAL_VAR = "_scout_optional_dismissal"
+_READONLY_DEFERRED_VAR = "_scout_readonly_actual"
 _ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 _INTERNAL_SCOUT_VARS = (
     _ENTRY_TARGET_VAR,
@@ -39,6 +40,7 @@ _INTERNAL_SCOUT_VARS = (
     _ENTRY_RESUME_TARGET_VAR,
     _ENTRY_OPENER_VAR,
     _OPTIONAL_DISMISSAL_VAR,
+    _READONLY_DEFERRED_VAR,
 )
 
 # Base name for the download var bound by `async with page.expect_download() as <name>:`.
@@ -801,9 +803,11 @@ def synthesize_code_block(
                 lines.append(f"{_INDENT * 3}pass")
         elif entry_post_auth_resume_index:
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
+            lines.append(f"{_INDENT * 2}pass")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
+    deferred_readonly_assertions: list[tuple[int, str, str, str]] = []
 
     def action_indent_for(trajectory_index: int) -> str:
         if entry_replay_condition_active:
@@ -911,8 +915,30 @@ def synthesize_code_block(
                 if typed_identity is not None:
                     typed_param_keys[typed_identity] = param_key
             diagnostics.typed_param_bindings.append((trajectory_index, param_key))
-            lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
-            append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
+            readonly_or_disabled = bool(interaction.get("control_readonly")) or bool(
+                interaction.get("control_disabled")
+            )
+            if readonly_or_disabled and bool(interaction.get("control_value_satisfied")):
+                verify_target = _step_target(interaction)
+                lines.append(f"{action_indent}try:")
+                lines.append(f"{action_indent}{_INDENT}{_READONLY_DEFERRED_VAR} = await {locator}.input_value()")
+                lines.append(f"{action_indent}except Exception:")
+                lines.append(f"{action_indent}{_INDENT}{_READONLY_DEFERRED_VAR} = None")
+                lines.append(
+                    f"{action_indent}if {_READONLY_DEFERRED_VAR} is not None "
+                    f"and {_READONLY_DEFERRED_VAR} != str({param_key}):"
+                )
+                lines.append(
+                    f"{action_indent}{_INDENT}print("
+                    f"{_py_str(f'{verify_target}: read-only value ')} + repr({_READONLY_DEFERRED_VAR})"
+                    f" + {_py_str(' does not match expected ')} + repr(str({param_key})))"
+                )
+                append_step(f"Verify {verify_target}", "input_text", line_start)
+            elif readonly_or_disabled:
+                deferred_readonly_assertions.append((trajectory_index, locator, param_key, _step_target(interaction)))
+            else:
+                lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
+                append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
             credential_field = str(interaction.get("credential_field") or "").strip()
@@ -954,8 +980,56 @@ def synthesize_code_block(
             continue
         emitted += 1
 
-    if entry_replay_condition_active and emitted == 0 and not entry_post_auth_resume_index:
+    if (
+        entry_replay_condition_active
+        and (emitted - len(deferred_readonly_assertions)) == 0
+        and (not entry_post_auth_resume_index)
+    ):
         lines.append(f"{_INDENT * 2}pass")
+
+    if deferred_readonly_assertions:
+        deferred_base = _INDENT
+        if entry_replay_condition_active:
+            lines.append(f"{_INDENT}if not {_ENTRY_REUSED_VAR}:")
+            deferred_base = _INDENT * 2
+
+        def emit_deferred_readonly_assertion(indent: str, locator_expr: str, param_ref: str, target: str) -> None:
+            line_start = len(lines) + 1
+            lines.append(f"{indent}try:")
+            lines.append(f"{indent}{_INDENT}{_READONLY_DEFERRED_VAR} = await {locator_expr}.input_value()")
+            lines.append(f"{indent}except Exception:")
+            lines.append(f"{indent}{_INDENT}{_READONLY_DEFERRED_VAR} = None")
+            lines.append(f"{indent}if {_READONLY_DEFERRED_VAR} == {_py_str('')}:")
+            lines.append(
+                f"{indent}{_INDENT}raise AssertionError("
+                f"{_py_str(f'{target} was not set to the required value by an earlier step')})"
+            )
+            lines.append(
+                f"{indent}elif {_READONLY_DEFERRED_VAR} is not None and {_READONLY_DEFERRED_VAR} != str({param_ref}):"
+            )
+            lines.append(
+                f"{indent}{_INDENT}print("
+                f"{_py_str(f'{target}: read-only value ')} + repr({_READONLY_DEFERRED_VAR})"
+                f" + {_py_str(' does not match expected ')} + repr(str({param_ref})))"
+            )
+            append_step(f"Verify {target}", "input_text", line_start)
+
+        for deferred_index, deferred_locator, deferred_param_key, deferred_target in deferred_readonly_assertions:
+            if entry_post_auth_resume_index and deferred_index < entry_post_auth_resume_index:
+                continue
+            emit_deferred_readonly_assertion(deferred_base, deferred_locator, deferred_param_key, deferred_target)
+
+        pre_resume_deferred = [
+            entry
+            for entry in deferred_readonly_assertions
+            if entry_post_auth_resume_index and entry[0] < entry_post_auth_resume_index
+        ]
+        if pre_resume_deferred:
+            lines.append(f"{deferred_base}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
+            for _, deferred_locator, deferred_param_key, deferred_target in pre_resume_deferred:
+                emit_deferred_readonly_assertion(
+                    deferred_base + _INDENT, deferred_locator, deferred_param_key, deferred_target
+                )
 
     if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
