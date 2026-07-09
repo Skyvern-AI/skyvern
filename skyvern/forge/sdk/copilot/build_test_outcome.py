@@ -228,6 +228,7 @@ class RecordedOutcomeBindingConstraint(BaseModel):
 class _RecordedBuildTestOutcomeContext(Protocol):
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
     recorded_build_test_outcome_history: list[dict[str, object]]
+    recorded_persisted_block_run_workflow_run_id: str | None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None
 
@@ -253,6 +254,8 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     )
     del history[:-_HISTORY_LIMIT]
     ctx.recorded_build_test_outcome_history = history
+    if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
+        ctx.recorded_persisted_block_run_workflow_run_id = outcome.workflow_run_id
     LOG.info(
         "copilot recorded build-test outcome stored",
         phase=outcome.phase,
@@ -398,14 +401,10 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
 
 
 def run_backed_repair_evidence_exists(ctx: object) -> bool:
-    fallback_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
-    if isinstance(latest, RecordedBuildTestOutcome):
-        # An author-time reject is never run-backed even if a stale run id lingers on ctx; only a persisted run counts.
-        if latest.phase != "persisted_block_run":
-            return False
-        return bool(latest.workflow_run_id or fallback_run_id)
-    return bool(fallback_run_id)
+    # Reached from the enforcement belt with an untyped ctx; a ctx without the latch must read as
+    # "no run-backed evidence" so the guardrail fails safe instead of raising.
+    run_id = getattr(ctx, "recorded_persisted_block_run_workflow_run_id", None)
+    return isinstance(run_id, str) and bool(run_id)
 
 
 def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGroundingRequirement | None:

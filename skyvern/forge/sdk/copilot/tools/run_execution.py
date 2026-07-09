@@ -3295,6 +3295,9 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
         arm_recorded_outcome_grounding_requirement(copilot_ctx)
     if contract.repair_loop_state.ceiling_reached and run_backed_repair_evidence_exists(copilot_ctx):
         signal = repair_ceiling_stop_signal(copilot_ctx, contract)
+        contract.repair_decision = contract.repair_decision.model_copy(
+            update={"next_action": RepairNextAction.STOP, "target_blocks": []}
+        )
         stash_blocker_signal(copilot_ctx, signal)
         stash_repair_ceiling_turn_halt(copilot_ctx, signal, consecutive_identical_repair_count=count)
 

@@ -8359,6 +8359,16 @@ async def _update_workflow(
             block_labels=missing_labels,
             missing_requested_output_facts=missing_metadata_output_facts,
         )
+        credential_scout_errors = (
+            []
+            if _request_policy_allows_untested_code_block_draft(ctx)
+            else _credentialed_code_block_scout_gate_errors(
+                workflow_yaml,
+                ctx,
+                block_labels=params.get("block_labels"),
+            )
+        )
+        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=bool(credential_scout_errors))
         return reject(
             error=missing_metadata_error,
             user_facing_summary=_compiled_authoring_user_summary(),

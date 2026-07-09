@@ -3910,6 +3910,7 @@ class TestCodeRepairProgressClassification:
             structural_failure_identity="completion:typed-output",
             authored_structure_signature="previous-authoring-signature",
         )
+        ctx.recorded_persisted_block_run_workflow_run_id = "wr_recorded"
         recorded_sig = authored_block_signatures_from_workflow(workflow_yaml, metadata)["submit_service_request"]
         ctx.recorded_outcome_binding_constraint = RecordedOutcomeBindingConstraint(
             repeated_structural_key=ctx.latest_recorded_build_test_outcome.structural_key or "",
@@ -7309,7 +7310,9 @@ class TestOutputContractBudgetRunGuard:
             verdict="repairable_failure",
             reason_code="failed_run",
             workflow_run_id="wr_1",
+            structural_failure_identity="runtime:failed",
         )
+        ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
 
         payload = workflow_update_module._record_output_contract_reject(ctx, evaluation, summary="x")
 
@@ -7834,6 +7837,42 @@ class TestCompiledAuthoringImposition:
         assert ctx.latest_recorded_build_test_outcome is not None
         assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
         assert ctx.latest_recorded_build_test_outcome.is_authoritative is True
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert ctx.last_code_authoring_reject_was_credential_priority is False
+
+    @pytest.mark.asyncio
+    async def test_missing_metadata_with_credential_gap_uses_credential_priority_counter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        submitted = _yaml(
+            """
+            title: Credentialed lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: credential_id, key: login_credential, default_value: cred_missing}
+              - {parameter_type: output, key: lookup_result}
+              blocks:
+              - block_type: code
+                label: lookup_with_saved_credential
+                parameter_keys: [login_credential]
+                prompt: Sign in and return the lookup result.
+                code: |
+                  await page.locator("#email").fill(login_credential.username)
+                  await page.locator("input[type='password']").fill(login_credential.password)
+                  return {"lookup_result": "sample"}
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "must pass `code_artifact_metadata`" in result["error"]
+        assert ctx.code_authoring_guardrail_reject_count == 1
+        assert ctx.last_code_authoring_reject_was_credential_priority is True
+        assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
     async def test_output_intent_rejects_partial_metadata_without_output_label(
