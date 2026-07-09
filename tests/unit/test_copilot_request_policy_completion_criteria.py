@@ -288,6 +288,40 @@ async def test_lowercase_record_id_is_augmented_as_requested_output() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_token",
+    [
+        pytest.param("`field_name`", id="backtick"),
+        pytest.param('"field_name"', id="double_quote"),
+        pytest.param("'field_name'", id="single_quote"),
+    ],
+)
+async def test_delimited_named_output_field_is_augmented_as_requested_output(field_token: str) -> None:
+    policy = await _policy_for_message(
+        f"Return a final record with output field named {field_token}.",
+        [],
+    )
+
+    criteria = _criteria_for_path(policy, "output.field_name")
+    trace = policy.to_trace_data()
+
+    assert len(criteria) == 1
+    assert criteria[0].output_path == "output.field_name"
+    assert trace["requested_output_criteria_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delimited_named_output_field_dedupes_with_bare_field() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with output field named field_name and output field named `field_name`.",
+        [],
+    )
+
+    assert len(_criteria_for_path(policy, "output.field_name")) == 1
+    assert policy.to_trace_data()["requested_output_criteria_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_leading_output_verb_does_not_enter_requested_output_slug() -> None:
     policy = await _policy_for_message(
         "Return a final record. Capture the identifier.",
@@ -1286,6 +1320,97 @@ def test_requested_output_canonicalization_preserves_marker_for_approved_downloa
     assert len(criteria) == 1
     assert criteria[0].id == "__copilot_requested_output__output_downloaded_file_artifact_ids"
     assert criteria[0].deliverable_kind == "registered_download"
+
+
+@pytest.mark.asyncio
+async def test_classifier_typed_download_preserves_registered_download_requested_output() -> None:
+    policy = await _policy_for_message(
+        "Build a workflow that downloads the May 2026 bill.",
+        [
+            {
+                "outcome": "The requested download artifact ids include the May 2026 bill.",
+                "output_path": "output.downloaded_file_artifact_ids",
+                "expected_output_value": "May 2026",
+                "expected_output_shape": "date",
+                "requested_output_evidence_source": "registered_artifact_content",
+                "deliverable_kind": "registered_download",
+            }
+        ],
+    )
+
+    criteria = _requested_output_subset(policy, {"output.downloaded_file_artifact_ids"})
+    trace = policy.to_trace_data()
+
+    assert len(criteria) == 1
+    assert criteria[0].output_path == "output.downloaded_file_artifact_ids"
+    assert criteria[0].deliverable_kind == "registered_download"
+    assert criteria[0].expected_output_value == "May 2026"
+    assert criteria[0].expected_output_shape == "date"
+    assert criteria[0].requested_output_evidence_source == "registered_artifact_content"
+    assert trace["requested_output_criteria_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_download_prose_without_typed_classifier_output_does_not_mint_requested_output() -> None:
+    policy = await _policy_for_message(
+        "Build a workflow that downloads the bill for May 2026.",
+        [],
+    )
+
+    criteria = _requested_output_subset(policy, {"output.downloaded_file_artifact_ids"})
+
+    assert criteria == []
+    assert policy.to_trace_data()["requested_output_criteria_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_download_alias_can_mint_registered_download_requested_output() -> None:
+    policy = await _policy_for_message(
+        "Build a workflow that returns the May 2026 download artifact.",
+        [
+            {
+                "outcome": "The returned record includes the download artifact.",
+                "output_path": "output.downloaded_file_artifact_ids",
+                "expected_output_value": "May 2026",
+                "expected_output_shape": "date",
+                "requested_output_evidence_source": "registered_artifact_content",
+                "deliverable_kind": "registered_download",
+            }
+        ],
+        config=CopilotConfig(
+            requested_output_path_aliases={"download artifact": "output.downloaded_file_artifact_ids"}
+        ),
+    )
+
+    criteria = _requested_output_subset(policy, {"output.downloaded_file_artifact_ids"})
+
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_value == "May 2026"
+    assert criteria[0].expected_output_shape == "date"
+    assert criteria[0].requested_output_evidence_source == "registered_artifact_content"
+    assert criteria[0].deliverable_kind == "registered_download"
+
+
+@pytest.mark.asyncio
+async def test_date_qualified_download_preserves_classifier_typed_value_and_shape() -> None:
+    policy = await _policy_for_message(
+        "Build a workflow that downloads the May 2026 bill.",
+        [
+            {
+                "outcome": "The requested download is returned.",
+                "output_path": "output.downloaded_file_artifact_ids",
+                "expected_output_value": "April 2026",
+                "expected_output_shape": "date",
+                "deliverable_kind": "registered_download",
+            }
+        ],
+    )
+
+    criteria = _requested_output_subset(policy, {"output.downloaded_file_artifact_ids"})
+
+    assert len(criteria) == 1
+    assert criteria[0].expected_output_value == "April 2026"
+    assert criteria[0].expected_output_shape == "date"
 
 
 @pytest.mark.parametrize(
