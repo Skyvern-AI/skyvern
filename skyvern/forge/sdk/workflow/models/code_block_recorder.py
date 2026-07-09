@@ -4,16 +4,13 @@ import sys
 import time
 from os import PathLike, fspath
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import pydantic
 import structlog
 
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
-
-if TYPE_CHECKING:
-    from skyvern.core.script_generations.skyvern_page import SkyvernPage
 
 LOG = structlog.get_logger()
 
@@ -59,8 +56,9 @@ _LOCATOR_FACTORY_METHODS = frozenset(
 # Mirror skyvern_page.py's @action_wrap table and the editor deriver
 # (code_block_steps._METHOD_ACTION_TYPES) so extraction and the rest of the surface
 # record as distinct, reader-facing steps.
+# `extract` is absent on purpose: code blocks run on a raw Playwright page and must not reach
+# the LLM extraction path, so nothing may author or record a page.extract call.
 _HIGH_LEVEL_ACTION_MAP: dict[str, ActionType] = {
-    "extract": ActionType.EXTRACT,
     "complete": ActionType.COMPLETE,
     "terminate": ActionType.TERMINATE,
     "wait": ActionType.WAIT,
@@ -78,10 +76,9 @@ _HIGH_LEVEL_ACTION_MAP: dict[str, ActionType] = {
 }
 # High-level methods whose natural-language `prompt` (positional or keyword) is the
 # reader-facing description; mirrors code_block_steps._PROMPT_POSITIONAL_METHODS.
-_PROMPT_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
+_PROMPT_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
 
 OnAction = Callable[[Action], Awaitable[None]]
-ExtractPageFactory = Callable[[], Awaitable["SkyvernPage"]]
 
 
 def _frame_user_line() -> int | None:
@@ -373,15 +370,9 @@ class RecordingPage:
     treat recordings as telemetry, not a tamper-proof audit trail.
     """
 
-    def __init__(
-        self,
-        page: Any,
-        on_action: OnAction | None = None,
-        extract_page_factory: ExtractPageFactory | None = None,
-    ) -> None:
+    def __init__(self, page: Any, on_action: OnAction | None = None) -> None:
         self.__page = page
         self.__recorder = _Recorder(on_action)
-        self.__extract_page_factory = extract_page_factory
 
     def recorded_actions(self) -> list[Action]:
         return list(self.__recorder.actions)
@@ -395,44 +386,6 @@ class RecordingPage:
     @property
     def keyboard(self) -> RecordingKeyboard:
         return RecordingKeyboard(self.__page.keyboard, self.__recorder)
-
-    async def extract(
-        self,
-        prompt: str,
-        schema: dict[str, Any] | list | str | None = None,
-        error_code_mapping: dict[str, str] | None = None,
-        intention: str | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any] | list | str | None:
-        # Recorder-only narrowing of SkyvernPage.extract: authored code may not supply its own
-        # system_prompt or data (the block owns prompt resolution) nor skip_refresh (set below).
-        call_kwargs = {
-            key: value for key, value in kwargs.items() if key not in {"data", "system_prompt", "skip_refresh"}
-        }
-        if schema is not None:
-            call_kwargs["schema"] = schema
-        if error_code_mapping is not None:
-            call_kwargs["error_code_mapping"] = error_code_mapping
-        if intention is not None:
-            call_kwargs["intention"] = intention
-        description = " ".join(prompt.split())[:200] if prompt.strip() else None
-
-        async def call() -> dict[str, Any] | list | str | None:
-            if self.__extract_page_factory is None:
-                return await self.__page.extract(prompt, **call_kwargs)
-            extract_page = await self.__extract_page_factory()
-            # The factory just scraped the page; letting extract refresh again would double-scrape.
-            return await extract_page.extract(prompt, skip_refresh=True, **call_kwargs)
-
-        return await self.__recorder.record(
-            ActionType.EXTRACT,
-            "page.extract",
-            None,
-            call,
-            (prompt,),
-            call_kwargs,
-            description=description,
-        )
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__page, name)

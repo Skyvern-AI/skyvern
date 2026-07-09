@@ -386,11 +386,10 @@ class AgentContext:
     # flaky scout pass. Cleared when the spine gains a source, on imposition, or on run dispatch.
     output_contract_declick_attempted_by_signature: dict[str, bool] = field(default_factory=dict)
     # One-shot per signature: a consumed advisory run whose observed output bound no required path may
-    # re-enter the ladder once so the stronger page-source extraction can be imposed before any terminal.
+    # re-enter the ladder once before any terminal.
     output_contract_dispatch_reopened_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Set once a page-source extraction (page.extract keyed to the required paths) has been imposed on a
-    # signature; the exhaustion terminal requires this so a code static-return never terminals a producible shape.
-    output_contract_page_source_required_by_signature: dict[str, bool] = field(default_factory=dict)
+    # The exhaustion terminal requires this, and no rung sets it while code blocks stay on raw
+    # Playwright, so that terminal is unreachable until output grounding returns.
     output_contract_page_extraction_imposed_by_signature: dict[str, bool] = field(default_factory=dict)
     # Run-output evidence recorded at the run-result seam: a dispatched run's output-contract signatures
     # mapped to their required paths (armed at seam-admit and page-source imposition), then the observed
