@@ -229,6 +229,24 @@ def _direct_click_page(
     return click, locator
 
 
+def _direct_type_page(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    count: int = 1,
+    visible: bool = True,
+    enabled: bool = True,
+    fill_error: Exception | None = None,
+) -> tuple[AsyncMock, MagicMock]:
+    locator = make_probe_locator(count=count, visible=visible, enabled=enabled)
+    raw_page = MagicMock()
+    raw_page.locator = MagicMock(return_value=locator)
+    fill = AsyncMock(side_effect=fill_error, return_value="typed")
+    page = SimpleNamespace(page=raw_page, evaluate=AsyncMock(return_value=False), fill=fill)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return fill, locator
+
+
 # Default (resilient) keeps the shared MCP surface unchanged for external callers: a selector
 # tries first, then dismisses overlays and AI-falls-back. selector_mode="direct" (which the
 # copilot binds via forced_args) opts into deterministic, no-AI behavior.
@@ -240,6 +258,7 @@ async def test_skyvern_click_selector_is_resilient_by_default(monkeypatch: pytes
 
     assert result["ok"] is True
     assert click.await_args.kwargs.get("mode") != "direct"
+    assert click.await_args.kwargs["_skip_element_prep"] is True
 
 
 @pytest.mark.asyncio
@@ -251,6 +270,7 @@ async def test_skyvern_click_selector_mode_direct_is_deterministic(monkeypatch: 
     assert result["ok"] is True
     assert click.await_args.kwargs["mode"] == "direct"
     assert "prompt" not in click.await_args.kwargs and "ai" not in click.await_args.kwargs
+    assert "_skip_element_prep" not in click.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -421,6 +441,26 @@ async def test_skyvern_click_direct_failure_reports_unknown_when_probe_fails(
 
 
 @pytest.mark.asyncio
+async def test_skyvern_click_selector_only_failure_uses_direct_element_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _click, _locator = _direct_click_page(
+        monkeypatch,
+        count=0,
+        visible=False,
+        enabled=False,
+        click_error=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."),
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SELECTOR_NOT_FOUND
+    assert result["error"]["details"]["element_state"] == "not_found"
+    assert result["error"]["details"]["actionability_timeout_ms"] == 5000
+
+
+@pytest.mark.asyncio
 async def test_skyvern_press_key_selector_only_uses_fast_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     press = AsyncMock()
     locator = MagicMock()
@@ -492,6 +532,7 @@ async def test_skyvern_click_selector_plus_intent_falls_back_by_default(monkeypa
     assert result["ok"] is True
     assert click.await_args.kwargs.get("ai") == "fallback"
     assert click.await_args.kwargs.get("mode") != "direct"
+    assert "_skip_element_prep" not in click.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -589,6 +630,7 @@ async def test_skyvern_type_selector_is_resilient_by_default(monkeypatch: pytest
 
     assert result["ok"] is True
     assert fill.await_args.kwargs.get("mode") != "direct"
+    assert fill.await_args.kwargs["_skip_element_prep"] is True
 
 
 @pytest.mark.asyncio
@@ -601,6 +643,20 @@ async def test_skyvern_type_selector_mode_direct_is_deterministic(monkeypatch: p
     assert result["ok"] is True
     assert fill.await_args.kwargs["mode"] == "direct"
     assert "prompt" not in fill.await_args.kwargs and "ai" not in fill.await_args.kwargs
+    assert "_skip_element_prep" not in fill.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_selector_only_append_skips_skyvern_page_prep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    type_text = AsyncMock(return_value="Noor")
+    _action_page(monkeypatch, type=type_text)
+
+    result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor", clear=False)
+
+    assert result["ok"] is True
+    assert type_text.await_args.kwargs["_skip_element_prep"] is True
 
 
 @pytest.mark.asyncio
@@ -613,6 +669,7 @@ async def test_skyvern_type_selector_plus_intent_falls_back_by_default(monkeypat
     assert result["ok"] is True
     assert fill.await_args.kwargs.get("ai") == "fallback"
     assert fill.await_args.kwargs.get("mode") != "direct"
+    assert "_skip_element_prep" not in fill.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -625,6 +682,27 @@ async def test_skyvern_type_intent_only_uses_proactive_ai(monkeypatch: pytest.Mo
     assert result["ok"] is True
     assert fill.await_args.kwargs["ai"] == "proactive"
     assert fill.await_args.kwargs.get("mode") != "direct"
+    assert "_skip_element_prep" not in fill.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_selector_only_failure_uses_direct_element_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fill, _locator = _direct_type_page(
+        monkeypatch,
+        count=1,
+        visible=False,
+        enabled=True,
+        fill_error=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."),
+    )
+
+    result = await mcp_browser.skyvern_type(selector="#target", text="Noor")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["details"]["element_state"] == "hidden"
+    assert result["error"]["details"]["actionability_timeout_ms"] == 5000
 
 
 @pytest.mark.asyncio
