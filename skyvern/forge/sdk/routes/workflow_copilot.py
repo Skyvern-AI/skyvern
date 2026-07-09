@@ -2069,6 +2069,7 @@ async def _new_copilot_chat_post(
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
                     stored_completion_criteria=stored_completion_criteria,
+                    prior_turn_outcome=prior_turn_outcome,
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(

@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_yaml_in_chat,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
     RequestPolicy,
     contains_email_password_pair,
     request_policy_has_present_completion_contract,
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
 )
+from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
@@ -30,8 +32,12 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids_from_parsed,
     workflow_credential_origins_from_parsed,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 WORKFLOW_PRESENT_SENTINEL = object()
+ACTUATION_OBLIGATION_STEER_REASON_CODE = "actuation_obligation_steer"
+ACTUATION_OBLIGATION_UNMET_REASON_CODE = "actuation_obligation_unmet"
+ACTUATION_OBLIGATION_BROWSER_ACTION_KEY = "browser_state:build:no_update:no_run"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
 # RHS of a secret-keyword assignment that references a bound value instead of carrying one:
@@ -183,6 +189,26 @@ class CopilotOutputKind(StrEnum):
     WORKFLOW_RUN_RESULT = "workflow_run_result"
 
 
+class CannotActReason(StrEnum):
+    MISSING_FIELD_VALUE = "missing_field_value"
+    AMBIGUOUS_TARGET = "ambiguous_target"
+    STRUCTURAL_BLOCKER = "structural_blocker"
+
+
+class ActuationObligationStatus(StrEnum):
+    ALLOWED = "allowed"
+    STEER = "steer"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class ActuationObligationEvaluation:
+    status: ActuationObligationStatus = ActuationObligationStatus.ALLOWED
+    reason_code: str = ""
+    cannot_act_reason: CannotActReason | None = None
+    obligation_key: str = ""
+
+
 class OutputPolicyReason(StrEnum):
     RAW_SECRET_LEAK = "raw_secret_leak"
     REQUEST_POLICY_CLARIFICATION_BYPASS = "request_policy_clarification_bypass"
@@ -199,6 +225,8 @@ class OutputPolicyReason(StrEnum):
     SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
     WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
     AVOIDABLE_OUTPUT_FIELD_CONFIRMATION = "avoidable_output_field_confirmation"
+    ACTUATION_OBLIGATION_STEER = ACTUATION_OBLIGATION_STEER_REASON_CODE
+    ACTUATION_OBLIGATION_UNMET = ACTUATION_OBLIGATION_UNMET_REASON_CODE
 
 
 @dataclass
@@ -232,8 +260,95 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
         OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION,
+        OutputPolicyReason.ACTUATION_OBLIGATION_STEER,
+        OutputPolicyReason.ACTUATION_OBLIGATION_UNMET,
     }
 )
+
+
+def coerce_cannot_act_reason(value: str | None) -> CannotActReason | None:
+    if value is None:
+        return None
+    try:
+        return CannotActReason(value)
+    except ValueError:
+        return None
+
+
+def turn_intent_requires_actuation(turn_intent: TurnIntent | None) -> bool:
+    return (
+        isinstance(turn_intent, TurnIntent)
+        and turn_intent.mode in {TurnIntentMode.BUILD, TurnIntentMode.UNKNOWN}
+        and RequiredContextKey.BROWSER_STATE in turn_intent.required_context
+        and not turn_intent.authority.may_update_workflow
+        and not turn_intent.authority.may_run_blocks
+    )
+
+
+def actuation_obligation_key(turn_intent: TurnIntent | None) -> str:
+    if not turn_intent_requires_actuation(turn_intent):
+        return ""
+    if turn_intent is not None and turn_intent.mode == TurnIntentMode.UNKNOWN:
+        return "browser_state:unknown:no_update:no_run"
+    return ACTUATION_OBLIGATION_BROWSER_ACTION_KEY
+
+
+def completion_criterion_requires_browser_fill_delivery(criterion: CompletionCriterion) -> bool:
+    if criterion.kind == "terminal_action" and criterion.terminal_action_family == "form":
+        return True
+    return criterion.kind == "outcome" and criterion.level == "run" and criterion.method_mandated
+
+
+def request_policy_requires_durable_fill(request_policy: RequestPolicy | None) -> bool:
+    return isinstance(request_policy, RequestPolicy) and any(
+        completion_criterion_requires_browser_fill_delivery(criterion)
+        for criterion in request_policy.completion_criteria
+    )
+
+
+def prior_turn_satisfies_actuation_terminal_condition(
+    prior_turn_outcome: TurnOutcome | None,
+    obligation_key: str,
+) -> bool:
+    # One key covers the turn's actuation obligation; a later partial action
+    # still failed the same browser-fill contract.
+    return (
+        prior_turn_outcome is not None
+        and prior_turn_outcome.reason_code
+        in {ACTUATION_OBLIGATION_STEER_REASON_CODE, ACTUATION_OBLIGATION_UNMET_REASON_CODE}
+        and prior_turn_outcome.actuation_obligation_key == obligation_key
+    )
+
+
+def evaluate_actuation_obligation(
+    *,
+    turn_intent: TurnIntent | None,
+    response_type: str,
+    output_kind: CopilotOutputKind,
+    successful_mutating_browser_actions: int,
+    cannot_act_reason: CannotActReason | None,
+    prior_turn_outcome: TurnOutcome | None,
+) -> ActuationObligationEvaluation:
+    obligation_key = actuation_obligation_key(turn_intent)
+    if (
+        not turn_intent_requires_actuation(turn_intent)
+        or response_type != "REPLY"
+        or output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER
+    ):
+        return ActuationObligationEvaluation(cannot_act_reason=cannot_act_reason)
+    if successful_mutating_browser_actions > 0 or cannot_act_reason is not None:
+        return ActuationObligationEvaluation(cannot_act_reason=cannot_act_reason, obligation_key=obligation_key)
+    if prior_turn_satisfies_actuation_terminal_condition(prior_turn_outcome, obligation_key):
+        return ActuationObligationEvaluation(
+            status=ActuationObligationStatus.TERMINAL,
+            reason_code=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+            obligation_key=obligation_key,
+        )
+    return ActuationObligationEvaluation(
+        status=ActuationObligationStatus.STEER,
+        reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+        obligation_key=obligation_key,
+    )
 
 
 def hard_block_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVerdict:

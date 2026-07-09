@@ -29,6 +29,7 @@ class TurnOutcome(BaseModel):
     turn_intent_summary: dict[str, Any] = Field(default_factory=dict)
     response_kind: ResponseKind
     reason_code: str = ""
+    actuation_obligation_key: str = ""
     normalized_reply_signature: str = ""
     tool_calls: list[str] = Field(default_factory=list)
     terminal_reason: str | None = None
