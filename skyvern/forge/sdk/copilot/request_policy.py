@@ -1020,6 +1020,7 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not candidate:
         return None
 
+    candidate = _normalize_named_output_field_delimiter(candidate)
     named_field = _OUTPUT_NAMED_FIELD_RE.search(candidate)
     if named_field is not None:
         return named_field.group(1)
@@ -1091,6 +1092,27 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not phrase_words:
         return None
     return " ".join(phrase_words)
+
+
+def _normalize_named_output_field_delimiter(candidate: str) -> str:
+    lowered = candidate.casefold()
+    for anchor in (" named", " called"):
+        token_start = lowered.find(anchor)
+        if token_start == -1:
+            continue
+        token_start += len(anchor)
+        while token_start < len(candidate) and candidate[token_start].isspace():
+            token_start += 1
+        if token_start >= len(candidate) or candidate[token_start] not in "'\"`":
+            continue
+        quote = candidate[token_start]
+        token_end = candidate.find(quote, token_start + 1)
+        if token_end == -1:
+            continue
+        field_name = candidate[token_start + 1 : token_end]
+        if _OUTPUT_EXPLICIT_FIELD_KEY_RE.fullmatch(field_name):
+            return f"{candidate[:token_start]}{field_name}{candidate[token_end + 1 :]}"
+    return candidate
 
 
 def _matched_alias_phrase(candidate: str, alias_key: str) -> str | None:
