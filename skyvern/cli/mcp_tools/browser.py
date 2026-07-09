@@ -5,7 +5,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -65,7 +65,17 @@ from ._element_state import (
     resolve_action_timeout_ms,
 )
 from ._localhost import is_localhost_url
-from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
+from ._session import (
+    BrowserNotAvailableError,
+    clear_session_ref_map,
+    get_current_session,
+    get_page,
+    get_session_ref,
+    no_browser_error,
+    page_ref_key,
+    replace_session_ref_map,
+    session_ref_generation,
+)
 
 LOG = structlog.get_logger(__name__)
 
@@ -240,6 +250,7 @@ async def skyvern_navigate(
     # (even failed navigations can partially load and destroy existing frames)
     state = get_current_session()
     state._working_frame = None
+    clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     with Timer() as timer:
         try:
@@ -261,6 +272,12 @@ async def skyvern_navigate(
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the URL is valid and accessible"),
             )
+        finally:
+            # Clear again after the attempt (success OR failure — a failed goto can
+            # still partially replace the document): an observe that started while
+            # navigation was in flight captured a post-clear generation, so only a
+            # second bump can invalidate its snapshot of the old document.
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     return make_result(
         "skyvern_navigate",
@@ -1968,6 +1985,7 @@ async def skyvern_frame_switch(
             # Persist frame on session state for subsequent MCP calls
             state = get_current_session()
             state._working_frame = page._working_frame
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
         except ValueError as e:
             return make_result(
                 "skyvern_frame_switch",
@@ -2023,6 +2041,7 @@ async def skyvern_frame_main(
     # Clear frame on session state
     state = get_current_session()
     state._working_frame = None
+    clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     return make_result(
         "skyvern_frame_main",
@@ -2238,11 +2257,14 @@ async def skyvern_observe(
         Field(description="Max elements to return. Default 50.", ge=1, le=200),
     ] = 50,
 ) -> dict[str, Any]:
-    """Snapshot interactive page elements with stable refs (e0, e1, ...) for use in skyvern_execute batches."""
+    """Snapshot interactive elements with refs reusable in this browser session until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe)."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_observe", ok=False, error=no_browser_error())
+
+    observe_page_key = page_ref_key(page)
+    generation = session_ref_generation(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     with Timer() as timer:
         try:
@@ -2263,11 +2285,21 @@ async def skyvern_observe(
             )
 
     elements = serialize_elements(result.elements)
+    replace_session_ref_map(
+        {element["ref"]: element for element in elements},
+        session_id=ctx.session_id,
+        cdp_url=ctx.cdp_url,
+        generation=generation,
+        page_key=observe_page_key,
+    )
     hint = (
         f"Found {result.element_count} interactive elements"
         f"{f' (of {result.total_on_page} total on page)' if result.total_on_page > result.element_count else ''}. "
         "Use these refs in skyvern_execute steps, e.g.: "
-        '{tool: "click", params: {ref: "e0"}}'
+        '{tool: "click", params: {ref: "e0"}}. '
+        "Refs remain valid across calls in this browser session until the next skyvern_observe, "
+        "skyvern_navigate, same-tab navigation, or tab/frame switch. Same-document DOM changes can also "
+        "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures."
     )
     return make_result(
         "skyvern_observe",
@@ -2323,14 +2355,22 @@ async def _dispatch_step(
     ref_map: dict[str, dict[str, Any]],
     session_id: str | None,
     cdp_url: str | None,
+    page_key: tuple[int, int | None, str] | None = None,
+    on_observe_page: Callable[[tuple[int, int | None, str]], None] | None = None,
 ) -> dict[str, Any] | None:
     """Route a step to the appropriate handler, resolving refs to selectors."""
     params = dict(step.params)
 
-    # Resolve ref to selector if present
+    # Resolve ref to selector if present. Refs bind to the page/frame they were
+    # observed on, so re-check identity against the page this step will actually
+    # run on — a popup or external tab change may have moved it mid-batch.
     if ref := params.pop("ref", None):
-        elem = ref_map.get(ref)
-        if not elem:
+        current_page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
+        current_key = page_ref_key(current_page)
+        elem = ref_map.get(ref) if page_key is None or current_key == page_key else None
+        if elem is None:
+            elem = get_session_ref(ref, session_id=session_id, cdp_url=cdp_url, page_key=current_key)
+        if elem is None:
             raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
         params["selector"] = ref_to_selector(elem)
 
@@ -2339,6 +2379,8 @@ async def _dispatch_step(
         from skyvern.cli.core.browser_ops import do_observe as _do_observe
 
         page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
+        if on_observe_page is not None:
+            on_observe_page(page_ref_key(page))
         accepted = {"selector", "interactive_only", "max_elements"}
         filtered = {k: v for k, v in params.items() if k in accepted}
         result = await _do_observe(page, **filtered)
@@ -2378,7 +2420,11 @@ async def skyvern_execute(
         Field(
             description=(
                 "Array of {tool, params} step objects to execute sequentially. "
-                f"Within params, refs from skyvern_observe are direct targets. {DIRECT_TARGET_DESCRIPTION}"
+                "Within params, refs from skyvern_observe are direct targets across calls in the same browser session. "
+                "The next skyvern_observe or page/document context change invalidates them; they can occasionally "
+                "expire early. Same-document DOM changes can also invalidate ordinal refs; on 'Unknown ref' or "
+                "unexpected failures, re-observe. "
+                f"{DIRECT_TARGET_DESCRIPTION}"
             )
         ),
     ],
@@ -2389,7 +2435,7 @@ async def skyvern_execute(
         Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
     ] = True,
 ) -> dict[str, Any]:
-    """Execute multiple browser operations in a single batch. Each step is {tool, params} using refs from skyvern_observe.
+    """Execute browser operations using current-session refs until the next observe or page/document context change.
     Allowed tools: navigate, click, type, press_key, select_option, hover, scroll, wait, observe, screenshot, evaluate."""
     if not steps:
         return make_result(
@@ -2441,15 +2487,55 @@ async def skyvern_execute(
 
     # Verify we can reach the browser before executing anything
     try:
-        await get_page(session_id=session_id, cdp_url=cdp_url)
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_execute", ok=False, error=no_browser_error())
 
+    batch_page_key = page_ref_key(page)
+
+    # Generation captured before each observe dispatch so a snapshot that raced
+    # a concurrent navigation/context switch is discarded, not committed.
+    observe_generation: dict[str, int] = {}
+    observe_page_key: tuple[int, int | None, str] | None = None
+
+    def capture_observe_page_key(page_key: tuple[int, int | None, str]) -> None:
+        nonlocal observe_page_key
+        observe_page_key = page_key
+
     async def dispatch(step: ExecuteStep, ref_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-        return await _dispatch_step(step, ref_map, session_id=session_id, cdp_url=cdp_url)
+        if step.tool == "observe":
+            observe_generation["value"] = session_ref_generation(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+        return await _dispatch_step(
+            step,
+            ref_map,
+            session_id=session_id,
+            cdp_url=cdp_url,
+            page_key=batch_page_key,
+            on_observe_page=capture_observe_page_key if step.tool == "observe" else None,
+        )
+
+    def publish_observe_refs(ref_map: dict[str, dict[str, Any]]) -> bool:
+        nonlocal batch_page_key
+        if observe_page_key is None:
+            return False
+        accepted = replace_session_ref_map(
+            ref_map,
+            session_id=ctx.session_id,
+            cdp_url=ctx.cdp_url,
+            generation=observe_generation.get("value"),
+            page_key=observe_page_key,
+        )
+        if accepted:
+            batch_page_key = observe_page_key
+        return accepted
 
     with Timer() as timer:
-        result = await do_execute(dispatch, parsed_steps, stop_on_error=stop_on_error)
+        result = await do_execute(
+            dispatch,
+            parsed_steps,
+            stop_on_error=stop_on_error,
+            on_ref_map_update=publish_observe_refs,
+        )
         timer.mark("sdk")
 
     step_results = []
