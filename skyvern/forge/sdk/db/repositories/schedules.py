@@ -213,7 +213,7 @@ class SchedulesRepository(BaseRepository):
         organization_id: str,
         cron_expression: str,
         timezone: str,
-        enabled: bool,
+        enabled: bool | object = _UNSET,
         parameters: dict[str, Any] | None = None,
         backend_schedule_id: str | None | object = _UNSET,
         name: str | None | object = _UNSET,
@@ -235,7 +235,8 @@ class SchedulesRepository(BaseRepository):
 
             workflow_schedule.cron_expression = cron_expression
             workflow_schedule.timezone = timezone
-            workflow_schedule.enabled = enabled
+            if enabled is not _UNSET:
+                workflow_schedule.enabled = enabled
             workflow_schedule.parameters = parameters
             if backend_schedule_id is not _UNSET:
                 workflow_schedule.backend_schedule_id = backend_schedule_id

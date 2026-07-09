@@ -602,6 +602,7 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.created_at.label("created_at"),
                     effective_wpid.label("workflow_permanent_id"),
                     TaskRunModel.script_run.label("script_run"),
+                    WorkflowRunModel.trigger_type.label("trigger_type"),
                     TaskRunModel.searchable_text.label("searchable_text"),
                     workflow_deleted_expr,
                 )
@@ -672,6 +673,7 @@ class WorkflowRunsRepository(BaseRepository):
                         WorkflowRunModel.created_at.label("created_at"),
                         WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
                         WorkflowRunModel.script_run.label("script_run"),
+                        WorkflowRunModel.trigger_type.label("trigger_type"),
                         WorkflowModel.title.label("searchable_text"),
                         self._workflow_deleted_expr(
                             WorkflowRunModel.workflow_permanent_id,
