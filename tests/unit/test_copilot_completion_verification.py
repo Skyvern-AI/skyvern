@@ -53,6 +53,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     structured_record_has_goal_content,
     structured_record_has_identity,
     summarize_unsatisfied_outcomes,
+    zero_requested_output_criteria_credit,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -101,6 +102,10 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_loop_error,
     _tool_visible_result_after_completion_verification,
     _watchdog_exit_allows_terminal_promotion,
+)
+from skyvern.forge.sdk.copilot.tools._shared import (
+    _TASK_ENVELOPE_BLOCK_TYPES,
+    _has_meaningful_registered_output_payload,
 )
 from skyvern.forge.sdk.copilot.tools.completion import (
     _POST_RUN_PAGE_OBSERVATION_LABEL,
@@ -3249,6 +3254,313 @@ def test_degraded_delivered_unverified_terminal_state_is_not_verified_success() 
     assert ctx.turn_halt.kind.value == "delivered_unverified"
     assert ctx.last_full_workflow_test_ok is False
     assert ctx.last_test_suspicious_success is False
+
+
+def _registered_output_result(value: dict[str, Any], block_type: str = "CODE") -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_x",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_bill"],
+            "current_url": "https://example.com/account",
+            "blocks": [
+                {
+                    "label": "extract_bill",
+                    "block_type": block_type,
+                    "status": "completed",
+                    "extracted_data": {"bill_statement": value},
+                }
+            ],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_x",
+                    "output_parameter_id": "op_bill",
+                    "output_parameter_key": "bill_statement",
+                    "block_label": "extract_bill",
+                    "block_type": block_type,
+                    "value": value,
+                }
+            ],
+        },
+    }
+
+
+def _persisted_output_parameter_result(value: dict[str, Any], run_id: str = "wr_x") -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_bill"],
+            "current_url": "https://example.com/account",
+            "blocks": [],
+            "workflow_run_output_parameters": [
+                {
+                    "workflow_run_id": run_id,
+                    "output_parameter_id": "op_bill",
+                    "output_parameter_key": "bill_statement",
+                    "block_label": "extract_bill",
+                    "block_type": "CODE",
+                    "value": value,
+                }
+            ],
+        },
+    }
+
+
+def test_zero_requested_output_criteria_credit_fires_only_with_payload() -> None:
+    satisfied = _evaluated(("login", True))
+
+    assert zero_requested_output_criteria_credit(satisfied, has_meaningful_registered_output=True) is True
+    assert zero_requested_output_criteria_credit(satisfied, has_meaningful_registered_output=False) is False
+
+
+def test_zero_requested_output_criteria_credit_ignored_when_criteria_formed() -> None:
+    with_criteria = replace(_evaluated(("bill", True)), requested_output_criteria_count=1)
+
+    assert zero_requested_output_criteria_credit(with_criteria, has_meaningful_registered_output=True) is False
+
+
+def test_zero_requested_output_criteria_credit_requires_evaluated_full_satisfaction() -> None:
+    assert zero_requested_output_criteria_credit(None, has_meaningful_registered_output=True) is False
+    assert (
+        zero_requested_output_criteria_credit(
+            CompletionVerificationResult(status="unavailable"), has_meaningful_registered_output=True
+        )
+        is False
+    )
+    assert (
+        zero_requested_output_criteria_credit(_evaluated(("c0", False)), has_meaningful_registered_output=True) is False
+    )
+
+
+def test_zero_requested_output_criteria_withholds_verified_success() -> None:
+    ctx = _ctx_with_blocks("code")
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx,
+            _registered_output_result({"summary": "raw"}),
+            completion_verification=_evaluated(("login", True)),
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+    assert ctx.last_full_workflow_test_ok is False
+    assert any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+
+    other_ctx = _ctx_with_blocks("code")
+    other = _record_run_blocks_result(
+        other_ctx,
+        _registered_output_result({"amount_due": "$99.99", "statement_month": "January 2026"}),
+        completion_verification=_evaluated(("login", True)),
+    )
+    assert other is not None
+    assert other.verdict == recorded.verdict
+    assert other_ctx.delivered_unverified_terminal is True
+
+
+def test_zero_requested_output_criteria_withholds_verified_success_on_failed_run() -> None:
+    ctx = _ctx_with_blocks("code")
+    result = _registered_output_result({"summary": "raw"})
+    result["ok"] = False
+    result["data"]["overall_status"] = "canceled"
+
+    recorded = _record_run_blocks_result(
+        ctx,
+        result,
+        completion_verification=_evaluated(("login", True)),
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.last_test_ok is False
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+
+
+def test_requested_output_criteria_still_reach_verified_success() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = replace(_evaluated(("bill", True)), requested_output_criteria_count=1)
+
+    recorded = _record_run_blocks_result(
+        ctx, _registered_output_result({"summary": "raw"}), completion_verification=verification
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_zero_requested_output_criteria_empty_task_output_reaches_verified_success() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    empty_task_output = {
+        "task_id": "tsk_login",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+
+    recorded = _record_run_blocks_result(
+        ctx,
+        _registered_output_result(empty_task_output, block_type="EXTRACTION"),
+        completion_verification=_evaluated(("login", True)),
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_zero_requested_output_criteria_login_reach_state_stays_inert() -> None:
+    ctx = _ctx_with_blocks("navigation")
+    reach_state_envelope = {
+        "task_id": "tsk_nav",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    result = _registered_output_result(reach_state_envelope, block_type="NAVIGATION")
+
+    assert _has_meaningful_registered_output_payload(result["data"]) is False
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_zero_requested_output_criteria_lowercase_block_type_slices_empty_envelope() -> None:
+    ctx = _ctx_with_blocks("login")
+    reach_state_envelope = {
+        "task_id": "tsk_login",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    result = _registered_output_result(reach_state_envelope, block_type="login")
+
+    assert _has_meaningful_registered_output_payload(result["data"]) is False
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+@pytest.mark.parametrize("block_type", ["file_download", "goto_url", "human_interaction", "task_v2"])
+def test_zero_requested_output_criteria_every_task_backed_block_reach_state_stays_inert(block_type: str) -> None:
+    ctx = _ctx_with_blocks(block_type)
+    reach_state_envelope = {
+        "task_id": f"tsk_{block_type}",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    result = _registered_output_result(reach_state_envelope, block_type=block_type)
+
+    assert _has_meaningful_registered_output_payload(result["data"]) is False
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_task_envelope_block_types_matches_explicit_envelope_block_set() -> None:
+    # Explicit, human-maintained list of every block type whose output is a TaskOutput
+    # envelope. Independent of the production walk on purpose: TaskV2Block subclasses
+    # Block directly (not BaseTaskBlock), so a walk from BaseTaskBlock alone would drop
+    # it. If a new envelope block is added, update both this literal and the derivation.
+    expected = {
+        "LOGIN",
+        "NAVIGATION",
+        "EXTRACTION",
+        "ACTION",
+        "TASK",
+        "VALIDATION",
+        "FILE_DOWNLOAD",
+        "GOTO_URL",
+        "HUMAN_INTERACTION",
+        "TASK_V2",
+    }
+    assert _TASK_ENVELOPE_BLOCK_TYPES == expected
+
+
+def test_zero_requested_output_criteria_task_id_user_schema_is_meaningful() -> None:
+    ctx = _ctx_with_blocks("code")
+    user_schema = {"task_id": "tsk_1", "amount_due": "$3,927.75", "statement_month": "March 2026"}
+
+    recorded = _record_run_blocks_result(
+        ctx,
+        _registered_output_result(user_schema, block_type="CODE"),
+        completion_verification=_evaluated(("login", True)),
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": user_schema}
+
+
+def test_zero_requested_output_criteria_fires_on_persisted_output_parameters_only() -> None:
+    ctx = _ctx_with_blocks("code")
+
+    recorded = _record_run_blocks_result(
+        ctx, _persisted_output_parameter_result({"summary": "raw"}), completion_verification=_evaluated(("login", True))
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+
+
+def test_zero_requested_output_criteria_excludes_foreign_run_registered_output() -> None:
+    ctx = _ctx_with_blocks("code")
+    result = _registered_output_result({"summary": "raw"})
+    result["data"]["registered_output_parameter_values"].append(
+        {
+            "workflow_run_id": "wr_other",
+            "output_parameter_id": "op_stale",
+            "output_parameter_key": "stale_output",
+            "block_label": "stale_block",
+            "block_type": "CODE",
+            "value": {"stale": "prior-run"},
+        }
+    )
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+
+
+def test_zero_requested_output_criteria_empty_valid_deliverable_still_credits() -> None:
+    ctx = _ctx_with_blocks("code")
+
+    recorded = _record_run_blocks_result(
+        ctx, _registered_output_result({"rows": []}), completion_verification=_evaluated(("login", True))
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
 
 
 def test_record_run_blocks_verifies_structural_requested_output_with_run_corroborator() -> None:
