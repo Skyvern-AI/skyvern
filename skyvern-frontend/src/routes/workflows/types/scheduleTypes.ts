@@ -35,7 +35,8 @@ export type CreateScheduleRequest = {
 export type UpdateScheduleRequest = {
   cron_expression: string;
   timezone: string;
-  enabled: boolean;
+  // Omit to preserve the schedule's current enable/disable state on the server.
+  enabled?: boolean;
   parameters?: Record<string, unknown> | null;
   name?: string;
   description?: string;
