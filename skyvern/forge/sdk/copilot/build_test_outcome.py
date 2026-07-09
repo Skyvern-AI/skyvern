@@ -1561,7 +1561,7 @@ def _runtime_output_repair_facts(
         return []
     facts: list[dict[str, object]] = []
     for verdict in completion_verification.verdicts:
-        if verdict.satisfied or not verdict.output_path:
+        if not verdict.output_path:
             continue
         output_path = _bounded_ref(verdict.output_path)
         if not _output_path_has_child(output_path):
@@ -1575,7 +1575,13 @@ def _runtime_output_repair_facts(
             workflow_run_id,
             output_path,
         )
-        value_status = _runtime_output_value_status(values, verdict)
+        owner_labels = _runtime_output_owner_labels(blocks, block_labels, verdict)
+        if verdict.satisfied:
+            if not owner_labels:
+                continue
+            value_status = "satisfied"
+        else:
+            value_status = _runtime_output_value_status(values, verdict)
         fact: dict[str, object] = {
             "workflow_run_id": _bounded_ref(workflow_run_id),
             "output_path": output_path,
@@ -1584,8 +1590,10 @@ def _runtime_output_repair_facts(
             "reason_code": _bounded_ref(verdict.reason_code),
             "value_status": value_status,
         }
-        if len(block_labels) == 1:
-            fact["block_label"] = block_labels[0]
+        if verdict.satisfied or len(owner_labels) > 1:
+            fact["owner_labels"] = owner_labels
+        if len(owner_labels) == 1:
+            fact["block_label"] = owner_labels[0]
         if verdict.grounding_mode:
             fact["grounding_mode"] = verdict.grounding_mode
         if verdict.expected_output_shape:
@@ -1646,6 +1654,7 @@ def _runtime_output_values_for_path(
     values: list[object] = []
     evidence_refs: list[str] = []
     block_labels: list[str] = []
+    current_labels = {label for block in blocks for label in [_bounded_ref(block.get("label"))] if label}
     for item in registered_output_parameter_payloads:
         item_run_id = _safe_str(item.get("workflow_run_id"))
         if item_run_id != workflow_run_id:
@@ -1654,7 +1663,7 @@ def _runtime_output_values_for_path(
         if not present:
             continue
         values.append(value)
-        label = _bounded_ref(item.get("block_label"))
+        label = _registered_output_owner_label(item, current_labels)
         key = _bounded_ref(item.get("output_parameter_key"))
         if label:
             block_labels.append(label)
@@ -1675,6 +1684,34 @@ def _runtime_output_values_for_path(
     return values, list(dict.fromkeys(evidence_refs)), sorted(dict.fromkeys(block_labels))
 
 
+def _registered_output_owner_label(item: Mapping[str, object], current_labels: set[str]) -> str:
+    label = _bounded_ref(item.get("block_label"))
+    if label in current_labels:
+        return label
+    return ""
+
+
+def _runtime_output_owner_labels(
+    blocks: Sequence[Mapping[str, object]],
+    block_labels: Sequence[str],
+    verdict: CriterionVerdict,
+) -> list[str]:
+    if not verdict.satisfied and verdict.requested_output_evidence_source == "independent_run_evidence":
+        return []
+    current_labels = {label for block in blocks for label in [_bounded_ref(block.get("label"))] if label}
+    labels = {label for label in block_labels if label in current_labels}
+    evidence_label = _block_output_evidence_ref_label(verdict.evidence_ref)
+    if evidence_label in current_labels:
+        labels.add(evidence_label)
+    return sorted(labels)
+
+
+def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
+    if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
+        return ""
+    return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
+
+
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:
     value = item.get("value")
     key = _safe_str(item.get("output_parameter_key"))
@@ -1683,6 +1720,10 @@ def _registered_output_value_for_path(item: Mapping[str, object], output_path: s
     if output_path.startswith("output.") and key == output_path.split(".", 1)[1]:
         return value, True
     if isinstance(value, Mapping):
+        if output_path.startswith("output."):
+            unwrapped_value, unwrapped_present = _value_at_output_path(value, output_path.split(".", 1)[1])
+            if unwrapped_present:
+                return unwrapped_value, True
         return _value_at_output_path(value, output_path)
     return None, False
 
