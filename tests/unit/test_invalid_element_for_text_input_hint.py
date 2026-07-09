@@ -5,11 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import InvalidElementForTextInput, SkyvernException
+from skyvern.exceptions import InputToInvisibleElement, InvalidElementForTextInput, SkyvernException
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
 from skyvern.webeye.actions.responses import ActionFailure
+from skyvern.webeye.utils.dom import SkyvernElement
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -59,6 +60,59 @@ _TASK = make_task(_NOW, _ORG, navigation_payload={}, navigation_goal="set the fr
 _STEP = make_step(_NOW, _TASK, step_id="stp-date-hint-1", status=StepStatus.created, order=0, output=None)
 
 
+def _make_skyvern_element(tag_name: str, *, editable: bool, attributes: dict | None = None) -> SkyvernElement:
+    locator = MagicMock()
+    locator.is_editable = AsyncMock(return_value=editable)
+    locator.get_attribute = AsyncMock(return_value=None)
+    return SkyvernElement(
+        locator=locator,
+        frame=MagicMock(),
+        static_element={"tagName": tag_name, "attributes": attributes or {}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_iframe_does_not_support_text_input() -> None:
+    element = _make_skyvern_element("iframe", editable=False)
+    assert await element.supports_text_input() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag_name", ["input", "textarea", "select", "INPUT"])
+async def test_form_controls_support_text_input(tag_name: str) -> None:
+    element = _make_skyvern_element(tag_name, editable=False)
+    assert await element.supports_text_input() is True
+
+
+@pytest.mark.asyncio
+async def test_editable_element_supports_text_input() -> None:
+    element = _make_skyvern_element("div", editable=True)
+    assert await element.supports_text_input() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "class_name",
+    ["custom blinking-cursor", "custom Blinking-Cursor"],
+)
+async def test_blinking_cursor_element_supports_text_input(class_name: str) -> None:
+    element = _make_skyvern_element("div", editable=False, attributes={"class": class_name})
+    assert await element.supports_text_input() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["", "true", "plaintext-only"])
+async def test_contenteditable_supports_text_input(value: str) -> None:
+    element = _make_skyvern_element("div", editable=False, attributes={"contenteditable": value})
+    assert await element.supports_text_input() is True
+
+
+@pytest.mark.asyncio
+async def test_contenteditable_false_does_not_support_text_input() -> None:
+    element = _make_skyvern_element("div", editable=False, attributes={"contenteditable": "false"})
+    assert await element.supports_text_input() is False
+
+
 def _mock_span_segment_element() -> MagicMock:
     el = MagicMock()
     el.get_id.return_value = "AAAA"
@@ -75,6 +129,7 @@ def _mock_span_segment_element() -> MagicMock:
     el.get_attr = AsyncMock(return_value=None)
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=False)
+    el.supports_text_input = AsyncMock(return_value=False)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
     el.is_auto_completion_input = AsyncMock(return_value=False)
@@ -160,3 +215,103 @@ async def test_no_hint_when_resolved_context_is_none() -> None:
     message = results[0].exception_message or ""
     assert "doesn't support text input" in message
     assert "calendar" not in message.lower()
+
+
+def _mock_iframe_element(*, hidden: bool = False) -> MagicMock:
+    el = MagicMock()
+    el.get_id.return_value = "IFRM"
+    el.get_tag_name.return_value = "iframe"
+    el.get_frame.return_value = MagicMock()
+    locator = MagicMock()
+    locator.focus = AsyncMock()
+    el.get_locator.return_value = locator
+    el.is_disabled = AsyncMock(return_value=False)
+    el.supports_text_input = AsyncMock(return_value=False)
+    el.get_selectable = AsyncMock(return_value=False)
+    el.has_hidden_attr = AsyncMock(return_value=hidden)
+    el.is_readonly = AsyncMock(return_value=False)
+    el.get_attr = AsyncMock(return_value=None)
+    el.is_spinbtn_input = AsyncMock(return_value=False)
+    el.is_editable = AsyncMock(return_value=False)
+    el.input_clear = AsyncMock()
+    el.input_fill = AsyncMock()
+    return el
+
+
+@pytest.mark.asyncio
+async def test_input_text_rejects_iframe_before_clear_or_fill() -> None:
+    el = _mock_iframe_element()
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"IFRM": {"tagName": "iframe"}}
+
+    action = InputTextAction(element_id="IFRM", text="hello", reasoning="fill the field")
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=MagicMock()),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
+            return_value="hello",
+        ),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=None)),
+    ):
+        results = await handle_input_text_action(
+            action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == InvalidElementForTextInput.__name__
+    el.input_clear.assert_not_called()
+    el.input_fill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hidden_iframe_keeps_non_blocking_invisible_failure() -> None:
+    el = _mock_iframe_element(hidden=True)
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"IFRM": {"tagName": "iframe"}}
+
+    action = InputTextAction(element_id="IFRM", text="hello", reasoning="fill the field")
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=MagicMock()),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
+            return_value="hello",
+        ),
+        patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=None)),
+    ):
+        results = await handle_input_text_action(
+            action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == InputToInvisibleElement.__name__
+    assert results[0].stop_execution_on_failure is False
+    el.input_clear.assert_not_called()
+    el.input_fill.assert_not_called()
