@@ -3940,6 +3940,95 @@ async def wrapper({default_args}):
                 best_start = step.line_start
         return best
 
+    def _static_goto_url_from_line(self, line: str) -> str | None:
+        # AST-only on purpose: substring/regex matching would also fire on comments and string
+        # literals containing ".goto(", handing element-rot heals a URL they must never get.
+        stripped = line.strip()
+        if not stripped:
+            return None
+        try:
+            # Parses one physical line at a time, so a goto(...) call whose args wrap onto another
+            # line SyntaxErrors here and is treated as "no goto on this line" (safe, not a false match).
+            tree = ast.parse(f"async def _probe():\n    {stripped}", mode="exec")
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "goto":
+                continue
+            # Supported authoring forms are positional (page.goto("...")) and keyword
+            # (page.goto(url="...")); check positional first, then fall back to url=.
+            if node.args:
+                url_node: ast.expr | None = node.args[0]
+            else:
+                url_node = next((keyword.value for keyword in node.keywords if keyword.arg == "url"), None)
+            if url_node is None:
+                return ""
+            if not isinstance(url_node, ast.Constant) or not isinstance(url_node.value, str):
+                return ""
+            parsed = urlparse(url_node.value)
+            return url_node.value if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+        return None
+
+    def _static_url_from_goal(self) -> str:
+        # The goal is human free text (prompt + step descriptions), not code, so a URL regex is
+        # appropriate here (unlike the AST-only code scan). This is the authored destination the
+        # heal should reach when the block's own navigation rotted. Returns the first well-formed
+        # absolute http(s) URL, else "".
+        texts = [self.prompt or ""]
+        if self.steps:
+            texts.extend(step.description or "" for step in self.steps)
+        for text in texts:
+            match = re.search(r"https?://[^\s'\"<>)\]]+", text)
+            if not match:
+                continue
+            candidate = match.group(0).rstrip(".,;")
+            parsed = urlparse(candidate)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                return candidate
+        return ""
+
+    def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
+        code_lines = self.code.splitlines()
+        failing_idx = failing_line - 1
+        failing_source_line = code_lines[failing_idx] if 0 <= failing_idx < len(code_lines) else ""
+
+        # None = no goto on the failing line; "" = a goto with a non-static arg; a str = static url.
+        failing_goto_url = self._static_goto_url_from_line(failing_source_line)
+        failing_line_is_goto = failing_goto_url is not None
+
+        try:
+            page_url = recording_page.url
+        except Exception:
+            page_url = None
+        current_url = page_url if isinstance(page_url, str) else None
+        is_error_seat = bool(current_url and current_url.startswith("chrome-error://"))
+
+        # Only a navigation-failure / error-page seat gets navigation recourse — element-rot heals
+        # must never navigate away from live SPA state (H8).
+        if not (failing_line_is_goto or is_error_seat):
+            return ""
+
+        # The block goal is the source of truth for the intended destination; the code's own goto is
+        # what rotted (e.g. the host went dead), so prefer a URL the goal names over re-navigating to
+        # the failing goto's possibly-dead target. Fall back to the code goto only when the goal
+        # names no static URL (a real goto that merely failed transiently is still worth a retry).
+        goal_url = self._static_url_from_goal()
+        if goal_url:
+            return goal_url
+
+        if failing_line_is_goto:
+            return failing_goto_url or ""
+
+        # Error-page seat with a non-goto failing line: walk backward for the nearest STATIC goto,
+        # not the first in the block — an earlier goto can be stale, a later one hasn't executed.
+        for line in reversed(code_lines[:failing_idx]):
+            line_url = self._static_goto_url_from_line(line)
+            if line_url:
+                return line_url
+        return ""
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4043,6 +4132,8 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
         browser_session_id: str | None,
+        browser_state: BrowserState,
+        page: Page,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
@@ -4096,10 +4187,26 @@ async def wrapper({default_args}):
             heal_max_steps = settings.MAX_STEPS_PER_RUN
             if organization.max_steps_per_run is not None:
                 heal_max_steps = min(heal_max_steps, organization.max_steps_per_run)
-            # Blank url: the heal takes over the live, half-mutated page rather than re-navigating to it
-            # (a truthy task.url makes the browser manager reload the page on the browser-session path).
+            escalation_url = (
+                self._derive_escalation_navigation_url(failing_line, recording_page) if failing_line is not None else ""
+            )
+            if escalation_url:
+                # BROWSER_MANAGER can early-return a cached browser state without ever reading
+                # task.url, so escalation_task.url alone is not reliable navigation recourse.
+                # Drive the live browser_state/page the heal will run on directly instead.
+                try:
+                    await browser_state.navigate_to_url(page=page, url=escalation_url)
+                except Exception:
+                    LOG.warning(
+                        "Self-heal dead-nav escalation navigation failed; continuing from current page",
+                        workflow_run_block_id=workflow_run_block_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+            # Kept in sync with the direct navigate above for task-record consistency; empty except
+            # on dead-navigation seats (element-rot heals must never navigate — H8 same-session invariant).
             escalation_task = await app.DATABASE.tasks.create_task(
-                url="",
+                url=escalation_url,
                 title=self.label,
                 navigation_goal=navigation_goal,
                 data_extraction_goal=None,
@@ -4473,6 +4580,8 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
+                browser_state=browser_state,
+                page=page,
             )
             if healed is not None:
                 # Finalize the seat task to the heal outcome before the idempotent `finally` no-ops it,
