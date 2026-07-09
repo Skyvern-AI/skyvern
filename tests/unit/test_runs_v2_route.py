@@ -31,6 +31,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
                     "workflow_permanent_id": "wpid_123",
                     "workflow_deleted": False,
                     "script_run": False,
+                    "trigger_type": "mcp",
                     "searchable_text": "Workflow run",
                 }
             ]
@@ -66,6 +67,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
             "workflow_permanent_id": "wpid_123",
             "workflow_deleted": False,
             "script_run": False,
+            "trigger_type": "mcp",
         }
     ]
 
