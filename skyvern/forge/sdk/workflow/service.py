@@ -76,6 +76,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
@@ -7421,6 +7422,13 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+            submission_shadow.schedule_submission_signal_shadow(
+                har_data=har_data,
+                browser_state=browser_state,
+                last_step=last_step,
+                workflow_run=workflow_run,
+            )
         LOG.debug("Persisting har data", har_size=len(har_data))
         if har_data:
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -7503,6 +7511,13 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+            submission_shadow.schedule_submission_signal_shadow(
+                har_data=har_data,
+                browser_state=browser_state,
+                last_step=last_step,
+                workflow_run=workflow_run,
+            )
         LOG.debug("Persisting har data (bundled)", har_size=len(har_data))
         if har_data:
             task_archive_entries["har.har"] = (ArtifactType.HAR, har_data)
