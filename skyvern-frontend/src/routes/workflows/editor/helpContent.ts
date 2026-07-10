@@ -83,6 +83,14 @@ export const helpTooltips = {
       "Structured JSON data sent to the field-mapping model. Supports the {{ parameter | json }} filter.",
     llmKey: "Optional LLM key override for the field-mapping step.",
   },
+  split_pdf: {
+    ...baseHelpTooltipContent,
+    fileUrl:
+      "The source PDF URL, S3 URI, or file path from an earlier block output.",
+    prompt:
+      "Describe how to split the PDF. Use {{ parameter_name }} references when needed.",
+    llmKey: "Optional LLM key override for the split-planning step.",
+  },
   google_sheets_read: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:
@@ -172,7 +180,7 @@ export const helpTooltips = {
   wait: {
     ...baseHelpTooltipContent,
     waitInSeconds:
-      "Specify a number for how many seconds to wait. Value must be between 0 and 300 seconds.",
+      "Specify a number for how many seconds to wait. Value must be between 1 and 1800 seconds.",
   },
   pdfParser: {
     ...baseHelpTooltipContent,

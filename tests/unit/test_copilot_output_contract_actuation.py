@@ -514,7 +514,6 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_actuation_count_by_signature={},
         output_contract_declick_attempted_by_signature={},
         output_contract_dispatch_reopened_by_signature={},
-        output_contract_page_source_required_by_signature={},
         output_contract_page_extraction_imposed_by_signature={},
         output_contract_pending_run_evidence={},
         output_contract_run_output_observed_by_signature={},
@@ -1168,12 +1167,12 @@ def test_observed_but_unbound_run_without_page_extraction_is_not_exhaustion() ->
     assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
 
 
-def test_reopen_requires_observed_unbound_run_and_arms_page_source() -> None:
+def test_reopen_requires_observed_unbound_run_and_reenters_the_ladder() -> None:
     signature = "sig_reopen"
     ctx = _advisory_ctx()
     _mark_consumed_empty_run(ctx, signature, page_extraction=False)
     assert wu._reopen_dispatch_lacked_bound_extraction(ctx, signature) is True
-    assert ctx.output_contract_page_source_required_by_signature[signature] is True
+    assert ctx.output_contract_dispatch_reopened_by_signature[signature] is True
     assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.UNUSED
 
 
@@ -1338,26 +1337,11 @@ def test_run_output_evidence_deep_leaf_binds() -> None:
     assert ctx.output_contract_run_bound_required_path_by_signature[signature] is True
 
 
-def test_page_source_extraction_code_reads_page_and_is_not_click_only() -> None:
-    required = {"output.confirmation_number", "output.account_number", "output.start_date"}
-    keyed = wu._page_source_extraction_code(_CLICK_ONLY_CODE, required)
-    assert "await page.extract(" in keyed
-    assert "confirmation_number" in keyed
-    assert "account_number" in keyed
-    assert "start_date" in keyed
-    assert keyed.strip().endswith(f"return {wu._OUTPUT_CONTRACT_PAGE_EXTRACT_VAR}")
-    assert wu._output_contract_click_only_spine(keyed) is False
-
-
-def test_impose_page_source_extraction_rewrites_owner_block_code() -> None:
-    parsed = {
-        "workflow_definition": {"blocks": [{"block_type": "code", "label": "collect", "code": "page.click('#toggle')"}]}
-    }
-    imposed = wu._impose_page_source_extraction(
-        parsed, "collect", "page.click('#toggle')", {"output.confirmation_number"}
-    )
-    assert imposed is not None
-    assert "await page.extract(" in imposed
+def test_output_contract_never_imposes_a_page_extract_call() -> None:
+    """Code blocks run on a raw Playwright page, so no output-contract rung may author
+    page.extract -- it would resolve to the LLM extraction path and fail at runtime."""
+    assert not hasattr(wu, "_impose_page_source_extraction")
+    assert not hasattr(wu, "_page_source_extraction_code")
 
 
 def test_advisory_grant_downgraded_to_directive_when_run_authority_forbids_dispatch() -> None:

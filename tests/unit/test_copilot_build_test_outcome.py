@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_run_blocks_result,
     recorded_outcome_from_scout_act_observe_hollow,
+    run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -302,7 +303,11 @@ def test_prose_or_label_only_typed_outcome_is_not_authoritative() -> None:
 
 
 def test_record_none_clears_stale_latest_outcome() -> None:
-    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+    )
     record_build_test_outcome(
         ctx,
         RecordedBuildTestOutcome(
@@ -320,8 +325,76 @@ def test_record_none_clears_stale_latest_outcome() -> None:
     assert ctx.latest_recorded_build_test_outcome is None
 
 
+def test_record_authoritative_persisted_run_latches_run_backed_evidence() -> None:
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_recorded",
+            structural_failure_identity="runtime:failed",
+        ),
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="author_time_reject",
+            attempted_tool="update_workflow",
+            verdict="authoring_rejected",
+            reason_code="metadata_reject",
+            structural_failure_identity="metadata:missing",
+        ),
+    )
+
+    assert ctx.recorded_persisted_block_run_workflow_run_id == "wr_recorded"
+    assert run_backed_repair_evidence_exists(ctx) is True
+
+
+def test_fallback_run_id_without_recorded_persisted_outcome_is_not_run_backed() -> None:
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+        last_run_blocks_workflow_run_id="wr_stale",
+    )
+
+    assert run_backed_repair_evidence_exists(ctx) is False
+
+
+def test_non_authoritative_persisted_run_does_not_latch_run_backed_evidence() -> None:
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+    )
+    record_build_test_outcome(
+        ctx,
+        RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="update_and_run_blocks",
+            verdict="repairable_failure",
+            reason_code="runtime_block_failure",
+            workflow_run_id="wr_hollow",
+        ),
+    )
+
+    assert ctx.recorded_persisted_block_run_workflow_run_id is None
+    assert run_backed_repair_evidence_exists(ctx) is False
+
+
 def test_repeated_outcome_ignores_intervening_scout_evaluate_history() -> None:
-    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+    )
     author_reject = RecordedBuildTestOutcome(
         phase="author_time_reject",
         verdict="authoring_rejected",
@@ -343,7 +416,11 @@ def test_repeated_outcome_ignores_intervening_scout_evaluate_history() -> None:
 
 
 def test_repeated_outcome_still_detects_different_author_reject_after_scout_evaluate() -> None:
-    ctx = SimpleNamespace(latest_recorded_build_test_outcome=None, recorded_build_test_outcome_history=[])
+    ctx = SimpleNamespace(
+        latest_recorded_build_test_outcome=None,
+        recorded_build_test_outcome_history=[],
+        recorded_persisted_block_run_workflow_run_id=None,
+    )
     first_reject = RecordedBuildTestOutcome(
         phase="author_time_reject",
         verdict="authoring_rejected",

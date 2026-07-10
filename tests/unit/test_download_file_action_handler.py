@@ -1452,6 +1452,9 @@ async def test_handle_action_uses_xhr_staging_fallback_when_no_native_file(
 
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            # No native file lands in the observed dir, so the wait loop would burn
+            # the full no-signal grace before falling back to xhr staging; shorten it.
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
             patch(
@@ -1511,6 +1514,9 @@ async def test_handle_action_moves_multiple_staged_xhr_files_as_fallback(
 
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            # No native file lands in the observed dir, so the wait loop would burn
+            # the full no-signal grace before falling back to xhr staging; shorten it.
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
             patch(

@@ -319,6 +319,9 @@ def _record_scouted_interaction(
     typed_length: int = 0,
     role: str = "",
     accessible_name: str = "",
+    control_readonly: bool | None = None,
+    control_disabled: bool | None = None,
+    control_value_satisfied: bool | None = None,
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
@@ -347,6 +350,13 @@ def _record_scouted_interaction(
         artifact["role"] = role
     if accessible_name:
         artifact["accessible_name"] = accessible_name
+    if tool_name == "type_text":
+        if control_readonly is not None:
+            artifact["control_readonly"] = control_readonly
+        if control_disabled is not None:
+            artifact["control_disabled"] = control_disabled
+        if control_value_satisfied is not None:
+            artifact["control_value_satisfied"] = control_value_satisfied
     if credential_id:
         artifact["credential_id"] = credential_id
     if credential_field:
@@ -455,8 +465,15 @@ def _fill_carry_to_interaction(carry: FillCarry, trajectory_index: int) -> Scout
         interaction["accessible_name"] = carry.accessible_name
     if carry.typed_length:
         interaction["typed_length"] = carry.typed_length
-    if carry.tool_name == "type_text" and carry.typed_value:
-        interaction["typed_value"] = carry.typed_value
+    if carry.tool_name == "type_text":
+        if carry.typed_value:
+            interaction["typed_value"] = carry.typed_value
+        if carry.control_readonly is not None:
+            interaction["control_readonly"] = carry.control_readonly
+        if carry.control_disabled is not None:
+            interaction["control_disabled"] = carry.control_disabled
+        if carry.control_value_satisfied is not None:
+            interaction["control_value_satisfied"] = carry.control_value_satisfied
     elif carry.tool_name == "select_option" and carry.value:
         interaction["value"] = carry.value
     elif carry.tool_name == "fill_credential_field":

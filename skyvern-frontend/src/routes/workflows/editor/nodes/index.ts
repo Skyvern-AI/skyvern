@@ -58,6 +58,8 @@ import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
 import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
 import { PdfFillNode } from "./PdfFillNode/types";
 import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
+import { SplitPdfNode } from "./SplitPdfNode/types";
+import { SplitPdfNode as SplitPdfNodeComponent } from "./SplitPdfNode/SplitPdfNode";
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
@@ -91,7 +93,8 @@ export type WorkflowBlockNode =
   | WorkflowTriggerNode
   | GoogleSheetsReadNode
   | GoogleSheetsWriteNode
-  | PdfFillNode;
+  | PdfFillNode
+  | SplitPdfNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -154,4 +157,5 @@ export const nodeTypes = {
   googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
   googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
   pdfFill: wrapBlock(PdfFillNodeComponent),
+  splitPdf: wrapBlock(SplitPdfNodeComponent),
 } as const;

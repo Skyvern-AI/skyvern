@@ -23,6 +23,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
+    clear_terminal_evidence_on_workflow_edit,
     maybe_clear_blocker_signal_on_tool_success,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -454,6 +455,10 @@ def _ceiling_reached_contract() -> DiagnosisRepairContract:
     )
 
 
+def _mark_recorded_run_backed(ctx: CopilotContext) -> None:
+    ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
+
+
 def test_zero_run_ceiling_yields_to_code_authoring_churn_backstop() -> None:
     ctx = _fresh_context()
     ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
@@ -473,6 +478,7 @@ def test_run_backed_ceiling_precedes_code_authoring_churn_backstop() -> None:
     ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
+    _mark_recorded_run_backed(ctx)
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -481,6 +487,32 @@ def test_run_backed_ceiling_precedes_code_authoring_churn_backstop() -> None:
     signal = ctx.blocker_signal
     assert isinstance(signal, CopilotToolBlockerSignal)
     assert signal.internal_reason_code == "repair_ceiling_reached"
+
+
+def test_stale_fallback_run_id_does_not_make_ceiling_run_backed() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+    ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+    ctx.last_run_blocks_workflow_run_id = "wr_stale"
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def test_workflow_edit_clears_recorded_persisted_run_latch() -> None:
+    ctx = _fresh_context()
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
+    ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
+
+    clear_terminal_evidence_on_workflow_edit(ctx)
+
+    assert ctx.last_run_blocks_workflow_run_id is None
+    assert ctx.recorded_persisted_block_run_workflow_run_id is None
 
 
 def test_credential_priority_churn_raises_at_higher_bound() -> None:
@@ -528,6 +560,7 @@ def test_run_backed_ceiling_precedes_credential_priority_churn() -> None:
     ctx.last_code_authoring_reject_was_credential_priority = True
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
+    _mark_recorded_run_backed(ctx)
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -580,6 +613,7 @@ def test_run_backed_ceiling_precedes_no_progress_interaction_floor() -> None:
     ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
+    _mark_recorded_run_backed(ctx)
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -1129,6 +1129,14 @@ class ExecuteStep:
     params: dict[str, Any] = field(default_factory=dict)
 
 
+class ToolStepError(RuntimeError):
+    """Step failure that preserves the failing tool's structured error payload."""
+
+    def __init__(self, error: dict[str, Any]) -> None:
+        super().__init__(error.get("message", "Tool execution failed"))
+        self.error = error
+
+
 @dataclass
 class StepResult:
     step: int
@@ -1136,7 +1144,7 @@ class StepResult:
     ok: bool
     wall_ms: int = 0
     data: dict[str, Any] | None = None
-    error: str | None = None
+    error: str | dict[str, Any] | None = None
 
 
 @dataclass
@@ -1151,6 +1159,7 @@ async def do_execute(
     dispatch_fn: Any,
     steps: list[ExecuteStep],
     stop_on_error: bool = True,
+    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool] | None = None,
 ) -> ExecuteResult:
     """Execute a sequence of deterministic browser operations in one batch.
 
@@ -1161,6 +1170,9 @@ async def do_execute(
     nav_failed = False
 
     for i, step in enumerate(steps):
+        if step.tool == "navigate":
+            ref_map = {}
+
         # DESIGN-3: Block sensitive ops after failed navigate
         if nav_failed and not stop_on_error and step.tool in _SENSITIVE_TOOLS:
             results.append(
@@ -1177,16 +1189,23 @@ async def do_execute(
         t0 = time.monotonic()
         try:
             result = await dispatch_fn(step, ref_map)
+            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges).
+            # If session publication rejects the snapshot (a concurrent navigation
+            # invalidated it), the batch must not act on it either.
+            if step.tool == "observe" and result and "elements" in result:
+                new_map = {elem["ref"]: elem for elem in result["elements"]}
+                if on_ref_map_update is None or on_ref_map_update(new_map):
+                    ref_map = new_map
+                else:
+                    ref_map = {}
+
             wall_ms = int((time.monotonic() - t0) * 1000)
             results.append(StepResult(step=i, tool=step.tool, ok=True, wall_ms=wall_ms, data=result))
 
-            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges)
-            if step.tool == "observe" and result and "elements" in result:
-                ref_map = {elem["ref"]: elem for elem in result["elements"]}
-
         except Exception as e:
             wall_ms = int((time.monotonic() - t0) * 1000)
-            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=str(e)))
+            error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
+            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:

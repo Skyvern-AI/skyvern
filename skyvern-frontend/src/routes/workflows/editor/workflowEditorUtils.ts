@@ -56,6 +56,7 @@ import {
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
   PdfFillBlockYAML,
+  SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -165,6 +166,11 @@ import {
 } from "./nodes/PdfFillNode/types";
 import { validatePdfFillNode } from "./nodes/PdfFillNode/validate";
 import {
+  isSplitPdfNode,
+  splitPdfNodeDefaultData,
+} from "./nodes/SplitPdfNode/types";
+import { validateSplitPdfNode } from "./nodes/SplitPdfNode/validate";
+import {
   containsJinjaReference,
   getAffectedBlocks,
   removeJinjaReference,
@@ -231,6 +237,9 @@ function serializeLoopNodeWhileBranchToYAML(
 }
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
+
+// Mirrors the backend settings.WORKFLOW_WAIT_BLOCK_MAX_SEC (30 minutes).
+const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
 
 function serializeSecretResponsePaths(
   secretResponsePaths: Array<string>,
@@ -914,7 +923,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
-          dataSchema: "null",
         },
       };
     }
@@ -1138,6 +1146,20 @@ function convertToNode(
             typeof block.payload === "string"
               ? block.payload
               : JSON.stringify(block.payload || {}, null, 2),
+          llmKey: block.llm_key ?? "",
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "split_pdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...commonData,
+          fileUrl: block.file_url ?? "",
+          prompt: block.prompt ?? "",
           llmKey: block.llm_key ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
         },
@@ -2562,6 +2584,17 @@ function createNode(
         },
       };
     }
+    case "splitPdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...splitPdfNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "workflowTrigger": {
       return {
         ...identifiers,
@@ -3139,6 +3172,16 @@ function getWorkflowBlock(
         file_url: node.data.fileUrl,
         prompt: node.data.prompt,
         payload: JSONSafeOrStringAllowArrays(node.data.payload),
+        llm_key: node.data.llmKey || null,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "splitPdf": {
+      return {
+        ...base,
+        block_type: "split_pdf",
+        file_url: node.data.fileUrl,
+        prompt: node.data.prompt,
         llm_key: node.data.llmKey || null,
         parameter_keys: node.data.parameterKeys,
       };
@@ -4488,6 +4531,17 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "split_pdf": {
+        const blockYaml: SplitPdfBlockYAML = {
+          ...base,
+          block_type: "split_pdf",
+          file_url: block.file_url,
+          prompt: block.prompt,
+          llm_key: block.llm_key,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "workflow_trigger": {
         const blockYaml: WorkflowTriggerBlockYAML = {
           ...base,
@@ -4782,6 +4836,17 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
     if (!isNumber) {
       errors.push(`${node.data.label}: Invalid input for wait time.`);
+      return;
+    }
+
+    // Mirror the backend bounds (InvalidWaitBlockTime rejects <= 0 or
+    // > WORKFLOW_WAIT_BLOCK_MAX_SEC) so a save fails fast instead of passing
+    // validation and then erroring at run time.
+    const waitSeconds = Number(waitTimeString);
+    if (waitSeconds < 1 || waitSeconds > WORKFLOW_WAIT_BLOCK_MAX_SEC) {
+      errors.push(
+        `${node.data.label}: Wait time must be between 1 and ${WORKFLOW_WAIT_BLOCK_MAX_SEC} seconds.`,
+      );
     }
   });
 
@@ -4829,6 +4894,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isPdfFillNode)
     .forEach((node) => errors.push(...validatePdfFillNode(node)));
+
+  nodes
+    .filter(isSplitPdfNode)
+    .forEach((node) => errors.push(...validateSplitPdfNode(node)));
 
   return errors;
 }

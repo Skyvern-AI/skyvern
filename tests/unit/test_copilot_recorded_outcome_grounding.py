@@ -240,6 +240,56 @@ def test_authoritative_persisted_outcome_arms_without_recorded_signature_prefix(
     assert requirement.satisfied is False
 
 
+def test_run_backed_author_time_reject_stashes_repair_ceiling_on_first_crossing() -> None:
+    outcome = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        attempted_tool="update_workflow",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        block_labels=["search_records"],
+        structural_failure_identity="metadata:missing-output",
+    )
+    ctx = _ctx(outcome)
+    key = outcome.structural_key
+    assert key is not None
+    ctx.recorded_persisted_block_run_workflow_run_id = "wr_prior"
+    ctx.last_repair_non_convergence_signature = f"recorded_build_test_outcome:{key}"
+    ctx.consecutive_non_converging_repair_count = settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL - 1
+    contract = _contract()
+
+    _update_repair_loop_state(ctx, contract)
+
+    assert contract.repair_decision.next_action is RepairNextAction.STOP
+    assert contract.repair_loop_state.ceiling_reached is True
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind is TurnHaltKind.REPAIR_CEILING_REACHED
+
+
+def test_zero_run_author_time_reject_does_not_stash_repair_ceiling_on_first_crossing() -> None:
+    outcome = RecordedBuildTestOutcome(
+        phase="author_time_reject",
+        attempted_tool="update_workflow",
+        verdict="authoring_rejected",
+        reason_code="metadata_reject",
+        block_labels=["search_records"],
+        structural_failure_identity="metadata:missing-output",
+    )
+    ctx = _ctx(outcome)
+    key = outcome.structural_key
+    assert key is not None
+    ctx.last_run_blocks_workflow_run_id = "wr_stale"
+    ctx.last_repair_non_convergence_signature = f"recorded_build_test_outcome:{key}"
+    ctx.consecutive_non_converging_repair_count = settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL - 1
+    contract = _contract()
+
+    _update_repair_loop_state(ctx, contract)
+
+    assert contract.repair_loop_state.ceiling_reached is True
+    assert contract.repair_decision.next_action is RepairNextAction.REPAIR
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+
+
 def test_progress_observed_outcome_does_not_arm_from_executed_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -85,6 +85,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
+from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -638,6 +639,22 @@ def block_yaml_to_block(
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:
+        missing_smtp_keys = [
+            key
+            for key in (
+                block_yaml.smtp_host_secret_parameter_key,
+                block_yaml.smtp_port_secret_parameter_key,
+                block_yaml.smtp_username_secret_parameter_key,
+                block_yaml.smtp_password_secret_parameter_key,
+            )
+            if key not in parameters
+        ]
+        if missing_smtp_keys:
+            raise InvalidWorkflowDefinition(
+                f"Send email block '{block_yaml.label}' references undefined parameter(s): "
+                f"{', '.join(sorted(set(missing_smtp_keys)))}. "
+                "Declare these parameters in the workflow before using them."
+            )
         return SendEmailBlock(
             **base_kwargs,
             smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
@@ -875,6 +892,16 @@ def block_yaml_to_block(
             payload=block_yaml.payload,
             llm_key=block_yaml.llm_key,
             parameters=pdf_fill_block_parameters,
+        )
+
+    elif block_yaml.block_type == BlockType.SPLIT_PDF:
+        split_pdf_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return SplitPdfBlock(
+            **base_kwargs,
+            file_url=block_yaml.file_url,
+            prompt=block_yaml.prompt,
+            llm_key=block_yaml.llm_key,
+            parameters=split_pdf_block_parameters,
         )
 
     elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:

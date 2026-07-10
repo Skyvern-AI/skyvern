@@ -247,6 +247,7 @@ class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
 class _TerminalEvidenceResetCtx(Protocol):
     last_run_blocks_workflow_run_id: str | None
     last_successful_run_blocks_workflow_run_id: str | None
+    recorded_persisted_block_run_workflow_run_id: str | None
     last_run_blocks_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
     last_run_outcome: RecordedRunOutcome | None
@@ -282,6 +283,7 @@ def terminal_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> TerminalEvidence:
 def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> None:
     ctx.last_run_blocks_workflow_run_id = None
     ctx.last_successful_run_blocks_workflow_run_id = None
+    ctx.recorded_persisted_block_run_workflow_run_id = None
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None

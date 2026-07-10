@@ -63,6 +63,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   goto_url: "url",
   http_request: "http_request",
   pdf_fill: "pdfFill",
+  split_pdf: "splitPdf",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
 };

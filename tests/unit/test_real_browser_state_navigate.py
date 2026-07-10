@@ -20,6 +20,14 @@ def browser_state() -> RealBrowserState:
     return state
 
 
+@pytest.fixture(autouse=True)
+def _instant_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests assert on strategy order and exceptions, not wall-clock timing.
+    # Collapse the retry backoff and the post-navigation settle to run instantly.
+    monkeypatch.setattr("skyvern.webeye.navigation.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.asyncio.sleep", AsyncMock())
+
+
 def test_same_page_ignoring_fragment_matches_fragment_only_differences() -> None:
     assert _same_page_ignoring_fragment("https://example.test/results#section", "https://example.test/results") is True
     assert _same_page_ignoring_fragment("https://example.test/results/", "https://example.test/results") is True

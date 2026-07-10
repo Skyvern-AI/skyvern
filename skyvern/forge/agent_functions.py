@@ -43,7 +43,7 @@ from skyvern.forge.sdk.services import google_drive_service, google_oauth_servic
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
-from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
+from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
@@ -54,6 +54,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
 
@@ -114,6 +115,22 @@ class FieldOptionResolution:
     matched_value: str | None
     confidence: float
     fallback_to_llm: bool
+
+
+@dataclass
+class CodeBlockEngineFailure:
+    error_code: str | None
+    safe_message: str | None
+    failure_reason: str | None
+    exception_class: str | None
+    failing_line: int | None
+    healability_hint: bool | None
+
+
+@dataclass
+class CodeBlockEngineResult:
+    block_result: BlockResult | None
+    failure: CodeBlockEngineFailure | None
 
 
 def _remove_rect(element: dict) -> None:
@@ -819,7 +836,8 @@ class AgentFunction:
         workflow_run_context: "WorkflowRunContext",
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
-    ) -> Any | None:
+        recording_page: "RecordingPage | None" = None,
+    ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
 
         OSS no-op returns None so callers fall through to in-process execution. Cloud

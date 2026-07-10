@@ -39,6 +39,11 @@ LOG = structlog.get_logger()
 _EXTRACT_FORM_FIELDS_JS: str | None = None
 
 
+def _is_pointer_interception_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "intercepts pointer events" in message or "intercepted by another element" in message
+
+
 def _get_extract_form_fields_js() -> str:
     """Load the base form field extraction JS (cached after first read)."""
     global _EXTRACT_FORM_FIELDS_JS
@@ -288,6 +293,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -298,6 +304,7 @@ class SkyvernPage(Page):
         prompt: str,
         ai: str | None = "fallback",
         mode: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -310,6 +317,7 @@ class SkyvernPage(Page):
         ai: str | None = "fallback",
         mode: str | None = None,
         recoverable_marker_id: int | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
@@ -377,8 +385,11 @@ class SkyvernPage(Page):
                 try:
                     # Retry selector lookup to handle page transitions (redirects,
                     # slow renders) before burning an expensive AI fallback call.
-                    locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
-                    await self._prepare_element(locator, timeout=timeout)
+                    if _skip_element_prep:
+                        locator = self._locator_scope.locator(selector).first
+                    else:
+                        locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
+                        await self._prepare_element(locator, timeout=timeout)
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
@@ -388,21 +399,27 @@ class SkyvernPage(Page):
                             selector=selector,
                         )
                         return selector
+                    should_retry_after_escape = (
+                        not _skip_element_prep
+                        or not isinstance(e, PlaywrightTimeoutError)
+                        or _is_pointer_interception_error(e)
+                    )
                     # The click may have failed because an autocomplete dropdown
                     # or other overlay is covering the target element.  Press
                     # Escape to dismiss it and retry once before falling to AI.
-                    try:
-                        await self.page.keyboard.press("Escape")
-                        await asyncio.sleep(0.3)
-                        locator = self._locator_scope.locator(selector).first
-                        await locator.click(timeout=timeout, **kwargs)
-                        LOG.info(
-                            "CSS selector click succeeded after dismissing overlay",
-                            selector=selector,
-                        )
-                        return selector
-                    except Exception:
-                        pass  # retry failed too — fall through to AI
+                    if should_retry_after_escape:
+                        try:
+                            await self.page.keyboard.press("Escape")
+                            await asyncio.sleep(0.3)
+                            locator = self._locator_scope.locator(selector).first
+                            await locator.click(timeout=timeout, **kwargs)
+                            LOG.info(
+                                "CSS selector click succeeded after dismissing overlay",
+                                selector=selector,
+                            )
+                            return selector
+                        except Exception:
+                            pass  # retry failed too — fall through to AI
                     LOG.info(
                         "CSS selector click failed, falling back to AI",
                         sampling=True,
@@ -476,6 +493,7 @@ class SkyvernPage(Page):
         mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str: ...
 
@@ -490,6 +508,7 @@ class SkyvernPage(Page):
         mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str: ...
 
@@ -505,6 +524,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -601,6 +621,7 @@ class SkyvernPage(Page):
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             recoverable_marker_id=recoverable_marker_id,
+            _skip_element_prep=_skip_element_prep,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -613,6 +634,8 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
+        *,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
         # Backward compatibility
@@ -636,6 +659,7 @@ class SkyvernPage(Page):
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             recoverable_marker_id=recoverable_marker_id,
+            _skip_element_prep=_skip_element_prep,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -946,6 +970,7 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         recoverable_marker_id: int | None = None,
+        _skip_element_prep: bool = False,
     ) -> str:
         """Input text into an element identified by ``selector``.
 
@@ -981,8 +1006,11 @@ class SkyvernPage(Page):
                     )
                     # Retry selector lookup to handle page transitions (redirects,
                     # slow renders) before burning an expensive AI fallback call.
-                    locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
-                    await self._prepare_element(locator, timeout=timeout)
+                    if _skip_element_prep:
+                        locator = self._locator_scope.locator(selector).first
+                    else:
+                        locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
+                        await self._prepare_element(locator, timeout=timeout)
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
                     # dropdowns on search bars and typeaheads which destabilise the DOM

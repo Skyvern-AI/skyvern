@@ -36,6 +36,8 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 LOG = structlog.get_logger()
 PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
+_AUTHORING_INTENTS = {"author_now", "defer_authoring"}
+DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
 _RAW_SECRET_HANDLINGS = {"none", "block", "redacted_draft"}
 _CLASSIFIER_FAILURE_KINDS = {
@@ -48,6 +50,7 @@ _CLASSIFIER_FAILURE_KINDS = {
 }
 _CLASSIFICATION_RESPONSE_FIELDS = {
     "testing_intent",
+    "authoring_intent",
     "credential_input_kind",
     "credential_refs",
     "login_page_urls",
@@ -153,6 +156,7 @@ _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
 )
+_CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
 _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
@@ -296,6 +300,7 @@ class CompletionCriterion:
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
+    authoring_intent: str = "author_now"
     credential_input_kind: str = "none"
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
@@ -335,6 +340,7 @@ class RequestPolicy:
     def to_trace_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "testing_intent": self.testing_intent,
+            "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
@@ -388,6 +394,7 @@ class RequestPolicy:
     def prompt_summary(self) -> str:
         lines = [
             f"testing_intent: {self.testing_intent}",
+            f"authoring_intent: {self.authoring_intent}",
             f"credential_input_kind: {self.credential_input_kind}",
             f"clarification_reason: {self.clarification_reason}",
             f"allow_update_workflow: {self.allow_update_workflow}",
@@ -431,6 +438,21 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     if request_policy is None:
         return False
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def is_defer_authoring_durable_fill_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id == DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID
+
+
+def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id=DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID,
+        outcome="the live form is filled on the page this turn",
+        kind="terminal_action",
+        terminal_action_family="form",
+        method_mandated=True,
+        level="run",
+    )
 
 
 def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
@@ -750,6 +772,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     if raw is None:
         return RequestPolicy()
     testing_intent = raw.get("testing_intent")
+    authoring_intent = raw.get("authoring_intent")
     credential_input_kind = raw.get("credential_input_kind")
     completion_contract_raw = raw.get("completion_contract")
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
@@ -757,6 +780,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
+        authoring_intent=authoring_intent if authoring_intent in _AUTHORING_INTENTS else "author_now",
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
@@ -2094,33 +2118,52 @@ async def _load_credentials(organization_id: str) -> list[Credential]:
         page += 1
 
 
-def _fallback_credential_name_candidates(user_message: str) -> list[str]:
+def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
+    return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
+
+
+def _exact_credential_name_candidates(user_message: str) -> list[str]:
+    text = user_message or ""
     candidates: list[str] = []
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(user_message or ""):
-        value = next((group for group in match.groups() if group), "")
-        if value.strip():
-            candidates.append(value.strip())
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(user_message or ""):
+    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
+        value = next((group for group in match.groups() if group), "").strip()
+        if value and _quote_in_credential_context(text, match.start()):
+            candidates.append(value)
+    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
         value = match.group(1).strip()
         if value:
             candidates.append(value)
     return _clean_list(candidates)
 
 
-async def _apply_fallback_credential_name_scope(
+def _exact_credential_name_scan_eligible(policy: RequestPolicy) -> bool:
+    if policy.raw_secret_detected:
+        return False
+    if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+        return False
+    if policy.credential_input_kind == "credential_name" and policy.credential_refs:
+        return False
+    return policy.credential_input_kind in ("none", "credential_name", "website_stored_credential")
+
+
+async def _apply_exact_credential_name_scope(
     policy: RequestPolicy,
     *,
     user_message: str,
     organization_id: str,
 ) -> None:
-    if policy.classifier_status != "fallback":
+    if not _exact_credential_name_scan_eligible(policy):
         return
-    if policy.raw_secret_detected or policy.credential_input_kind not in ("none", "credential_name"):
-        return
-    candidates = _fallback_credential_name_candidates(user_message)
+    candidates = _exact_credential_name_candidates(user_message)
     if not candidates:
         return
     credentials = await _load_credentials(organization_id)
+    if (
+        policy.credential_input_kind == "website_stored_credential"
+        and policy.login_page_urls
+        and _match_by_url(credentials, policy.login_page_urls)
+    ):
+        return
     matched_names = _clean_list(
         [candidate for candidate in candidates if any(credential.name == candidate for credential in credentials)]
     )
@@ -2567,14 +2610,14 @@ async def build_request_policy(
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
     try:
-        await _apply_fallback_credential_name_scope(
+        await _apply_exact_credential_name_scope(
             policy,
             user_message=user_message,
             organization_id=organization_id,
         )
     except Exception:
         LOG.warning(
-            "request-policy fallback credential-name extraction failed",
+            "request-policy exact credential-name extraction failed",
             organization_id=organization_id,
             exc_info=True,
         )
@@ -2674,6 +2717,12 @@ async def build_request_policy(
                 policy,
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
+
+    if policy.authoring_intent == "defer_authoring":
+        policy.allow_update_workflow = False
+        policy.allow_run_blocks = False
+        if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
+            policy.completion_criteria = list(policy.completion_criteria) + [_defer_authoring_durable_fill_criterion()]
 
     trace_data = policy.to_trace_data()
     if policy.classifier_status == "fallback":

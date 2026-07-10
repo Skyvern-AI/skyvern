@@ -10,8 +10,17 @@ from fastapi import BackgroundTasks, HTTPException
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
+
+
+def _caller(org_id: str = "org_123") -> SimpleNamespace:
+    return SimpleNamespace(
+        organization=SimpleNamespace(organization_id=org_id),
+        caller_id="user_123",
+        caller_type=CallerType.USER,
+    )
 
 
 @pytest.mark.asyncio
@@ -31,6 +40,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
                     "workflow_permanent_id": "wpid_123",
                     "workflow_deleted": False,
                     "script_run": False,
+                    "trigger_type": "mcp",
                     "searchable_text": "Workflow run",
                 }
             ]
@@ -66,6 +76,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
             "workflow_permanent_id": "wpid_123",
             "workflow_deleted": False,
             "script_run": False,
+            "trigger_type": "mcp",
         }
     ]
 
@@ -179,8 +190,11 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
             return_value=[(SimpleNamespace(key="customer"), SimpleNamespace(value="acme"))]
         ),
     )
+    mock_tags = SimpleNamespace(
+        get_active_grouped_tags_for_run=AsyncMock(return_value={"env": "prod", "skyvern.platform": "example-platform"})
+    )
     mock_debug = SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False))
-    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs, debug=mock_debug)
+    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs, debug=mock_debug, tags=mock_tags)
     mock_workflow_service = SimpleNamespace(
         get_workflow=AsyncMock(
             return_value=SimpleNamespace(version=7, title="Original workflow title", organization_id="org_123")
@@ -195,7 +209,6 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     monkeypatch.setattr(agent_protocol.skyvern_context, "ensure_context", lambda: SimpleNamespace(request_id="req_123"))
     mock_agent_function = SimpleNamespace(
         is_block_scoped_workflow_run=AsyncMock(return_value=False),
-        get_workflow_run_metadata=AsyncMock(return_value={"env": "prod"}),
     )
     monkeypatch.setattr(app_instance, "AGENT_FUNCTION", mock_agent_function, raising=False)
 
@@ -209,11 +222,12 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     run_workflow_mock = AsyncMock(return_value=retried_run)
     monkeypatch.setattr(agent_protocol.workflow_service, "run_workflow", run_workflow_mock)
 
+    caller = _caller()
     response = await agent_protocol.retry_workflow_run(
         request=SimpleNamespace(),
         background_tasks=BackgroundTasks(),
         workflow_run_id="wr_original",
-        current_org=SimpleNamespace(organization_id="org_123"),
+        caller=caller,
         x_api_key="api-key",
         x_max_steps_override=10,
         x_user_agent="skyvern-ui",
@@ -228,9 +242,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         workflow_run_id="wr_original",
     )
     mock_agent_function.is_block_scoped_workflow_run.assert_awaited_once_with(original_run)
-    mock_permission_checker.check.assert_awaited_once_with(
-        SimpleNamespace(organization_id="org_123"), browser_session_id="pbs_123"
-    )
+    mock_permission_checker.check.assert_awaited_once_with(caller.organization, browser_session_id="pbs_123")
     mock_rate_limiter.rate_limit_submit_run.assert_awaited_once_with("org_123")
     mock_workflow_service.get_workflow.assert_awaited_once_with(
         workflow_id="wf_original",
@@ -239,7 +251,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     mock_workflow_runs.get_workflow_run_parameters.assert_awaited_once_with(
         workflow_run_id="wr_original",
     )
-    mock_agent_function.get_workflow_run_metadata.assert_awaited_once_with(
+    mock_tags.get_active_grouped_tags_for_run.assert_awaited_once_with(
         workflow_run_id="wr_original",
         organization_id="org_123",
     )
@@ -254,6 +266,9 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     assert call_kwargs["request_id"] == "req_123"
     assert call_kwargs["trigger_type"] == WorkflowRunTriggerType.manual
     assert call_kwargs["ignore_inherited_workflow_system_prompt"] is True
+    assert call_kwargs["tag_write_context"].caller_id == "user_123"
+    assert call_kwargs["tag_write_context"].source == TagSource.MANUAL
+    assert call_kwargs["tag_write_context"].caller_type == CallerType.USER
     assert isinstance(call_kwargs["workflow_request"], WorkflowRequestBody)
     assert call_kwargs["workflow_request"].data == {"customer": "acme"}
     assert call_kwargs["workflow_request"].webhook_callback_url == "https://example.com/webhook"
@@ -308,7 +323,7 @@ async def test_retry_workflow_run_rejects_block_scoped_run(monkeypatch: pytest.M
             request=SimpleNamespace(),
             background_tasks=BackgroundTasks(),
             workflow_run_id="wr_block",
-            current_org=SimpleNamespace(organization_id="org_123"),
+            caller=_caller(),
             x_api_key=None,
             x_max_steps_override=None,
             x_user_agent=None,
@@ -363,7 +378,8 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         get_workflow_run_parameters=AsyncMock(return_value=[]),
     )
     mock_debug = SimpleNamespace(has_block_run_for_workflow_run=AsyncMock(return_value=False))
-    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs, debug=mock_debug)
+    mock_tags = SimpleNamespace(get_active_grouped_tags_for_run=AsyncMock(side_effect=RuntimeError("tags unavailable")))
+    mock_database = SimpleNamespace(workflow_runs=mock_workflow_runs, debug=mock_debug, tags=mock_tags)
     mock_workflow_service = SimpleNamespace(
         get_workflow=AsyncMock(
             return_value=SimpleNamespace(version=3, title="Template title", organization_id="template_org")
@@ -379,7 +395,6 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         "AGENT_FUNCTION",
         SimpleNamespace(
             is_block_scoped_workflow_run=AsyncMock(return_value=False),
-            get_workflow_run_metadata=AsyncMock(side_effect=RuntimeError("metadata unavailable")),
         ),
         raising=False,
     )
@@ -398,7 +413,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         request=SimpleNamespace(),
         background_tasks=BackgroundTasks(),
         workflow_run_id="wr_template",
-        current_org=SimpleNamespace(organization_id="org_123"),
+        caller=_caller(),
         x_api_key=None,
         x_max_steps_override=None,
         x_user_agent=None,
@@ -409,6 +424,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
     assert run_workflow_mock.call_args.kwargs["version"] == 3
     assert run_workflow_mock.call_args.kwargs["ignore_inherited_workflow_system_prompt"] is False
     assert run_workflow_mock.call_args.kwargs["workflow_request"].run_metadata is None
+    assert run_workflow_mock.call_args.kwargs["tag_write_context"].caller_id == "user_123"
     mock_workflow_service.get_workflow.assert_awaited_once_with(
         workflow_id="wf_template",
         organization_id=None,
@@ -462,7 +478,7 @@ async def test_retry_workflow_run_rejects_missing_workflow(monkeypatch: pytest.M
             request=SimpleNamespace(),
             background_tasks=BackgroundTasks(),
             workflow_run_id="wr_missing_workflow",
-            current_org=SimpleNamespace(organization_id="org_123"),
+            caller=_caller(),
             x_api_key=None,
             x_max_steps_override=None,
             x_user_agent=None,
@@ -488,7 +504,7 @@ async def test_retry_workflow_run_rejects_active_run(monkeypatch: pytest.MonkeyP
             request=SimpleNamespace(),
             background_tasks=BackgroundTasks(),
             workflow_run_id="wr_running",
-            current_org=SimpleNamespace(organization_id="org_123"),
+            caller=_caller(),
             x_api_key=None,
             x_max_steps_override=None,
             x_user_agent=None,

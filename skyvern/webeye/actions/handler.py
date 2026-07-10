@@ -2827,6 +2827,27 @@ async def handle_input_text_action(
         skyvern_element=skyvern_element,
         step=step,
     )
+    if not await skyvern_element.supports_text_input():
+        if await skyvern_element.has_hidden_attr():
+            return [ActionFailure(InputToInvisibleElement(skyvern_element.get_id()), stop_execution_on_failure=False)]
+
+        is_date_related = input_or_select_context is not None and input_or_select_context.is_date_related is True
+        LOG.warning(
+            "Target element does not support text input, rejecting input text action",
+            action_type=action.action_type,
+            element_id=skyvern_element.get_id(),
+            tag_name=tag_name,
+            is_date_related=is_date_related,
+        )
+        return [
+            ActionFailure(
+                InvalidElementForTextInput(
+                    element_id=action.element_id,
+                    tag_name=tag_name,
+                    is_date_related=is_date_related,
+                )
+            )
+        ]
 
     # check if it's selectable
     if (
@@ -2999,7 +3020,7 @@ async def handle_input_text_action(
     # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
     # we need find a better way to detect the attribute in the future
     class_name: str | None = await skyvern_element.get_attr("class")
-    if class_name and "blinking-cursor" in class_name:
+    if class_name and "blinking-cursor" in class_name.lower():
         if is_totp_value:
             text = generate_totp_value_with_task(task=task, parameter=action.text)
         await skyvern_element.press_fill(text=text)

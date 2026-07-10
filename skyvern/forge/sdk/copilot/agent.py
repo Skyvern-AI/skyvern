@@ -44,7 +44,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase, initial_build_phase
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -152,6 +152,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_request_policy,
     credential_prompt_reason,
+    is_defer_authoring_durable_fill_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
@@ -177,10 +178,12 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     RequiredContextKey,
     TurnIntent,
     TurnIntentClassifierResult,
+    TurnIntentExpectedOutput,
     TurnIntentMode,
     TurnIntentReasonCode,
     build_turn_intent,
     classify_turn_intent,
+    turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
@@ -459,12 +462,14 @@ def _reconcile_completion_criteria_on_context(
     policy_inputs: RequestPolicyGuardrailInputs,
 ) -> None:
     fresh_criteria = list(policy.completion_criteria)
+    durable_fill_carriers = [c for c in fresh_criteria if is_defer_authoring_durable_fill_criterion(c)]
     floored_fresh, fresh_floor_rekeyed_paths = apply_requested_output_producer_floor(fresh_criteria)
     if fresh_floor_rekeyed_paths:
         policy.completion_criteria = list(floored_fresh)
     snapshot = policy_inputs.stored_completion_criteria
     if snapshot is None:
         _log_requested_output_producer_floor(fresh_floor_rekeyed_paths)
+        _restore_durable_fill_carriers(policy, durable_fill_carriers)
         return
     requested_output_path_aliases = (
         ctx.copilot_config.requested_output_path_aliases if ctx.copilot_config is not None else None
@@ -482,6 +487,16 @@ def _reconcile_completion_criteria_on_context(
     if decision.action == "adopt_stored" or floor_rekeyed_paths:
         policy.completion_criteria = list(floored_criteria)
     _log_requested_output_producer_floor(floor_rekeyed_paths)
+    _restore_durable_fill_carriers(policy, durable_fill_carriers)
+
+
+def _restore_durable_fill_carriers(policy: RequestPolicy, carriers: list[CompletionCriterion]) -> None:
+    if not carriers:
+        return
+    present_ids = {criterion.id for criterion in policy.completion_criteria}
+    missing = [carrier for carrier in carriers if carrier.id not in present_ids]
+    if missing:
+        policy.completion_criteria = list(policy.completion_criteria) + missing
 
 
 def _store_request_policy_on_context(
@@ -3599,6 +3614,15 @@ def _structural_infeasibility_question(turn_intent: TurnIntent | None) -> str | 
     return question or None
 
 
+def _infeasibility_bail_question(turn_intent: TurnIntent | None) -> str | None:
+    """The pre-loop clarification question, or None when the turn must not bail. A
+    defer-authoring live-fill turn decides feasibility post-session at the actuation
+    hook, so it never takes the pre-loop bail even when judged structurally infeasible."""
+    if turn_intent_defers_authoring_live_fill(turn_intent):
+        return None
+    return _structural_infeasibility_question(turn_intent)
+
+
 def _build_infeasibility_clarification_result(
     question: str,
     user_message: str,
@@ -3646,6 +3670,86 @@ def _build_infeasibility_clarification_result(
             ),
         ),
         exit_site="feasibility_clarification",
+    )
+
+
+_DEFER_AUTHORING_NO_SESSION_MESSAGE = (
+    "You asked me to fill the page live now instead of authoring a workflow, but I don't have a live "
+    "browser session open on that page to act on. Open the page in a live browser session and I'll fill it directly."
+)
+
+
+def apply_defer_authoring_actuation_entry(
+    ctx: CopilotContext,
+    validated_browser_session_id: str | None,
+    *,
+    user_message: str,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult | None:
+    """With a validated live session, enters COMPOSING and enables live actuation while workflow
+    mutation stays blocked by the authority gate; without one, returns a deterministic honest terminal."""
+    turn_intent = ctx.turn_intent
+    if not isinstance(turn_intent, TurnIntent):
+        return None
+    if not turn_intent_defers_authoring_live_fill(turn_intent):
+        return None
+    if not validated_browser_session_id:
+        return _build_defer_authoring_no_session_result(
+            user_message=user_message,
+            prior_global_llm_context=prior_global_llm_context,
+            prior_workflow_yaml=prior_workflow_yaml,
+            ctx=ctx,
+        )
+    if turn_intent.mode in NO_MUTATION_TURN_INTENT_MODES:
+        turn_intent.mode = TurnIntentMode.BUILD
+        turn_intent.expected_output = TurnIntentExpectedOutput.RUN_RESULT
+    if RequiredContextKey.BROWSER_STATE not in turn_intent.required_context:
+        turn_intent.required_context.append(RequiredContextKey.BROWSER_STATE)
+    ctx.build_phase = BuildPhase.COMPOSING
+    return None
+
+
+def _build_defer_authoring_no_session_result(
+    *,
+    user_message: str,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+    ctx: CopilotContext,
+) -> AgentResult:
+    structured = StructuredContext.from_json_str(prior_global_llm_context)
+    if not structured.user_goal:
+        structured.user_goal = user_message[:300]
+    structured.decisions_made.append("defer-authoring live fill deferred: no live browser session")
+
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=_DEFER_AUTHORING_NO_SESSION_MESSAGE,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="defer_authoring_no_live_session",
+    )
+    return _finalize_result_with_blocker_override(
+        ctx,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=None,
+            global_llm_context=structured.to_json_str(),
+            response_type="ASK_QUESTION",
+            workflow_yaml=prior_workflow_yaml or None,
+            workflow_was_persisted=False,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
+            turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
+        ),
+        exit_site="defer_authoring_no_live_session",
     )
 
 
@@ -4476,7 +4580,7 @@ async def _run_copilot_turn_impl(
     )
 
     # Infeasibility rides on turn_intent: a verdict carrying a question bails to a pre-loop clarification.
-    infeasibility_question = _structural_infeasibility_question(ctx.turn_intent)
+    infeasibility_question = _infeasibility_bail_question(ctx.turn_intent)
     if infeasibility_question is not None:
         return _build_infeasibility_clarification_result(
             question=infeasibility_question,
@@ -4508,6 +4612,15 @@ async def _run_copilot_turn_impl(
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
     ctx.browser_session_id = validated_browser_session_id
+    defer_authoring_terminal = apply_defer_authoring_actuation_entry(
+        ctx,
+        validated_browser_session_id,
+        user_message=agent_user_message,
+        prior_global_llm_context=global_llm_context,
+        prior_workflow_yaml=chat_request.workflow_yaml,
+    )
+    if defer_authoring_terminal is not None:
+        return defer_authoring_terminal
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
         llm_api_handler,

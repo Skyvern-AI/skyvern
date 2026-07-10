@@ -63,6 +63,7 @@ import {
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
+import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
 import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import {
@@ -80,14 +81,14 @@ import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
 import { useFeatureFlagEnabled } from "posthog-js/react";
-import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
-import { cn } from "@/util/utils";
+import { cn, formatElapsedSeconds } from "@/util/utils";
+import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -183,13 +184,6 @@ function defaultCodeBlockRequestOverride(
   }
   // Ask-only variants, including ask_code, do not send a build request override.
   return null;
-}
-
-function formatElapsedSeconds(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000));
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 // Ask's mark is a text dingbat; Build's is a color emoji that ModeGlyph flattens
@@ -299,7 +293,7 @@ function ConvoAggregatePill({
   );
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   id: string;
   sender: WorkflowCopilotChatSender;
   content: string;
@@ -308,6 +302,8 @@ interface ChatMessage {
   // so the per-block cards persist as the user scrolls back through past
   // turns. Live in-flight narrative is rendered separately at the bottom.
   narrative?: TurnNarrativeState;
+  // FE-synthetic run status line (never persisted, never sent to the LLM).
+  kind?: "run_lifecycle";
 }
 
 const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
@@ -318,6 +314,17 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
     }
   }
   return null;
+};
+
+// messages.length - 1 with any trailing run_lifecycle lines skipped, so
+// proposal actions / FixCard keep attaching to the last real turn.
+const findLastTurnIndex = (messages: ChatMessage[]): number => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.kind !== "run_lifecycle") {
+      return index;
+    }
+  }
+  return -1;
 };
 
 type QueuedPrompt = {
@@ -393,6 +400,23 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
     </div>
   );
 });
+
+// Studio-only run status line, distinct from ai prose: no bubble, no footer.
+function RunLifecycleLine({ content }: { content: string }) {
+  return (
+    <div
+      className="flex items-center gap-2 pl-1 text-xs text-muted-foreground"
+      role="status"
+      aria-live="polite"
+    >
+      <span
+        aria-hidden="true"
+        className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-slate-500"
+      />
+      <span>{content}</span>
+    </div>
+  );
+}
 
 // `persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
 // `applied` marks a turn's accepted terminal apply; drafts and snap-backs omit it.
@@ -671,6 +695,18 @@ export function WorkflowCopilotChat({
   // The studio focuses a run via ?wr= (not a path param), so the route param is
   // empty there; an explicit prop grounds the chat in that run and wins.
   const workflowRunId = workflowRunIdProp ?? routeWorkflowRunId;
+  const announceRunLifecycle = useCallback((message: ChatMessage) => {
+    setMessages((prev) =>
+      prev.some((existing) => existing.id === message.id)
+        ? prev
+        : [...prev, message],
+    );
+  }, []);
+  useRunLifecycleAnnouncements({
+    workflowRunId: docked && copilotUxV1Enabled ? workflowRunId : undefined,
+    turnInFlightRef: inFlightRef,
+    announce: announceRunLifecycle,
+  });
   // Recorded actions arrive well after block_progress (they're persisted in
   // batch at block end), so fetch them once a run reaches adjudication
   // instead of waiting on the narrower block_progress/tool-call cadence.
@@ -854,7 +890,10 @@ export function WorkflowCopilotChat({
   };
 
   const applyHistoryResponse = useCallback(
-    (data: WorkflowCopilotChatHistoryResponse) => {
+    (
+      data: WorkflowCopilotChatHistoryResponse,
+      carryForwardLifecycle = true,
+    ) => {
       const historyMessages = data.chat_history.map((message, index) => ({
         id: `${index}-${Date.now()}`,
         sender: message.sender,
@@ -882,7 +921,14 @@ export function WorkflowCopilotChat({
         ? getLatestDiffCardTurnId(historyMessages)
         : null;
       latestTurnId.current = pendingProposalTurnId;
-      setMessages(historyMessages);
+      // History never carries run_lifecycle lines (local-only); carry them
+      // forward only for the mount-race caller, not an explicit chat switch.
+      setMessages((prev) => [
+        ...historyMessages,
+        ...(carryForwardLifecycle
+          ? prev.filter((message) => message.kind === "run_lifecycle")
+          : []),
+      ]);
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
       setAutoAccept(data.auto_accept ?? false);
@@ -913,7 +959,7 @@ export function WorkflowCopilotChat({
             },
           },
         );
-        applyHistoryResponse(response.data);
+        applyHistoryResponse(response.data, false);
         // Mark history loaded for this workflow so the mount effect won't reload
         // the latest chat over the one the user just selected.
         historyLoadedForRef.current = workflowPermanentId;
@@ -2233,6 +2279,7 @@ export function WorkflowCopilotChat({
       ? `Listening… · ${browserStatusText}`
       : "Listening…"
     : browserStatusText;
+  const lastTurnIndex = findLastTurnIndex(messages);
 
   const content = (
     <div
@@ -2338,9 +2385,17 @@ export function WorkflowCopilotChat({
               }
             />
             {messages.map((message, index) => {
-              const isLastMessage = index === messages.length - 1;
+              const isLastMessage = index === lastTurnIndex;
               const showQueuedFooter =
                 isQueuedPromptWaiting && message.id === queuedPrompt?.id;
+              if (message.kind === "run_lifecycle") {
+                return (
+                  <RunLifecycleLine
+                    key={message.id}
+                    content={message.content}
+                  />
+                );
+              }
               // Per-message frozen narrative. When an AI message carries a
               // frozen narrative, render the narrative card stack in place
               // of the legacy text bubble so the per-block cards survive

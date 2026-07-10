@@ -163,7 +163,8 @@ export type BlockYAML =
   | WorkflowTriggerBlockYAML
   | GoogleSheetsReadBlockYAML
   | GoogleSheetsWriteBlockYAML
-  | PdfFillBlockYAML;
+  | PdfFillBlockYAML
+  | SplitPdfBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -488,6 +489,14 @@ export type PdfFillBlockYAML = BlockYAMLBase & {
   file_url: string;
   prompt: string;
   payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key?: string | null;
+  parameter_keys?: Array<string> | null;
+};
+
+export type SplitPdfBlockYAML = BlockYAMLBase & {
+  block_type: "split_pdf";
+  file_url: string;
+  prompt: string;
   llm_key?: string | null;
   parameter_keys?: Array<string> | null;
 };

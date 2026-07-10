@@ -91,6 +91,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "pdf_fill": {
       return <FileTextIcon className={className} />;
     }
+    case "split_pdf": {
+      return <FileTextIcon className={className} />;
+    }
     case "goto_url": {
       return <ExternalLinkIcon className={className} />;
     }

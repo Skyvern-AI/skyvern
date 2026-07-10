@@ -135,10 +135,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-max-steps-override",
@@ -1372,6 +1370,352 @@
         "x-fern-sdk-method-name": "delete_folder"
       }
     },
+    "/v1/runs/{workflow_run_id}/tags": {
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Apply run tags",
+        "description": "Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
+        "operationId": "apply_run_tags_v1_runs__workflow_run_id__tags_post",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagApplyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully applied tag changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Invalid tag key or value"
+          }
+        },
+        "x-fern-sdk-method-name": "apply_run_tags"
+      },
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Get run tags",
+        "description": "Get the current tag state for a workflow run.",
+        "operationId": "get_run_tags_v1_runs__workflow_run_id__tags_get",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tags"
+      }
+    },
+    "/v1/runs/{workflow_run_id}/tags/{key}": {
+      "delete": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Delete run tag",
+        "description": "Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.",
+        "operationId": "delete_run_tag_v1_runs__workflow_run_id__tags__key__delete",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to delete",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key to delete"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag (or no-op if absent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_run_tag"
+      }
+    },
+    "/v1/runs/{workflow_run_id}/tags/history": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Get run tag history",
+        "description": "Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.",
+        "operationId": "get_run_tag_history_v1_runs__workflow_run_id__tags_history_get",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Max events to return",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Max events to return"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only return events at or after this timestamp",
+              "title": "Since"
+            },
+            "description": "Only return events at or after this timestamp"
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to events for a single tag key",
+              "title": "Key"
+            },
+            "description": "Filter to events for a single tag key"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagHistoryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tag_history"
+      }
+    },
     "/v1/tag-keys": {
       "get": {
         "tags": [
@@ -1576,6 +1920,24 @@
         "description": "List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
         "operationId": "list_tag_values_v1_tag_values_get",
         "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to values for a single tag key",
+              "title": "Key"
+            },
+            "description": "Filter to values for a single tag key"
+          },
           {
             "name": "x-api-key",
             "in": "header",
@@ -1992,6 +2354,149 @@
         },
         "x-hidden": true,
         "x-fern-sdk-method-name": "batch_get_workflow_tags_post"
+      }
+    },
+    "/v1/run-tags": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Batch get run tags",
+        "description": "Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.",
+        "operationId": "batch_get_run_tags_v1_run_tags_get",
+        "parameters": [
+          {
+            "name": "workflow_run_ids",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated workflow run IDs",
+              "examples": [
+                "wr_123,wr_456"
+              ],
+              "title": "Workflow Run Ids"
+            },
+            "description": "Comma-separated workflow run IDs"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many workflow run IDs requested"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "batch_get_run_tags"
+      },
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Batch get run tags (POST)",
+        "description": "Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).",
+        "operationId": "batch_get_run_tags_post_v1_run_tags_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunTagsBatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many workflow run IDs requested"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "batch_get_run_tags_post"
       }
     },
     "/v1/artifacts/{artifact_id}/content": {
@@ -5493,10 +5998,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-max-steps-override",
@@ -18522,6 +19025,84 @@
         ],
         "title": "RunStatus"
       },
+      "RunTagHistoryResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/TagHistoryItem"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "events"
+        ],
+        "title": "RunTagHistoryResponse"
+      },
+      "RunTagsBatchRequest": {
+        "properties": {
+          "workflow_run_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Workflow Run Ids",
+            "description": "Workflow run IDs to fetch tags for."
+          }
+        },
+        "type": "object",
+        "title": "RunTagsBatchRequest",
+        "description": "Body for ``POST /v1/run-tags`` (used when the run-id list would exceed\nthe URL length cap)."
+      },
+      "RunTagsBatchResponse": {
+        "properties": {
+          "run_tags": {
+            "additionalProperties": {
+              "items": {
+                "$ref": "#/components/schemas/TagItem"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Run Tags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_tags"
+        ],
+        "title": "RunTagsBatchResponse",
+        "description": "Response for the run-tags batch endpoint.\n\nRuns with no tags are present with an empty list so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nRuns outside the caller's org are silently absent (no leakage)."
+      },
+      "RunTagsResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/TagResponse"
+            },
+            "type": "array",
+            "title": "Tags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "tags"
+        ],
+        "title": "RunTagsResponse",
+        "description": "Current tags for a workflow run."
+      },
       "RunWebhookReplayResponse": {
         "properties": {
           "run_id": {
@@ -19698,6 +20279,16 @@
           "removed_from_workflow_count": {
             "type": "integer",
             "title": "Removed From Workflow Count"
+          },
+          "removed_from_run_count": {
+            "type": "integer",
+            "title": "Removed From Run Count",
+            "default": 0
+          },
+          "removed_count": {
+            "type": "integer",
+            "title": "Removed Count",
+            "default": 0
           }
         },
         "type": "object",
@@ -19826,6 +20417,16 @@
           "removed_from_workflow_count": {
             "type": "integer",
             "title": "Removed From Workflow Count"
+          },
+          "removed_from_run_count": {
+            "type": "integer",
+            "title": "Removed From Run Count",
+            "default": 0
+          },
+          "removed_count": {
+            "type": "integer",
+            "title": "Removed Count",
+            "default": 0
           }
         },
         "type": "object",

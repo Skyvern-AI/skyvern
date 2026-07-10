@@ -34,7 +34,15 @@ def test_all_production_call_sites_pass_caller() -> None:
                 fpath = os.path.join(dirpath, fname)
                 try:
                     with open(fpath) as f:
-                        tree = ast.parse(f.read(), filename=fpath)
+                        content = f.read()
+                except OSError:
+                    continue
+                # A call site must textually contain the method name; skip parsing
+                # the thousands of files that cannot possibly hold one.
+                if "safe_wait_for_animation_end" not in content:
+                    continue
+                try:
+                    tree = ast.parse(content, filename=fpath)
                 except SyntaxError:
                     continue
                 for node in ast.walk(tree):

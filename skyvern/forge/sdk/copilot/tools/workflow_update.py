@@ -1818,7 +1818,6 @@ _MAX_OUTPUT_CONTRACT_STEERING_REJECTS = 2
 _MAX_OUTPUT_CONTRACT_REJECTS = 4
 _MAX_OUTPUT_CONTRACT_DEFERRALS = 3
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
-_OUTPUT_CONTRACT_PAGE_EXTRACT_VAR = "output_contract_page_values"
 _OUTPUT_CONTRACT_ABLATION_GATE_ID = "output_contract_actuation"
 _METADATA_PREFLIGHT_ABLATION_GATE_ID = "metadata_run_preflight_reject"
 
@@ -3474,17 +3473,8 @@ def _run_authority_permits_dispatch(ctx: AgentContext) -> bool:
     )
 
 
-def _output_contract_page_source_required(ctx: AgentContext, signature: str) -> bool:
-    return bool(signature) and bool(ctx.output_contract_page_source_required_by_signature.get(signature))
-
-
 def _page_extraction_imposed(ctx: AgentContext, signature: str) -> bool:
     return bool(signature) and bool(ctx.output_contract_page_extraction_imposed_by_signature.get(signature))
-
-
-def _mark_page_extraction_imposed(ctx: AgentContext, signature: str) -> None:
-    if signature:
-        ctx.output_contract_page_extraction_imposed_by_signature[signature] = True
 
 
 def _arm_pending_run_evidence(ctx: AgentContext, signature: str, required_paths: set[str]) -> None:
@@ -3550,7 +3540,7 @@ def record_output_contract_run_output_evidence(ctx: AgentContext, result: object
 def _reopen_dispatch_lacked_bound_extraction(ctx: AgentContext, signature: str) -> bool:
     """One-shot per signature: a consumed advisory run whose observed output bound no required path is not
     exhaustion evidence — a code static-return provably cannot key values a click-only trajectory never
-    captured. Reset the signature to UNUSED and require the stronger page-source extraction on the next pass."""
+    captured. Reset the signature to UNUSED so the ladder re-enters once before any terminal."""
     if not signature:
         return False
     if _output_contract_advisory_state(ctx, signature) != OutputContractAdvisoryState.CONSUMED:
@@ -3564,7 +3554,6 @@ def _reopen_dispatch_lacked_bound_extraction(ctx: AgentContext, signature: str) 
     if ctx.output_contract_dispatch_reopened_by_signature.get(signature):
         return False
     ctx.output_contract_dispatch_reopened_by_signature[signature] = True
-    ctx.output_contract_page_source_required_by_signature[signature] = True
     ctx.output_contract_actuation_by_signature[signature] = OutputContractAdvisoryState.UNUSED
     ctx.output_contract_actuation_count_by_signature[signature] = max(
         1, int(ctx.output_contract_actuation_count_by_signature.get(signature, 0) or 0)
@@ -3574,49 +3563,6 @@ def _reopen_dispatch_lacked_bound_extraction(ctx: AgentContext, signature: str) 
         canonical_output_contract_signature=signature,
     )
     return True
-
-
-def _strip_top_level_returns(code: str) -> str:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return code
-    kept = [node for node in tree.body if not isinstance(node, ast.Return)]
-    if len(kept) == len(tree.body):
-        return code
-    return ast.unparse(ast.Module(body=kept, type_ignores=[]))
-
-
-def _page_source_extraction_prompt(required_paths: set[str]) -> str:
-    paths = ", ".join(sorted(_metadata_contract_required_paths(required_paths)))
-    return (
-        "Extract the requested output values visible on the current page. "
-        f"Populate these output paths when visible: {paths}."
-    )
-
-
-def _page_source_extraction_code(target_code: str, required_paths: set[str]) -> str:
-    body = _strip_top_level_returns(textwrap.dedent(target_code).strip())
-    schema = _schema_template_for_required_paths(required_paths)
-    extract_block = (
-        f"{_OUTPUT_CONTRACT_PAGE_EXTRACT_VAR} = await page.extract(\n"
-        f"    prompt={json.dumps(_page_source_extraction_prompt(required_paths))},\n"
-        f"    schema={schema!r},\n"
-        ")\n"
-        f"return {_OUTPUT_CONTRACT_PAGE_EXTRACT_VAR}"
-    )
-    return f"{body}\n{extract_block}" if body else extract_block
-
-
-def _impose_page_source_extraction(
-    parsed: dict[str, Any], label: str, target_code: str, required_paths: set[str]
-) -> str | None:
-    keyed = _page_source_extraction_code(target_code, required_paths)
-    for block in _workflow_code_blocks(parsed):
-        if str(block.get("label") or "").strip() == label:
-            block["code"] = keyed.rstrip() + "\n"
-            return yaml.safe_dump(parsed, sort_keys=False)
-    return None
 
 
 def _actuate_output_contract_bail(
@@ -3702,15 +3648,10 @@ def _impose_output_contract_envelope_after_steering(
         required_paths=required_paths,
     )
     _reopen_dispatch_lacked_bound_extraction(ctx, signature)
-    page_source_needed = _output_contract_page_source_required(ctx, signature) and not _page_extraction_imposed(
-        ctx, signature
-    )
     runtime_attempt_key = _runtime_output_repair_attempt_key(ctx, workflow_yaml, required_paths, source, reason_code)
-    if (
-        not page_source_needed
-        and _output_contract_reject_count(ctx, signature) < _MAX_OUTPUT_CONTRACT_STEERING_REJECTS
-        and _runtime_output_repair_attempt_recorded(ctx, runtime_attempt_key)
-    ):
+    if _output_contract_reject_count(
+        ctx, signature
+    ) < _MAX_OUTPUT_CONTRACT_STEERING_REJECTS and _runtime_output_repair_attempt_recorded(ctx, runtime_attempt_key):
         return workflow_yaml, raw_code_artifact_metadata, False
     label, owner_labels = _target_output_contract_block_label(
         ctx,
@@ -3730,27 +3671,6 @@ def _impose_output_contract_envelope_after_steering(
         return workflow_yaml, raw_code_artifact_metadata, False
     target_code = str(target_block.get("code") or "")
     current_fingerprint = _output_contract_structural_fingerprint(workflow_yaml, signature)
-    if page_source_needed:
-        imposed_yaml = _impose_page_source_extraction(parsed, label, target_code, required_paths)
-        if imposed_yaml is not None:
-            scaffolded_metadata = _apply_metadata_contract_scaffold(
-                ctx,
-                imposed_yaml,
-                raw_code_artifact_metadata,
-                required_paths=required_paths,
-                source=source,
-                reason_code=reason_code,
-            )
-            _mark_page_extraction_imposed(ctx, signature)
-            _arm_pending_run_evidence(ctx, signature, required_paths)
-            _mark_output_contract_imposed(ctx, signature)
-            _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
-            LOG.info(
-                "copilot_output_contract_page_source_extraction_imposed",
-                block_label=label,
-                canonical_output_contract_signature=signature,
-            )
-            return imposed_yaml, scaffolded_metadata, True
     if _scout_spine_requires_separated_blocks(ctx):
         synthesized = synthesize_code_block(
             ctx.scout_trajectory,
@@ -8439,6 +8359,16 @@ async def _update_workflow(
             block_labels=missing_labels,
             missing_requested_output_facts=missing_metadata_output_facts,
         )
+        credential_scout_errors = (
+            []
+            if _request_policy_allows_untested_code_block_draft(ctx)
+            else _credentialed_code_block_scout_gate_errors(
+                workflow_yaml,
+                ctx,
+                block_labels=params.get("block_labels"),
+            )
+        )
+        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=bool(credential_scout_errors))
         return reject(
             error=missing_metadata_error,
             user_facing_summary=_compiled_authoring_user_summary(),

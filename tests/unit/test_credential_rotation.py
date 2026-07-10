@@ -29,14 +29,15 @@ from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitio
 
 def _credential_parameter(
     *,
+    key: str = "login_cred",
     credential_id: str = "cred_a",
     credential_ids: list[str] | None = None,
     selection_strategy: str | None = None,
 ) -> CredentialParameter:
     now = datetime.now(timezone.utc)
     return CredentialParameter(
-        key="login_cred",
-        credential_parameter_id="cp_test",
+        key=key,
+        credential_parameter_id=f"cp_{key}",
         workflow_id="wf_test",
         credential_id=credential_id,
         credential_ids=credential_ids,
@@ -196,6 +197,98 @@ async def test_selection_is_idempotent_for_run_and_key() -> None:
     assert first == "cred_a"
     assert second == "cred_a"
     assert repo.created == []
+
+
+@pytest.mark.asyncio
+async def test_run_credential_override_persists_for_rotation_parameter() -> None:
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential()
+    workflow_run = _setup_workflow_run()
+    repo = _SelectionRepo()
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflow_run_credential_selections = repo
+        overrides = await service._apply_run_credential_parameter_overrides(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            organization_id="org_test",
+            request_data={"login_cred": "cred_b"},
+        )
+
+    assert overrides == {"login_cred": "cred_b"}
+    assert repo.created == [
+        {
+            "organization_id": "org_test",
+            "workflow_run_id": "wr_test",
+            "workflow_permanent_id": "wpid_test",
+            "parameter_key": "login_cred",
+            "credential_id": "cred_b",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_credential_override_rejects_credentials_outside_rotation_pool() -> None:
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential()
+
+    with pytest.raises(SkyvernHTTPException, match="configured rotation credentials"):
+        await service._apply_run_credential_parameter_overrides(
+            workflow=workflow,
+            workflow_run=_setup_workflow_run(),
+            organization_id="org_test",
+            request_data={"login_cred": "cred_other"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_credential_override_rejects_conflicting_existing_selection() -> None:
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential()
+    repo = _SelectionRepo(existing={("wr_test", "login_cred"): "cred_a"})
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        pytest.raises(SkyvernHTTPException, match="conflicts with an existing credential selection"),
+    ):
+        mock_app.DATABASE.workflow_run_credential_selections = repo
+        await service._apply_run_credential_parameter_overrides(
+            workflow=workflow,
+            workflow_run=_setup_workflow_run(),
+            organization_id="org_test",
+            request_data={"login_cred": "cred_b"},
+        )
+
+    assert repo.created == []
+
+
+@pytest.mark.asyncio
+async def test_select_rotating_credentials_keeps_override_and_selects_remaining() -> None:
+    service = WorkflowService()
+    workflow = _setup_workflow_with_rotating_credential(browser_profile_key="{{ login_cred }}-{{ backup_cred }}")
+    workflow.workflow_definition.parameters = [
+        _credential_parameter(key="login_cred", credential_ids=["cred_a", "cred_b"]),
+        _credential_parameter(key="backup_cred", credential_id="cred_c", credential_ids=["cred_c", "cred_d"]),
+    ]
+    select_mock = AsyncMock(return_value="cred_d")
+
+    with patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock):
+        selections = await service._select_rotating_credential_parameters_for_render(
+            workflow=workflow,
+            workflow_run=_setup_workflow_run(),
+            organization_id="org_test",
+            credential_parameter_overrides={"login_cred": "cred_b"},
+        )
+
+    assert selections == {"login_cred": "cred_b", "backup_cred": "cred_d"}
+    select_mock.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        parameter_key="backup_cred",
+        credential_ids=["cred_c", "cred_d"],
+        selection_strategy=None,
+    )
 
 
 @pytest.mark.asyncio

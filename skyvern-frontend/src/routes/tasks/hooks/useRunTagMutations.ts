@@ -42,38 +42,4 @@ function useApplyRunTagsMutation() {
   });
 }
 
-function useDeleteRunTagMutation() {
-  const credentialGetter = useCredentialGetter();
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: async ({
-      workflowRunId,
-      key,
-    }: {
-      workflowRunId: string;
-      key: string;
-    }) => {
-      const client = await getClient(credentialGetter);
-      return client
-        .delete(`/runs/${workflowRunId}/tags/${encodeURIComponent(key)}`)
-        .then((response) => response.data);
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["run-tags"] });
-      queryClient.invalidateQueries({ queryKey: ["tag-keys"] });
-      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-    },
-    onError: (error: unknown) => {
-      toast({
-        variant: "destructive",
-        title: "Failed to delete run tag",
-        description: tagErrorMessage(error),
-      });
-    },
-  });
-}
-
-export { useApplyRunTagsMutation, useDeleteRunTagMutation };
+export { useApplyRunTagsMutation };

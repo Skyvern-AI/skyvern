@@ -12,6 +12,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.agent import (
     _completion_contract_not_violated,
     _rewrite_failed_test_response,
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     structured_record_has_goal_content,
     structured_record_has_identity,
     summarize_unsatisfied_outcomes,
+    zero_requested_output_criteria_credit,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -102,6 +104,11 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_visible_result_after_completion_verification,
     _watchdog_exit_allows_terminal_promotion,
 )
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools._shared import (
+    _TASK_ENVELOPE_BLOCK_TYPES,
+    _has_meaningful_registered_output_payload,
+)
 from skyvern.forge.sdk.copilot.tools.completion import (
     _POST_RUN_PAGE_OBSERVATION_LABEL,
     _artifact_health_blocker_from_result,
@@ -113,7 +120,16 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _apply_code_artifact_requested_output_evidence_sources,
     _normalize_code_artifact_metadata,
 )
+from tests.unit.copilot_test_helpers import (
+    DISPATCHED_LOGIN_GATE_HTML,
+    DISPATCHED_NAV_ONLY_HTML,
+    DISPATCHED_RESULTS_HTML,
+)
 from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
+from tests.unit.copilot_test_helpers import (
+    make_stub_html_artifact,
+    stub_artifact_app,
+)
 
 _STRUCTURED_RECORD_CRITERIA = (
     ("fallback_record_identity", "The returned record identifies the target record."),
@@ -3249,6 +3265,313 @@ def test_degraded_delivered_unverified_terminal_state_is_not_verified_success() 
     assert ctx.turn_halt.kind.value == "delivered_unverified"
     assert ctx.last_full_workflow_test_ok is False
     assert ctx.last_test_suspicious_success is False
+
+
+def _registered_output_result(value: dict[str, Any], block_type: str = "CODE") -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_x",
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_bill"],
+            "current_url": "https://example.com/account",
+            "blocks": [
+                {
+                    "label": "extract_bill",
+                    "block_type": block_type,
+                    "status": "completed",
+                    "extracted_data": {"bill_statement": value},
+                }
+            ],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_x",
+                    "output_parameter_id": "op_bill",
+                    "output_parameter_key": "bill_statement",
+                    "block_label": "extract_bill",
+                    "block_type": block_type,
+                    "value": value,
+                }
+            ],
+        },
+    }
+
+
+def _persisted_output_parameter_result(value: dict[str, Any], run_id: str = "wr_x") -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": run_id,
+            "overall_status": "completed",
+            "executed_block_labels": ["extract_bill"],
+            "current_url": "https://example.com/account",
+            "blocks": [],
+            "workflow_run_output_parameters": [
+                {
+                    "workflow_run_id": run_id,
+                    "output_parameter_id": "op_bill",
+                    "output_parameter_key": "bill_statement",
+                    "block_label": "extract_bill",
+                    "block_type": "CODE",
+                    "value": value,
+                }
+            ],
+        },
+    }
+
+
+def test_zero_requested_output_criteria_credit_fires_only_with_payload() -> None:
+    satisfied = _evaluated(("login", True))
+
+    assert zero_requested_output_criteria_credit(satisfied, has_meaningful_registered_output=True) is True
+    assert zero_requested_output_criteria_credit(satisfied, has_meaningful_registered_output=False) is False
+
+
+def test_zero_requested_output_criteria_credit_ignored_when_criteria_formed() -> None:
+    with_criteria = replace(_evaluated(("bill", True)), requested_output_criteria_count=1)
+
+    assert zero_requested_output_criteria_credit(with_criteria, has_meaningful_registered_output=True) is False
+
+
+def test_zero_requested_output_criteria_credit_requires_evaluated_full_satisfaction() -> None:
+    assert zero_requested_output_criteria_credit(None, has_meaningful_registered_output=True) is False
+    assert (
+        zero_requested_output_criteria_credit(
+            CompletionVerificationResult(status="unavailable"), has_meaningful_registered_output=True
+        )
+        is False
+    )
+    assert (
+        zero_requested_output_criteria_credit(_evaluated(("c0", False)), has_meaningful_registered_output=True) is False
+    )
+
+
+def test_zero_requested_output_criteria_withholds_verified_success() -> None:
+    ctx = _ctx_with_blocks("code")
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx,
+            _registered_output_result({"summary": "raw"}),
+            completion_verification=_evaluated(("login", True)),
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+    assert ctx.last_full_workflow_test_ok is False
+    assert any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+
+    other_ctx = _ctx_with_blocks("code")
+    other = _record_run_blocks_result(
+        other_ctx,
+        _registered_output_result({"amount_due": "$99.99", "statement_month": "January 2026"}),
+        completion_verification=_evaluated(("login", True)),
+    )
+    assert other is not None
+    assert other.verdict == recorded.verdict
+    assert other_ctx.delivered_unverified_terminal is True
+
+
+def test_zero_requested_output_criteria_withholds_verified_success_on_failed_run() -> None:
+    ctx = _ctx_with_blocks("code")
+    result = _registered_output_result({"summary": "raw"})
+    result["ok"] = False
+    result["data"]["overall_status"] = "canceled"
+
+    recorded = _record_run_blocks_result(
+        ctx,
+        result,
+        completion_verification=_evaluated(("login", True)),
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.last_test_ok is False
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+
+
+def test_requested_output_criteria_still_reach_verified_success() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = replace(_evaluated(("bill", True)), requested_output_criteria_count=1)
+
+    recorded = _record_run_blocks_result(
+        ctx, _registered_output_result({"summary": "raw"}), completion_verification=verification
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_zero_requested_output_criteria_empty_task_output_reaches_verified_success() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    empty_task_output = {
+        "task_id": "tsk_login",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+
+    recorded = _record_run_blocks_result(
+        ctx,
+        _registered_output_result(empty_task_output, block_type="EXTRACTION"),
+        completion_verification=_evaluated(("login", True)),
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_zero_requested_output_criteria_login_reach_state_stays_inert() -> None:
+    ctx = _ctx_with_blocks("navigation")
+    reach_state_envelope = {
+        "task_id": "tsk_nav",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    result = _registered_output_result(reach_state_envelope, block_type="NAVIGATION")
+
+    assert _has_meaningful_registered_output_payload(result["data"]) is False
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_zero_requested_output_criteria_lowercase_block_type_slices_empty_envelope() -> None:
+    ctx = _ctx_with_blocks("login")
+    reach_state_envelope = {
+        "task_id": "tsk_login",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    result = _registered_output_result(reach_state_envelope, block_type="login")
+
+    assert _has_meaningful_registered_output_payload(result["data"]) is False
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+@pytest.mark.parametrize("block_type", ["file_download", "goto_url", "human_interaction", "task_v2"])
+def test_zero_requested_output_criteria_every_task_backed_block_reach_state_stays_inert(block_type: str) -> None:
+    ctx = _ctx_with_blocks(block_type)
+    reach_state_envelope = {
+        "task_id": f"tsk_{block_type}",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    result = _registered_output_result(reach_state_envelope, block_type=block_type)
+
+    assert _has_meaningful_registered_output_payload(result["data"]) is False
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+
+
+def test_task_envelope_block_types_matches_explicit_envelope_block_set() -> None:
+    # Explicit, human-maintained list of every block type whose output is a TaskOutput
+    # envelope. Independent of the production walk on purpose: TaskV2Block subclasses
+    # Block directly (not BaseTaskBlock), so a walk from BaseTaskBlock alone would drop
+    # it. If a new envelope block is added, update both this literal and the derivation.
+    expected = {
+        "LOGIN",
+        "NAVIGATION",
+        "EXTRACTION",
+        "ACTION",
+        "TASK",
+        "VALIDATION",
+        "FILE_DOWNLOAD",
+        "GOTO_URL",
+        "HUMAN_INTERACTION",
+        "TASK_V2",
+    }
+    assert _TASK_ENVELOPE_BLOCK_TYPES == expected
+
+
+def test_zero_requested_output_criteria_task_id_user_schema_is_meaningful() -> None:
+    ctx = _ctx_with_blocks("code")
+    user_schema = {"task_id": "tsk_1", "amount_due": "$3,927.75", "statement_month": "March 2026"}
+
+    recorded = _record_run_blocks_result(
+        ctx,
+        _registered_output_result(user_schema, block_type="CODE"),
+        completion_verification=_evaluated(("login", True)),
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": user_schema}
+
+
+def test_zero_requested_output_criteria_fires_on_persisted_output_parameters_only() -> None:
+    ctx = _ctx_with_blocks("code")
+
+    recorded = _record_run_blocks_result(
+        ctx, _persisted_output_parameter_result({"summary": "raw"}), completion_verification=_evaluated(("login", True))
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+
+
+def test_zero_requested_output_criteria_excludes_foreign_run_registered_output() -> None:
+    ctx = _ctx_with_blocks("code")
+    result = _registered_output_result({"summary": "raw"})
+    result["data"]["registered_output_parameter_values"].append(
+        {
+            "workflow_run_id": "wr_other",
+            "output_parameter_id": "op_stale",
+            "output_parameter_key": "stale_output",
+            "block_label": "stale_block",
+            "block_type": "CODE",
+            "value": {"stale": "prior-run"},
+        }
+    )
+
+    recorded = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(("login", True)))
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_observed_outputs == {"bill_statement": {"summary": "raw"}}
+
+
+def test_zero_requested_output_criteria_empty_valid_deliverable_still_credits() -> None:
+    ctx = _ctx_with_blocks("code")
+
+    recorded = _record_run_blocks_result(
+        ctx, _registered_output_result({"rows": []}), completion_verification=_evaluated(("login", True))
+    )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
 
 
 def test_record_run_blocks_verifies_structural_requested_output_with_run_corroborator() -> None:
@@ -9995,6 +10318,108 @@ def test_judgment_truth_condition_refutes_inverted_login_gate_packet() -> None:
     assert verdicts[0].state == "unsatisfied"
     assert verdicts[0].reason_code == "evidence_contradicts"
     assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def _dispatched_judgment_criterion() -> CompletionCriterion:
+    return replace(
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        ),
+        judgment_truth_condition=JudgmentTruthCondition(predicate="login_gate_blocks_target", polarity_when_holds=True),
+    )
+
+
+async def _dispatched_chain_snapshot(
+    monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, html: str
+) -> RunEvidenceSnapshot:
+    stub_artifact_app(
+        monkeypatch,
+        [make_stub_html_artifact("art_terminal", ArtifactType.HTML_ACTION)],
+        {"art_terminal": html.encode()},
+    )
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx, run_id="wr_requested_output", organization_id="o", current_url=""
+    )
+    return _build_run_evidence_snapshot(ctx, _requested_output_result({"login_gate_blocks_target": True}))
+
+
+@pytest.mark.asyncio
+async def test_dispatched_chain_login_gate_packet_confirms_judgment_boolean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    snapshot = await _dispatched_chain_snapshot(monkeypatch, ctx, DISPATCHED_LOGIN_GATE_HTML)
+
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, [_dispatched_judgment_criterion()], snapshot)
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert snapshot.block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] == "independent_page_evidence"
+    assert bound["forms"]
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
+        and log["verdict"] == "evidence_confirms"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatched_chain_result_container_packet_contradicts_login_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    snapshot = await _dispatched_chain_snapshot(monkeypatch, ctx, DISPATCHED_RESULTS_HTML)
+
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, [_dispatched_judgment_criterion()], snapshot)
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert bound["result_containers"]
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert all(verdict.reason_code != "structurally_abstained" for verdict in verdicts)
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["verdict"] == "evidence_contradicts"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatched_chain_nav_only_page_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Dispatched captures parse with no current URL, so the same-origin filter drops every
+    # navigation target and a nav-only terminal page yields an undecidable hollow packet.
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    snapshot = await _dispatched_chain_snapshot(monkeypatch, ctx, DISPATCHED_NAV_ONLY_HTML)
+
+    verdicts = grade_requested_output_criteria(ctx, [_dispatched_judgment_criterion()], snapshot)
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert bound["navigation_targets"] == []
+    assert bound["forms"] == []
+    assert bound["result_containers"] == []
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
     assert verdicts[0].evidence_source == "independent_page_evidence"
 
 

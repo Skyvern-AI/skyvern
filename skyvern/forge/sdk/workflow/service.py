@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 import os
+import random
 import textwrap
 import time
 import uuid
@@ -102,6 +103,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     PdfFillBlock,
     PDFParserBlock,
+    SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
     WhileLoopBlock,
@@ -124,6 +126,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.run_limits import get_effective_workflow_run_max_elapsed_time_minutes
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
@@ -191,6 +194,8 @@ DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH = 120
 MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH = 40
+DETECTED_PLATFORM_RUN_TAG_KEY = "skyvern.platform"
+DETECTED_PLATFORM_RUN_TAG_CALLER_ID = "system:platform-detector"
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -278,7 +283,7 @@ def _collect_enterprise_gated_workflow_features(
             engine = block.engine
         block_uses_model = task_block_uses_engine_and_model or isinstance(
             block,
-            (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock),
+            (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock),
         )
         model = block.model if block_uses_model else None
         feature_names.update(
@@ -573,6 +578,7 @@ class WorkflowService:
         run_metadata: dict[str, str] | None,
     ) -> None:
         """Persist optional workflow-run metadata while swallowing write failures."""
+        # Dormant legacy hook retained until the workflow_run_metadata table drop follow-up.
         if not run_metadata:
             return
 
@@ -598,6 +604,7 @@ class WorkflowService:
         run_metadata: dict[str, str] | None,
     ) -> None:
         """Schedule optional workflow-run metadata persistence off the run-creation path."""
+        # Dormant legacy hook retained until the workflow_run_metadata table drop follow-up.
         if not run_metadata:
             return
 
@@ -610,6 +617,64 @@ class WorkflowService:
         )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    @staticmethod
+    async def _apply_initial_run_metadata_tags(
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+        context: TagWriteContext | None,
+    ) -> None:
+        if not run_metadata:
+            return
+
+        write_context = context or TagWriteContext(
+            caller_id=organization_id,
+            source=TagSource.SYSTEM,
+            caller_type=CallerType.SYSTEM,
+        )
+        for attempt in range(2):
+            try:
+                await app.DATABASE.tags.apply_run_tag_changes(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    sets=run_metadata,
+                    deletes=set(),
+                    context=write_context,
+                )
+                return
+            except IntegrityError:
+                if attempt == 0:
+                    await asyncio.sleep(random.uniform(0.01, 0.05))
+                    continue
+                raise
+
+    @staticmethod
+    async def _apply_detected_platform_run_tag_best_effort(
+        *,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str,
+        parameters: dict[str, Any],
+    ) -> None:
+        try:
+            platform = workflow_script_service.detect_workflow_platform(workflow, parameters)
+            if not platform:
+                return
+            await app.DATABASE.tags.apply_system_run_tag_changes(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                sets={DETECTED_PLATFORM_RUN_TAG_KEY: platform},
+                caller_id=DETECTED_PLATFORM_RUN_TAG_CALLER_ID,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to apply detected platform workflow run tag",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _determine_cache_invalidation(
@@ -1053,16 +1118,104 @@ class WorkflowService:
             if isinstance(parameter, CredentialParameter) and bool(parameter.credential_ids)
         ]
 
+    def _get_run_credential_parameter_overrides(
+        self,
+        *,
+        workflow: Workflow,
+        request_data: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        if not request_data:
+            return {}
+
+        overrides: dict[str, str] = {}
+        for parameter in self._get_rotating_credential_parameters(workflow):
+            if parameter.key not in request_data:
+                continue
+
+            override = request_data[parameter.key]
+            if override is None or override == "":
+                continue
+            if not isinstance(override, str):
+                raise InvalidCredentialId(f"<non-string value of type {type(override).__name__}>")
+
+            credential_ids = parameter.credential_ids or []
+            if override not in credential_ids:
+                raise SkyvernHTTPException(
+                    message=(
+                        f"Credential override for parameter {parameter.key} must be one of the configured "
+                        "rotation credentials."
+                    ),
+                    status_code=400,
+                )
+
+            overrides[parameter.key] = override
+
+        return overrides
+
+    async def _apply_run_credential_parameter_overrides(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization_id: str,
+        request_data: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        overrides = self._get_run_credential_parameter_overrides(
+            workflow=workflow,
+            request_data=request_data,
+        )
+        if not overrides:
+            return {}
+
+        repo = app.DATABASE.workflow_run_credential_selections
+        for parameter_key, credential_id in overrides.items():
+            existing = await repo.get_selection(
+                workflow_run_id=workflow_run.workflow_run_id,
+                parameter_key=parameter_key,
+            )
+            if existing:
+                if existing != credential_id:
+                    raise SkyvernHTTPException(
+                        message=(
+                            f"Credential override for parameter {parameter_key} conflicts with an existing "
+                            "credential selection for this run."
+                        ),
+                        status_code=400,
+                    )
+                continue
+
+            try:
+                await repo.create_selection(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    parameter_key=parameter_key,
+                    credential_id=credential_id,
+                )
+            except IntegrityError:
+                existing = await repo.get_selection(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    parameter_key=parameter_key,
+                )
+                if existing == credential_id:
+                    continue
+                raise
+
+        return overrides
+
     async def _select_rotating_credential_parameters_for_render(
         self,
         *,
         workflow: Workflow,
         workflow_run: WorkflowRun,
         organization_id: str,
+        credential_parameter_overrides: dict[str, str] | None = None,
     ) -> dict[str, str]:
+        selections = dict(credential_parameter_overrides or {})
         try:
-            selections: dict[str, str] = {}
             for parameter in self._get_rotating_credential_parameters(workflow):
+                if parameter.key in selections:
+                    continue
                 credential_ids = parameter.credential_ids
                 if not credential_ids:
                     continue
@@ -1084,7 +1237,7 @@ class WorkflowService:
             )
             if workflow.browser_profile_key:
                 raise
-            return {}
+            return selections
 
     async def validate_schedule_parameters(
         self,
@@ -1164,6 +1317,7 @@ class WorkflowService:
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
         resolved_workflow_id: str | None = None,
+        tag_write_context: TagWriteContext | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -1271,11 +1425,20 @@ class WorkflowService:
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
             )
-            self._record_workflow_run_metadata_in_background(
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization.organization_id,
-                run_metadata=workflow_request.run_metadata,
-            )
+            try:
+                await self._apply_initial_run_metadata_tags(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    run_metadata=workflow_request.run_metadata,
+                    context=tag_write_context,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to apply initial workflow run metadata tags",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    exc_info=True,
+                )
 
             LOG.info(
                 f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -1403,10 +1566,17 @@ class WorkflowService:
                 )
 
                 parameter_values = {param.key: value for param, value in workflow_parameter_values}
+                run_credential_parameter_overrides = await self._apply_run_credential_parameter_overrides(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization_id=organization.organization_id,
+                    request_data=workflow_request.data,
+                )
                 rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
                     workflow=workflow,
                     workflow_run=workflow_run,
                     organization_id=organization.organization_id,
+                    credential_parameter_overrides=run_credential_parameter_overrides,
                 )
                 parameter_values.update(rotating_credential_selections)
                 workflow_run = await self._prepare_persisted_workflow_browser_profile(
@@ -1450,6 +1620,12 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             batch_error=str(batch_error),
                         )
+                await self._apply_detected_platform_run_tag_best_effort(
+                    workflow=workflow,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    parameters=parameter_values,
+                )
             except Exception as e:
                 LOG.exception(
                     f"Error while setting up workflow run {workflow_run.workflow_run_id}",
@@ -5563,6 +5739,15 @@ class WorkflowService:
                 },
             )
             if force_browser_session:
+                workflow = await self.get_workflow(workflow_id=workflow_id)
+                # Forced session creation happens before setup_workflow_run persists
+                # run-level credential selections. This validates override inputs
+                # before best-effort profile-key rendering, then setup_workflow_run
+                # persists the same override after the workflow_run_id exists.
+                run_credential_parameter_overrides = self._get_run_credential_parameter_overrides(
+                    workflow=workflow,
+                    request_data=workflow_request.data,
+                )
                 workflow_run = await app.DATABASE.workflow_runs.create_workflow_run(
                     workflow_permanent_id=workflow_permanent_id,
                     workflow_id=workflow_id,
@@ -5600,7 +5785,6 @@ class WorkflowService:
                 effective_proxy_location = workflow_request.proxy_location
                 pin_required = False
                 try:
-                    workflow = await self.get_workflow(workflow_id=workflow_id)
                     # pin_required must be known before any awaited call that can raise, so the
                     # except path never falls through to creating an unprofiled pinned session.
                     effective_proxy_location = (
@@ -5618,6 +5802,7 @@ class WorkflowService:
                         workflow=workflow,
                         workflow_run=workflow_run,
                         organization_id=organization_id,
+                        credential_parameter_overrides=run_credential_parameter_overrides,
                     )
                     forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
                         workflow=workflow,
