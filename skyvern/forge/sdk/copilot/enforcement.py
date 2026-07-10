@@ -7,6 +7,7 @@ import copy
 import json
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -29,16 +30,23 @@ from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     author_time_reject_missing_output_paths,
+    latest_recorded_build_test_outcome_repeated,
+    record_build_test_outcome,
+    recorded_outcome_from_authoring_repair_context,
     run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
+    missing_rung_text,
+    render_missing_rung_call_sources,
     render_synthesized_offer_text,
     synthesize_code_block,
     trajectory_has_browser_fill_interaction,
+    uncovered_required_emitted_interactions,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
@@ -70,6 +78,7 @@ from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
     normalize_block_authoring_policy,
 )
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     RepairLoopState,
@@ -107,7 +116,12 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
     run_outcome_display_reason,
 )
-from skyvern.forge.sdk.copilot.runtime import AuthorTimeGateAblationPayload, record_author_time_gate_ablation_event
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    AuthorTimeGateAblationPayload,
+    output_contract_ladder_unresolved,
+    record_author_time_gate_ablation_event,
+)
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
@@ -428,6 +442,144 @@ def credential_priority_authoring_churn_stop_signal(ctx: Any) -> CopilotToolBloc
         internal_reason_code="credential_priority_authoring_churn",
         blocked_tool="update_workflow",
     )
+
+
+_CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
+_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL = "persisted_draft"
+
+
+def _scouted_spine_open_obligation(ctx: AgentContext) -> list[Mapping[str, Any]]:
+    """Required scouted rungs the latest persisted draft leaves uncovered; empty when no in-turn
+    persist exists or coverage holds."""
+    persisted_calls = ctx.persisted_draft_browser_calls
+    if persisted_calls is None:
+        return []
+    if not ctx.impose_synthesized_code_block:
+        return []
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return []
+    trajectory = ctx.scout_trajectory
+    if not trajectory:
+        return []
+    if not str(trajectory[0].get("source_url") or "").strip():
+        return []
+    synthesized = synthesize_code_block(
+        trajectory,
+        strict_selectors=True,
+        reached_download_target=ctx.reached_download_target,
+    )
+    if synthesized is None:
+        return []
+    return uncovered_required_emitted_interactions(synthesized.diagnostics.emitted_interactions, persisted_calls)
+
+
+def _log_scouted_spine_unresolved(uncovered: list[Mapping[str, Any]], *, site: str) -> None:
+    LOG.info(
+        "copilot_scouted_spine_under_build_unresolved",
+        site=site,
+        missing_rung_count=len(uncovered),
+        missing_rungs=missing_rung_text(uncovered),
+    )
+
+
+SCOUTED_SPINE_TURN_HALT_USER_REASON = (
+    "I couldn't get past the same problem after several attempts. The saved draft is still missing "
+    "steps I demonstrated while scouting, and my rewrites kept leaving them out. "
+    "Tell me what to change and I'll try a different approach."
+)
+
+
+def log_scouted_spine_unresolved_at_turn_halt(ctx: AgentContext) -> bool:
+    """Log-only and never raises: a failed obligation read must not block rendering the halt reply."""
+    try:
+        uncovered = _scouted_spine_open_obligation(ctx)
+    except Exception:
+        LOG.warning("copilot_scouted_spine_turn_halt_check_failed", exc_info=True)
+        return False
+    if not uncovered:
+        return False
+    _log_scouted_spine_unresolved(uncovered, site="turn_halt")
+    return True
+
+
+def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
+    try:
+        uncovered = _scouted_spine_open_obligation(ctx)
+    except Exception:
+        LOG.warning("copilot_scouted_spine_turn_end_check_failed", exc_info=True)
+        return None
+    if not uncovered:
+        return None
+    if ctx.scouted_spine_checkpoint_fired:
+        _log_scouted_spine_unresolved(uncovered, site="turn_end")
+        return None
+    ctx.scouted_spine_checkpoint_fired = True
+    repair_context = CodeAuthoringRepairContext(
+        block_label=_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL,
+        reason_code=SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+        selector=str(uncovered[0].get("selector") or "") or None,
+    )
+    ctx.last_code_authoring_repair_context = repair_context
+    record_build_test_outcome(ctx, recorded_outcome_from_authoring_repair_context(repair_context))
+    _record_code_authoring_guardrail_reject(ctx)
+    missing_text = missing_rung_text(uncovered)
+    LOG.info(
+        "copilot_scouted_spine_under_build",
+        block_label=_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL,
+        site="turn_end",
+        missing_rung_count=len(uncovered),
+        missing_rungs=missing_text,
+    )
+    nudge = (
+        f"The persisted draft under-builds the scouted spine ({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): "
+        f"missing rung(s): {missing_text}. Resubmit the code block through update_workflow so every scouted "
+        "rung is replayed — reuse the synthesized code block verbatim."
+    )
+    artifact = render_missing_rung_call_sources(uncovered)
+    if artifact:
+        nudge += "\n" + artifact
+    return nudge
+
+
+def _record_code_authoring_guardrail_reject(
+    ctx: AgentContext, *, defer_churn_stop: bool = False, frontier_unchanged: bool = False
+) -> None:
+    # Callers record the current build-test outcome first so repeat detection compares that key to history.
+    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
+    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
+    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
+    if repeated_outcome is False and not frontier_unchanged:
+        ctx.code_authoring_guardrail_reject_count = 0
+    ctx.code_authoring_guardrail_reject_count += 1
+    ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
+    LOG.info(
+        "copilot code-authoring guardrail reject recorded",
+        reject_count=ctx.code_authoring_guardrail_reject_count,
+        credential_priority=defer_churn_stop,
+    )
+    if defer_churn_stop:
+        if ctx.code_authoring_guardrail_reject_count < MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS:
+            return
+        signal: CopilotToolBlockerSignal = credential_priority_authoring_churn_stop_signal(ctx)
+    elif ctx.code_authoring_guardrail_reject_count < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
+        return
+    else:
+        signal = code_authoring_churn_stop_signal(ctx)
+    # A genuinely-terminal held blocker keeps both the rendered reply and the
+    # halt kind, so the churn stop defers to it rather than overriding.
+    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    if output_contract_ladder_unresolved(ctx):
+        return
+    try:
+        unresolved_obligation = _scouted_spine_open_obligation(ctx)
+    except Exception:
+        LOG.warning("copilot_scouted_spine_churn_stop_check_failed", exc_info=True)
+        unresolved_obligation = []
+    if unresolved_obligation:
+        _log_scouted_spine_unresolved(unresolved_obligation, site="churn_stop")
+    stash_blocker_signal(ctx, signal)
+    ctx.blocker_signal = signal
 
 
 def no_forward_progress_interaction_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
@@ -2788,23 +2940,38 @@ async def run_with_enforcement(
         # nudge path and the finalize path.
         synthesized_msg = _maybe_synthesized_block_offer_msg(ctx)
 
+        spine_checkpoint_nudge = False
         if nudge is None and synthesized_msg is None:
-            _consume_pending_screenshots(ctx)
-            _maybe_raise_non_retriable_nav(ctx)
-            return result
+            spine_nudge = _scouted_spine_turn_end_nudge(ctx)
+            if spine_nudge is None:
+                _consume_pending_screenshots(ctx)
+                _maybe_raise_non_retriable_nav(ctx)
+                return result
+            nudge = spine_nudge
+            spine_checkpoint_nudge = True
 
-        if nudge is not None and nudge == _nudge(copilot_config, "post_update"):
+        if nudge is not None and not spine_checkpoint_nudge and nudge == _nudge(copilot_config, "post_update"):
             if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:
                 LOG.warning(
                     "Enforcement exhausted post-update nudges, allowing response",
                     nudge_count=ctx.post_update_nudge_count,
                 )
-                _consume_pending_screenshots(ctx)
-                _maybe_raise_non_retriable_nav(ctx)
-                return result
-            ctx.post_update_nudge_count += 1
+                spine_nudge = _scouted_spine_turn_end_nudge(ctx)
+                if spine_nudge is None:
+                    _consume_pending_screenshots(ctx)
+                    _maybe_raise_non_retriable_nav(ctx)
+                    return result
+                nudge = spine_nudge
+                spine_checkpoint_nudge = True
+            else:
+                ctx.post_update_nudge_count += 1
 
-        nudge_type = _nudge_type_for_log(nudge, copilot_config) if nudge is not None else "synthesized_block_offer"
+        if spine_checkpoint_nudge:
+            nudge_type = "scouted_spine_under_build_checkpoint"
+        elif nudge is not None:
+            nudge_type = _nudge_type_for_log(nudge, copilot_config)
+        else:
+            nudge_type = "synthesized_block_offer"
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
         # OpenAI rejects images in tool messages, so a queued post-run

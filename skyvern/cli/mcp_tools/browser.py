@@ -27,6 +27,7 @@ from skyvern.cli.core.browser_ops import (
     do_observe,
     do_screenshot,
     parse_extract_schema,
+    ref_map_from_elements,
     ref_to_selector,
     select_native_option_if_targeted,
     serialize_elements,
@@ -2256,8 +2257,15 @@ async def skyvern_observe(
         int,
         Field(description="Max elements to return. Default 50.", ge=1, le=200),
     ] = 50,
+    include_values: Annotated[
+        bool,
+        Field(
+            description="Include current values for non-password inputs. "
+            "Password values are never returned. Default false."
+        ),
+    ] = False,
 ) -> dict[str, Any]:
-    """Snapshot interactive elements with refs reusable in this browser session until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe)."""
+    """Snapshot interactive elements with refs reusable in this browser session until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe). Input values are omitted by default; set include_values=True to return non-password values. Password values are never returned."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -2273,6 +2281,7 @@ async def skyvern_observe(
                 selector=selector,
                 interactive_only=interactive_only,
                 max_elements=max_elements,
+                include_values=include_values,
             )
             timer.mark("sdk")
         except Exception as e:
@@ -2286,7 +2295,7 @@ async def skyvern_observe(
 
     elements = serialize_elements(result.elements)
     replace_session_ref_map(
-        {element["ref"]: element for element in elements},
+        ref_map_from_elements(elements),
         session_id=ctx.session_id,
         cdp_url=ctx.cdp_url,
         generation=generation,
@@ -2299,7 +2308,8 @@ async def skyvern_observe(
         '{tool: "click", params: {ref: "e0"}}. '
         "Refs remain valid across calls in this browser session until the next skyvern_observe, "
         "skyvern_navigate, same-tab navigation, or tab/frame switch. Same-document DOM changes can also "
-        "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures."
+        "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures. "
+        "Input values are omitted unless include_values=true; password values are never returned."
     )
     return make_result(
         "skyvern_observe",
@@ -2381,7 +2391,7 @@ async def _dispatch_step(
         page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
         if on_observe_page is not None:
             on_observe_page(page_ref_key(page))
-        accepted = {"selector", "interactive_only", "max_elements"}
+        accepted = {"selector", "interactive_only", "max_elements", "include_values"}
         filtered = {k: v for k, v in params.items() if k in accepted}
         result = await _do_observe(page, **filtered)
         return {
