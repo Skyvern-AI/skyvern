@@ -932,8 +932,17 @@ function adjudicatedSummaryParts(
     hasDrafts: boolean;
     hasCleanCompletedBuild: boolean;
   },
+  uxV1 = false,
 ): AdjudicatedParts | null {
   if (turn.responseKind === null) return null;
+  // Disposition-first (rule A): a pending draft review outranks why the turn
+  // ended, regardless of responseKind (including non-build/clarify turns).
+  if (uxV1 && flags.needsUntestedProposalReview) {
+    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
+  }
+  if (uxV1 && flags.needsTestedProposalReview) {
+    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
+  }
   if (turn.responseKind !== "build") {
     return {
       headline:
@@ -941,7 +950,9 @@ function adjudicatedSummaryParts(
           ? "Declined"
           : turn.responseKind === "diagnose"
             ? "Answered"
-            : "Question",
+            : uxV1
+              ? "Needs your input"
+              : "Question",
       accent: "qa",
       glyph: "✦",
     };
@@ -982,7 +993,11 @@ function adjudicatedSummaryParts(
   return { headline: "Completed the run", accent: "ok", glyph: "✓" };
 }
 
-export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
+export function computeTurnSummary(
+  turn: TurnNarrativeState,
+  opts: { uxV1?: boolean } = {},
+): TurnSummary {
+  const uxV1 = opts.uxV1 ?? false;
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const isFail =
     turn.terminal === "error" || rollupBlocks.some((b) => b.state === "failed");
@@ -1014,13 +1029,17 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const adjudicated =
     isStoppedWithDraft || isFail
       ? null
-      : adjudicatedSummaryParts(turn, {
-          needsUntestedProposalReview,
-          needsTestedProposalReview,
-          hasEdited,
-          hasDrafts,
-          hasCleanCompletedBuild,
-        });
+      : adjudicatedSummaryParts(
+          turn,
+          {
+            needsUntestedProposalReview,
+            needsTestedProposalReview,
+            hasEdited,
+            hasDrafts,
+            hasCleanCompletedBuild,
+          },
+          uxV1,
+        );
 
   const headline = adjudicated
     ? adjudicated.headline
@@ -1028,23 +1047,41 @@ export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
       ? "Stopped with a draft"
       : isFail
         ? "Run halted"
-        : needsInput
-          ? "Question"
-          : needsUntestedProposalReview
+        : uxV1
+          ? needsUntestedProposalReview
             ? "Draft needs review"
             : needsTestedProposalReview
               ? "Workflow ready for review"
-              : isQA
-                ? mode === "refuse"
-                  ? "Declined"
-                  : mode === "clarify"
-                    ? "Question"
-                    : "Answered"
-                : hasEdited
-                  ? "Applied edits and re-tested"
-                  : hasDrafts
-                    ? "Built and tested the workflow"
-                    : "Completed the run";
+              : needsInput
+                ? "Needs your input"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Needs your input"
+                      : "Answered"
+                  : hasEdited
+                    ? "Applied edits and re-tested"
+                    : hasDrafts
+                      ? "Built and tested the workflow"
+                      : "Completed the run"
+          : needsInput
+            ? "Question"
+            : needsUntestedProposalReview
+              ? "Draft needs review"
+              : needsTestedProposalReview
+                ? "Workflow ready for review"
+                : isQA
+                  ? mode === "refuse"
+                    ? "Declined"
+                    : mode === "clarify"
+                      ? "Question"
+                      : "Answered"
+                  : hasEdited
+                    ? "Applied edits and re-tested"
+                    : hasDrafts
+                      ? "Built and tested the workflow"
+                      : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);

@@ -66,6 +66,7 @@ import { NarrativeView } from "./NarrativeView";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
 import { FixCard, shouldShowFixCard } from "./cards/FixCard";
+import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
 import {
   CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
@@ -321,6 +322,20 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
 const findLastTurnIndex = (messages: ChatMessage[]): number => {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index]?.kind !== "run_lifecycle") {
+      return index;
+    }
+  }
+  return -1;
+};
+
+// Locates the message owning a bypassed pending proposal so its gate keeps
+// rendering actionable controls even after later turns push it up the thread.
+const findLastIndexOfTurn = (
+  messages: ChatMessage[],
+  turnId: string,
+): number => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.narrative?.turnId === turnId) {
       return index;
     }
   }
@@ -592,9 +607,22 @@ export function WorkflowCopilotChat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
+  // Owning turn of the current proposedWorkflow. Kept alongside it (never
+  // merged into one object) so the gate can re-attach to its owning message.
+  const [pendingProposalTurnId, setPendingProposalTurnId] = useState<
+    string | null
+  >(null);
+  // Transient ring highlight on the gate the pending-proposal chip just
+  // scrolled to; cleared after the flash window.
+  const [gateFlashTurnId, setGateFlashTurnId] = useState<string | null>(null);
   // Turn IDs the user explicitly rejected. This is client-local because reject
   // only reverts the local canvas; the backend proposalDisposition stays fixed.
   const [rejectedTurnIds, setRejectedTurnIds] = useState<Set<string>>(
+    new Set(),
+  );
+  // Mirror of rejectedTurnIds for manual Accept, session-local (no server
+  // record of a non-auto-applied accept).
+  const [acceptedTurnIds, setAcceptedTurnIds] = useState<Set<string>>(
     new Set(),
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
@@ -632,6 +660,7 @@ export function WorkflowCopilotChat({
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
   const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gateFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Backend cancel watcher polls Redis: a turn can complete normally between
   // the cancel POST and the watcher firing, so the frontend must remember it.
   const cancelInFlightController = useRef<AbortController | null>(null);
@@ -661,6 +690,10 @@ export function WorkflowCopilotChat({
       if (cancelSafetyTimer.current !== null) {
         clearTimeout(cancelSafetyTimer.current);
         cancelSafetyTimer.current = null;
+      }
+      if (gateFlashTimer.current !== null) {
+        clearTimeout(gateFlashTimer.current);
+        gateFlashTimer.current = null;
       }
     };
   }, []);
@@ -880,8 +913,10 @@ export function WorkflowCopilotChat({
     updateQueuedPrompt(null);
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
+    setPendingProposalTurnId(null);
     setAutoAccept(false);
     setRejectedTurnIds(new Set());
+    setAcceptedTurnIds(new Set());
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
@@ -917,10 +952,10 @@ export function WorkflowCopilotChat({
           return hydrated;
         })(),
       }));
-      const pendingProposalTurnId = data.proposed_workflow
+      const restoredPendingProposalTurnId = data.proposed_workflow
         ? getLatestDiffCardTurnId(historyMessages)
         : null;
-      latestTurnId.current = pendingProposalTurnId;
+      latestTurnId.current = restoredPendingProposalTurnId;
       // History never carries run_lifecycle lines (local-only); carry them
       // forward only for the mount-race caller, not an explicit chat switch.
       setMessages((prev) => [
@@ -931,6 +966,9 @@ export function WorkflowCopilotChat({
       ]);
       setWorkflowCopilotChatId(data.workflow_copilot_chat_id);
       setProposedWorkflow(data.proposed_workflow ?? null);
+      setPendingProposalTurnId(
+        data.proposed_workflow ? restoredPendingProposalTurnId : null,
+      );
       setAutoAccept(data.auto_accept ?? false);
     },
     // Only stable state setters are referenced, so the callback never needs to change.
@@ -943,6 +981,7 @@ export function WorkflowCopilotChat({
       setIsLoadingHistory(true);
       updateQueuedPrompt(null);
       setRejectedTurnIds(new Set());
+      setAcceptedTurnIds(new Set());
       setNarrative(EMPTY_NARRATIVE);
       turnSnapshots.current.clear();
       pendingSubmitSnapshot.current = null;
@@ -1039,6 +1078,15 @@ export function WorkflowCopilotChat({
     [onWorkflowUpdate],
   );
 
+  // Records the accepted turn (for the "Applied changes" relabel) before
+  // clearing the pending-gate handle, shared by all three accept outcomes.
+  const markProposalAccepted = () => {
+    if (pendingProposalTurnId) {
+      setAcceptedTurnIds((prev) => new Set(prev).add(pendingProposalTurnId));
+    }
+    setPendingProposalTurnId(null);
+  };
+
   const handleAcceptWorkflow = async (
     workflow: WorkflowApiResponse,
     alwaysAccept: boolean = false,
@@ -1060,6 +1108,7 @@ export function WorkflowCopilotChat({
       if (!applyWorkflowUpdate(workflow, { applied: true })) {
         return;
       }
+      markProposalAccepted();
       setProposedWorkflow(null);
       if (alwaysAccept) {
         setAutoAccept(true);
@@ -1083,6 +1132,7 @@ export function WorkflowCopilotChat({
       ) {
         return;
       }
+      markProposalAccepted();
       setProposedWorkflow(null);
       if (alwaysAccept) {
         setAutoAccept(true);
@@ -1104,6 +1154,7 @@ export function WorkflowCopilotChat({
         });
         return;
       }
+      markProposalAccepted();
       setProposedWorkflow(null);
       if (alwaysAccept) {
         setAutoAccept(true);
@@ -1116,7 +1167,10 @@ export function WorkflowCopilotChat({
     // The staged proposal was rendered onto the canvas mid-turn (via
     // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
     // canvas state captured client-side at submit time.
-    const turnId = latestTurnId.current ?? getLatestDiffCardTurnId(messages);
+    const turnId =
+      pendingProposalTurnId ??
+      latestTurnId.current ??
+      getLatestDiffCardTurnId(messages);
     const entry = turnId ? turnSnapshots.current.get(turnId) : null;
     if (entry?.snapshot) {
       applyWorkflowUpdate(entry.snapshot);
@@ -1125,6 +1179,7 @@ export function WorkflowCopilotChat({
       setRejectedTurnIds((prev) => new Set(prev).add(turnId));
     }
     setProposedWorkflow(null);
+    setPendingProposalTurnId(null);
     void clearProposedWorkflow(false);
   };
 
@@ -1179,6 +1234,32 @@ export function WorkflowCopilotChat({
     },
     [credentialGetter, workflowPermanentId],
   );
+
+  // A follow-up turn that ends without a new draft no longer nulls a bypassed
+  // proposal client-side (flag-on); re-fetch the chat row instead, since the
+  // backend (keep_pending_proposal) may have kept it alive server-side.
+  // useCallback-stable: handleSend depends on it and is itself a dependency
+  // of other effects, so a churning identity here would cascade into them.
+  const resyncProposalFromChatRow = useCallback(async (): Promise<void> => {
+    const chatId = workflowCopilotChatIdRef.current?.trim();
+    if (!chatId) {
+      return;
+    }
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+        "/workflow/copilot/chat-history",
+        { params: { workflow_copilot_chat_id: chatId } },
+      );
+      const nextProposal = response.data.proposed_workflow ?? null;
+      setProposedWorkflow(nextProposal);
+      if (!nextProposal) {
+        setPendingProposalTurnId(null);
+      }
+    } catch (error) {
+      console.error("Failed to resync pending proposal:", error);
+    }
+  }, [credentialGetter]);
 
   const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
     const clearProposalByChatId = async (chatId: string) => {
@@ -1236,7 +1317,10 @@ export function WorkflowCopilotChat({
   };
 
   const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
-    onReviewWorkflow?.(workflow, () => setProposedWorkflow(null));
+    onReviewWorkflow?.(workflow, () => {
+      setProposedWorkflow(null);
+      setPendingProposalTurnId(null);
+    });
   };
 
   useEffect(() => {
@@ -1251,6 +1335,7 @@ export function WorkflowCopilotChat({
       updateQueuedPrompt(null);
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
+      setPendingProposalTurnId(null);
       setAutoAccept(false);
       setNarrative(EMPTY_NARRATIVE);
       historyLoadedForRef.current = null;
@@ -1457,7 +1542,10 @@ export function WorkflowCopilotChat({
             { id: queuedId, sender: "user", content: candidate },
           ]);
         }
-        setProposedWorkflow(null);
+        if (!copilotUxV1Enabled) {
+          setProposedWorkflow(null);
+          setPendingProposalTurnId(null);
+        }
         if (messageOverride === undefined) {
           setInputValue("");
         }
@@ -1493,7 +1581,10 @@ export function WorkflowCopilotChat({
       if (!options.queuedMessageId) {
         setMessages((prev) => [...prev, userMessage]);
       }
-      setProposedWorkflow(null);
+      if (!copilotUxV1Enabled) {
+        setProposedWorkflow(null);
+        setPendingProposalTurnId(null);
+      }
       const messageContent = candidate;
       if (messageOverride === undefined && !options.queuedMessageId) {
         setInputValue("");
@@ -1688,8 +1779,14 @@ export function WorkflowCopilotChat({
             )
           ) {
             applyWorkflowUpdate(response.updated_workflow, { applied: true });
+            // This turn's auto-commit already moved canonical past any earlier
+            // bypassed proposal — drop the stale handle so its gate cannot
+            // reapply an outdated draft over what was just committed.
+            setProposedWorkflow(null);
+            setPendingProposalTurnId(null);
           } else if (response.updated_workflow) {
             setProposedWorkflow(response.updated_workflow);
+            setPendingProposalTurnId(responseTurnId);
           } else if (
             // Cancel/error terminal on a turn that produced staged content →
             // snap canvas back to the pre-submit client snapshot.
@@ -1699,11 +1796,18 @@ export function WorkflowCopilotChat({
           ) {
             applyWorkflowUpdate(responseEntry.snapshot);
             setProposedWorkflow(null);
+            setPendingProposalTurnId(null);
+          } else if (copilotUxV1Enabled && pendingProposalTurnId) {
+            // No new draft this turn, but a bypassed proposal is still
+            // pending: re-fetch instead of nulling, since the backend (given
+            // keep_pending_proposal) may have kept it alive for a late Accept.
+            void resyncProposalFromChatRow();
           } else {
             // Informational reply OR proposal pending review. For
             // proposals, the Accept/Reject card is the user's next gate;
             // canvas keeps the staged content until the user acts.
             setProposedWorkflow(response.updated_workflow ?? null);
+            setPendingProposalTurnId(null);
           }
         };
 
@@ -1734,6 +1838,7 @@ export function WorkflowCopilotChat({
           if (errorEntry?.hadStagedDraft && errorEntry?.snapshot) {
             applyWorkflowUpdate(errorEntry.snapshot);
             setProposedWorkflow(null);
+            setPendingProposalTurnId(null);
           }
         };
 
@@ -1764,6 +1869,8 @@ export function WorkflowCopilotChat({
             cancel_token: cancelToken,
             target_block_label: targetBlockLabel,
             fix_origin: fixOrigin,
+            keep_pending_proposal:
+              copilotUxV1Enabled && Boolean(pendingProposalTurnId),
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -1877,6 +1984,7 @@ export function WorkflowCopilotChat({
       codeBlockModeEnabled,
       codeBlockRequestOverride,
       composerMode,
+      copilotUxV1Enabled,
       copilotV2Enabled,
       credentialGetter,
       getSaveData,
@@ -1886,7 +1994,9 @@ export function WorkflowCopilotChat({
       isLiveBrowserReady,
       liveBrowserSessionId,
       maybeFetchRecordedActions,
+      pendingProposalTurnId,
       requiresLiveBrowser,
+      resyncProposalFromChatRow,
       stopSpeech,
       takeSpeechAudioBlob,
       updateQueuedPrompt,
@@ -2280,6 +2390,15 @@ export function WorkflowCopilotChat({
       : "Listening…"
     : browserStatusText;
   const lastTurnIndex = findLastTurnIndex(messages);
+  // A bypassed proposal's gate stays attached to its owning turn (not
+  // necessarily the last message) so a chip can jump back to it.
+  const gateOwnerIndex = pendingProposalTurnId
+    ? findLastIndexOfTurn(messages, pendingProposalTurnId)
+    : -1;
+  const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
+  // Mid-turn Accept would be clobbered by the in-flight turn's terminal
+  // restore, so gate actions wait for idle.
+  const gateActionable = Boolean(proposedWorkflow) && !isLoading;
 
   const content = (
     <div
@@ -2402,8 +2521,13 @@ export function WorkflowCopilotChat({
               // subsequent turns. The Accept/Reject controls render only on
               // the latest message AND while the proposal is pending review.
               if (message.sender === "ai" && message.narrative) {
+                const turnId = message.narrative.turnId;
                 const showProposalActions =
                   isLastMessage && Boolean(proposedWorkflow);
+                const showReviewGate =
+                  copilotUxV1Enabled &&
+                  (shouldShowDiffCard(message.narrative) ||
+                    (turnId !== null && turnId === pendingProposalTurnId));
                 return (
                   <div
                     key={message.id}
@@ -2414,50 +2538,93 @@ export function WorkflowCopilotChat({
                     <NarrativeView
                       turn={message.narrative}
                       onBlockSelect={onBlockSelect}
+                      uxV1={copilotUxV1Enabled}
                     />
-                    {showProposalActions && proposedWorkflow ? (
-                      <div className="flex flex-wrap gap-2 pl-1">
-                        <button
-                          type="button"
-                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
-                        >
-                          Review
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
-                        >
-                          Accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleAcceptWorkflow(proposedWorkflow, true)
-                          }
-                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
-                        >
-                          Always accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleRejectWorkflow}
-                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    ) : null}
-                    {docked && shouldShowDiffCard(message.narrative) ? (
-                      <DiffCard
-                        pendingProposal={showProposalActions}
-                        rejected={
-                          message.narrative.turnId !== null &&
-                          rejectedTurnIds.has(message.narrative.turnId)
-                        }
+                    {showReviewGate ? (
+                      <ReviewGateCard
                         turn={message.narrative}
+                        pending={
+                          index === gateIndex && Boolean(proposedWorkflow)
+                        }
+                        verdict={getReviewGateVerdict(
+                          message.narrative,
+                          proposedWorkflow,
+                        )}
+                        settled={
+                          turnId && acceptedTurnIds.has(turnId)
+                            ? "accepted"
+                            : turnId && rejectedTurnIds.has(turnId)
+                              ? "rejected"
+                              : null
+                        }
+                        actionsEnabled={gateActionable}
+                        onAccept={() =>
+                          proposedWorkflow &&
+                          handleAcceptWorkflow(proposedWorkflow)
+                        }
+                        onAlwaysAccept={() =>
+                          proposedWorkflow &&
+                          handleAcceptWorkflow(proposedWorkflow, true)
+                        }
+                        onReject={handleRejectWorkflow}
+                        onReview={() =>
+                          proposedWorkflow &&
+                          handleReviewWorkflow(proposedWorkflow)
+                        }
+                        gateId={turnId ? `copilot-gate-${turnId}` : undefined}
+                        flash={turnId !== null && turnId === gateFlashTurnId}
                       />
+                    ) : !copilotUxV1Enabled ? (
+                      <>
+                        {showProposalActions && proposedWorkflow ? (
+                          <div className="flex flex-wrap gap-2 pl-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleReviewWorkflow(proposedWorkflow)
+                              }
+                              className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
+                            >
+                              Review
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAcceptWorkflow(proposedWorkflow)
+                              }
+                              className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
+                            >
+                              Accept
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleAcceptWorkflow(proposedWorkflow, true)
+                              }
+                              className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
+                            >
+                              Always accept
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleRejectWorkflow}
+                              className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        ) : null}
+                        {docked && shouldShowDiffCard(message.narrative) ? (
+                          <DiffCard
+                            pendingProposal={showProposalActions}
+                            rejected={
+                              message.narrative.turnId !== null &&
+                              rejectedTurnIds.has(message.narrative.turnId)
+                            }
+                            turn={message.narrative}
+                          />
+                        ) : null}
+                      </>
                     ) : null}
                     {docked &&
                     isLastMessage &&
@@ -2475,6 +2642,8 @@ export function WorkflowCopilotChat({
                 );
               }
               const showProposedPanel = isLastMessage && proposedWorkflow;
+              const isGateOwnerOrLast =
+                index === gateIndex && Boolean(proposedWorkflow);
               return (
                 <MessageItem
                   key={message.id}
@@ -2485,7 +2654,30 @@ export function WorkflowCopilotChat({
                         <ReloadIcon className="h-3 w-3 animate-spin" />
                         <span>{queuedPromptWaitingStatus}</span>
                       </div>
-                    ) : showProposedPanel ? (
+                    ) : copilotUxV1Enabled && isGateOwnerOrLast ? (
+                      <ReviewGateCard
+                        pending
+                        verdict={getReviewGateVerdict(
+                          undefined,
+                          proposedWorkflow,
+                        )}
+                        settled={null}
+                        actionsEnabled={gateActionable}
+                        onAccept={() =>
+                          proposedWorkflow &&
+                          handleAcceptWorkflow(proposedWorkflow)
+                        }
+                        onAlwaysAccept={() =>
+                          proposedWorkflow &&
+                          handleAcceptWorkflow(proposedWorkflow, true)
+                        }
+                        onReject={handleRejectWorkflow}
+                        onReview={() =>
+                          proposedWorkflow &&
+                          handleReviewWorkflow(proposedWorkflow)
+                        }
+                      />
+                    ) : !copilotUxV1Enabled && showProposedPanel ? (
                       <>
                         <button
                           type="button"
@@ -2534,7 +2726,11 @@ export function WorkflowCopilotChat({
                 role="status"
                 aria-live="polite"
               >
-                <NarrativeView turn={narrative} onBlockSelect={onBlockSelect} />
+                <NarrativeView
+                  turn={narrative}
+                  onBlockSelect={onBlockSelect}
+                  uxV1={copilotUxV1Enabled}
+                />
               </div>
             )}
           </div>
@@ -2553,6 +2749,32 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-border p-3">
+        {copilotUxV1Enabled &&
+        proposedWorkflow &&
+        pendingProposalTurnId &&
+        (gateOwnerIndex !== lastTurnIndex || isLoading) ? (
+          <button
+            type="button"
+            onClick={() => {
+              if (!pendingProposalTurnId) return;
+              document
+                .getElementById(`copilot-gate-${pendingProposalTurnId}`)
+                ?.scrollIntoView({ behavior: "smooth", block: "center" });
+              if (gateFlashTimer.current !== null) {
+                clearTimeout(gateFlashTimer.current);
+              }
+              setGateFlashTurnId(pendingProposalTurnId);
+              gateFlashTimer.current = setTimeout(() => {
+                setGateFlashTurnId(null);
+                gateFlashTimer.current = null;
+              }, 1100);
+            }}
+            className="mb-2 flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-[10.5px] text-muted-foreground hover:bg-slate-elevation3"
+          >
+            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />1 proposal
+            pending · Review
+          </button>
+        ) : null}
         {inputStatusText ? (
           <div
             className="mb-2 text-xs text-muted-foreground"
