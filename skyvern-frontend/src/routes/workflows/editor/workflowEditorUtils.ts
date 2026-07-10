@@ -56,6 +56,7 @@ import {
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
   PdfFillBlockYAML,
+  SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -164,6 +165,11 @@ import {
   pdfFillNodeDefaultData,
 } from "./nodes/PdfFillNode/types";
 import { validatePdfFillNode } from "./nodes/PdfFillNode/validate";
+import {
+  isSplitPdfNode,
+  splitPdfNodeDefaultData,
+} from "./nodes/SplitPdfNode/types";
+import { validateSplitPdfNode } from "./nodes/SplitPdfNode/validate";
 import {
   containsJinjaReference,
   getAffectedBlocks,
@@ -1140,6 +1146,20 @@ function convertToNode(
             typeof block.payload === "string"
               ? block.payload
               : JSON.stringify(block.payload || {}, null, 2),
+          llmKey: block.llm_key ?? "",
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "split_pdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...commonData,
+          fileUrl: block.file_url ?? "",
+          prompt: block.prompt ?? "",
           llmKey: block.llm_key ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
         },
@@ -2564,6 +2584,17 @@ function createNode(
         },
       };
     }
+    case "splitPdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...splitPdfNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "workflowTrigger": {
       return {
         ...identifiers,
@@ -3141,6 +3172,16 @@ function getWorkflowBlock(
         file_url: node.data.fileUrl,
         prompt: node.data.prompt,
         payload: JSONSafeOrStringAllowArrays(node.data.payload),
+        llm_key: node.data.llmKey || null,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "splitPdf": {
+      return {
+        ...base,
+        block_type: "split_pdf",
+        file_url: node.data.fileUrl,
+        prompt: node.data.prompt,
         llm_key: node.data.llmKey || null,
         parameter_keys: node.data.parameterKeys,
       };
@@ -4490,6 +4531,17 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "split_pdf": {
+        const blockYaml: SplitPdfBlockYAML = {
+          ...base,
+          block_type: "split_pdf",
+          file_url: block.file_url,
+          prompt: block.prompt,
+          llm_key: block.llm_key,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "workflow_trigger": {
         const blockYaml: WorkflowTriggerBlockYAML = {
           ...base,
@@ -4842,6 +4894,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isPdfFillNode)
     .forEach((node) => errors.push(...validatePdfFillNode(node)));
+
+  nodes
+    .filter(isSplitPdfNode)
+    .forEach((node) => errors.push(...validateSplitPdfNode(node)));
 
   return errors;
 }

@@ -29,6 +29,7 @@ const REACT_FLOW_TYPE_TO_BLOCK_TYPE: Record<string, string> = {
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
   pdfFill: "pdf_fill",
+  splitPdf: "split_pdf",
 };
 
 type Loopish = { type?: string; data?: Partial<LoopNodeData> };

@@ -270,6 +270,18 @@ const nodeLibraryItems: Array<{
     description: "Fill a PDF form",
   },
   {
+    nodeType: "splitPdf",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.SplitPDF}
+        className="size-6"
+      />
+    ),
+    title: "Split PDF",
+    description:
+      "Split one PDF into multiple PDFs based on a prompt and save each to S3.",
+  },
+  {
     nodeType: "workflowTrigger",
     icon: (
       <WorkflowBlockIcon

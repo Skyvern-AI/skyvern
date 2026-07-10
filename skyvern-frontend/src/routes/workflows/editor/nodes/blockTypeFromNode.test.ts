@@ -22,6 +22,10 @@ describe("blockTypeFromNode", () => {
     expect(blockTypeFromNode({ type: "pdfFill" })).toBe("pdf_fill");
   });
 
+  it("maps splitPdf to split_pdf", () => {
+    expect(blockTypeFromNode({ type: "splitPdf" })).toBe("split_pdf");
+  });
+
   it("maps url to goto_url", () => {
     expect(blockTypeFromNode({ type: "url" })).toBe("goto_url");
   });

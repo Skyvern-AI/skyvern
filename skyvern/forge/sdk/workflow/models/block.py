@@ -11123,6 +11123,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsWriteBlock,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -11153,6 +11154,7 @@ BlockSubclasses = Union[
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
     PdfFillBlock,
+    SplitPdfBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

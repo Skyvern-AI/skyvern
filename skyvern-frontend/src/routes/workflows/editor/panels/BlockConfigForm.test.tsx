@@ -114,9 +114,10 @@ describe("BLOCK_FORMS dispatcher", () => {
         "googleSheetsRead",
         "googleSheetsWrite",
         "pdfFill",
+        "splitPdf",
       ]),
     );
-    expect(BLOCK_FORM_KEYS).toHaveLength(27);
+    expect(BLOCK_FORM_KEYS).toHaveLength(28);
   });
 
   test("conditional routes to a sidebar form that shows branch prompts", () => {
