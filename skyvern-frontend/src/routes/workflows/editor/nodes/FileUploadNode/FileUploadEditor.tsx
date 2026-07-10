@@ -49,6 +49,14 @@ function FileUploadEditorBody({
     azureBlobContainerName,
     googleCredentialId,
     googleDriveFolderId,
+    sftpHost,
+    sftpPort,
+    sftpUsername,
+    sftpPassword,
+    sftpPrivateKey,
+    sftpPrivateKeyPassphrase,
+    sftpRemotePath,
+    sftpHostKey,
   } = data;
   const update = useUpdate<FileUploadNodeData>({ id: blockId, editable });
 
@@ -63,7 +71,9 @@ function FileUploadEditorBody({
           value={storageType}
           onValueChange={(value) =>
             value &&
-            update({ storageType: value as "s3" | "azure" | "google_drive" })
+            update({
+              storageType: value as "s3" | "azure" | "google_drive" | "sftp",
+            })
           }
           disabled={!editable}
         >
@@ -74,6 +84,7 @@ function FileUploadEditorBody({
             <SelectItem value="s3">Amazon S3</SelectItem>
             <SelectItem value="azure">Azure Blob Storage</SelectItem>
             <SelectItem value="google_drive">Google Drive</SelectItem>
+            <SelectItem value="sftp">SFTP</SelectItem>
           </SelectContent>
         </Select>
       </div>
@@ -255,6 +266,117 @@ function FileUploadEditorBody({
               nodeId={blockId}
               onChange={(value) => update({ googleDriveFolderId: value })}
               value={googleDriveFolderId ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+        </>
+      )}
+
+      {storageType === "sftp" && (
+        <>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">SFTP Host</Label>
+              <HelpTooltip content="The SFTP host to upload files to." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpHost: value })}
+              value={sftpHost ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Port</Label>
+              <HelpTooltip content="Numeric only — template values are not supported. Defaults to 22 if left blank." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) =>
+                update({ sftpPort: value.replace(/[^0-9]/g, "") })
+              }
+              value={sftpPort ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Username</Label>
+              <HelpTooltip content="The SFTP username." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpUsername: value })}
+              value={sftpUsername ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Password</Label>
+              <HelpTooltip content="Password auth. Leave blank if using a private key. Reference a secret parameter for security." />
+            </div>
+            <WorkflowBlockInput
+              nodeId={blockId}
+              type="password"
+              onChange={(value) => update({ sftpPassword: value })}
+              value={sftpPassword ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Private Key</Label>
+              <HelpTooltip content="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpPrivateKey: value })}
+              value={sftpPrivateKey ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                Private Key Passphrase (Optional)
+              </Label>
+              <HelpTooltip content="Optional passphrase for the private key." />
+            </div>
+            <WorkflowBlockInput
+              nodeId={blockId}
+              type="password"
+              onChange={(value) => update({ sftpPrivateKeyPassphrase: value })}
+              value={sftpPrivateKeyPassphrase ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                (Optional) Remote Directory
+              </Label>
+              <HelpTooltip content="Remote directory to upload into. Created if it does not exist. Defaults to the login directory." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpRemotePath: value })}
+              value={sftpRemotePath ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                (Optional) Host Key
+              </Label>
+              <HelpTooltip content="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpHostKey: value })}
+              value={sftpHostKey ?? ""}
               className="nopan text-xs"
             />
           </div>

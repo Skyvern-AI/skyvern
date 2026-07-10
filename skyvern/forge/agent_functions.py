@@ -39,7 +39,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
@@ -1547,6 +1547,24 @@ class AgentFunction:
                 folder_id=destination.google_drive_folder_id,
             )
             return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
+
+        if destination.storage_type == FileStorageType.SFTP:
+            if not destination.sftp_host or not destination.sftp_username:
+                raise ValueError("SFTP destination is missing required fields")
+            if not destination.sftp_password and not destination.sftp_private_key:
+                raise ValueError("SFTP destination requires a password or private key")
+            await sftp_service.upload_file(
+                file_path=file_path,
+                host=destination.sftp_host,
+                port=destination.sftp_port if destination.sftp_port is not None else 22,
+                username=destination.sftp_username,
+                remote_path=destination.sftp_remote_path,
+                password=destination.sftp_password,
+                private_key=destination.sftp_private_key,
+                private_key_passphrase=destination.sftp_private_key_passphrase,
+                host_key=destination.sftp_host_key,
+            )
+            return destination.customer_uri
 
         raise ValueError(f"Unsupported storage type: {destination.storage_type}")
 

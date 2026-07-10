@@ -506,6 +506,7 @@ class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
     GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
 
 
 class FileUploadDestination(BaseModel):
@@ -533,6 +534,14 @@ class FileUploadDestination(BaseModel):
 
     google_access_token: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -916,6 +925,14 @@ class FileUploadBlockYAML(BlockYAML):
     azure_folder_path: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
     path: str | None = None
 
 

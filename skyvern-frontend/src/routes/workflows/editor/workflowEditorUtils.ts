@@ -1081,6 +1081,14 @@ function convertToNode(
           azureBlobContainerName: block.azure_blob_container_name ?? "",
           googleCredentialId: block.google_credential_id ?? "",
           googleDriveFolderId: block.google_drive_folder_id ?? "",
+          sftpHost: block.sftp_host ?? "",
+          sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
+          sftpUsername: block.sftp_username ?? "",
+          sftpPassword: block.sftp_password ?? "",
+          sftpPrivateKey: block.sftp_private_key ?? "",
+          sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
+          sftpRemotePath: block.sftp_remote_path ?? "",
+          sftpHostKey: block.sftp_host_key ?? "",
         },
       };
     }
@@ -3085,6 +3093,17 @@ function getWorkflowBlock(
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
         google_credential_id: node.data.googleCredentialId ?? "",
         google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+        sftp_host: node.data.sftpHost ?? "",
+        sftp_port:
+          node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
+            ? Number(node.data.sftpPort)
+            : null,
+        sftp_username: node.data.sftpUsername ?? "",
+        sftp_password: node.data.sftpPassword ?? "",
+        sftp_private_key: node.data.sftpPrivateKey ?? "",
+        sftp_private_key_passphrase: node.data.sftpPrivateKeyPassphrase ?? "",
+        sftp_remote_path: node.data.sftpRemotePath ?? "",
+        sftp_host_key: node.data.sftpHostKey ?? "",
       };
     }
     case "fileParser": {
@@ -4441,6 +4460,14 @@ function convertBlocksToBlockYAML(
           azure_blob_container_name: block.azure_blob_container_name ?? "",
           google_credential_id: block.google_credential_id ?? "",
           google_drive_folder_id: block.google_drive_folder_id ?? "",
+          sftp_host: block.sftp_host ?? "",
+          sftp_port: block.sftp_port ?? null,
+          sftp_username: block.sftp_username ?? "",
+          sftp_password: block.sftp_password ?? "",
+          sftp_private_key: block.sftp_private_key ?? "",
+          sftp_private_key_passphrase: block.sftp_private_key_passphrase ?? "",
+          sftp_remote_path: block.sftp_remote_path ?? "",
+          sftp_host_key: block.sftp_host_key ?? "",
         };
         return blockYaml;
       }
