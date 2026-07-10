@@ -209,6 +209,8 @@ RequestedOutputEvidenceSource = Literal[
 ]
 JudgmentPredicate = Literal["login_gate_blocks_target"]
 _JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
+MintDegrade = Literal["turn_unsatisfiable_fallback", "contingent_missing_antecedent"]
+MINT_DEGRADE_VALUES: frozenset[str] = frozenset(get_args(MintDegrade))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
@@ -293,7 +295,7 @@ class CompletionCriterion:
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
-    mint_degrade: Literal["turn_unsatisfiable_fallback"] | None = None
+    mint_degrade: MintDegrade | None = None
     judgment_truth_condition: JudgmentTruthCondition | None = None
 
 
@@ -389,6 +391,14 @@ class RequestPolicy:
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
+        mint_degraded_criteria = [
+            criterion for criterion in self.completion_criteria if criterion.mint_degrade is not None
+        ]
+        data["mint_degraded_criterion_count"] = len(mint_degraded_criteria)
+        for index, criterion in enumerate(mint_degraded_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"mint_degraded_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
         return data
 
     def prompt_summary(self) -> str:
@@ -1702,7 +1712,19 @@ def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
 
 
 def is_turn_unsatisfiable_fallback_degraded(criterion: CompletionCriterion) -> bool:
-    return criterion.mint_degrade == "turn_unsatisfiable_fallback"
+    return criterion.mint_degrade is not None
+
+
+def resolve_mint_degrade(
+    stored_value: object,
+    contingent_on: str | None,
+    contingent_antecedent_output_path: str | None,
+) -> MintDegrade | None:
+    if isinstance(stored_value, str) and stored_value in MINT_DEGRADE_VALUES:
+        return cast(MintDegrade, stored_value)
+    if contingent_on and contingent_antecedent_output_path is None:
+        return "contingent_missing_antecedent"
+    return None
 
 
 _FALLBACK_LITERAL_MIN_CHARS = 4
@@ -1783,6 +1805,26 @@ def _mark_turn_unsatisfiable_fallback_criteria(policy: RequestPolicy) -> None:
     policy.completion_criteria = marked
 
 
+def _degrade_pathless_contingent_criteria(policy: RequestPolicy) -> None:
+    swept: list[CompletionCriterion] = []
+    degraded_ids: list[str] = []
+    for criterion in policy.completion_criteria:
+        resolved = resolve_mint_degrade(
+            criterion.mint_degrade, criterion.contingent_on, criterion.contingent_antecedent_output_path
+        )
+        if resolved != criterion.mint_degrade:
+            criterion = replace(criterion, mint_degrade=resolved)
+            degraded_ids.append(criterion.id)
+        swept.append(criterion)
+    policy.completion_criteria = swept
+    if degraded_ids:
+        LOG.info(
+            "copilot_contingent_criterion_mint_degraded",
+            criterion_ids=degraded_ids,
+            mint_degrade="contingent_missing_antecedent",
+        )
+
+
 def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
     floor = [
         CompletionCriterion(
@@ -1850,6 +1892,7 @@ def _classifier_fallback_policy(
     )
     _apply_classifier_typed_requested_output_corroborators(policy)
     _mark_turn_unsatisfiable_fallback_criteria(policy)
+    _degrade_pathless_contingent_criteria(policy)
     if policy.graded_completion_criteria():
         policy.completion_contract_status = "present"
     return policy
@@ -2101,6 +2144,7 @@ async def _classify_request(
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
     _apply_validation_classification_completion_criteria(policy)
     _apply_classifier_typed_requested_output_corroborators(policy)
+    _degrade_pathless_contingent_criteria(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )

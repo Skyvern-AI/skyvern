@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     judgment_truth_condition_key,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
+    resolve_mint_degrade,
     typed_expected_output_value_key,
 )
 
@@ -177,7 +178,10 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         )
         classification_output_key = _coerce_classification_output_key(item.get("classification_output_key"))
         expected_classification = _coerce_expected_classification(item.get("expected_classification"))
-        contingent_on = item.get("contingent_on")
+        contingent_on_raw = item.get("contingent_on")
+        contingent_on = (
+            contingent_on_raw.strip() if isinstance(contingent_on_raw, str) and contingent_on_raw.strip() else None
+        )
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
         )
@@ -208,9 +212,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             CompletionCriterion(
                 id=criterion_id,
                 outcome=outcome,
-                contingent_on=contingent_on.strip()
-                if isinstance(contingent_on, str) and contingent_on.strip()
-                else None,
+                contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
                 deliverable_kind=_normalize_deliverable_kind(item.get("deliverable_kind")),
                 implicit=bool(item.get("implicit")),
@@ -225,9 +227,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
                 requested_output_corroborator=bool(item.get("requested_output_corroborator")),
-                mint_degrade="turn_unsatisfiable_fallback"
-                if item.get("mint_degrade") == "turn_unsatisfiable_fallback"
-                else None,
+                mint_degrade=resolve_mint_degrade(
+                    item.get("mint_degrade"), contingent_on, contingent_antecedent_output_path
+                ),
                 judgment_truth_condition=_coerce_judgment_truth_condition(
                     item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
                 ),

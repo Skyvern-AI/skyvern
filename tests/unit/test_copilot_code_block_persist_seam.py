@@ -4126,7 +4126,7 @@ class TestCodeRepairProgressClassification:
         judgment_only_ctx = _code_only_ctx()
         judgment_only_ctx.request_policy = RequestPolicy(completion_criteria=[judgment_criterion])
 
-        judgment_only_paths, _, _ = workflow_update_module._output_contract_required_paths_source(judgment_only_ctx)
+        judgment_only_paths = workflow_update_module._output_contract_required_paths_source(judgment_only_ctx).union
 
         assert judgment_only_paths == set()
 
@@ -4142,7 +4142,8 @@ class TestCodeRepairProgressClassification:
             ]
         )
 
-        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
 
         assert required_paths == {"output.record_id"}
         assert source == "requested_output_contract"
@@ -4163,7 +4164,7 @@ class TestCodeRepairProgressClassification:
             ]
         )
 
-        required_paths, _, _ = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths = workflow_update_module._output_contract_required_paths_source(ctx).union
 
         assert required_paths == set()
 
@@ -4194,7 +4195,7 @@ class TestCodeRepairProgressClassification:
             metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
         )
 
-        required_paths, _, _ = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths = workflow_update_module._output_contract_required_paths_source(ctx).union
         result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, _SAFE_CODE_YAML, [])
 
         assert required_paths == set()
@@ -4227,7 +4228,8 @@ class TestCodeRepairProgressClassification:
             metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
         )
 
-        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
 
         assert required_paths == {"output.record_id"}
         assert source == "requested_output_contract"
@@ -4268,7 +4270,7 @@ class TestCodeRepairProgressClassification:
             ],
         )
 
-        required_paths, _, _ = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths = workflow_update_module._output_contract_required_paths_source(ctx).union
 
         assert required_paths == set()
 
@@ -4322,7 +4324,8 @@ class TestCodeRepairProgressClassification:
             ],
         )
 
-        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
 
         assert required_paths == {"output.record_id"}
         assert source == "runtime_output_repair"
@@ -4470,7 +4473,8 @@ class TestCodeRepairProgressClassification:
 
         ctx = _code_only_ctx()
         ctx.latest_recorded_build_test_outcome = outcome
-        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
         assert required_paths == {
             "output.public_form_exists",
             "output.recommended_next_action",
@@ -6951,6 +6955,8 @@ class TestSeparatedSpineViolationActuation:
             block_label="extract_record",
             artifact_id="art-1",
             required_paths={"output.confirmation_number"},
+            observation_paths={"output.confirmation_number"},
+            declaration_paths=set(),
             source="requested_output_contract",
             reason_code="requested_output_contract_missing_output_coverage",
             missing_metadata_paths=[],
@@ -7220,7 +7226,8 @@ class TestSeparatedSpineImpositionRunEligibility:
         scaffolded_metadata, _applied = workflow_update_module._scaffold_metadata_contract_for_update(
             ctx, workflow_yaml, []
         )
-        required_paths, source, reason_code = workflow_update_module._output_contract_required_paths_source(ctx)
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
         read_label, _owner_labels = workflow_update_module._target_output_contract_block_label(
             ctx, workflow_yaml, scaffolded_metadata, required_paths
         )
@@ -12599,3 +12606,96 @@ def _auto_act_scout_ctx() -> AgentContext:
 class _AutoActClickServer:
     async def call_internal_tool(self, tool_name: str, args: dict[str, object]) -> dict[str, object]:
         return {"ok": True, "data": {"selector": args.get("selector")}}
+
+
+def _declaration_stamp_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.turn_id = "t-decl"
+    ctx.scout_trajectory = []
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c_record",
+                outcome="The returned record includes record id.",
+                output_path="output.record_id",
+            ),
+            CompletionCriterion(
+                id="c_blocker",
+                outcome="A blocker is reported when the site blocks submission.",
+                contingent_on="the site blocks submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+    return ctx
+
+
+class TestDeclarationContractStamp:
+    def test_zero_output_block_persists_declared_blocker_at_ceiling(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        signature = workflow_update_module._stable_output_contract_key(
+            "turn:t-decl", {"output.record_id", "output.blocker"}
+        )
+        ctx.output_contract_reject_count_by_signature = {
+            signature: workflow_update_module._MAX_OUTPUT_CONTRACT_STEERING_REJECTS
+        }
+        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")')
+
+        new_yaml, _metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+
+        assert applied is True
+        code = str(workflow_blocks(parse_workflow_yaml(new_yaml))[0].get("code") or "")
+        produced = workflow_update_module._code_block_produced_output_paths(code)
+        assert "output.blocker" in produced  # nosemgrep: incomplete-url-substring-sanitization
+        assert "output.record_id" not in produced
+        assert '"blocker": None' in code
+
+    def test_stamp_applies_before_steering_reject_wait(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")\nreturn {}')
+
+        new_yaml, _metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+
+        assert applied is True
+        code = str(workflow_blocks(parse_workflow_yaml(new_yaml))[0].get("code") or "")
+        assert 'return {"output": {"blocker": None}}' in code
+
+    def test_stamp_is_idempotent_across_calls(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")')
+
+        first_yaml, _metadata, _applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        again_yaml, _metadata2, _applied2 = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, first_yaml, []
+        )
+
+        assert again_yaml == first_yaml
+
+    def test_stamp_skips_without_single_owner_block(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _yaml(
+            "title: Two blocks\n"
+            "workflow_definition:\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: first\n"
+            "    code: |\n"
+            '      await page.click("#a")\n'
+            "  - block_type: code\n"
+            "    label: second\n"
+            "    code: |\n"
+            '      await page.click("#b")\n'
+        )
+
+        new_yaml, _metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+
+        assert applied is False
+        assert new_yaml == workflow_yaml

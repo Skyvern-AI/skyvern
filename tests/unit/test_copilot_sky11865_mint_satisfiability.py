@@ -454,6 +454,52 @@ def test_recorded_branch_no_meaningful_output_degrades() -> None:
     assert outcome.reason_code == "fallback_floor_turn_unsatisfiable"
 
 
+def test_contingent_missing_antecedent_counts_as_degraded() -> None:
+    criterion = CompletionCriterion(
+        id="c1",
+        outcome="A blocker is reported to the user.",
+        level="run",
+        contingent_on="the site blocks submission",
+        mint_degrade="contingent_missing_antecedent",
+    )
+    assert is_turn_unsatisfiable_fallback_degraded(criterion) is True
+    assert is_turn_unsatisfiable_fallback_degraded(replace(criterion, mint_degrade=None)) is False
+
+
+def test_contingent_missing_antecedent_carries_and_blocks_credit_when_unsatisfied() -> None:
+    result = carry_degraded_criterion_ids(
+        CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c1", "floor"],
+            verdicts=[
+                CriterionVerdict(criterion_id="c1", state="unsatisfied", reason_code="no_evidence"),
+                CriterionVerdict(criterion_id="floor", state="satisfied", reason_code="evidence_confirms"),
+            ],
+        ),
+        [
+            CompletionCriterion(
+                id="c1",
+                outcome="A blocker is reported to the user.",
+                level="run",
+                contingent_on="the site blocks submission",
+                mint_degrade="contingent_missing_antecedent",
+            )
+        ],
+    )
+    assert "c1" in result.degraded_criterion_ids
+    assert result.is_fully_satisfied() is False
+
+
+def test_satisfied_degraded_criterion_still_credits_on_merits() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c1"],
+        verdicts=[CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")],
+        degraded_criterion_ids=["c1"],
+    )
+    assert result.is_fully_satisfied() is True
+
+
 def test_recorded_branch_ambiguous_code_with_failed_block_stays_repairable() -> None:
     result = {
         "data": {
