@@ -108,6 +108,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
@@ -5006,6 +5007,14 @@ class ForgeAgent:
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+                submission_shadow.schedule_submission_signal_shadow(
+                    har_data=har_data,
+                    browser_state=browser_state,
+                    last_step=last_step,
+                    task=task,
+                    browser_session_id=browser_session_id,
+                )
             LOG.debug("Uploading har data", har_size=len(har_data))
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
