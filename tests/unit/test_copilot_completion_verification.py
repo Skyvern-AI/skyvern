@@ -12,6 +12,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.agent import (
     _completion_contract_not_violated,
     _rewrite_failed_test_response,
@@ -103,6 +104,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _tool_visible_result_after_completion_verification,
     _watchdog_exit_allows_terminal_promotion,
 )
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools._shared import (
     _TASK_ENVELOPE_BLOCK_TYPES,
     _has_meaningful_registered_output_payload,
@@ -118,7 +120,16 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _apply_code_artifact_requested_output_evidence_sources,
     _normalize_code_artifact_metadata,
 )
+from tests.unit.copilot_test_helpers import (
+    DISPATCHED_LOGIN_GATE_HTML,
+    DISPATCHED_NAV_ONLY_HTML,
+    DISPATCHED_RESULTS_HTML,
+)
 from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
+from tests.unit.copilot_test_helpers import (
+    make_stub_html_artifact,
+    stub_artifact_app,
+)
 
 _STRUCTURED_RECORD_CRITERIA = (
     ("fallback_record_identity", "The returned record identifies the target record."),
@@ -10307,6 +10318,108 @@ def test_judgment_truth_condition_refutes_inverted_login_gate_packet() -> None:
     assert verdicts[0].state == "unsatisfied"
     assert verdicts[0].reason_code == "evidence_contradicts"
     assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+
+
+def _dispatched_judgment_criterion() -> CompletionCriterion:
+    return replace(
+        _criterion(
+            "c_login_gate",
+            "The returned record reports whether the login gate blocks the target.",
+            output_path="output.login_gate_blocks_target",
+            expected_output_value=True,
+            requested_output_evidence_source="independent_run_evidence",
+        ),
+        judgment_truth_condition=JudgmentTruthCondition(predicate="login_gate_blocks_target", polarity_when_holds=True),
+    )
+
+
+async def _dispatched_chain_snapshot(
+    monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, html: str
+) -> RunEvidenceSnapshot:
+    stub_artifact_app(
+        monkeypatch,
+        [make_stub_html_artifact("art_terminal", ArtifactType.HTML_ACTION)],
+        {"art_terminal": html.encode()},
+    )
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx, run_id="wr_requested_output", organization_id="o", current_url=""
+    )
+    return _build_run_evidence_snapshot(ctx, _requested_output_result({"login_gate_blocks_target": True}))
+
+
+@pytest.mark.asyncio
+async def test_dispatched_chain_login_gate_packet_confirms_judgment_boolean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    snapshot = await _dispatched_chain_snapshot(monkeypatch, ctx, DISPATCHED_LOGIN_GATE_HTML)
+
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, [_dispatched_judgment_criterion()], snapshot)
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert snapshot.block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] == "independent_page_evidence"
+    assert bound["forms"]
+    assert verdicts[0].state == "satisfied"
+    assert verdicts[0].reason_code == "evidence_confirms"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["packet_label"] == _POST_RUN_PAGE_OBSERVATION_LABEL
+        and log["verdict"] == "evidence_confirms"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatched_chain_result_container_packet_contradicts_login_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    snapshot = await _dispatched_chain_snapshot(monkeypatch, ctx, DISPATCHED_RESULTS_HTML)
+
+    with capture_logs() as logs:
+        verdicts = grade_requested_output_criteria(ctx, [_dispatched_judgment_criterion()], snapshot)
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert bound["result_containers"]
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "evidence_contradicts"
+    assert verdicts[0].evidence_ref == f"block_outputs:{_POST_RUN_PAGE_OBSERVATION_LABEL}"
+    assert verdicts[0].evidence_source == "independent_page_evidence"
+    assert all(verdict.reason_code != "structurally_abstained" for verdict in verdicts)
+    assert any(
+        log["event"] == "copilot_judgment_evidence_verdict"
+        and log["predicate"] == "login_gate_blocks_target"
+        and log["verdict"] == "evidence_contradicts"
+        for log in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatched_chain_nav_only_page_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Dispatched captures parse with no current URL, so the same-origin filter drops every
+    # navigation target and a nav-only terminal page yields an undecidable hollow packet.
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "extract_profile")
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("login_gate_blocks_target")
+    snapshot = await _dispatched_chain_snapshot(monkeypatch, ctx, DISPATCHED_NAV_ONLY_HTML)
+
+    verdicts = grade_requested_output_criteria(ctx, [_dispatched_judgment_criterion()], snapshot)
+
+    bound = snapshot.block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL]
+    assert bound["navigation_targets"] == []
+    assert bound["forms"] == []
+    assert bound["result_containers"] == []
+    assert verdicts[0].state == "unsatisfied"
+    assert verdicts[0].reason_code == "structurally_abstained"
     assert verdicts[0].evidence_source == "independent_page_evidence"
 
 

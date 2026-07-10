@@ -27,7 +27,13 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.tools import completion as completion_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from tests.unit.copilot_test_helpers import make_completion_criterion
+from tests.unit.copilot_test_helpers import (
+    DISPATCHED_NAV_ONLY_HTML,
+    make_completion_criterion,
+)
+from tests.unit.copilot_test_helpers import make_stub_artifact as _artifact
+from tests.unit.copilot_test_helpers import make_stub_html_artifact as _html_artifact
+from tests.unit.copilot_test_helpers import stub_artifact_app as _stub_app
 
 _POST_RUN_LABEL = "post_run_page_observation"
 _ARTIFACT_LABEL = "registered_artifact_observation"
@@ -373,55 +379,6 @@ def test_parse_registered_artifact_text_pdf_cleans_temp_file_on_exception(monkey
     assert not os.path.exists(captured["path"])
 
 
-def _artifact(
-    artifact_id: str,
-    file_name: str,
-    file_size: int | None,
-    artifact_type: ArtifactType = ArtifactType.DOWNLOAD,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        artifact_id=artifact_id,
-        uri=f"s3://bucket/{file_name}",
-        file_size=file_size,
-        artifact_type=artifact_type,
-    )
-
-
-def _stub_app(
-    monkeypatch: pytest.MonkeyPatch,
-    artifacts: list[SimpleNamespace],
-    retrieved: dict[str, bytes],
-    *,
-    by_ids: list[SimpleNamespace] | None = None,
-) -> list[str]:
-    retrieved_ids: list[str] = []
-
-    async def fake_get_artifacts_for_run(
-        run_id: str, *, organization_id: str, artifact_types: object
-    ) -> list[SimpleNamespace]:
-        return artifacts
-
-    async def fake_get_artifacts_by_ids(artifact_ids: list[str], *, organization_id: str) -> list[SimpleNamespace]:
-        pool = {artifact.artifact_id: artifact for artifact in (by_ids if by_ids is not None else artifacts)}
-        return [pool[artifact_id] for artifact_id in artifact_ids if artifact_id in pool]
-
-    async def fake_retrieve_artifact(artifact: SimpleNamespace) -> bytes:
-        retrieved_ids.append(artifact.artifact_id)
-        return retrieved.get(artifact.artifact_id, b"")
-
-    fake_app = SimpleNamespace(
-        DATABASE=SimpleNamespace(
-            artifacts=SimpleNamespace(
-                get_artifacts_for_run=fake_get_artifacts_for_run,
-                get_artifacts_by_ids=fake_get_artifacts_by_ids,
-            )
-        ),
-        ARTIFACT_MANAGER=SimpleNamespace(retrieve_artifact=fake_retrieve_artifact),
-    )
-    monkeypatch.setattr(run_execution_module, "app", fake_app)
-    return retrieved_ids
-
-
 @pytest.mark.asyncio
 async def test_artifact_producer_binds_parsed_text(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_artifact("art_1", "receipt.txt", 20)]
@@ -552,17 +509,6 @@ _HTML_NO_VALUE = (
     "<html><body><main><h1>Submit your request</h1><p>Fill the form below to begin.</p></main></body></html>"
 )
 _HTML_SCRAPE_PREACTION = "<html><body><main><p>SCRAPEONLYTOKEN loading form</p></main></body></html>"
-
-
-def _html_artifact(
-    artifact_id: str,
-    artifact_type: ArtifactType,
-    file_size: int | None = 400,
-    created_at: datetime | None = None,
-) -> SimpleNamespace:
-    artifact = _artifact(artifact_id, f"{artifact_id}.html", file_size, artifact_type=artifact_type)
-    artifact.created_at = created_at or datetime(2026, 7, 9, tzinfo=timezone.utc)
-    return artifact
 
 
 def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> SimpleNamespace:
@@ -785,3 +731,72 @@ async def test_dispatched_producer_abstains_without_terminal_artifact(monkeypatc
         ctx, run_id="wr_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence is None
+
+
+_HTML_FORM_AND_RESULTS = (
+    "<html><head><title>Find a provider</title></head><body><main>"
+    '<form id="finder" action="/find" method="get">'
+    '<label for="zip">ZIP code</label>'
+    '<input id="zip" name="zip" type="text" required />'
+    '<input id="account-password" name="password" type="password" />'
+    '<button type="submit">Search</button>'
+    "</form>"
+    '<table id="provider-results"><tbody>'
+    "<tr><td>Example Fiber</td><td>up to 500 Mbps</td></tr>"
+    "<tr><td>Example Cable</td><td>up to 300 Mbps</td></tr>"
+    "</tbody></table></main></body></html>"
+)
+_HTML_DISABLED_SUBMIT = (
+    "<html><body><main>"
+    '<form id="apply" action="/apply" method="post">'
+    '<input id="account-email" name="email" type="email" />'
+    '<input id="account-password" name="password" type="password" />'
+    '<button type="submit" disabled>Submit</button>'
+    "</form></main></body></html>"
+)
+
+
+async def _dispatched_packet(monkeypatch: pytest.MonkeyPatch, html: str) -> dict[str, object]:
+    _stub_app(monkeypatch, [_html_artifact("art_page", ArtifactType.HTML_ACTION)], {"art_page": html.encode()})
+    ctx = _producer_ctx()
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+    )
+    assert ctx.composition_page_evidence is not None
+    return ctx.composition_page_evidence
+
+
+@pytest.mark.asyncio
+async def test_dispatched_packet_carries_forms_and_result_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    packet = await _dispatched_packet(monkeypatch, _HTML_FORM_AND_RESULTS)
+    forms = packet["forms"]
+    assert forms
+    assert any(field.get("type") == "password" for field in forms[0]["fields"])
+    assert any(control.get("type") == "submit" for control in forms[0]["submit_controls"])
+    containers = packet["result_containers"]
+    assert containers
+    assert any(container.get("selector") for container in containers)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_packet_drops_navigation_targets_without_current_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Dispatched captures carry no current URL, so the same-origin link filter drops every target.
+    packet = await _dispatched_packet(monkeypatch, DISPATCHED_NAV_ONLY_HTML)
+    assert packet["navigation_targets"] == []
+    assert packet["forms"] == []
+    assert packet["result_containers"] == []
+
+
+@pytest.mark.asyncio
+async def test_dispatched_packet_carries_static_disabled_submit_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    packet = await _dispatched_packet(monkeypatch, _HTML_DISABLED_SUBMIT)
+    controls = packet["forms"][0]["submit_controls"]
+    assert controls
+    assert controls[0]["disabled"] is True
+    # Without challenge indicators the static parse never claims challenge gating; the
+    # literal disabled attribute above is the only gating signal a dispatched packet carries.
+    challenge_state = packet["challenge_state"]
+    assert challenge_state["gates_submit_controls"] is False
+    assert challenge_state["gated_submit_controls"] == []
