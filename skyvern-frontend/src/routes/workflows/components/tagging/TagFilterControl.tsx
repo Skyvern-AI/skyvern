@@ -25,6 +25,7 @@ import { copyText } from "@/util/copyText";
 import { toast } from "@/components/ui/use-toast";
 import {
   MAX_AUTOCOMPLETE_SUGGESTIONS,
+  isSystemTagKey,
   parseTagFilterTerm,
   parseTypedTagQuery,
   termDedupeKey,
@@ -373,7 +374,7 @@ function TagFilterControl({
                           {tagKey.workflow_count}
                         </span>
                       ) : null}
-                      {onDeleteKey ? (
+                      {onDeleteKey && !isSystemTagKey(tagKey.key) ? (
                         <button
                           type="button"
                           aria-label={`Delete group ${tagKey.key}`}

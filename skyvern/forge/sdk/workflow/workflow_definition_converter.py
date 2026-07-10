@@ -639,6 +639,22 @@ def block_yaml_to_block(
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:
+        missing_smtp_keys = [
+            key
+            for key in (
+                block_yaml.smtp_host_secret_parameter_key,
+                block_yaml.smtp_port_secret_parameter_key,
+                block_yaml.smtp_username_secret_parameter_key,
+                block_yaml.smtp_password_secret_parameter_key,
+            )
+            if key not in parameters
+        ]
+        if missing_smtp_keys:
+            raise InvalidWorkflowDefinition(
+                f"Send email block '{block_yaml.label}' references undefined parameter(s): "
+                f"{', '.join(sorted(set(missing_smtp_keys)))}. "
+                "Declare these parameters in the workflow before using them."
+            )
         return SendEmailBlock(
             **base_kwargs,
             smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
