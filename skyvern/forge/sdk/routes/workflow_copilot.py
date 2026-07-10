@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     format_recoverable_failure_reply,
     merge_failure_into_context,
 )
+from skyvern.forge.sdk.copilot.request_policy import is_defer_authoring_durable_fill_criterion
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CopilotComposerMode,
     build_minimal_turn_outcome,
@@ -600,7 +601,9 @@ async def _persist_completion_criteria_state(chat: Any, agent_result: AgentResul
                 organization_id=chat.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 goal_epoch=plan.create_epoch or 1,
-                criteria=criteria_to_json(plan.create_criteria),
+                criteria=criteria_to_json(
+                    [c for c in plan.create_criteria if not is_defer_authoring_durable_fill_criterion(c)]
+                ),
                 source_turn_id=agent_result.turn_id,
                 source_goal_text=user_message[:2000] if user_message else None,
                 consecutive_all_no_evidence=plan.counter_value,

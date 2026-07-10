@@ -1,11 +1,16 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
 - require_test: the user asks to build/create and test/run/verify/end-to-end it, or asks for a complete workflow that should be validated.
 - unspecified: the user does not say whether Skyvern should test the workflow.
 - Do not use skip_test for a "done when", "complete when", or success-condition sentence; that is a completion_contract.
+
+authoring_intent:
+- defer_authoring: only when the latest message BOTH asks to act on the live page/form now (fill, enter, click, submit it on the open page) AND explicitly says not to author, build, save, or create a workflow yet. Both halves must be present.
+- author_now: the default for every other request, including an ordinary "build a workflow that fills the form" — building a workflow IS the author-now case.
+- Do not infer defer_authoring from a live-action verb alone, from skip_test, or from a draft-only request; author-deferral requires the explicit "do not author the workflow yet" half.
 
 credential_input_kind:
 - raw_secret: the user pasted a literal credential value — a password string, an API key/bearer token value, a session/auth cookie value, a TOTP/OTP/MFA digit code, a private-key body, a card number, or a CVV. The value must look like the secret itself (e.g. `password: hunter2`, `email@example.test:<password>`, bulk `email@example.test:<password>` account rows, `eyJ…` JWT, `sk-…` API key, a numeric OTP). Identifier-shaped vault-pointer strings such as `customer-<uuid>-pass`, `prod-app-secret-id`, `<service>-key-vault-id`, or `https://<vault>.vault.azure.net/secrets/<name>` are POINTERS to where a secret is stored, not secret values; do NOT classify them as raw_secret on the basis of a `-pass`, `-secret`, `-key`, or `-token` suffix alone.
