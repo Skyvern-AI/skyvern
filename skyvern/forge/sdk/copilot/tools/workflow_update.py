@@ -1680,7 +1680,28 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
             continue
         if getattr(criterion, "kind", None) == "validation_classification":
             continue
+        if getattr(criterion, "mint_degrade", None) is not None:
+            continue
         path = _canonical_requested_output_path(getattr(criterion, "output_path", None))
+        if path and _output_path_has_child(path):
+            paths.add(path)
+    return paths
+
+
+def _contingent_antecedent_child_paths(ctx: AgentContext) -> set[str]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return set()
+    paths: set[str] = set()
+    for criterion in _active_completion_criteria(ctx):
+        if not isinstance(criterion, CompletionCriterion):
+            continue
+        if criterion.mint_degrade is not None:
+            continue
+        if criterion.level == "definition" and not (
+            criterion.output_path and _is_judgment_boolean_criterion(criterion)
+        ):
+            continue
+        path = _canonical_requested_output_path(criterion.contingent_antecedent_output_path)
         if path and _output_path_has_child(path):
             paths.add(path)
     return paths
@@ -1741,13 +1762,22 @@ def _required_child_output_paths_for_authoring(ctx: AgentContext) -> tuple[set[s
     )
 
 
-def _missing_requested_output_facts(paths: Iterable[str], *, reason_code: str) -> list[dict[str, object]]:
+_DECLARATION_REQUIRED_VALUE_STATUS = "declaration_required_default_none"
+
+
+def _missing_requested_output_facts(
+    paths: Iterable[str],
+    *,
+    reason_code: str,
+    declaration_paths: set[str] | None = None,
+) -> list[dict[str, object]]:
+    declaration_paths = declaration_paths or set()
     return [
         {
             "output_path": path,
             "output_root": _output_path_root(path),
             "reason_code": reason_code,
-            "value_status": "no_typed_value",
+            "value_status": (_DECLARATION_REQUIRED_VALUE_STATUS if path in declaration_paths else "no_typed_value"),
         }
         for path in sorted(paths)
     ]
@@ -1758,22 +1788,38 @@ def _single_repair_block_label(block_labels: list[str]) -> str:
     return labels[0] if len(labels) == 1 else ""
 
 
+def _normalized_repair_paths(paths: Iterable[str]) -> list[str]:
+    return sorted(dict.fromkeys(str(path).strip() for path in paths if str(path).strip()))
+
+
+def _declaration_repair_sentence(declaration_paths: Iterable[str]) -> str:
+    declaration_text = ", ".join(_normalized_repair_paths(declaration_paths))
+    if not declaration_text:
+        return ""
+    return (
+        f" Declare {declaration_text} in the extraction_schema and the returned structure with value None "
+        "unless the run actually hits that condition; never source it from the page."
+    )
+
+
 def _metadata_repair_contract(
     *,
     block_labels: list[str],
     required_paths: Iterable[str],
     source: str,
     reason_code: str,
+    declaration_paths: Iterable[str] = (),
 ) -> dict[str, object] | None:
-    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    goal_paths = _normalized_repair_paths(required_paths)
+    union_paths = sorted(dict.fromkeys([*goal_paths, *_normalized_repair_paths(declaration_paths)]))
     block_label = _single_repair_block_label(block_labels)
-    if not paths or not block_label:
+    if not union_paths or not block_label:
         return None
     return {
         "block_label": block_label,
-        "required_goal_value_paths": paths,
-        "required_extraction_schema_paths": paths,
-        "required_code_return_paths": paths,
+        "required_goal_value_paths": goal_paths,
+        "required_extraction_schema_paths": union_paths,
+        "required_code_return_paths": union_paths,
         "source": source,
         "reason_code": reason_code,
     }
@@ -1786,25 +1832,29 @@ def _metadata_output_repair_context(
     coverage_reason_code: str,
     source: str,
     summary: str,
+    declaration_paths: Iterable[str] = (),
 ) -> CodeAuthoringRepairContext | None:
-    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    goal_paths = _normalized_repair_paths(required_paths)
+    declaration = _normalized_repair_paths(declaration_paths)
+    union_paths = sorted(dict.fromkeys([*goal_paths, *declaration]))
     block_label = _single_repair_block_label(block_labels)
-    if not paths or not block_label:
+    if not union_paths or not block_label:
         return None
-    path_text = ", ".join(paths)
+    path_text = ", ".join(union_paths)
     return CodeAuthoringRepairContext(
         block_label=block_label,
         reason_code="metadata_reject",
         runtime_failure_class=coverage_reason_code,
         runtime_failure_reason=summary,
-        required_goal_value_paths=paths,
-        required_extraction_schema_paths=paths,
-        required_code_return_paths=paths,
+        required_goal_value_paths=goal_paths,
+        required_extraction_schema_paths=union_paths,
+        required_code_return_paths=union_paths,
         metadata_contract_source=source,
         metadata_contract_reason_code=coverage_reason_code,
         repair_instruction=(
             "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths "
             f"{path_text}, make the code return those paths, then rerun update_and_run_blocks."
+            + _declaration_repair_sentence(declaration)
         ),
     )
 
@@ -1827,6 +1877,8 @@ class _OutputContractEvaluation:
     block_label: str
     artifact_id: str
     required_paths: set[str]
+    observation_paths: set[str]
+    declaration_paths: set[str]
     source: str
     reason_code: str
     missing_metadata_paths: list[str]
@@ -1917,15 +1969,19 @@ def _path_segments(path: str) -> list[tuple[str, bool]]:
     return segments
 
 
-def _schema_template_for_required_paths(required_paths: Iterable[str]) -> dict[str, Any]:
+def _schema_template_for_required_paths(
+    required_paths: Iterable[str],
+    declaration_paths: Iterable[str] = (),
+) -> dict[str, Any]:
     schema: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+    declaration = _metadata_contract_required_paths(declaration_paths)
 
     def ensure_required(container: dict[str, Any], key: str) -> None:
         required = container.setdefault("required", [])
         if isinstance(required, list) and key not in required:
             required.append(key)
 
-    for path in sorted(_metadata_contract_required_paths(required_paths)):
+    for path in sorted(_metadata_contract_required_paths(required_paths) | declaration):
         segments = _path_segments(path)
         container = schema
         for index, (key, is_array) in enumerate(segments):
@@ -1950,6 +2006,9 @@ def _schema_template_for_required_paths(required_paths: Iterable[str]) -> dict[s
                         items.setdefault("required", [])
                         container = items
                 continue
+            if is_leaf and path in declaration:
+                properties.setdefault(key, {"type": ["string", "null"]})
+                continue
             child = properties.setdefault(key, {} if is_leaf else {"type": "object", "properties": {}, "required": []})
             if isinstance(child, dict) and not is_leaf:
                 child.setdefault("type", "object")
@@ -1959,8 +2018,11 @@ def _schema_template_for_required_paths(required_paths: Iterable[str]) -> dict[s
     return schema
 
 
-def _schema_template_text_for_required_paths(required_paths: Iterable[str]) -> str:
-    return json.dumps(_schema_template_for_required_paths(required_paths), sort_keys=True)
+def _schema_template_text_for_required_paths(
+    required_paths: Iterable[str],
+    declaration_paths: Iterable[str] = (),
+) -> str:
+    return json.dumps(_schema_template_for_required_paths(required_paths, declaration_paths), sort_keys=True)
 
 
 def _metadata_contract_template(
@@ -1969,10 +2031,12 @@ def _metadata_contract_template(
     required_paths: set[str],
     source: str,
     reason_code: str,
+    declaration_paths: set[str] | None = None,
 ) -> dict[str, Any]:
+    declaration_paths = declaration_paths or set()
     artifact_id = _artifact_id_for_block_label(block_label)
-    schema_text = _schema_template_text_for_required_paths(required_paths)
-    paths = sorted(required_paths)
+    schema_text = _schema_template_text_for_required_paths(required_paths | declaration_paths, declaration_paths)
+    paths = sorted(required_paths - declaration_paths)
     return {
         "block_label": block_label,
         "artifact_id": artifact_id,
@@ -1998,12 +2062,21 @@ def _metadata_contract_template(
     }
 
 
-def _return_skeleton_for_required_paths(required_paths: Iterable[str]) -> str:
-    paths = sorted(_metadata_contract_required_paths(required_paths))
+def _return_skeleton_for_required_paths(
+    required_paths: Iterable[str],
+    declaration_paths: Iterable[str] = (),
+) -> str:
+    declaration = _metadata_contract_required_paths(declaration_paths)
+    paths = sorted(_metadata_contract_required_paths(required_paths) | declaration)
     roots = sorted({_output_path_root(path) for path in paths if _output_path_root(path)})
     if not roots:
         return ""
     if roots == ["output"]:
+        declaration_children = {
+            child
+            for path in declaration
+            if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
+        }
         child_names = sorted(
             {
                 child
@@ -2012,7 +2085,9 @@ def _return_skeleton_for_required_paths(required_paths: Iterable[str]) -> str:
             }
         )
         if child_names:
-            pairs = ", ".join(f'"{name}": {name}' for name in child_names)
+            pairs = ", ".join(
+                f'"{name}": None' if name in declaration_children else f'"{name}": {name}' for name in child_names
+            )
             return f'return {{"output": {{{pairs}}}}}'
         return "return output"
     if len(roots) == 1 and _return_scaffold_name_is_safe(roots[0]):
@@ -2329,44 +2404,86 @@ def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> 
     )
 
 
-def _output_contract_required_paths_source(ctx: AgentContext) -> tuple[set[str], str, str]:
+@dataclass(frozen=True)
+class _OutputContractRequiredPaths:
+    """Two-lane contract: observation paths must be sourced from the page/run; declaration paths
+    must only be declared in the returned structure (None when the contingency never fires)."""
+
+    observation_paths: set[str]
+    declaration_paths: set[str]
+    source: str
+    reason_code: str
+
+    @property
+    def union(self) -> set[str]:
+        return self.observation_paths | self.declaration_paths
+
+
+def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContractRequiredPaths:
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
+    antecedent_paths = _contingent_antecedent_child_paths(ctx)
     if runtime_contract is not None:
-        return (
-            runtime_contract.required_paths - _independent_judgment_output_paths(ctx),
-            runtime_contract.source,
-            runtime_contract.reason_code,
+        runtime_observation_paths = runtime_contract.required_paths - _independent_judgment_output_paths(ctx)
+        return _OutputContractRequiredPaths(
+            observation_paths=runtime_observation_paths,
+            declaration_paths=antecedent_paths - runtime_observation_paths,
+            source=runtime_contract.source,
+            reason_code=runtime_contract.reason_code,
         )
-    required_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
+    observation_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
     repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
-    if required_paths or not isinstance(repair_context, CodeAuthoringRepairContext):
-        return required_paths, source, reason_code
-    if repair_context.reason_code != "metadata_reject":
-        return required_paths, source, reason_code
-    required_paths = _metadata_contract_required_paths(
-        [
-            *repair_context.required_goal_value_paths,
-            *repair_context.required_extraction_schema_paths,
-            *repair_context.required_code_return_paths,
-        ]
+    if (
+        not observation_paths
+        and isinstance(repair_context, CodeAuthoringRepairContext)
+        and repair_context.reason_code == "metadata_reject"
+    ):
+        goal_paths = _metadata_contract_required_paths(repair_context.required_goal_value_paths)
+        rehydrated = _metadata_contract_required_paths(
+            [
+                *repair_context.required_goal_value_paths,
+                *repair_context.required_extraction_schema_paths,
+                *repair_context.required_code_return_paths,
+            ]
+        )
+        rehydrated -= _independent_judgment_output_paths(ctx)
+        # An antecedent the repair contract carried only in schema/return roles stays in the
+        # declaration lane on rehydration; the goal role is the observation-lane record.
+        observation_paths = rehydrated - (antecedent_paths - goal_paths)
+        source = str(repair_context.metadata_contract_source or "").strip() or "metadata_reject"
+        reason_code = (
+            str(repair_context.metadata_contract_reason_code or "").strip()
+            or str(repair_context.runtime_failure_class or "").strip()
+            or "metadata_reject"
+        )
+    return _OutputContractRequiredPaths(
+        observation_paths=observation_paths,
+        declaration_paths=antecedent_paths - observation_paths,
+        source=source,
+        reason_code=reason_code,
     )
-    required_paths -= _independent_judgment_output_paths(ctx)
-    source = str(repair_context.metadata_contract_source or "").strip() or "metadata_reject"
-    reason_code = (
-        str(repair_context.metadata_contract_reason_code or "").strip()
-        or str(repair_context.runtime_failure_class or "").strip()
-        or "metadata_reject"
-    )
-    return required_paths, source, reason_code
 
 
-def _code_return_is_static_advisory_candidate(code: str, required_paths: set[str]) -> bool:
-    if not required_paths:
+def _declaration_envelope_paths(declaration_paths: set[str]) -> set[str]:
+    return declaration_paths | {_output_path_root(path) for path in declaration_paths}
+
+
+def _code_return_is_static_advisory_candidate(
+    code: str,
+    required_paths: set[str],
+    declaration_paths: set[str] | None = None,
+) -> bool:
+    declaration_paths = declaration_paths or set()
+    if not (required_paths - declaration_paths):
+        return False
+    declaration_envelope = _declaration_envelope_paths(declaration_paths)
+    produced_paths = _code_block_produced_output_paths(code)
+    if produced_paths - declaration_envelope:
         return False
     produced = _code_block_produced_output_roots(code)
-    if not produced.abstained:
-        return False
-    if _code_block_produced_output_paths(code):
+    # A stamped declaration-only return (e.g. blocker: None) keeps the block abstained for the
+    # observation lane; only observation-lane production disqualifies the advisory.
+    declaration_only_production = bool(produced_paths) and produced_paths <= declaration_envelope
+    if not produced.abstained and not declaration_only_production:
         return False
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
@@ -2388,7 +2505,12 @@ def _evaluate_output_contract_for_code_block(
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
-    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    contract = _output_contract_required_paths_source(ctx)
+    required_paths = contract.union
+    observation_paths = contract.observation_paths
+    declaration_paths = contract.declaration_paths
+    source = contract.source
+    reason_code = contract.reason_code
     if not required_paths:
         return None
     effective_metadata = raw_code_artifact_metadata
@@ -2400,7 +2522,7 @@ def _evaluate_output_contract_for_code_block(
         ctx,
         workflow_yaml,
         effective_metadata,
-        required_paths,
+        observation_paths,
     )
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     target_block = code_blocks.get(block_label) if block_label else None
@@ -2410,9 +2532,11 @@ def _evaluate_output_contract_for_code_block(
     submitted_code_paths = (
         _code_block_produced_output_paths(str(target_block.get("code") or "")) if target_block is not None else set()
     )
-    missing_metadata_paths = sorted(required_paths - submitted_goal_paths)
+    missing_metadata_paths = sorted(observation_paths - submitted_goal_paths)
     missing_schema_paths = sorted(required_paths - submitted_schema_paths)
     missing_return_paths = sorted(required_paths - submitted_code_paths)
+    missing_observation_return_paths = sorted(observation_paths - submitted_code_paths)
+    missing_declaration_return_paths = sorted(declaration_paths - submitted_code_paths)
     shape_violations: list[str] = []
     if not block_label:
         shape_violations.append("ambiguous_output_owner" if owner_labels else "missing_output_owner")
@@ -2449,7 +2573,7 @@ def _evaluate_output_contract_for_code_block(
     ]
     post_steering_static_return_advisory = (
         allow_static_return_advisory
-        and bool(missing_return_paths)
+        and bool(missing_observation_return_paths)
         and not missing_metadata_paths
         and not missing_schema_paths
         and not run_gating_shape_violations
@@ -2461,14 +2585,16 @@ def _evaluate_output_contract_for_code_block(
     )
     static_return_advisory = (
         allow_static_return_advisory
-        and bool(missing_return_paths)
+        and bool(missing_observation_return_paths)
         and not missing_metadata_paths
         and not missing_schema_paths
         and not run_gating_shape_violations
         and target_block is not None
         and (
             post_steering_static_return_advisory
-            or _code_return_is_static_advisory_candidate(str(target_block.get("code") or ""), required_paths)
+            or _code_return_is_static_advisory_candidate(
+                str(target_block.get("code") or ""), required_paths, declaration_paths
+            )
         )
     )
     separated_spine_run_eligible = (
@@ -2477,26 +2603,32 @@ def _evaluate_output_contract_for_code_block(
         and not missing_schema_paths
         and not run_gating_shape_violations
     )
-    run_eligible = static_return_advisory or separated_spine_run_eligible
-    effective_missing_return_paths = [] if static_return_advisory else missing_return_paths
+    # Declaration paths are trivially satisfiable by construction, so no advisory door may waive
+    # them; only observation-lane return misses are advisory-eligible.
+    run_eligible = (static_return_advisory or separated_spine_run_eligible) and not missing_declaration_return_paths
+    effective_missing_return_paths = (
+        missing_declaration_return_paths if static_return_advisory else missing_return_paths
+    )
     runtime_signature = _runtime_output_contract_signature(runtime_contract)
     artifact_id = _artifact_id_for_block_label(block_label) if block_label else ""
     metadata_repair_contract = (
         _metadata_repair_contract(
             block_labels=[block_label],
-            required_paths=required_paths,
+            required_paths=observation_paths,
             source=source,
             reason_code=reason_code,
+            declaration_paths=declaration_paths,
         )
         if block_label
         else None
     )
     repair = _metadata_output_repair_context(
         block_labels=[block_label] if block_label else [],
-        required_paths=required_paths,
+        required_paths=observation_paths,
         coverage_reason_code=reason_code,
         source=source,
         summary="Submitted workflow does not satisfy the requested output contract.",
+        declaration_paths=declaration_paths,
     )
     missing_paths = sorted(
         set(missing_metadata_paths)
@@ -2509,13 +2641,14 @@ def _evaluate_output_contract_for_code_block(
         "block_label": block_label,
         "artifact_id": artifact_id,
         "canonical_required_child_paths": sorted(required_paths),
+        "declaration_only_child_paths": sorted(declaration_paths),
         "source": source,
         "metadata_contract_source": source,
         "metadata_contract_reason_code": reason_code,
         "missing_goal_value_paths": missing_metadata_paths,
         "missing_extraction_schema_paths": missing_schema_paths,
         "missing_code_return_paths": effective_missing_return_paths,
-        "static_return_advisory_paths": missing_return_paths if static_return_advisory else [],
+        "static_return_advisory_paths": missing_observation_return_paths if static_return_advisory else [],
         "post_steering_static_return_advisory": post_steering_static_return_advisory,
         "shape_violations": shape_violations,
         "can_attempt_run": run_eligible,
@@ -2533,16 +2666,18 @@ def _evaluate_output_contract_for_code_block(
                     required_paths=required_paths,
                     source=source,
                     reason_code=reason_code,
+                    declaration_paths=declaration_paths,
                 )
                 if block_label
                 else None
             ),
-            "extraction_schema": _schema_template_for_required_paths(required_paths),
-            "return_skeleton": _return_skeleton_for_required_paths(required_paths),
+            "extraction_schema": _schema_template_for_required_paths(required_paths, declaration_paths),
+            "return_skeleton": _return_skeleton_for_required_paths(required_paths, declaration_paths),
         },
         "missing_requested_output_facts": _missing_requested_output_facts(
             missing_paths,
             reason_code=reason_code,
+            declaration_paths=declaration_paths,
         ),
     }
     if _SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE in shape_violations and block_label:
@@ -2563,10 +2698,11 @@ def _evaluate_output_contract_for_code_block(
                 repair.spine_split_blockers = list(blockers)
     if not block_label and signature in ctx.output_contract_output_owner_directive_candidates_by_signature:
         repair = _output_owner_ambiguity_repair_context(
-            required_paths=required_paths,
+            required_paths=observation_paths,
             owner_labels=owner_labels,
             source=source,
             reason_code=reason_code,
+            declaration_paths=declaration_paths,
         )
         payload["output_owner_directive"] = {"output_owner_candidate_labels": repair.output_owner_candidate_labels}
     progress_data = _code_repair_progress_data(
@@ -2579,6 +2715,8 @@ def _evaluate_output_contract_for_code_block(
         block_label=block_label,
         artifact_id=artifact_id,
         required_paths=required_paths,
+        observation_paths=observation_paths,
+        declaration_paths=declaration_paths,
         source=source,
         reason_code=reason_code,
         missing_metadata_paths=missing_metadata_paths,
@@ -2621,10 +2759,11 @@ def _adjudicate_output_contract_ladder_after_reject(
         ctx,
         blockers=blockers,
         target_code=target_code,
-        required_paths=evaluation.required_paths,
+        required_paths=evaluation.observation_paths,
         signature=signature,
         current_fingerprint=current_fingerprint,
         advisory_run_grantable=blockers == [_OUTPUT_CONTRACT_REJECT_REASON_CODE],
+        declaration_paths=evaluation.declaration_paths,
     )
     if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
         _stash_output_source_unobservable_terminal(
@@ -2778,10 +2917,13 @@ def _output_contract_reject_result(
     else:
         path_text = ", ".join(str(path) for path in data.get("canonical_required_child_paths", []) or [])
         path_suffix = f" Required requested output paths: {path_text}." if path_text else ""
+        declaration_suffix = _declaration_repair_sentence(
+            str(path) for path in data.get("declaration_only_child_paths", []) or []
+        )
         error = (
             f"{tool_name} cannot proceed until the submitted workflow satisfies the requested output contract. "
             "Use the returned code_artifact_metadata, extraction_schema, and return skeleton templates exactly for "
-            "the canonical required child paths." + path_suffix
+            "the canonical required child paths." + path_suffix + declaration_suffix
         )
     return {
         "ok": False,
@@ -2794,17 +2936,17 @@ def _output_contract_reject_result(
 def _ensure_metadata_contract_rows(
     item: dict[str, Any],
     *,
-    required_paths: set[str],
+    goal_value_paths: set[str],
     schema_text: str,
 ) -> None:
     for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
         rows = _artifact_mutable_rows(item.get(field_name))
         if not rows:
-            item[field_name] = [{"goal_value_paths": sorted(required_paths)}]
+            item[field_name] = [{"goal_value_paths": sorted(goal_value_paths)}]
             rows = _artifact_mutable_rows(item.get(field_name))
         for row in rows:
-            if not _artifact_goal_value_paths(row.get("goal_value_paths")):
-                row["goal_value_paths"] = sorted(required_paths)
+            if goal_value_paths and not _artifact_goal_value_paths(row.get("goal_value_paths")):
+                row["goal_value_paths"] = sorted(goal_value_paths)
             if schema_text and not str(row.get("extraction_schema") or "").strip():
                 row["extraction_schema"] = schema_text
 
@@ -2825,8 +2967,10 @@ def _output_contract_scaffold_target_label(
     raw_code_artifact_metadata: object,
     required_paths: set[str],
     *,
+    declaration_paths: set[str] | None = None,
     allow_missing_static_return: bool = False,
 ) -> str:
+    declaration_paths = declaration_paths or set()
     label, owner_labels = _target_output_contract_block_label(
         ctx,
         workflow_yaml,
@@ -2840,7 +2984,9 @@ def _output_contract_scaffold_target_label(
     if target_block is None:
         return ""
     target_code = str(target_block.get("code") or "")
-    if not allow_missing_static_return and not required_paths <= _code_block_produced_output_paths(target_code):
+    if not allow_missing_static_return and not (
+        required_paths | declaration_paths
+    ) <= _code_block_produced_output_paths(target_code):
         return ""
     if not allow_missing_static_return and _scout_spine_requires_separated_blocks(ctx):
         synthesized = synthesize_code_block(
@@ -2861,17 +3007,21 @@ def _apply_metadata_contract_scaffold(
     required_paths: set[str],
     source: str,
     reason_code: str,
+    declaration_paths: set[str] | None = None,
     allow_missing_static_return: bool = False,
 ) -> object:
+    declaration_paths = declaration_paths or set()
+    union_paths = required_paths | declaration_paths
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return raw_code_artifact_metadata
-    if not required_paths:
+    if not union_paths:
         return raw_code_artifact_metadata
     label = _output_contract_scaffold_target_label(
         ctx,
         workflow_yaml,
         raw_code_artifact_metadata,
         required_paths,
+        declaration_paths=declaration_paths,
         allow_missing_static_return=allow_missing_static_return,
     )
     if not label:
@@ -2879,20 +3029,20 @@ def _apply_metadata_contract_scaffold(
     existing_item = _metadata_item_for_block_label(raw_code_artifact_metadata, label)
     prior_item = _metadata_item_for_block_label(getattr(ctx, "code_artifact_metadata", None), label)
     if _metadata_item_declares_extraction_schema(existing_item) and not _metadata_item_effective_schema_text(
-        existing_item, required_paths
+        existing_item, union_paths
     ):
         return raw_code_artifact_metadata
     if _metadata_item_declares_extraction_schema(prior_item) and not _metadata_item_effective_schema_text(
-        prior_item, required_paths
+        prior_item, union_paths
     ):
         return raw_code_artifact_metadata
     schema_text = (
-        _metadata_item_effective_schema_text(existing_item, required_paths)
+        _metadata_item_effective_schema_text(existing_item, union_paths)
         or _metadata_item_effective_schema_text(
             prior_item,
-            required_paths,
+            union_paths,
         )
-        or _schema_template_text_for_required_paths(required_paths)
+        or _schema_template_text_for_required_paths(union_paths, declaration_paths)
     )
     items = [
         copy.deepcopy(item)
@@ -2913,7 +3063,7 @@ def _apply_metadata_contract_scaffold(
         items[target_index] = target
     target["block_label"] = label
     target["artifact_id"] = _artifact_id_for_block_label(label)
-    _ensure_metadata_contract_rows(target, required_paths=required_paths, schema_text=schema_text)
+    _ensure_metadata_contract_rows(target, goal_value_paths=required_paths, schema_text=schema_text)
     return items
 
 
@@ -2922,23 +3072,24 @@ def _scaffold_metadata_contract_for_update(
     workflow_yaml: str,
     raw_code_artifact_metadata: object,
 ) -> tuple[object, bool]:
-    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
-    if not required_paths:
+    contract = _output_contract_required_paths_source(ctx)
+    if not contract.union:
         return raw_code_artifact_metadata, False
     signature = _output_contract_signature(
         ctx=ctx,
         workflow_yaml=workflow_yaml,
-        source=source,
-        reason_code=reason_code,
-        required_paths=required_paths,
+        source=contract.source,
+        reason_code=contract.reason_code,
+        required_paths=contract.union,
     )
     scaffolded = _apply_metadata_contract_scaffold(
         ctx,
         workflow_yaml,
         raw_code_artifact_metadata,
-        required_paths=required_paths,
-        source=source,
-        reason_code=reason_code,
+        required_paths=contract.observation_paths,
+        source=contract.source,
+        reason_code=contract.reason_code,
+        declaration_paths=contract.declaration_paths,
         allow_missing_static_return=_output_contract_advisory_granted(ctx, signature)
         or _output_contract_reject_count(ctx, signature) >= _MAX_OUTPUT_CONTRACT_STEERING_REJECTS,
     )
@@ -2952,14 +3103,15 @@ def _apply_metadata_contract_schema_to_workflow_yaml(
 ) -> str:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return workflow_yaml
-    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    contract = _output_contract_required_paths_source(ctx)
+    required_paths = contract.union
     if not required_paths:
         return workflow_yaml
     label, owner_labels = _target_output_contract_block_label(
         ctx,
         workflow_yaml,
         raw_code_artifact_metadata,
-        required_paths,
+        contract.observation_paths,
     )
     if not label or owner_labels != [label]:
         return workflow_yaml
@@ -2985,8 +3137,8 @@ def _apply_metadata_contract_schema_to_workflow_yaml(
         "copilot_output_contract_schema_projected_to_workflow",
         block_label=label,
         canonical_required_child_paths=sorted(required_paths),
-        source=source,
-        reason_code=reason_code,
+        source=contract.source,
+        reason_code=contract.reason_code,
     )
     return yaml.safe_dump(parsed, sort_keys=False)
 
@@ -3101,6 +3253,7 @@ def _attempt_separated_spine_split(
     target_code: str,
     synthesized: SynthesizedCodeBlock,
     required_paths: set[str],
+    declaration_paths: set[str] | None = None,
 ) -> _SpineSplitOutcome:
     code_block = next(
         (block for block in _workflow_code_blocks(parsed) if str(block.get("label") or "").strip() == label),
@@ -3130,7 +3283,7 @@ def _attempt_separated_spine_split(
         return _SpineSplitOutcome(None, ["extraction_suffix_contains_browser_actions"], None)
 
     keyed_extraction, static_violations = _extraction_code_with_required_static_return(
-        extraction_suffix, required_paths=required_paths
+        extraction_suffix, required_paths=required_paths, declaration_paths=declaration_paths
     )
     if static_violations:
         return _SpineSplitOutcome(None, ["static_return_envelope_unavailable"], None)
@@ -3206,17 +3359,19 @@ def _output_owner_ambiguity_repair_context(
     owner_labels: list[str],
     source: str,
     reason_code: str,
+    declaration_paths: set[str] | None = None,
 ) -> CodeAuthoringRepairContext:
-    paths = sorted(dict.fromkeys(str(path).strip() for path in required_paths if str(path).strip()))
+    goal_paths = _normalized_repair_paths(required_paths)
+    union_paths = sorted(dict.fromkeys([*goal_paths, *_normalized_repair_paths(declaration_paths or set())]))
     candidates = sorted(dict.fromkeys(str(label).strip() for label in owner_labels if str(label).strip()))
-    path_text = ", ".join(paths)
+    path_text = ", ".join(union_paths)
     return CodeAuthoringRepairContext(
         block_label="",
         reason_code=OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
         runtime_failure_class=reason_code,
-        required_goal_value_paths=paths,
-        required_extraction_schema_paths=paths,
-        required_code_return_paths=paths,
+        required_goal_value_paths=goal_paths,
+        required_extraction_schema_paths=union_paths,
+        required_code_return_paths=union_paths,
         metadata_contract_source=source,
         metadata_contract_reason_code=reason_code,
         output_owner_candidate_labels=candidates,
@@ -3258,11 +3413,11 @@ def _code_reads_page_value(code: str) -> bool:
     return False
 
 
-def _output_contract_click_only_spine(target_code: str) -> bool:
+def _output_contract_click_only_spine(target_code: str, declaration_paths: set[str] | None = None) -> bool:
     mutations, _, ambiguous = _browser_surface_for_code(target_code)
     if not (mutations or ambiguous):
         return False
-    if _code_block_produced_output_paths(target_code):
+    if _code_block_produced_output_paths(target_code) - _declaration_envelope_paths(declaration_paths or set()):
         return False
     return not _code_reads_page_value(target_code)
 
@@ -3574,8 +3729,9 @@ def _actuate_output_contract_bail(
     signature: str,
     current_fingerprint: str,
     advisory_run_grantable: bool = False,
+    declaration_paths: set[str] | None = None,
 ) -> OutputContractActuation:
-    click_only_spine = _output_contract_click_only_spine(target_code)
+    click_only_spine = _output_contract_click_only_spine(target_code, declaration_paths)
     observed_required_values = _observed_required_output_values(ctx, required_paths)
     if not click_only_spine or observed_required_values:
         _clear_declick_attempt(ctx, signature)
@@ -3631,13 +3787,144 @@ def _actuate_output_contract_bail(
     return actuation
 
 
+def _merge_declaration_children_into_literal_returns(code: str, declaration_paths: set[str]) -> str:
+    if {_output_path_root(path) for path in declaration_paths} != {"output"}:
+        return ""
+    declaration_children = sorted(
+        {
+            child
+            for path in declaration_paths
+            if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
+        }
+    )
+    if not declaration_children:
+        return ""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+    lines = code.splitlines()
+    insertions: list[tuple[int, int, str]] = []
+    for node in _iter_top_level_scope(tree.body):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
+            continue
+        output_value: ast.expr | None = None
+        for key, value in zip(node.value.keys, node.value.values):
+            if isinstance(key, ast.Constant) and key.value == "output":
+                output_value = value
+                break
+        if output_value is None:
+            pairs = ", ".join(f'"{name}": None' for name in declaration_children)
+            insert_text = f'"output": {{{pairs}}}'
+            target = node.value
+        elif isinstance(output_value, ast.Dict):
+            existing_keys = {
+                key.value for key in output_value.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            missing_children = [name for name in declaration_children if name not in existing_keys]
+            if not missing_children:
+                continue
+            insert_text = ", ".join(f'"{name}": None' for name in missing_children)
+            target = output_value
+        else:
+            return ""
+        # Front insertion keeps any later literal or unpacked entries authoritative over the
+        # stamped None defaults.
+        suffix = ", " if (target.keys or target.values) else ""
+        insertions.append((target.lineno - 1, target.col_offset + 1, insert_text + suffix))
+    if not insertions:
+        return ""
+    for line_index, col, text in sorted(insertions, reverse=True):
+        if line_index < 0 or line_index >= len(lines) or col > len(lines[line_index]):
+            return ""
+        lines[line_index] = lines[line_index][:col] + text + lines[line_index][col:]
+    return "\n".join(lines)
+
+
+def _code_with_declared_contract_defaults(code: str, declaration_paths: set[str]) -> str:
+    stripped_code = textwrap.dedent(code).strip()
+    if not stripped_code or not declaration_paths:
+        return ""
+    if declaration_paths <= _code_block_produced_output_paths(stripped_code):
+        return ""
+    merged = _merge_declaration_children_into_literal_returns(stripped_code, declaration_paths)
+    if merged and declaration_paths <= _code_block_produced_output_paths(merged):
+        return merged
+    try:
+        tree = ast.parse(stripped_code)
+    except SyntaxError:
+        return ""
+    if any(isinstance(node, ast.Return) for node in _iter_top_level_scope(tree.body)):
+        return ""
+    appended, violations = _extraction_code_with_required_static_return(
+        stripped_code,
+        required_paths=set(),
+        declaration_paths=declaration_paths,
+    )
+    if violations or appended == stripped_code:
+        return ""
+    if declaration_paths <= _code_block_produced_output_paths(appended):
+        return appended
+    return ""
+
+
+def _stamp_declaration_contract_defaults(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    contract: _OutputContractRequiredPaths,
+    signature: str,
+) -> tuple[str, bool]:
+    if not contract.declaration_paths:
+        return workflow_yaml, False
+    label, owner_labels = _target_output_contract_block_label(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        contract.observation_paths,
+    )
+    if not label or owner_labels != [label]:
+        return workflow_yaml, False
+    target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(label)
+    if target_block is None:
+        return workflow_yaml, False
+    stamped_code = _code_with_declared_contract_defaults(
+        str(target_block.get("code") or ""), contract.declaration_paths
+    )
+    if not stamped_code:
+        return workflow_yaml, False
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml, False
+    applied = False
+    for block in _workflow_code_blocks(parsed):
+        if str(block.get("label") or "").strip() == label:
+            block["code"] = stamped_code.rstrip() + "\n"
+            applied = True
+            break
+    if not applied:
+        return workflow_yaml, False
+    LOG.info(
+        "copilot_output_contract_declaration_stamped",
+        block_label=label,
+        declaration_only_child_paths=sorted(contract.declaration_paths),
+        canonical_output_contract_signature=signature,
+    )
+    return yaml.safe_dump(parsed, sort_keys=False), True
+
+
 def _impose_output_contract_envelope_after_steering(
     ctx: AgentContext,
     workflow_yaml: str,
     raw_code_artifact_metadata: object,
 ) -> tuple[str, object, bool]:
     ctx.output_contract_bail_actuated_this_call = False
-    required_paths, source, reason_code = _output_contract_required_paths_source(ctx)
+    contract = _output_contract_required_paths_source(ctx)
+    required_paths = contract.union
+    observation_paths = contract.observation_paths
+    declaration_paths = contract.declaration_paths
+    source = contract.source
+    reason_code = contract.reason_code
     if not required_paths:
         return workflow_yaml, raw_code_artifact_metadata, False
     signature = _output_contract_signature(
@@ -3647,28 +3934,37 @@ def _impose_output_contract_envelope_after_steering(
         reason_code=reason_code,
         required_paths=required_paths,
     )
+    # The stamp precedes the steering-reject wait and ignores advisory state so no
+    # acceptance route can persist a block that omits the declaration paths.
+    workflow_yaml, declaration_stamped = _stamp_declaration_contract_defaults(
+        ctx,
+        workflow_yaml,
+        raw_code_artifact_metadata,
+        contract,
+        signature,
+    )
     _reopen_dispatch_lacked_bound_extraction(ctx, signature)
     runtime_attempt_key = _runtime_output_repair_attempt_key(ctx, workflow_yaml, required_paths, source, reason_code)
     if _output_contract_reject_count(
         ctx, signature
     ) < _MAX_OUTPUT_CONTRACT_STEERING_REJECTS and _runtime_output_repair_attempt_recorded(ctx, runtime_attempt_key):
-        return workflow_yaml, raw_code_artifact_metadata, False
+        return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
     label, owner_labels = _target_output_contract_block_label(
         ctx,
         workflow_yaml,
         raw_code_artifact_metadata,
-        required_paths,
+        observation_paths,
     )
     if not label or owner_labels != [label]:
         _arm_output_contract_output_owner_directive(ctx, signature=signature, owner_labels=owner_labels)
-        return workflow_yaml, raw_code_artifact_metadata, False
+        return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
-        return workflow_yaml, raw_code_artifact_metadata, False
+        return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     target_block = code_blocks.get(label)
     if target_block is None:
-        return workflow_yaml, raw_code_artifact_metadata, False
+        return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
     target_code = str(target_block.get("code") or "")
     current_fingerprint = _output_contract_structural_fingerprint(workflow_yaml, signature)
     if _scout_spine_requires_separated_blocks(ctx):
@@ -3685,15 +3981,17 @@ def _impose_output_contract_envelope_after_steering(
                 target_code=target_code,
                 synthesized=synthesized,
                 required_paths=required_paths,
+                declaration_paths=declaration_paths,
             )
             if split.imposed_yaml is not None:
                 scaffolded_metadata = _apply_metadata_contract_scaffold(
                     ctx,
                     split.imposed_yaml,
                     raw_code_artifact_metadata,
-                    required_paths=required_paths,
+                    required_paths=observation_paths,
                     source=source,
                     reason_code=reason_code,
+                    declaration_paths=declaration_paths,
                 )
                 _mark_output_contract_imposed(ctx, signature)
                 _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
@@ -3708,10 +4006,11 @@ def _impose_output_contract_envelope_after_steering(
                 ctx,
                 blockers=split.blockers,
                 target_code=target_code,
-                required_paths=required_paths,
+                required_paths=observation_paths,
                 signature=signature,
                 current_fingerprint=current_fingerprint,
                 advisory_run_grantable=True,
+                declaration_paths=declaration_paths,
             )
             if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
                 _stash_output_source_unobservable_terminal(
@@ -3722,11 +4021,11 @@ def _impose_output_contract_envelope_after_steering(
                     signature=signature,
                     blockers=split.blockers,
                 )
-                return workflow_yaml, raw_code_artifact_metadata, False
+                return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
             if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
-                return workflow_yaml, raw_code_artifact_metadata, False
+                return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
             if copilot_author_time_gate_log_only_enabled():
-                return workflow_yaml, raw_code_artifact_metadata, False
+                return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
             attempt_key = _output_contract_spine_directive_attempt_key(
                 signature=signature, block_label=label, workflow_yaml=workflow_yaml
             )
@@ -3739,16 +4038,21 @@ def _impose_output_contract_envelope_after_steering(
                 signature=signature,
             )
             _record_armed_directive_fingerprint(ctx, signature, current_fingerprint)
-            return workflow_yaml, raw_code_artifact_metadata, False
-    keyed_code, violations = _extraction_code_with_required_static_return(target_code, required_paths=required_paths)
+            return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
+    keyed_code, violations = _extraction_code_with_required_static_return(
+        target_code,
+        required_paths=required_paths,
+        declaration_paths=declaration_paths,
+    )
     if violations:
         scaffolded_metadata = _apply_metadata_contract_scaffold(
             ctx,
             workflow_yaml,
             raw_code_artifact_metadata,
-            required_paths=required_paths,
+            required_paths=observation_paths,
             source=source,
             reason_code=reason_code,
+            declaration_paths=declaration_paths,
             allow_missing_static_return=True,
         )
         scaffolded = scaffolded_metadata is not raw_code_artifact_metadata
@@ -3773,9 +4077,10 @@ def _impose_output_contract_envelope_after_steering(
             ctx,
             blockers=["static_return_envelope_unavailable"],
             target_code=target_code,
-            required_paths=required_paths,
+            required_paths=observation_paths,
             signature=signature,
             current_fingerprint=current_fingerprint,
+            declaration_paths=declaration_paths,
         )
         if actuation.kind == OutputContractActuationKind.BLOCKED_TERMINAL:
             _stash_output_source_unobservable_terminal(
@@ -3786,7 +4091,7 @@ def _impose_output_contract_envelope_after_steering(
                 signature=signature,
                 blockers=["static_return_envelope_unavailable"],
             )
-        return workflow_yaml, scaffolded_metadata, scaffolded
+        return workflow_yaml, scaffolded_metadata, scaffolded or declaration_stamped
     changed_code = keyed_code != textwrap.dedent(target_code).strip()
     if changed_code:
         for block in _workflow_code_blocks(parsed):
@@ -3798,9 +4103,10 @@ def _impose_output_contract_envelope_after_steering(
         ctx,
         workflow_yaml,
         raw_code_artifact_metadata,
-        required_paths=required_paths,
+        required_paths=observation_paths,
         source=source,
         reason_code=reason_code,
+        declaration_paths=declaration_paths,
     )
     scaffolded = scaffolded_metadata is not raw_code_artifact_metadata
     applied = changed_code or scaffolded
@@ -3815,7 +4121,7 @@ def _impose_output_contract_envelope_after_steering(
             return_envelope_applied=changed_code,
             metadata_scaffold_applied=scaffolded,
         )
-    return workflow_yaml, scaffolded_metadata, applied
+    return workflow_yaml, scaffolded_metadata, applied or declaration_stamped
 
 
 def _metadata_contract_run_preflight_reject(
@@ -3902,7 +4208,7 @@ def _metadata_contract_run_preflight_reject(
         workflow_yaml=workflow_yaml,
     )
     if advisory_granted:
-        _arm_pending_run_evidence(ctx, evaluation.canonical_signature, set(evaluation.required_paths))
+        _arm_pending_run_evidence(ctx, evaluation.canonical_signature, set(evaluation.observation_paths))
         return None
     if evaluation.repair_context is not None:
         ctx.last_code_authoring_repair_context = evaluation.repair_context
@@ -4135,7 +4441,10 @@ def _extraction_code_with_required_static_return(
     code: str,
     *,
     required_paths: set[str],
+    declaration_paths: set[str] | None = None,
 ) -> tuple[str, list[str]]:
+    declaration_paths = declaration_paths or set()
+    required_paths = required_paths | declaration_paths
     stripped_code = textwrap.dedent(code).strip()
     if not stripped_code or not required_paths:
         return stripped_code, []
@@ -4145,8 +4454,13 @@ def _extraction_code_with_required_static_return(
         tree = ast.parse(stripped_code)
     except SyntaxError:
         return stripped_code, []
+    declaration_children = {
+        child
+        for path in declaration_paths
+        if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
+    }
     if any(isinstance(node, ast.Return) for node in _iter_top_level_scope(tree.body)):
-        replacement = _replace_direct_child_local_return(stripped_code, tree, required_paths)
+        replacement = _replace_direct_child_local_return(stripped_code, tree, required_paths, declaration_children)
         if replacement and required_paths <= _code_block_produced_output_paths(replacement):
             return replacement, []
         missing = sorted(required_paths - _code_block_produced_output_paths(stripped_code))
@@ -4170,7 +4484,7 @@ def _extraction_code_with_required_static_return(
                     for path in required_paths
                     if (child := _output_path_direct_child(path, "output"))
                     and _return_scaffold_name_is_safe(child)
-                    and child in assigned_names
+                    and (child in assigned_names or child in declaration_children)
                 }
             )
             required_child_names = {
@@ -4179,7 +4493,12 @@ def _extraction_code_with_required_static_return(
                 if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
             }
             if child_names and set(child_names) == required_child_names:
-                child_pairs = ", ".join(f'"{name}": {name}' for name in child_names)
+                child_pairs = ", ".join(
+                    f'"{name}": None'
+                    if name in declaration_children and name not in assigned_names
+                    else f'"{name}": {name}'
+                    for name in child_names
+                )
                 candidate = stripped_code + f'\nreturn {{"output": {{{child_pairs}}}}}'
     if not candidate and len(roots) == 1:
         candidate = _single_mapping_local_static_return_candidate(stripped_code, next(iter(roots)), required_paths)
@@ -4227,7 +4546,13 @@ def _single_mapping_local_static_return_candidate(code: str, root: str, required
     return code + f'\nreturn {{"{root}": {mapping_local}}}'
 
 
-def _replace_direct_child_local_return(code: str, tree: ast.Module, required_paths: set[str]) -> str:
+def _replace_direct_child_local_return(
+    code: str,
+    tree: ast.Module,
+    required_paths: set[str],
+    declaration_children: set[str] | None = None,
+) -> str:
+    declaration_children = declaration_children or set()
     roots = {_output_path_root(path) for path in required_paths if _output_path_root(path)}
     if roots != {"output"}:
         return ""
@@ -4238,9 +4563,10 @@ def _replace_direct_child_local_return(code: str, tree: ast.Module, required_pat
             if (child := _output_path_direct_child(path, "output")) and _return_scaffold_name_is_safe(child)
         }
     )
-    if len(child_names) != 1:
+    local_child_names = [child for child in child_names if child not in declaration_children]
+    if len(local_child_names) != 1:
         return ""
-    child_name = child_names[0]
+    child_name = local_child_names[0]
     returns = [node for node in tree.body if isinstance(node, ast.Return)]
     if len(returns) != 1:
         return ""
@@ -4256,7 +4582,10 @@ def _replace_direct_child_local_return(code: str, tree: ast.Module, required_pat
     if indent_match is None:
         return ""
     indent = indent_match.group(0)
-    replacement = f'{indent}return {{"output": {{"{child_name}": {child_name}}}}}'
+    pairs = ", ".join(
+        f'"{name}": None' if name in declaration_children else f'"{name}": {name}' for name in child_names
+    )
+    replacement = f'{indent}return {{"output": {{{pairs}}}}}'
     return "\n".join(
         [
             *lines[: return_node.lineno - 1],
@@ -6396,7 +6725,7 @@ def _selector_join_parameter_alias_by_authored_fill(
 def _synthesized_parameter_binding_reject_count(ctx: AgentContext | None) -> int:
     if ctx is None:
         return 0
-    required_paths, _, _ = _output_contract_required_paths_source(ctx)
+    required_paths = _output_contract_required_paths_source(ctx).union
     if required_paths:
         contract_count = _output_contract_reject_count(
             ctx,
@@ -8194,7 +8523,7 @@ async def _update_workflow(
             imposition.repair_context is not None
             and imposition.repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
         ):
-            required_paths, _, _ = _output_contract_required_paths_source(ctx)
+            required_paths = _output_contract_required_paths_source(ctx).union
             _record_output_contract_family_reject(
                 ctx,
                 required_paths,
