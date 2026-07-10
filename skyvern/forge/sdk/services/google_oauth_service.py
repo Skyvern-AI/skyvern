@@ -24,6 +24,7 @@ from google_auth_oauthlib.flow import Flow
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import generate_google_oauth_credential_id
 
 # Lifecycle constants and InvalidConsentNonceError live on the repository (the DB owns
@@ -39,7 +40,12 @@ from skyvern.forge.sdk.db.repositories.google_oauth import (  # noqa: F401
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
-from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
+from skyvern.forge.sdk.schemas.google_oauth import (
+    GoogleOAuthClientConfig,
+    GoogleOAuthClientConfigSafe,
+    GoogleOAuthCredentialBase,
+)
+from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
 
@@ -98,12 +104,37 @@ class UnsupportedScopeProfileError(ValueError):
     """Raised when a caller asks for an unsupported Google OAuth scope profile."""
 
 
+class OrganizationGoogleOAuthConfigDisabledError(RuntimeError):
+    """Raised when org-level Google OAuth client config is disabled for this deployment."""
+
+
+class OrganizationClientConfigUnavailableError(RuntimeError):
+    """Raised when a stored org OAuth client config exists (or cannot be ruled out) but cannot be loaded."""
+
+
 @dataclass(frozen=True)
 class GoogleCredentialSecrets:
     """Decrypted credential material needed to mint an access token."""
 
     refresh_token: str
     scopes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class GoogleOAuthClientConfigResolution:
+    config: GoogleOAuthClientConfig | None
+    source: str
+
+    def safe(self) -> GoogleOAuthClientConfigSafe:
+        return GoogleOAuthClientConfigSafe(
+            client_id=self.config.client_id if self.config else None,
+            redirect_hosts=list(self.config.redirect_hosts) if self.config else [],
+            app_origins=list(self.config.app_origins) if self.config else [],
+            client_secret_configured=bool(self.config and self.config.client_secret),
+            configured=self.config is not None,
+            source=self.source,
+            encryption_enabled=settings.ENABLE_ENCRYPTION,
+        )
 
 
 def _require_encryption() -> None:
@@ -115,9 +146,103 @@ def _require_encryption() -> None:
         )
 
 
-def _require_client_credentials() -> tuple[str, str]:
-    client_id = settings.GOOGLE_OAUTH_CLIENT_ID
-    client_secret = settings.GOOGLE_OAUTH_CLIENT_SECRET
+def _settings_client_config() -> GoogleOAuthClientConfig | None:
+    if not settings.GOOGLE_OAUTH_CLIENT_ID or not settings.GOOGLE_OAUTH_CLIENT_SECRET:
+        return None
+    return GoogleOAuthClientConfig(
+        client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
+        redirect_hosts=list(settings.GOOGLE_OAUTH_REDIRECT_HOSTS),
+        app_origins=list(settings.GOOGLE_OAUTH_APP_ORIGINS),
+    )
+
+
+def _organization_client_config_enabled() -> bool:
+    return SettingsManager.get_settings().ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG
+
+
+def _require_organization_client_config_enabled() -> None:
+    if not _organization_client_config_enabled():
+        raise OrganizationGoogleOAuthConfigDisabledError("Organization Google OAuth client config is disabled")
+
+
+async def resolve_client_config(
+    organization_id: str | None = None,
+    *,
+    strict: bool = True,
+) -> GoogleOAuthClientConfigResolution:
+    if organization_id and _organization_client_config_enabled():
+        try:
+            token = await app.DATABASE.organizations.get_valid_org_auth_token(
+                organization_id=organization_id,
+                token_type=OrganizationAuthTokenType.google_oauth_client_config.value,
+            )
+        except Exception:
+            if strict:
+                LOG.warning("Failed to load organization Google OAuth client config", organization_id=organization_id)
+                raise OrganizationClientConfigUnavailableError(
+                    "Failed to load the organization Google OAuth client config"
+                ) from None
+            LOG.warning(
+                "Failed to load organization Google OAuth client config; falling back to environment for token refresh",
+                organization_id=organization_id,
+            )
+            token = None
+        if token is not None:
+            if not token.token:
+                LOG.warning(
+                    "Stored organization Google OAuth client config is empty",
+                    organization_id=organization_id,
+                )
+                raise OrganizationClientConfigUnavailableError(
+                    "Stored organization Google OAuth client config is invalid"
+                )
+            try:
+                return GoogleOAuthClientConfigResolution(
+                    config=GoogleOAuthClientConfig.model_validate_json(token.token),
+                    source="organization",
+                )
+            except Exception:
+                LOG.warning(
+                    "Stored organization Google OAuth client config is invalid",
+                    organization_id=organization_id,
+                )
+                raise OrganizationClientConfigUnavailableError(
+                    "Stored organization Google OAuth client config is invalid"
+                ) from None
+
+    env_config = _settings_client_config()
+    return GoogleOAuthClientConfigResolution(config=env_config, source="environment" if env_config else "missing")
+
+
+async def save_client_config(
+    organization_id: str,
+    config: GoogleOAuthClientConfig,
+) -> GoogleOAuthClientConfigResolution:
+    _require_organization_client_config_enabled()
+    _require_encryption()
+    token_payload = config.model_dump_json()
+    await app.DATABASE.organizations.replace_org_auth_token(
+        organization_id=organization_id,
+        token_type=OrganizationAuthTokenType.google_oauth_client_config,
+        token=token_payload,
+        encrypted_method=EncryptMethod.AES,
+    )
+    return GoogleOAuthClientConfigResolution(config=config, source="organization")
+
+
+async def delete_client_config(organization_id: str) -> None:
+    _require_organization_client_config_enabled()
+    await app.DATABASE.organizations.invalidate_org_auth_tokens(
+        organization_id=organization_id,
+        token_type=OrganizationAuthTokenType.google_oauth_client_config,
+    )
+
+
+def _require_client_credentials(client_config: GoogleOAuthClientConfig | None = None) -> tuple[str, str]:
+    config = client_config or _settings_client_config()
+    client_id = config.client_id if config else None
+    client_secret = config.client_secret if config else None
     if not client_id or not client_secret:
         raise ValueError("Google OAuth client credentials are not configured")
     return client_id, client_secret
@@ -153,20 +278,21 @@ def has_required_scopes(
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _validate_redirect_uri(redirect_uri: str) -> None:
+def _validate_redirect_uri(redirect_uri: str, client_config: GoogleOAuthClientConfig | None = None) -> None:
     """Validate redirect_uri against the allowlist; defense-in-depth alongside Google's check.
 
     Beyond the host allowlist, we enforce scheme=https for non-loopback hosts so
     an attacker who controls ``http://allowed-host.com`` can't satisfy a
     hostname-only allowlist intended for ``https://allowed-host.com``.
     """
-    allowlist = settings.GOOGLE_OAUTH_REDIRECT_HOSTS
+    allowlist = client_config.redirect_hosts if client_config else settings.GOOGLE_OAUTH_REDIRECT_HOSTS
     if not allowlist:
         # Empty allowlist + no client_id = OAuth not configured at all → silent
         # pass-through (the consent flow itself will fail later in
         # ``_require_client_credentials``). Empty allowlist + client_id = misconfig
         # we must catch up-front so we don't leak a redirect_uri to Google unchecked.
-        if settings.GOOGLE_OAUTH_CLIENT_ID:
+        configured_client_id = client_config.client_id if client_config else settings.GOOGLE_OAUTH_CLIENT_ID
+        if configured_client_id:
             raise InvalidRedirectURIError(
                 "GOOGLE_OAUTH_REDIRECT_HOSTS must be configured when GOOGLE_OAUTH_CLIENT_ID is set"
             )
@@ -185,7 +311,7 @@ def _validate_redirect_uri(redirect_uri: str) -> None:
         raise InvalidRedirectURIError(f"redirect_uri must use https for non-loopback host: {host}")
 
 
-def _validate_app_origin(app_origin: str) -> None:
+def _validate_app_origin(app_origin: str, client_config: GoogleOAuthClientConfig | None = None) -> None:
     """Validate app_origin against the GOOGLE_OAUTH_APP_ORIGINS allowlist.
 
     Entries are either:
@@ -199,7 +325,7 @@ def _validate_app_origin(app_origin: str) -> None:
 
     Fails closed: empty allowlist always raises.
     """
-    allowlist = settings.GOOGLE_OAUTH_APP_ORIGINS
+    allowlist = client_config.app_origins if client_config else settings.GOOGLE_OAUTH_APP_ORIGINS
     if not allowlist:
         raise InvalidAppOriginError("GOOGLE_OAUTH_APP_ORIGINS is not configured; app_origin is not accepted")
 
@@ -243,6 +369,7 @@ def build_authorize_url(
     state: str,
     scopes: str | list[str] | tuple[str, ...] | None = None,
     code_verifier: str | None = None,
+    client_config: GoogleOAuthClientConfig | None = None,
 ) -> tuple[str, str]:
     """Assemble the Google OAuth 2.0 consent URL the browser should navigate to.
 
@@ -256,8 +383,8 @@ def build_authorize_url(
     """
     # Require both halves up-front; otherwise consent completes but /callback fails every time
     # because exchange_code_for_tokens needs the secret for the code -> token roundtrip.
-    client_id, client_secret = _require_client_credentials()
-    _validate_redirect_uri(redirect_uri)
+    client_id, client_secret = _require_client_credentials(client_config)
+    _validate_redirect_uri(redirect_uri, client_config)
 
     scope_list = _coerce_scopes(scopes)
     flow = Flow.from_client_config(
@@ -305,9 +432,12 @@ async def start_authorization(
 ) -> GoogleAuthorizationStart:
     """Insert a pending consent row, build the authorize URL, persist the PKCE verifier."""
     _require_encryption()
-    _validate_redirect_uri(redirect_uri)
+    resolved_config = await resolve_client_config(organization_id)
+    if resolved_config.config is None:
+        raise ValueError("Google OAuth client credentials are not configured")
+    _validate_redirect_uri(redirect_uri, resolved_config.config)
     if app_origin is not None:
-        _validate_app_origin(app_origin)
+        _validate_app_origin(app_origin, resolved_config.config)
 
     credential_id = generate_google_oauth_credential_id()
     nonce = secrets.token_urlsafe(32)
@@ -337,6 +467,7 @@ async def start_authorization(
         state=nonce,
         scopes=requested_scopes,
         code_verifier=code_verifier,
+        client_config=resolved_config.config,
     )
 
     return GoogleAuthorizationStart(authorize_url=authorize_url, state=nonce)
@@ -370,9 +501,15 @@ async def load_pending_consent_context(organization_id: str, nonce: str) -> Pend
     )
 
 
-async def exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: str | None) -> dict:
+async def exchange_code_for_tokens(
+    code: str,
+    redirect_uri: str,
+    code_verifier: str | None,
+    organization_id: str | None = None,
+) -> dict:
     """Exchange an OAuth authorization code for access and refresh tokens."""
-    client_id, client_secret = _require_client_credentials()
+    resolved_config = await resolve_client_config(organization_id)
+    client_id, client_secret = _require_client_credentials(resolved_config.config)
 
     # ``code_verifier`` is passed to ``fetch_token`` (where the PKCE verification
     # actually happens); ``Flow.from_client_config`` ignores the kwarg.
@@ -403,9 +540,10 @@ async def exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: 
     }
 
 
-async def refresh_access_token(refresh_token: str) -> dict:
+async def refresh_access_token(refresh_token: str, organization_id: str | None = None) -> dict:
     """Exchange a refresh token for a new access token via google-auth."""
-    client_id, client_secret = _require_client_credentials()
+    resolved_config = await resolve_client_config(organization_id, strict=False)
+    client_id, client_secret = _require_client_credentials(resolved_config.config)
 
     creds = Credentials(
         token=None,
@@ -439,20 +577,30 @@ async def load_credential_secrets(
     return GoogleCredentialSecrets(refresh_token=refresh_token, scopes=payload.scopes_granted)
 
 
-async def access_token_from_secrets(credential_secrets: GoogleCredentialSecrets) -> str:
+async def access_token_from_secrets(
+    credential_secrets: GoogleCredentialSecrets,
+    organization_id: str | None = None,
+) -> str:
     """Exchange loaded secrets for an access token. Network-only; no DB."""
     if not credential_secrets.refresh_token:
         raise ValueError("OAuth credential is missing refresh_token")
-    token_data = await refresh_access_token(credential_secrets.refresh_token)
+    if organization_id is None:
+        token_data = await refresh_access_token(credential_secrets.refresh_token)
+    else:
+        token_data = await refresh_access_token(credential_secrets.refresh_token, organization_id=organization_id)
     access_token = token_data.get("access_token")
     if not access_token:
         raise MissingAccessTokenError("Google token response did not include access_token")
     return access_token
 
 
-async def credentials_from_secrets(credential_secrets: GoogleCredentialSecrets) -> Credentials:
+async def credentials_from_secrets(
+    credential_secrets: GoogleCredentialSecrets,
+    organization_id: str | None = None,
+) -> Credentials:
     """Build a refreshed ``Credentials`` from already-decrypted secrets. Network-only; no DB."""
-    client_id, client_secret = _require_client_credentials()
+    resolved_config = await resolve_client_config(organization_id, strict=False)
+    client_id, client_secret = _require_client_credentials(resolved_config.config)
     creds = Credentials(
         token=None,
         refresh_token=credential_secrets.refresh_token,

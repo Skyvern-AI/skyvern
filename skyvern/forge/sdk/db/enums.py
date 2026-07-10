@@ -8,6 +8,7 @@ class OrganizationAuthTokenType(StrEnum):
     custom_credential_service = "custom_credential_service"
     bitwarden_credential = "bitwarden_credential"
     custom_llm = "custom_llm"
+    google_oauth_client_config = "google_oauth_client_config"
 
 
 class TaskType(StrEnum):
