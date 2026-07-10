@@ -26,6 +26,7 @@ import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
   formatElapsed,
+  runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
 import { toReadableSearch } from "../panes";
@@ -318,13 +319,7 @@ export function RunView({
 
   const hasInputs =
     runInputs.parameters.length > 0 || runInputs.meta.length > 0;
-  const hasOutputs =
-    runErrors.length > 0 ||
-    (extractedInformation != null &&
-      Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0 ||
-    observerOutput != null ||
-    webhookFailureReason != null;
+  const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
