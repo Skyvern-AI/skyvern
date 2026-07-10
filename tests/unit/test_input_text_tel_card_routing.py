@@ -36,6 +36,7 @@ def _mock_input(attrs: dict[str, str | None]) -> MagicMock:
     el.is_editable = AsyncMock(return_value=True)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=True)
+    el.supports_text_input = AsyncMock(return_value=True)
     el.find_blocking_element = AsyncMock(return_value=(None, False))
     el.get_element_handler = AsyncMock(return_value=MagicMock())
     el.input_sequentially = AsyncMock()

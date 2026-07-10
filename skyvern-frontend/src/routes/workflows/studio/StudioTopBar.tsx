@@ -132,7 +132,10 @@ function PanelToggle({
   );
 }
 
-export function RunStopButton() {
+// stopOnly: global (read-only) workflows can't start runs from the studio, but
+// runs started elsewhere (e.g. the recipe pages run templates in place) still
+// land here and must be stoppable — render Stop when active, nothing otherwise.
+export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const navigate = useNavigate();
   const { workflowPermanentId } = useParams();
   const runId = useStudioRunId();
@@ -225,7 +228,7 @@ export function RunStopButton() {
         </DialogContent>
       </Dialog>
     );
-    if (!isBlockRun) {
+    if (stopOnly || !isBlockRun) {
       return stopDialog;
     }
     return (
@@ -262,6 +265,9 @@ export function RunStopButton() {
         </Dialog>
       </>
     );
+  }
+  if (stopOnly) {
+    return null;
   }
   return (
     <Button
@@ -303,7 +309,10 @@ export function StudioTopBar() {
           Agent deleted on {basicLocalTimeFormat(workflowDeletedAt)}
         </span>
       ) : isGlobalWorkflow ? (
-        <MakeACopyButton />
+        <div className="flex items-center gap-2">
+          <RunStopButton stopOnly />
+          <MakeACopyButton />
+        </div>
       ) : (
         <div data-tour="editor-actions" className="flex items-center gap-2">
           <div className="flex items-center gap-1">
