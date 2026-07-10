@@ -512,6 +512,27 @@ class Settings(BaseSettings):
     AZURE_GPT5_4_API_BASE: str | None = None
     AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.6 sol
+    ENABLE_AZURE_GPT5_6_SOL: bool = False
+    AZURE_GPT5_6_SOL_DEPLOYMENT: str = "gpt-5.6-sol"
+    AZURE_GPT5_6_SOL_API_KEY: str | None = None
+    AZURE_GPT5_6_SOL_API_BASE: str | None = None
+    AZURE_GPT5_6_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5.6 terra
+    ENABLE_AZURE_GPT5_6_TERRA: bool = False
+    AZURE_GPT5_6_TERRA_DEPLOYMENT: str = "gpt-5.6-terra"
+    AZURE_GPT5_6_TERRA_API_KEY: str | None = None
+    AZURE_GPT5_6_TERRA_API_BASE: str | None = None
+    AZURE_GPT5_6_TERRA_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5.6 luna
+    ENABLE_AZURE_GPT5_6_LUNA: bool = False
+    AZURE_GPT5_6_LUNA_DEPLOYMENT: str = "gpt-5.6-luna"
+    AZURE_GPT5_6_LUNA_API_KEY: str | None = None
+    AZURE_GPT5_6_LUNA_API_BASE: str | None = None
+    AZURE_GPT5_6_LUNA_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -780,6 +801,27 @@ class Settings(BaseSettings):
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
             ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
+            (
+                "azure/gpt-5.6-sol",
+                self.ENABLE_AZURE_GPT5_6_SOL,
+                "AZURE_OPENAI_GPT5_6_SOL",
+                "OPENAI_GPT5_6_SOL",
+                "GPT 5.6 Sol",
+            ),
+            (
+                "azure/gpt-5.6-terra",
+                self.ENABLE_AZURE_GPT5_6_TERRA,
+                "AZURE_OPENAI_GPT5_6_TERRA",
+                "OPENAI_GPT5_6_TERRA",
+                "GPT 5.6 Terra",
+            ),
+            (
+                "azure/gpt-5.6-luna",
+                self.ENABLE_AZURE_GPT5_6_LUNA,
+                "AZURE_OPENAI_GPT5_6_LUNA",
+                "OPENAI_GPT5_6_LUNA",
+                "GPT 5.6 Luna",
+            ),
             ("azure/o3", self.ENABLE_AZURE_O3, "AZURE_OPENAI_O3", "OPENAI_O3", "GPT O3"),
         ]
         for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:
