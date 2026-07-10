@@ -105,6 +105,15 @@ async def google_oauth_callback(
             status_code=400,
             detail="OAuth consent row is missing the PKCE verifier; restart the consent flow",
         )
+    try:
+        resolved = await google_oauth_service.resolve_client_config(current_org.organization_id)
+    except google_oauth_service.OrganizationClientConfigUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if context.client_id is not None and (resolved.config is None or resolved.config.client_id != context.client_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Google OAuth client configuration changed since consent started; restart the connection",
+        )
 
     try:
         token_data = await google_oauth_service.exchange_code_for_tokens(
@@ -112,6 +121,7 @@ async def google_oauth_callback(
             redirect_uri=context.consent_redirect_uri,
             code_verifier=context.consent_code_verifier,
             organization_id=current_org.organization_id,
+            client_config=resolved.config,
         )
     except google_oauth_service.OrganizationClientConfigUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -229,7 +239,7 @@ async def list_google_oauth_credentials(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
 ) -> GoogleOAuthCredentialListResponse:
     """Fetch a list of Google OAuth credentials associated with an organization."""
-    credentials = await google_oauth_service.get_credentials_for_org(
+    credentials = await google_oauth_service.get_visible_credentials_for_org(
         organization_id=current_org.organization_id,
     )
     return GoogleOAuthCredentialListResponse(credentials=credentials)
