@@ -19,16 +19,24 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
+import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { TaskActions } from "./TaskActions";
 import { TaskListSkeletonRows } from "./TaskListSkeletonRows";
 import { Button } from "@/components/ui/button";
 import { DownloadIcon } from "@radix-ui/react-icons";
 import { downloadBlob } from "@/util/downloadBlob";
+import { useRunTagsBatchQuery } from "../hooks/useRunTagsBatchQuery";
+
+const EMPTY_LABEL_SUGGESTIONS: Array<string> = [];
 
 function TaskHistory() {
   const credentialGetter = useCredentialGetter();
@@ -36,6 +44,7 @@ function TaskHistory() {
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const navigate = useNavigate();
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
 
   const {
     data: tasks,
@@ -62,6 +71,31 @@ function TaskHistory() {
     },
   });
 
+  const workflowRunIds = useMemo(
+    () =>
+      (tasks ?? [])
+        .map((task) => task.workflow_run_id)
+        .filter((id): id is string => Boolean(id)),
+    [tasks],
+  );
+  const { data: runTagsMap = {} } = useRunTagsBatchQuery(workflowRunIds, {
+    enabled: taggingEnabled,
+  });
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
+  const tagDescriptions = useMemo(
+    () =>
+      new Map(
+        tagKeys.map((tagKey): [string, string | null] => [
+          tagKey.key,
+          tagKey.description,
+        ]),
+      ),
+    [tagKeys],
+  );
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
+  const visibleTasks = tasks ?? [];
+  const showRowsPending = isPending;
+
   if (isError) {
     return <div>Error: {error?.message}</div>;
   }
@@ -83,7 +117,7 @@ function TaskHistory() {
       return; // should never happen
     }
     const data = ["id,url,status,created,failure_reason"];
-    tasks.forEach((task) => {
+    visibleTasks.forEach((task) => {
       const row = [
         task.task_id,
         task.request.url,
@@ -131,21 +165,35 @@ function TaskHistory() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {isPending ? (
+            {showRowsPending ? (
               <TaskListSkeletonRows />
-            ) : tasks?.length === 0 ? (
+            ) : visibleTasks.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={5}>No tasks found</TableCell>
               </TableRow>
             ) : (
-              tasks?.map((task) => {
+              visibleTasks.map((task) => {
+                const workflowRunId = task.workflow_run_id;
+                const runTags = workflowRunId
+                  ? runTagsMap[workflowRunId]
+                  : undefined;
                 return (
                   <TableRow key={task.task_id}>
                     <TableCell
                       className="w-1/4 cursor-pointer"
                       onClick={(event) => handleNavigate(event, task.task_id)}
                     >
-                      {task.task_id}
+                      <div className="flex min-w-0 flex-col gap-1">
+                        <span>{task.task_id}</span>
+                        {taggingEnabled && runTags && runTags.length > 0 ? (
+                          <TagChipList
+                            tags={runTags}
+                            descriptions={tagDescriptions}
+                            colors={tagColors}
+                            maxVisible={2}
+                          />
+                        ) : null}
+                      </div>
                     </TableCell>
                     <TableCell
                       className="w-1/4 max-w-64 cursor-pointer overflow-hidden overflow-ellipsis whitespace-nowrap"
@@ -167,7 +215,13 @@ function TaskHistory() {
                       {basicLocalTimeFormat(task.created_at)}
                     </TableCell>
                     <TableCell className="w-1/12">
-                      <TaskActions task={task} />
+                      <TaskActions
+                        task={task}
+                        taggingEnabled={taggingEnabled}
+                        tagKeys={tagKeys}
+                        labelSuggestions={EMPTY_LABEL_SUGGESTIONS}
+                        currentTags={runTags}
+                      />
                     </TableCell>
                   </TableRow>
                 );
