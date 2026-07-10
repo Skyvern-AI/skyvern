@@ -98,6 +98,8 @@ class _Ctx:
         self.observation_after_navigate = False
         self.navigate_enforcement_done = False
         self.update_workflow_called = False
+        self.persisted_draft_browser_calls = None
+        self.scouted_spine_checkpoint_fired = False
         self.test_after_update_done = False
         self.post_update_nudge_count = 0
         self.coverage_nudge_count = 0

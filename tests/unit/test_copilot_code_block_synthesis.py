@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
+    uncovered_required_emitted_interactions,
 )
 from skyvern.forge.sdk.copilot.context import (
     FillCarry,
@@ -2615,3 +2616,191 @@ class TestReadonlyControlStateCarry:
         persisted = StructuredContext(fill_carry=carry).to_json_str()
         assert '"control_readonly": true' in persisted
         assert '"control_value_satisfied": false' in persisted
+
+
+class TestEmittedInteractionPartition:
+    def _mixed_trajectory(self) -> list[dict[str, Any]]:
+        return [
+            {"tool_name": "click", "selector": "#open", "source_url": "https://example.com/start"},
+            {
+                "tool_name": "type_text",
+                "selector": "#name",
+                "typed_value": "Ada",
+                "role": "textbox",
+                "accessible_name": "Name",
+            },
+            {"tool_name": "hover", "selector": "#menu"},
+            {"tool_name": "select_option", "selector": "#state"},
+            {
+                "tool_name": "type_text",
+                "selector": "#locked",
+                "typed_value": "fixed",
+                "control_readonly": True,
+                "control_value_satisfied": True,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#accept",
+                "role": "button",
+                "accessible_name": "Accept all cookies",
+            },
+            {"tool_name": "press_key", "selector": "#name", "key": "Enter"},
+        ]
+
+    def test_every_retained_index_in_exactly_one_partition(self) -> None:
+        trajectory = self._mixed_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.truncated is False
+        emitted = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        dropped = {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+        forgiven = {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        assert emitted | dropped | forgiven == set(range(len(trajectory)))
+        assert emitted & dropped == set()
+        assert emitted & forgiven == set()
+        assert dropped & forgiven == set()
+
+    def test_emitted_records_carry_method_selector_and_lane_flags(self) -> None:
+        trajectory = self._mixed_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[0]["method"] == "click"
+        assert by_index[0]["selector"] == "#open"
+        assert "lane" not in by_index[0]
+        assert by_index[1]["method"] == "fill"
+        assert by_index[4]["method"] == "input_value"
+        assert by_index[4]["lane"] == "readonly_skip"
+        assert by_index[5]["method"] == "click"
+        assert by_index[5]["lane"] == "optional_dismissal"
+        assert by_index[6]["method"] == "press"
+        dropped_reasons = {
+            record["trajectory_index"]: record["reason_code"] for record in result.diagnostics.dropped_interactions
+        }
+        assert dropped_reasons[2] == "unsupported_tool"
+        assert dropped_reasons[3] == "missing_value"
+
+    def test_every_emitted_record_carries_verbatim_call_source(self) -> None:
+        trajectory = self._mixed_trajectory()
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert result.diagnostics.emitted_interactions
+        for record in result.diagnostics.emitted_interactions:
+            call_source = str(record.get("call_source") or "")
+            assert call_source.strip()
+            for line in call_source.splitlines():
+                assert line.strip() in result.code
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert 'await page.locator("#open").click()' in by_index[0]["call_source"]
+
+    def test_entry_replay_prefix_indices_are_forgiven_not_lost(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "button", "source_url": "https://example.com/start"},
+            {"tool_name": "click", "selector": "#promo"},
+            {
+                "tool_name": "type_text",
+                "selector": "#name",
+                "typed_value": "Ada",
+                "role": "textbox",
+                "accessible_name": "Name",
+            },
+            {"tool_name": "click", "selector": "#submit"},
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        diagnostics = result.diagnostics
+        emitted = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        dropped = {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+        forgiven = {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        assert emitted | dropped | forgiven == set(range(len(trajectory)))
+        assert emitted == {2, 3}
+        assert dropped == {0}
+        assert diagnostics.forgiven_interactions == [
+            {"trajectory_index": 1, "tool_name": "click", "lane": "entry_replay_prefix"}
+        ]
+
+
+class TestUncoveredRequiredEmittedInteractions:
+    def _emitted(self) -> list[dict[str, Any]]:
+        return [
+            {"method": "click", "locator": 'page.locator("#a")', "selector": "#a"},
+            {"method": "fill", "locator": 'page.locator("#b")', "selector": "#b"},
+            {"method": "click", "locator": 'page.locator("#c")', "selector": "#c"},
+        ]
+
+    def test_verbatim_in_order_resubmission_clears(self) -> None:
+        draft_calls = [
+            ("click", 'page.locator("#a")'),
+            ("fill", 'page.locator("#b")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        assert uncovered_required_emitted_interactions(self._emitted(), draft_calls) == []
+
+    def test_reordered_but_complete_draft_reports_under_build(self) -> None:
+        draft_calls = [
+            ("fill", 'page.locator("#b")'),
+            ("click", 'page.locator("#a")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        uncovered = uncovered_required_emitted_interactions(self._emitted(), draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["#b", "#c"]
+
+    def test_first_miss_over_reports_later_rungs_as_missing(self) -> None:
+        draft_calls = [
+            ("click", 'page.locator("#a")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        uncovered = uncovered_required_emitted_interactions(self._emitted(), draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["#b", "#c"]
+
+    def test_shared_name_literal_on_different_element_does_not_cover(self) -> None:
+        emitted = [
+            {"method": "click", "locator": 'page.get_by_role("button", name="Submit")', "selector": "Submit"},
+        ]
+        draft_calls = [("click", 'page.get_by_role("link", name="Submit")')]
+
+        uncovered = uncovered_required_emitted_interactions(emitted, draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["Submit"]
+
+    def test_bare_locator_call_with_exact_full_selector_covers(self) -> None:
+        emitted = [
+            {"method": "click", "locator": 'page.locator("#a").first', "selector": "#a"},
+        ]
+        draft_calls = [("click", 'page.locator("#a")')]
+
+        assert uncovered_required_emitted_interactions(emitted, draft_calls) == []
+
+    def test_receiver_quoting_selector_among_other_literals_does_not_cover(self) -> None:
+        emitted = [
+            {"method": "click", "locator": 'page.locator("#a")', "selector": "#a"},
+        ]
+        draft_calls = [("click", 'page.locator("#wrapper").locator("#a", has_text="Go")')]
+
+        uncovered = uncovered_required_emitted_interactions(emitted, draft_calls)
+
+        assert [record["selector"] for record in uncovered] == ["#a"]
+
+    def test_lane_flagged_records_are_not_required(self) -> None:
+        emitted = self._emitted()
+        emitted[1]["lane"] = "optional_dismissal"
+        draft_calls = [
+            ("click", 'page.locator("#a")'),
+            ("click", 'page.locator("#c")'),
+        ]
+
+        assert uncovered_required_emitted_interactions(emitted, draft_calls) == []
