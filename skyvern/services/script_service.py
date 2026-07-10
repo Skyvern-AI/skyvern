@@ -2872,6 +2872,14 @@ async def upload_file(
     azure_blob_container_name: str | None = None,
     google_credential_id: str | None = None,
     google_drive_folder_id: str | None = None,
+    sftp_host: str | None = None,
+    sftp_port: int | None = None,
+    sftp_username: str | None = None,
+    sftp_password: str | None = None,
+    sftp_private_key: str | None = None,
+    sftp_private_key_passphrase: str | None = None,
+    sftp_remote_path: str | None = None,
+    sftp_host_key: str | None = None,
     path: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
@@ -2893,6 +2901,20 @@ async def upload_file(
         google_credential_id = _render_template_with_label(google_credential_id, label)
     if google_drive_folder_id:
         google_drive_folder_id = _render_template_with_label(google_drive_folder_id, label)
+    if sftp_host:
+        sftp_host = _render_template_with_label(sftp_host, label)
+    if sftp_username:
+        sftp_username = _render_template_with_label(sftp_username, label)
+    if sftp_password:
+        sftp_password = _render_template_with_label(sftp_password, label)
+    if sftp_private_key:
+        sftp_private_key = _render_template_with_label(sftp_private_key, label)
+    if sftp_private_key_passphrase:
+        sftp_private_key_passphrase = _render_template_with_label(sftp_private_key_passphrase, label)
+    if sftp_remote_path:
+        sftp_remote_path = _render_template_with_label(sftp_remote_path, label)
+    if sftp_host_key:
+        sftp_host_key = _render_template_with_label(sftp_host_key, label)
     if path:
         path = _render_template_with_label(path, label)
     file_upload_block = FileUploadBlock(
@@ -2909,6 +2931,14 @@ async def upload_file(
         azure_blob_container_name=azure_blob_container_name,
         google_credential_id=google_credential_id,
         google_drive_folder_id=google_drive_folder_id,
+        sftp_host=sftp_host,
+        sftp_port=sftp_port,
+        sftp_username=sftp_username,
+        sftp_password=sftp_password,
+        sftp_private_key=sftp_private_key,
+        sftp_private_key_passphrase=sftp_private_key_passphrase,
+        sftp_remote_path=sftp_remote_path,
+        sftp_host_key=sftp_host_key,
         path=path,
     )
     await file_upload_block.execute_safe(

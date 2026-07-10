@@ -636,6 +636,14 @@ def block_yaml_to_block(
             azure_blob_container_name=block_yaml.azure_blob_container_name,
             google_credential_id=block_yaml.google_credential_id,
             google_drive_folder_id=block_yaml.google_drive_folder_id,
+            sftp_host=block_yaml.sftp_host,
+            sftp_port=block_yaml.sftp_port,
+            sftp_username=block_yaml.sftp_username,
+            sftp_password=block_yaml.sftp_password,
+            sftp_private_key=block_yaml.sftp_private_key,
+            sftp_private_key_passphrase=block_yaml.sftp_private_key_passphrase,
+            sftp_remote_path=block_yaml.sftp_remote_path,
+            sftp_host_key=block_yaml.sftp_host_key,
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:

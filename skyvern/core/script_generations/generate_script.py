@@ -2132,6 +2132,14 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         "azure_blob_container_name",
         "google_credential_id",
         "google_drive_folder_id",
+        "sftp_host",
+        "sftp_port",
+        "sftp_username",
+        "sftp_password",
+        "sftp_private_key",
+        "sftp_private_key_passphrase",
+        "sftp_remote_path",
+        "sftp_host_key",
         "path",
     ]:
         if block.get(key) is not None:

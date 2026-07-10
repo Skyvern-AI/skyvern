@@ -215,6 +215,9 @@ class Settings(BaseSettings):
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
+    # SFTP uploads connect directly from the worker, so private/internal hosts are
+    # blocked by default; self-hosted deployments with internal SFTP targets can enable.
+    ALLOW_SFTP_INTERNAL_HOSTS: bool = False
 
     # Format: "http://<username>:<password>@host:port, http://<username>:<password>@host:port, ...."
     HOSTED_PROXY_POOL: str = ""

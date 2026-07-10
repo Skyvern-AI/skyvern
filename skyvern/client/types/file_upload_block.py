@@ -37,6 +37,14 @@ class FileUploadBlock(UniversalBaseModel):
     azure_blob_container_name: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
+    sftp_host: typing.Optional[str] = None
+    sftp_port: typing.Optional[int] = None
+    sftp_username: typing.Optional[str] = None
+    sftp_password: typing.Optional[str] = None
+    sftp_private_key: typing.Optional[str] = None
+    sftp_private_key_passphrase: typing.Optional[str] = None
+    sftp_remote_path: typing.Optional[str] = None
+    sftp_host_key: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:

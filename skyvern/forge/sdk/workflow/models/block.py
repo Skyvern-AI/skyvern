@@ -108,7 +108,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -5580,6 +5580,14 @@ class FileUploadBlock(Block):
     azure_blob_container_name: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
     path: str | None = None
     continue_on_empty: bool = Field(
         default=False,
@@ -5624,6 +5632,27 @@ class FileUploadBlock(Block):
         if self.google_drive_folder_id and workflow_run_context.has_parameter(self.google_drive_folder_id):
             parameters.append(workflow_run_context.get_parameter(self.google_drive_folder_id))
 
+        if self.sftp_host and workflow_run_context.has_parameter(self.sftp_host):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_host))
+
+        if self.sftp_username and workflow_run_context.has_parameter(self.sftp_username):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_username))
+
+        if self.sftp_password and workflow_run_context.has_parameter(self.sftp_password):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_password))
+
+        if self.sftp_private_key and workflow_run_context.has_parameter(self.sftp_private_key):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_private_key))
+
+        if self.sftp_private_key_passphrase and workflow_run_context.has_parameter(self.sftp_private_key_passphrase):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_private_key_passphrase))
+
+        if self.sftp_remote_path and workflow_run_context.has_parameter(self.sftp_remote_path):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_remote_path))
+
+        if self.sftp_host_key and workflow_run_context.has_parameter(self.sftp_host_key):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_host_key))
+
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
@@ -5661,6 +5690,34 @@ class FileUploadBlock(Block):
         if self.google_drive_folder_id:
             self.google_drive_folder_id = self.format_block_parameter_template_from_workflow_run_context(
                 self.google_drive_folder_id, workflow_run_context
+            )
+        if self.sftp_host:
+            self.sftp_host = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_host, workflow_run_context
+            )
+        if self.sftp_username:
+            self.sftp_username = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_username, workflow_run_context
+            )
+        if self.sftp_password:
+            self.sftp_password = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_password, workflow_run_context
+            )
+        if self.sftp_private_key:
+            self.sftp_private_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_private_key, workflow_run_context
+            )
+        if self.sftp_private_key_passphrase:
+            self.sftp_private_key_passphrase = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_private_key_passphrase, workflow_run_context
+            )
+        if self.sftp_remote_path:
+            self.sftp_remote_path = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_remote_path, workflow_run_context
+            )
+        if self.sftp_host_key:
+            self.sftp_host_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_host_key, workflow_run_context
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
@@ -5739,6 +5796,36 @@ class FileUploadBlock(Block):
             sdk_uri=f"https://drive.google.com/drive/folders/{folder_id}",
             google_access_token=access_token,
             google_drive_folder_id=folder_id,
+        )
+
+    def _build_sftp_destination(
+        self,
+        *,
+        file_path: str,
+        host: str,
+        port: int,
+        username: str,
+        password: str | None,
+        private_key: str | None,
+        private_key_passphrase: str | None,
+        remote_path: str | None,
+        host_key: str | None,
+    ) -> FileUploadDestination:
+        filename = Path(file_path).name
+        remote_target = sftp_service.build_remote_target(remote_path, filename)
+        remote_uri = f"sftp://{host}:{port}/{remote_target.lstrip('/')}"
+        return FileUploadDestination(
+            storage_type=FileStorageType.SFTP,
+            customer_uri=remote_uri,
+            sdk_uri=remote_uri,
+            sftp_host=host,
+            sftp_port=port,
+            sftp_username=username,
+            sftp_password=password,
+            sftp_private_key=private_key,
+            sftp_private_key_passphrase=private_key_passphrase,
+            sftp_remote_path=remote_path,
+            sftp_host_key=host_key,
         )
 
     @staticmethod
@@ -5961,6 +6048,13 @@ class FileUploadBlock(Block):
                 missing_parameters.append("google_credential_id")
             if not self.google_drive_folder_id:
                 missing_parameters.append("google_drive_folder_id")
+        elif self.storage_type == FileStorageType.SFTP:
+            if not self.sftp_host:
+                missing_parameters.append("sftp_host")
+            if not self.sftp_username:
+                missing_parameters.append("sftp_username")
+            if not self.sftp_password and not self.sftp_private_key:
+                missing_parameters.append("sftp_password or sftp_private_key")
         else:
             return await self.build_block_result(
                 success=False,
@@ -6003,7 +6097,7 @@ class FileUploadBlock(Block):
             files_to_upload = []
             max_file_count = (
                 MAX_UPLOAD_FILE_COUNT
-                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE}
+                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
                 else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
             )
             files_to_upload = self._get_files_to_upload_from_download_dir(
@@ -6170,6 +6264,42 @@ class FileUploadBlock(Block):
                     )
                     uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
+            elif self.storage_type == FileStorageType.SFTP:
+                actual_sftp_username = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
+                )
+                actual_sftp_password = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_password) or self.sftp_password
+                )
+                actual_sftp_private_key = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key)
+                    or self.sftp_private_key
+                )
+                actual_sftp_passphrase = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key_passphrase)
+                    or self.sftp_private_key_passphrase
+                )
+                sftp_port = 22 if self.sftp_port is None else self.sftp_port
+                for file_path in files_to_upload:
+                    destination = self._build_sftp_destination(
+                        file_path=file_path,
+                        host=self.sftp_host or "",
+                        port=sftp_port,
+                        username=actual_sftp_username or "",
+                        password=actual_sftp_password,
+                        private_key=actual_sftp_private_key,
+                        private_key_passphrase=actual_sftp_passphrase,
+                        remote_path=self.sftp_remote_path,
+                        host_key=self.sftp_host_key,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=organization_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
+                LOG.info("FileUploadBlock File(s) uploaded to SFTP", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation
                 raise ValueError(f"Unsupported storage type: {self.storage_type}")
