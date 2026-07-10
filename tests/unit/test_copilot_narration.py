@@ -17,6 +17,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot import narration
 from skyvern.forge.sdk.copilot.narration import (
+    MIN_BLOCK_STATUS_POLL_GAP_SECONDS,
     MIN_NARRATION_GAP_SECONDS,
     NarratorState,
     TransitionKind,
@@ -922,6 +923,42 @@ async def test_poll_tick_no_change_still_calls_schedule_narration() -> None:
         await state.in_flight_task
     except (asyncio.CancelledError, Exception):
         pass
+
+
+@pytest.mark.asyncio
+async def test_poll_tick_refetches_block_status_within_narration_gap_but_past_poll_gap() -> None:
+    """Block-status re-fetch must not be held to the 10s narration floor (SKY-12196):
+    a change 2s after the last fetch -- inside MIN_NARRATION_GAP_SECONDS but past
+    MIN_BLOCK_STATUS_POLL_GAP_SECONDS -- must still surface immediately."""
+    assert 0.0 < MIN_BLOCK_STATUS_POLL_GAP_SECONDS < 2.0 < MIN_NARRATION_GAP_SECONDS
+    state = NarratorState()
+    stream = _StubStream()
+    seen: dict[str, str] = {}
+    fetch_calls = 0
+
+    async def fetch() -> list[_StubBlock]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return [_StubBlock("b0", "running")]
+
+    await narrator_poll_tick(
+        state,
+        current_block_ts=_ts(2.0),
+        prior_block_ts=_ts(1.0),
+        last_block_fetch_monotonic=time.monotonic() - 2.0,
+        seen_block_states=seen,
+        fetch_block_statuses=fetch,
+        stream=stream,  # type: ignore[arg-type]
+    )
+
+    assert fetch_calls == 1
+    assert seen == {"b0": "running"}
+    if state.in_flight_task is not None:
+        state.in_flight_task.cancel()
+        try:
+            await state.in_flight_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 @pytest.mark.asyncio
