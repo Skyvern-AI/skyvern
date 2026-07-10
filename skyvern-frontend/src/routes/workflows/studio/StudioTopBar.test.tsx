@@ -32,7 +32,7 @@ function LocationProbe() {
   );
 }
 
-function renderAt(path: string) {
+function renderAt(path: string, element = <RunStopButton />) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -43,7 +43,7 @@ function renderAt(path: string) {
           <Routes>
             <Route
               path="/workflows/:workflowPermanentId/studio"
-              element={<RunStopButton />}
+              element={element}
             />
             <Route
               path="/agents/:workflowPermanentId/run"
@@ -127,5 +127,43 @@ describe("RunStopButton concurrency with a live block run", () => {
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_1/run",
     );
+  });
+});
+
+// Global workflows can't start runs from the studio, but recipe pages run
+// them in place — a live run must still be stoppable from the top bar.
+describe("RunStopButton stopOnly (global workflows)", () => {
+  test("a running run offers Stop and no Run", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1", <RunStopButton stopOnly />);
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).toBeNull();
+  });
+
+  test("a running block run offers Stop only — no concurrent full run", () => {
+    renderAt(
+      "/workflows/wpid_1/studio?wr=wr_1&bl=Block%201",
+      <RunStopButton stopOnly />,
+    );
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).toBeNull();
+  });
+
+  test("stopping asks for the same soft confirm", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1", <RunStopButton stopOnly />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Stop/ }));
+    expect(screen.queryByText("Stop this run?")).not.toBeNull();
+  });
+
+  test("a finished run renders nothing", () => {
+    mockRun(Status.Completed);
+    renderAt("/workflows/wpid_1/studio?wr=wr_1", <RunStopButton stopOnly />);
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  test("no focused run renders nothing", () => {
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    renderAt("/workflows/wpid_1/studio", <RunStopButton stopOnly />);
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });
