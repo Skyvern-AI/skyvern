@@ -49,6 +49,7 @@ type Props = {
   tagKeys: Array<TagKey>;
   labelSuggestions: Array<string>;
   valueSuggestionsByKey?: Map<string, Array<string>>;
+  currentTags?: Array<Tag>;
   onNavigate: (path: string) => void;
   // Lets the list prune this id from its multi-select set after a single-row
   // delete, so the selection header/bulk bar can't get stuck on a gone row.
@@ -65,6 +66,7 @@ function WorkflowRowContextMenu({
   tagKeys,
   labelSuggestions,
   valueSuggestionsByKey,
+  currentTags,
   onNavigate,
   onDeleted,
   selectedCount = 0,
@@ -101,6 +103,26 @@ function WorkflowRowContextMenu({
           const tagLabel =
             tag.key !== null ? `${tag.key}: ${tag.value}` : tag.value;
           toast({ title: `Tagged with ${tagLabel}.`, variant: "success" });
+        },
+      },
+    );
+  }
+
+  function removeTag(tag: Tag) {
+    applyTagsMutation.mutate(
+      {
+        workflowPermanentId: workflow.workflow_permanent_id,
+        data: {
+          tags_to_delete: [
+            tag.key !== null ? { key: tag.key } : { value: tag.value },
+          ],
+        },
+      },
+      {
+        onSuccess: () => {
+          const tagLabel =
+            tag.key !== null ? `${tag.key}: ${tag.value}` : tag.value;
+          toast({ title: `Removed ${tagLabel}.`, variant: "success" });
         },
       },
     );
@@ -210,9 +232,12 @@ function WorkflowRowContextMenu({
                   tagKeys={tagKeys}
                   labelSuggestions={labelSuggestions}
                   valueSuggestionsByKey={valueSuggestionsByKey}
+                  currentTags={currentTags}
                   error={tagError}
                   onErrorChange={setTagError}
+                  disabled={applyTagsMutation.isPending}
                   onApply={applyTag}
+                  onRemove={removeTag}
                 />
               </ContextMenuSubContent>
             </ContextMenuSub>
