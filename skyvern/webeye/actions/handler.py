@@ -339,6 +339,12 @@ def _truncate_select_shadow_field(text: str | None) -> str | None:
     return text[:SELECT_SHADOW_MATCH_FIELD_MAX_CHARS] + "…"
 
 
+def _normalized_select_shadow_field(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return _truncate_select_shadow_field(_normalize_select_shadow_text(text))
+
+
 class SelectShadowAgreement(BaseModel):
     agrees: bool | None
     llm_index: int | None = None
@@ -531,18 +537,17 @@ def _select_shadow_agrees_with_native_choice(
     if matched_index is None:
         agreement.agrees = False
         return agreement
-    if llm_index is not None:
-        agreement.agrees = matched_index == llm_index
-        return agreement
-    if llm_value is None or matched_index >= len(candidates):
-        return agreement
 
-    matched_candidate = candidates[matched_index]
     llm_value_norm = _normalize_select_shadow_text(llm_value)
-    agreement.agrees = llm_value_norm in {
-        _normalize_select_shadow_text(matched_candidate.get("label")),
-        _normalize_select_shadow_text(matched_candidate.get("value")),
-    }
+    if llm_value_norm:
+        if matched_index < len(candidates):
+            matched_candidate = candidates[matched_index]
+            agreement.agrees = llm_value_norm in {
+                _normalize_select_shadow_text(matched_candidate.get("label")),
+                _normalize_select_shadow_text(matched_candidate.get("value")),
+            }
+    elif llm_index is not None:
+        agreement.agrees = matched_index == llm_index
     return agreement
 
 
@@ -561,15 +566,14 @@ def _select_shadow_agrees_with_element_choice(
         return agreement
 
     matched_candidate = candidates[matched_index]
-    matched_element_id = matched_candidate.get("element_id")
-    if matched_element_id and llm_element_id:
-        agreement.agrees = matched_element_id == llm_element_id
-        return agreement
-    if llm_value is None:
-        return agreement
-    agreement.agrees = _normalize_select_shadow_text(matched_candidate.get("label")) == _normalize_select_shadow_text(
-        llm_value
-    )
+    llm_value_norm = _normalize_select_shadow_text(llm_value)
+    # Element ids are unstable across incremental scrapes, so id equality never decides
+    # agreement — ids stay in the logged detail fields as metadata only.
+    if llm_value_norm:
+        agreement.agrees = llm_value_norm in {
+            _normalize_select_shadow_text(matched_candidate.get("label")),
+            _normalize_select_shadow_text(matched_candidate.get("value")),
+        }
     return agreement
 
 
@@ -600,6 +604,10 @@ def _log_select_shadow_match(
                 "llm_index": result.llm_index,
                 "llm_value": _truncate_select_shadow_field(result.llm_value),
                 "llm_element_id": result.llm_element_id,
+                "normalized_target_value": _normalized_select_shadow_field(target_value),
+                "normalized_matched_label": _normalized_select_shadow_field(matched_candidate.get("label")),
+                "normalized_matched_value": _normalized_select_shadow_field(matched_candidate.get("value")),
+                "normalized_llm_value": _normalized_select_shadow_field(result.llm_value),
             }
             disagreement_fields = {key: value for key, value in disagreement_fields.items() if value is not None}
         LOG.info(
