@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     author_time_reject_missing_output_paths,
     run_backed_repair_evidence_exists,
 )
+from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
@@ -529,6 +530,7 @@ def _terminal_challenge_halt_signal(
     evidence_source: str,
     evidence_reason: str,
     blocked_tool: str = "update_and_run_blocks",
+    challenge_evidence_source: str | None = None,
 ) -> CopilotToolBlockerSignal:
     workflow_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     safe_evidence_reason = (
@@ -551,6 +553,7 @@ def _terminal_challenge_halt_signal(
         extra={
             "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
             "evidence_source": evidence_source,
+            "challenge_evidence_source": challenge_evidence_source,
             "evidence_reason": safe_evidence_reason,
             "workflow_run_id": workflow_run_id if isinstance(workflow_run_id, str) else None,
         },
@@ -567,11 +570,15 @@ def terminal_challenge_blocker_signal_from_page_evidence(
     page_reason = _structured_page_challenge_reason(ctx, evidence)
     if page_reason is None:
         return None
+    carrier = composition_challenge_carrier(
+        evidence if evidence is not None else getattr(ctx, "composition_page_evidence", None)
+    )
     return _terminal_challenge_halt_signal(
         ctx,
         evidence_source=evidence_source,
         evidence_reason=page_reason,
         blocked_tool=blocked_tool,
+        challenge_evidence_source=carrier.value if carrier else None,
     )
 
 
@@ -630,7 +637,13 @@ def _maybe_stash_terminal_challenge_halt(ctx: Any) -> None:
     outcome = _typed_terminal_challenge_outcome(ctx)
     if outcome is not None:
         reason = outcome.display_reason or "Structured evidence reported a terminal site challenge."
-        signal = _terminal_challenge_halt_signal(ctx, evidence_source="run_outcome", evidence_reason=reason)
+        carrier = composition_challenge_carrier(getattr(ctx, "composition_page_evidence", None))
+        signal = _terminal_challenge_halt_signal(
+            ctx,
+            evidence_source="run_outcome",
+            evidence_reason=reason,
+            challenge_evidence_source=carrier.value if carrier else None,
+        )
         stash_blocker_signal(ctx, signal)
         stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
         return

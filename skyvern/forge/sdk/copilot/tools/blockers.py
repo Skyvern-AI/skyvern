@@ -21,6 +21,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     maybe_satisfy_recorded_outcome_grounding_requirement,
     recorded_outcome_grounding_requires_current_page,
 )
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    artifact_challenge_flag_key,
+    is_carrier_backed_category_entry,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
     structured_record_has_goal_content as _structured_record_candidate_has_goal_content,
 )
@@ -1084,6 +1088,41 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any], copilot_ctx: 
     return None
 
 
+def _artifact_challenge_flag_from_result(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:
+    """First typed anti-bot artifact marker in the run output, or ``None``. This is
+    the artifact carrier; free-text scans are not. Only block outputs and registered
+    output parameters are typed payloads, so their string marker values count; the
+    run envelope's own string fields are prose/status (``failure_reason`` etc.) and
+    are scanned for typed boolean flags only, never marker values."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None
+    flag = artifact_challenge_flag_key(
+        {key: value for key, value in data.items() if key != "blocks"},
+        match_marker_values=False,
+    )
+    if flag:
+        return flag
+    blocks = data.get("blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("status") != "completed":
+                continue
+            declared_keys = (
+                _declared_code_output_keys(copilot_ctx, block.get("label"))
+                if _is_code_block_type(block.get("block_type"))
+                else frozenset()
+            )
+            flag = artifact_challenge_flag_key(block.get("extracted_data"), declared_keys=declared_keys)
+            if flag:
+                return flag
+    for registered in _registered_output_parameter_payloads(data):
+        flag = artifact_challenge_flag_key(registered.get("value"))
+        if flag:
+            return flag
+    return None
+
+
 def _is_blocker_term_key(key: object, declared_keys: frozenset[str] = frozenset()) -> bool:
     normalized_key = _normalize_structured_key(key)
     if normalized_key in declared_keys:
@@ -1856,7 +1895,13 @@ def _analyze_run_blocks(
     if categories:
         for cat in categories:
             if cat.get("category") == "ANTI_BOT_DETECTION":
-                anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
+                if is_carrier_backed_category_entry(cat):
+                    anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
+                else:
+                    LOG.info(
+                        "copilot anti-bot classifier match keyword-only-suppressed",
+                        workflow_run_id=data.get("workflow_run_id"),
+                    )
                 break
 
     if complete_structured_record_output:

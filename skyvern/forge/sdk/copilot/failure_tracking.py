@@ -27,6 +27,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES,
+    carrier_backed_anti_bot_categories,
+)
+
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -48,9 +53,7 @@ ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY = "ACTIVE_RUN_TERMINAL_EVIDENCE"
 ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE = "tool_error_active_run_terminal_evidence"
 
 _ROOT_CAUSE_CATEGORY_ALIASES = {
-    "ANTI_BOT_DETECTION": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
-    "CHALLENGE_DETECTION": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
-    "HUMAN_VERIFICATION_CHALLENGE": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+    **{alias: ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY for alias in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES},
     # Self-mappings document categories whose noisy failure prose must not
     # affect repeat identity.
     "PARAMETER_BINDING_ERROR": "PARAMETER_BINDING_ERROR",
@@ -433,7 +436,7 @@ def update_repeated_failure_state(
     if isinstance(data, dict):
         raw_cats = data.get("failure_categories")
         if isinstance(raw_cats, list):
-            failure_categories = raw_cats
+            failure_categories = carrier_backed_anti_bot_categories(raw_cats)
 
     suspicious_success_raw = getattr(ctx, "last_test_suspicious_success", False)
     suspicious_success = bool(suspicious_success_raw) if isinstance(suspicious_success_raw, (bool, int)) else False

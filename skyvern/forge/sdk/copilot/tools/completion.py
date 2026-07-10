@@ -5,6 +5,7 @@ from typing import Any, Protocol
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
     grade_requested_output_criteria,
@@ -74,7 +75,7 @@ from ._shared import (
 from .blockers import (
     _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
-    _looks_like_anti_bot_blocker,
+    _artifact_challenge_flag_from_result,
     _run_blocks_structured_blocker_message,
 )
 
@@ -685,7 +686,7 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
         return False
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot, _empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
-    if structured_blocker and (anti_bot or _looks_like_anti_bot_blocker(structured_blocker)):
+    if structured_blocker and (anti_bot or _artifact_challenge_flag_from_result(result, copilot_ctx)):
         return False
     return True
 
@@ -709,13 +710,15 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
 
 
 def _failure_category_names(result: dict[str, Any]) -> list[str]:
+    """Carrier-backed category names only: an uncorroborated anti-bot stamp must
+    not count toward the artifact-health exclusion set."""
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
     raw_categories = data.get("failure_categories")
     if not isinstance(raw_categories, list):
         return []
     categories: list[str] = []
-    for item in raw_categories:
+    for item in carrier_backed_anti_bot_categories(raw_categories):
         if not isinstance(item, dict):
             continue
         category = item.get("category")

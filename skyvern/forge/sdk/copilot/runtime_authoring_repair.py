@@ -5,6 +5,10 @@ from typing import Any, TypeGuard
 
 import structlog
 
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    interactive_challenge_controls,
+    is_carrier_backed_category_entry,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
@@ -207,8 +211,8 @@ def _post_run_terminal_page_evidence(evidence: dict[str, Any]) -> bool:
     indicators = evidence.get("anti_bot_indicators")
     has_indicators = isinstance(indicators, list) and any(isinstance(item, str) and item.strip() for item in indicators)
     controls = evidence.get("challenge_controls")
-    has_controls = isinstance(controls, list) and any(isinstance(item, dict) for item in controls)
-    return has_indicators and has_controls
+    has_interactive_controls = isinstance(controls, list) and bool(interactive_challenge_controls(controls))
+    return has_indicators and has_interactive_controls
 
 
 def _first_runtime_failed_block(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -349,7 +353,7 @@ def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any
             "UNRECOVERABLE_TOOL_ERROR",
             ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
             "ANTI_BOT_DETECTION",
-        }:
+        } and is_carrier_backed_category_entry(entry):
             return True
         if trusted_terminal_challenge_category_name(entry):
             return True
