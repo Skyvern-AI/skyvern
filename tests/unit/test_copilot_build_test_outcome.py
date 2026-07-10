@@ -72,6 +72,46 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
     assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
 
 
+def _failed_run_result_with_categories(categories: list[dict]) -> dict:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "failure_categories": categories,
+            "blocks": [
+                {"label": "search", "status": "failed", "failure_reason": "Timeout waiting for #results"},
+            ],
+        },
+    }
+
+
+def test_structural_identity_ignores_keyword_only_anti_bot_categories() -> None:
+    element_only = recorded_outcome_from_run_blocks_result(
+        _failed_run_result_with_categories([{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}])
+    )
+    with_keyword_stamp = recorded_outcome_from_run_blocks_result(
+        _failed_run_result_with_categories(
+            [
+                {"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8},
+                {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.7, "evidence_source": "keyword_only"},
+            ]
+        )
+    )
+    with_carrier = recorded_outcome_from_run_blocks_result(
+        _failed_run_result_with_categories(
+            [
+                {"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8},
+                {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "challenge_state"},
+            ]
+        )
+    )
+
+    assert element_only is not None and with_keyword_stamp is not None and with_carrier is not None
+    assert with_keyword_stamp.structural_failure_identity == element_only.structural_failure_identity
+    assert with_carrier.structural_failure_identity != element_only.structural_failure_identity
+
+
 def test_structural_key_ignores_display_prose_and_workflow_run_id() -> None:
     first = RecordedBuildTestOutcome(
         phase="persisted_block_run",

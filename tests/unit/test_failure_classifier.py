@@ -171,6 +171,17 @@ def test_access_denied_with_auth_context_is_not_antibot() -> None:
         assert "ANTI_BOT_DETECTION" not in categories, reason
 
 
+def test_antibot_category_is_marked_keyword_only() -> None:
+    categories = classify_from_failure_reason("Cloudflare turnstile challenge blocked the page after a timeout")
+
+    assert categories is not None
+    antibot = next(category for category in categories if category["category"] == "ANTI_BOT_DETECTION")
+    assert antibot["evidence_source"] == "keyword_only"
+    assert all(
+        "evidence_source" not in category for category in categories if category["category"] != "ANTI_BOT_DETECTION"
+    )
+
+
 def test_broad_blocked_and_forbidden_do_not_match_antibot() -> None:
     for reason in ["UI element blocked by overlay", "403 Forbidden from auth endpoint"]:
         result = classify_from_failure_reason(reason)
