@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import io
 import os
@@ -6,15 +8,12 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Generator
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
-import boto3
 import pytest
 import zstandard as zstd
 from freezegun import freeze_time
-from moto.server import ThreadedMotoServer
-from types_boto3_s3.client import S3Client
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
@@ -30,6 +29,9 @@ from tests.unit.forge.sdk.artifact.storage.test_helpers import (
     create_fake_thought,
     create_fake_workflow_run_block,
 )
+
+if TYPE_CHECKING:
+    from types_boto3_s3.client import S3Client
 
 # Test constants
 TEST_BUCKET = "test-skyvern-bucket"
@@ -52,8 +54,9 @@ class S3StorageForTests(S3Storage):
 
 
 @pytest.fixture
-def s3_storage(moto_server: str) -> S3Storage:
-    return S3StorageForTests(bucket=TEST_BUCKET, endpoint_url=moto_server)
+def s3_storage() -> S3Storage:
+    """Construct storage for pure tests without starting an S3 server."""
+    return S3StorageForTests(bucket=TEST_BUCKET, endpoint_url="http://127.0.0.1:1")
 
 
 @pytest.fixture(autouse=True)
@@ -61,54 +64,6 @@ def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mocked AWS Credentials for moto."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-
-
-@pytest.fixture(autouse=True)
-def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
-    """Stub out the DB-side artifact-row inserts for browser-session files.
-
-    ``S3Storage.sync_browser_session_file`` now awaits
-    ``app.ARTIFACT_MANAGER.create_browser_session_download_artifact`` (for
-    ``artifact_type="downloads"``) and
-    ``app.ARTIFACT_MANAGER.create_browser_session_recording_artifact`` (for
-    ``artifact_type="videos"``). These storage tests run against a moto S3
-    with no forge app initialized, so we monkey-patch the module-level
-    ``app`` reference in ``s3.py`` — patching ``app.ARTIFACT_MANAGER``
-    directly would trip the lazy-init guard on AppHolder.
-    """
-    from unittest.mock import MagicMock
-
-    import skyvern.forge.sdk.artifact.storage.s3 as s3_module
-
-    fake_app = MagicMock()
-    fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
-    fake_app.ARTIFACT_MANAGER.create_browser_session_recording_artifact = AsyncMock(return_value="a_test")
-    monkeypatch.setattr(s3_module, "app", fake_app)
-    yield
-
-
-@pytest.fixture(scope="module")
-def moto_server() -> Generator[str, None, None]:
-    # Note: pass `port=0` to get a random free port.
-    server = ThreadedMotoServer(port=0)
-    server.start()
-    host, port = server.get_host_and_port()
-    yield f"http://{host}:{port}"
-    server.stop()
-
-
-@pytest.fixture(scope="module", autouse=True)
-def boto3_test_client(moto_server: str) -> Generator[S3Client, None, None]:
-    client = boto3.client(
-        "s3",
-        aws_access_key_id="testing",
-        aws_secret_access_key="testing",
-        region_name=settings.AWS_REGION,
-        endpoint_url=moto_server,
-    )
-    client.create_bucket(Bucket=TEST_BUCKET)  # Ensure the bucket exists for the test
-    client.create_bucket(Bucket=settings.AWS_S3_BUCKET_UPLOADS)
-    yield client
 
 
 @freeze_time("2025-06-09T12:00:00")
@@ -209,6 +164,8 @@ def _assert_object_content(boto3_test_client: S3Client, uri: str, expected_conte
 class TestS3StorageStore:
     """Test S3Storage store methods."""
 
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
+
     def _create_artifact_for_ai_suggestion(
         self,
         s3_storage: S3Storage,
@@ -263,6 +220,8 @@ TEST_BROWSER_SESSION_ID = "bs_test_123"
 @pytest.mark.asyncio
 class TestS3StorageBrowserSessionFiles:
     """Test S3Storage browser session file methods."""
+
+    __test__ = False  # Moto cases are collected in test_s3_storage_moto.py.
 
     async def test_sync_browser_session_file_with_date(
         self, s3_storage: S3Storage, boto3_test_client: S3Client, tmp_path: Path
@@ -811,6 +770,8 @@ CONTENT_TYPE_TEST_CASES = [
 class TestS3StorageContentType:
     """Test S3Storage content type guessing."""
 
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
+
     @pytest.mark.parametrize("filename,expected_content_type,artifact_type,date", CONTENT_TYPE_TEST_CASES)
     async def test_content_type_guessing(
         self,
@@ -843,6 +804,8 @@ class TestS3StorageContentType:
 @pytest.mark.asyncio
 class TestS3StorageHARCompression:
     """Test S3Storage HAR file compression with zstd."""
+
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
 
     def _create_har_artifact(self, s3_storage: S3Storage, step_id: str) -> Artifact:
         """Helper method to create a HAR Artifact."""
@@ -945,6 +908,8 @@ _build_zip = ArtifactManager._build_zip
 @pytest.mark.asyncio
 class TestS3StorageZIPArchiveRetrieve:
     """Test retrieve_artifact with STEP_ARCHIVE / TASK_ARCHIVE bundle_key extraction."""
+
+    __test__ = False  # Moto cases are collected in test_s3_storage_moto.py.
 
     def _make_archive_artifact(
         self,
@@ -1151,6 +1116,8 @@ class TestS3StoragePerRunRecordingClips:
     ``S3Storage.sync_browser_session_file(videos)`` against moto S3 with a real
     ffmpeg-generated recording, asserting a run-scoped clip is cut and uploaded."""
 
+    __test__ = False  # Collected with moto fixtures in test_s3_storage_moto.py.
+
     async def test_session_close_cuts_and_uploads_run_scoped_clip(
         self,
         s3_storage: S3Storage,
@@ -1223,3 +1190,37 @@ class TestS3StoragePerRunRecordingClips:
         clip_key = S3Uri(clip_uri).key
         head = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=clip_key)
         assert head["ContentLength"] > 0
+
+
+@pytest.mark.asyncio
+class TestS3StorageBrowserSessionPure:
+    """URI authorization checks that do not perform S3 I/O."""
+
+    test_assert_managed_file_access_accepts_org_scoped_uploads = (
+        TestS3StorageBrowserSessionFiles.test_assert_managed_file_access_accepts_org_scoped_uploads
+    )
+    test_assert_managed_file_access_accepts_artifact_bucket = (
+        TestS3StorageBrowserSessionFiles.test_assert_managed_file_access_accepts_artifact_bucket
+    )
+    test_assert_managed_file_access_rejects_other_org = (
+        TestS3StorageBrowserSessionFiles.test_assert_managed_file_access_rejects_other_org
+    )
+    test_assert_managed_file_access_rejects_other_org_artifact_bucket = (
+        TestS3StorageBrowserSessionFiles.test_assert_managed_file_access_rejects_other_org_artifact_bucket
+    )
+    test_download_managed_file_rejects_other_org = (
+        TestS3StorageBrowserSessionFiles.test_download_managed_file_rejects_other_org
+    )
+    test_storage_type_property = TestS3StorageBrowserSessionFiles.test_storage_type_property
+
+
+@pytest.mark.asyncio
+class TestS3StorageZIPArchivePure:
+    """Archive URI checks that do not perform S3 I/O."""
+
+    test_build_uri_step_archive_has_zip_extension = (
+        TestS3StorageZIPArchiveRetrieve.test_build_uri_step_archive_has_zip_extension
+    )
+    test_build_uri_task_archive_has_zip_extension = (
+        TestS3StorageZIPArchiveRetrieve.test_build_uri_task_archive_has_zip_extension
+    )

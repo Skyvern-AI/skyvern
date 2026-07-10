@@ -10,6 +10,7 @@ import json
 import keyword
 import sys
 import textwrap
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,6 +44,23 @@ from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
 from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
+
+
+@pytest.fixture(autouse=True)
+def _stub_mypy_for_static_policy_cases(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if "real_mypy" in request.fixturenames:
+        return
+    fake_mypy = ModuleType("mypy")
+    fake_mypy.__dict__["api"] = SimpleNamespace(run=lambda _args: ("", "", 0))
+    monkeypatch.setitem(sys.modules, "mypy", fake_mypy)
+
+
+@pytest.fixture
+def real_mypy() -> None:
+    return None
 
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
@@ -2069,7 +2087,32 @@ class TestCredentialFillSynthesis:
         assert _code_block_safety_errors(workflow_yaml, None) == []
 
 
-def test_code_block_preflight_restores_recursion_limit() -> None:
+@pytest.mark.parametrize(
+    ("code", "expected_codes"),
+    [
+        pytest.param(
+            "await page.locator('button[type=submit]').first.click(timeout=5000)\n",
+            (),
+            id="valid-locator-click",
+        ),
+        pytest.param(
+            "await page.locator('button[type=submit]').first().click(timeout=5000)\n",
+            ("PLAYWRIGHT_API_MISMATCH",),
+            id="locator-property-called-as-method",
+        ),
+    ],
+)
+def test_code_block_preflight_real_mypy_contract_matrix(
+    real_mypy: None,
+    code: str,
+    expected_codes: tuple[str, ...],
+) -> None:
+    diagnostics = preflight_code_block(code)
+
+    assert [diagnostic.code for diagnostic in diagnostics] == list(expected_codes)
+
+
+def test_code_block_preflight_restores_recursion_limit(real_mypy: None) -> None:
     before = sys.getrecursionlimit()
     preflight_code_block("await page.locator('button[type=submit]').first.click(timeout=5000)\n")
 

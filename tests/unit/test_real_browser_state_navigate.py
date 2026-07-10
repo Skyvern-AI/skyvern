@@ -4,19 +4,25 @@ Covers SKY-8818: pages whose subresources never finish loading must still
 succeed if the DOM has parsed, via progressive wait_until degradation.
 """
 
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import FailedToNavigateToUrl
+from skyvern.webeye import real_browser_state
+from skyvern.webeye.navigation import navigate_with_retry
 from skyvern.webeye.real_browser_state import RealBrowserState, _same_page_ignoring_fragment
 
 
 @pytest.fixture
-def browser_state() -> RealBrowserState:
+def browser_state(monkeypatch: pytest.MonkeyPatch) -> RealBrowserState:
+    retry_sleep = AsyncMock()
+    monkeypatch.setattr(real_browser_state, "navigate_with_retry", partial(navigate_with_retry, sleep=retry_sleep))
     # Bypass __init__; navigate_to_url only uses `self` for LOG context and _wait_for_settle.
     state = RealBrowserState.__new__(RealBrowserState)
+    monkeypatch.setattr(state, "_wait_for_settle", AsyncMock())
     return state
 
 
