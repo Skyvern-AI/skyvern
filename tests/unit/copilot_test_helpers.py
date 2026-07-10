@@ -178,6 +178,7 @@ def make_completion_criterion(
     classification_output_key: str | None = None,
     expected_classification: str | bool | None = None,
     requested_output_corroborator: bool = False,
+    mint_degrade: str | None = None,
 ) -> CompletionCriterion:
     return CompletionCriterion(
         id=cid,
@@ -196,4 +197,5 @@ def make_completion_criterion(
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
         requested_output_corroborator=requested_output_corroborator,
+        mint_degrade=mint_degrade,  # type: ignore[arg-type]
     )
