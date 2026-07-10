@@ -30,7 +30,7 @@ import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { PaneHeaderDivider } from "../PaneHeaderDivider";
-import { runOutcomeFromStatus } from "../runProjections";
+import { runHasOutputs, runOutcomeFromStatus } from "../runProjections";
 import { studioPanelId } from "../constants";
 import { useStudioPaneCompact } from "../StudioShellContext";
 import { useStudioInspectedRun } from "../useStudioInspectedRun";
@@ -97,6 +97,7 @@ export function RunPaneViewToggles() {
     workflowRun.status === Status.Created ||
     workflowRun.status === Status.Queued;
   const showLive = outcome === "running" && !provisioning;
+  const showOutputsIndicator = runHasOutputs(workflowRun) && view !== "outputs";
 
   return (
     <>
@@ -125,7 +126,20 @@ export function RunPaneViewToggles() {
           onClick={() => setView("outputs")}
           compact={compact}
           label="Outputs"
-          icon={<FileTextIcon className="h-3 w-3" />}
+          ariaLabel={
+            showOutputsIndicator ? "Outputs, content available" : undefined
+          }
+          icon={
+            <span className="relative inline-flex">
+              <FileTextIcon className="h-3 w-3" />
+              {showOutputsIndicator ? (
+                <span
+                  aria-hidden
+                  className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-primary"
+                />
+              ) : null}
+            </span>
+          }
         />
         <ViewToggle
           active={view === "code"}
