@@ -11,10 +11,10 @@ import pytest
 
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.browser_ops import (
+    _OBSERVE_INTERACTABLES_JS,
     ExecuteStep,
     ObserveResult,
     _flatten_a11y_tree,
-    _is_password_field,
     do_execute,
     do_observe,
     ref_to_selector,
@@ -62,6 +62,35 @@ def _make_page(a11y_tree: dict[str, Any] | None = None) -> AsyncMock:
     return page
 
 
+def _make_values_page() -> AsyncMock:
+    """Page with a non-password input (DOM value present) and a password input (DOM value absent)."""
+    tree = _make_a11y_tree(
+        children=[
+            {"role": "textbox", "name": "Email", "value": "snapshot@example.com"},
+            {"role": "textbox", "name": "Current", "value": "snapshot-secret"},
+        ]
+    )
+    page = _make_page(tree)
+    page.evaluate = AsyncMock(
+        return_value=[
+            {
+                "role": "textbox",
+                "name": "Email",
+                "tag": "input",
+                "selector": "#email",
+                "value": "person@example.com",
+            },
+            {
+                "role": "textbox",
+                "name": "Current",
+                "tag": "input",
+                "selector": "#password",
+            },
+        ]
+    )
+    return page
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: _flatten_a11y_tree
 # ---------------------------------------------------------------------------
@@ -100,32 +129,6 @@ class TestFlattenA11yTree:
         flat = _flatten_a11y_tree(tree)
         assert len(flat) == 1
         assert flat[0]["name"] == "Click me"
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: _is_password_field
-# ---------------------------------------------------------------------------
-
-
-class TestIsPasswordField:
-    def test_password_name(self) -> None:
-        assert _is_password_field("textbox", "Password") is True
-
-    def test_passphrase_name(self) -> None:
-        assert _is_password_field("textbox", "Enter your passphrase") is True
-
-    def test_secret_name(self) -> None:
-        assert _is_password_field("textbox", "API Secret") is True
-
-    def test_token_name(self) -> None:
-        assert _is_password_field("textbox", "Auth Token") is True
-
-    def test_non_password(self) -> None:
-        assert _is_password_field("textbox", "Email") is False
-
-    def test_button_with_password_name(self) -> None:
-        # buttons named "password" still match the regex
-        assert _is_password_field("button", "Show Password") is True
 
 
 # ---------------------------------------------------------------------------
@@ -187,19 +190,33 @@ class TestDoObserve:
         assert refs == ["e0", "e1", "e2", "e3"]
 
     @pytest.mark.asyncio
-    async def test_password_redaction(self) -> None:
-        """DESIGN-2: Password field values must be redacted."""
+    async def test_default_omits_values(self) -> None:
         page = _make_page()
-        result = await do_observe(page)
-        password_elem = next(e for e in result.elements if e.name == "Password")
-        assert password_elem.value == "***"
+        observed = serialize_elements((await do_observe(page)).elements)
+
+        assert all("value" not in element for element in observed)
 
     @pytest.mark.asyncio
-    async def test_non_password_value_preserved(self) -> None:
-        page = _make_page()
-        result = await do_observe(page)
-        email_elem = next(e for e in result.elements if e.name == "Email")
-        assert email_elem.value == ""
+    async def test_include_values_keeps_non_password_dom_value_only(self) -> None:
+        page = _make_values_page()
+
+        observed = serialize_elements((await do_observe(page, include_values=True)).elements)
+
+        email = next(element for element in observed if element["name"] == "Email")
+        password = next(element for element in observed if element["name"] == "Current")
+        assert email["value"] == "person@example.com"
+        assert "value" not in password
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_include_values_fails_closed(self) -> None:
+        page = _make_values_page()
+
+        await do_observe(page, include_values="false")  # type: ignore[arg-type]
+
+        page.evaluate.assert_awaited_once_with(
+            _OBSERVE_INTERACTABLES_JS,
+            {"scopeSelector": None, "includeValues": False},
+        )
 
     @pytest.mark.asyncio
     async def test_max_elements_cap(self) -> None:
@@ -253,7 +270,9 @@ class TestDoObserve:
         )
         page = _make_page(tree)
         result = await do_observe(page)
-        assert result.elements[0].options == ["US", "UK", "CA"]
+        country = serialize_elements(result.elements)[0]
+        assert country["options"] == ["US", "UK", "CA"]
+        assert "value" not in country
 
     @pytest.mark.asyncio
     async def test_dom_interactables_are_merged_with_selectors(self) -> None:
@@ -322,7 +341,6 @@ class TestDoObserve:
                     "name": "East",
                     "tag": "option",
                     "selector": "#region > option:nth-of-type(2)",
-                    "value": "east",
                 }
             ]
         )
@@ -332,30 +350,8 @@ class TestDoObserve:
 
         east_option = next(element for element in serialized if element["name"] == "East")
         assert east_option["selector"] == "#region > option:nth-of-type(2)"
-        assert east_option["value"] == "east"
+        assert "value" not in east_option
         assert ref_to_selector(east_option) == "#region > option:nth-of-type(2)"
-
-    @pytest.mark.asyncio
-    async def test_dom_password_field_value_redacted_by_type_not_name(self) -> None:
-        # A password input whose accessible name is NOT password-like must still be redacted
-        # when the DOM scan flags it (is_password); its raw value must never surface.
-        page = _make_page(_make_a11y_tree(children=[]))
-        page.evaluate = AsyncMock(
-            return_value=[
-                {
-                    "role": "textbox",
-                    "name": "Current",
-                    "tag": "input",
-                    "value": "",
-                    "is_password": True,
-                    "selector": "#pw",
-                }
-            ]
-        )
-        result = await do_observe(page)
-        serialized = serialize_elements(result.elements)
-        pw = next(element for element in serialized if element["name"] == "Current")
-        assert pw["value"] == "***"
 
     @pytest.mark.asyncio
     async def test_duplicate_label_options_do_not_get_wrong_selector(self) -> None:
@@ -382,14 +378,12 @@ class TestDoObserve:
                     "name": "North",
                     "tag": "option",
                     "selector": "#r > option:nth-of-type(1)",
-                    "value": "n1",
                 },
                 {
                     "role": "option",
                     "name": "North",
                     "tag": "option",
                     "selector": "#r > option:nth-of-type(2)",
-                    "value": "n2",
                 },
             ]
         )
@@ -397,37 +391,6 @@ class TestDoObserve:
         serialized = serialize_elements(result.elements)
         a11y_norths = [e for e in serialized if e["name"] == "North" and not e.get("selector")]
         assert len(a11y_norths) == 2
-
-    @pytest.mark.asyncio
-    async def test_duplicate_name_password_redacts_all_a11y_values(self) -> None:
-        # A password field whose accessible name is shared with another textbox must have its
-        # a11y value redacted even when the DOM match is ambiguous (duplicate name).
-        tree = _make_a11y_tree(
-            children=[
-                {"role": "textbox", "name": "Current", "value": "s3cr3t"},
-                {"role": "textbox", "name": "Current", "value": ""},
-            ]
-        )
-        page = _make_page(tree)
-        page.evaluate = AsyncMock(
-            return_value=[
-                {
-                    "role": "textbox",
-                    "name": "Current",
-                    "tag": "input",
-                    "value": "",
-                    "is_password": True,
-                    "selector": "#pw",
-                },
-            ]
-        )
-        result = await do_observe(page, max_elements=100)
-        serialized = serialize_elements(result.elements)
-        currents = [element for element in serialized if element["name"] == "Current"]
-        assert currents, serialized
-        for element in currents:
-            assert element["value"] in ("***", "", None), element
-        assert all("s3cr3t" not in str(element.get("value") or "") for element in serialized)
 
     @pytest.mark.asyncio
     async def test_match_index_stable_when_cap_reorders(self) -> None:
@@ -450,34 +413,6 @@ class TestDoObserve:
         selectorless_dups = [e for e in result.elements if e.name == "Dup" and not e.selector]
         assert selectorless_dups, result.elements
         assert selectorless_dups[0].match_index == 0
-
-    @pytest.mark.asyncio
-    async def test_divergent_name_dom_password_fails_closed(self) -> None:
-        # If a DOM password field's accessible name diverges from the a11y name (so it cannot be
-        # mapped), fail closed: redact every a11y textbox value rather than leak the a11y value.
-        tree = _make_a11y_tree(
-            children=[
-                {"role": "textbox", "name": "Account", "value": "s3cr3t"},
-            ]
-        )
-        page = _make_page(tree)
-        page.evaluate = AsyncMock(
-            return_value=[
-                {
-                    "role": "textbox",
-                    "name": "DifferentName",
-                    "tag": "input",
-                    "value": "",
-                    "is_password": True,
-                    "selector": "#pw",
-                },
-            ]
-        )
-        result = await do_observe(page, max_elements=100)
-        serialized = serialize_elements(result.elements)
-        account = next(element for element in serialized if element["name"] == "Account")
-        assert account["value"] == "***"
-        assert all("s3cr3t" not in str(element.get("value") or "") for element in serialized)
 
     @pytest.mark.asyncio
     async def test_role_to_tag_mapping(self) -> None:
@@ -758,6 +693,85 @@ class TestSkyvernObserveMCP:
         assert result["data"]["element_count"] == 4
 
     @pytest.mark.asyncio
+    async def test_default_observe_omits_values_from_output_and_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_observe()
+
+        assert all("value" not in element for element in result["data"]["elements"])
+        assert all("value" not in element for element in state._observed_refs["refs"].values())
+
+    @pytest.mark.asyncio
+    async def test_observe_include_values_keeps_values_out_of_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_values_page()
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_observe(include_values=True)
+
+        email = next(element for element in result["data"]["elements"] if element["name"] == "Email")
+        assert email["value"] == "person@example.com"
+        assert all("value" not in element for element in state._observed_refs["refs"].values())
+
+    @pytest.mark.asyncio
+    async def test_observe_include_values_keeps_non_password_dom_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_values_page()
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        result = await mcp_browser.skyvern_observe(include_values=True)
+
+        email = next(element for element in result["data"]["elements"] if element["name"] == "Email")
+        password = next(element for element in result["data"]["elements"] if element["name"] == "Current")
+        assert email["value"] == "person@example.com"
+        assert "value" not in password
+
+    @pytest.mark.asyncio
+    async def test_observe_preserves_existing_positional_parameter_order(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        observe = AsyncMock(
+            return_value=ObserveResult(
+                url=page.url,
+                title="Login Page",
+                elements=[],
+                element_count=0,
+                total_on_page=0,
+            )
+        )
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr(mcp_browser, "do_observe", observe)
+
+        result = await mcp_browser.skyvern_observe(None, None, None, False, 7)
+
+        assert result["ok"] is True
+        observe.assert_awaited_once_with(
+            page,
+            selector=None,
+            interactive_only=False,
+            max_elements=7,
+            include_values=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_observe_no_browser(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.cli.mcp_tools._session import BrowserNotAvailableError
 
@@ -845,6 +859,27 @@ class TestSkyvernExecuteMCP:
         assert 'role=button[name="Sign In"]' in str(click_call)
 
     @pytest.mark.asyncio
+    async def test_execute_observe_threads_include_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        observe = AsyncMock(
+            return_value=ObserveResult(
+                url=page.url,
+                title="Login Page",
+                elements=[],
+                element_count=0,
+                total_on_page=0,
+            )
+        )
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr("skyvern.cli.core.browser_ops.do_observe", observe)
+
+        result = await mcp_browser.skyvern_execute(steps=[{"tool": "observe", "params": {"include_values": True}}])
+
+        assert result["ok"] is True
+        observe.assert_awaited_once_with(page, include_values=True)
+
+    @pytest.mark.asyncio
     async def test_execute_resolves_ref_from_prior_observe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
@@ -866,6 +901,25 @@ class TestSkyvernExecuteMCP:
         assert execute_result["ok"] is True
         assert execute_result["data"]["steps_completed"] == 1
         assert mcp_browser.skyvern_click.call_args.kwargs["selector"] == 'role=button[name="Sign In"]'
+
+    @pytest.mark.asyncio
+    async def test_execute_observe_include_values_keeps_values_out_of_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_values_page()
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_execute(steps=[{"tool": "observe", "params": {"include_values": True}}])
+
+        elements = result["data"]["results"][0]["data"]["elements"]
+        email = next(element for element in elements if element["name"] == "Email")
+        assert email["value"] == "person@example.com"
+        assert state._observed_refs["refs"]
+        assert all("value" not in element for element in state._observed_refs["refs"].values())
 
     @pytest.mark.asyncio
     async def test_execute_resolves_ref_from_prior_observe_without_session_id(
@@ -1355,7 +1409,6 @@ class TestSkyvernExecuteMCP:
                         "name": "East",
                         "tag": "option",
                         "selector": option_selector,
-                        "value": "east",
                     }
                 ]
             ),
