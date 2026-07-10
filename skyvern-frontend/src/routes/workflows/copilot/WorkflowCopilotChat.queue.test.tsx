@@ -100,7 +100,9 @@ vi.mock("react-router-dom", async (importOriginal) => {
 });
 
 vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => true,
+  // "copilot_ux_v1" stays off — this file's fixtures pin today's headline
+  // strings, not the disposition-first reorder behind that flag.
+  useFeatureFlagEnabled: (flag: string) => flag !== "copilot_ux_v1",
 }));
 
 const saveData = {

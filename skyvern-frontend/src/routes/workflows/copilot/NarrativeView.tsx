@@ -787,10 +787,18 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
 interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
+  uxV1?: boolean;
 }
 
-export function NarrativeView({ turn, onBlockSelect }: NarrativeViewProps) {
-  const summary = useMemo(() => computeTurnSummary(turn), [turn]);
+export function NarrativeView({
+  turn,
+  onBlockSelect,
+  uxV1,
+}: NarrativeViewProps) {
+  const summary = useMemo(
+    () => computeTurnSummary(turn, { uxV1 }),
+    [turn, uxV1],
+  );
   const isInFlight = turn.terminal === null;
   const isComplete = !isInFlight;
   const [userRolled, setUserRolled] = useState<boolean | null>(null);
