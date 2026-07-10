@@ -108,6 +108,10 @@ class OrganizationGoogleOAuthConfigDisabledError(RuntimeError):
     """Raised when org-level Google OAuth client config is disabled for this deployment."""
 
 
+class ClientConfigMismatchError(ValueError):
+    """Raised when a credential's stored OAuth client no longer matches the resolved client config."""
+
+
 class OrganizationClientConfigUnavailableError(RuntimeError):
     """Raised when a stored org OAuth client config exists (or cannot be ruled out) but cannot be loaded."""
 
@@ -118,6 +122,7 @@ class GoogleCredentialSecrets:
 
     refresh_token: str
     scopes: list[str] = field(default_factory=list)
+    client_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +233,18 @@ async def save_client_config(
         token=token_payload,
         encrypted_method=EncryptMethod.AES,
     )
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    flipped = await app.DATABASE.google_oauth.mark_active_mismatched_client_as_error(
+        organization_id=organization_id,
+        new_client_id=config.client_id,
+        now=now,
+    )
+    if flipped:
+        LOG.info(
+            "Marked Google OAuth credentials for reconnect after client config change",
+            organization_id=organization_id,
+            count=flipped,
+        )
     return GoogleOAuthClientConfigResolution(config=config, source="organization")
 
 
@@ -237,6 +254,19 @@ async def delete_client_config(organization_id: str) -> None:
         organization_id=organization_id,
         token_type=OrganizationAuthTokenType.google_oauth_client_config,
     )
+    env_config = _settings_client_config()
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    flipped = await app.DATABASE.google_oauth.mark_active_mismatched_client_as_error(
+        organization_id=organization_id,
+        new_client_id=env_config.client_id if env_config else None,
+        now=now,
+    )
+    if flipped:
+        LOG.info(
+            "Marked Google OAuth credentials for reconnect after client config change",
+            organization_id=organization_id,
+            count=flipped,
+        )
 
 
 def _require_client_credentials(client_config: GoogleOAuthClientConfig | None = None) -> tuple[str, str]:
@@ -460,6 +490,7 @@ async def start_authorization(
         consent_expires_at=now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS),
         consent_app_origin=app_origin,
         consent_code_verifier=code_verifier,
+        client_id=resolved_config.config.client_id,
     )
 
     authorize_url, _ = build_authorize_url(
@@ -506,10 +537,13 @@ async def exchange_code_for_tokens(
     redirect_uri: str,
     code_verifier: str | None,
     organization_id: str | None = None,
+    client_config: GoogleOAuthClientConfig | None = None,
 ) -> dict:
     """Exchange an OAuth authorization code for access and refresh tokens."""
-    resolved_config = await resolve_client_config(organization_id)
-    client_id, client_secret = _require_client_credentials(resolved_config.config)
+    if client_config is None:
+        resolved_config = await resolve_client_config(organization_id)
+        client_config = resolved_config.config
+    client_id, client_secret = _require_client_credentials(client_config)
 
     # ``code_verifier`` is passed to ``fetch_token`` (where the PKCE verification
     # actually happens); ``Flow.from_client_config`` ignores the kwarg.
@@ -540,10 +574,16 @@ async def exchange_code_for_tokens(
     }
 
 
-async def refresh_access_token(refresh_token: str, organization_id: str | None = None) -> dict:
+async def refresh_access_token(
+    refresh_token: str,
+    organization_id: str | None = None,
+    client_config: GoogleOAuthClientConfig | None = None,
+) -> dict:
     """Exchange a refresh token for a new access token via google-auth."""
-    resolved_config = await resolve_client_config(organization_id, strict=False)
-    client_id, client_secret = _require_client_credentials(resolved_config.config)
+    if client_config is None:
+        resolved_config = await resolve_client_config(organization_id, strict=False)
+        client_config = resolved_config.config
+    client_id, client_secret = _require_client_credentials(client_config)
 
     creds = Credentials(
         token=None,
@@ -574,7 +614,11 @@ async def load_credential_secrets(
     if payload is None:
         raise ValueError(f"No active Google OAuth credential found: {credential_id}")
     refresh_token = await encryptor.decrypt(payload.encrypted_refresh_token, payload.encrypted_method)
-    return GoogleCredentialSecrets(refresh_token=refresh_token, scopes=payload.scopes_granted)
+    return GoogleCredentialSecrets(
+        refresh_token=refresh_token,
+        scopes=payload.scopes_granted,
+        client_id=payload.client_id,
+    )
 
 
 async def access_token_from_secrets(
@@ -587,7 +631,18 @@ async def access_token_from_secrets(
     if organization_id is None:
         token_data = await refresh_access_token(credential_secrets.refresh_token)
     else:
-        token_data = await refresh_access_token(credential_secrets.refresh_token, organization_id=organization_id)
+        resolved_config = await resolve_client_config(organization_id, strict=False)
+        if credential_secrets.client_id is not None and (
+            resolved_config.config is None or resolved_config.config.client_id != credential_secrets.client_id
+        ):
+            raise ClientConfigMismatchError(
+                "Google OAuth client configuration changed since this credential was connected; reconnect the account"
+            )
+        token_data = await refresh_access_token(
+            credential_secrets.refresh_token,
+            organization_id=organization_id,
+            client_config=resolved_config.config,
+        )
     access_token = token_data.get("access_token")
     if not access_token:
         raise MissingAccessTokenError("Google token response did not include access_token")
@@ -600,6 +655,12 @@ async def credentials_from_secrets(
 ) -> Credentials:
     """Build a refreshed ``Credentials`` from already-decrypted secrets. Network-only; no DB."""
     resolved_config = await resolve_client_config(organization_id, strict=False)
+    if credential_secrets.client_id is not None and (
+        resolved_config.config is None or resolved_config.config.client_id != credential_secrets.client_id
+    ):
+        raise ClientConfigMismatchError(
+            "Google OAuth client configuration changed since this credential was connected; reconnect the account"
+        )
     client_id, client_secret = _require_client_credentials(resolved_config.config)
     creds = Credentials(
         token=None,
@@ -621,6 +682,10 @@ async def credentials_from_secrets(
 async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
     """List all active Google OAuth credentials for an organization (metadata only)."""
     return await app.DATABASE.google_oauth.list_active_for_org(organization_id=organization_id)
+
+
+async def get_visible_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
+    return await app.DATABASE.google_oauth.list_visible_for_org(organization_id=organization_id)
 
 
 # google-auth 2.x has no first-class async revoke helper; keep the 10-line httpx POST.
