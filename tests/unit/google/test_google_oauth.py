@@ -1,3 +1,4 @@
+import datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock
@@ -14,6 +15,8 @@ from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
+    CreateGoogleOAuthCallbackRequest,
+    GoogleOAuthCredentialBase,
     UpdateGoogleOAuthClientConfigRequest,
     UpdateGoogleOAuthCredentialRequest,
 )
@@ -562,10 +565,11 @@ async def test_save_client_config_requires_encryption(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", False, raising=False)
     organizations = SimpleNamespace(replace_org_auth_token=AsyncMock())
+    google_oauth = SimpleNamespace(mark_active_mismatched_client_as_error=AsyncMock())
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
-        SimpleNamespace(organizations=organizations),
+        SimpleNamespace(organizations=organizations, google_oauth=google_oauth),
         raising=False,
     )
 
@@ -575,6 +579,7 @@ async def test_save_client_config_requires_encryption(monkeypatch: pytest.Monkey
             google_oauth_service.GoogleOAuthClientConfig(client_id="cid", client_secret="secret"),
         )
     organizations.replace_org_auth_token.assert_not_awaited()
+    google_oauth.mark_active_mismatched_client_as_error.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -610,10 +615,14 @@ async def test_save_client_config_uses_aes(monkeypatch: pytest.MonkeyPatch) -> N
     )
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     replace_mock = AsyncMock()
+    mark_mock = AsyncMock(return_value=2)
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
-        SimpleNamespace(organizations=SimpleNamespace(replace_org_auth_token=replace_mock)),
+        SimpleNamespace(
+            organizations=SimpleNamespace(replace_org_auth_token=replace_mock),
+            google_oauth=SimpleNamespace(mark_active_mismatched_client_as_error=mark_mock),
+        ),
         raising=False,
     )
 
@@ -624,6 +633,42 @@ async def test_save_client_config_uses_aes(monkeypatch: pytest.MonkeyPatch) -> N
     assert resolved.config == config
     replace_mock.assert_awaited_once()
     assert replace_mock.await_args.kwargs["encrypted_method"] is EncryptMethod.AES
+    mark_mock.assert_awaited_once()
+    assert mark_mock.await_args.kwargs["organization_id"] == "org_1"
+    assert mark_mock.await_args.kwargs["new_client_id"] == "cid"
+    assert isinstance(mark_mock.await_args.kwargs["now"], datetime.datetime)
+
+
+@pytest.mark.asyncio
+async def test_save_client_config_does_not_mark_mismatched_when_save_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    replace_mock = AsyncMock(side_effect=RuntimeError("save failed"))
+    mark_mock = AsyncMock()
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            organizations=SimpleNamespace(replace_org_auth_token=replace_mock),
+            google_oauth=SimpleNamespace(mark_active_mismatched_client_as_error=mark_mock),
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        await google_oauth_service.save_client_config(
+            "org_1",
+            google_oauth_service.GoogleOAuthClientConfig(client_id="cid", client_secret="secret"),
+        )
+
+    replace_mock.assert_awaited_once()
+    mark_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -633,11 +678,17 @@ async def test_delete_client_config_invalidates_org_token_when_enabled(monkeypat
         "get_settings",
         lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
     )
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "env-client", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "env-secret", raising=False)
     invalidate_mock = AsyncMock()
+    mark_mock = AsyncMock(return_value=1)
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
-        SimpleNamespace(organizations=SimpleNamespace(invalidate_org_auth_tokens=invalidate_mock)),
+        SimpleNamespace(
+            organizations=SimpleNamespace(invalidate_org_auth_tokens=invalidate_mock),
+            google_oauth=SimpleNamespace(mark_active_mismatched_client_as_error=mark_mock),
+        ),
         raising=False,
     )
 
@@ -647,6 +698,44 @@ async def test_delete_client_config_invalidates_org_token_when_enabled(monkeypat
         organization_id="org_1",
         token_type=OrganizationAuthTokenType.google_oauth_client_config,
     )
+    mark_mock.assert_awaited_once()
+    assert mark_mock.await_args.kwargs["organization_id"] == "org_1"
+    assert mark_mock.await_args.kwargs["new_client_id"] == "env-client"
+    assert isinstance(mark_mock.await_args.kwargs["now"], datetime.datetime)
+
+
+@pytest.mark.asyncio
+async def test_delete_client_config_marks_mismatched_against_missing_env_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "", raising=False)
+    invalidate_mock = AsyncMock()
+    mark_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            organizations=SimpleNamespace(invalidate_org_auth_tokens=invalidate_mock),
+            google_oauth=SimpleNamespace(mark_active_mismatched_client_as_error=mark_mock),
+        ),
+        raising=False,
+    )
+
+    await google_oauth_service.delete_client_config("org_1")
+
+    invalidate_mock.assert_awaited_once_with(
+        organization_id="org_1",
+        token_type=OrganizationAuthTokenType.google_oauth_client_config,
+    )
+    mark_mock.assert_awaited_once()
+    assert mark_mock.await_args.kwargs["organization_id"] == "org_1"
+    assert mark_mock.await_args.kwargs["new_client_id"] is None
 
 
 @pytest.mark.asyncio
@@ -1013,6 +1102,7 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
     assert insert_kwargs["credential_name"] == "my-cred"
     assert insert_kwargs["consent_redirect_uri"] == "https://x/cb"
     assert insert_kwargs["consent_nonce"] == result.state
+    assert insert_kwargs["client_id"] == "cid"
     # The verifier must be in the same insert as everything else — no second
     # round-trip — so a crash mid-flow can't leave a verifier-less pending row.
     assert insert_kwargs["consent_code_verifier"]
@@ -1209,6 +1299,43 @@ async def test_exchange_code_for_tokens_falls_back_to_session_token_scope(monkey
 
 
 @pytest.mark.asyncio
+async def test_exchange_code_for_tokens_uses_provided_client_config_without_resolving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_service, "resolve_client_config", resolve_mock)
+    config = google_oauth_service.GoogleOAuthClientConfig(
+        client_id="provided-client",
+        client_secret="provided-secret",
+    )
+    creds = SimpleNamespace(
+        token="at",
+        refresh_token="rt",
+        scopes=None,
+        granted_scopes="https://a/scope",
+        expiry=None,
+    )
+    captured = _install_fake_flow(
+        monkeypatch,
+        credentials=creds,
+        session_token={"scope": "https://a/scope", "access_token": "at"},
+    )
+
+    result = await google_oauth_service.exchange_code_for_tokens(
+        code="abc",
+        redirect_uri="https://x/cb",
+        code_verifier="v",
+        organization_id="org_1",
+        client_config=config,
+    )
+
+    assert result["access_token"] == "at"
+    assert captured["client_config"]["web"]["client_id"] == "provided-client"
+    assert captured["client_config"]["web"]["client_secret"] == "provided-secret"
+    resolve_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_exchange_code_raises_without_client_creds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", None, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", None, raising=False)
@@ -1306,6 +1433,7 @@ async def test_load_credential_secrets_decrypts_repo_payload(monkeypatch: pytest
         encrypted_refresh_token="ENC::rt",
         encrypted_method=EncryptMethod.AES,
         scopes_granted=["https://a", "https://b"],
+        client_id="client-1",
     )
     fake_repo = SimpleNamespace(load_active_ciphertext=AsyncMock(return_value=payload))
     monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
@@ -1320,6 +1448,7 @@ async def test_load_credential_secrets_decrypts_repo_payload(monkeypatch: pytest
 
     assert secrets.refresh_token == "refresh-123"
     assert secrets.scopes == ["https://a", "https://b"]
+    assert secrets.client_id == "client-1"
     decrypt_mock.assert_awaited_once_with("ENC::rt", EncryptMethod.AES)
 
 
@@ -1352,6 +1481,51 @@ async def test_get_credentials_for_org_delegates_to_repo(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_get_visible_credentials_for_org_delegates_to_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    credentials = [SimpleNamespace(id="goac_active", state="active"), SimpleNamespace(id="goac_error", state="error")]
+    list_mock = AsyncMock(return_value=credentials)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=SimpleNamespace(list_visible_for_org=list_mock)),
+        raising=False,
+    )
+
+    result = await google_oauth_service.get_visible_credentials_for_org(organization_id="org_1")
+
+    assert result is credentials
+    list_mock.assert_awaited_once_with(organization_id="org_1")
+
+
+@pytest.mark.asyncio
+async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_error",
+        organization_id="org_1",
+        credential_name="Needs reconnect",
+        state="error",
+        created_at=now,
+        modified_at=now,
+    )
+    list_mock = AsyncMock(return_value=[credential])
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "get_visible_credentials_for_org", list_mock)
+
+    response = await google_oauth_routes.list_google_oauth_credentials(
+        current_org=SimpleNamespace(organization_id="org_1")
+    )
+
+    assert response.credentials == [credential]
+    assert response.credentials[0].state == "error"
+    list_mock.assert_awaited_once_with(organization_id="org_1")
+
+
+@pytest.mark.asyncio
 async def test_access_token_from_secrets_calls_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     refresh_mock = AsyncMock(return_value={"access_token": "at-456"})
     monkeypatch.setattr(google_oauth_service, "refresh_access_token", refresh_mock)
@@ -1365,6 +1539,62 @@ async def test_access_token_from_secrets_calls_refresh(monkeypatch: pytest.Monke
 
     assert token == "at-456"
     refresh_mock.assert_awaited_once_with("rt-1")
+
+
+@pytest.mark.asyncio
+async def test_access_token_from_secrets_raises_on_client_config_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    resolve_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+            config=google_oauth_service.GoogleOAuthClientConfig(client_id="new", client_secret="secret"),
+            source="organization",
+        )
+    )
+    refresh_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_service, "resolve_client_config", resolve_mock)
+    monkeypatch.setattr(google_oauth_service, "refresh_access_token", refresh_mock)
+
+    secrets = google_oauth_service.GoogleCredentialSecrets(refresh_token="rt-1", client_id="old")
+
+    with pytest.raises(google_oauth_service.ClientConfigMismatchError, match="configuration changed"):
+        await google_oauth_service.access_token_from_secrets(secrets, organization_id="org_1")
+
+    resolve_mock.assert_awaited_once_with("org_1", strict=False)
+    refresh_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_client_id", ["client-1", None])
+async def test_access_token_from_secrets_passes_resolved_config_to_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    stored_client_id: str | None,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    config = google_oauth_service.GoogleOAuthClientConfig(client_id="client-1", client_secret="secret")
+    resolve_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(config=config, source="organization")
+    )
+    refresh_mock = AsyncMock(return_value={"access_token": "at-456"})
+    monkeypatch.setattr(google_oauth_service, "resolve_client_config", resolve_mock)
+    monkeypatch.setattr(google_oauth_service, "refresh_access_token", refresh_mock)
+
+    secrets = google_oauth_service.GoogleCredentialSecrets(refresh_token="rt-1", client_id=stored_client_id)
+
+    token = await google_oauth_service.access_token_from_secrets(secrets, organization_id="org_1")
+
+    assert token == "at-456"
+    resolve_mock.assert_awaited_once_with("org_1", strict=False)
+    refresh_mock.assert_awaited_once_with("rt-1", organization_id="org_1", client_config=config)
 
 
 @pytest.mark.asyncio
@@ -1565,6 +1795,79 @@ async def test_credentials_from_secrets_wraps_google_auth_error(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_credentials_from_secrets_raises_on_client_config_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    resolve_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+            config=google_oauth_service.GoogleOAuthClientConfig(client_id="new", client_secret="secret"),
+            source="organization",
+        )
+    )
+    monkeypatch.setattr(google_oauth_service, "resolve_client_config", resolve_mock)
+
+    class _UnexpectedCreds:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("Credentials should not be constructed")
+
+    monkeypatch.setattr(google_oauth_service, "Credentials", _UnexpectedCreds)
+
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-1",
+        scopes=["https://a"],
+        client_id="old",
+    )
+    with pytest.raises(google_oauth_service.ClientConfigMismatchError, match="configuration changed"):
+        await google_oauth_service.credentials_from_secrets(secrets, organization_id="org_1")
+
+    resolve_mock.assert_awaited_once_with("org_1", strict=False)
+
+
+@pytest.mark.asyncio
+async def test_credentials_from_secrets_allows_matching_client_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    config = google_oauth_service.GoogleOAuthClientConfig(client_id="client-1", client_secret="secret")
+    resolve_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(config=config, source="organization")
+    )
+    monkeypatch.setattr(google_oauth_service, "resolve_client_config", resolve_mock)
+    captured: dict = {}
+
+    class _FakeCreds:
+        def __init__(self, **kwargs) -> None:
+            captured["init_kwargs"] = kwargs
+            self.token: str | None = None
+
+        def refresh(self, request) -> None:
+            self.token = "at-refreshed"
+
+    monkeypatch.setattr(google_oauth_service, "Credentials", _FakeCreds)
+
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-decoded",
+        scopes=["https://a"],
+        client_id="client-1",
+    )
+    creds = await google_oauth_service.credentials_from_secrets(secrets, organization_id="org_1")
+
+    assert creds.token == "at-refreshed"
+    assert captured["init_kwargs"]["client_id"] == "client-1"
+    assert captured["init_kwargs"]["client_secret"] == "secret"
+    resolve_mock.assert_awaited_once_with("org_1", strict=False)
+
+
+@pytest.mark.asyncio
 async def test_credentials_from_secrets_returns_refreshed_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "secret", raising=False)
@@ -1610,6 +1913,135 @@ def test_update_google_oauth_credential_request_rejects_empty() -> None:
 def test_update_google_oauth_credential_request_enforces_max_length() -> None:
     with pytest.raises(ValidationError):
         UpdateGoogleOAuthCredentialRequest(credential_name="x" * 129)
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_rejects_changed_client_before_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.db.repositories.google_oauth import PendingConsentContext
+
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    load_mock = AsyncMock(
+        return_value=PendingConsentContext(
+            credential_id="goac_1",
+            consent_redirect_uri="https://x/cb",
+            consent_code_verifier="verifier",
+            client_id="old-client",
+        )
+    )
+    resolve_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+            config=google_oauth_service.GoogleOAuthClientConfig(client_id="new-client", client_secret="secret"),
+            source="organization",
+        )
+    )
+    exchange_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "load_pending_consent_context", load_mock)
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "resolve_client_config", resolve_mock)
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "exchange_code_for_tokens", exchange_mock)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert (
+        exc_info.value.detail
+        == "Google OAuth client configuration changed since consent started; restart the connection"
+    )
+    load_mock.assert_awaited_once_with(organization_id="org_1", nonce="nonce")
+    resolve_mock.assert_awaited_once_with("org_1")
+    exchange_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context_client_id", "resolved_client_id"),
+    [
+        ("old-client", "old-client"),
+        (None, None),
+    ],
+)
+async def test_google_oauth_callback_allows_matching_or_legacy_client(
+    monkeypatch: pytest.MonkeyPatch,
+    context_client_id: str | None,
+    resolved_client_id: str | None,
+) -> None:
+    from skyvern.forge.sdk.db.repositories.google_oauth import PendingConsentContext
+
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    load_mock = AsyncMock(
+        return_value=PendingConsentContext(
+            credential_id="goac_1",
+            consent_redirect_uri="https://x/cb",
+            consent_code_verifier="verifier",
+            client_id=context_client_id,
+        )
+    )
+    resolved_config = (
+        google_oauth_service.GoogleOAuthClientConfig(client_id=resolved_client_id, client_secret="secret")
+        if resolved_client_id
+        else None
+    )
+    resolve_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+            config=resolved_config,
+            source="organization" if resolved_config else "missing",
+        )
+    )
+    exchange_mock = AsyncMock(
+        return_value={
+            "refresh_token": "refresh-token",
+            "scope": "https://www.googleapis.com/auth/spreadsheets",
+        }
+    )
+    credential = GoogleOAuthCredentialBase(
+        id="goac_1",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=[],
+        scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+        created_at=datetime.datetime.utcnow(),
+        modified_at=datetime.datetime.utcnow(),
+    )
+    promote_mock = AsyncMock(return_value=credential)
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "load_pending_consent_context", load_mock)
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "resolve_client_config", resolve_mock)
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "exchange_code_for_tokens", exchange_mock)
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "promote_pending_credential", promote_mock)
+
+    response = await google_oauth_routes.google_oauth_callback(
+        CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
+        current_org=SimpleNamespace(organization_id="org_1"),
+    )
+
+    assert response.credential.id == "goac_1"
+    exchange_mock.assert_awaited_once_with(
+        code="code",
+        redirect_uri="https://x/cb",
+        code_verifier="verifier",
+        organization_id="org_1",
+        client_config=resolved_config,
+    )
+    promote_mock.assert_awaited_once_with(
+        organization_id="org_1",
+        nonce="nonce",
+        refresh_token="refresh-token",
+        scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+    )
 
 
 @pytest.mark.asyncio
