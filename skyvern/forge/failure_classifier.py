@@ -68,6 +68,9 @@ def classify_from_failure_reason(
                 "category": "ANTI_BOT_DETECTION",
                 "confidence_float": 0.7,
                 "reasoning": "Keywords matched in failure reason",
+                # Provenance marker: a keyword match is not positive challenge
+                # evidence, so evidence-gated consumers must not assert on it.
+                "evidence_source": "keyword_only",
             }
         )
 

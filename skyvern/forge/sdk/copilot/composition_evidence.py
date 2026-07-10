@@ -16,6 +16,13 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_EVIDENCE_SOURCE_KEY,
+    CONSENT_OBSTRUCTION_KIND,
+    ChallengeEvidenceSource,
+    interactive_challenge_controls,
+    vision_challenge_carrier,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     NAV_TARGET_DOWNLOAD_KIND_KEY,
     classify_download_affordance,
@@ -127,20 +134,6 @@ def _challenge_kind(indicators: list[str]) -> str:
     return "unknown" if indicators else "none"
 
 
-# Tags that carry challenge-vendor markup without rendering a widget. A passive
-# script/meta tag ships on every page behind some CDNs, so it can trigger the
-# visual fallback but never assert human verification by itself.
-_PASSIVE_CHALLENGE_TAGS: frozenset[str] = frozenset({"script", "noscript", "style", "link", "meta"})
-
-
-def interactive_challenge_controls(challenge_controls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    return [
-        control
-        for control in challenge_controls or []
-        if isinstance(control, dict) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
-    ]
-
-
 def _challenge_state(
     indicators: list[str],
     *,
@@ -154,7 +147,7 @@ def _challenge_state(
     # asserting human verification requires a rendered challenge control or a
     # later vision confirmation.
     semantic_challenge = bool(interactive_challenge_controls(challenge_controls))
-    return {
+    state = {
         "detected": detected,
         "kind": _challenge_kind(indicators),
         "source": source if detected else "",
@@ -164,6 +157,9 @@ def _challenge_state(
         "gates_submit_controls": bool(semantic_challenge and gated_controls),
         "gated_submit_controls": gated_controls[:5] if detected else [],
     }
+    if semantic_challenge:
+        state[CHALLENGE_EVIDENCE_SOURCE_KEY] = ChallengeEvidenceSource.CHALLENGE_STATE.value
+    return state
 
 
 def _control_disabled(node: Any) -> bool:
@@ -260,11 +256,6 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
 
-# The vision classifier's typed non-challenge obstruction kind: a consent dialog
-# is dismissed, not solved, so it must never promote challenge state.
-CONSENT_OBSTRUCTION_KIND = "cookie_consent"
-
-
 def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
     if visual_summary.get("challenge_detected") is not True:
         return False
@@ -313,6 +304,8 @@ def merge_visual_composition_evidence(
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
         challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
+        if vision_challenge_carrier(visual_summary):
+            challenge_state.setdefault(CHALLENGE_EVIDENCE_SOURCE_KEY, ChallengeEvidenceSource.VISION.value)
         if challenge_confirmed:
             challenge_state["detected"] = True
             challenge_state["requires_human_verification"] = True
@@ -1546,6 +1539,10 @@ def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
             )
         ).lower()
         if not any(pattern in identity for pattern in _ANTI_BOT_PATTERNS):
+            continue
+        # A widget inside a hidden ancestor (solved/stale challenge markup) may
+        # trigger the visual fallback but must not read as a rendered control.
+        if _is_hidden_modal_candidate(node):
             continue
         selector = _selector_for(node)[:160]
         if selector in seen_selectors:

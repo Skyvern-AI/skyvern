@@ -12,6 +12,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -1040,7 +1041,7 @@ def recorded_outcome_from_run_blocks_result(
         )
     run_status = _safe_str(data.get("overall_status"))
     failure_type = _safe_str(data.get("failure_type"))
-    failure_categories = _failure_category_refs(data.get("failure_categories"))
+    failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
     runtime_failure_identity = _runtime_failure_identity(failed_block)
     if referenced_unbound_keys:
