@@ -4389,6 +4389,49 @@ def test_artifact_health_skips_when_all_categories_are_excluded() -> None:
     assert failure_classes == []
 
 
+def _syntax_error_result_with_anti_bot_category(evidence_source: str | None) -> dict:
+    category = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9}
+    if evidence_source is not None:
+        category["evidence_source"] = evidence_source
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed_code",
+            "overall_status": "failed",
+            "failure_categories": [category],
+            "blocks": [
+                {
+                    "label": "extract_results",
+                    "block_type": "EXTRACTION",
+                    "status": "failed",
+                    "failure_reason": "Page.evaluate: SyntaxError: Unexpected token ')'",
+                }
+            ],
+        },
+    }
+
+
+def test_artifact_health_not_suppressed_by_keyword_only_anti_bot_category() -> None:
+    result = _syntax_error_result_with_anti_bot_category("keyword_only")
+
+    reason, failed_labels, failure_classes = _artifact_health_blocker_from_result(result)
+
+    assert reason is not None
+    assert "SyntaxError" in reason
+    assert failed_labels == ["extract_results"]
+    assert failure_classes == ["SyntaxError"]
+
+
+def test_artifact_health_skips_when_anti_bot_category_is_carrier_backed() -> None:
+    result = _syntax_error_result_with_anti_bot_category("challenge_state")
+
+    reason, failed_labels, failure_classes = _artifact_health_blocker_from_result(result)
+
+    assert reason is None
+    assert failed_labels == []
+    assert failure_classes == []
+
+
 def test_unfinished_run_verification_candidate_admits_canceled_with_evidence() -> None:
     ctx = _run_ctx()
     assert _is_unfinished_run_verification_candidate(ctx, _canceled_budget_result()) is True
@@ -4649,7 +4692,9 @@ def test_terminal_challenge_contract_still_stops_when_outcome_fully_verified() -
         "data": {
             "workflow_run_id": "wr_blocked",
             "overall_status": "failed",
-            "failure_categories": [{"category": "ANTI_BOT_DETECTION", "confidence_float": 1.0}],
+            "failure_categories": [
+                {"category": "ANTI_BOT_DETECTION", "confidence_float": 1.0, "evidence_source": "challenge_state"}
+            ],
         },
     }
 
