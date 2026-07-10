@@ -51,7 +51,7 @@ async def _mint_access_token(organization_id: str, credential_id: str) -> str:
             },
         )
     try:
-        return await google_oauth_service.access_token_from_secrets(secrets)
+        return await google_oauth_service.access_token_from_secrets(secrets, organization_id=organization_id)
     except google_oauth_service.MissingAccessTokenError as exc:
         # Google rejected the refresh token (invalid_grant after revoke/expiry);
         # only a fresh consent round can recover, so route to the reconnect flow.
