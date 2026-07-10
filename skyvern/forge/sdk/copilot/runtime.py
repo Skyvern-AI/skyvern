@@ -372,6 +372,10 @@ class AgentContext:
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
+    # Ordered (method, receiver) browser mutations of the last successfully persisted draft's code
+    # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
+    persisted_draft_browser_calls: list[tuple[str, str]] | None = None
+    scouted_spine_checkpoint_fired: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)

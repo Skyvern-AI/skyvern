@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -306,6 +306,29 @@ async def _resolve_scout_role_name(
     return "", ""
 
 
+def _capped_with_eviction_accounting(
+    items: list[ScoutedInteraction],
+    *,
+    collection: Literal["scout_trajectory", "scouted_interactions"],
+) -> list[ScoutedInteraction]:
+    if len(items) <= _MAX_SCOUTED_INTERACTIONS:
+        return items
+    try:
+        for item in items[: len(items) - _MAX_SCOUTED_INTERACTIONS]:
+            event: dict[str, Any] = {
+                "collection": collection,
+                "tool_name": item.get("tool_name"),
+                "selector": item.get("selector"),
+                "source_url": item.get("source_url"),
+            }
+            if collection == "scout_trajectory":
+                event["trajectory_index"] = item.get("trajectory_index")
+            LOG.info("copilot_scout_interaction_evicted", **event)
+    except Exception:
+        pass
+    return items[-_MAX_SCOUTED_INTERACTIONS:]
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -329,6 +352,12 @@ def _record_scouted_interaction(
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
     if tool_name != "press_key" and not selector:
+        LOG.info(
+            "copilot_scout_capture_loss",
+            tool_name=tool_name,
+            reason="unresolvable_selector",
+            url=(source_url or "").strip() or None,
+        )
         return
     _reset_evaluate_tracker(ctx)
     artifact: ScoutedInteraction = {"tool_name": tool_name}
@@ -374,13 +403,13 @@ def _record_scouted_interaction(
         )
     ]
     interactions.append(artifact)
-    ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
 
     trajectory = list(ctx.scout_trajectory)
     trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
     trajectory_artifact["trajectory_index"] = len(trajectory)
     trajectory.append(trajectory_artifact)
-    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
 
     LOG.info(
         "copilot_scout_interaction_captured",
@@ -517,7 +546,7 @@ async def _maybe_rebind_prior_fill_carry(
     trajectory = list(ctx.scout_trajectory)
     for carry in rebound:
         trajectory.append(_fill_carry_to_interaction(carry, len(trajectory)))
-    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
     LOG.info(
         "copilot_fill_carry_rebound",
         url=url,

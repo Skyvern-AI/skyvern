@@ -36,7 +36,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedOutcomeBindingConstraint,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
-    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
@@ -54,6 +53,8 @@ from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _BARE_TAG_RE,
     _SYNTHESIZED_BLOCK_LABEL,
+    CREDENTIAL_FILL_TOOL_NAME,
+    SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _get_by_role_expr_strict,
@@ -61,7 +62,12 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _parse_role_name,
     artifact_dependency_id,
     artifact_observation_ref_id,
+    locator_selector_literals,
+    missing_rung_text,
+    normalized_locator_expr,
+    render_missing_rung_call_sources,
     synthesize_code_block,
+    uncovered_required_emitted_interactions,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
@@ -77,10 +83,9 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
-    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
-    MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS,
-    code_authoring_churn_stop_signal,
-    credential_priority_authoring_churn_stop_signal,
+    _CHURN_REASON_CODES,
+    _record_code_authoring_guardrail_reject,
+    _scouted_spine_open_obligation,
     synthesized_persistence_reopened_after_failed_run,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
@@ -121,7 +126,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     AuthorTimeGateAblationPayload,
     ScoutedInteraction,
     copilot_author_time_gate_log_only_enabled,
-    output_contract_ladder_unresolved,
     record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
@@ -134,7 +138,6 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
-    blocker_signal_is_genuinely_terminal,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
@@ -1218,43 +1221,6 @@ def _clear_code_authoring_repair_context(ctx: AgentContext) -> None:
 
 def _is_unresolved_symbol_repair_context(repair_context: CodeAuthoringRepairContext | None) -> bool:
     return repair_context is not None and repair_context.reason_code == SANDBOX_UNRESOLVED_NAME_REASON_CODE
-
-
-_CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_priority_authoring_churn"})
-
-
-def _record_code_authoring_guardrail_reject(
-    ctx: AgentContext, *, defer_churn_stop: bool = False, frontier_unchanged: bool = False
-) -> None:
-    # Callers record the current build-test outcome first so repeat detection compares that key to history.
-    repeated_outcome = latest_recorded_build_test_outcome_repeated(ctx)
-    # A frontier-unchanged reject is churn even when sibling edits move the whole-signature key each
-    # turn (which reads as a non-repeat); it must accumulate toward the churn stop, not reset.
-    if repeated_outcome is False and not frontier_unchanged:
-        ctx.code_authoring_guardrail_reject_count = 0
-    ctx.code_authoring_guardrail_reject_count += 1
-    ctx.last_code_authoring_reject_was_credential_priority = defer_churn_stop
-    LOG.info(
-        "copilot code-authoring guardrail reject recorded",
-        reject_count=ctx.code_authoring_guardrail_reject_count,
-        credential_priority=defer_churn_stop,
-    )
-    if defer_churn_stop:
-        if ctx.code_authoring_guardrail_reject_count < MAX_CREDENTIAL_PRIORITY_AUTHORING_REJECTS:
-            return
-        signal: CopilotToolBlockerSignal = credential_priority_authoring_churn_stop_signal(ctx)
-    elif ctx.code_authoring_guardrail_reject_count < MAX_CODE_AUTHORING_GUARDRAIL_REJECTS:
-        return
-    else:
-        signal = code_authoring_churn_stop_signal(ctx)
-    # A genuinely-terminal held blocker keeps both the rendered reply and the
-    # halt kind, so the churn stop defers to it rather than overriding.
-    if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
-        return
-    if output_contract_ladder_unresolved(ctx):
-        return
-    stash_blocker_signal(ctx, signal)
-    ctx.blocker_signal = signal
 
 
 def _record_author_time_reject_outcome(
@@ -5522,6 +5488,24 @@ def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> boo
     )
 
 
+def _log_imposition_skipped_after_update(ctx: AgentContext) -> None:
+    scout_trajectory = ctx.scout_trajectory
+    if not scout_trajectory:
+        return
+    target = ctx.reached_download_target
+    LOG.info(
+        "copilot_imposition_skipped_after_update",
+        trajectory_length=len(scout_trajectory),
+        reopen_download_target=(
+            isinstance(target, ReachedDownloadTarget)
+            and not target.already_registered
+            and bool(target.selector.strip())
+        ),
+        reopen_persistence_after_failed_run=synthesized_persistence_reopened_after_failed_run(ctx),
+        reopen_author_time_reject=_author_time_reject_reopens_synthesized_imposition(ctx),
+    )
+
+
 def _recorded_outcome_imposition_block_labels(ctx: AgentContext) -> frozenset[str]:
     constraint = ctx.recorded_outcome_binding_constraint
     if isinstance(constraint, RecordedOutcomeBindingConstraint):
@@ -5669,14 +5653,33 @@ _VALUE_BEARING_READ_METHODS = frozenset(
 )
 
 
-class _BrowserSurfaceValidation(NamedTuple):
-    violations: list[str]
-
-
 class _BrowserMutationSignature(NamedTuple):
     method: str
     receiver: str
     call_shape: str
+
+
+_BrowserSurfaceProvenanceKind = Literal["never_captured", "shape_diverged", "ambiguous", "suffix_disallowed"]
+_BrowserSurfaceDivergenceSource = Literal["synthesized", "trajectory_dropped"]
+_BrowserSurfaceProvenanceSite = Literal["whole_trajectory", "extraction_suffix"]
+
+_BROWSER_SURFACE_PROVENANCE_EVENT = "copilot_browser_surface_rejection_provenance"
+
+
+class _BrowserSurfaceRejectionProvenance(NamedTuple):
+    kind: _BrowserSurfaceProvenanceKind
+    action: str
+    site: _BrowserSurfaceProvenanceSite
+    block_label: str
+    nearest_method: str | None = None
+    nearest_receiver: str | None = None
+    nearest_selector: str | None = None
+    divergence_source: _BrowserSurfaceDivergenceSource | None = None
+
+
+class _BrowserSurfaceValidation(NamedTuple):
+    violations: list[str]
+    provenance: list[_BrowserSurfaceRejectionProvenance]
 
 
 class _BrowserBindings(NamedTuple):
@@ -5866,8 +5869,16 @@ def _browser_surface_for_code(code: str) -> tuple[list[_BrowserMutationSignature
     locator_aliases = _collect_locator_aliases(tree)
     method_aliases = _collect_browser_method_aliases(tree, page_aliases, locator_aliases)
     bindings = _BrowserBindings(page_aliases, locator_aliases, method_aliases)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    # ast.walk yields breadth-first; the coverage scan (uncovered_required_emitted_interactions)
+    # matches draft calls as an ordered subsequence, so enumerate Call nodes in source order or a
+    # nested-but-present rung is falsely reported uncovered.
+    call_nodes = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    for node in call_nodes:
+        if isinstance(node.func, ast.Name) and node.func.id in bindings.method_aliases:
+            ambiguous.append(_call_name(node))
             continue
         if isinstance(node.func, ast.Name) and node.func.id in bindings.method_aliases:
             ambiguous.append(_call_name(node))
@@ -5895,6 +5906,162 @@ def _browser_surface_for_code(code: str) -> tuple[list[_BrowserMutationSignature
     return direct_mutations, sorted(unscouted), sorted(set(ambiguous))
 
 
+_SCOUT_TOOL_EMITTED_METHODS = {
+    "click": "click",
+    "type_text": "fill",
+    "press_key": "press",
+    "select_option": "select_option",
+    CREDENTIAL_FILL_TOOL_NAME: "fill",
+}
+
+
+def _captured_selector_for_signature(
+    signature: _BrowserMutationSignature, diagnostics: SynthesisDiagnostics | None
+) -> str | None:
+    if diagnostics is None:
+        return None
+    # Signature receivers come from ast.unparse while emitted locators are synthesizer text, so both
+    # sides are normalized before comparison.
+    receiver = normalized_locator_expr(signature.receiver)
+    for record in diagnostics.emitted_interactions:
+        if (
+            str(record.get("method") or "") == signature.method
+            and normalized_locator_expr(str(record.get("locator") or "")) == receiver
+        ):
+            selector = str(record.get("selector") or "")
+            if selector:
+                return selector
+    return None
+
+
+def _classify_unscouted_mutation(
+    mutation: _BrowserMutationSignature,
+    *,
+    scouted_mutations: list[_BrowserMutationSignature],
+    diagnostics: SynthesisDiagnostics | None,
+    site: _BrowserSurfaceProvenanceSite,
+    block_label: str,
+) -> _BrowserSurfaceRejectionProvenance:
+    action = f"{mutation.receiver}.{mutation.method}"
+    exact = next(
+        (
+            signature
+            for signature in scouted_mutations
+            if signature.method == mutation.method and signature.receiver == mutation.receiver
+        ),
+        None,
+    )
+    if exact is not None:
+        return _BrowserSurfaceRejectionProvenance(
+            kind="shape_diverged",
+            action=action,
+            site=site,
+            block_label=block_label,
+            nearest_method=exact.method,
+            nearest_receiver=exact.receiver,
+            nearest_selector=_captured_selector_for_signature(exact, diagnostics),
+            divergence_source="synthesized",
+        )
+    receiver_literals = locator_selector_literals(mutation.receiver)
+    emitted_records = diagnostics.emitted_interactions if diagnostics is not None else []
+    for record in emitted_records:
+        selector = str(record.get("selector") or "")
+        if str(record.get("method") or "") == mutation.method and selector and selector in receiver_literals:
+            return _BrowserSurfaceRejectionProvenance(
+                kind="shape_diverged",
+                action=action,
+                site=site,
+                block_label=block_label,
+                nearest_method=mutation.method,
+                nearest_receiver=str(record.get("locator") or "") or None,
+                nearest_selector=selector,
+                divergence_source="synthesized",
+            )
+    dropped_records = diagnostics.dropped_interactions if diagnostics is not None else []
+    for record in dropped_records:
+        if _SCOUT_TOOL_EMITTED_METHODS.get(str(record.get("tool_name") or "")) != mutation.method:
+            continue
+        selector = str(record.get("selector") or "")
+        if selector and selector not in receiver_literals:
+            continue
+        return _BrowserSurfaceRejectionProvenance(
+            kind="shape_diverged",
+            action=action,
+            site=site,
+            block_label=block_label,
+            nearest_method=mutation.method,
+            nearest_selector=selector or None,
+            divergence_source="trajectory_dropped",
+        )
+    nearest = next((signature for signature in scouted_mutations if signature.method == mutation.method), None) or next(
+        (signature for signature in scouted_mutations if signature.receiver == mutation.receiver), None
+    )
+    return _BrowserSurfaceRejectionProvenance(
+        kind="never_captured",
+        action=action,
+        site=site,
+        block_label=block_label,
+        nearest_method=nearest.method if nearest is not None else None,
+        nearest_receiver=nearest.receiver if nearest is not None else None,
+        nearest_selector=_captured_selector_for_signature(nearest, diagnostics) if nearest is not None else None,
+    )
+
+
+def _ambiguous_browser_action_provenance(
+    action: str, *, site: _BrowserSurfaceProvenanceSite, block_label: str
+) -> _BrowserSurfaceRejectionProvenance:
+    return _BrowserSurfaceRejectionProvenance(kind="ambiguous", action=action, site=site, block_label=block_label)
+
+
+def _provenance_reject_clause(provenance: _BrowserSurfaceRejectionProvenance) -> str:
+    if provenance.kind == "never_captured":
+        clause = f"`{provenance.action}`: never_captured — the scout never captured this action; re-scout that step"
+        if provenance.nearest_receiver is not None and provenance.nearest_method is not None:
+            clause += f" (nearest scouted signature: `{provenance.nearest_receiver}.{provenance.nearest_method}`)"
+        return clause
+    if provenance.kind == "shape_diverged":
+        clause = f"`{provenance.action}`: shape_diverged ({provenance.divergence_source})"
+        if provenance.nearest_receiver is not None and provenance.nearest_method is not None:
+            clause += (
+                f" — reuse the exact synthesized call on `{provenance.nearest_receiver}.{provenance.nearest_method}`"
+            )
+        else:
+            clause += " — reuse the exact synthesized call for this captured step"
+        if provenance.nearest_selector is not None:
+            clause += f" (captured selector {provenance.nearest_selector!r})"
+        return clause
+    if provenance.kind == "suffix_disallowed":
+        return (
+            f"`{provenance.action}`: suffix_disallowed — the synthesized spine already performs this action; "
+            "remove the duplicate from the extraction suffix"
+        )
+    return (
+        f"`{provenance.action}`: ambiguous — rewrite it as a direct page/locator call "
+        "or reuse the exact synthesized call"
+    )
+
+
+def _log_browser_surface_rejection_provenance(provenance: list[_BrowserSurfaceRejectionProvenance]) -> None:
+    for record in provenance:
+        LOG.info(
+            _BROWSER_SURFACE_PROVENANCE_EVENT,
+            kind=record.kind,
+            action=record.action,
+            site=record.site,
+            block_label=record.block_label,
+            nearest_method=record.nearest_method,
+            nearest_receiver=record.nearest_receiver,
+            nearest_selector=record.nearest_selector,
+            divergence_source=record.divergence_source,
+        )
+
+
+def _provenance_suffix_text(provenance: list[_BrowserSurfaceRejectionProvenance]) -> str:
+    if not provenance:
+        return ""
+    return " Provenance: " + "; ".join(_provenance_reject_clause(record) for record in provenance) + "."
+
+
 def _whole_trajectory_browser_surface_violations(
     *,
     code_blocks: list[dict[str, Any]],
@@ -5902,8 +6069,10 @@ def _whole_trajectory_browser_surface_violations(
     submitted_selected_code: str,
     synthesized_code: str,
     prior_yaml: str | None = None,
+    synthesized_diagnostics: SynthesisDiagnostics | None = None,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
+    provenance: list[_BrowserSurfaceRejectionProvenance] = []
     scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
     scouted_signatures = set(scouted_mutations)
     for block in code_blocks:
@@ -5919,16 +6088,35 @@ def _whole_trajectory_browser_surface_violations(
             action_text = ", ".join(
                 f"{mutation.receiver}.{mutation.method}" for mutation in sorted(unscouted_mutations)
             )
+            block_provenance = [
+                _classify_unscouted_mutation(
+                    mutation,
+                    scouted_mutations=scouted_mutations,
+                    diagnostics=synthesized_diagnostics,
+                    site="whole_trajectory",
+                    block_label=label,
+                )
+                for mutation in sorted(unscouted_mutations)
+            ]
+            provenance.extend(block_provenance)
             violations.append(
-                f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): {action_text}."
+                f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): "
+                f"{action_text}.{_provenance_suffix_text(block_provenance)}"
             )
         if block_ambiguous:
+            ambiguous_provenance = [
+                _ambiguous_browser_action_provenance(action, site="whole_trajectory", block_label=label)
+                for action in block_ambiguous
+            ]
+            provenance.extend(ambiguous_provenance)
             violations.append(
                 f"Unable to impose synthesized code block: `{label}` contains ambiguous browser action(s): "
                 + ", ".join(block_ambiguous)
                 + "."
+                + _provenance_suffix_text(ambiguous_provenance)
             )
-    return _BrowserSurfaceValidation(violations)
+    _log_browser_surface_rejection_provenance(provenance)
+    return _BrowserSurfaceValidation(violations, provenance)
 
 
 def _separated_spine_already_imposed(
@@ -5948,7 +6136,16 @@ def _separated_spine_already_imposed(
             continue
         block_mutations, _, _ = _browser_surface_for_code(str(block.get("code") or ""))
         sibling_signatures.update(block_mutations)
-    return sibling_signatures == set(scouted_mutations)
+    already_imposed = sibling_signatures == set(scouted_mutations)
+    if already_imposed:
+        LOG.info(
+            "copilot_separated_spine_fast_path",
+            spine_coverage="set_equality",
+            synthesized_mutation_count=len(scouted_mutations),
+            sibling_signature_count=len(sibling_signatures),
+            duplicate_rungs_lost=len(scouted_mutations) != len(set(scouted_mutations)),
+        )
+    return already_imposed
 
 
 def _browser_surface_contains_full_action_spine(submitted_code: str, synthesized_code: str) -> bool:
@@ -5960,6 +6157,154 @@ def _browser_surface_contains_full_action_spine(submitted_code: str, synthesized
         return False
     submitted_iter = iter(submitted_mutations)
     return all(any(candidate == synthesized for candidate in submitted_iter) for synthesized in synthesized_mutations)
+
+
+_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = SCOUTED_SPINE_UNDER_BUILD_REASON_CODE
+
+
+def _synthesized_resubmission_credential_scout_requirements(
+    ctx: AgentContext, synthesized: SynthesizedCodeBlock, *, block_label: str
+) -> list[str]:
+    # Runs the credential-scout gate against the verbatim resubmission the under-build reject asks
+    # for, so the reject names every step of a route that is admissible end-to-end.
+    credential_parameters = [
+        parameter for parameter in synthesized.parameters if str(parameter.get("credential_id") or "").strip()
+    ]
+    if not credential_parameters:
+        return []
+    probe_yaml = yaml.safe_dump(
+        {
+            "workflow_definition": {
+                "parameters": [
+                    {
+                        "parameter_type": "credential",
+                        "key": str(parameter.get("key") or ""),
+                        "credential_id": str(parameter.get("credential_id") or ""),
+                    }
+                    for parameter in credential_parameters
+                ],
+                "blocks": [{"block_type": "code", "label": block_label, "code": synthesized.code}],
+            }
+        },
+        sort_keys=False,
+    )
+    return _credentialed_code_block_scout_gate_errors(probe_yaml, ctx)
+
+
+def _scouted_spine_under_build_result(
+    workflow_yaml: str,
+    *,
+    ctx: AgentContext,
+    synthesized: SynthesizedCodeBlock,
+    draft_codes: list[str],
+    block_label: str,
+    site: str = "imposition",
+) -> _SynthesizedCodeImpositionResult | None:
+    diagnostics = synthesized.diagnostics
+    # Lane-flagged emissions (optional dismissals, readonly verifies, entry recovery) are conditional
+    # or read-only replays, not load-bearing rungs.
+    required = [record for record in diagnostics.emitted_interactions if not str(record.get("lane") or "")]
+    if not required:
+        return None
+    draft_calls = [
+        (mutation.method, mutation.receiver) for code in draft_codes for mutation in _browser_surface_for_code(code)[0]
+    ]
+    uncovered = uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls)
+    if not uncovered:
+        return None
+    credential_scout_requirements = _synthesized_resubmission_credential_scout_requirements(
+        ctx, synthesized, block_label=block_label
+    )
+    missing_text = missing_rung_text(uncovered)
+    LOG.info(
+        "copilot_scouted_spine_under_build",
+        block_label=block_label,
+        site=site,
+        required_rung_count=len(required),
+        covered_rung_count=len(required) - len(uncovered),
+        missing_rungs=missing_text,
+        credential_scout_precondition_pending=bool(credential_scout_requirements),
+    )
+    first_uncovered = uncovered[0]
+    pass_route = render_missing_rung_call_sources(uncovered)
+    violation = (
+        f"Unable to impose synthesized code block: `{block_label}` under-builds the scouted spine "
+        f"({_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): the draft covers "
+        f"{len(required) - len(uncovered)} of {len(required)} scouted rung(s); missing: {missing_text}. "
+    )
+    if credential_scout_requirements:
+        violation += (
+            "Two steps are required, in order. Step 1 — satisfy the credential-scout precondition: "
+            + " ".join(credential_scout_requirements)
+            + " Step 2 — resubmit the code block, reusing the synthesized rung source verbatim so every "
+            "scouted rung is replayed."
+        )
+    else:
+        violation += (
+            "Author the remaining synthesized rungs — reuse the synthesized code block verbatim so every "
+            "scouted rung is replayed."
+        )
+    if pass_route:
+        violation += "\n" + pass_route
+    return _SynthesizedCodeImpositionResult(
+        workflow_yaml=workflow_yaml,
+        violations=[violation],
+        repair_context=CodeAuthoringRepairContext(
+            block_label=block_label,
+            reason_code=_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+            selector=str(first_uncovered.get("selector") or "") or None,
+        ),
+    )
+
+
+def _persist_seam_spine_under_build_result(
+    workflow_yaml: str, ctx: AgentContext
+) -> _SynthesizedCodeImpositionResult | None:
+    if not ctx.impose_synthesized_code_block:
+        return None
+    # First-persist drafts stay imposition's concern; this seam guards later persists in a turn that
+    # already committed one, and the turn-end checkpoint owns coverage for everything else.
+    if not ctx.update_workflow_called and ctx.persisted_draft_browser_calls is None:
+        return None
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    scout_trajectory = ctx.scout_trajectory
+    if not scout_trajectory:
+        return None
+    if not str(scout_trajectory[0].get("source_url") or "").strip():
+        return None
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return None
+    code_blocks = _workflow_code_blocks(parsed)
+    synthesized = synthesize_code_block(
+        scout_trajectory,
+        strict_selectors=True,
+        reached_download_target=ctx.reached_download_target,
+    )
+    if synthesized is None:
+        return None
+    # A submission with zero code blocks still holds the open spine obligation: empty draft calls
+    # leave every required rung uncovered rather than slipping the seam.
+    return _scouted_spine_under_build_result(
+        workflow_yaml,
+        ctx=ctx,
+        synthesized=synthesized,
+        draft_codes=[str(block.get("code") or "") for block in code_blocks],
+        block_label=", ".join(_code_block_label(block) for block in code_blocks) or _SYNTHESIZED_BLOCK_LABEL,
+        site="persist_seam",
+    )
+
+
+def _workflow_yaml_browser_call_pairs(workflow_yaml: str) -> list[tuple[str, str]]:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return []
+    return [
+        (mutation.method, mutation.receiver)
+        for block in _workflow_code_blocks(parsed)
+        for mutation in _browser_surface_for_code(str(block.get("code") or ""))[0]
+    ]
 
 
 _IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
@@ -7180,6 +7525,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if ctx.update_workflow_called and not _should_impose_after_update_attempt(ctx):
+        _log_imposition_skipped_after_update(ctx)
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
@@ -7259,23 +7605,57 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         submitted_selected_code=submitted_code,
         synthesized_code=synthesized.code,
         prior_yaml=prior_yaml,
+        synthesized_diagnostics=diagnostics,
     )
     violations.extend(surface_validation.violations)
+    ambiguous_reject_present = any(record.kind == "ambiguous" for record in surface_validation.provenance)
     extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
     if extraction_suffix:
         suffix_mutations, _, suffix_ambiguous = _browser_surface_for_code(extraction_suffix)
+        selected_label = _code_block_label(code_block)
         if suffix_mutations:
             action_text = ", ".join(f"{mutation.receiver}.{mutation.method}" for mutation in sorted(suffix_mutations))
+            synthesized_mutations, _, _ = _browser_surface_for_code(synthesized.code)
+            synthesized_signatures = set(synthesized_mutations)
+            suffix_provenance = [
+                _BrowserSurfaceRejectionProvenance(
+                    kind="suffix_disallowed",
+                    action=f"{mutation.receiver}.{mutation.method}",
+                    site="extraction_suffix",
+                    block_label=selected_label,
+                    nearest_method=mutation.method,
+                    nearest_receiver=mutation.receiver,
+                    nearest_selector=_captured_selector_for_signature(mutation, diagnostics),
+                )
+                if mutation in synthesized_signatures
+                else _classify_unscouted_mutation(
+                    mutation,
+                    scouted_mutations=synthesized_mutations,
+                    diagnostics=diagnostics,
+                    site="extraction_suffix",
+                    block_label=selected_label,
+                )
+                for mutation in sorted(suffix_mutations)
+            ]
+            _log_browser_surface_rejection_provenance(suffix_provenance)
             violations.append(
                 "Unable to impose synthesized code block: extraction suffix contains unscouted browser action(s): "
                 + action_text
                 + "."
+                + _provenance_suffix_text(suffix_provenance)
             )
         if suffix_ambiguous:
+            ambiguous_reject_present = True
+            suffix_ambiguous_provenance = [
+                _ambiguous_browser_action_provenance(action, site="extraction_suffix", block_label=selected_label)
+                for action in suffix_ambiguous
+            ]
+            _log_browser_surface_rejection_provenance(suffix_ambiguous_provenance)
             violations.append(
                 "Unable to impose synthesized code block: extraction suffix contains ambiguous browser action(s): "
                 + ", ".join(suffix_ambiguous)
                 + "."
+                + _provenance_suffix_text(suffix_ambiguous_provenance)
             )
 
     parameter_reconciliation = _reconcile_synthesized_parameters(
@@ -7290,6 +7670,12 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     if repair_context is None:
         repair_context = parameter_reconciliation.repair_context
     if violations:
+        persisted_calls = ctx.persisted_draft_browser_calls
+        if ambiguous_reject_present and ctx.update_workflow_called and persisted_calls is not None:
+            open_obligation = uncovered_required_emitted_interactions(diagnostics.emitted_interactions, persisted_calls)
+            artifact = render_missing_rung_call_sources(open_obligation)
+            if artifact:
+                violations.append(_missing_scouted_rung_violation_text(artifact))
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
             violations=violations,
@@ -7410,6 +7796,16 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
                 violations=split_violations,
                 repair_context=repair_context,
             )
+        split_under_build = _scouted_spine_under_build_result(
+            workflow_yaml,
+            ctx=ctx,
+            synthesized=synthesized,
+            draft_codes=[*durable_stage_codes, split_extraction_code],
+            block_label=str(code_block.get("label") or ""),
+            site="separated_split",
+        )
+        if split_under_build is not None:
+            return split_under_build
         substitutions["separated_browser_stage_count"] = len(durable_stage_codes)
     else:
         imposed_code = textwrap.dedent(submitted_code if preserve_submitted_extraction else synthesized.code).lstrip(
@@ -7420,6 +7816,15 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         elif append_selected_extraction:
             imposed_code = imposed_code.rstrip() + "\n" + textwrap.dedent(submitted_code).strip() + "\n"
         imposed_code = _apply_parameter_reconciliation_to_code(imposed_code, parameter_reconciliation)
+        under_build = _scouted_spine_under_build_result(
+            workflow_yaml,
+            ctx=ctx,
+            synthesized=synthesized,
+            draft_codes=[imposed_code],
+            block_label=str(code_block.get("label") or ""),
+        )
+        if under_build is not None:
+            return under_build
         code_block["code"] = imposed_code
     if parameter_reconciliation.aliases:
         substitutions["parameter_aliases"] = parameter_reconciliation.aliases
@@ -8441,6 +8846,30 @@ def _credentialed_code_block_scout_gate_errors(
     return errors
 
 
+def _missing_scouted_rung_violation_text(artifact: str) -> str:
+    return "The persisted draft is missing scouted rung(s). " + artifact
+
+
+def _open_scouted_spine_obligation_artifact(ctx: AgentContext) -> str:
+    try:
+        uncovered = _scouted_spine_open_obligation(ctx)
+    except Exception:
+        LOG.warning("copilot_scouted_spine_obligation_read_failed", exc_info=True)
+        return ""
+    artifact = render_missing_rung_call_sources(uncovered)
+    if not artifact:
+        return ""
+    return _missing_scouted_rung_violation_text(artifact)
+
+
+def _credential_scout_reject_error_text(ctx: AgentContext, credential_scout_errors: list[str]) -> str:
+    error_text = "\n".join(credential_scout_errors)
+    obligation_artifact = _open_scouted_spine_obligation_artifact(ctx)
+    if obligation_artifact:
+        error_text += "\n" + obligation_artifact
+    return error_text
+
+
 def _reject_schema_incompatibility(
     ctx: AgentContext,
     incompatibility: SchemaIncompatibility,
@@ -8529,6 +8958,19 @@ async def _update_workflow(
                 required_paths,
                 reject_family=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
             )
+        if (
+            imposition.repair_context is not None
+            and imposition.repair_context.reason_code == _SCOUTED_SPINE_UNDER_BUILD_REASON_CODE
+        ):
+            _set_code_authoring_repair_context(ctx, imposition.repair_context)
+            _record_code_authoring_guardrail_reject(ctx)
+            return reject(
+                error="\n".join(imposition.violations),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data=_code_repair_progress_data(imposition.repair_context),
+                repair_context=imposition.repair_context,
+                record_repair_context_outcome=False,
+            )
         return reject(
             error="\n".join(imposition.violations),
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -8536,6 +8978,18 @@ async def _update_workflow(
             repair_context=imposition.repair_context,
         )
     workflow_yaml = imposition.workflow_yaml
+    if imposition.substitutions is None:
+        seam_under_build = _persist_seam_spine_under_build_result(workflow_yaml, ctx)
+        if seam_under_build is not None:
+            _set_code_authoring_repair_context(ctx, seam_under_build.repair_context)
+            _record_code_authoring_guardrail_reject(ctx)
+            return reject(
+                error="\n".join(seam_under_build.violations),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data=_code_repair_progress_data(seam_under_build.repair_context),
+                repair_context=seam_under_build.repair_context,
+                record_repair_context_outcome=False,
+            )
     stripped_sandbox_imports: list[str] = []
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml, stripped_sandbox_imports = _strip_redundant_sandbox_imports_in_yaml(workflow_yaml)
@@ -8815,7 +9269,7 @@ async def _update_workflow(
         )
     if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
         return reject(
-            error="\n".join(credential_scout_errors),
+            error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
             user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
             data={
                 "failure_type": "missing_credential_or_init",
@@ -8855,7 +9309,7 @@ async def _update_workflow(
         )
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
         return reject(
-            error="\n".join(credential_scout_errors),
+            error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
             user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
             data={"failure_type": "missing_credential_or_init"},
         )
@@ -9174,6 +9628,7 @@ async def _update_workflow(
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
+        ctx.persisted_draft_browser_calls = _workflow_yaml_browser_call_pairs(workflow_yaml)
         ctx.code_authoring_guardrail_reject_count = 0
         ctx.last_code_authoring_reject_was_credential_priority = False
         _clear_code_authoring_repair_context(ctx)

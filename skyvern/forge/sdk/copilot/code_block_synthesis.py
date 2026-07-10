@@ -8,10 +8,12 @@ that runs on the raw ``page`` object the copilot code block executes against.
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import keyword
 import re
+import textwrap
 import tokenize
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -157,6 +159,10 @@ class SynthesisDiagnostics:
     emitted_interaction_count: int = 0
     truncated: bool = False
     dropped_interactions: list[dict[str, Any]] = field(default_factory=list)
+    # Emission ground truth recorded at each emission branch; with dropped/forgiven it partitions the
+    # retained trajectory indices. Diagnostics-only, never serialized.
+    emitted_interactions: list[dict[str, Any]] = field(default_factory=list)
+    forgiven_interactions: list[dict[str, Any]] = field(default_factory=list)
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
@@ -662,6 +668,21 @@ def synthesize_code_block(
             }
         )
 
+    def record_emission(
+        trajectory_index: int, tool_name: str, method: str, locator_expr: str, *, line_start: int, lane: str = ""
+    ) -> None:
+        record: dict[str, Any] = {
+            "trajectory_index": trajectory_index,
+            "tool_name": tool_name,
+            "method": method,
+            "selector": str(trajectory[trajectory_index].get("selector") or "").strip(),
+            "locator": locator_expr,
+            "call_source": textwrap.dedent("\n".join(lines[line_start - 1 :])),
+        }
+        if lane:
+            record["lane"] = lane
+        diagnostics.emitted_interactions.append(record)
+
     entry_url = ""
     entry_index = -1
     entry_replay_condition_active = False
@@ -717,7 +738,7 @@ def synthesize_code_block(
             notes.append("entry fallback can resume after authentication when login controls stay hidden")
         elif fallback_entry_index > entry_index:
             notes.append("entry replay starts at a later durable interaction")
-        entry_recovery_clicks: list[str] = []
+        entry_recovery_clicks: list[tuple[int, str]] = []
         if fallback_entry_index > entry_index:
             for recovery_index in range(entry_index, fallback_entry_index):
                 recovery_interaction = trajectory[recovery_index]
@@ -732,7 +753,7 @@ def synthesize_code_block(
                     strict_selectors=strict_selectors,
                 )
                 if recovery_locator:
-                    entry_recovery_clicks.append(recovery_locator)
+                    entry_recovery_clicks.append((recovery_index, recovery_locator))
             if entry_recovery_clicks:
                 notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
         line_start = len(lines) + 1
@@ -781,12 +802,21 @@ def synthesize_code_block(
                     recovery_indent = post_goto_indent + 2
                 else:
                     recovery_indent = post_goto_indent + 1
-                for recovery_locator in entry_recovery_clicks:
+                for recovery_index, recovery_locator in entry_recovery_clicks:
+                    recovery_line_start = len(lines) + 1
                     lines.append(f"{_INDENT * recovery_indent}{_ENTRY_OPENER_VAR} = {recovery_locator}")
                     lines.append(f"{_INDENT * recovery_indent}if await {_ENTRY_OPENER_VAR}.count() == 1:")
                     lines.append(f"{_INDENT * (recovery_indent + 1)}await {_ENTRY_OPENER_VAR}.click()")
                     lines.append(
                         f"{_INDENT * (recovery_indent + 1)}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})"
+                    )
+                    record_emission(
+                        recovery_index,
+                        "click",
+                        "click",
+                        recovery_locator,
+                        line_start=recovery_line_start,
+                        lane="entry_recovery",
                     )
                 lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
             else:
@@ -824,6 +854,18 @@ def synthesize_code_block(
             notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
             break
         if entry_replay_start_index and trajectory_index < entry_replay_start_index:
+            already_recorded = any(
+                record.get("trajectory_index") == trajectory_index
+                for record in (*diagnostics.emitted_interactions, *diagnostics.dropped_interactions)
+            )
+            if not already_recorded:
+                diagnostics.forgiven_interactions.append(
+                    {
+                        "trajectory_index": trajectory_index,
+                        "tool_name": str(interaction.get("tool_name") or ""),
+                        "lane": "entry_replay_prefix",
+                    }
+                )
             continue
         action_indent = action_indent_for(trajectory_index)
         tool_name = str(interaction.get("tool_name") or "")
@@ -850,6 +892,7 @@ def synthesize_code_block(
             line_start = len(lines) + 1
             if locator:
                 lines.append(f"{action_indent}await {locator}.press({_py_str(key)})")
+                record_emission(trajectory_index, tool_name, "press", locator, line_start=line_start)
             else:
                 if strict_selectors:
                     diagnostics.dropped_interactions.append(
@@ -861,6 +904,7 @@ def synthesize_code_block(
                     )
                     continue
                 lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
+                record_emission(trajectory_index, tool_name, "press", "page.keyboard", line_start=line_start)
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             append_step(f"Press {key}", "keypress", line_start)
             emitted += 1
@@ -890,9 +934,18 @@ def synthesize_code_block(
                 )
                 lines.append(f"{action_indent}{_INDENT}except Exception:")
                 lines.append(f"{action_indent}{_INDENT * 2}pass")
+                record_emission(
+                    trajectory_index,
+                    tool_name,
+                    "click",
+                    optional_locator,
+                    line_start=line_start,
+                    lane="optional_dismissal",
+                )
             else:
                 lines.append(f"{action_indent}await {locator}.click()")
                 lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+                record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
             typed_identity = _typed_value_identity(interaction)
@@ -933,11 +986,15 @@ def synthesize_code_block(
                     f"{_py_str(f'{verify_target}: read-only value ')} + repr({_READONLY_DEFERRED_VAR})"
                     f" + {_py_str(' does not match expected ')} + repr(str({param_key})))"
                 )
+                record_emission(
+                    trajectory_index, tool_name, "input_value", locator, line_start=line_start, lane="readonly_skip"
+                )
                 append_step(f"Verify {verify_target}", "input_text", line_start)
             elif readonly_or_disabled:
                 deferred_readonly_assertions.append((trajectory_index, locator, param_key, _step_target(interaction)))
             else:
                 lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
+                record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
                 append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
@@ -961,6 +1018,7 @@ def synthesize_code_block(
                 lines.append(f"{action_indent}await {locator}.fill(await {credential_param_key}.otp())")
             else:
                 lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
+            record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
         elif tool_name == "select_option":
             value = str(interaction.get("value") or "").strip()
             if not value:
@@ -971,6 +1029,7 @@ def synthesize_code_block(
                 continue
             lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+            record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
@@ -1017,7 +1076,16 @@ def synthesize_code_block(
         for deferred_index, deferred_locator, deferred_param_key, deferred_target in deferred_readonly_assertions:
             if entry_post_auth_resume_index and deferred_index < entry_post_auth_resume_index:
                 continue
+            deferred_line_start = len(lines) + 1
             emit_deferred_readonly_assertion(deferred_base, deferred_locator, deferred_param_key, deferred_target)
+            record_emission(
+                deferred_index,
+                "type_text",
+                "input_value",
+                deferred_locator,
+                line_start=deferred_line_start,
+                lane="readonly_skip",
+            )
 
         pre_resume_deferred = [
             entry
@@ -1026,9 +1094,18 @@ def synthesize_code_block(
         ]
         if pre_resume_deferred:
             lines.append(f"{deferred_base}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
-            for _, deferred_locator, deferred_param_key, deferred_target in pre_resume_deferred:
+            for deferred_index, deferred_locator, deferred_param_key, deferred_target in pre_resume_deferred:
+                deferred_line_start = len(lines) + 1
                 emit_deferred_readonly_assertion(
                     deferred_base + _INDENT, deferred_locator, deferred_param_key, deferred_target
+                )
+                record_emission(
+                    deferred_index,
+                    "type_text",
+                    "input_value",
+                    deferred_locator,
+                    line_start=deferred_line_start,
+                    lane="readonly_skip",
                 )
 
     if compile_download_target and reached_download_target is not None:
@@ -1067,6 +1144,95 @@ def synthesize_code_block(
     diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"
     return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics, steps=steps)
+
+
+SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = "scouted_spine_under_build"
+
+
+def normalized_locator_expr(text: str) -> str:
+    try:
+        return ast.unparse(ast.parse(text, mode="eval"))
+    except SyntaxError:
+        return text
+
+
+def locator_selector_literals(locator: str) -> set[str]:
+    try:
+        tree = ast.parse(locator, mode="eval")
+    except SyntaxError:
+        return set()
+    return {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+
+
+def _bare_locator_call_selector(receiver: str) -> str | None:
+    try:
+        node = ast.parse(receiver, mode="eval").body
+    except SyntaxError:
+        return None
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "locator"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value
+    return None
+
+
+def emitted_record_covered_by_call(record: Mapping[str, Any], method: str, receiver: str) -> bool:
+    if method != str(record.get("method") or ""):
+        return False
+    locator = str(record.get("locator") or "")
+    if locator and normalized_locator_expr(receiver) == normalized_locator_expr(locator):
+        return True
+    # Literal-membership matching would falsely cover a receiver that merely quotes the captured
+    # selector (a shared name= across different elements), so only a bare .locator(<selector>) counts.
+    selector = str(record.get("selector") or "")
+    return bool(selector) and selector == _bare_locator_call_selector(receiver)
+
+
+def uncovered_required_emitted_interactions(
+    emitted_interactions: Sequence[Mapping[str, Any]],
+    draft_calls: Sequence[tuple[str, str]],
+) -> list[Mapping[str, Any]]:
+    """Required (non-lane) emitted records the draft's ordered (method, receiver) calls do not
+    cover as an ordered subsequence, matched at method + selector/locator level."""
+    required = [record for record in emitted_interactions if not str(record.get("lane") or "")]
+    if not required:
+        return []
+    # Greedy ordered-subsequence scan: a miss consumes the remaining calls, so later rungs over-report (safe superset).
+    uncovered: list[Mapping[str, Any]] = []
+    next_call_index = 0
+    for record in required:
+        match_index = None
+        for call_index in range(next_call_index, len(draft_calls)):
+            method, receiver = draft_calls[call_index]
+            if emitted_record_covered_by_call(record, method, receiver):
+                match_index = call_index
+                break
+        if match_index is None:
+            uncovered.append(record)
+            next_call_index = len(draft_calls)
+        else:
+            next_call_index = match_index + 1
+    return uncovered
+
+
+def missing_rung_text(uncovered: Sequence[Mapping[str, Any]]) -> str:
+    return ", ".join(
+        f"`{str(record.get('method') or '')}` on {str(record.get('selector') or record.get('locator') or '')!r}"
+        for record in uncovered
+    )
+
+
+def render_missing_rung_call_sources(uncovered: Sequence[Mapping[str, Any]]) -> str:
+    sources = [source for record in uncovered if (source := str(record.get("call_source") or "").strip())]
+    if not sources:
+        return ""
+    return "Missing rung source to reuse verbatim:\n```python\n" + "\n".join(sources) + "\n```"
 
 
 # Model-owned slots the synthesizer cannot prove; the model fills these.

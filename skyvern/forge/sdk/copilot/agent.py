@@ -92,7 +92,9 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+    SCOUTED_SPINE_TURN_HALT_USER_REASON,
     artifact_health_blocked,
+    log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
     recycle_admits_present_completion_contract_ask,
     synthesized_persistence_reopened,
@@ -2051,11 +2053,15 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
     )
 
 
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+
+
 def _build_turn_halt_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
     halt: TurnHalt,
 ) -> AgentResult:
+    under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
     if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
         reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
         return _build_wip_exit_result(
@@ -2070,11 +2076,16 @@ def _build_turn_halt_exit_result(
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
         signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
-    user_response = (
-        signal.user_facing_reason
-        if isinstance(signal, CopilotToolBlockerSignal)
-        else "I could not continue this turn safely. Tell me what to change and I'll try again."
-    )
+    if under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS:
+        user_response = SCOUTED_SPINE_TURN_HALT_USER_REASON
+        # The blocker-override finalizer re-renders from the held signal, so the
+        # reframed reason must live there, not just in the local reply.
+        if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
+            ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
+    elif isinstance(signal, CopilotToolBlockerSignal):
+        user_response = signal.user_facing_reason
+    else:
+        user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
     return _build_exit_result(
         ctx,
         user_response,
