@@ -328,6 +328,30 @@ class TestSanitizeBody:
         result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
         assert result == _REDACTED
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/v1/google/oauth/config",
+            "/v1/google/oauth/config",
+        ],
+    )
+    def test_google_oauth_config_request_redacted(self, path: str) -> None:
+        request = _make_request("PUT", path)
+        result = _sanitize_body(request, b'{"client_id": "cid", "client_secret": "secret"}', "application/json")
+        assert result == _REDACTED
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/v1/google/oauth/callback",
+            "/v1/google/oauth/callback",
+        ],
+    )
+    def test_google_oauth_callback_request_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        result = _sanitize_body(request, b'{"code": "4/0Adeu...", "state": "nonce"}', "application/json")
+        assert result == _REDACTED
+
     def test_non_sensitive_endpoint_request_preserved(self) -> None:
         request = _make_request("GET", "/v1/tasks")
         result = _sanitize_body(request, b'{"user": "alice"}', "application/json")

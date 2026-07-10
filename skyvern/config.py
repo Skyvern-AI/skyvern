@@ -724,6 +724,9 @@ class Settings(BaseSettings):
     # Fails closed: an empty list rejects every app_origin, so self-hosted operators
     # who want to use the bounce-back flow must populate this with at least one entry.
     GOOGLE_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
+    # OSS/self-hosted instances can store the Google OAuth client config per org
+    # through Settings. Skyvern Cloud keeps the centrally managed OAuth client.
+    ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG: bool = True
 
     # Google Sheets API runtime tuning
     GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0

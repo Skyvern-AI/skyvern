@@ -378,6 +378,27 @@ export interface GoogleOAuthCredentialListResponse {
   credentials: GoogleOAuthCredential[];
 }
 
+export interface GoogleOAuthClientConfigSafe {
+  client_id: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+  client_secret_configured: boolean;
+  configured: boolean;
+  source: string;
+  encryption_enabled: boolean;
+}
+
+export interface GoogleOAuthClientConfigResponse {
+  config: GoogleOAuthClientConfigSafe;
+}
+
+export interface UpdateGoogleOAuthClientConfigRequest {
+  client_id: string;
+  client_secret?: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+}
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
