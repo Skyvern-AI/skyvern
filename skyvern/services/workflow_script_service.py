@@ -284,6 +284,20 @@ def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any], 
     return ""
 
 
+def detect_workflow_platform(
+    workflow: Workflow,
+    parameters: dict[str, Any],
+    *,
+    strict: bool = False,
+    domain_override: str | None = None,
+) -> str | None:
+    """Detect the Skyvern-supported platform for a workflow's first resolvable block URL."""
+    domain = domain_override or _extract_first_block_domain(workflow, parameters, strict=strict)
+    if not domain:
+        return None
+    return app.AGENT_FUNCTION.detect_ats_platform(domain)
+
+
 def resolve_cache_key_value(
     workflow: Workflow,
     parameters: dict[str, Any],
@@ -310,7 +324,12 @@ def resolve_cache_key_value(
                     "Unable to resolve default cache key: provide cache_context.parameters or domain_override"
                 )
             if domain:
-                ats_platform = app.AGENT_FUNCTION.detect_ats_platform(domain)
+                ats_platform = detect_workflow_platform(
+                    workflow,
+                    parameters,
+                    strict=strict,
+                    domain_override=domain,
+                )
                 if ats_platform:
                     LOG.info(
                         "Code 2.0: platform detected, using platform-level cache key",
