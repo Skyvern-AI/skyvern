@@ -47,6 +47,13 @@ LOG = structlog.get_logger()
 # from producing back-to-back emissions.
 MIN_NARRATION_GAP_SECONDS = 10.0
 
+# Floor on how often narrator_poll_tick re-fetches block statuses from the DB.
+# That fetch is a free read, not an LLM call, so it must not share the
+# narration floor above -- it only needs a small burst guard. Well below the
+# caller's RUN_BLOCKS_POLL_INTERVAL_SECONDS (5.0 in run_execution.py), so it
+# never actually binds at today's cadence -- it's a ceiling, not a throttle.
+MIN_BLOCK_STATUS_POLL_GAP_SECONDS = 1.0
+
 # Cap on how many tool round-trips we hand to the narrator LLM. The narrator
 # only needs recent context; keeping this small caps prompt cost.
 MAX_TOOL_ACTIVITY_BUFFER = 8
@@ -818,12 +825,12 @@ async def narrator_poll_tick(
     """
     now = time.monotonic()
     block_changed = current_block_ts != prior_block_ts
-    gate_open = (now - last_block_fetch_monotonic) >= MIN_NARRATION_GAP_SECONDS
+    fetch_gate_open = (now - last_block_fetch_monotonic) >= MIN_BLOCK_STATUS_POLL_GAP_SECONDS
 
     next_prior_block_ts = prior_block_ts
     next_last_fetch = last_block_fetch_monotonic
 
-    if block_changed and gate_open:
+    if block_changed and fetch_gate_open:
         next_last_fetch = now
         try:
             blocks = await fetch_block_statuses()
