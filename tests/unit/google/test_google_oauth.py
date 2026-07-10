@@ -5,11 +5,18 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
-from skyvern.forge.sdk.schemas.google_oauth import CreateGoogleOAuthAuthorizeRequest, UpdateGoogleOAuthCredentialRequest
+from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
+from skyvern.forge.sdk.schemas.google_oauth import (
+    CreateGoogleOAuthAuthorizeRequest,
+    UpdateGoogleOAuthClientConfigRequest,
+    UpdateGoogleOAuthCredentialRequest,
+)
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
 
 
@@ -279,6 +286,591 @@ def test_sheets_api_runtime_defaults_match_previous_hardcoded_values() -> None:
     assert fresh.GOOGLE_DRIVE_API_MAX_RETRIES == 3
 
 
+@pytest.mark.asyncio
+async def test_resolve_client_config_prefers_org_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    config = google_oauth_service.GoogleOAuthClientConfig(
+        client_id="org-client",
+        client_secret="org-secret",
+        redirect_hosts=["oss.example.com"],
+        app_origins=["https://oss.example.com"],
+    )
+    organizations = SimpleNamespace(
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token=config.model_dump_json()))
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    resolved = await google_oauth_service.resolve_client_config("org_1")
+
+    assert resolved.source == "organization"
+    assert resolved.config == config
+    organizations.get_valid_org_auth_token.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_ignores_org_token_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "env-client", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "env-secret", raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock())
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    resolved = await google_oauth_service.resolve_client_config("org_1")
+
+    assert resolved.source == "environment"
+    assert resolved.config is not None
+    assert resolved.config.client_id == "env-client"
+    organizations.get_valid_org_auth_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_returns_missing_without_org_token_or_env_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "", raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    resolved = await google_oauth_service.resolve_client_config("org_1")
+
+    assert resolved.source == "missing"
+    assert resolved.config is None
+    organizations.get_valid_org_auth_token.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_fails_closed_for_invalid_org_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "_settings_client_config",
+        lambda: pytest.fail("environment config must not be consulted"),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="not-json")))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(
+        google_oauth_service.OrganizationClientConfigUnavailableError,
+        match="Stored organization Google OAuth client config is invalid",
+    ):
+        await google_oauth_service.resolve_client_config("org_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [True, False])
+async def test_resolve_client_config_fails_closed_for_empty_org_token_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    strict: bool,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "_settings_client_config",
+        lambda: pytest.fail("environment config must not be consulted"),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="")))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(
+        google_oauth_service.OrganizationClientConfigUnavailableError,
+        match="Stored organization Google OAuth client config is invalid",
+    ):
+        await google_oauth_service.resolve_client_config("org_1", strict=strict)
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_fails_closed_when_org_token_load_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "_settings_client_config",
+        lambda: pytest.fail("environment config must not be consulted"),
+    )
+    organizations = SimpleNamespace(
+        get_valid_org_auth_token=AsyncMock(side_effect=RuntimeError("database unavailable"))
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(
+        google_oauth_service.OrganizationClientConfigUnavailableError,
+        match="Failed to load the organization Google OAuth client config",
+    ):
+        await google_oauth_service.resolve_client_config("org_1")
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_non_strict_falls_back_to_env_when_org_token_load_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "env-client", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "env-secret", raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    organizations = SimpleNamespace(
+        get_valid_org_auth_token=AsyncMock(side_effect=RuntimeError("database unavailable"))
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+    warning_calls: list[tuple[str, dict[str, object]]] = []
+
+    def warning(event: str, **kwargs: object) -> None:
+        warning_calls.append((event, kwargs))
+
+    monkeypatch.setattr(google_oauth_service, "LOG", SimpleNamespace(warning=warning))
+
+    resolved = await google_oauth_service.resolve_client_config("org_1", strict=False)
+
+    assert resolved.source == "environment"
+    assert resolved.config is not None
+    assert resolved.config.client_id == "env-client"
+    assert warning_calls == [
+        (
+            "Failed to load organization Google OAuth client config; falling back to environment for token refresh",
+            {"organization_id": "org_1"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_non_strict_fails_closed_for_invalid_org_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "_settings_client_config",
+        lambda: pytest.fail("environment config must not be consulted"),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="not-json")))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(
+        google_oauth_service.OrganizationClientConfigUnavailableError,
+        match="Stored organization Google OAuth client config is invalid",
+    ):
+        await google_oauth_service.resolve_client_config("org_1", strict=False)
+
+
+@pytest.mark.asyncio
+async def test_resolve_client_config_falls_back_to_env_without_org_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "env-client", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "env-secret", raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    resolved = await google_oauth_service.resolve_client_config("org_1")
+
+    assert resolved.source == "environment"
+    assert resolved.config is not None
+    assert resolved.config.client_id == "env-client"
+
+
+@pytest.mark.asyncio
+async def test_save_client_config_requires_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", False, raising=False)
+    organizations = SimpleNamespace(replace_org_auth_token=AsyncMock())
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(google_oauth_service.EncryptionNotConfiguredError):
+        await google_oauth_service.save_client_config(
+            "org_1",
+            google_oauth_service.GoogleOAuthClientConfig(client_id="cid", client_secret="secret"),
+        )
+    organizations.replace_org_auth_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_save_client_config_requires_org_config_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", False, raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    organizations = SimpleNamespace(replace_org_auth_token=AsyncMock())
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(google_oauth_service.OrganizationGoogleOAuthConfigDisabledError):
+        await google_oauth_service.save_client_config(
+            "org_1",
+            google_oauth_service.GoogleOAuthClientConfig(client_id="cid", client_secret="secret"),
+        )
+    organizations.replace_org_auth_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_save_client_config_uses_aes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    replace_mock = AsyncMock()
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=SimpleNamespace(replace_org_auth_token=replace_mock)),
+        raising=False,
+    )
+
+    config = google_oauth_service.GoogleOAuthClientConfig(client_id="cid", client_secret="secret")
+    resolved = await google_oauth_service.save_client_config("org_1", config)
+
+    assert resolved.source == "organization"
+    assert resolved.config == config
+    replace_mock.assert_awaited_once()
+    assert replace_mock.await_args.kwargs["encrypted_method"] is EncryptMethod.AES
+
+
+@pytest.mark.asyncio
+async def test_delete_client_config_invalidates_org_token_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    invalidate_mock = AsyncMock()
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=SimpleNamespace(invalidate_org_auth_tokens=invalidate_mock)),
+        raising=False,
+    )
+
+    await google_oauth_service.delete_client_config("org_1")
+
+    invalidate_mock.assert_awaited_once_with(
+        organization_id="org_1",
+        token_type=OrganizationAuthTokenType.google_oauth_client_config,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_client_config_requires_org_config_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    invalidate_mock = AsyncMock()
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=SimpleNamespace(invalidate_org_auth_tokens=invalidate_mock)),
+        raising=False,
+    )
+
+    with pytest.raises(google_oauth_service.OrganizationGoogleOAuthConfigDisabledError):
+        await google_oauth_service.delete_client_config("org_1")
+    invalidate_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_client_config_does_not_reuse_environment_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    env_config = google_oauth_service.GoogleOAuthClientConfig(
+        client_id="env-client",
+        client_secret="env-secret",
+        redirect_hosts=["env.example.com"],
+    )
+    save_mock = AsyncMock()
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+                config=env_config,
+                source="environment",
+            )
+        ),
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "save_client_config", save_mock)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.update_google_oauth_client_config(
+            UpdateGoogleOAuthClientConfigRequest(
+                client_id="org-client",
+                redirect_hosts=["org.example.com"],
+            ),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Google OAuth client secret is required"
+    save_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_client_config_does_not_reuse_organization_secret_when_client_id_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    org_config = google_oauth_service.GoogleOAuthClientConfig(
+        client_id="old-client",
+        client_secret="old-secret",
+        redirect_hosts=["org.example.com"],
+    )
+    save_mock = AsyncMock()
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+                config=org_config,
+                source="organization",
+            )
+        ),
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "save_client_config", save_mock)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.update_google_oauth_client_config(
+            UpdateGoogleOAuthClientConfigRequest(
+                client_id="new-client",
+                redirect_hosts=["org.example.com"],
+            ),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Google OAuth client secret is required"
+    save_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_client_config_allows_repair_when_stored_config_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    unavailable_error = google_oauth_service.OrganizationClientConfigUnavailableError(
+        "Stored organization Google OAuth client config is invalid"
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(side_effect=unavailable_error),
+    )
+    saved_config = google_oauth_service.GoogleOAuthClientConfig(
+        client_id="replacement-client",
+        client_secret="replacement-secret",
+        redirect_hosts=["org.example.com"],
+    )
+    save_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+            config=saved_config,
+            source="organization",
+        )
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "save_client_config", save_mock)
+
+    response = await google_oauth_routes.update_google_oauth_client_config(
+        UpdateGoogleOAuthClientConfigRequest(
+            client_id="replacement-client",
+            client_secret="replacement-secret",
+            redirect_hosts=["org.example.com"],
+        ),
+        current_org=SimpleNamespace(organization_id="org_1"),
+    )
+
+    assert response.config.source == "organization"
+    save_mock.assert_awaited_once_with("org_1", saved_config)
+
+
+@pytest.mark.asyncio
+async def test_update_client_config_requires_secret_when_stored_config_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    unavailable_error = google_oauth_service.OrganizationClientConfigUnavailableError(
+        "Stored organization Google OAuth client config is invalid"
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(side_effect=unavailable_error),
+    )
+    save_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "save_client_config", save_mock)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.update_google_oauth_client_config(
+            UpdateGoogleOAuthClientConfigRequest(
+                client_id="replacement-client",
+                redirect_hosts=["org.example.com"],
+            ),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Google OAuth client secret is required"
+    save_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_client_config_returns_503_when_org_config_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    unavailable_error = google_oauth_service.OrganizationClientConfigUnavailableError(
+        "Failed to load the organization Google OAuth client config"
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(side_effect=unavailable_error),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.get_google_oauth_client_config(current_org=SimpleNamespace(organization_id="org_1"))
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Failed to load the organization Google OAuth client config"
+
+
+@pytest.mark.asyncio
+async def test_config_route_handlers_return_404_when_org_config_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    current_org = SimpleNamespace(organization_id="org_1")
+
+    with pytest.raises(HTTPException) as get_exc_info:
+        await google_oauth_routes.get_google_oauth_client_config(current_org=current_org)
+    assert get_exc_info.value.status_code == 404
+
+    with pytest.raises(HTTPException) as delete_exc_info:
+        await google_oauth_routes.delete_google_oauth_client_config(current_org=current_org)
+    assert delete_exc_info.value.status_code == 404
+
+
 def test_build_authorize_url_includes_required_params(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
@@ -390,11 +982,22 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
     monkeypatch.setattr(google_oauth_service, "generate_google_oauth_credential_id", lambda: "goac_test")
 
     insert_mock = AsyncMock(return_value=SimpleNamespace(id="goac_test", organization_id="org_1"))
     fake_repo = SimpleNamespace(insert_pending_credential=insert_mock)
-    monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=fake_repo, organizations=organizations),
+        raising=False,
+    )
 
     result = await google_oauth_service.start_authorization(
         organization_id="org_1",
@@ -762,6 +1365,52 @@ async def test_access_token_from_secrets_calls_refresh(monkeypatch: pytest.Monke
 
     assert token == "at-456"
     refresh_mock.assert_awaited_once_with("rt-1")
+
+
+@pytest.mark.asyncio
+async def test_access_token_from_secrets_falls_back_to_env_when_org_config_load_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "env-client", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "env-secret", raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    organizations = SimpleNamespace(
+        get_valid_org_auth_token=AsyncMock(side_effect=RuntimeError("database unavailable"))
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(organizations=organizations),
+        raising=False,
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeCreds:
+        def __init__(self, **kwargs: object) -> None:
+            captured["init_kwargs"] = kwargs
+            self.token: str | None = None
+            self.expiry = None
+
+        def refresh(self, request: object) -> None:
+            captured["refresh_request"] = request
+            self.token = "at-refreshed"
+
+    monkeypatch.setattr(google_oauth_service, "Credentials", _FakeCreds)
+    secrets = google_oauth_service.GoogleCredentialSecrets(refresh_token="rt-1", scopes=["https://a"])
+
+    token = await google_oauth_service.access_token_from_secrets(secrets, organization_id="org_1")
+
+    assert token == "at-refreshed"
+    init_kwargs = captured["init_kwargs"]
+    assert isinstance(init_kwargs, dict)
+    assert init_kwargs["client_id"] == "env-client"
+    assert init_kwargs["client_secret"] == "env-secret"
+    assert "refresh_request" in captured
+    organizations.get_valid_org_auth_token.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1162,11 +1811,22 @@ async def test_start_authorization_persists_app_origin(monkeypatch: pytest.Monke
         google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app-staging.skyvern.com"], raising=False
     )
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_APP_ORIGINS", ["*.vercel.app"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
     monkeypatch.setattr(google_oauth_service, "generate_google_oauth_credential_id", lambda: "goac_test2")
 
     insert_mock = AsyncMock(return_value=SimpleNamespace(id="goac_test2", organization_id="org_1"))
     fake_repo = SimpleNamespace(insert_pending_credential=insert_mock)
-    monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=fake_repo, organizations=organizations),
+        raising=False,
+    )
 
     result = await google_oauth_service.start_authorization(
         organization_id="org_1",
@@ -1192,10 +1852,21 @@ async def test_start_authorization_rejects_bad_app_origin(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         google_oauth_service.settings, "GOOGLE_OAUTH_APP_ORIGINS", ["https://app.skyvern.com"], raising=False
     )
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
 
     insert_mock = AsyncMock()
     fake_repo = SimpleNamespace(insert_pending_credential=insert_mock)
-    monkeypatch.setattr(google_oauth_service.app, "DATABASE", SimpleNamespace(google_oauth=fake_repo), raising=False)
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=fake_repo, organizations=organizations),
+        raising=False,
+    )
 
     with pytest.raises(google_oauth_service.InvalidAppOriginError):
         await google_oauth_service.start_authorization(
