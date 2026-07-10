@@ -218,14 +218,7 @@ async def skyvern_browser_session_create(
                 )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
 
-            app_url: str | None = None
-            if not result.local and result.session_id:
-                try:
-                    fetched = await skyvern.get_browser_session(result.session_id)
-                    app_url = fetched.app_url
-                except Exception:
-                    pass
-                timer.mark("app_url")
+            app_url = browser.app_url
 
         except ValueError as e:
             return make_result(

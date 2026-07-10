@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -1065,16 +1064,15 @@ async def test_session_create_stateless_mode_rejects_local() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_create_stateful_mode_fetches_app_url(
+async def test_session_create_stateful_mode_uses_sdk_app_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_browser = MagicMock()
     fake_browser.browser_session_id = "pbs_stateful"
+    fake_browser.app_url = "https://app.example.test/sessions/pbs_stateful"
     fake_skyvern = MagicMock()
     fake_skyvern.launch_cloud_browser = AsyncMock(return_value=fake_browser)
-    fake_skyvern.get_browser_session = AsyncMock(
-        return_value=SimpleNamespace(app_url="https://app.example.test/sessions/pbs_stateful")
-    )
+    fake_skyvern.get_browser_session = AsyncMock()
     monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
     result = await mcp_session.skyvern_browser_session_create(timeout=50)
@@ -1082,43 +1080,19 @@ async def test_session_create_stateful_mode_fetches_app_url(
     assert result["ok"] is True
     assert list(result["data"])[0] == "app_url"
     assert result["data"]["app_url"] == "https://app.example.test/sessions/pbs_stateful"
-    fake_skyvern.get_browser_session.assert_awaited_once_with("pbs_stateful")
+    fake_skyvern.get_browser_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_session_create_stateful_mode_app_url_fetch_counts_toward_timing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The app_url follow-up must run inside the Timer context, not after it exits."""
-    fake_browser = MagicMock()
-    fake_browser.browser_session_id = "pbs_timed"
-    fake_skyvern = MagicMock()
-    fake_skyvern.launch_cloud_browser = AsyncMock(return_value=fake_browser)
-
-    async def _slow_get_browser_session(_session_id: str) -> SimpleNamespace:
-        await asyncio.sleep(0.03)
-        return SimpleNamespace(app_url="https://app.example.test/sessions/pbs_timed")
-
-    fake_skyvern.get_browser_session = _slow_get_browser_session
-    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
-
-    result = await mcp_session.skyvern_browser_session_create(timeout=50)
-
-    timing_ms = result["timing_ms"]
-    assert "app_url" in timing_ms
-    assert timing_ms["app_url"] >= 25
-    assert timing_ms["total"] >= timing_ms["app_url"]
-
-
-@pytest.mark.asyncio
-async def test_session_create_stateful_mode_succeeds_when_app_url_fetch_fails(
+async def test_session_create_stateful_mode_omits_missing_sdk_app_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_browser = MagicMock()
     fake_browser.browser_session_id = "pbs_stateful"
+    fake_browser.app_url = None
     fake_skyvern = MagicMock()
     fake_skyvern.launch_cloud_browser = AsyncMock(return_value=fake_browser)
-    fake_skyvern.get_browser_session = AsyncMock(side_effect=ConnectionError("session lookup failed"))
+    fake_skyvern.get_browser_session = AsyncMock()
     monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
     result = await mcp_session.skyvern_browser_session_create(timeout=50)
@@ -1126,7 +1100,7 @@ async def test_session_create_stateful_mode_succeeds_when_app_url_fetch_fails(
     assert result["ok"] is True
     assert result["data"] == {"session_id": "pbs_stateful", "timeout_minutes": 50}
     assert "app_url" not in result["data"]
-    fake_skyvern.get_browser_session.assert_awaited_once_with("pbs_stateful")
+    fake_skyvern.get_browser_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
