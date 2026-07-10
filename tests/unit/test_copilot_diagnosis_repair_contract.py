@@ -1867,7 +1867,7 @@ def test_unresolved_symbol_context_does_not_preempt_terminal_challenge_stop() ->
                 "workflow_run_id": "wr_blocked",
                 "overall_status": "completed",
                 "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
                 "blocks": [
                     {
                         "label": "extract",
@@ -1967,7 +1967,7 @@ def test_terminal_challenge_preempts_clean_run_ok_contract_stops(
                 "workflow_run_id": run_id,
                 "overall_status": "completed",
                 "failure_reason": failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
                 "blocks": [
                     {
                         "label": "extract",
@@ -2003,7 +2003,7 @@ def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_v
                 "workflow_run_id": "wr_blocked_failed",
                 "overall_status": "failed",
                 "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
                 "blocks": [{"label": "submit", "block_type": "NAVIGATION", "status": "failed"}],
             },
         },
@@ -2016,6 +2016,33 @@ def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_v
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.completion_contract_satisfied is False
     assert contract.verification_result.remaining_blocker is not None
+
+
+def test_keyword_only_challenge_category_never_reaches_contract() -> None:
+    ctx = _ctx()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Run failed.",
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "overall_status": "failed",
+                "failure_reason": "Timeout waiting for search results",
+                "failure_categories": [
+                    {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.7, "evidence_source": "keyword_only"},
+                ],
+                "blocks": [{"label": "search", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert "ANTI_BOT_DETECTION" not in contract.diagnosis_input.failure_categories
+    assert contract.repair_decision.next_action != RepairNextAction.STOP
+    assert "ANTI_BOT_CHALLENGE" not in contract.diagnosis_result.root_cause_identity.failure_categories
 
 
 def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contract() -> None:
@@ -2301,6 +2328,7 @@ def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() ->
         extra={
             "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
             "evidence_source": "page_evidence",
+            "challenge_evidence_source": "challenge_state",
             "evidence_reason": "human verification requires human verification",
         },
     )
@@ -2308,6 +2336,7 @@ def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() ->
     payload = json.loads(_diagnosis_repair_tool_error(ctx, "update_and_run_blocks", "terminal challenge"))
 
     assert payload["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
+    assert payload["data"]["failure_categories"][0]["evidence_source"] == "challenge_state"
     assert ctx.latest_diagnosis_repair_contract is not None
     assert (
         ctx.latest_diagnosis_repair_contract.diagnosis_result.suspected_failure_type
