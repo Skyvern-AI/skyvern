@@ -18,7 +18,11 @@ from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_security import author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
+    _ENTRY_RESUME_AFTER_AUTH_VAR,
+    _ENTRY_REUSED_VAR,
+    _INDENT,
     _MAX_STEPS,
+    _READONLY_DEFERRED_VAR,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     _get_by_role_expr,
@@ -29,8 +33,14 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     render_synthesized_offer_text,
     synthesize_code_block,
 )
+from skyvern.forge.sdk.copilot.context import (
+    FillCarry,
+    StructuredContext,
+    _fill_carry_from_scout_trajectory,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
+from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
 from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
 
@@ -2258,3 +2268,307 @@ class TestDownloadRungSynthesis:
         result = synthesize_code_block([_nav_click()])
         assert result is not None
         assert "expect_download" not in result.code
+
+
+def _readonly_type(**overrides: Any) -> dict[str, Any]:
+    base = _interaction(
+        "type_text",
+        selector="#electric-date",
+        source_url="https://example.com/service",
+        typed_length=10,
+        role="textbox",
+        accessible_name="Start date",
+    )
+    base.update(overrides)
+    return base
+
+
+def _deferred_conditional_snippet(code: str) -> str:
+    lines = code.splitlines()
+    start = next(i for i, ln in enumerate(lines) if f"if {_READONLY_DEFERRED_VAR} == " in ln)
+    return textwrap.dedent("\n".join(lines[start : start + 4]))
+
+
+def _guarded_deferred_snippet(code: str, guard_var: str) -> str:
+    lines = code.splitlines()
+    cond = [i for i, ln in enumerate(lines) if f"if {_READONLY_DEFERRED_VAR} == " in ln][-1]
+    guard = max(i for i in range(cond) if lines[i].strip() == f"if not {guard_var}:")
+    body = textwrap.dedent("\n".join(lines[cond : cond + 4]))
+    return lines[guard].strip() + "\n" + textwrap.indent(body, _INDENT)
+
+
+class TestReadonlyControlStateSynthesis:
+    def test_readonly_holding_value_emits_nonraising_verify_not_fill(self) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=True)])
+        assert result is not None
+        assert ".fill(str(start_date))" not in result.code
+        assert 'await page.locator("#electric-date").input_value()' in result.code
+        assert "!= str(start_date)" in result.code
+        assert "raise AssertionError" not in result.code
+        assert "print(" in result.code
+        assert result.parameters == [{"key": "start_date"}]
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_disabled_holding_value_emits_verify_not_fill(self) -> None:
+        result = synthesize_code_block([_readonly_type(control_disabled=True, control_value_satisfied=True)])
+        assert result is not None
+        assert ".fill(str(" not in result.code
+        assert ".input_value()" in result.code
+
+    def test_readonly_needing_value_defers_assertion_after_later_picker(self) -> None:
+        trajectory = [
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+            _interaction(
+                "click",
+                selector="#date-picker-next",
+                source_url="https://example.com/service",
+                role="button",
+                accessible_name="Next",
+            ),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        code = result.code
+        assert ".fill(str(start_date))" not in code
+        assert "raise AssertionError" in code
+        assert code.index('await page.locator("#date-picker-next").click()') < code.index("raise AssertionError")
+        assert code.index(f"{_READONLY_DEFERRED_VAR} = await") > code.index(".click()")
+        ast.parse("async def _block(page):\n" + code)
+
+    def test_readonly_needing_value_still_asserts_without_actuator(self) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=False)])
+        assert result is not None
+        assert "raise AssertionError" in result.code
+        assert ".fill(str(" not in result.code
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_post_auth_resume_header_always_carries_a_body(self) -> None:
+        # The resume-only entry header (elif entry_post_auth_resume_index) gets a guarding `pass` so that a
+        # pre-resume body reduced to deferring readonly actions never compiles to an empty block (SKY-12102).
+        trajectory = [
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#user",
+                source_url="https://example.com/service",
+                credential_id="cred_1",
+                credential_name="mock_login",
+                credential_field="username",
+            ),
+            _interaction("click", selector="#signin", source_url="https://example.com/service"),
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+            _interaction("click", selector="#statement", source_url="https://example.com/service"),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        lines = result.code.splitlines()
+        header_index = lines.index("    if not _scout_entry_resume_after_auth:")
+        assert lines[header_index + 1] == f"{_INDENT * 2}pass"
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_deferred_assertion_short_circuits_with_replayed_trajectory_on_reuse(self) -> None:
+        trajectory = [
+            _readonly_type(control_readonly=True, control_value_satisfied=False),
+            _interaction(
+                "click",
+                selector="#date-picker-next",
+                source_url="https://example.com/service",
+                role="button",
+                accessible_name="Next",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, reached_download_target=_download_target())
+        assert result is not None
+        lines = result.code.splitlines()
+        guard = next(ln for ln in lines if ln.strip() == f"if not {_ENTRY_REUSED_VAR}:")
+        guard_indent = len(guard) - len(guard.lstrip())
+        read_idx = next(i for i, ln in enumerate(lines) if f"{_READONLY_DEFERRED_VAR} = await" in ln)
+        deferred_try = max(i for i in range(read_idx) if lines[i].strip() == "try:")
+        assert (len(lines[deferred_try]) - len(lines[deferred_try].lstrip())) > guard_indent
+        raise_line = next(ln for ln in lines if "raise AssertionError" in ln)
+        assert (len(raise_line) - len(raise_line.lstrip())) > guard_indent
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_unknown_editability_falls_through_to_fill(self) -> None:
+        result = synthesize_code_block([_readonly_type()])
+        assert result is not None
+        assert 'await page.locator("#electric-date").fill(str(start_date))' in result.code
+        assert ".input_value()" not in result.code
+        assert "raise AssertionError" not in result.code
+
+    def test_editable_control_state_falls_through_to_fill(self) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=False, control_disabled=False)])
+        assert result is not None
+        assert "fill(str(start_date))" in result.code
+        assert ".input_value()" not in result.code
+
+    def test_deferred_verify_var_is_cleaned_up_not_leaked_as_output(self) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=False)])
+        assert result is not None
+        assert f"del {_READONLY_DEFERRED_VAR}" in result.code
+
+    def test_readonly_verify_matches_fill_param_registration(self) -> None:
+        readonly = synthesize_code_block(
+            [_readonly_type(control_readonly=True, control_value_satisfied=True, typed_value="example-value")]
+        )
+        editable = synthesize_code_block([_readonly_type(typed_value="example-value")])
+        assert readonly is not None and editable is not None
+        assert readonly.parameters == editable.parameters
+
+    def test_deferred_empty_read_raises_honest_fail(self) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=False)])
+        assert result is not None
+        snippet = _deferred_conditional_snippet(result.code)
+        with pytest.raises(AssertionError):
+            exec(snippet, {"_scout_readonly_actual": "", "start_date": "06/22/2026"})
+
+    def test_deferred_reformatted_nonempty_read_prints_not_raises(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=False)])
+        assert result is not None
+        snippet = _deferred_conditional_snippet(result.code)
+        exec(snippet, {"_scout_readonly_actual": "2026-06-22", "start_date": "06/22/2026"})
+        assert "does not match expected" in capsys.readouterr().out
+
+    def test_deferred_matching_nonempty_read_neither_raises_nor_prints(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=False)])
+        assert result is not None
+        snippet = _deferred_conditional_snippet(result.code)
+        exec(snippet, {"_scout_readonly_actual": "06/22/2026", "start_date": "06/22/2026"})
+        assert capsys.readouterr().out == ""
+
+    def test_deferred_unreadable_none_read_is_silent(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = synthesize_code_block([_readonly_type(control_readonly=True, control_value_satisfied=False)])
+        assert result is not None
+        snippet = _deferred_conditional_snippet(result.code)
+        exec(snippet, {"_scout_readonly_actual": None, "start_date": "06/22/2026"})
+        assert capsys.readouterr().out == ""
+
+    def test_resume_gating_partitions_pre_and_post_resume_deferred_assertions(self) -> None:
+        trajectory = [
+            _readonly_type(control_readonly=True, control_value_satisfied=False, selector="#account-id"),
+            _interaction(
+                CREDENTIAL_FILL_TOOL_NAME,
+                selector="#user",
+                source_url="https://example.com/login",
+                credential_id="cred_123",
+                credential_name="mock_portal_login",
+                credential_field="username",
+            ),
+            _interaction("click", selector="#signinBtn", source_url="https://example.com/login"),
+            _interaction("click", selector="#current-statement-row", source_url="https://example.com/bills"),
+            _readonly_type(
+                control_readonly=True,
+                control_value_satisfied=False,
+                selector="#post-field",
+                source_url="https://example.com/bills",
+            ),
+        ]
+        result = synthesize_code_block(trajectory)
+        assert result is not None
+        lines = result.code.splitlines()
+        pre_read = next(i for i, ln in enumerate(lines) if "#account-id" in ln and ".input_value()" in ln)
+        post_read = next(i for i, ln in enumerate(lines) if "#post-field" in ln and ".input_value()" in ln)
+        guard = next(
+            i
+            for i, ln in enumerate(lines)
+            if ln == f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:" and i > post_read
+        )
+        assert post_read < guard < pre_read
+        guard_indent = len(lines[guard]) - len(lines[guard].lstrip())
+        assert (len(lines[pre_read]) - len(lines[pre_read].lstrip())) > guard_indent
+        ast.parse("async def _block(page):\n" + result.code)
+
+    def test_resume_and_reuse_gates_short_circuit_deferred_assertion_at_runtime(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        resume = synthesize_code_block(
+            [
+                _readonly_type(control_readonly=True, control_value_satisfied=False, selector="#account-id"),
+                _interaction(
+                    CREDENTIAL_FILL_TOOL_NAME,
+                    selector="#user",
+                    source_url="https://example.com/login",
+                    credential_id="cred_123",
+                    credential_name="mock_portal_login",
+                    credential_field="username",
+                ),
+                _interaction("click", selector="#signinBtn", source_url="https://example.com/login"),
+                _interaction("click", selector="#current-statement-row", source_url="https://example.com/bills"),
+                _readonly_type(
+                    control_readonly=True,
+                    control_value_satisfied=False,
+                    selector="#post-field",
+                    source_url="https://example.com/bills",
+                ),
+            ]
+        )
+        assert resume is not None
+        pre_resume = _guarded_deferred_snippet(resume.code, _ENTRY_RESUME_AFTER_AUTH_VAR)
+        post_resume = _deferred_conditional_snippet(resume.code)
+
+        exec(
+            pre_resume,
+            {_ENTRY_RESUME_AFTER_AUTH_VAR: True, _READONLY_DEFERRED_VAR: "2026-06-22", "start_date": "06/22/2026"},
+        )
+        assert capsys.readouterr().out == ""
+        with pytest.raises(AssertionError):
+            exec(pre_resume, {_ENTRY_RESUME_AFTER_AUTH_VAR: False, _READONLY_DEFERRED_VAR: ""})
+        with pytest.raises(AssertionError):
+            exec(post_resume, {_ENTRY_RESUME_AFTER_AUTH_VAR: True, _READONLY_DEFERRED_VAR: ""})
+
+        reuse = synthesize_code_block(
+            [
+                _readonly_type(control_readonly=True, control_value_satisfied=False),
+                _interaction(
+                    "click",
+                    selector="#date-picker-next",
+                    source_url="https://example.com/service",
+                    role="button",
+                    accessible_name="Next",
+                ),
+            ],
+            reached_download_target=_download_target(),
+        )
+        assert reuse is not None
+        reuse_gated = _guarded_deferred_snippet(reuse.code, _ENTRY_REUSED_VAR)
+        exec(reuse_gated, {_ENTRY_REUSED_VAR: True, _READONLY_DEFERRED_VAR: "2026-06-22", "start_date": "06/22/2026"})
+        assert capsys.readouterr().out == ""
+        with pytest.raises(AssertionError):
+            exec(reuse_gated, {_ENTRY_REUSED_VAR: False, _READONLY_DEFERRED_VAR: ""})
+
+
+class TestReadonlyControlStateCarry:
+    def test_fill_carry_roundtrip_preserves_control_state_for_type_text(self) -> None:
+        interaction = _readonly_type(control_readonly=True, control_value_satisfied=True)
+        carry = _fill_carry_from_scout_trajectory([interaction])
+        assert len(carry) == 1
+        assert carry[0].control_readonly is True
+        assert carry[0].control_value_satisfied is True
+        rebound = _fill_carry_to_interaction(carry[0], trajectory_index=0)
+        assert rebound["control_readonly"] is True
+        assert rebound["control_value_satisfied"] is True
+        result = synthesize_code_block([rebound])
+        assert result is not None
+        assert ".fill(str(" not in result.code
+        assert ".input_value()" in result.code
+
+    def test_credential_carry_persists_no_control_state_keys(self) -> None:
+        credential_carry = FillCarry(
+            source_url="https://example.com/login",
+            selector="#password",
+            tool_name="fill_credential_field",
+            credential_id="cred_example",
+            credential_field="password",
+        )
+        persisted = StructuredContext(fill_carry=[credential_carry]).to_json_str()
+        assert "control_readonly" not in persisted
+        assert "control_disabled" not in persisted
+        assert "control_value_satisfied" not in persisted
+
+    def test_type_text_carry_persists_control_value_satisfied_bool(self) -> None:
+        interaction = _readonly_type(control_readonly=True, control_value_satisfied=False)
+        carry = _fill_carry_from_scout_trajectory([interaction])
+        persisted = StructuredContext(fill_carry=carry).to_json_str()
+        assert '"control_readonly": true' in persisted
+        assert '"control_value_satisfied": false' in persisted

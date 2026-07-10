@@ -108,6 +108,34 @@ def selector_match_count_expression(css_selector: str) -> str:
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
 
 
+# Read only the readonly/disabled control-state booleans for a CSS or XPath selector; never reads the
+# element's value. An unresolvable selector or non-CSS/XPath engine returns null (UNKNOWN editability).
+def scout_control_state_expression(selector: str) -> str:
+    sel = json.dumps(selector)
+    return (
+        "(() => {"
+        f"  const sel = {sel};"
+        "  let el = null;"
+        "  try {"
+        "    if (/^\\s*(xpath=|\\(?\\/)/.test(sel)) {"
+        "      const x = sel.replace(/^\\s*xpath=/, '');"
+        "      const r = document.evaluate(x, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
+        "      el = r ? r.singleNodeValue : null;"
+        "    } else {"
+        "      el = document.querySelector(sel);"
+        "    }"
+        "  } catch (e) { return null; }"
+        "  if (!el) return null;"
+        "  const attrOf = (k) => (el.getAttribute && el.getAttribute(k)) || '';"
+        "  const readonly = el.readOnly === true || (el.hasAttribute && el.hasAttribute('readonly'))"
+        "    || attrOf('aria-readonly').toLowerCase() === 'true';"
+        "  const disabled = el.disabled === true || (el.hasAttribute && el.hasAttribute('disabled'))"
+        "    || attrOf('aria-disabled').toLowerCase() === 'true';"
+        "  return { readonly: !!readonly, disabled: !!disabled };"
+        "})()"
+    )
+
+
 COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
     "(() => {"
     "  const body = document.body; if (!body) return [];"

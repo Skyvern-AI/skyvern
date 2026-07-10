@@ -162,6 +162,9 @@ class FillCarry(BaseModel):
     typed_length: int = 0
     typed_value: str = ""
     value: str = ""
+    control_readonly: bool | None = None
+    control_disabled: bool | None = None
+    control_value_satisfied: bool | None = None
     credential_id: str = ""
     credential_field: str = ""
 
@@ -240,6 +243,7 @@ class StructuredContext(BaseModel):
         payload["loaded_result_targets"] = [
             _sanitized_loaded_result_target_payload(target) for target in self.loaded_result_targets
         ]
+        payload["fill_carry"] = [carry.model_dump(mode="json", exclude_none=True) for carry in self.fill_carry]
         return json.dumps(payload, indent=2)
 
     @classmethod
@@ -408,6 +412,10 @@ def _carry_int(value: FillCarryPrimitive) -> int:
     return parsed if parsed > 0 else 0
 
 
+def _carry_bool(value: FillCarryPrimitive) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
 def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarryPrimitive]]) -> list[FillCarry]:
     carry: list[FillCarry] = []
     for interaction in trajectory:
@@ -429,6 +437,9 @@ def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarr
                     accessible_name=accessible_name,
                     typed_length=typed_length,
                     typed_value=_carry_text(interaction.get("typed_value")),
+                    control_readonly=_carry_bool(interaction.get("control_readonly")),
+                    control_disabled=_carry_bool(interaction.get("control_disabled")),
+                    control_value_satisfied=_carry_bool(interaction.get("control_value_satisfied")),
                 )
             )
         elif tool_name == "select_option":

@@ -187,6 +187,10 @@ class ScoutedInteraction(TypedDict):
     raw_typed_value: NotRequired[str]
     role: NotRequired[str]
     accessible_name: NotRequired[str]
+    # Captured for the type_text lane only; absent on credential fills (secret-leak boundary).
+    control_readonly: NotRequired[bool]
+    control_disabled: NotRequired[bool]
+    control_value_satisfied: NotRequired[bool]
     trajectory_index: NotRequired[int]
     carried: NotRequired[bool]
     # Credential fills carry references and metadata only — never secret values.
@@ -343,7 +347,7 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
-    prior_fill_carry: list[dict[str, str | int]] = field(default_factory=list)
+    prior_fill_carry: list[dict[str, str | int | bool | None]] = field(default_factory=list)
     fill_carry_rebound_done: bool = False
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
