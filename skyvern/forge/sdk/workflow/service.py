@@ -102,6 +102,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     PdfFillBlock,
     PDFParserBlock,
+    SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
     WhileLoopBlock,
@@ -278,7 +279,7 @@ def _collect_enterprise_gated_workflow_features(
             engine = block.engine
         block_uses_model = task_block_uses_engine_and_model or isinstance(
             block,
-            (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock),
+            (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock),
         )
         model = block.model if block_uses_model else None
         feature_names.update(

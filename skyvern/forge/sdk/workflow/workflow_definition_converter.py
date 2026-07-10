@@ -85,6 +85,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
+from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -875,6 +876,16 @@ def block_yaml_to_block(
             payload=block_yaml.payload,
             llm_key=block_yaml.llm_key,
             parameters=pdf_fill_block_parameters,
+        )
+
+    elif block_yaml.block_type == BlockType.SPLIT_PDF:
+        split_pdf_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return SplitPdfBlock(
+            **base_kwargs,
+            file_url=block_yaml.file_url,
+            prompt=block_yaml.prompt,
+            llm_key=block_yaml.llm_key,
+            parameters=split_pdf_block_parameters,
         )
 
     elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:
