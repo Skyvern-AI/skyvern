@@ -25,6 +25,14 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
+const { mockCopilotUxV1Enabled } = vi.hoisted(() => ({
+  mockCopilotUxV1Enabled: vi.fn(() => true),
+}));
+
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => mockCopilotUxV1Enabled(),
+}));
+
 const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
   () => {
     const calls: StreamCall[] = [];
@@ -85,13 +93,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-// This suite exercises the legacy (copilot_ux_v1 off) default-mode logic; no
-// test here touches copilot_ux_v1-gated behavior, so pin it off rather than
-// the stray `true` this file previously carried over from SKY-11973's mock.
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => false,
-}));
-
 const saveData = {
   title: "Test WF",
   workflow: {
@@ -128,8 +129,6 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
 }));
 
-// Unrelated to this file's tests; the real hook needs a QueryClientProvider
-// this harness doesn't set up.
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
@@ -139,7 +138,8 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 type FlagConfig = {
   copilotV2?: boolean;
   codeBlockMode?: boolean;
-  defaultMode?: string;
+  requiresLiveBrowser?: boolean;
+  isLiveBrowserReady?: boolean;
 };
 
 async function renderChat(flags: FlagConfig) {
@@ -148,19 +148,17 @@ async function renderChat(flags: FlagConfig) {
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: flags.codeBlockMode ?? false,
     CODE_BLOCK_ACCESS: flags.codeBlockMode ?? false,
   };
-  const valueFlags: Record<string, string | undefined> = {
-    WORKFLOW_COPILOT_DEFAULT_MODE: flags.defaultMode,
-  };
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <FeatureFlagValueContext.Provider value={(name) => valueFlags[name]}>
-        <WorkflowCopilotChat />
+      <FeatureFlagValueContext.Provider value={() => undefined}>
+        <WorkflowCopilotChat
+          requiresLiveBrowser={flags.requiresLiveBrowser}
+          isLiveBrowserReady={flags.isLiveBrowserReady}
+        />
       </FeatureFlagValueContext.Provider>
     </FeatureFlagContext.Provider>,
   );
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -175,22 +173,11 @@ async function submit(value: string) {
   });
 }
 
-async function selectMode(label: "Ask" | "Build" | "Build workflow as code") {
-  await act(async () => {
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-  });
-  const item = await screen.findByRole("menuitem", { name: label });
-  await act(async () => {
-    fireEvent.click(item);
-  });
-}
-
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
+  mockCopilotUxV1Enabled.mockReset();
+  mockCopilotUxV1Enabled.mockReturnValue(true);
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
@@ -206,106 +193,121 @@ afterEach(() => {
   cleanup();
 });
 
-describe("WorkflowCopilotChat — composer default mode variant", () => {
-  it("leaves code_block unset for backend fallback when the default variant is unset", async () => {
+describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
+  it("defaults straight to Build with code when code-first is accessible", async () => {
     await renderChat({ copilotV2: true, codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
-
-  it("sends code_block=true for the build_code override variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "build_code",
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
     expect(streamCalls[0]?.body.code_block).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "Switch mode" }).textContent,
+    ).toContain("Build with code");
   });
 
-  it("sends code_block=false for the build_no_code variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "build_no_code",
-    });
+  it("falls back to plain Build when the code-block flag is off", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: false });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
+    expect(streamCalls[0]?.body.code_block).toBe(null);
+    const pillText = screen.getByRole("button", {
+      name: "Switch mode",
+    }).textContent;
+    expect(pillText).toContain("Build");
+    expect(pillText).not.toContain("Build with code");
   });
 
-  it("defaults to Ask for the ask variant and sends code_block=null", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask",
-    });
-    await submit("answer a question");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+  it("opens the mode pill as a real Radix menu, not a hand-rolled div", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    const trigger = screen.getByRole("button", { name: "Switch mode" });
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
 
+    await act(async () => {
+      fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    });
+    expect(await screen.findByRole("menu")).toBeTruthy();
+
+    const askItem = await screen.findByRole("menuitem", { name: "Ask" });
+    await act(async () => {
+      fireEvent.click(askItem);
+    });
+    await submit("what does this workflow do?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
     expect(streamCalls[0]?.body.mode).toBe("ask");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
-  it("defaults to Ask for the ask_code variant and sends code_block=null while in Ask", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask_code",
-    });
-    await submit("answer a question");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("ask");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
-
-  it("lands on code ON when selecting Build workflow as code", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask_code",
-    });
-    await selectMode("Build workflow as code");
+  it("morphs to stop while running with an empty box, and cancels the run on click", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
+    const button = screen.getByRole("button", { name: "Stop" });
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
   });
 
-  it("turns code OFF when selecting plain Build from a code default", async () => {
+  it("flips back to a queueing send when typing mid-run, and queues on click", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(textarea(), {
+      target: { value: "also grab the story scores" },
+    });
+    const button = screen.getByRole("button", {
+      name: "Queue for next turn",
+    });
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+
+    // Queued, not sent as a second concurrent turn.
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Queued")).toBeTruthy();
+    // Exactly one status line — the Queued chip, not also the legacy
+    // aria-live text line (browserStatusText is suppressed under S4 so the
+    // two don't announce the same status twice).
+    expect(
+      screen.getAllByText("Queued — sends when this turn finishes."),
+    ).toHaveLength(1);
+  });
+
+  it("disables the morph button (not a dead-looking Send) while a prompt waits on the live browser", async () => {
     await renderChat({
       copilotV2: true,
       codeBlockMode: true,
-      defaultMode: "build_code",
-    });
-    await selectMode("Build");
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
-  });
-
-  it("sends code_block=null when the code-block flag is off, ignoring the variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: false,
-      defaultMode: "build_no_code",
+      requiresLiveBrowser: true,
+      isLiveBrowserReady: false,
     });
     await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
+    // No turn started yet — queued purely on the live-browser gate.
+    expect(postStreaming).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("Prompt queued. Waiting for live browser..."),
+    ).toBeTruthy();
+
+    const button = screen.getByRole("button", {
+      name: "Send disabled — waiting for live browser",
+    });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+
+    const cancel = screen.getByRole("button", {
+      name: "Cancel queued message",
+    });
+    await act(async () => {
+      fireEvent.click(cancel);
+    });
+    expect(screen.queryByText("Queued")).toBeNull();
   });
 });
