@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import AsyncGenerator
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import (
-    Base,
     TagKeyModel,
     TagValueModel,
     WorkflowModel,
@@ -43,12 +41,8 @@ WRID = "wr_alpha"
 
 
 @pytest_asyncio.fixture
-async def engine() -> AsyncGenerator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
+async def engine(sqlite_engine: AsyncEngine) -> AsyncEngine:
+    return sqlite_engine
 
 
 @pytest_asyncio.fixture
