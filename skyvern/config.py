@@ -206,6 +206,9 @@ class Settings(BaseSettings):
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
+    # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
+    WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
