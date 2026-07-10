@@ -38,6 +38,14 @@ function FileUploadBlockFormBody({
     azureBlobContainerName,
     googleCredentialId,
     googleDriveFolderId,
+    sftpHost,
+    sftpPort,
+    sftpUsername,
+    sftpPassword,
+    sftpPrivateKey,
+    sftpPrivateKeyPassphrase,
+    sftpRemotePath,
+    sftpHostKey,
   } = node.data;
 
   const value = useMemo(
@@ -53,6 +61,14 @@ function FileUploadBlockFormBody({
       azureBlobContainerName,
       googleCredentialId,
       googleDriveFolderId,
+      sftpHost,
+      sftpPort,
+      sftpUsername,
+      sftpPassword,
+      sftpPrivateKey,
+      sftpPrivateKeyPassphrase,
+      sftpRemotePath,
+      sftpHostKey,
     }),
     [
       storageType,
@@ -66,6 +82,14 @@ function FileUploadBlockFormBody({
       azureBlobContainerName,
       googleCredentialId,
       googleDriveFolderId,
+      sftpHost,
+      sftpPort,
+      sftpUsername,
+      sftpPassword,
+      sftpPrivateKey,
+      sftpPrivateKeyPassphrase,
+      sftpRemotePath,
+      sftpHostKey,
     ],
   );
   const { commit } = useDebouncedSidebarSave({
