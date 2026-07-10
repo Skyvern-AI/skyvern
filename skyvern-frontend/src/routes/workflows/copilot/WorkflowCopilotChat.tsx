@@ -704,6 +704,10 @@ export function WorkflowCopilotChat({
   // workflow_run_id — a run's evaluating and final verdict frames share an
   // id, so this stops the same run from being fetched twice.
   const fetchedActionRunIds = useRef<Set<string>>(new Set());
+  // Run ids the copilot claimed via run_outcome — the turn narrates these
+  // itself, so useRunLifecycleAnnouncements suppresses their lifecycle lines by
+  // identity (an unrelated run seen in the same window must still be narrated).
+  const turnOwnedRunIds = useRef<Set<string>>(new Set());
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -760,7 +764,11 @@ export function WorkflowCopilotChat({
   }, []);
   useRunLifecycleAnnouncements({
     workflowRunId: docked && copilotUxV1Enabled ? workflowRunId : undefined,
-    turnInFlightRef: inFlightRef,
+    // isLoading here, not inFlightRef: this hook needs a value React re-runs
+    // its effect on when the turn ends, which a ref can't do. The one-render
+    // lag that matters for the double-submit guard above doesn't matter here.
+    turnInFlight: isLoading,
+    turnOwnedRunIds,
     announce: announceRunLifecycle,
   });
   // Recorded actions arrive well after block_progress (they're persisted in
@@ -1931,6 +1939,15 @@ export function WorkflowCopilotChat({
                 return false;
               case "run_outcome":
                 applyStoredNarrativeEvent(payload);
+                if (payload.workflow_run_id) {
+                  const owned = turnOwnedRunIds.current;
+                  owned.add(payload.workflow_run_id);
+                  while (owned.size > MAX_TURN_SNAPSHOTS) {
+                    const oldest = owned.values().next().value;
+                    if (oldest === undefined) break;
+                    owned.delete(oldest);
+                  }
+                }
                 maybeFetchRecordedActions(payload);
                 return false;
               case "turn_start": {

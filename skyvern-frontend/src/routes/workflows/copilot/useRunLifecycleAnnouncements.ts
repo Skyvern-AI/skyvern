@@ -74,22 +74,24 @@ function buildStartMessage(
 function buildTerminalMessage(
   id: string,
   data: WorkflowRunStatusApiResponse,
+  isBlockRun: boolean,
 ): RunLifecycleMessage {
+  const runLabel = isBlockRun ? "Block run" : "Run";
   const dur = formatElapsedSeconds(
     elapsedMs(data.started_at ?? data.created_at, data.finished_at),
   );
   let content: string;
   if (data.status === Status.Canceled) {
-    content = "Run canceled.";
+    content = `${runLabel} canceled.`;
   } else if (statusIsAFailureType({ status: data.status })) {
     const reason = data.failure_reason
       ? ` — ${truncate(data.failure_reason, FAILURE_REASON_MAX_CHARS)}`
       : "";
-    content = `Run ${failureVerb(data.status)} after ${dur}${reason}. Ask me to diagnose and fix it.`;
+    content = `${runLabel} ${failureVerb(data.status)} after ${dur}${reason}. Ask me to diagnose and fix it.`;
   } else {
     const count = extractedCount(data.outputs);
     const extracted = count ? ` — extracted ${count} item(s)` : "";
-    content = `Run completed in ${dur}${extracted}. Want to review or change anything?`;
+    content = `${runLabel} completed in ${dur}${extracted}. Want to review or change anything?`;
   }
   return {
     id: `run-lifecycle-${id}-terminal`,
@@ -99,7 +101,7 @@ function buildTerminalMessage(
   };
 }
 
-type SeenEntry = { start: boolean; terminal: boolean };
+type SeenEntry = { start: boolean; terminal: boolean; wasRunning: boolean };
 
 /**
  * Watches the studio's focused run and appends presentational lifecycle lines
@@ -108,11 +110,16 @@ type SeenEntry = { start: boolean; terminal: boolean };
  */
 export function useRunLifecycleAnnouncements({
   workflowRunId,
-  turnInFlightRef,
+  turnInFlight,
+  turnOwnedRunIds,
   announce,
 }: {
   workflowRunId: string | undefined;
-  turnInFlightRef: { current: boolean };
+  turnInFlight: boolean;
+  // Run ids the copilot claimed via run_outcome this session — the turn already
+  // narrates these through its own SSE stream, so we suppress them by identity
+  // rather than by the timing of when they were first seen.
+  turnOwnedRunIds: { current: Set<string> };
   announce: (message: RunLifecycleMessage) => void;
 }): void {
   // enabled: false (not just an omitted workflowRunId) stops useWorkflowRunQuery
@@ -135,19 +142,53 @@ export function useRunLifecycleAnnouncements({
     const id = data.workflow_run_id;
     let entry = seen.current.get(id);
     if (!entry) {
-      const finalized = statusIsFinalized({ status: data.status });
-      const silent = finalized || turnInFlightRef.current;
-      entry = { start: silent, terminal: silent };
+      entry = { start: false, terminal: false, wasRunning: false };
       seen.current.set(id, entry);
-      if (!silent) {
-        entry.start = true;
-        announce(buildStartMessage(id, data, isBlockRun));
+    }
+    // The copilot's own build/test run narrates itself through the turn's SSE
+    // stream, so identity — not timing — is what silences it: a run whose id
+    // the turn claimed via run_outcome stays fully silent, forever.
+    if (turnOwnedRunIds.current.has(id)) {
+      entry.start = true;
+      entry.terminal = true;
+      return;
+    }
+    const finalized = statusIsFinalized({ status: data.status });
+    // A not-yet-claimed run seen mid-turn may still turn out to be the turn's
+    // own (its run_outcome hasn't landed yet), so hold its lines until the turn
+    // ends instead of leaking a start line the turn would also narrate. Record
+    // that it was live so a completion observed right after the turn ends is
+    // announced as a real terminal, not silently absorbed as an
+    // already-finished first sight (which is what a genuinely unrelated run
+    // finishing inside the post-turn poll gap would otherwise look like).
+    if (!entry.start && turnInFlight) {
+      if (!finalized) {
+        entry.wasRunning = true;
       }
       return;
     }
-    if (!entry.terminal && statusIsFinalized({ status: data.status })) {
-      entry.terminal = true;
-      announce(buildTerminalMessage(id, data));
+    if (!entry.start) {
+      entry.start = true;
+      if (finalized) {
+        entry.terminal = true;
+        if (entry.wasRunning) {
+          announce(buildTerminalMessage(id, data, isBlockRun));
+        }
+        return;
+      }
+      announce(buildStartMessage(id, data, isBlockRun));
+      return;
     }
-  }, [workflowRunId, data, announce, isBlockRun, turnInFlightRef]);
+    if (!entry.terminal && finalized) {
+      entry.terminal = true;
+      announce(buildTerminalMessage(id, data, isBlockRun));
+    }
+  }, [
+    workflowRunId,
+    data,
+    announce,
+    isBlockRun,
+    turnInFlight,
+    turnOwnedRunIds,
+  ]);
 }
