@@ -192,6 +192,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     DESIGN_START = "design_start"
     DESIGN_END = "design_end"
     WORKFLOW_DRAFT = "workflow_draft"
+    CODEGEN_PROGRESS = "codegen_progress"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -396,6 +397,22 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
+
+
+class WorkflowCopilotCodegenProgressUpdate(BaseModel):
+    """Live-only drafting progress while the LLM streams authoring-tool arguments. Not persisted; the
+    workflow_draft frame supersedes it."""
+
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.CODEGEN_PROGRESS, description="Message type"
+    )
+    tool_name: str = Field(..., description="Authoring tool whose arguments are being streamed")
+    blocks_drafted: list[str] = Field(
+        default_factory=list, description="Cumulative ordered unique block labels seen so far in this call"
+    )
+    chars_streamed: int = Field(..., description="Cumulative argument characters streamed so far in this call")
+    iteration: int = Field(..., description="Agent loop iteration number; matches the TOOL_CALL frame that follows")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowYAMLConversionRequest(BaseModel):
