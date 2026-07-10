@@ -8,9 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEYS,
-    SKYVERN_TAG_NAMESPACE,
     TAG_DESCRIPTION_MAX_LENGTH,
-    TAG_KEY_REGEX,
+    assert_user_writable_tag_key,
     normalize_optional_tag_key,
     normalize_optional_tag_value,
     normalize_tag_color,
@@ -27,13 +26,7 @@ def _assert_user_key_writable(key: str) -> None:
     write paths."""
     if not isinstance(key, str):
         raise ValueError("tag key must be a string")
-    if key.startswith(SKYVERN_TAG_NAMESPACE):
-        raise ValueError(f"tag keys must not start with the reserved '{SKYVERN_TAG_NAMESPACE}' prefix")
-    if not TAG_KEY_REGEX.match(key):
-        raise ValueError(
-            "tag keys must match '^[A-Za-z0-9][A-Za-z0-9_.-]*$' "
-            "(alphanumeric, underscore, dot, hyphen; must start with alphanumeric)"
-        )
+    assert_user_writable_tag_key(key)
 
 
 class TagInput(BaseModel):
@@ -171,6 +164,13 @@ class TagsResponse(BaseModel):
     tags: list[TagResponse]
 
 
+class RunTagsResponse(BaseModel):
+    """Current tags for a workflow run."""
+
+    workflow_run_id: str
+    tags: list[TagResponse]
+
+
 class TagHistoryItem(BaseModel):
     """One row from ``GET /v1/workflows/{wpid}/tags/history``."""
 
@@ -191,6 +191,11 @@ class TagHistoryResponse(BaseModel):
     events: list[TagHistoryItem]
 
 
+class RunTagHistoryResponse(BaseModel):
+    workflow_run_id: str
+    events: list[TagHistoryItem]
+
+
 class TagKey(BaseModel):
     """Tag-key registry entry."""
 
@@ -208,6 +213,8 @@ class TagKeyDeleteResponse(BaseModel):
 
     key: str
     removed_from_workflow_count: int
+    removed_from_run_count: int = 0
+    removed_count: int = 0
 
 
 class TagKeyUpdate(BaseModel):
@@ -311,6 +318,8 @@ class TagValueDeleteResponse(BaseModel):
     key: str
     value: str
     removed_from_workflow_count: int
+    removed_from_run_count: int = 0
+    removed_count: int = 0
 
 
 class WorkflowTagsBatchRequest(BaseModel):
@@ -320,6 +329,16 @@ class WorkflowTagsBatchRequest(BaseModel):
     workflow_permanent_ids: list[str] = Field(
         default_factory=list,
         description="Workflow permanent IDs to fetch tags for.",
+    )
+
+
+class RunTagsBatchRequest(BaseModel):
+    """Body for ``POST /v1/run-tags`` (used when the run-id list would exceed
+    the URL length cap)."""
+
+    workflow_run_ids: list[str] = Field(
+        default_factory=list,
+        description="Workflow run IDs to fetch tags for.",
     )
 
 
@@ -339,3 +358,13 @@ class WorkflowTagsBatchResponse(BaseModel):
     Workflows outside the caller's org are silently absent (no leakage)."""
 
     workflow_tags: dict[str, list[TagItem]]
+
+
+class RunTagsBatchResponse(BaseModel):
+    """Response for the run-tags batch endpoint.
+
+    Runs with no tags are present with an empty list so the frontend can
+    distinguish "fetched, none set" from "not fetched" without a second call.
+    Runs outside the caller's org are silently absent (no leakage)."""
+
+    run_tags: dict[str, list[TagItem]]

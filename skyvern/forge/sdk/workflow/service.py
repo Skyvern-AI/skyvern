@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 import os
+import random
 import textwrap
 import time
 import uuid
@@ -125,6 +126,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.run_limits import get_effective_workflow_run_max_elapsed_time_minutes
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
@@ -192,6 +194,8 @@ DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH = 120
 MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH = 40
+DETECTED_PLATFORM_RUN_TAG_KEY = "skyvern.platform"
+DETECTED_PLATFORM_RUN_TAG_CALLER_ID = "system:platform-detector"
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -574,6 +578,7 @@ class WorkflowService:
         run_metadata: dict[str, str] | None,
     ) -> None:
         """Persist optional workflow-run metadata while swallowing write failures."""
+        # Dormant legacy hook retained until the workflow_run_metadata table drop follow-up.
         if not run_metadata:
             return
 
@@ -599,6 +604,7 @@ class WorkflowService:
         run_metadata: dict[str, str] | None,
     ) -> None:
         """Schedule optional workflow-run metadata persistence off the run-creation path."""
+        # Dormant legacy hook retained until the workflow_run_metadata table drop follow-up.
         if not run_metadata:
             return
 
@@ -611,6 +617,64 @@ class WorkflowService:
         )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    @staticmethod
+    async def _apply_initial_run_metadata_tags(
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+        context: TagWriteContext | None,
+    ) -> None:
+        if not run_metadata:
+            return
+
+        write_context = context or TagWriteContext(
+            caller_id=organization_id,
+            source=TagSource.SYSTEM,
+            caller_type=CallerType.SYSTEM,
+        )
+        for attempt in range(2):
+            try:
+                await app.DATABASE.tags.apply_run_tag_changes(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    sets=run_metadata,
+                    deletes=set(),
+                    context=write_context,
+                )
+                return
+            except IntegrityError:
+                if attempt == 0:
+                    await asyncio.sleep(random.uniform(0.01, 0.05))
+                    continue
+                raise
+
+    @staticmethod
+    async def _apply_detected_platform_run_tag_best_effort(
+        *,
+        workflow: Workflow,
+        workflow_run_id: str,
+        organization_id: str,
+        parameters: dict[str, Any],
+    ) -> None:
+        try:
+            platform = workflow_script_service.detect_workflow_platform(workflow, parameters)
+            if not platform:
+                return
+            await app.DATABASE.tags.apply_system_run_tag_changes(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                sets={DETECTED_PLATFORM_RUN_TAG_KEY: platform},
+                caller_id=DETECTED_PLATFORM_RUN_TAG_CALLER_ID,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to apply detected platform workflow run tag",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _determine_cache_invalidation(
@@ -1253,6 +1317,7 @@ class WorkflowService:
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
         resolved_workflow_id: str | None = None,
+        tag_write_context: TagWriteContext | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -1360,11 +1425,20 @@ class WorkflowService:
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
             )
-            self._record_workflow_run_metadata_in_background(
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization.organization_id,
-                run_metadata=workflow_request.run_metadata,
-            )
+            try:
+                await self._apply_initial_run_metadata_tags(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    run_metadata=workflow_request.run_metadata,
+                    context=tag_write_context,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to apply initial workflow run metadata tags",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    exc_info=True,
+                )
 
             LOG.info(
                 f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -1546,6 +1620,12 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             batch_error=str(batch_error),
                         )
+                await self._apply_detected_platform_run_tag_best_effort(
+                    workflow=workflow,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=organization.organization_id,
+                    parameters=parameter_values,
+                )
             except Exception as e:
                 LOG.exception(
                     f"Error while setting up workflow run {workflow_run.workflow_run_id}",

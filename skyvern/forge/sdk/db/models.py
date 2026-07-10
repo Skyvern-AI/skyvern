@@ -389,7 +389,7 @@ class WorkflowTagEventModel(Base):
         ),
         CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
         CheckConstraint(
-            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import')",
+            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import', 'system')",
             name="ck_workflow_tag_events_source",
         ),
         CheckConstraint(
