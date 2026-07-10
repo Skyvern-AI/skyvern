@@ -31,6 +31,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    CardNumberInputMismatch,
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
@@ -1193,6 +1194,122 @@ async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_n
         tag_name=tag_name,
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
+    )
+
+
+_CARD_NUMBER_MIN_DIGITS = 13
+_CARD_NUMBER_MAX_DIGITS = 19
+
+
+def _card_number_digits(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _luhn_valid(digits: str) -> bool:
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        digit = ord(char) - ord("0")
+        if index % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
+def _is_probable_card_number(digits: str) -> bool:
+    # A bare digit string that is card-length (13-19) and Luhn-valid. Luhn plus length is a strong,
+    # self-limiting gate: phone numbers, order IDs, and free text almost never satisfy both, so the
+    # read-back path stays off non-card fields.
+    if not (_CARD_NUMBER_MIN_DIGITS <= len(digits) <= _CARD_NUMBER_MAX_DIGITS):
+        return False
+    return _luhn_valid(digits)
+
+
+def _has_card_number_token(value: str | None) -> bool:
+    # Lower-case first, then drop all separators, so camelCase and unseparated forms match too:
+    # "card.number" / "card_number" / "cardNumber" / "cardnumber" / "cc-number" all count, while
+    # "number" / "phone" / "cardholder" do not.
+    normalized = re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    return "cardnumber" in normalized or "ccnumber" in normalized
+
+
+_CARD_READBACK_SEPARATORS = r"[\s\-./]"
+
+
+def _readable_card_digits(actual_value: str | None) -> str | None:
+    # The rendered value reduced to a clean ASCII digit string, or None when it cannot be compared
+    # (empty, masked with bullets/asterisks, or non-digit after stripping common group separators).
+    # Python \s covers NBSP, which some auto-formatters emit between groups.
+    if not actual_value:
+        return None
+    stripped = re.sub(_CARD_READBACK_SEPARATORS, "", actual_value)
+    if not (stripped.isascii() and stripped.isdigit()):
+        return None
+    return stripped
+
+
+def _card_readback_is_mismatch(expected_digits: str, actual_value: str | None) -> bool:
+    # True only when the rendered value is a clean digit string that differs from the expected card
+    # digits. An unreadable read-back (empty/masked) is not a mismatch: before clearing, the field is
+    # left as typed rather than risking a wrong retype on a field we cannot read.
+    actual_digits = _readable_card_digits(actual_value)
+    return actual_digits is not None and actual_digits != expected_digits
+
+
+def _card_readback_matches(expected_digits: str, actual_value: str | None) -> bool:
+    # True only on a positive digit match. Used after clearing a known-bad value and atomically
+    # re-entering it: success must be positively confirmed, so an unreadable/masked/mismatched retry
+    # read-back is NOT a match and forces a loud failure rather than a silent wrong card.
+    return _readable_card_digits(actual_value) == expected_digits
+
+
+async def _is_card_number_field(skyvern_element: SkyvernElement) -> bool:
+    # Deterministic, live-attr detection of a card-number field: an explicit cc-number autocomplete
+    # token, or a numeric-only field. Paired with a Luhn-valid 13-19 digit value at the call site,
+    # this stays off phone numbers, quantities, and other numeric inputs.
+    autocomplete = (await skyvern_element.get_attr("autocomplete") or "").lower()
+    if "cc-number" in autocomplete:
+        return True
+    for attr_name in ("name", "id"):
+        if _has_card_number_token(await skyvern_element.get_attr(attr_name)):
+            return True
+    inputmode = (await skyvern_element.get_attr("inputmode") or "").lower()
+    return inputmode == "numeric"
+
+
+async def _fill_card_number_with_readback(
+    *, skyvern_element: SkyvernElement, tag_name: str, text: str, expected_digits: str
+) -> ActionFailure | None:
+    # Type the card number, then read the rendered digits back. Character-by-character typing races an
+    # auto-formatting field's caret restore and can scramble the value (SKY-11720); a single atomic
+    # value-set formats once, without the race, so a mismatch is re-entered atomically before failing.
+    await skyvern_element.input_sequentially(text=text)
+    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    if not _card_readback_is_mismatch(expected_digits, actual_value):
+        return None
+
+    await skyvern_element.input_clear()
+    await skyvern_element.input_fill(text=text)
+    actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    # Success after re-entry must be positively confirmed: a clean digit match. An empty/masked/
+    # unreadable or still-mismatched retry read-back is NOT success -- fail loudly rather than silently
+    # proceed with a value we deleted-and-could-not-verify.
+    if _card_readback_matches(expected_digits, actual_value):
+        return None
+
+    actual_digits = _card_number_digits(actual_value)
+    LOG.warning(
+        "Card number read-back mismatch after retry",
+        element_id=skyvern_element.get_id(),
+        expected_digit_count=len(expected_digits),
+        actual_digit_count=len(actual_digits),
+    )
+    return ActionFailure(
+        CardNumberInputMismatch(
+            expected_digit_count=len(expected_digits),
+            actual_digit_count=len(actual_digits),
+        )
     )
 
 
@@ -2987,9 +3104,13 @@ async def handle_input_text_action(
         return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
     is_tel = await skyvern_element.get_attr("type") == "tel"
+    candidate_card_digits = _card_number_digits(text)
+    is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
+        skyvern_element
+    )
     is_plain_nanp_tel = False
     run_phone_format_check = False
-    if is_tel and await _is_tel_digit_fix_enabled(task):
+    if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
         # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
         # byte-for-byte. Plain-NANP tel is typed as bare digits (skipping the format-check LLM) unless
         # the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
@@ -2997,7 +3118,7 @@ async def handle_input_text_action(
         text, is_plain_nanp_tel, run_phone_format_check = _plan_tel_text(
             is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
         )
-    elif is_tel and not is_secret_value:
+    elif is_tel and not is_card_number_input and not is_secret_value:
         run_phone_format_check = True
     if run_phone_format_check:
         try:
@@ -3161,37 +3282,56 @@ async def handle_input_text_action(
         # Only the bare-digit NANP fill is read back to verify; other tel shapes are left unverified.
         verify_tel_input_after_fill = is_plain_nanp_tel
 
+        # SKY-11720: an auto-formatting card-number field (a space every 4 digits) restores its caret
+        # naively, racing character-by-character entry so the rendered value can silently differ from
+        # the provided card while the block still completes. Deterministic card-number read-back runs
+        # only when the value is Luhn-valid 13-19 digits and live field attrs identify a card-like
+        # numeric field; mismatches are re-entered atomically before failing loudly.
+        card_expected_digits = ""
+        if is_card_number_input:
+            card_expected_digits = candidate_card_digits
+
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
         try:
-            await skyvern_element.input_sequentially(text=text)
-            if verify_tel_input_after_fill:
-                # Read the typed digits back; on mismatch, clear and retype once. A second mismatch
-                # fails the action here rather than letting it surface as a silent wrong fill.
-                try:
-                    await _verify_tel_input_after_fill(
-                        skyvern_element=skyvern_element,
-                        tag_name=tag_name,
-                        expected_value=text,
-                    )
-                except PhoneNumberInputMismatch:
-                    await skyvern_element.input_clear()
-                    await skyvern_element.input_sequentially(text=text)
+            if card_expected_digits:
+                card_failure = await _fill_card_number_with_readback(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    text=text,
+                    expected_digits=card_expected_digits,
+                )
+                if card_failure is not None:
+                    return [card_failure]
+            else:
+                await skyvern_element.input_sequentially(text=text)
+                if verify_tel_input_after_fill:
+                    # Read the typed digits back; on mismatch, clear and retype once. A second mismatch
+                    # fails the action here rather than letting it surface as a silent wrong fill.
                     try:
                         await _verify_tel_input_after_fill(
                             skyvern_element=skyvern_element,
                             tag_name=tag_name,
                             expected_value=text,
                         )
-                    except PhoneNumberInputMismatch as mismatch:
-                        LOG.warning(
-                            "Phone input read-back mismatch after retry",
-                            action=action,
-                            element_id=skyvern_element.get_id(),
-                            expected_digit_count=mismatch.expected_digit_count,
-                            actual_digit_count=mismatch.actual_digit_count,
-                        )
-                        return [ActionFailure(mismatch)]
+                    except PhoneNumberInputMismatch:
+                        await skyvern_element.input_clear()
+                        await skyvern_element.input_sequentially(text=text)
+                        try:
+                            await _verify_tel_input_after_fill(
+                                skyvern_element=skyvern_element,
+                                tag_name=tag_name,
+                                expected_value=text,
+                            )
+                        except PhoneNumberInputMismatch as mismatch:
+                            LOG.warning(
+                                "Phone input read-back mismatch after retry",
+                                action=action,
+                                element_id=skyvern_element.get_id(),
+                                expected_digit_count=mismatch.expected_digit_count,
+                                actual_digit_count=mismatch.actual_digit_count,
+                            )
+                            return [ActionFailure(mismatch)]
 
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
