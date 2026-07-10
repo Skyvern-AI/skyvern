@@ -180,6 +180,10 @@ MAX_NO_PROGRESS_INTERACTION_ATTEMPTS = 4
 _NO_PROGRESS_INTERACTION_REASON_CODES = frozenset({"loop_detected_no_forward_progress_interaction"})
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
 TOTAL_TIMEOUT_SECONDS = 900
+# Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
+# never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
+# constant so tests can shrink it instead of paying a full second per deadline.
+MIN_DEADLINE_REMAINING_SECONDS = 1.0
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
 # already prevent individual branches from looping; this stops a brand-new
 # enforcement rule that forgets its own counter from spinning within 900s.
@@ -2024,13 +2028,13 @@ async def _run_streamed_with_deadline(
     ``_build_exit_result`` path emits a non-empty REPLY before the
     client's own transport timeout closes the stream.
 
-    ``max(1.0, ...)`` floors ``remaining`` so ``wait_for(timeout=0)``
-    never panics on an already-spent budget.
+    ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so
+    ``wait_for(timeout=0)`` never panics on an already-spent budget.
     """
     from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
 
     elapsed = time.monotonic() - start_time
-    remaining = max(1.0, TOTAL_TIMEOUT_SECONDS - elapsed)
+    remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
     result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
     try:
         try:

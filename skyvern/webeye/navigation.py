@@ -39,8 +39,11 @@ async def navigate_with_retry(
     retry_times: int,
     settle: SettleFunc,
     wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
-    sleep: SleepFunc = asyncio.sleep,
+    sleep: SleepFunc | None = None,
 ) -> None:
+    # Late-bound so a test patching ``asyncio.sleep`` reaches the retry backoff.
+    if sleep is None:
+        sleep = asyncio.sleep
     degradation = _DEGRADATION_MAP.get(wait_until, [wait_until])
 
     for attempt in range(retry_times):

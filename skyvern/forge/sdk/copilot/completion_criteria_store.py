@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_requested_output_evidence_source,
     _normalize_contingent_antecedent_output_path,
     _normalize_deliverable_kind,
+    is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
     judgment_truth_condition_key,
     normalized_criterion_outcome_key,
@@ -426,6 +427,7 @@ def reconcile_completion_criteria(
     """
     stored = snapshot.active if snapshot is not None else None
     next_epoch = snapshot.next_epoch if snapshot is not None else 1
+    fresh = [criterion for criterion in fresh if not is_defer_authoring_durable_fill_criterion(criterion)]
     if fresh and all(is_fallback_floor_criterion(criterion) for criterion in fresh):
         fresh = []
     if stored is None:
