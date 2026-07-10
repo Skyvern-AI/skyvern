@@ -119,6 +119,28 @@ def _replace_direct_string_in_value(value: Any, old_key: str, new_key: str) -> A
     return value
 
 
+def _replace_direct_string_param_refs(value: Any, key_mapping: dict[str, str], *, _in_key_field: bool = False) -> Any:
+    """Rewrites exact-match direct string references to parameter keys (e.g. source_parameter_key).
+
+    Resolves each string against the whole mapping in a single pass and stops at the first match,
+    so a collision-driven rename chain (my-key -> my_key AND my_key -> my_key_2) can't compound a
+    reference into the wrong target. The parameter's own `key` field is never rewritten here: it is
+    already finalized by _sanitize_parameters, and re-applying the mapping to it would collapse two
+    distinct keys into the same name.
+    """
+    if isinstance(value, str):
+        if _in_key_field:
+            return value
+        return key_mapping.get(value, value)
+    elif isinstance(value, dict):
+        return {
+            k: _replace_direct_string_param_refs(v, key_mapping, _in_key_field=(k == "key")) for k, v in value.items()
+        }
+    elif isinstance(value, list):
+        return [_replace_direct_string_param_refs(item, key_mapping) for item in value]
+    return value
+
+
 def _make_unique(candidate: str, seen: set[str]) -> str:
     """Appends a numeric suffix to make candidate unique within the seen set.
 
@@ -350,15 +372,21 @@ def sanitize_workflow_yaml_with_references(workflow_yaml: dict[str, Any]) -> dic
             workflow_definition["parameters"] = _replace_references_in_value(
                 workflow_definition["parameters"], old_key, new_key
             )
-            # Also update direct string references (e.g., source_parameter_key)
-            workflow_definition["parameters"] = _replace_direct_string_in_value(
-                workflow_definition["parameters"], old_key, new_key
-            )
 
         if isinstance(workflow_definition.get("workflow_system_prompt"), str):
             workflow_definition["workflow_system_prompt"] = _replace_references_in_value(
                 workflow_definition["workflow_system_prompt"], old_key, new_key
             )
+
+    # Update direct string references to parameter keys (e.g. source_parameter_key) in one atomic
+    # pass. Doing this per-mapping-entry sequentially chained a collision rename (my-key -> my_key
+    # then my_key -> my_key_2) onto the already-renamed reference, and it also rewrote each param's
+    # own final `key` field back into a duplicate. _replace_direct_string_param_refs leaves the key
+    # field alone and resolves each reference against the whole mapping exactly once.
+    if param_key_mapping and "parameters" in workflow_definition:
+        workflow_definition["parameters"] = _replace_direct_string_param_refs(
+            workflow_definition["parameters"], param_key_mapping
+        )
 
     # Rewrite workflow-level error_code_mapping atomically so substitutions don't chain
     # (e.g. foo-bar -> foo_bar and foo_bar -> foo_bar_2 must not combine into foo_bar_2).
