@@ -221,7 +221,8 @@ export type WorkflowBlock =
   | WorkflowTriggerBlock
   | GoogleSheetsReadBlock
   | GoogleSheetsWriteBlock
-  | PdfFillBlock;
+  | PdfFillBlock
+  | SplitPdfBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -252,6 +253,7 @@ export const WorkflowBlockTypes = {
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
   PDFFill: "pdf_fill",
+  SplitPDF: "split_pdf",
 } as const;
 
 // all of them
@@ -638,6 +640,14 @@ export type PdfFillBlock = WorkflowBlockBase & {
   file_url: string;
   prompt: string;
   payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type SplitPdfBlock = WorkflowBlockBase & {
+  block_type: "split_pdf";
+  file_url: string;
+  prompt: string;
   llm_key: string | null;
   parameters: Array<WorkflowParameter>;
 };
