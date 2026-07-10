@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, NotRequired, TypedDict
+from typing import Any, Awaitable, Callable, List, TypedDict
 
 import structlog
 from fuzzysearch import find_near_matches
@@ -5963,8 +5963,9 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
     return out
 
 
-def _custom_select_choice_input_ids(node: dict) -> set[str]:
+def _custom_select_descendant_choice_inputs(node: dict) -> tuple[set[str], bool]:
     input_ids: set[str] = set()
+    contains_choice_input = False
     queue: deque[dict] = deque(node.get("children") or [])
     while queue:
         child = queue.popleft()
@@ -5974,11 +5975,13 @@ def _custom_select_choice_input_ids(node: dict) -> set[str]:
         attrs = child.get("attributes") or {}
         input_type = str(attrs.get("type") or "").lower()
         element_id = str(child.get("id") or "")
-        if tag == "input" and input_type in ("checkbox", "radio") and element_id:
-            input_ids.add(element_id)
+        if tag == "input" and input_type in ("checkbox", "radio"):
+            contains_choice_input = True
+            if element_id:
+                input_ids.add(element_id)
         for grandchild in child.get("children") or []:
             queue.append(grandchild)
-    return input_ids
+    return input_ids, contains_choice_input
 
 
 def _custom_select_choice_value(node: dict) -> str | None:
@@ -6013,17 +6016,17 @@ class _CustomSelectCandidate(TypedDict):
     label: str | None
     element_id: str | None
     value: str | None
-    is_choice_input: NotRequired[bool]
+    is_choice_input: bool
 
 
 def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_CustomSelectCandidate]:
-    queue: deque[tuple[dict, bool]] = deque((element, False) for element in elements)
+    queue: deque[tuple[dict, bool, bool]] = deque((element, False, False) for element in elements)
     candidates: list[_CustomSelectCandidate] = []
     seen: set[tuple[str | None, str | None, str | None]] = set()
     covered_choice_input_ids: set[str] = set()
 
     while queue:
-        node, in_choice_surface = queue.popleft()
+        node, in_choice_surface, in_multiselectable = queue.popleft()
         if not isinstance(node, dict):
             continue
 
@@ -6034,15 +6037,18 @@ def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_Custo
         element_id = str(node.get("id") or "") or None
         value = _custom_select_choice_value(node)
         label = _select_shadow_label_from_node(node) or value
-        choice_input_ids = _custom_select_choice_input_ids(node)
+        choice_input_ids, contains_choice_input = _custom_select_descendant_choice_inputs(node)
         is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
         is_option_node = role in _CUSTOM_SELECT_CHOICE_ROLES or tag == "option" or (tag == "li" and in_choice_surface)
-        is_label_choice = tag == "label" and bool(choice_input_ids)
-        # Whether the candidate is checkbox/radio-shaped, computed here (rather than re-derived
-        # from the resolved element later) because only the full tree walk sees an option/label
-        # wrapper around a checkbox/radio: the emitted candidate is the wrapper, not the covered
-        # <input> itself.
-        is_choice_input_shape = is_choice_input or bool(choice_input_ids) or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES
+        is_label_choice = tag == "label" and contains_choice_input
+        # Only the full tree walk can see toggle semantics inherited from wrappers or an ancestor
+        # multiselect container; the resolved candidate element alone does not carry that context.
+        is_choice_input_shape = (
+            is_choice_input
+            or contains_choice_input
+            or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES
+            or (in_multiselectable and role in {"option", "treeitem"})
+        )
         has_choice_state = "aria-selected" in attrs or "aria-checked" in attrs
         is_clickable_choice = (
             bool(node.get("interactable"))
@@ -6075,8 +6081,12 @@ def _custom_select_candidates_from_elements(elements: list[dict]) -> list[_Custo
                         covered_choice_input_ids.update(choice_input_ids)
 
         child_in_choice_surface = in_choice_surface or _is_custom_select_choice_surface(role)
+        aria_multiselectable = attrs.get("aria-multiselectable")
+        child_in_multiselectable = in_multiselectable or (
+            isinstance(aria_multiselectable, str) and aria_multiselectable.lower() == "true"
+        )
         for child in node.get("children") or []:
-            queue.append((child, child_in_choice_surface))
+            queue.append((child, child_in_choice_surface, child_in_multiselectable))
 
     return candidates
 
@@ -6108,6 +6118,8 @@ _CUSTOM_SELECT_MATCHED_STATE_JS = r"""
     ].map(normalize).find(Boolean) || "";
     const role = normalize(el.getAttribute("role"));
     const nestedChoice = el.querySelector?.("input[type='checkbox'], input[type='radio']");
+    const multiselectable = el.closest?.("[aria-multiselectable]");
+    const inMultiselectable = normalize(multiselectable?.getAttribute("aria-multiselectable")) === "true";
     const ariaSelected = el.getAttribute("aria-selected") === "true";
     const ariaChecked = el.getAttribute("aria-checked") === "true";
     const selectedAttr = el.hasAttribute("selected") || el.selected === true;
@@ -6115,7 +6127,16 @@ _CUSTOM_SELECT_MATCHED_STATE_JS = r"""
         (el.matches?.("input[type='checkbox'], input[type='radio']") && el.checked)
         || nestedChoice?.checked
     );
-    return { label, role, ariaSelected, ariaChecked, selectedAttr, checked };
+    return {
+        label,
+        role,
+        nestedChoice: nestedChoice != null,
+        inMultiselectable,
+        ariaSelected,
+        ariaChecked,
+        selectedAttr,
+        checked
+    };
 }
 """
 
@@ -6262,7 +6283,9 @@ def _custom_select_matched_state_confirms_pre_click(state: dict | None, expected
         return False
     if any(bool(state.get(field)) for field in ("ariaChecked", "selectedAttr", "checked")):
         return True
-    if str(state.get("role") or "").lower() == "option":
+    # In an aria-multiselectable container aria-selected IS the committed state (clicking would
+    # toggle it off); only single-select options treat bare aria-selected as a keyboard highlight.
+    if str(state.get("role") or "").lower() == "option" and not bool(state.get("inMultiselectable")):
         return False
     return bool(state.get("ariaSelected"))
 
@@ -6437,9 +6460,9 @@ async def _select_deterministic_custom_option(
     matched_candidate = option_candidates[resolution.matched_index]
     element_id = matched_candidate.get("element_id")
     matched_label = resolution.matched_label
-    # Computed by the tree walk in _custom_select_candidates_from_elements, which sees the
-    # label-wraps-checkbox case; the resolved element below may just be the <label>.
-    matched_option_is_choice_input = bool(matched_candidate.get("is_choice_input"))
+    # Computed by the tree walk, which sees wrapper and multiselect-container toggle semantics
+    # that are not necessarily present on the resolved element itself.
+    matched_option_is_choice_input = matched_candidate["is_choice_input"]
     if not element_id:
         return None
 
@@ -6449,6 +6472,15 @@ async def _select_deterministic_custom_option(
         selected_element = await get_skyvern_element(element_id)
         if await selected_element.get_attr("role") == "listbox":
             return None
+
+        matched_state = await _read_custom_select_matched_state(selected_element)
+        live_role = str((matched_state or {}).get("role") or "").lower()
+        live_toggle_shaped = (
+            (bool((matched_state or {}).get("inMultiselectable")) and live_role in {"option", "treeitem"})
+            or live_role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES
+            or bool((matched_state or {}).get("nestedChoice"))
+        )
+        matched_option_is_choice_input = matched_option_is_choice_input or live_toggle_shaped
 
         readback_scope_element = await _resolve_custom_select_readback_scope_element(
             get_readback_scope_element=get_readback_scope_element,
@@ -6460,7 +6492,6 @@ async def _select_deterministic_custom_option(
 
         expected_label = _normalize_select_shadow_text(matched_label)
         if expected_label:
-            matched_state = await _read_custom_select_matched_state(selected_element)
             if _custom_select_matched_state_confirms_pre_click(matched_state, expected_label):
                 return ActionSuccess(), matched_label
             if await _custom_select_scope_confirms_committed(
@@ -6507,9 +6538,8 @@ async def _select_deterministic_custom_option(
         return None
 
     if not matched_option_is_choice_input:
-        # A non-checkbox/radio option (e.g. a button/div-anchored single-select listbox) can be
-        # safely replayed by the LLM mini-agent; only checkbox/radio panels risk toggling into an
-        # unintended state on a retry, so only those hard-fail below.
+        # A non-toggle option (e.g. a button/div-anchored single-select listbox) can be safely
+        # replayed by the LLM mini-agent. Toggle-shaped options hard-fail below instead.
         LOG.info(
             "Deterministic custom-select read-back inconclusive on non-choice-input option; routing to LLM fallback",
             target_value=target_value,
