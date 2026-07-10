@@ -255,3 +255,21 @@ async def test_async_get_workflow_runs_by_id_uses_workflow_scoped_route() -> Non
     assert captured_requests[0].url.params["status"] == "failed"
     assert captured_requests[0].url.params["search_key"] == "prod"
     assert captured_requests[0].url.params["error_code"] == "TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_connect_to_cloud_browser_session_threads_app_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LibrarySkyvern(base_url="https://api.example.test", api_key="test-key")
+    cdp_browser = SimpleNamespace(contexts=[SimpleNamespace(_loop=None)])
+    fake_playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=cdp_browser)))
+    monkeypatch.setattr(client, "_get_playwright", AsyncMock(return_value=fake_playwright))
+    browser_session = SimpleNamespace(
+        browser_session_id="pbs_123",
+        browser_address="wss://cdp.example.test",
+        app_url="https://app.example.test/browser-sessions/pbs_123",
+    )
+
+    browser = await client._connect_to_cloud_browser_session(browser_session)
+
+    assert browser.app_url == "https://app.example.test/browser-sessions/pbs_123"
+    assert browser.browser_session_id == "pbs_123"
