@@ -16,6 +16,8 @@ import {
   Cross2Icon,
   ChevronDownIcon,
   CheckIcon,
+  ArrowUpIcon,
+  StopIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
@@ -62,6 +64,7 @@ import {
   resolveSendAction,
 } from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
+import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { NarrativeView } from "./NarrativeView";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
@@ -90,6 +93,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn, formatElapsedSeconds } from "@/util/utils";
 import { COPILOT_UX_V1_FLAG } from "@/util/featureFlags";
+import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -558,11 +563,23 @@ export function WorkflowCopilotChat({
   const defaultModeVariant = useFeatureFlagValue(
     "WORKFLOW_COPILOT_DEFAULT_MODE",
   );
+  // S4: under the campaign flag, default straight to code-first (skipping the
+  // WORKFLOW_COPILOT_DEFAULT_MODE A/B variant) whenever code-first is accessible.
+  const codeFirstAccessible = copilotV2Enabled && codeBlockModeEnabled;
+  const s4DefaultVariant: ComposerDefaultVariant = codeFirstAccessible
+    ? "build_code"
+    : "build";
   // The variant configures the initial default only when both gating flags are on.
-  const effectiveDefaultVariant: ComposerDefaultVariant =
-    copilotV2Enabled && codeBlockModeEnabled
+  const effectiveDefaultVariant: ComposerDefaultVariant = copilotUxV1Enabled
+    ? s4DefaultVariant
+    : copilotV2Enabled && codeBlockModeEnabled
       ? normalizeComposerDefaultVariant(defaultModeVariant)
       : "build";
+  // codeBlockRequestOverride keys off the same source effectiveDefaultVariant
+  // used, not the raw flag value, so the S4 default stays internally consistent.
+  const codeOverrideVariantSource = copilotUxV1Enabled
+    ? s4DefaultVariant
+    : defaultModeVariant;
   const [composerMode, setComposerMode] = useState<"ask" | "build">(() =>
     effectiveDefaultVariant === "ask" || effectiveDefaultVariant === "ask_code"
       ? "ask"
@@ -573,7 +590,7 @@ export function WorkflowCopilotChat({
   );
   const [codeBlockRequestOverride, setCodeBlockRequestOverride] = useState<
     boolean | null
-  >(() => defaultCodeBlockRequestOverride(defaultModeVariant));
+  >(() => defaultCodeBlockRequestOverride(codeOverrideVariantSource));
   // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
   const composerSeededRef = useRef(false);
   const flagsResolved =
@@ -593,9 +610,15 @@ export function WorkflowCopilotChat({
     );
     setCodeWorkflow(defaultVariantUsesCode(effectiveDefaultVariant));
     setCodeBlockRequestOverride(
-      defaultCodeBlockRequestOverride(defaultModeVariant),
+      defaultCodeBlockRequestOverride(codeOverrideVariantSource),
     );
-  }, [flagsResolved, effectiveDefaultVariant, defaultModeVariant]);
+  }, [
+    flagsResolved,
+    effectiveDefaultVariant,
+    defaultModeVariant,
+    copilotUxV1Enabled,
+    codeOverrideVariantSource,
+  ]);
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
   const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
@@ -681,6 +704,10 @@ export function WorkflowCopilotChat({
   // workflow_run_id — a run's evaluating and final verdict frames share an
   // id, so this stops the same run from being fetched twice.
   const fetchedActionRunIds = useRef<Set<string>>(new Set());
+  // Run ids the copilot claimed via run_outcome — the turn narrates these
+  // itself, so useRunLifecycleAnnouncements suppresses their lifecycle lines by
+  // identity (an unrelated run seen in the same window must still be narrated).
+  const turnOwnedRunIds = useRef<Set<string>>(new Set());
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -737,7 +764,11 @@ export function WorkflowCopilotChat({
   }, []);
   useRunLifecycleAnnouncements({
     workflowRunId: docked && copilotUxV1Enabled ? workflowRunId : undefined,
-    turnInFlightRef: inFlightRef,
+    // isLoading here, not inFlightRef: this hook needs a value React re-runs
+    // its effect on when the turn ends, which a ref can't do. The one-render
+    // lag that matters for the double-submit guard above doesn't matter here.
+    turnInFlight: isLoading,
+    turnOwnedRunIds,
     announce: announceRunLifecycle,
   });
   // Recorded actions arrive well after block_progress (they're persisted in
@@ -805,6 +836,28 @@ export function WorkflowCopilotChat({
       workflowPermanentId,
     ],
   );
+  // Explore/Draft boundary is unobservable (the LLM writes code with no
+  // frames emitted); after DRAFTING_GAP_MS of silence with no pending block
+  // run, assume Draft has started. Re-arms per narrative update; the reducer
+  // guard makes a stale or double-fired timer a no-op.
+  const DRAFTING_GAP_MS = 8000;
+  useEffect(() => {
+    if (!copilotUxV1Enabled) return;
+    if (!shouldArmDraftingGapTimer(narrative)) return;
+    const wait = Math.max(
+      0,
+      DRAFTING_GAP_MS - (Date.now() - narrative.lastActivityAtMs!),
+    );
+    const t = setTimeout(
+      () =>
+        applyStoredNarrativeEvent({
+          type: "client_phase_hint",
+          hintedAtMs: Date.now(),
+        }),
+      wait,
+    );
+    return () => clearTimeout(t);
+  }, [narrative, applyStoredNarrativeEvent, copilotUxV1Enabled]);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
@@ -813,7 +866,6 @@ export function WorkflowCopilotChat({
     requiresLiveBrowser,
     isLiveBrowserReady,
   });
-  const isQueuedPromptWaiting = Boolean(queuedPrompt);
   // Reset on initialMessage change so a re-arrival of the prop (without a
   // remount) can fire auto-send again.
   useEffect(() => {
@@ -1887,6 +1939,15 @@ export function WorkflowCopilotChat({
                 return false;
               case "run_outcome":
                 applyStoredNarrativeEvent(payload);
+                if (payload.workflow_run_id) {
+                  const owned = turnOwnedRunIds.current;
+                  owned.add(payload.workflow_run_id);
+                  while (owned.size > MAX_TURN_SNAPSHOTS) {
+                    const oldest = owned.values().next().value;
+                    if (oldest === undefined) break;
+                    owned.delete(oldest);
+                  }
+                }
                 maybeFetchRecordedActions(payload);
                 return false;
               case "turn_start": {
@@ -2377,8 +2438,12 @@ export function WorkflowCopilotChat({
     queuedPrompt?.reason === "working"
       ? "Queued — sends when this turn finishes."
       : "Prompt queued. Waiting for live browser...";
+  // S4's Queued chip already surfaces queuedPromptWaitingStatus; don't
+  // duplicate it as a second status line above the composer.
   const browserStatusText = queuedPrompt
-    ? queuedPromptWaitingStatus
+    ? copilotUxV1Enabled && copilotV2Enabled
+      ? null
+      : queuedPromptWaitingStatus
     : isLoading
       ? "Copilot is working. Your next send will wait for the next turn."
       : isWaitingForLiveBrowser
@@ -2399,6 +2464,98 @@ export function WorkflowCopilotChat({
   // Mid-turn Accept would be clobbered by the in-flight turn's terminal
   // restore, so gate actions wait for idle.
   const gateActionable = Boolean(proposedWorkflow) && !isLoading;
+  const hasComposerText = inputValue.trim().length > 0;
+  // A live_browser-reason queued prompt parks with no active turn to stop and
+  // a disabled, emptied textarea — the morph button would otherwise render as
+  // a live "Send" that's a guaranteed no-op; only the Queued chip's ✕ acts.
+  const waitingOnQueueOnly = queuedPrompt?.reason === "live_browser";
+  const morphButtonLabel = waitingOnQueueOnly
+    ? "Send disabled — waiting for live browser"
+    : !isLoading
+      ? "Send"
+      : hasComposerText
+        ? "Queue for next turn"
+        : "Stop";
+  // Shared between the legacy fused split-button and the S4 mode pill so the
+  // three options never drift between the two composer treatments.
+  const modeMenuItems = (
+    <>
+      <DropdownMenuItem
+        aria-label="Ask"
+        onSelect={() => {
+          setComposerMode("ask");
+          setCodeWorkflow(false);
+          setCodeBlockRequestOverride(null);
+        }}
+        className={cn("flex items-start gap-2.5", !isBuild && "bg-accent")}
+      >
+        <ModeGlyph mode="ask" />
+        <span className="flex flex-1 flex-col">
+          <span className="text-sm font-medium">Ask</span>
+          <span className="text-xs leading-snug text-muted-foreground">
+            Answer questions and make quick workflow edits.
+          </span>
+        </span>
+        {!isBuild ? <CheckIcon className="h-4 w-4 text-sky-400" /> : null}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        aria-label="Build"
+        onSelect={() => {
+          setComposerMode("build");
+          setCodeWorkflow(false);
+          setCodeBlockRequestOverride(false);
+        }}
+        className={cn(
+          "flex items-start gap-2.5",
+          isBuild && !codeWorkflow && "bg-accent",
+        )}
+      >
+        <ModeGlyph mode="build" />
+        <span className="flex flex-1 flex-col">
+          <span className="text-sm font-medium">Build</span>
+          <span className="text-xs leading-snug text-muted-foreground">
+            Navigates the site to design your workflow, then tests that it
+            works.
+          </span>
+        </span>
+        {isBuild && !codeWorkflow ? (
+          <CheckIcon className="h-4 w-4 text-sky-400" />
+        ) : null}
+      </DropdownMenuItem>
+      {codeOptionAvailable ? (
+        <DropdownMenuItem
+          aria-label={
+            copilotUxV1Enabled ? "Build with code" : "Build workflow as code"
+          }
+          onSelect={() => {
+            setComposerMode("build");
+            setCodeWorkflow(true);
+            setCodeBlockRequestOverride(true);
+          }}
+          className={cn(
+            "flex items-start gap-2.5",
+            isBuild && codeWorkflow && "bg-accent",
+          )}
+        >
+          <ModeGlyph mode="build" glow />
+          <span className="flex flex-1 flex-col">
+            <span className="text-sm font-medium">
+              {copilotUxV1Enabled
+                ? "Build with code"
+                : "Build workflow as code"}
+            </span>
+            <span className="text-xs leading-snug text-muted-foreground">
+              Build the workflow as code. Faster and more flexible, but may need
+              extra detail to handle every edge case.
+            </span>
+          </span>
+          {isBuild && codeWorkflow ? (
+            <CheckIcon className="h-4 w-4 text-sky-400" />
+          ) : null}
+        </DropdownMenuItem>
+      ) : null}
+    </>
+  );
 
   const content = (
     <div
@@ -2505,8 +2662,6 @@ export function WorkflowCopilotChat({
             />
             {messages.map((message, index) => {
               const isLastMessage = index === lastTurnIndex;
-              const showQueuedFooter =
-                isQueuedPromptWaiting && message.id === queuedPrompt?.id;
               if (message.kind === "run_lifecycle") {
                 return (
                   <RunLifecycleLine
@@ -2649,12 +2804,7 @@ export function WorkflowCopilotChat({
                   key={message.id}
                   message={message}
                   footer={
-                    showQueuedFooter ? (
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                        <ReloadIcon className="h-3 w-3 animate-spin" />
-                        <span>{queuedPromptWaitingStatus}</span>
-                      </div>
-                    ) : copilotUxV1Enabled && isGateOwnerOrLast ? (
+                    copilotUxV1Enabled && isGateOwnerOrLast ? (
                       <ReviewGateCard
                         pending
                         verdict={getReviewGateVerdict(
@@ -2749,6 +2899,42 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-border p-3">
+        {copilotUxV1Enabled && copilotV2Enabled ? (
+          <div className="mb-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  title="Switch mode"
+                  aria-label="Switch mode"
+                  className="flex items-center gap-1.5 rounded-full border border-border bg-slate-elevation2 px-2.5 py-1 text-[11px] font-medium text-muted-foreground hover:bg-slate-elevation3 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <span>Mode:</span>
+                  <ModeGlyph
+                    mode={isBuild ? "build" : "ask"}
+                    glow={codeStateActive}
+                  />
+                  <span className="text-foreground">
+                    {codeStateActive
+                      ? "Build with code"
+                      : isBuild
+                        ? "Build"
+                        : "Ask"}
+                  </span>
+                  <ChevronDownIcon className="h-3 w-3" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                side="top"
+                align="start"
+                className="w-[272px] p-1.5"
+                onCloseAutoFocus={(event) => event.preventDefault()}
+              >
+                {modeMenuItems}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        ) : null}
         {copilotUxV1Enabled &&
         proposedWorkflow &&
         pendingProposalTurnId &&
@@ -2775,6 +2961,22 @@ export function WorkflowCopilotChat({
             pending · Review
           </button>
         ) : null}
+        {copilotUxV1Enabled && copilotV2Enabled && queuedPrompt ? (
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-slate-elevation2 px-2.5 py-1.5 text-xs text-muted-foreground">
+            <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
+            <span className="shrink-0 font-medium text-foreground">Queued</span>
+            <span className="flex-1 truncate">{queuedPromptWaitingStatus}</span>
+            <button
+              type="button"
+              onClick={cancelQueuedPrompt}
+              title="Cancel queued message"
+              aria-label="Cancel queued message"
+              className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            >
+              <Cross2Icon className="h-3 w-3" />
+            </button>
+          </div>
+        ) : null}
         {inputStatusText ? (
           <div
             className="mb-2 text-xs text-muted-foreground"
@@ -2790,7 +2992,14 @@ export function WorkflowCopilotChat({
             isHearingSpeech={isSpeechHearing}
             disabled={inputDisabled}
             onToggle={toggleSpeech}
-            className="h-10 w-10 rounded-lg"
+            className={
+              copilotUxV1Enabled && copilotV2Enabled
+                ? "h-8 w-8 rounded-full border-0 bg-transparent"
+                : "h-10 w-10 rounded-lg"
+            }
+            iconClassName={
+              copilotUxV1Enabled && copilotV2Enabled ? "h-3.5 w-3.5" : undefined
+            }
           />
           <textarea
             ref={setTextareaRef}
@@ -2816,7 +3025,35 @@ export function WorkflowCopilotChat({
               overflowY: "hidden",
             }}
           />
-          {isLoading && queuedPrompt ? (
+          {copilotUxV1Enabled && copilotV2Enabled ? (
+            <TooltipProvider>
+              <ControlTooltip
+                content={morphButtonLabel}
+                blocked={waitingOnQueueOnly}
+              >
+                <button
+                  type="button"
+                  disabled={waitingOnQueueOnly}
+                  onClick={() =>
+                    isLoading && !hasComposerText ? cancelSend() : handleSend()
+                  }
+                  aria-label={morphButtonLabel}
+                  className={cn(
+                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                    isLoading && !hasComposerText
+                      ? "bg-slate-elevation4 text-foreground hover:bg-slate-elevation3"
+                      : "bg-cta text-cta-foreground hover:bg-cta-hover",
+                  )}
+                >
+                  {isLoading && !hasComposerText ? (
+                    <StopIcon className="h-3 w-3" />
+                  ) : (
+                    <ArrowUpIcon className="h-4 w-4" />
+                  )}
+                </button>
+              </ControlTooltip>
+            </TooltipProvider>
+          ) : isLoading && queuedPrompt ? (
             <>
               <button
                 onClick={cancelQueuedPrompt}
@@ -2910,81 +3147,7 @@ export function WorkflowCopilotChat({
                   className="w-[272px] p-1.5"
                   onCloseAutoFocus={(event) => event.preventDefault()}
                 >
-                  <DropdownMenuItem
-                    aria-label="Ask"
-                    onSelect={() => {
-                      setComposerMode("ask");
-                      setCodeWorkflow(false);
-                      setCodeBlockRequestOverride(null);
-                    }}
-                    className={cn(
-                      "flex items-start gap-2.5",
-                      !isBuild && "bg-accent",
-                    )}
-                  >
-                    <ModeGlyph mode="ask" />
-                    <span className="flex flex-1 flex-col">
-                      <span className="text-sm font-medium">Ask</span>
-                      <span className="text-xs leading-snug text-muted-foreground">
-                        Answer questions and make quick workflow edits.
-                      </span>
-                    </span>
-                    {!isBuild ? (
-                      <CheckIcon className="h-4 w-4 text-sky-400" />
-                    ) : null}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    aria-label="Build"
-                    onSelect={() => {
-                      setComposerMode("build");
-                      setCodeWorkflow(false);
-                      setCodeBlockRequestOverride(false);
-                    }}
-                    className={cn(
-                      "flex items-start gap-2.5",
-                      isBuild && !codeWorkflow && "bg-accent",
-                    )}
-                  >
-                    <ModeGlyph mode="build" />
-                    <span className="flex flex-1 flex-col">
-                      <span className="text-sm font-medium">Build</span>
-                      <span className="text-xs leading-snug text-muted-foreground">
-                        Navigates the site to design your workflow, then tests
-                        that it works.
-                      </span>
-                    </span>
-                    {isBuild && !codeWorkflow ? (
-                      <CheckIcon className="h-4 w-4 text-sky-400" />
-                    ) : null}
-                  </DropdownMenuItem>
-                  {codeOptionAvailable ? (
-                    <DropdownMenuItem
-                      aria-label="Build workflow as code"
-                      onSelect={() => {
-                        setComposerMode("build");
-                        setCodeWorkflow(true);
-                        setCodeBlockRequestOverride(true);
-                      }}
-                      className={cn(
-                        "flex items-start gap-2.5",
-                        isBuild && codeWorkflow && "bg-accent",
-                      )}
-                    >
-                      <ModeGlyph mode="build" glow />
-                      <span className="flex flex-1 flex-col">
-                        <span className="text-sm font-medium">
-                          Build workflow as code
-                        </span>
-                        <span className="text-xs leading-snug text-muted-foreground">
-                          Build the workflow as code. Faster and more flexible,
-                          but may need extra detail to handle every edge case.
-                        </span>
-                      </span>
-                      {isBuild && codeWorkflow ? (
-                        <CheckIcon className="h-4 w-4 text-sky-400" />
-                      ) : null}
-                    </DropdownMenuItem>
-                  ) : null}
+                  {modeMenuItems}
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
