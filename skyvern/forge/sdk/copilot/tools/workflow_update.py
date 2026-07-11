@@ -97,8 +97,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     arm_credential_scout_reopen,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
+    synthesized_goal_completion_landing_pending,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
+    synthesized_trajectory_is_goal_complete,
+    synthesized_trajectory_reaches_goal,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
@@ -113,6 +116,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     declared_string_workflow_parameter_keys,
     resolve_output_contract_actuation,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
 from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
@@ -5469,21 +5473,45 @@ def _author_time_reject_reopens_synthesized_imposition(ctx: AgentContext) -> boo
     )
 
 
+def _reopen_download_target_registers(ctx: AgentContext) -> bool:
+    target = ctx.reached_download_target
+    return isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip())
+
+
 def _log_imposition_skipped_after_update(ctx: AgentContext) -> None:
     scout_trajectory = ctx.scout_trajectory
     if not scout_trajectory:
         return
-    target = ctx.reached_download_target
     LOG.info(
         "copilot_imposition_skipped_after_update",
         trajectory_length=len(scout_trajectory),
-        reopen_download_target=(
-            isinstance(target, ReachedDownloadTarget)
-            and not target.already_registered
-            and bool(target.selector.strip())
-        ),
+        reopen_download_target=_reopen_download_target_registers(ctx),
         reopen_persistence_after_failed_run=synthesized_persistence_reopened_after_failed_run(ctx),
         reopen_author_time_reject=_author_time_reject_reopens_synthesized_imposition(ctx),
+        reaches_goal=synthesized_trajectory_reaches_goal(ctx),
+        goal_complete=synthesized_trajectory_is_goal_complete(ctx),
+        synthesized_goal_complete_landed=ctx.synthesized_goal_complete_landed,
+    )
+
+
+def _imposition_admission_key_after_update(ctx: AgentContext) -> str:
+    if synthesized_goal_completion_landing_pending(ctx):
+        return "goal_completion_landing_pending"
+    if synthesized_trajectory_reaches_goal(ctx) and not ctx.synthesized_goal_complete_landed:
+        return "goal_reaching_spine_unlanded"
+    if _reopen_download_target_registers(ctx):
+        return "reopen_download_target"
+    if synthesized_persistence_reopened_after_failed_run(ctx):
+        return "reopen_failed_run"
+    return "reopen_author_time_reject"
+
+
+def _log_imposition_admitted_after_update(ctx: AgentContext) -> None:
+    LOG.info(
+        "copilot_imposition_admitted_after_update",
+        admission_key=_imposition_admission_key_after_update(ctx),
+        trajectory_length=len(ctx.scout_trajectory),
+        goal_complete=synthesized_trajectory_is_goal_complete(ctx),
     )
 
 
@@ -5534,6 +5562,162 @@ def _select_synthesized_imposition_code_block(
     if len(changed_without_download_intent) == 1:
         return changed_without_download_intent[0]
     return None
+
+
+_ADMISSIBLE_BROWSER_COVERAGE_ROUTE = (
+    "The scouted spine is the browser draft: extend browser coverage by scouting the step so the spine carries it, "
+    "never by authoring browser calls freehand."
+)
+
+
+class _StaleSpineRungReplacement(NamedTuple):
+    violation: str | None
+    replaced_labels: list[str]
+
+
+def _code_block_drives_browser(block: Mapping[str, Any]) -> bool:
+    mutations, _, ambiguous = _browser_surface_for_code(str(block.get("code") or ""))
+    return bool(mutations or ambiguous)
+
+
+def _spine_carrier_code_block(
+    code_blocks: list[dict[str, Any]],
+    *,
+    prior_yaml: str | None,
+) -> dict[str, Any] | None:
+    if not code_blocks:
+        return None
+    changed_blocks = [block for block in code_blocks if _submitted_code_block_changed(block, prior_yaml)]
+    for block in changed_blocks:
+        if _code_block_drives_browser(block):
+            return block
+    return changed_blocks[0] if changed_blocks else code_blocks[0]
+
+
+def _stale_spine_rung_blocks(
+    code_blocks: list[dict[str, Any]],
+    *,
+    carrier: Mapping[str, Any],
+    prior_yaml: str | None,
+) -> list[dict[str, Any]]:
+    """Changed non-carrier browser-driving blocks, each on an owned attempt either a duplicate spine rung or an
+    ungrounded hand-authored one that the spine replaces. Blocks that only parse or extract carry no browser surface
+    and are never touched."""
+    return [
+        block
+        for block in code_blocks
+        if block is not carrier
+        and _submitted_code_block_changed(block, prior_yaml)
+        and _code_block_drives_browser(block)
+    ]
+
+
+def _stale_spine_rung_provenance(
+    stale_rungs: list[dict[str, Any]],
+    *,
+    scouted_mutations: list[_BrowserMutationSignature],
+    diagnostics: SynthesisDiagnostics,
+) -> list[_BrowserSurfaceRejectionProvenance]:
+    """Provenance for the ungrounded actions among the replaced rungs; a rung that only duplicates scouted
+    signatures yields none, which is what distinguishes a duplicate from a hand-authored rung in the record."""
+    scouted_signatures = set(scouted_mutations)
+    provenance: list[_BrowserSurfaceRejectionProvenance] = []
+    for block in stale_rungs:
+        label = _code_block_label(block)
+        mutations, _, ambiguous = _browser_surface_for_code(str(block.get("code") or ""))
+        provenance.extend(
+            _classify_unscouted_mutation(
+                mutation,
+                scouted_mutations=scouted_mutations,
+                diagnostics=diagnostics,
+                site="whole_trajectory",
+                block_label=label,
+            )
+            for mutation in sorted(mutation for mutation in mutations if mutation not in scouted_signatures)
+        )
+        provenance.extend(
+            _ambiguous_browser_action_provenance(action, site="whole_trajectory", block_label=label)
+            for action in sorted(ambiguous)
+        )
+    return provenance
+
+
+def _draft_leaves_scouted_rungs_uncovered(
+    code_blocks: list[dict[str, Any]], *, synthesized: SynthesizedCodeBlock
+) -> bool:
+    draft_calls = [
+        (mutation.method, mutation.receiver)
+        for block in code_blocks
+        for mutation in _browser_surface_for_code(str(block.get("code") or ""))[0]
+    ]
+    return bool(uncovered_required_emitted_interactions(synthesized.diagnostics.emitted_interactions, draft_calls))
+
+
+def _code_block_browser_actions(block: Mapping[str, Any]) -> list[str]:
+    mutations, _, ambiguous = _browser_surface_for_code(str(block.get("code") or ""))
+    return sorted({f"{mutation.receiver}.{mutation.method}" for mutation in mutations} | set(ambiguous))
+
+
+def _workflow_string_scalars(node: Any, *, excluded: Mapping[str, Any]) -> Iterator[str]:
+    if node is excluded:
+        return
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, Mapping):
+        for value in node.values():
+            yield from _workflow_string_scalars(value, excluded=excluded)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _workflow_string_scalars(item, excluded=excluded)
+
+
+def _code_block_output_is_referenced(parsed: Mapping[str, Any], block: Mapping[str, Any]) -> bool:
+    label = str(block.get("label") or "").strip()
+    if not label:
+        return False
+    output_key = f"{label}_output"
+    return any(output_key in text for text in _workflow_string_scalars(parsed, excluded=block))
+
+
+def _remove_top_level_code_blocks(parsed: dict[str, Any], removed: list[dict[str, Any]]) -> bool:
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return False
+    blocks = definition.get("blocks")
+    if not isinstance(blocks, list):
+        return False
+    if any(not any(existing is block for existing in blocks) for block in removed):
+        return False
+    definition["blocks"] = [block for block in blocks if all(block is not stale for stale in removed)]
+    return True
+
+
+def _drop_stale_spine_rung_blocks(
+    parsed: dict[str, Any],
+    stale_rungs: list[dict[str, Any]],
+    *,
+    carrier_label: str,
+    provenance: list[_BrowserSurfaceRejectionProvenance],
+) -> _StaleSpineRungReplacement:
+    undroppable = [block for block in stale_rungs if _code_block_output_is_referenced(parsed, block)]
+    if not undroppable and _remove_top_level_code_blocks(parsed, stale_rungs):
+        replaced_labels = [_code_block_label(block) for block in stale_rungs]
+        LOG.info(
+            "copilot_spine_stale_rung_dropped",
+            carrier_label=carrier_label,
+            dropped_labels=replaced_labels,
+            dropped_actions=[action for block in stale_rungs for action in _code_block_browser_actions(block)],
+            dropped_provenance=[record._asdict() for record in provenance],
+        )
+        return _StaleSpineRungReplacement(violation=None, replaced_labels=replaced_labels)
+    blocked = ", ".join(f"`{_code_block_label(block)}`" for block in (undroppable or stale_rungs))
+    violation = (
+        f"Unable to impose synthesized code block: the scouted spine belongs on `{carrier_label}`, but {blocked} "
+        f"still drive(s) the browser and cannot be removed automatically. Delete those block(s) and resubmit with "
+        f"the browser spine on a single code block. {_ADMISSIBLE_BROWSER_COVERAGE_ROUTE}"
+        f"{_provenance_suffix_text(provenance)}"
+    )
+    return _StaleSpineRungReplacement(violation=violation, replaced_labels=[])
 
 
 def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: SynthesisDiagnostics) -> bool:
@@ -6352,6 +6536,8 @@ def _persist_seam_spine_under_build_result(
     workflow_yaml: str, ctx: AgentContext
 ) -> _SynthesizedCodeImpositionResult | None:
     if not ctx.impose_synthesized_code_block:
+        return None
+    if ctx.spine_imposition_owned_attempt:
         return None
     # First-persist drafts stay imposition's concern; this seam guards later persists in a turn that
     # already committed one, and the turn-end checkpoint owns coverage for everything else.
@@ -7552,13 +7738,22 @@ def _split_selected_output_owner_into_browser_stages(
 
 
 def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
+    ctx.pending_goal_complete_landing = False
+    ctx.pending_requested_output_extraction_candidate = None
+    ctx.spine_imposition_owned_attempt = False
     if not getattr(ctx, "impose_synthesized_code_block", False):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
-    if ctx.update_workflow_called and not _should_impose_after_update_attempt(ctx):
+    reaches_goal = synthesized_trajectory_reaches_goal(ctx)
+    # Goal-completeness gates on the requested-output plan, which materializes mid-turn, so keying availability on
+    # it would make ownership race the plan; reach is monotone in the scout's capture. Landing still closes the lane.
+    spine_landing_available = reaches_goal and not ctx.synthesized_goal_complete_landed
+    if ctx.update_workflow_called and not spine_landing_available and not _should_impose_after_update_attempt(ctx):
         _log_imposition_skipped_after_update(ctx)
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    if ctx.update_workflow_called:
+        _log_imposition_admitted_after_update(ctx)
 
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     if not isinstance(scout_trajectory, list) or not scout_trajectory:
@@ -7577,12 +7772,26 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         prior_yaml=prior_yaml,
         preferred_labels=_recorded_outcome_imposition_block_labels(ctx),
     )
+    if code_block is None and reaches_goal:
+        code_block = _spine_carrier_code_block(code_blocks, prior_yaml=prior_yaml)
     if code_block is None:
+        if reaches_goal:
+            LOG.info("copilot_spine_imposition_no_carrier", code_block_count=len(code_blocks))
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     submitted_code = str(code_block.get("code") or "")
 
-    if not _submitted_code_block_changed(code_block, prior_yaml):
+    owns_spine = reaches_goal
+    ctx.spine_imposition_owned_attempt = owns_spine
+    carrier_changed = _submitted_code_block_changed(code_block, prior_yaml)
+    if not owns_spine and not carrier_changed:
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    if owns_spine:
+        LOG.info(
+            "copilot_spine_imposition_owned_attempt",
+            carrier_label=_code_block_label(code_block),
+            code_block_count=len(code_blocks),
+            carrier_changed=carrier_changed,
+        )
 
     extraction_plan = requested_output_extraction_plan(ctx)
     extraction_candidate_refresh_allowed = synthesized_persistence_reopened(
@@ -7607,6 +7816,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
         )
+    imposed_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     if extraction_plan is not None:
         candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
         if candidate is None:
@@ -7624,9 +7834,29 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
                 workflow_yaml=workflow_yaml,
                 violations=["Unable to impose synthesized code block: extraction candidate identity changed."],
             )
-        ctx.requested_output_extraction_candidate = candidate
+        imposed_candidate = candidate
 
     synthesized_spine_code = synthesized.interaction_code or synthesized.code
+    if not carrier_changed and not _draft_leaves_scouted_rungs_uncovered(code_blocks, synthesized=synthesized):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    replaced_rung_labels: list[str] = []
+    if owns_spine:
+        stale_rungs = _stale_spine_rung_blocks(code_blocks, carrier=code_block, prior_yaml=prior_yaml)
+        if stale_rungs:
+            replacement = _drop_stale_spine_rung_blocks(
+                parsed,
+                stale_rungs,
+                carrier_label=_code_block_label(code_block),
+                provenance=_stale_spine_rung_provenance(
+                    stale_rungs,
+                    scouted_mutations=_browser_surface_for_code(synthesized_spine_code)[0],
+                    diagnostics=synthesized.diagnostics,
+                ),
+            )
+            if replacement.violation is not None:
+                return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml, violations=[replacement.violation])
+            replaced_rung_labels = replacement.replaced_labels
+            code_blocks = [block for block in code_blocks if all(block is not stale for stale in stale_rungs)]
     if _separated_spine_already_imposed(code_blocks, code_block, synthesized_spine_code):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
@@ -7911,6 +8141,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         if under_build is not None:
             return under_build
         code_block["code"] = imposed_code
+    if replaced_rung_labels:
+        substitutions["replaced_hand_authored_browser_rungs"] = replaced_rung_labels
+        substitutions["browser_coverage_route"] = _ADMISSIBLE_BROWSER_COVERAGE_ROUTE
     if parameter_reconciliation.aliases:
         substitutions["parameter_aliases"] = parameter_reconciliation.aliases
     if extraction_suffix:
@@ -7937,6 +8170,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             candidate_source=extraction_candidate_source,
             candidate_fingerprint=synthesized.extraction_fingerprint,
         )
+    ctx.pending_requested_output_extraction_candidate = imposed_candidate
+    if synthesized_trajectory_is_goal_complete(ctx):
+        ctx.pending_goal_complete_landing = True
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
         substitutions=substitutions,
@@ -9809,6 +10045,14 @@ def _record_code_only_raw_secret_reject_span(ctx: AgentContext, verdict: OutputP
         pass
 
 
+def _persisted_landing_leaves_spine_uncovered(ctx: AgentContext) -> bool:
+    try:
+        return bool(_scouted_spine_open_obligation(ctx))
+    except Exception:
+        LOG.warning("copilot_landing_spine_coverage_read_failed", exc_info=True)
+        return True
+
+
 def _record_workflow_update_result(
     copilot_ctx: Any, result: dict[str, Any], prior_definition: object | None = None
 ) -> None:
@@ -9826,6 +10070,13 @@ def _record_workflow_update_result(
         if isinstance(block_count, int):
             copilot_ctx.last_update_block_count = block_count
     copilot_ctx.update_workflow_called = True
+    if copilot_ctx.pending_requested_output_extraction_candidate is not None:
+        copilot_ctx.requested_output_extraction_candidate = copilot_ctx.pending_requested_output_extraction_candidate
+        copilot_ctx.pending_requested_output_extraction_candidate = None
+    if copilot_ctx.pending_goal_complete_landing:
+        if not _persisted_landing_leaves_spine_uncovered(copilot_ctx):
+            copilot_ctx.synthesized_goal_complete_landed = True
+        copilot_ctx.pending_goal_complete_landing = False
     copilot_ctx.synthesized_block_reopened_after_failed_run = False
     copilot_ctx.synthesized_block_reopened_for_output_coverage = False
     copilot_ctx.uncovered_output_rescout_steer_key = None

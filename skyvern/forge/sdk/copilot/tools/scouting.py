@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+from dataclasses import replace
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
@@ -1369,6 +1370,18 @@ def _register_reached_download_scout_interaction(ctx: AgentContext, target: Reac
     )
 
 
+def _with_trajectory_anchor(ctx: AgentContext, target: ReachedDownloadTarget) -> ReachedDownloadTarget:
+    """Pin the target to the trajectory position where the affordance was observed, using the stored
+    ``trajectory_index`` rather than the list position so the anchor survives trajectory eviction."""
+    trajectory = list(ctx.scout_trajectory)
+    if not trajectory:
+        return target
+    anchor = trajectory[-1].get("trajectory_index")
+    if not isinstance(anchor, int):
+        return target
+    return replace(target, trajectory_anchor=anchor)
+
+
 async def _maybe_attach_reached_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1400,7 +1413,7 @@ async def _maybe_attach_reached_download_target(
         data["reached_download_guidance"] = _reached_download_guidance_for(target)
         if not target.already_registered:
             # The pure synthesizer compiles the terminal expect_download step from this typed object.
-            ctx.reached_download_target = target
+            ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
             if ctx.synthesized_block_offered and not ctx.update_workflow_called:
                 # The prompt-side offer latched before this download target resolved, so it rendered the
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.

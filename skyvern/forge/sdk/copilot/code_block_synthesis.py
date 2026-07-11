@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import structlog
+
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     FrozenRequestedOutputExtractionCandidate,
@@ -32,6 +34,8 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.utils.strings import escape_code_fences
+
+LOG = structlog.get_logger()
 
 _MAX_STEPS = 60
 _INDENT = "    "
@@ -274,6 +278,8 @@ class SynthesisDiagnostics:
     # retained trajectory indices. Diagnostics-only, never serialized.
     emitted_interactions: list[dict[str, Any]] = field(default_factory=list)
     forgiven_interactions: list[dict[str, Any]] = field(default_factory=list)
+    download_terminal_anchor: int | None = None
+    download_terminal_dropped_trailing: int = 0
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
@@ -759,6 +765,23 @@ def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict
     return "", -1
 
 
+def _trajectory_prefix_at_anchor(
+    trajectory: Sequence[Mapping[str, Any]], anchor: int | None
+) -> tuple[Sequence[Mapping[str, Any]], int]:
+    """Cut the trajectory at the position where the download affordance was observed; interactions captured
+    after it navigate away, so replaying them would leave the terminal click on a page without the target."""
+    if anchor is None:
+        return trajectory, 0
+    prefix = [
+        interaction
+        for interaction in trajectory
+        if not isinstance(interaction.get("trajectory_index"), int) or int(interaction["trajectory_index"]) <= anchor
+    ]
+    if not prefix or len(prefix) == len(trajectory):
+        return trajectory, 0
+    return prefix, len(trajectory) - len(prefix)
+
+
 def synthesize_code_block(
     trajectory: Sequence[Mapping[str, Any]],
     *,
@@ -783,6 +806,18 @@ def synthesize_code_block(
         and not reached_download_target.already_registered
         and bool(reached_download_target.selector)
     )
+    if compile_download_target and reached_download_target is not None:
+        trajectory, dropped_trailing = _trajectory_prefix_at_anchor(
+            trajectory, reached_download_target.trajectory_anchor
+        )
+        if dropped_trailing:
+            diagnostics.download_terminal_anchor = reached_download_target.trajectory_anchor
+            diagnostics.download_terminal_dropped_trailing = dropped_trailing
+            LOG.info(
+                "copilot_spine_download_terminal_sequenced",
+                anchor=reached_download_target.trajectory_anchor,
+                dropped_trailing_count=dropped_trailing,
+            )
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
         steps.append(

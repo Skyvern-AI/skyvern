@@ -106,7 +106,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     parse_final_response,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     CompletionCriterion,
@@ -2345,6 +2344,8 @@ def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
         return True
     if ctx.synthesized_block_reopened_for_credential_scout:
         return True
+    if synthesized_goal_completion_landing_pending(ctx):
+        return True
     return synthesized_persistence_reopened_after_failed_run(ctx)
 
 
@@ -2553,23 +2554,14 @@ def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bo
     return bool(gap.missing_fields) or gap.missing_submit
 
 
-def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
-    """Complete once the scout trajectory covers a durable entry followed by a commit (or a reached download target)
-    with no requested-output path left uncovered and no engaged credential flow left unscouted; empty requested-output
-    and credential-fill sets fall through to the shape heuristic byte-identically."""
-    if uncovered_requested_output_paths(ctx):
+def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
+    """The scout trajectory covers a durable entry followed by a commit, or a reached download target with a selector.
+    Monotone in what the scout captured, so it cannot flip as the requested-output extraction plan materializes."""
+    trajectory = ctx.scout_trajectory
+    if not trajectory:
         return False
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    plan = requested_output_extraction_plan(ctx)
-    if requested_paths and (plan is None or not requested_paths.issubset(set(plan.requested_output_paths))):
-        return False
-    trajectory = getattr(ctx, "scout_trajectory", None)
-    if not isinstance(trajectory, list) or not trajectory:
-        return False
-    if _credential_flow_scout_gap_incomplete(ctx, trajectory):
-        return False
-    download = getattr(ctx, "reached_download_target", None)
-    if isinstance(download, ReachedDownloadTarget) and download.selector:
+    download = ctx.reached_download_target
+    if download is not None and download.selector:
         return True
     last_entry_index: int | None = None
     for index, item in enumerate(trajectory):
@@ -2583,6 +2575,44 @@ def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
         and not is_generic_entry_opener_click(item)
         for item in trajectory[last_entry_index + 1 :]
     )
+
+
+def _request_expects_unreached_download(ctx: AgentContext) -> bool:
+    # A registered-download deliverable is confirmable only post-run, so it is absent from the pre-run
+    # requested-output gate — a goal-reaching prefix (e.g. sign-in) would otherwise read goal-complete
+    # before the scout reaches the download and land the latch on a partial spine.
+    download = ctx.reached_download_target
+    if download is not None and download.selector:
+        return False
+    return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
+
+
+def synthesized_trajectory_is_goal_complete(ctx: AgentContext) -> bool:
+    """A goal-reaching trajectory with no requested-output path left uncovered; an empty requested-output set falls
+    through to the reach shape byte-identically, so an entry ``synthesize_code_block`` would drop never counts."""
+    if uncovered_requested_output_paths(ctx):
+        return False
+    if _request_expects_unreached_download(ctx):
+        return False
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    plan = requested_output_extraction_plan(ctx)
+    if requested_paths and (plan is None or not requested_paths.issubset(set(plan.requested_output_paths))):
+        return False
+    if _credential_flow_scout_gap_incomplete(ctx, ctx.scout_trajectory):
+        return False
+    return synthesized_trajectory_reaches_goal(ctx)
+
+
+def synthesized_goal_completion_landing_pending(ctx: AgentContext) -> bool:
+    """A goal-complete scout trajectory whose spine has not yet landed in a persisted draft. Only the imposition
+    seam lands a spine and only an authoring call can leave one unlanded, so both are preconditions."""
+    if not ctx.impose_synthesized_code_block:
+        return False
+    if not ctx.update_workflow_called:
+        return False
+    if ctx.synthesized_goal_complete_landed:
+        return False
+    return synthesized_trajectory_is_goal_complete(ctx)
 
 
 def _has_unconsumed_output_contract_advisory_grant(ctx: Any) -> bool:

@@ -430,6 +430,16 @@ class AgentContext:
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
+    # candidate only once the update it rode in on succeeds.
+    pending_requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # Set by the imposition seam when a goal-complete spine is on its way into a draft; the successful update
+    # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
+    pending_goal_complete_landing: bool = False
+    synthesized_goal_complete_landed: bool = False
+    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
+    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    spine_imposition_owned_attempt: bool = False
     synthesized_block_reopened_after_failed_run: bool = False
     synthesized_block_reopened_for_output_coverage: bool = False
     synthesized_block_reopened_for_credential_scout: bool = False
