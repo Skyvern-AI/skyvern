@@ -29,6 +29,7 @@ function FileUploadBlockFormBody({
   const {
     storageType,
     path,
+    prompt,
     s3Bucket,
     awsAccessKeyId,
     awsSecretAccessKey,
@@ -52,6 +53,7 @@ function FileUploadBlockFormBody({
     () => ({
       storageType,
       path,
+      prompt,
       s3Bucket,
       awsAccessKeyId,
       awsSecretAccessKey,
@@ -73,6 +75,7 @@ function FileUploadBlockFormBody({
     [
       storageType,
       path,
+      prompt,
       s3Bucket,
       awsAccessKeyId,
       awsSecretAccessKey,

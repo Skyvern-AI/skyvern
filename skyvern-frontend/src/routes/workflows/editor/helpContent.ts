@@ -154,6 +154,8 @@ export const helpTooltips = {
   fileUpload: {
     ...baseHelpTooltipContent,
     path: "The path of the folder to upload the files to.",
+    prompt:
+      "Optionally describe which downloaded files should be uploaded (e.g. only certain file names). Leave empty to upload all files.",
     storage_type:
       "The type of storage to upload the file to. S3, Azure Blob Storage, Google Drive, and SFTP are supported.",
     s3_bucket: "The S3 bucket to upload the file to.",

@@ -4,6 +4,7 @@ import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowT
 
 export type FileUploadNodeData = NodeBaseData & {
   path: string;
+  prompt: string | null;
   editable: boolean;
   storageType: "s3" | "azure" | "google_drive" | "sftp";
   s3Bucket: string | null;
@@ -33,6 +34,7 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   storageType: "s3",
   label: "",
   path: "{{ workflow_run_id }}",
+  prompt: null,
   s3Bucket: null,
   awsAccessKeyId: null,
   awsSecretAccessKey: null,

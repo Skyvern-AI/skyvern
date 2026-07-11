@@ -422,6 +422,7 @@ export type UploadToS3Block = WorkflowBlockBase & {
 export type FileUploadBlock = WorkflowBlockBase & {
   block_type: "file_upload";
   path: string;
+  prompt: string | null;
   storage_type: "s3" | "azure" | "google_drive" | "sftp";
   s3_bucket: string | null;
   region_name: string | null;

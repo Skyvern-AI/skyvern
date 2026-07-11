@@ -40,6 +40,7 @@ function FileUploadEditorBody({
     editable,
     storageType,
     path,
+    prompt,
     s3Bucket,
     awsAccessKeyId,
     awsSecretAccessKey,
@@ -87,6 +88,25 @@ function FileUploadEditorBody({
             <SelectItem value="sftp">SFTP</SelectItem>
           </SelectContent>
         </Select>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label className="text-sm text-slate-400">Prompt</Label>
+          <HelpTooltip content={helpTooltips["fileUpload"]["prompt"]} />
+        </div>
+        <WorkflowBlockInputTextarea
+          nodeId={blockId}
+          onChange={(value) => update({ prompt: value })}
+          value={prompt ?? ""}
+          placeholder={
+            'e.g. Only upload the PDF files whose names contain "invoice"'
+          }
+          className="nopan text-xs"
+        />
+        <p className="text-xs text-slate-400">
+          Optional. Leave empty to upload all downloaded files.
+        </p>
       </div>
 
       {storageType === "s3" && (
