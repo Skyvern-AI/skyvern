@@ -347,6 +347,7 @@ export type UploadToS3BlockYAML = BlockYAMLBase & {
 export type FileUploadBlockYAML = BlockYAMLBase & {
   block_type: "file_upload";
   path?: string | null;
+  prompt?: string | null;
   storage_type: string;
   s3_bucket: string;
   region_name: string;

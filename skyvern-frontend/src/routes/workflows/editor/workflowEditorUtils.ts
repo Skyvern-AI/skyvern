@@ -1071,6 +1071,7 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+          prompt: block.prompt ?? null,
           storageType: block.storage_type,
           s3Bucket: block.s3_bucket ?? "",
           awsAccessKeyId: block.aws_access_key_id ?? "",
@@ -3083,6 +3084,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_upload",
         path: node.data.path,
+        prompt: node.data.prompt,
         storage_type: node.data.storageType,
         s3_bucket: node.data.s3Bucket ?? "",
         aws_access_key_id: node.data.awsAccessKeyId ?? "",
@@ -4450,6 +4452,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "file_upload",
           path: block.path,
+          prompt: block.prompt,
           storage_type: block.storage_type,
           s3_bucket: block.s3_bucket ?? "",
           aws_access_key_id: block.aws_access_key_id ?? "",

@@ -583,6 +583,7 @@ _QUIET_BLOCK_TYPES: frozenset[str] = frozenset(
         BlockType.TEXT_PROMPT.value,
         BlockType.HUMAN_INTERACTION.value,
         BlockType.FILE_DOWNLOAD.value,
+        BlockType.FILE_UPLOAD.value,
     }
 )
 
