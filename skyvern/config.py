@@ -728,6 +728,12 @@ class Settings(BaseSettings):
     # through Settings. Skyvern Cloud keeps the centrally managed OAuth client.
     ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG: bool = True
 
+    MICROSOFT_OAUTH_CLIENT_ID: str | None = None
+    MICROSOFT_OAUTH_CLIENT_SECRET: str | None = None
+    MICROSOFT_OAUTH_TENANT: str = "common"
+    MICROSOFT_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    MICROSOFT_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
+
     # Google Sheets API runtime tuning
     GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
     GOOGLE_SHEETS_API_MAX_RETRIES: int = 3

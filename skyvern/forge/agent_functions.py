@@ -44,6 +44,7 @@ from skyvern.forge.sdk.services import (
     google_gmail_service,
     google_oauth_service,
     google_sheets_service,
+    microsoft_oauth_service,
     sftp_service,
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
@@ -1216,6 +1217,38 @@ class AgentFunction:
         except Exception:
             LOG.exception(
                 "Failed to get Google Sheets credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+
+    async def get_microsoft_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+        required_scopes: list[str] | None = None,
+    ) -> str | None:
+        try:
+            secrets = await microsoft_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            if required_scopes and not microsoft_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+                LOG.info(
+                    "Microsoft OAuth credential missing required scopes",
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    required_scopes=required_scopes,
+                )
+                return None
+            return await microsoft_oauth_service.refresh_and_rotate(
+                organization_id=organization_id,
+                credential_id=credential_id,
+                credential_secrets=secrets,
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to get Microsoft credentials",
                 organization_id=organization_id,
                 credential_id=credential_id,
             )

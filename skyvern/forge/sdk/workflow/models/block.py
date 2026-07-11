@@ -14,6 +14,7 @@ import re
 import shutil
 import smtplib
 import textwrap
+import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
@@ -5588,6 +5589,10 @@ class FileUploadBlock(Block):
     sftp_private_key_passphrase: str | None = None
     sftp_remote_path: str | None = None
     sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
     continue_on_empty: bool = Field(
         default=False,
@@ -5607,6 +5612,9 @@ class FileUploadBlock(Block):
 
         if self.path and workflow_run_context.has_parameter(self.path):
             parameters.append(workflow_run_context.get_parameter(self.path))
+
+        if self.prompt and workflow_run_context.has_parameter(self.prompt):
+            parameters.append(workflow_run_context.get_parameter(self.prompt))
 
         if self.s3_bucket and workflow_run_context.has_parameter(self.s3_bucket):
             parameters.append(workflow_run_context.get_parameter(self.s3_bucket))
@@ -5658,6 +5666,11 @@ class FileUploadBlock(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+
+        if self.prompt:
+            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
+                self.prompt, workflow_run_context
+            )
 
         if self.s3_bucket:
             self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
@@ -5719,6 +5732,8 @@ class FileUploadBlock(Block):
             self.sftp_host_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.sftp_host_key, workflow_run_context
             )
+
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
@@ -5865,6 +5880,123 @@ class FileUploadBlock(Block):
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
         return files_to_upload
+
+    async def _select_files_to_upload_with_prompt(
+        self,
+        *,
+        prompt: str,
+        files_to_upload: list[str],
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> tuple[list[str], str]:
+        candidate_paths_by_exact_name: dict[str, str] = {}
+        candidate_paths_by_normalized_name: dict[str, str] = {}
+        colliding_normalized_names: set[str] = set()
+        candidate_file_names: list[str] = []
+        for candidate_file_path in files_to_upload:
+            candidate_name = Path(candidate_file_path).name
+            candidate_paths_by_exact_name[candidate_name] = candidate_file_path
+            candidate_file_names.append(candidate_name[:300])
+
+            normalized_name = unicodedata.normalize("NFC", candidate_name)
+            if normalized_name in colliding_normalized_names:
+                continue
+            existing_path = candidate_paths_by_normalized_name.get(normalized_name)
+            if existing_path is not None and existing_path != candidate_file_path:
+                # Distinct files that normalize to the same basename are only safe to resolve by exact spelling.
+                colliding_normalized_names.add(normalized_name)
+                candidate_paths_by_normalized_name.pop(normalized_name)
+            else:
+                candidate_paths_by_normalized_name[normalized_name] = candidate_file_path
+
+        llm_prompt = prompt_engine.load_prompt(
+            "file-upload-select-files",
+            user_instructions=prompt,
+            candidate_file_names=candidate_file_names,
+        )
+        llm_key = self.override_llm_key_for_organization(organization_id)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+
+        workflow_run_block = None
+        try:
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                workflow_run_block_id, organization_id
+            )
+        except Exception as e:
+            LOG.error(
+                "Failed to fetch workflow_run_block for FileUploadBlock selection artifacts",
+                block_label=self.label,
+                workflow_run_block_id=workflow_run_block_id,
+                error=e,
+            )
+
+        llm_response = await llm_api_handler(
+            prompt=llm_prompt,
+            prompt_name="file-upload-select-files",
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            force_dict=False,
+        )
+
+        if workflow_run_block:
+            try:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                    workflow_run_block=workflow_run_block,
+                    artifacts=[
+                        (ArtifactType.LLM_PROMPT, llm_prompt.encode("utf-8")),
+                        (ArtifactType.LLM_RESPONSE, json.dumps(llm_response).encode("utf-8")),
+                    ],
+                )
+            except Exception as e:
+                LOG.error(
+                    "Failed to save FileUploadBlock selection artifacts",
+                    block_label=self.label,
+                    workflow_run_block_id=workflow_run_block_id,
+                    error=e,
+                )
+
+        if not isinstance(llm_response, dict):
+            raise ValueError("File upload selection LLM response must be a JSON object")
+        reasoning = llm_response.get("reasoning")
+        if not isinstance(reasoning, str):
+            raise ValueError("File upload selection LLM response reasoning must be a string")
+
+        selected_names = llm_response.get("files_to_upload")
+        if not isinstance(selected_names, list) or not all(isinstance(name, str) for name in selected_names):
+            raise ValueError("File upload selection LLM response files_to_upload must be a list of strings")
+
+        selected_paths: list[str] = []
+        seen_paths: set[str] = set()
+        unmatched_names: list[str] = []
+        for selected_name in selected_names:
+            resolved_candidate_path = candidate_paths_by_exact_name.get(selected_name)
+            if resolved_candidate_path is None:
+                normalized_name = unicodedata.normalize("NFC", selected_name)
+                if normalized_name not in colliding_normalized_names:
+                    resolved_candidate_path = candidate_paths_by_normalized_name.get(normalized_name)
+            if resolved_candidate_path is None:
+                unmatched_names.append(selected_name)
+                continue
+            if resolved_candidate_path in seen_paths:
+                continue
+            seen_paths.add(resolved_candidate_path)
+            selected_paths.append(resolved_candidate_path)
+
+        # Any selected name outside the candidate list means the response cannot be trusted; fail closed.
+        if unmatched_names:
+            LOG.warning(
+                "FileUploadBlock prompt selected names that are not candidates",
+                block_label=self.label,
+                workflow_run_block_id=workflow_run_block_id,
+                unmatched_name_count=len(unmatched_names),
+                unmatched_names=[name[:100] for name in unmatched_names[:3]],
+            )
+            raise ValueError(
+                f"File upload selection returned {len(unmatched_names)} name(s) that are not candidate files"
+            )
+
+        return selected_paths, reasoning
 
     def _get_files_in_alternate_candidate_download_dirs(
         self,
@@ -6177,6 +6309,42 @@ class FileUploadBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
+
+            if files_to_upload and self.prompt and self.prompt.strip():
+                candidate_count = len(files_to_upload)
+                files_to_upload, selection_reasoning = await self._select_files_to_upload_with_prompt(
+                    prompt=self.prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                selected_count = len(files_to_upload)
+                LOG.info(
+                    "FileUploadBlock prompt selection completed",
+                    block_label=self.label,
+                    candidate_count=candidate_count,
+                    selected_count=selected_count,
+                )
+
+                if not files_to_upload:
+                    LOG.warning(
+                        "FileUploadBlock prompt selected no files; treating as no-op",
+                        block_label=self.label,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        candidate_count=candidate_count,
+                        selected_count=selected_count,
+                        reasoning=selection_reasoning,
+                    )
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
+                    return await self.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value=uploaded_uris,
+                        status=BlockStatus.completed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
 
             if self.storage_type == FileStorageType.S3:
                 actual_aws_access_key_id = (
@@ -11248,6 +11416,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 # Late import: google_sheets_blocks imports Block from this module, so top-level import would cycle.
+from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E402
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
@@ -11282,6 +11451,7 @@ BlockSubclasses = Union[
     PrintPageBlock,
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,
+    EmailInboxBlock,
     GoogleSheetsWriteBlock,
     PdfFillBlock,
     SplitPdfBlock,
