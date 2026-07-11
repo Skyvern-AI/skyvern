@@ -284,6 +284,34 @@ def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any], 
     return ""
 
 
+def resolve_target_domain_for_run_provenance(workflow: Workflow, parameters: dict[str, Any]) -> str:
+    """Resolve a normalized first-block domain without recording unresolved parameter keys.
+
+    Requires a real dotted host so a bare ``url`` literal that isn't a declared
+    parameter (e.g. a misconfigured ``unknown_key``) is not recorded as a fake
+    ``skyvern.target_domain``.
+    """
+    try:
+        parameter_keys = {parameter.key for parameter in workflow.workflow_definition.parameters}
+        for block in get_all_blocks(workflow.workflow_definition.blocks):
+            raw_url = getattr(block, "url", None)
+            if not raw_url:
+                continue
+            url_template = str(raw_url)
+            if url_template in parameter_keys or url_template in parameters:
+                if not parameters.get(url_template):
+                    return ""
+            rendered_url = _resolve_block_url_for_cache_key(url_template, parameters)
+            if not rendered_url:
+                return ""
+            if "." not in (urllib.parse.urlparse(rendered_url).hostname or ""):
+                return ""
+            return _jinja_domain_filter(rendered_url).rpartition("@")[2].lower()
+    except Exception:
+        return ""
+    return ""
+
+
 def detect_workflow_platform(
     workflow: Workflow,
     parameters: dict[str, Any],
@@ -301,9 +329,11 @@ def detect_workflow_platform(
 def detect_workflow_platform_for_tagging(
     workflow: Workflow,
     parameters: dict[str, Any],
+    *,
+    domain_override: str | None = None,
 ) -> str | None:
     """Detect a cloud platform for run tagging without changing cache-key behavior."""
-    domain = _extract_first_block_domain(workflow, parameters)
+    domain = domain_override if domain_override is not None else _extract_first_block_domain(workflow, parameters)
     if not domain:
         return None
     return app.AGENT_FUNCTION.detect_platform_for_tagging(domain)

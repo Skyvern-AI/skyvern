@@ -196,7 +196,9 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH = 120
 MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH = 40
 DETECTED_PLATFORM_RUN_TAG_KEY = "skyvern.platform"
-DETECTED_PLATFORM_RUN_TAG_CALLER_ID = "system:platform-detector"
+TRIGGER_RUN_TAG_KEY = "skyvern.trigger"
+TARGET_DOMAIN_RUN_TAG_KEY = "skyvern.target_domain"
+CREATION_RUN_TAG_CALLER_ID = "system:creation-tagging"
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -652,26 +654,41 @@ class WorkflowService:
                 raise
 
     @staticmethod
-    async def _apply_detected_platform_run_tag_best_effort(
+    async def _apply_creation_run_tags_best_effort(
         *,
         workflow: Workflow,
         workflow_run_id: str,
         organization_id: str,
         parameters: dict[str, Any],
+        trigger_type: WorkflowRunTriggerType,
     ) -> None:
         try:
-            platform = workflow_script_service.detect_workflow_platform_for_tagging(workflow, parameters)
-            if not platform:
-                return
+            tags = {TRIGGER_RUN_TAG_KEY: trigger_type.value}
+            domain = workflow_script_service.resolve_target_domain_for_run_provenance(workflow, parameters)
+            if domain:
+                tags[TARGET_DOMAIN_RUN_TAG_KEY] = domain
+            try:
+                platform = workflow_script_service.detect_workflow_platform_for_tagging(
+                    workflow, parameters, domain_override=domain
+                )
+                if platform:
+                    tags[DETECTED_PLATFORM_RUN_TAG_KEY] = platform
+            except Exception:
+                LOG.warning(
+                    "Failed to detect platform for creation workflow run tags",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
             await app.DATABASE.tags.apply_system_run_tag_changes(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
-                sets={DETECTED_PLATFORM_RUN_TAG_KEY: platform},
-                caller_id=DETECTED_PLATFORM_RUN_TAG_CALLER_ID,
+                sets=tags,
+                caller_id=CREATION_RUN_TAG_CALLER_ID,
             )
         except Exception:
             LOG.warning(
-                "Failed to apply detected platform workflow run tag",
+                "Failed to apply creation workflow run tags",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 exc_info=True,
@@ -1621,11 +1638,12 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             batch_error=str(batch_error),
                         )
-                await self._apply_detected_platform_run_tag_best_effort(
+                await self._apply_creation_run_tags_best_effort(
                     workflow=workflow,
                     workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization.organization_id,
                     parameters=parameter_values,
+                    trigger_type=resolved_trigger_type,
                 )
             except Exception as e:
                 LOG.exception(
