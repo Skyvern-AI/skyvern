@@ -19,9 +19,12 @@ from skyvern.forge.sdk.copilot.agent import (
     _verified_workflow_or_none,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    StoredCriteriaSet,
+    StoredCriteriaSnapshot,
     apply_requested_output_producer_floor,
     criteria_from_json,
     criteria_to_json,
+    reconcile_completion_criteria,
 )
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
     _schema_boolean_output_paths,
@@ -34,12 +37,16 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
     DeliveredUnverifiedTerminalState,
+    EvidenceSourceKind,
+    FloorRekeyedDeliverableCredit,
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
+    carry_floor_rekeyed_criterion_ids,
     combine_verification_results,
     degraded_contract_delivered_unverified_terminal_state,
     evaluate_completion_criteria,
+    floor_rekeyed_deliverable_credit,
     grade_definition_criteria,
     grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
@@ -80,6 +87,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     JudgmentTruthCondition,
     RequestPolicy,
+    _apply_classifier_typed_requested_output_corroborators,
+    _apply_requested_output_completion_criteria,
     _parse_completion_criteria,
     build_classifier_fallback_floor,
 )
@@ -3344,6 +3353,491 @@ def test_zero_requested_output_criteria_credit_requires_evaluated_full_satisfact
     assert (
         zero_requested_output_criteria_credit(_evaluated(("c0", False)), has_meaningful_registered_output=True) is False
     )
+
+
+_PAGE_EVIDENCE_DELIVERABLE_REF = "block_outputs:post_run_page_observation.document_name"
+
+
+def _corroborated_abstention_verdicts(
+    *,
+    corroborator_source: EvidenceSourceKind | None,
+    marked_id: str = "deliverable",
+    marked_output_path: str = "output.document_name",
+    marked_evidence_ref: str = _PAGE_EVIDENCE_DELIVERABLE_REF,
+    corroborator_evidence_ref: str | None = None,
+) -> list[CriterionVerdict]:
+    return [
+        CriterionVerdict(
+            criterion_id=marked_id,
+            state="unsatisfied",
+            reason_code="structurally_abstained",
+            evidence_ref=marked_evidence_ref,
+            output_path=marked_output_path,
+            has_exact_value=False,
+        ),
+        CriterionVerdict(
+            criterion_id=f"{marked_id}__requested_output_corroborator",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_source=corroborator_source,
+            evidence_ref=corroborator_evidence_ref,
+        ),
+    ]
+
+
+def _observed_end_state_verdict(cid: str = "deliverable") -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=cid,
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref="observed_end_state_url",
+    )
+
+
+def _floored_run_plane_verdicts(
+    *,
+    corroborator_source: EvidenceSourceKind | None,
+    marked_id: str = "deliverable",
+    corroborator_evidence_ref: str | None = _PAGE_EVIDENCE_DELIVERABLE_REF,
+) -> list[CriterionVerdict]:
+    return [
+        CriterionVerdict(
+            criterion_id=marked_id,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:post_run_page_observation",
+            evidence_source="independent_page_evidence",
+        ),
+        CriterionVerdict(
+            criterion_id=f"{marked_id}__requested_output_corroborator",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_source=corroborator_source,
+            evidence_ref=corroborator_evidence_ref,
+        ),
+    ]
+
+
+def _floor_rekeyed_result(
+    verdicts: list[CriterionVerdict],
+    marked_ids: list[str],
+    output_path_by_id: dict[str, str] | None = None,
+) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[verdict.criterion_id for verdict in verdicts],
+        verdicts=list(verdicts),
+        floor_rekeyed_criterion_ids=list(marked_ids),
+        floor_rekeyed_output_path_by_criterion_id=dict(output_path_by_id or {}),
+    )
+
+
+def test_floor_rekeyed_credit_grants_on_independent_page_evidence() -> None:
+    result = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(
+            corroborator_source="independent_page_evidence",
+            corroborator_evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        ),
+        ["deliverable"],
+    )
+
+    credit = floor_rekeyed_deliverable_credit(result)
+
+    assert isinstance(credit, FloorRekeyedDeliverableCredit)
+    assert credit.criterion_ids == ("deliverable",)
+    assert credit.evidence_sources == ("independent_page_evidence",)
+    assert credit.evidence_refs == (_PAGE_EVIDENCE_DELIVERABLE_REF,)
+
+
+def test_floor_rekeyed_credit_grants_on_run_plane_marked_verdict() -> None:
+    result = _floor_rekeyed_result(
+        _floored_run_plane_verdicts(corroborator_source="independent_page_evidence"),
+        ["deliverable"],
+        {"deliverable": "output.document_name"},
+    )
+
+    credit = floor_rekeyed_deliverable_credit(result)
+
+    assert credit is not None
+    assert credit.evidence_sources == ("independent_page_evidence",)
+    assert credit.output_paths == ("output.document_name",)
+
+
+def test_floor_rekeyed_credit_withholds_without_corroborator() -> None:
+    result = _floor_rekeyed_result([_observed_end_state_verdict()], ["deliverable"])
+
+    assert result.is_fully_satisfied() is True
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+@pytest.mark.parametrize(
+    "corroborator_source",
+    ["registered_output_parameter", "registered_artifact_content"],
+)
+def test_floor_rekeyed_credit_withholds_on_registered_corroborator_source(
+    corroborator_source: EvidenceSourceKind,
+) -> None:
+    result = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(corroborator_source=corroborator_source),
+        ["deliverable"],
+    )
+
+    assert result.is_fully_satisfied() is True
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+@pytest.mark.parametrize(
+    "corroborator_source",
+    ["runtime_output", "same_record_context", None],
+)
+def test_floor_rekeyed_credit_withholds_on_self_emitted_corroborator(
+    corroborator_source: EvidenceSourceKind | None,
+) -> None:
+    result = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(corroborator_source=corroborator_source),
+        ["deliverable"],
+    )
+
+    assert result.is_fully_satisfied() is True
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+def test_floor_rekeyed_credit_requires_every_marked_id_page_grounded() -> None:
+    verdicts = [
+        *_corroborated_abstention_verdicts(
+            corroborator_source="independent_page_evidence",
+            marked_id="deliverable_a",
+            corroborator_evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        ),
+        *_corroborated_abstention_verdicts(corroborator_source="runtime_output", marked_id="deliverable_b"),
+    ]
+    result = _floor_rekeyed_result(verdicts, ["deliverable_a", "deliverable_b"])
+
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+def test_floor_rekeyed_credit_none_without_marked_ids() -> None:
+    result = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(corroborator_source="independent_page_evidence"),
+        [],
+    )
+
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+def test_floor_rekeyed_credit_ignores_corroborator_scoped_to_other_id() -> None:
+    verdicts = [
+        *_corroborated_abstention_verdicts(corroborator_source="runtime_output"),
+        CriterionVerdict(
+            criterion_id="unrelated__requested_output_corroborator",
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_source="independent_page_evidence",
+            evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        ),
+    ]
+    result = _floor_rekeyed_result(verdicts, ["deliverable"])
+
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+def test_floor_rekeyed_credit_none_when_partial_satisfaction() -> None:
+    verdicts = [
+        *_corroborated_abstention_verdicts(
+            corroborator_source="independent_page_evidence",
+            corroborator_evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        ),
+        CriterionVerdict(criterion_id="other", state="unsatisfied", reason_code="no_evidence"),
+    ]
+    result = _floor_rekeyed_result(verdicts, ["deliverable"])
+
+    assert result.is_fully_satisfied() is False
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+def test_floor_rekeyed_credit_none_for_kill_shape() -> None:
+    assert floor_rekeyed_deliverable_credit(_evaluated(("login", True))) is None
+
+
+def test_floor_rekeyed_credit_does_not_mutate_result() -> None:
+    result = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(
+            corroborator_source="independent_page_evidence",
+            corroborator_evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        ),
+        ["deliverable"],
+    )
+    before = replace(result)
+
+    floor_rekeyed_deliverable_credit(result)
+
+    assert result == before
+
+
+def test_carry_floor_rekeyed_ids_from_marked_criteria() -> None:
+    criteria = [
+        CompletionCriterion(id="deliverable", outcome="Document name is shown.", requested_output_floor_rekeyed=True),
+        CompletionCriterion(id="plain", outcome="Login succeeds."),
+    ]
+    result = CompletionVerificationResult(status="evaluated", criterion_ids=["deliverable", "plain"])
+
+    carried = carry_floor_rekeyed_criterion_ids(result, criteria)
+
+    assert carried.floor_rekeyed_criterion_ids == ["deliverable"]
+
+
+def test_combine_threads_floor_rekeyed_ids_from_run_result() -> None:
+    run_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["deliverable"],
+        verdicts=[CriterionVerdict(criterion_id="deliverable", state="satisfied", reason_code="evidence_confirms")],
+        floor_rekeyed_criterion_ids=["deliverable"],
+    )
+
+    combined = combine_verification_results(["deliverable"], run_result, [])
+
+    assert combined.floor_rekeyed_criterion_ids == ["deliverable"]
+
+
+def test_floor_marker_re_derived_across_persistence_round_trip() -> None:
+    fresh = [
+        CompletionCriterion(id="deliverable", outcome="Document name is shown.", output_path="output.document_name")
+    ]
+
+    floored_first, rekeyed_first = apply_requested_output_producer_floor(fresh)
+    assert rekeyed_first == ("output.document_name",)
+    assert floored_first[0].requested_output_floor_rekeyed is True
+
+    persisted = criteria_to_json(fresh)
+    assert persisted[0]["output_path"] == "output.document_name"
+    assert "requested_output_floor_rekeyed" not in persisted[0]
+
+    stored = criteria_from_json(persisted)
+    assert stored[0].requested_output_floor_rekeyed is False
+
+    snapshot = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="set_1", goal_epoch=1, criteria=stored), next_epoch=2
+    )
+    decision = reconcile_completion_criteria(snapshot, fresh, actionable=True)
+    assert decision.action == "adopt_stored"
+
+    floored_again, rekeyed_again = apply_requested_output_producer_floor(decision.criteria)
+    assert rekeyed_again == ("output.document_name",)
+    assert floored_again[0].requested_output_floor_rekeyed is True
+
+
+def test_floor_idempotent_on_already_floored_set() -> None:
+    fresh = [
+        CompletionCriterion(id="deliverable", outcome="Document name is shown.", output_path="output.document_name")
+    ]
+    floored_once, _ = apply_requested_output_producer_floor(fresh)
+
+    floored_twice, rekeyed_twice = apply_requested_output_producer_floor(floored_once)
+
+    assert rekeyed_twice == ()
+    assert floored_twice[0].requested_output_floor_rekeyed is True
+
+
+def test_floor_rekeyed_credit_grants_when_floor_path_binds_delivered_payload() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = _floor_rekeyed_result(
+        _floored_run_plane_verdicts(corroborator_source="independent_page_evidence"),
+        ["deliverable"],
+        {"deliverable": "output.document_name"},
+    )
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx,
+            _registered_output_result({"document_name": "Resale certificate"}),
+            completion_verification=verification,
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    granted = [entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit"]
+    assert granted and granted[0]["credited_output_paths"] == ["output.document_name"]
+    assert granted[0]["registered_output_keys"] == ["bill_statement"]
+
+
+def test_floor_rekeyed_credit_withheld_when_floor_path_absent_from_payload() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = _floor_rekeyed_result(
+        _floored_run_plane_verdicts(corroborator_source="independent_page_evidence"),
+        ["deliverable"],
+        {"deliverable": "output.document_name"},
+    )
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx, _registered_output_result({"summary": "raw"}), completion_verification=verification
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    unbound = [
+        entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_credit_payload_unbound"
+    ]
+    assert unbound and unbound[0]["unbound_output_paths"] == ["output.document_name"]
+    assert any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+
+
+def test_floor_rekeyed_deliverable_reaches_verified_success() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(
+            corroborator_source="independent_page_evidence",
+            corroborator_evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        ),
+        ["deliverable"],
+    )
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx, _registered_output_result({"summary": "raw"}), completion_verification=verification
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    assert ctx.delivered_unverified_terminal is False
+    assert ctx.turn_halt is None
+    granted = [entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit"]
+    assert granted and granted[0]["criterion_ids"] == ["deliverable"]
+    assert granted[0]["evidence_sources"] == ["independent_page_evidence"]
+    assert not any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+
+
+def _floored_policy_criteria(criteria: list[CompletionCriterion], user_message: str) -> list[CompletionCriterion]:
+    policy = RequestPolicy(completion_criteria=criteria)
+    _apply_requested_output_completion_criteria(policy, user_message)
+    _apply_classifier_typed_requested_output_corroborators(policy)
+    floored, _rekeyed = apply_requested_output_producer_floor(policy.completion_criteria)
+    return list(floored)
+
+
+def _satisfied_page_evidence_result(criteria: list[CompletionCriterion]) -> CompletionVerificationResult:
+    verdicts = [
+        CriterionVerdict(
+            criterion_id=criterion.id,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_source="independent_page_evidence",
+            evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
+        )
+        for criterion in criteria
+    ]
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[criterion.id for criterion in criteria],
+        verdicts=verdicts,
+    )
+    return carry_floor_rekeyed_criterion_ids(result, criteria)
+
+
+def test_floor_rekeyed_credit_is_inert_when_the_seam_mints_no_per_deliverable_corroborator() -> None:
+    criteria = _floored_policy_criteria(
+        [
+            CompletionCriterion(
+                id="run_end_state",
+                outcome="The run opens the order-level document list and selects the demand document row.",
+            )
+        ],
+        "Return a final record with document name.",
+    )
+    marked_id = "__copilot_requested_output__output_document_name"
+    result = _satisfied_page_evidence_result(criteria)
+
+    assert result.floor_rekeyed_criterion_ids == [marked_id]
+    assert result.is_fully_satisfied() is True
+    assert [criterion.id for criterion in criteria if criterion.requested_output_corroborator] == []
+    assert floor_rekeyed_deliverable_credit(result) is None
+
+
+@pytest.mark.asyncio
+async def test_floor_rekeyed_deliverable_is_credited_through_the_verification_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c1",
+                outcome="The run captures the document status from the order documents list.",
+                output_path="output.doc_status",
+            )
+        ]
+    )
+    _apply_classifier_typed_requested_output_corroborators(policy)
+    floored, rekeyed_paths = apply_requested_output_producer_floor(policy.completion_criteria)
+    policy.completion_criteria = list(floored)
+    assert rekeyed_paths == ("output.doc_status",)
+    assert "c1__requested_output_corroborator" in {criterion.id for criterion in floored}
+
+    async def handler(**_: object) -> dict:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": criterion.id,
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "block_outputs:post_run_page_observation.visible_text_excerpt",
+                }
+                for criterion in policy.completion_criteria
+            ]
+        }
+
+    async def handler_lookup(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        handler_lookup,
+    )
+    ctx = _ctx_with_blocks("code")
+    ctx.request_policy = policy
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_x",
+        "observed_after_workflow_run": True,
+        "visible_text_excerpt": "Resale certificate - Delivered",
+    }
+    result = _registered_output_result({"doc_status": "Delivered"})
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.floor_rekeyed_criterion_ids == ["c1"]
+    assert verification.floor_rekeyed_output_path_by_criterion_id == {"c1": "output.doc_status"}
+    assert verification.is_fully_satisfied() is True
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(ctx, result, completion_verification=verification)
+
+    assert recorded is not None
+    assert recorded.verdict == "demonstrated"
+    granted = [entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit"]
+    assert granted and granted[0]["criterion_ids"] == ["c1"]
+    assert granted[0]["evidence_sources"] == ["independent_page_evidence"]
+
+
+def test_floor_rekeyed_runtime_output_only_still_withholds() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = _floor_rekeyed_result(
+        _corroborated_abstention_verdicts(corroborator_source="runtime_output"),
+        ["deliverable"],
+    )
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx, _registered_output_result({"summary": "raw"}), completion_verification=verification
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+    assert any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+    assert not any(entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit" for entry in logs)
 
 
 def test_zero_requested_output_criteria_withholds_verified_success() -> None:
