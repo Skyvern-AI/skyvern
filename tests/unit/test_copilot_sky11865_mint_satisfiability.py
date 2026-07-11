@@ -25,7 +25,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     _fallback_literal_candidates_for_field,
     build_classifier_fallback_floor,
+    is_contingent_missing_antecedent_degraded,
     is_turn_unsatisfiable_fallback_degraded,
+    resolve_mint_degrade,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.run_execution import _terminal_challenge_completion_verification
@@ -454,7 +456,7 @@ def test_recorded_branch_no_meaningful_output_degrades() -> None:
     assert outcome.reason_code == "fallback_floor_turn_unsatisfiable"
 
 
-def test_contingent_missing_antecedent_counts_as_degraded() -> None:
+def test_contingent_missing_antecedent_routes_to_its_own_degrade_lane() -> None:
     criterion = CompletionCriterion(
         id="c1",
         outcome="A blocker is reported to the user.",
@@ -462,8 +464,9 @@ def test_contingent_missing_antecedent_counts_as_degraded() -> None:
         contingent_on="the site blocks submission",
         mint_degrade="contingent_missing_antecedent",
     )
-    assert is_turn_unsatisfiable_fallback_degraded(criterion) is True
-    assert is_turn_unsatisfiable_fallback_degraded(replace(criterion, mint_degrade=None)) is False
+    assert is_contingent_missing_antecedent_degraded(criterion) is True
+    assert is_turn_unsatisfiable_fallback_degraded(criterion) is False
+    assert is_contingent_missing_antecedent_degraded(replace(criterion, mint_degrade=None)) is False
 
 
 def test_contingent_missing_antecedent_carries_and_blocks_credit_when_unsatisfied() -> None:
@@ -486,8 +489,10 @@ def test_contingent_missing_antecedent_carries_and_blocks_credit_when_unsatisfie
             )
         ],
     )
-    assert "c1" in result.degraded_criterion_ids
+    assert "c1" in result.contingent_degraded_criterion_ids
+    assert "c1" not in result.degraded_criterion_ids
     assert result.is_fully_satisfied() is False
+    assert only_degraded_blocking(result) is True
 
 
 def test_satisfied_degraded_criterion_still_credits_on_merits() -> None:
@@ -515,3 +520,12 @@ def test_recorded_branch_ambiguous_code_with_failed_block_stays_repairable() -> 
     assert outcome is not None
     assert outcome.verdict == "repairable_failure"
     assert outcome.reason_code != "fallback_floor_turn_unsatisfiable"
+
+
+def test_turn_unsatisfiable_fallback_stamp_precedes_pathless_contingent_degrade() -> None:
+    resolved = resolve_mint_degrade(
+        "turn_unsatisfiable_fallback",
+        "the site blocks submission",
+        None,
+    )
+    assert resolved == "turn_unsatisfiable_fallback"

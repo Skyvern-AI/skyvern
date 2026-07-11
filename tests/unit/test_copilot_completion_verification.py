@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
+    carry_degraded_criterion_ids,
     carry_floor_rekeyed_criterion_ids,
     combine_verification_results,
     degraded_contract_delivered_unverified_terminal_state,
@@ -55,6 +56,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
+    only_degraded_blocking,
     registered_download_completion_criterion,
     run_plane_all_no_evidence,
     structural_unfired_contingent_criterion_ids,
@@ -91,6 +93,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _apply_requested_output_completion_criteria,
     _parse_completion_criteria,
     build_classifier_fallback_floor,
+    is_contingent_missing_antecedent_degraded,
+    is_turn_unsatisfiable_fallback_degraded,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import (
@@ -3217,6 +3221,28 @@ def _delivered_terminal_state(
 def test_degraded_delivered_unverified_terminal_state_allows_observed_runtime_output() -> None:
     terminal_state = _delivered_terminal_state(_degraded_delivered_result(_observed_structural_abstention()))
 
+    assert terminal_state is not None
+    assert [verdict.criterion_id for verdict in terminal_state.observed_verdicts] == ["requested_output"]
+
+
+def test_degraded_delivered_unverified_terminal_state_spans_contingent_degraded_lane() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_contingent_degraded", "requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_contingent_degraded",
+                state="unsatisfied",
+                reason_code="no_evidence",
+            ),
+            _observed_structural_abstention(),
+        ],
+        contingent_degraded_criterion_ids=["c_contingent_degraded"],
+    )
+
+    terminal_state = _delivered_terminal_state(result)
+
+    assert result.degraded_criterion_ids == []
     assert terminal_state is not None
     assert [verdict.criterion_id for verdict in terminal_state.observed_verdicts] == ["requested_output"]
 
@@ -11901,3 +11927,347 @@ def test_bound_post_run_page_evidence_drops_only_stamp_keys() -> None:
     }
     assert "workflow_run_id" not in bound
     assert "observed_after_workflow_run" not in bound
+
+
+def _blocker_contingent_criterion(cid: str = "c_contingent") -> CompletionCriterion:
+    return _criterion(
+        cid,
+        "A blocker is reported to the user.",
+        contingent_on="the site only exposes an email or manual submission path",
+        output_path="output.blocker",
+        mint_degrade="contingent_missing_antecedent",
+    )
+
+
+def _registered_output_criteria() -> list[CompletionCriterion]:
+    return [_criterion(f"c{index}", f"Requested output {index} is registered.") for index in range(1, 6)]
+
+
+def _graded_result(
+    criteria: list[CompletionCriterion],
+    snapshot: RunEvidenceSnapshot,
+    unsatisfied_ids: set[str],
+    *,
+    unsatisfied_state: str = "unsatisfied",
+    unsatisfied_reason_code: str = "evidence_contradicts",
+    unsatisfied_evidence_ref: str | None = None,
+    satisfied_evidence_ref: str | None = None,
+) -> CompletionVerificationResult:
+    contingent_ids = [criterion.id for criterion in criteria if criterion.contingent_on]
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[criterion.id for criterion in criteria],
+        contingent_criterion_ids=contingent_ids,
+        contingent_on_by_criterion_id={
+            criterion.id: criterion.contingent_on for criterion in criteria if criterion.contingent_on
+        },
+        structural_unfired_criterion_ids=structural_unfired_contingent_criterion_ids(criteria, snapshot),
+        verdicts=[
+            CriterionVerdict(
+                criterion_id=criterion.id,
+                state=unsatisfied_state if criterion.id in unsatisfied_ids else "satisfied",
+                reason_code=unsatisfied_reason_code if criterion.id in unsatisfied_ids else "evidence_confirms",
+                evidence_ref=unsatisfied_evidence_ref if criterion.id in unsatisfied_ids else satisfied_evidence_ref,
+            )
+            for criterion in criteria
+        ],
+    )
+    return carry_degraded_criterion_ids(result, criteria)
+
+
+_NON_ABSTAINING_CONTINGENT_CRITERIA: dict[str, tuple[CompletionCriterion, RunEvidenceSnapshot]] = {
+    "real_blocker": (
+        _blocker_contingent_criterion(),
+        RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": "Provider requires a phone call."}}),
+    ),
+    "real_blocker_alias_key": (
+        _blocker_contingent_criterion(),
+        RunEvidenceSnapshot(block_outputs={"blocker_output": "Provider requires a phone call."}),
+    ),
+}
+
+
+@pytest.mark.parametrize("arm", sorted(_NON_ABSTAINING_CONTINGENT_CRITERIA))
+@pytest.mark.parametrize(
+    "unsatisfied_state, unsatisfied_reason_code",
+    [("unsatisfied", "structurally_abstained"), ("unknown", "definition_unknown")],
+)
+def test_non_abstaining_contingent_criterion_vetoes_via_excusable_verdict_shapes(
+    arm: str, unsatisfied_state: str, unsatisfied_reason_code: str
+) -> None:
+    contingent, snapshot = _NON_ABSTAINING_CONTINGENT_CRITERIA[arm]
+    criteria = [*_registered_output_criteria(), contingent]
+
+    result = _graded_result(
+        criteria,
+        snapshot,
+        {contingent.id},
+        unsatisfied_state=unsatisfied_state,
+        unsatisfied_reason_code=unsatisfied_reason_code,
+    )
+
+    assert result.structural_unfired_criterion_ids == []
+    assert result.contingent_degraded_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is False
+
+
+@pytest.mark.parametrize("arm", sorted(_NON_ABSTAINING_CONTINGENT_CRITERIA))
+def test_non_abstaining_contingent_criterion_vetoes_via_reperception_contradiction(arm: str) -> None:
+    contingent, snapshot = _NON_ABSTAINING_CONTINGENT_CRITERIA[arm]
+    criteria = [*_registered_output_criteria(), contingent]
+
+    result = _graded_result(
+        criteria,
+        snapshot,
+        {contingent.id},
+        unsatisfied_evidence_ref="scout_synthesized_browser_steps_output",
+        satisfied_evidence_ref="observed_end_state_url",
+    )
+
+    assert result.structural_unfired_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_abstained_pathless_contingent_criterion_does_not_veto_via_abstention_reason_shapes() -> None:
+    contingent = _blocker_contingent_criterion()
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id}, unsatisfied_reason_code="no_evidence")
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is True
+
+
+def test_fallback_floor_base_criterion_degraded_as_contingent_stays_strict() -> None:
+    floor = [
+        replace(criterion, mint_degrade="contingent_missing_antecedent")
+        for criterion in build_classifier_fallback_floor([])
+    ]
+    snapshot = RunEvidenceSnapshot(block_outputs={"submit_request": _validation_review_payload()})
+
+    verdicts = grade_fallback_floor_reached_end_state_criteria(floor, snapshot)
+
+    assert [verdict.state for verdict in verdicts] != ["satisfied"]
+
+
+def test_pathless_blocker_contingent_criterion_abstains_and_does_not_veto() -> None:
+    contingent = _blocker_contingent_criterion()
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": "", "submitted": True}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+
+    assert is_contingent_missing_antecedent_degraded(contingent) is True
+    assert is_turn_unsatisfiable_fallback_degraded(contingent) is False
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.contingent_degraded_criterion_ids == [contingent.id]
+    assert contingent.id not in result.degraded_criterion_ids
+    assert result.is_fully_satisfied() is True
+    assert contingent.id not in result.to_trace_data()["unmet_criterion_ids"]
+
+
+def test_abstained_pathless_contingent_criterion_earns_zero_credit() -> None:
+    contingent = _blocker_contingent_criterion()
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result([contingent], snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is False
+
+
+def test_pathless_contingent_abstention_emits_structural_unfired_trace_record() -> None:
+    contingent = _blocker_contingent_criterion()
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    trace = _graded_result(criteria, snapshot, {contingent.id}).to_trace_data()
+
+    assert trace["structural_unfired_criterion_ids"] == [contingent.id]
+    assert trace["contingent_degraded_criterion_ids"] == [contingent.id]
+    unfired_keys = {
+        key: value
+        for key, value in trace.items()
+        if key.endswith("_structural_unfired") and not key.startswith("structural_unfired")
+    }
+    assert unfired_keys == {"verdict_5_structural_unfired": True}
+
+
+def test_real_blocker_evidence_keeps_pathless_contingent_criterion_blocking() -> None:
+    contingent = _blocker_contingent_criterion()
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": "Provider requires a phone call."}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+
+
+def test_missing_blocker_family_output_abstains_pathless_contingent_criterion() -> None:
+    contingent = _blocker_contingent_criterion()
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"submitted": True}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.contingent_degraded_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is True
+
+
+@pytest.mark.parametrize("registered_blocker", ["", None, False, "none", "null", "false"])
+def test_registered_no_blocker_value_shapes_abstain_regardless_of_value(registered_blocker: str | bool | None) -> None:
+    contingent = _blocker_contingent_criterion()
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": registered_blocker}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is True
+
+
+def test_non_blocker_shaped_pathless_contingent_criterion_abstains() -> None:
+    contingent = _criterion(
+        "c_contingent",
+        "The out-of-stock notice is reported to the user.",
+        contingent_on="the item is out of stock",
+        output_path="output.stock_notice",
+        mint_degrade="contingent_missing_antecedent",
+    )
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.contingent_degraded_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is True
+
+
+def test_pathless_contingent_criterion_without_blocker_key_abstains_without_credit() -> None:
+    contingent = _criterion(
+        "c_contingent",
+        "The earliest available start date is reported to the user.",
+        contingent_on="the provider offers a scheduling window",
+        output_path="output.desired_start_date",
+        mint_degrade="contingent_missing_antecedent",
+    )
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"submitted": True}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+    solo_result = _graded_result([contingent], snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.contingent_degraded_criterion_ids == [contingent.id]
+    assert result.is_fully_satisfied() is True
+    assert contingent.id not in result.to_trace_data()["unmet_criterion_ids"]
+    assert solo_result.is_fully_satisfied() is False
+
+
+def test_pathed_blocker_contingent_criterion_still_abstains_on_empty_blocker() -> None:
+    contingent = _criterion(
+        "c_contingent",
+        "A blocker is reported to the user.",
+        contingent_on="the site blocks online submission",
+        contingent_antecedent_output_path="output.blocker",
+    )
+    criteria = [*_registered_output_criteria(), contingent]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result(criteria, snapshot, {contingent.id})
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.contingent_degraded_criterion_ids == []
+    assert result.is_fully_satisfied() is True
+
+
+def test_turn_unsatisfiable_fallback_still_vetoes_and_stays_in_blocking_lane() -> None:
+    fallback = _criterion(
+        "c_fallback",
+        "The requested turn outcome is reached.",
+        mint_degrade="turn_unsatisfiable_fallback",
+    )
+    criteria = [*_registered_output_criteria(), fallback]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result(criteria, snapshot, {fallback.id})
+
+    assert is_turn_unsatisfiable_fallback_degraded(fallback) is True
+    assert is_contingent_missing_antecedent_degraded(fallback) is False
+    assert result.structural_unfired_criterion_ids == []
+    assert result.degraded_criterion_ids == [fallback.id]
+    assert result.contingent_degraded_criterion_ids == []
+    assert result.is_fully_satisfied() is False
+    assert only_degraded_blocking(result) is True
+
+
+def test_abstained_criterion_with_satisfied_verdict_is_not_a_credit_authorizer() -> None:
+    contingent = _blocker_contingent_criterion()
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result([contingent], snapshot, set())
+
+    assert result.structural_unfired_criterion_ids == [contingent.id]
+    assert result.verdicts[0].satisfied is True
+    assert result.is_fully_satisfied() is False
+
+
+def test_abstained_criterion_earns_no_credit_via_corroborated_requested_output_door() -> None:
+    contingent = _blocker_contingent_criterion()
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result([contingent], snapshot, {contingent.id})
+    result = replace(
+        result,
+        verdicts=[
+            replace(
+                result.verdicts[0],
+                reason_code="structurally_abstained",
+                evidence_ref="extract_result",
+                output_path="output.blocker",
+            ),
+            CriterionVerdict(
+                criterion_id="c_terminal_record",
+                state="satisfied",
+                reason_code="evidence_confirms",
+                grounding_mode="terminal_record",
+            ),
+        ],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_abstained_criterion_earns_no_credit_via_self_emitted_corroborator_door() -> None:
+    contingent = _blocker_contingent_criterion()
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result([contingent], snapshot, {contingent.id})
+    result = replace(
+        result,
+        verdicts=[replace(result.verdicts[0], self_emitted_judgment_not_independent=True)],
+    )
+
+    assert result.is_fully_satisfied() is False
+
+
+def test_fallback_degraded_criterion_in_structural_unfired_set_still_vetoes() -> None:
+    fallback = _criterion(
+        "c_fallback",
+        "The requested turn outcome is reached.",
+        contingent_on="the site only exposes an email or manual submission path",
+        mint_degrade="turn_unsatisfiable_fallback",
+    )
+    criteria = [*_registered_output_criteria(), fallback]
+    snapshot = RunEvidenceSnapshot(block_outputs={"extract_result": {"blocker": ""}})
+
+    result = _graded_result(criteria, snapshot, {fallback.id})
+    result = replace(result, structural_unfired_criterion_ids=[fallback.id])
+
+    assert result.degraded_criterion_ids == [fallback.id]
+    assert result.contingent_degraded_criterion_ids == []
+    assert result.is_fully_satisfied() is False

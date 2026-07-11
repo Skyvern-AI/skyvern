@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     TerminalActionFamily,
+    is_contingent_missing_antecedent_degraded,
     is_fallback_floor_base_criterion,
     is_turn_unsatisfiable_fallback_degraded,
     redact_raw_secrets_for_prompt,
@@ -115,6 +116,7 @@ class CompletionVerificationResult:
     degraded_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
+    contingent_degraded_criterion_ids: list[str] = field(default_factory=list)
     requested_output_criteria_count: int = 0
 
     def is_fully_satisfied(self) -> bool:
@@ -128,7 +130,10 @@ class CompletionVerificationResult:
             _is_satisfied_observed_end_state_verdict(verdict) or _is_satisfied_terminal_record_verdict(verdict)
             for verdict in verdict_by_id.values()
         )
-        degraded_id_set = set(self.degraded_criterion_ids)
+        abstained_id_set = self.abstained_criterion_ids()
+        degraded_id_set = degraded_lane_criterion_ids(self) - (
+            set(self.contingent_degraded_criterion_ids) & abstained_id_set
+        )
         satisfied_run_plane_count = 0
         for criterion_id in self.criterion_ids:
             verdict = verdict_by_id.get(criterion_id)
@@ -136,22 +141,22 @@ class CompletionVerificationResult:
                 # A definition-plane satisfied verdict proves the workflow is configurable,
                 # never that a run reached the outcome, so it cannot authorize verified success
                 # on its own — only a satisfied run-plane verdict can.
-                if not verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX):
+                if criterion_id not in abstained_id_set and not verdict.reason_code.startswith(
+                    _DEFINITION_REASON_PREFIX
+                ):
                     satisfied_run_plane_count += 1
                 continue
-            # A turn-unsatisfiable fallback criterion has no reachable satisfaction route,
-            # so an unsatisfied one can never be credited via corroboration or value-blind excusal.
+            # A degraded criterion that did not structurally abstain has no reachable satisfaction
+            # route, so an unsatisfied one is never creditable via corroboration or value-blind excusal.
             if criterion_id in degraded_id_set:
                 return False
+            # A structurally-unfired contingent criterion is N/A for this run: it neither vetoes nor
+            # earns credit, so success must derive from the remaining genuinely-satisfied criteria.
+            if criterion_id in abstained_id_set:
+                continue
             # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
             if verdict is not None and _is_definition_plane_abstention(verdict):
-                continue
-            if verdict is not None and _is_contingent_abstention(
-                verdict,
-                self.contingent_criterion_ids,
-                self.structural_unfired_criterion_ids,
-            ):
                 continue
             if verdict is not None and verdict.self_emitted_judgment_not_independent:
                 if _has_independent_satisfied_requested_output_corroborator(verdict_by_id, criterion_id):
@@ -173,12 +178,15 @@ class CompletionVerificationResult:
             return False
         return satisfied_run_plane_count > 0
 
+    def abstained_criterion_ids(self) -> set[str]:
+        """A criterion abstains when its antecedent is known not to have fired: the
+        ``contingent_missing_antecedent`` degrade is that determination, so its lane counts alongside
+        the contingent metadata even when the criterion carries no antecedent binding."""
+        lane_ids = set(self.contingent_criterion_ids) | set(self.contingent_degraded_criterion_ids)
+        return set(self.structural_unfired_criterion_ids) & lane_ids
+
     def is_structural_contingent_abstention(self, verdict: CriterionVerdict) -> bool:
-        return _is_contingent_abstention(
-            verdict,
-            self.contingent_criterion_ids,
-            self.structural_unfired_criterion_ids,
-        )
+        return _is_contingent_abstention(verdict, self.abstained_criterion_ids())
 
     def to_trace_data(self) -> dict[str, Any]:
         unmet = [
@@ -208,6 +216,10 @@ class CompletionVerificationResult:
             data["contingent_criterion_ids"] = list(self.contingent_criterion_ids)
         if self.structural_unfired_criterion_ids:
             data["structural_unfired_criterion_ids"] = list(self.structural_unfired_criterion_ids)
+        if self.contingent_degraded_criterion_ids:
+            data["contingent_degraded_criterion_ids"] = list(self.contingent_degraded_criterion_ids)
+        contingent_id_set = set(self.contingent_criterion_ids)
+        structural_unfired_id_set = set(self.structural_unfired_criterion_ids)
         for index, verdict in enumerate(self.verdicts[:_MAX_TRACE_VERDICTS]):
             prefix = f"verdict_{index}"
             data[f"{prefix}_criterion_id"] = verdict.criterion_id
@@ -239,9 +251,8 @@ class CompletionVerificationResult:
                 data[f"{prefix}_contingent_on"] = contingent_on
             if contingent_path := self.contingent_antecedent_output_path_by_criterion_id.get(verdict.criterion_id):
                 data[f"{prefix}_contingent_antecedent_output_path"] = contingent_path
-                data[f"{prefix}_structural_unfired"] = verdict.criterion_id in set(
-                    self.structural_unfired_criterion_ids
-                )
+            if verdict.criterion_id in contingent_id_set or verdict.criterion_id in structural_unfired_id_set:
+                data[f"{prefix}_structural_unfired"] = verdict.criterion_id in structural_unfired_id_set
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
@@ -506,6 +517,10 @@ def _find_structured_field_values(value: Any, field_names: Collection[str]) -> I
             yield from _find_structured_field_values(item, field_names)
 
 
+_BLOCKER_PATH_FIELDS = frozenset({"blocker", "manual_service_blocker"})
+_BLOCKER_FIELDS = frozenset({"blocker", "blocker_output", "manual_service_blocker", "manual_service_blocker_output"})
+
+
 def structural_unfired_contingent_criterion_ids(
     criteria: Iterable[CompletionCriterion],
     snapshot: RunEvidenceSnapshot,
@@ -513,6 +528,12 @@ def structural_unfired_contingent_criterion_ids(
     unfired_ids: list[str] = []
     for criterion in criteria:
         if is_turn_unsatisfiable_fallback_degraded(criterion):
+            continue
+        if is_contingent_missing_antecedent_degraded(criterion):
+            # The degrade value is itself the source determination that the antecedent never fired,
+            # so only affirmative evidence that a real blocker fired can keep the criterion in play.
+            if not (_contingent_antecedent_blocker_shaped(criterion) and _has_real_blocker_evidence(snapshot)):
+                unfired_ids.append(criterion.id)
             continue
         path = criterion.contingent_antecedent_output_path
         if not path:
@@ -541,10 +562,16 @@ def _is_blocker_contingent_criterion(criterion: CompletionCriterion) -> bool:
     path = criterion.contingent_antecedent_output_path
     if path is None:
         return False
-    return _output_path_field(path) in {"blocker", "manual_service_blocker"}
+    return _output_path_field(path) in _BLOCKER_PATH_FIELDS
 
 
-_BLOCKER_FIELDS = frozenset({"blocker", "blocker_output", "manual_service_blocker", "manual_service_blocker_output"})
+def _contingent_antecedent_blocker_shaped(criterion: CompletionCriterion) -> bool:
+    """A pathless contingent criterion anchors to blocker evidence only when its own consequent
+    writes the blocker field, which makes the run's blocker record evidence about its antecedent."""
+    if criterion.contingent_antecedent_output_path is not None:
+        return False
+    path = criterion.output_path
+    return path is not None and _output_path_field(path) in _BLOCKER_PATH_FIELDS
 
 
 def _blocker_family_values(snapshot: RunEvidenceSnapshot) -> list[Any]:
@@ -565,6 +592,8 @@ def _is_real_blocker_evidence(value: Any) -> bool:
 
 
 def _has_structural_no_blocker_evidence(snapshot: RunEvidenceSnapshot) -> bool:
+    """A registered blocker-family key is an explicit negative record whatever its value shape
+    (None/""/false/"none"); only an absent key is an absent record, which ``_blocker_family_values`` guarantees."""
     for value in _blocker_family_values(snapshot):
         if _is_structural_no_blocker_marker(value):
             return True
@@ -1285,7 +1314,7 @@ def grade_fallback_floor_reached_end_state_criteria(
     eligible_criteria = [criterion for criterion in criteria if is_fallback_floor_base_criterion(criterion)]
     if not eligible_criteria:
         return []
-    floor_degraded = any(is_turn_unsatisfiable_fallback_degraded(criterion) for criterion in eligible_criteria)
+    floor_degraded = any(criterion.mint_degrade is not None for criterion in eligible_criteria)
     evidence_ref = None
     if not floor_degraded:
         evidence_ref = _fallback_floor_reached_end_state_evidence_ref(snapshot, criteria)
@@ -2148,14 +2177,9 @@ def only_structural_requested_output_abstentions(result: CompletionVerificationR
     return bool(unmet) and all(_is_structural_requested_output_abstention(verdict) for verdict in unmet)
 
 
-def _is_contingent_abstention(
-    verdict: CriterionVerdict,
-    contingent_criterion_ids: Iterable[str],
-    structural_unfired_criterion_ids: Iterable[str],
-) -> bool:
+def _is_contingent_abstention(verdict: CriterionVerdict, abstained_criterion_ids: Collection[str]) -> bool:
     return (
-        verdict.criterion_id in set(contingent_criterion_ids)
-        and verdict.criterion_id in set(structural_unfired_criterion_ids)
+        verdict.criterion_id in abstained_criterion_ids
         and not verdict.satisfied
         and verdict.reason_code in _CONTINGENT_ABSTENTION_REASON_CODES
     )
@@ -2194,6 +2218,7 @@ def combine_verification_results(
     degraded_ids: list[str] = []
     floor_rekeyed_ids: list[str] = []
     floor_rekeyed_path_by_id: dict[str, str] = {}
+    contingent_degraded_ids: list[str] = []
     if run_result is not None:
         contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
         contingent_on_by_id.update(run_result.contingent_on_by_criterion_id)
@@ -2204,6 +2229,9 @@ def combine_verification_results(
         degraded_ids = list(dict.fromkeys([*degraded_ids, *run_result.degraded_criterion_ids]))
         floor_rekeyed_ids = list(dict.fromkeys([*floor_rekeyed_ids, *run_result.floor_rekeyed_criterion_ids]))
         floor_rekeyed_path_by_id.update(run_result.floor_rekeyed_output_path_by_criterion_id)
+        contingent_degraded_ids = list(
+            dict.fromkeys([*contingent_degraded_ids, *run_result.contingent_degraded_criterion_ids])
+        )
     if run_result is not None and run_result.status != "evaluated":
         return CompletionVerificationResult(
             status=run_result.status,
@@ -2216,6 +2244,7 @@ def combine_verification_results(
             degraded_criterion_ids=degraded_ids,
             floor_rekeyed_criterion_ids=floor_rekeyed_ids,
             floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
+            contingent_degraded_criterion_ids=contingent_degraded_ids,
             requested_output_criteria_count=requested_output_criteria_count,
         )
     if run_result is not None:
@@ -2248,18 +2277,23 @@ def combine_verification_results(
         degraded_criterion_ids=degraded_ids,
         floor_rekeyed_criterion_ids=floor_rekeyed_ids,
         floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
+        contingent_degraded_criterion_ids=contingent_degraded_ids,
         requested_output_criteria_count=requested_output_criteria_count,
     )
 
 
+def degraded_lane_criterion_ids(result: CompletionVerificationResult) -> set[str]:
+    return {*result.degraded_criterion_ids, *result.contingent_degraded_criterion_ids}
+
+
 def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
-    """True only when every criterion that still blocks full satisfaction is a
-    turn-unsatisfiable fallback criterion. A genuine unsatisfied/unknown non-degraded
-    criterion, an empty blocking set, or no degraded ids all return False, so this
-    never masks a real runtime failure or a mixed degraded+legitimate result."""
+    """True only when every criterion that still blocks full satisfaction is a degraded
+    criterion. A genuine unsatisfied/unknown non-degraded criterion, an empty blocking set,
+    or no degraded ids all return False, so this never masks a real runtime failure or a
+    mixed degraded+legitimate result."""
     if result.status != "evaluated":
         return False
-    degraded = set(result.degraded_criterion_ids)
+    degraded = degraded_lane_criterion_ids(result)
     if not degraded:
         return False
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
@@ -2321,7 +2355,7 @@ def degraded_contract_delivered_unverified_terminal_state(
         or terminal_blocked
     ):
         return None
-    degraded = set(result.degraded_criterion_ids)
+    degraded = degraded_lane_criterion_ids(result)
     if not degraded:
         return None
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
@@ -2406,11 +2440,25 @@ def carry_degraded_criterion_ids(
     result: CompletionVerificationResult,
     criteria: Iterable[CompletionCriterion],
 ) -> CompletionVerificationResult:
+    criteria = list(criteria)
     degraded = [criterion.id for criterion in criteria if is_turn_unsatisfiable_fallback_degraded(criterion)]
-    if not degraded and not result.degraded_criterion_ids:
+    contingent_degraded = [
+        criterion.id for criterion in criteria if is_contingent_missing_antecedent_degraded(criterion)
+    ]
+    if (
+        not degraded
+        and not contingent_degraded
+        and not result.degraded_criterion_ids
+        and not result.contingent_degraded_criterion_ids
+    ):
         return result
-    merged = list(dict.fromkeys([*result.degraded_criterion_ids, *degraded]))
-    return replace(result, degraded_criterion_ids=merged)
+    return replace(
+        result,
+        degraded_criterion_ids=list(dict.fromkeys([*result.degraded_criterion_ids, *degraded])),
+        contingent_degraded_criterion_ids=list(
+            dict.fromkeys([*result.contingent_degraded_criterion_ids, *contingent_degraded])
+        ),
+    )
 
 
 def carry_floor_rekeyed_criterion_ids(
