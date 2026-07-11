@@ -1055,13 +1055,28 @@ def _phone_readback_digits_match(expected_digits: str, actual_digits: str) -> bo
     return expected_nanp_digits is not None and expected_nanp_digits == actual_nanp_digits
 
 
-def _is_plain_nanp_number(value: str | None) -> bool:
-    # A 10-digit North American number with no '+'/country-code/extension markers. There is no
-    # international handling, so a value carrying a '+' or letters (an extension) is excluded.
-    text = value or ""
-    if "+" in text or re.search(r"[A-Za-z]", text):
-        return False
-    return len(_phone_digits(text)) == 10
+def _nanp_national_digits(value: str | None) -> str | None:
+    text = (value or "").strip()
+    if re.search(r"[A-Za-z]", text):
+        return None
+
+    digits = _phone_digits(text)
+    # A leading 1 counts as a country code only when written as one (+1, or 1 set off by a
+    # separator); bare 11-digit strings can be non-NANP numbers whose first digit is 1.
+    if re.fullmatch(r"1[0-9]{10}", digits) and re.match(r"\+1|1[ \-.(]", text):
+        national_digits = digits[-10:]
+    elif re.fullmatch(
+        r"\([0-9]{3}\) [0-9]{3}-[0-9]{4}|[0-9]{3}-[0-9]{3}-[0-9]{4}|"
+        r"[0-9]{3}\.[0-9]{3}\.[0-9]{4}|[0-9]{3} [0-9]{3} [0-9]{4}",
+        text,
+    ):
+        national_digits = digits
+    else:
+        return None
+
+    if national_digits[0] not in "23456789" or national_digits[3] not in "23456789":
+        return None
+    return national_digits
 
 
 def _tel_pattern_allows_bare_digits(pattern: str | None, bare_digits: str) -> bool:
@@ -1079,12 +1094,11 @@ def _tel_pattern_allows_bare_digits(pattern: str | None, bare_digits: str) -> bo
 
 def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | None) -> tuple[str, bool, bool]:
     # Decide how to fill a tel field. Returns (text_to_type, used_bare_nanp, run_format_check).
-    # A separator-formatted value is long enough to fill()-split into a half-open "(ddd" that a
-    # self-formatting field collapses, dropping a digit; bare national digits avoid that. Stripping is a
-    # local transform, so it is applied to secret values too. The format-check LLM is reserved for
-    # non-secret values that the bare-digit path does not handle.
-    if is_tel and _is_plain_nanp_number(value) and _tel_pattern_allows_bare_digits(pattern, _phone_digits(value)):
-        return _phone_digits(value), True, False
+    # Bare national digits avoid the fill()-split behavior that can drop a digit in self-formatting fields.
+    # This local transform is safe for secrets; the format-check LLM remains limited to non-secret fallbacks.
+    national_digits = _nanp_national_digits(value) if is_tel else None
+    if national_digits and _tel_pattern_allows_bare_digits(pattern, national_digits):
+        return national_digits, True, False
     return value, False, is_tel and not is_secret
 
 
@@ -1195,6 +1209,11 @@ async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
         )
+    LOG.info(
+        "Phone input read-back verified",
+        expected_digit_count=len(expected_digits),
+        actual_digit_count=len(actual_digits),
+    )
 
 
 async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_name: str, expected_value: str) -> None:
@@ -1203,6 +1222,33 @@ async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_n
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
     )
+
+
+async def _log_tel_fallback_fill_digit_counts(
+    *, skyvern_element: SkyvernElement, tag_name: str, expected_value: str, task_id: str | None, step_id: str | None
+) -> None:
+    # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
+    # otherwise invisible. Count-only (values may be secrets) and never fails the action.
+    try:
+        actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+        expected_digit_count = len(_phone_digits(expected_value))
+        actual_digit_count = len(_phone_digits(actual_value))
+        LOG.info(
+            "Tel fallback fill digit counts",
+            expected_digit_count=expected_digit_count,
+            actual_digit_count=actual_digit_count,
+            digit_count_match=expected_digit_count == actual_digit_count,
+            element_id=skyvern_element.get_id(),
+            task_id=task_id,
+            step_id=step_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read back tel fallback fill",
+            task_id=task_id,
+            step_id=step_id,
+            exc_info=True,
+        )
 
 
 _CARD_NUMBER_MIN_DIGITS = 13
@@ -3116,16 +3162,27 @@ async def handle_input_text_action(
     is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
         skyvern_element
     )
-    is_plain_nanp_tel = False
+    used_bare_nanp = False
     run_phone_format_check = False
+    log_tel_fallback_readback = False
     if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
         # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
-        # byte-for-byte. Plain-NANP tel is typed as bare digits (skipping the format-check LLM) unless
-        # the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
+        # byte-for-byte. Affirmative-NANP tel is typed as bare national digits (skipping the format-check
+        # LLM) unless the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
         tel_pattern = await skyvern_element.get_attr("pattern")
-        text, is_plain_nanp_tel, run_phone_format_check = _plan_tel_text(
+        text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
             is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
         )
+        log_tel_fallback_readback = run_phone_format_check
+        if used_bare_nanp:
+            LOG.info(
+                "Tel bare-digit fill using national digits",
+                used_bare_nanp=True,
+                expected_digit_count=len(text),
+                element_id=skyvern_element.get_id(),
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
     elif is_tel and not is_card_number_input and not is_secret_value:
         run_phone_format_check = True
     if run_phone_format_check:
@@ -3288,7 +3345,7 @@ async def handle_input_text_action(
                     return [result]
 
         # Only the bare-digit NANP fill is read back to verify; other tel shapes are left unverified.
-        verify_tel_input_after_fill = is_plain_nanp_tel
+        verify_tel_input_after_fill = used_bare_nanp
 
         # SKY-11720: an auto-formatting card-number field (a space every 4 digits) restores its caret
         # naively, racing character-by-character entry so the rendered value can silently differ from
@@ -3340,6 +3397,14 @@ async def handle_input_text_action(
                                 actual_digit_count=mismatch.actual_digit_count,
                             )
                             return [ActionFailure(mismatch)]
+                elif log_tel_fallback_readback:
+                    await _log_tel_fallback_fill_digit_counts(
+                        skyvern_element=skyvern_element,
+                        tag_name=tag_name,
+                        expected_value=text,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                    )
 
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
