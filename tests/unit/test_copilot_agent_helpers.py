@@ -2098,6 +2098,7 @@ workflow_definition:
 
         async def fake_update_workflow(payload, _ctx, **_kwargs):
             captured_metadata.extend(payload["code_artifact_metadata"])
+            captured_metadata.append({"formation_prepared": _kwargs["formation_prepared"]})
             return {"ok": False, "error": "sentinel update reached", "data": {"from_update": True}}
 
         monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
@@ -2122,9 +2123,10 @@ workflow_definition:
             "output.flags",
             "output.record_id",
         ]
+        assert captured_metadata[-1]["formation_prepared"] is True
 
     @pytest.mark.asyncio
-    async def test_update_and_run_blocks_post_steering_static_return_gap_reaches_run(self, monkeypatch) -> None:
+    async def test_update_and_run_blocks_typed_advisory_static_return_gap_reaches_run(self, monkeypatch) -> None:
         workflow_yaml = """
 title: Test workflow
 workflow_definition:
@@ -2158,7 +2160,7 @@ workflow_definition:
             reason_code="requested_output_contract_missing_output_coverage",
             required_paths=required_paths,
         )
-        ctx.output_contract_reject_count_by_signature = {signature: 2}
+        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
         captured: dict[str, object] = {}
 
         async def fake_update_workflow(payload, update_ctx, **_kwargs):
@@ -2231,7 +2233,11 @@ workflow_definition:
         captured: dict[str, str | bool] = {}
 
         async def fake_update_workflow(
-            payload, ctx, allow_missing_credentials=False, allow_static_output_uncertainty=False
+            payload,
+            ctx,
+            allow_missing_credentials=False,
+            allow_static_output_uncertainty=False,
+            formation_prepared=False,
         ):
             captured["workflow_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]

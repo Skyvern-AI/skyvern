@@ -12,6 +12,7 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
+from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 
 
@@ -54,6 +55,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page=2,
         page_size=5,
         search_key="abc",
+        run_type=[RunType.workflow_run, RunType.task_v1],
     )
 
     mock_workflow_runs.get_all_runs_v2.assert_awaited_once_with(
@@ -62,6 +64,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         page_size=5,
         status=None,
         search_key="abc",
+        run_type=["workflow_run", "task_v1"],
     )
     assert orjson.loads(response.body) == [
         {
