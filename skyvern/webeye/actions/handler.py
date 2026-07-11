@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, List, TypedDict
 
 import structlog
+from cachetools import TTLCache
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
@@ -84,6 +85,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -164,6 +166,10 @@ FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
+COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
+# Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
+# Cross-process re-resolution is deterministic under stable flag config.
+_COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, ttl=86_400)
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
@@ -1127,7 +1133,52 @@ async def _is_tel_digit_fix_enabled(task: Task) -> bool:
         return False
 
 
-async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
+async def _resolve_collapse_xp_assignment(
+    experimentation_provider: BaseExperimentationProvider,
+    task: Task,
+    organization_id: str,
+) -> bool:
+    distinct_id = task.workflow_run_id or task.task_id
+    if distinct_id in _COLLAPSE_XP_ASSIGNMENT_MEMO:
+        return _COLLAPSE_XP_ASSIGNMENT_MEMO[distinct_id]
+
+    try:
+        assignment = bool(
+            await experimentation_provider.resolve_feature_enabled_unrecorded(
+                COLLAPSE_XP_ASSIGNMENT_FLAG,
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        )
+    except Exception:
+        if distinct_id in _COLLAPSE_XP_ASSIGNMENT_MEMO:
+            return _COLLAPSE_XP_ASSIGNMENT_MEMO[distinct_id]
+        _COLLAPSE_XP_ASSIGNMENT_MEMO[distinct_id] = False
+        LOG.info(
+            "collapse_xp_assignment",
+            workflow_run_id=task.workflow_run_id,
+            task_id=task.task_id,
+            organization_id=organization_id,
+            assigned=False,
+            pinned_on_error=True,
+        )
+        raise
+
+    if distinct_id in _COLLAPSE_XP_ASSIGNMENT_MEMO:
+        return _COLLAPSE_XP_ASSIGNMENT_MEMO[distinct_id]
+    _COLLAPSE_XP_ASSIGNMENT_MEMO[distinct_id] = assignment
+    LOG.info(
+        "collapse_xp_assignment",
+        workflow_run_id=task.workflow_run_id,
+        task_id=task.task_id,
+        organization_id=organization_id,
+        assigned=assignment,
+        pinned_on_error=False,
+    )
+    return assignment
+
+
+async def _is_collapse_fanout_enabled(task: Task, family_flag: str, log_label: str) -> bool:
     organization_id = task.organization_id
     if not organization_id:
         return False
@@ -1135,68 +1186,43 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
     if not experimentation_provider:
         return False
     try:
-        return bool(
-            await experimentation_provider.is_feature_enabled_cached(
-                COLLAPSE_SELECT_FANOUT_FLAG,
-                organization_id,
-                properties={"organization_id": organization_id},
-            )
+        family_enabled = await experimentation_provider.is_feature_enabled_cached(
+            family_flag,
+            organization_id,
+            properties={"organization_id": organization_id},
         )
+        if not family_enabled:
+            return False
+        # PostHog hashes per flag key, so this umbrella is the only randomization source.
+        # Family flags are kill switches and must never use percentage rollouts.
+        return await _resolve_collapse_xp_assignment(experimentation_provider, task, organization_id)
     except Exception:
         LOG.warning(
-            "Failed to evaluate collapse-select-fanout flag; defaulting to disabled",
+            f"Failed to evaluate {log_label} flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
         return False
+
+
+async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
+    return await _is_collapse_fanout_enabled(task, COLLAPSE_SELECT_FANOUT_FLAG, "collapse-select-fanout")
 
 
 async def _is_collapse_custom_select_fanout_enabled(task: Task) -> bool:
-    organization_id = task.organization_id
-    if not organization_id:
-        return False
-    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
-    if not experimentation_provider:
-        return False
-    try:
-        return bool(
-            await experimentation_provider.is_feature_enabled_cached(
-                COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-                organization_id,
-                properties={"organization_id": organization_id},
-            )
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to evaluate collapse-custom-select-fanout flag; defaulting to disabled",
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        return False
+    return await _is_collapse_fanout_enabled(
+        task,
+        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
+        "collapse-custom-select-fanout",
+    )
 
 
 async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
-    organization_id = task.organization_id
-    if not organization_id:
-        return False
-    experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
-    if not experimentation_provider:
-        return False
-    try:
-        return bool(
-            await experimentation_provider.is_feature_enabled_cached(
-                COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG,
-                organization_id,
-                properties={"organization_id": organization_id},
-            )
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to evaluate collapse-autocomplete-fanout flag; defaulting to disabled",
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        return False
+    return await _is_collapse_fanout_enabled(
+        task,
+        COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG,
+        "collapse-autocomplete-fanout",
+    )
 
 
 async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
