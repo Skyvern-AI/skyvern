@@ -360,6 +360,7 @@ class AgentContext:
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+    latest_evaluate_result_composition_signature: str | None = None
     last_auto_acted_signature: str | None = None
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.

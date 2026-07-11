@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
     loaded_result_composition_evidence_from_page,
     loaded_result_composition_target_summary,
 )
@@ -596,6 +597,25 @@ def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: flo
     return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
 
 
+def _mint_current_loaded_result_source(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any] | None,
+    *,
+    url: str,
+) -> LoadedResultCompositionEvidence | None:
+    if page_evidence is None:
+        return None
+    loaded_results = loaded_result_composition_evidence_from_page(
+        page_evidence,
+        source_tool="evaluate",
+        source_url=url,
+    )
+    if loaded_results is not None:
+        ctx.latest_evaluate_result_composition_steer = loaded_results
+        ctx.latest_evaluate_result_composition_signature = None
+    return loaded_results
+
+
 async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
     """Run the bounded page-side extractor right after a scout interaction.
 
@@ -861,6 +881,7 @@ def _reset_evaluate_tracker(ctx: AgentContext) -> None:
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
     ctx.latest_evaluate_result_composition_steer = None
+    ctx.latest_evaluate_result_composition_signature = None
 
 
 def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1212,7 +1233,7 @@ async def _maybe_steer_evaluate_to_action(
             _reset_evaluate_tracker(ctx)
             return False
         record_scouted_output_coverage(ctx, parsed)
-        loaded_results = loaded_result_composition_evidence_from_page(parsed)
+        loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
@@ -1232,6 +1253,7 @@ async def _maybe_steer_evaluate_to_action(
             # The result is patched in-place; returning False keeps the normal tool-loop guard active.
             return False
         ctx.latest_evaluate_result_composition_steer = None
+        ctx.latest_evaluate_result_composition_signature = None
         identities = _actionable_target_identities(parsed)
         if not identities:
             _reset_evaluate_tracker(ctx)

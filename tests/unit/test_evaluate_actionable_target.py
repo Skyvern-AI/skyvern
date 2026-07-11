@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import scouting
 
@@ -109,6 +110,68 @@ def _ctx() -> AgentContext:
     return AgentContext.__new__(AgentContext)
 
 
+@pytest.mark.asyncio
+async def test_evaluate_mints_current_card_and_table_source_idempotently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packet = _packet()
+    packet["result_containers"] = [
+        {"selector": "#coastalCard", "text": "Provider credentialing status is visible"},
+        {"tag": "table", "selector": "#results", "row_count": 2, "sample_rows": ["A", "B"]},
+    ]
+    ctx = _ctx()
+    ctx.discovery_mcp_server = object()
+
+    async def fake_structured_evidence(*args: object, **kwargs: object) -> dict[str, object]:
+        return packet
+
+    monkeypatch.setattr(scouting, "_composition_get_structured_evidence", fake_structured_evidence)
+
+    page_evidence = await scouting._scout_act_observe_page_evidence(ctx, url="https://example.com/results")
+    assert getattr(ctx, "latest_evaluate_result_composition_steer", None) is None
+    result = {"ok": True, "data": {"url": "https://example.com/results"}}
+    await scouting._maybe_steer_evaluate_to_action(
+        ctx, result, url="https://example.com/results", page_evidence=page_evidence
+    )
+    first_carrier = ctx.latest_evaluate_result_composition_steer
+    await scouting._maybe_steer_evaluate_to_action(
+        ctx, result, url="https://example.com/results", page_evidence=page_evidence
+    )
+
+    assert first_carrier == ctx.latest_evaluate_result_composition_steer
+    assert [target.selector for target in first_carrier.targets] == ["#coastalCard", "#results"]
+    assert first_carrier.source_tool == "evaluate"
+    assert first_carrier.source_url == "https://example.com/results"
+    assert loaded_result_source_producible(first_carrier) is True
+    assert loaded_result_source_producible(first_carrier, target_code='await page.locator("#coastalCard")') is True
+    assert loaded_result_source_producible(first_carrier, target_code='await page.locator("#otherCard")') is False
+
+
+@pytest.mark.asyncio
+async def test_scout_interaction_observation_does_not_mint_evaluate_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packet = _packet()
+    packet["result_containers"] = [{"selector": "#coastalCard", "text": "Provider result is visible"}]
+    ctx = _ctx()
+    ctx.discovery_mcp_server = object()
+
+    async def fake_structured_evidence(*args: object, **kwargs: object) -> dict[str, object]:
+        return packet
+
+    monkeypatch.setattr(scouting, "_composition_get_structured_evidence", fake_structured_evidence)
+
+    await scouting._register_scout_interaction_observation(
+        ctx,
+        tool_name="click",
+        selector="#search",
+        source_url="https://example.com/search",
+        url="https://example.com/results",
+    )
+
+    assert getattr(ctx, "latest_evaluate_result_composition_steer", None) is None
+
+
 async def _seed(ctx, monkeypatch, packet, url):
     async def fake(c, *, url):
         return packet
@@ -209,6 +272,8 @@ async def test_first_loaded_result_table_steers_to_composition_not_click_even_wi
     }
     assert ctx.latest_evaluate_result_composition_steer.result_container_count == 1
     assert ctx.latest_evaluate_result_composition_steer.targets[0].selector == "#results"
+    assert ctx.latest_evaluate_result_composition_steer.source_tool == "evaluate"
+    assert ctx.latest_evaluate_result_composition_steer.source_url == "https://example.com/results"
     assert ctx.last_evaluate_actionable_signature is None
     assert ctx.last_evaluate_actionable_url is None
 
