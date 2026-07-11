@@ -54,9 +54,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     record_scouted_output_coverage,
     run_with_enforcement,
     synthesized_block_persistence_signal,
+    synthesized_goal_completion_landing_pending,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
+    synthesized_trajectory_reaches_goal,
     uncovered_output_reject_scout_steer_signal,
     uncovered_requested_output_paths,
 )
@@ -134,6 +136,8 @@ class _Ctx:
         self.synthesized_block_reopened_for_output_coverage = False
         self.synthesized_block_reopened_for_credential_scout = False
         self.credential_scout_rescout_context_key = None
+        self.synthesized_goal_complete_landed = False
+        self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
         self.flow_evidence: list[dict[str, object]] = []
         self.copilot_config: CopilotConfig | None = None
@@ -781,6 +785,35 @@ class TestSynthesizedOfferPersistenceGate:
         assert ctx.synthesized_block_offered_goal_complete is True
         assert _should_force_synthesized_block_persistence(ctx) is True
         assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_unlanded_goal_completion_forces_persistence_after_first_authoring_call(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.impose_synthesized_code_block = True
+        ctx.update_workflow_called = True
+
+        assert synthesized_goal_completion_landing_pending(ctx) is True
+        assert synthesized_persistence_reopened(ctx) is True
+        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
+
+    def test_landed_goal_completion_stops_forcing_on_identical_resubmission(self) -> None:
+        trajectory = [
+            {"tool_name": "type_text", "selector": "input[name='q']", "accessible_name": "Search"},
+            {"tool_name": "click", "selector": "button[data-action='search']", "accessible_name": "Search"},
+        ]
+        ctx = self._authoring_ctx(trajectory=trajectory, download_target=None)
+        ctx.impose_synthesized_code_block = True
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+
+        assert synthesized_goal_completion_landing_pending(ctx) is False
+        assert synthesized_persistence_reopened(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
 
     def test_failed_verified_run_with_new_commit_reopens_synthesized_persistence_gate(self) -> None:
         previous_trajectory = [
@@ -2207,6 +2240,16 @@ def _criterion(output_path: str, outcome: str) -> CompletionCriterion:
     return CompletionCriterion(id=output_path, outcome=outcome, output_path=output_path)
 
 
+def _registered_download_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id="output.statement_pdf",
+        outcome="the statement PDF is downloaded",
+        output_path="output.statement_pdf",
+        deliverable_kind="registered_download",
+        requested_output_evidence_source="registered_artifact_content",
+    )
+
+
 def _turn_state(*criteria: CompletionCriterion) -> SimpleNamespace:
     return SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
 
@@ -2348,6 +2391,13 @@ class TestScoutOutputCoverageGate:
         assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
         assert synthesized_block_persistence_signal(ctx, "click") is None
 
+    def test_uncovered_output_leaves_the_trajectory_goal_reaching(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_reaches_goal(ctx) is True
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
+
     def test_value_bearing_container_coverage_without_plan_does_not_force(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
         page_evidence = {
@@ -2388,6 +2438,17 @@ class TestScoutOutputCoverageGate:
         )
         ctx.reached_download_target = _download_target()
         assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    def test_registered_download_request_not_goal_complete_until_download_reached(self) -> None:
+        # Post-run registered-download evidence is absent from the pre-run requested-output gate, so a
+        # durable-entry+commit prefix (sign-in) would read goal-complete and land the mechanism-F latch
+        # mid-scout — locking out imposition of the real download spine once the scout reaches it.
+        ctx = self._authoring_ctx(_registered_download_criterion())
+        assert uncovered_requested_output_paths(ctx) == set()
+        assert ctx.reached_download_target is None
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        ctx.reached_download_target = _download_target()
+        assert synthesized_trajectory_is_goal_complete(ctx) is True
 
     def test_unreachable_output_never_completes_on_long_trajectory(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))

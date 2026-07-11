@@ -62,7 +62,12 @@ from skyvern.forge.sdk.copilot.output_contracts import (
 )
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, JudgmentTruthCondition, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    JudgmentTruthCondition,
+    RequestedOutputEvidenceSource,
+    RequestPolicy,
+)
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
@@ -464,7 +469,7 @@ def test_browser_surface_rejects_alias_dynamic_unbounded_and_mutation_forms(code
     assert mutations or unscouted or ambiguous
 
 
-def test_plan_backed_imposition_executes_generated_and_submitted_live_read_recipe() -> None:
+def _live_read_extraction_ctx() -> CopilotContext:
     ctx = _code_only_ctx()
     _enable_imposition(ctx)
     ctx.request_policy = RequestPolicy(
@@ -508,7 +513,11 @@ def test_plan_backed_imposition_executes_generated_and_submitted_live_read_recip
             },
         }
     ]
-    submitted = _yaml(
+    return ctx
+
+
+def _live_read_submitted_yaml() -> str:
+    return _yaml(
         """
         title: Record lookup
         workflow_definition:
@@ -519,6 +528,11 @@ def test_plan_backed_imposition_executes_generated_and_submitted_live_read_recip
               await page.locator("#search-submit").click()
         """
     )
+
+
+def test_plan_backed_imposition_executes_generated_and_submitted_live_read_recipe() -> None:
+    ctx = _live_read_extraction_ctx()
+    submitted = _live_read_submitted_yaml()
 
     result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
 
@@ -11298,18 +11312,18 @@ class TestWholeTrajectoryImposition:
         assert "getattr" not in code
 
     def test_rejects_extra_changed_block_with_unscouted_browser_mutation(self) -> None:
-        ctx = _quote_ctx()
+        ctx = _records_spine_ctx()
         submitted = _yaml(
             f"""
-            title: Quote
+            title: Records
             workflow_definition:
               blocks:
               - block_type: code
                 label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
                 code: |
-                  await page.locator("#zip").fill(str(zip_code))
-                  await page.locator("#continue").click()
-                  await page.locator("#coverage-next").click()
+                  await page.locator("#stage-a").click()
+                  await page.locator("#stage-b").click()
+                  await page.locator("#stage-c").click()
               - block_type: code
                 label: invented_browser_step
                 code: |
@@ -11317,10 +11331,15 @@ class TestWholeTrajectoryImposition:
             """
         )
 
-        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
 
+        assert ctx.spine_imposition_owned_attempt is False
         assert any("unscouted browser action" in violation for violation in result.violations)
+        assert any("never_captured" in violation for violation in result.violations)
         assert result.substitutions is None
+        events = [log for log in logs if log["event"] == "copilot_browser_surface_rejection_provenance"]
+        assert events and events[0]["kind"] == "never_captured"
 
     @pytest.mark.parametrize(
         "sibling_code",
@@ -11421,12 +11440,43 @@ class TestWholeTrajectoryImposition:
             ),
         ],
     )
-    def test_rejects_ambiguous_browser_mutation(self, sibling_code: str) -> None:
+    def test_owned_attempt_drops_ambiguous_only_sibling(self, sibling_code: str) -> None:
         ctx = _quote_ctx()
         submitted = _submitted_with_sibling_code(sibling_code)
 
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
+        assert "preserved_code" not in blocks
+        dropped = [log for log in logs if log["event"] == "copilot_spine_stale_rung_dropped"]
+        assert dropped and dropped[0]["dropped_labels"] == ["preserved_code"]
+        assert dropped[0]["dropped_actions"]
+
+    def test_unowned_attempt_still_rejects_ambiguous_browser_mutation(self) -> None:
+        ctx = _records_spine_ctx()
+        submitted = _yaml(
+            f"""
+            title: Records
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#stage-a").click()
+              - block_type: code
+                label: helper_stage
+                code: |
+                  target = page.locator("#stage-z")
+                  await getattr(target, "fill")("2026-07-01")
+            """
+        )
+
         result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
 
+        assert ctx.spine_imposition_owned_attempt is False
         assert any("ambiguous browser action" in violation for violation in result.violations)
         assert result.substitutions is None
 
@@ -11593,7 +11643,7 @@ class TestWholeTrajectoryImposition:
         )
         assert result.substitutions is None
 
-    def test_rejects_ambiguous_helper_browser_mutation(self) -> None:
+    def test_owned_attempt_drops_ambiguous_helper_browser_mutation(self) -> None:
         ctx = _quote_ctx()
         submitted = _yaml(
             f"""
@@ -11617,8 +11667,8 @@ class TestWholeTrajectoryImposition:
 
         result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
 
-        assert any("ambiguous browser action" in violation for violation in result.violations)
-        assert result.substitutions is None
+        assert result.violations == []
+        assert "helper_step" not in _code_blocks(parse_workflow_yaml(result.workflow_yaml))
 
     def test_multi_screen_trajectory_persists_in_order_with_proven_locators(self) -> None:
         ctx = _quote_ctx()
@@ -12036,6 +12086,7 @@ class TestWholeTrajectoryImposition:
     def test_author_schema_incompatibility_does_not_reopen_collapsed_code_block(self) -> None:
         ctx = _quote_ctx()
         ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
         ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("schema_incompatibility")
         ctx.workflow_yaml = _yaml(
             f"""
@@ -13171,6 +13222,20 @@ class TestImpositionSkippedAfterUpdateRecord:
         assert events[0]["reopen_download_target"] is False
         assert events[0]["reopen_persistence_after_failed_run"] is False
         assert events[0]["reopen_author_time_reject"] is False
+        assert events[0]["reaches_goal"] is False
+
+    def test_reach_admitted_attempt_names_its_own_lane(self) -> None:
+        ctx = _reaching_extraction_ctx()
+        ctx.flow_evidence = []
+        ctx.update_workflow_called = True
+
+        with capture_logs() as logs:
+            workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+
+        events = [log for log in logs if log["event"] == "copilot_imposition_admitted_after_update"]
+        assert len(events) == 1
+        assert events[0]["admission_key"] == "goal_reaching_spine_unlanded"
+        assert events[0]["goal_complete"] is False
 
 
 class TestScoutCaptureParityAccounting:
@@ -13747,6 +13812,7 @@ class TestScoutedSpinePersistSeamCoverage:
     async def test_satisfied_credential_precondition_keeps_single_step_route(self) -> None:
         ctx = _credential_spine_ctx()
         ctx.scout_trajectory.append(_submit_interaction(source_url="https://example.com/records"))
+        ctx.synthesized_goal_complete_landed = True
 
         with capture_logs() as logs:
             rejected = await _update_workflow(
@@ -14235,3 +14301,708 @@ class TestCredentialScoutReopenSeam:
         assert workflow_update_module._should_impose_after_update_attempt(ctx) is False
         ctx.synthesized_block_reopened_for_credential_scout = True
         assert workflow_update_module._should_impose_after_update_attempt(ctx) is True
+
+
+def _persisted_workflow_result() -> dict[str, object]:
+    return {
+        "ok": True,
+        "_workflow": SimpleNamespace(
+            workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="quote_flow")]),
+            proxy_location=None,
+        ),
+    }
+
+
+def _quote_submitted_yaml() -> str:
+    return _yaml(
+        """
+        title: Quote
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: quote_flow
+            code: |
+              await page.locator("#zip").fill(str(zip_code))
+              await page.locator("#continue").click()
+        """
+    )
+
+
+class TestGoalCompletionLandingImposition:
+    def test_goal_complete_trajectory_imposes_after_mid_scout_first_authoring_call(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert 'page.locator("#coverage-next")' in code
+        assert "expect_download" not in code
+        assert ctx.pending_goal_complete_landing is True
+        assert ctx.synthesized_goal_complete_landed is False
+
+    def test_unregistered_download_target_still_admits_imposition_after_landing(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/files/report.pdf"]',
+            affordance_text="Download PDF",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "async with page.expect_download()" in code
+
+    def test_non_goal_complete_trajectory_still_skips_imposition_after_update(self) -> None:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "button",
+                "source_url": "https://example.com/search",
+                "trajectory_index": 0,
+            }
+        ]
+        ctx.update_workflow_called = True
+        submitted = _yaml(
+            """
+            title: Search
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: search
+                code: |
+                  await page.locator("#other").click()
+            """
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.workflow_yaml == submitted
+        skipped = [entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update"]
+        assert len(skipped) == 1
+        assert skipped[0]["goal_complete"] is False
+        assert skipped[0]["synthesized_goal_complete_landed"] is False
+        assert not [entry for entry in logs if entry["event"] == "copilot_imposition_admitted_after_update"]
+
+    def test_admission_record_names_the_landing_pending_key(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+
+        with capture_logs() as logs:
+            workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        admitted = [entry for entry in logs if entry["event"] == "copilot_imposition_admitted_after_update"]
+        assert len(admitted) == 1
+        assert admitted[0]["admission_key"] == "goal_completion_landing_pending"
+
+    def test_landed_spine_is_not_reimposed_on_resubmission(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        assert result.workflow_yaml == _quote_submitted_yaml()
+        assert result.substitutions is None
+        skipped = [entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update"]
+        assert len(skipped) == 1
+        assert skipped[0]["goal_complete"] is True
+        assert skipped[0]["synthesized_goal_complete_landed"] is True
+
+    def test_successful_update_promotes_pending_goal_completion_landing(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+        ctx.persisted_draft_browser_calls = workflow_update_module._workflow_yaml_browser_call_pairs(
+            result.workflow_yaml
+        )
+        workflow_update_module._record_workflow_update_result(ctx, _persisted_workflow_result())
+
+        assert ctx.synthesized_goal_complete_landed is True
+        assert ctx.pending_goal_complete_landing is False
+
+    def test_premature_landing_that_under_builds_does_not_retire_and_reimposes_full_spine(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+
+        workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+        assert ctx.pending_goal_complete_landing is True
+        ctx.persisted_draft_browser_calls = workflow_update_module._workflow_yaml_browser_call_pairs(
+            _quote_submitted_yaml()
+        )
+        workflow_update_module._record_workflow_update_result(ctx, _persisted_workflow_result())
+
+        assert ctx.synthesized_goal_complete_landed is False
+        assert ctx.pending_goal_complete_landing is False
+
+        reimposed = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+        code = str(_single_code_block(parse_workflow_yaml(reimposed.workflow_yaml))["code"])
+        assert 'page.locator("#coverage-next")' in code
+        assert ctx.pending_goal_complete_landing is True
+
+    def test_armed_landing_reads_current_spine_not_arm_snapshot_and_does_not_retire(self) -> None:
+        ctx = _quote_ctx()
+        ctx.pending_goal_complete_landing = True
+        ctx.persisted_draft_browser_calls = workflow_update_module._workflow_yaml_browser_call_pairs(
+            _quote_submitted_yaml()
+        )
+
+        workflow_update_module._record_workflow_update_result(ctx, _persisted_workflow_result())
+
+        assert ctx.synthesized_goal_complete_landed is False
+        assert ctx.pending_goal_complete_landing is False
+
+        reimposed = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+        code = str(_single_code_block(parse_workflow_yaml(reimposed.workflow_yaml))["code"])
+        assert 'page.locator("#coverage-next")' in code
+
+    def test_full_spine_plus_suffix_draft_stays_retired_without_reimposition(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#coverage-next").click()
+                  records = [{"quote": "captured"}]
+            """
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.workflow_yaml == submitted
+        assert result.substitutions is None
+        assert result.violations == []
+        skipped = [entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update"]
+        assert len(skipped) == 1
+        assert skipped[0]["synthesized_goal_complete_landed"] is True
+        assert ctx.synthesized_goal_complete_landed is True
+        assert ctx.pending_goal_complete_landing is False
+
+    def test_successful_update_promotes_pending_extraction_candidate(self) -> None:
+        ctx = _live_read_extraction_ctx()
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert ctx.requested_output_extraction_candidate is None
+        pending_candidate = ctx.pending_requested_output_extraction_candidate
+        assert pending_candidate is not None
+
+        workflow_update_module._record_workflow_update_result(ctx, _persisted_workflow_result())
+
+        assert ctx.requested_output_extraction_candidate == pending_candidate
+        assert ctx.pending_requested_output_extraction_candidate is None
+
+    def test_failed_update_leaves_committed_candidate_and_landing_latch_untouched(self) -> None:
+        ctx = _live_read_extraction_ctx()
+
+        workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+        workflow_update_module._record_workflow_update_result(ctx, {"ok": False})
+
+        assert ctx.requested_output_extraction_candidate is None
+        assert ctx.synthesized_goal_complete_landed is False
+
+    def test_rejected_imposition_does_not_mutate_committed_candidate(self) -> None:
+        ctx = _live_read_extraction_ctx()
+        workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+        workflow_update_module._record_workflow_update_result(ctx, _persisted_workflow_result())
+        committed = ctx.requested_output_extraction_candidate
+        assert committed is not None
+        ctx.synthesized_block_reopened_after_failed_run = True
+
+        unscouted_sibling = _yaml(
+            f"""
+            title: Record lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: {workflow_update_module._SYNTHESIZED_BLOCK_LABEL}
+                code: |
+                  await page.locator("#search-submit").click()
+              - block_type: code
+                label: helper_stage
+                code: |
+                  await page.locator("#surprise").click()
+            """
+        )
+        result = workflow_update_module._maybe_impose_synthesized_code_block(unscouted_sibling, ctx)
+
+        assert result.violations
+        assert ctx.requested_output_extraction_candidate == committed
+        assert ctx.pending_requested_output_extraction_candidate is None
+
+
+def _hand_authored_rung_yaml() -> str:
+    return _yaml(
+        """
+        title: Quote
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: enter_zip
+            code: |
+              await page.locator("#zip").fill(str(zip_code))
+          - block_type: code
+            label: continue_step
+            code: |
+              await page.locator("#continue").click()
+          - block_type: code
+            label: coverage_step
+            code: |
+              await page.locator("#coverage-next").click()
+        """
+    )
+
+
+class TestAdmittedImpositionOwnsSpineCoverage:
+    def test_multi_block_hand_authored_draft_lands_spine_on_carrier_without_stale_rungs(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_hand_authored_rung_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        blocks = _code_blocks(parsed)
+        assert list(blocks) == ["enter_zip"]
+        code = str(blocks["enter_zip"]["code"])
+        assert 'page.locator("#continue")' in code
+        assert code.count('page.locator("#coverage-next")') == 1
+        assert ctx.spine_imposition_owned_attempt is True
+
+    def test_referenced_stale_rung_label_steers_instead_of_being_dropped(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: enter_zip
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+              - block_type: code
+                label: coverage_step
+                code: |
+                  await page.locator("#coverage-next").click()
+              - block_type: code
+                label: summarize
+                code: |
+                  return {"output": coverage_step_output}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.substitutions is None
+        assert any("`coverage_step`" in violation for violation in result.violations)
+        assert result.workflow_yaml == submitted
+
+    def test_admitted_imposition_is_not_answered_by_the_persist_seam_guard(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+        ctx.persisted_draft_browser_calls = [("click", 'page.locator("#zip")')]
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/files/report.pdf"]',
+            affordance_text="Download PDF",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(_hand_authored_rung_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        assert ctx.spine_imposition_owned_attempt is True
+        assert workflow_update_module._persist_seam_spine_under_build_result(result.workflow_yaml, ctx) is None
+        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
+
+    def test_persist_seam_guard_still_fires_when_imposition_is_not_admitted(self) -> None:
+        ctx = _records_spine_ctx()
+        ctx.update_workflow_called = True
+        under_built = _records_block_yaml('await page.locator("#stage-a").click()')
+
+        imposition = workflow_update_module._maybe_impose_synthesized_code_block(under_built, ctx)
+
+        assert ctx.spine_imposition_owned_attempt is False
+        assert imposition.substitutions is None
+
+        with capture_logs() as logs:
+            guarded = workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx)
+
+        assert guarded is not None
+        assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
+        events = [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
+        assert events and events[0]["site"] == "persist_seam"
+
+    def test_ungrounded_sibling_mixing_ambiguous_and_concrete_calls_is_replaced_by_the_spine(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+              - block_type: code
+                label: download_matching_invoice
+                code: |
+                  async with page.expect_download(timeout=20000) as download_info:
+                      await page.get_by_role("link", name="View Printable Statement").click()
+                  download = await download_info.value
+              - block_type: code
+                label: summarize
+                code: |
+                  records = [{"invoice": "parsed"}]
+            """
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert ctx.spine_imposition_owned_attempt is True
+        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
+        assert list(blocks) == ["quote_flow", "summarize"]
+        carrier_code = str(blocks["quote_flow"]["code"])
+        assert "get_by_role" not in carrier_code
+        assert carrier_code.count('page.locator("#coverage-next").click()') == 1
+        dropped = [log for log in logs if log["event"] == "copilot_spine_stale_rung_dropped"]
+        assert dropped and dropped[0]["dropped_labels"] == ["download_matching_invoice"]
+        assert "never_captured" in {record["kind"] for record in dropped[0]["dropped_provenance"]}
+        assert result.substitutions is not None
+        assert result.substitutions["replaced_hand_authored_browser_rungs"] == ["download_matching_invoice"]
+
+    def test_referenced_ungrounded_sibling_steers_instead_of_being_replaced(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+              - block_type: code
+                label: download_matching_invoice
+                code: |
+                  async with page.expect_download(timeout=20000) as download_info:
+                      await page.get_by_role("link", name="View Printable Statement").click()
+                  download = await download_info.value
+              - block_type: code
+                label: summarize
+                code: |
+                  return {"output": download_matching_invoice_output}
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.substitutions is None
+        assert result.workflow_yaml == submitted
+        assert any("`download_matching_invoice`" in violation for violation in result.violations)
+        assert any("never_captured" in violation for violation in result.violations)
+        assert any("never by authoring browser calls freehand" in violation for violation in result.violations)
+
+    def test_hand_authored_download_rung_is_replaced_by_the_grounded_spine_terminal(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/files/report.pdf"]',
+            affordance_text="Download PDF",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: enter_zip
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+              - block_type: code
+                label: download_statement
+                code: |
+                  async with page.expect_download() as dl:
+                      await page.locator("a[href=\\"/files/report.pdf\\"]").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
+        assert list(blocks) == ["enter_zip"]
+        code = str(blocks["enter_zip"]["code"])
+        assert code.count("async with page.expect_download()") == 1
+        assert 'page.locator("#coverage-next")' in code
+
+    def test_aliased_download_handle_rung_is_dropped_for_the_grounded_spine_terminal(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/files/report.pdf"]',
+            affordance_text="Download PDF",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: enter_zip
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+              - block_type: code
+                label: download_statement
+                code: |
+                  rows = page.locator("div.statement-row")
+                  await rows.count()
+                  printable = rows.nth(0).locator("a.printable")
+                  await printable.wait_for(state="visible", timeout=10000)
+                  async with page.expect_download(timeout=20000) as download_info:
+                      await printable.click()
+                  download = await download_info.value
+            """
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        blocks = _code_blocks(parse_workflow_yaml(result.workflow_yaml))
+        assert list(blocks) == ["enter_zip"]
+        code = str(blocks["enter_zip"]["code"])
+        assert code.count("async with page.expect_download()") == 1
+        assert "printable" not in code
+        dropped = [log for log in logs if log["event"] == "copilot_spine_stale_rung_dropped"]
+        assert dropped and dropped[0]["dropped_labels"] == ["download_statement"]
+        assert "page.expect_download(timeout=20000)" in dropped[0]["dropped_actions"]
+
+    def test_unchanged_under_built_carrier_still_lands_the_spine_on_an_owned_attempt(self) -> None:
+        ctx = _records_spine_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/files/report.pdf"]',
+            affordance_text="Download PDF",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        under_built = _records_block_yaml('await page.locator("#stage-a").click()')
+        ctx.workflow_yaml = under_built
+
+        imposition = workflow_update_module._maybe_impose_synthesized_code_block(under_built, ctx)
+
+        assert imposition.violations == []
+        assert imposition.substitutions is not None
+        assert ctx.spine_imposition_owned_attempt is True
+        code = str(_single_code_block(parse_workflow_yaml(imposition.workflow_yaml))["code"])
+        assert 'page.locator("#stage-b").click()' in code
+        assert workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx) is None
+
+
+def _reaching_extraction_ctx() -> CopilotContext:
+    ctx = _live_read_extraction_ctx()
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/report.pdf"]',
+        affordance_text="Download PDF",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+    return ctx
+
+
+class TestReachingTrajectoryOwnershipDeterminism:
+    def test_owned_attempt_fires_before_the_extraction_plan_materializes(self) -> None:
+        ctx = _reaching_extraction_ctx()
+        ctx.flow_evidence = []
+        ctx.update_workflow_called = True
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+        assert result.violations == []
+        assert ctx.spine_imposition_owned_attempt is True
+        assert len([log for log in logs if log["event"] == "copilot_spine_imposition_owned_attempt"]) == 1
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "_extraction_value_0" not in code
+        assert ctx.pending_requested_output_extraction_candidate is None
+
+    def test_materialized_plan_reimposes_idempotently_and_holds_candidate_identity(self) -> None:
+        ctx = _reaching_extraction_ctx()
+        ctx.flow_evidence = []
+        ctx.update_workflow_called = True
+        first = workflow_update_module._maybe_impose_synthesized_code_block(_live_read_submitted_yaml(), ctx)
+        assert first.violations == []
+
+        ctx.flow_evidence = _live_read_extraction_ctx().flow_evidence
+        second = workflow_update_module._maybe_impose_synthesized_code_block(first.workflow_yaml, ctx)
+
+        assert second.violations == []
+        assert ctx.spine_imposition_owned_attempt is True
+        code = str(_single_code_block(parse_workflow_yaml(second.workflow_yaml))["code"])
+        assert code.count('return {"output": {"record_id": _extraction_value_0}}') == 1
+        candidate = ctx.pending_requested_output_extraction_candidate
+        assert candidate is not None
+
+        third = workflow_update_module._maybe_impose_synthesized_code_block(second.workflow_yaml, ctx)
+
+        assert third.violations == []
+        assert ctx.pending_requested_output_extraction_candidate == candidate
+        assert str(_single_code_block(parse_workflow_yaml(third.workflow_yaml))["code"]) == code
+
+    def test_reaching_attempt_without_a_carrier_records_the_absence(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        blockless = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks: []
+            """
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(blockless, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is None
+        assert ctx.spine_imposition_owned_attempt is False
+        assert [log for log in logs if log["event"] == "copilot_spine_imposition_no_carrier"]
+
+
+def _download_ctx() -> CopilotContext:
+    ctx = _quote_ctx()
+    ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+        {
+            "tool_name": "click",
+            "selector": "#view-printable",
+            "source_url": "https://example.com/quote/statement",
+            "trajectory_index": 3,
+        }
+    ]
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/report.pdf"]',
+        affordance_text="Download PDF",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+        trajectory_anchor=2,
+    )
+    return ctx
+
+
+def _download_ctx_with_criterion(evidence_source: RequestedOutputEvidenceSource) -> CopilotContext:
+    ctx = _download_ctx()
+    ctx.turn_id = "t-download"
+    ctx.update_workflow_called = True
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="downloaded_statement",
+                outcome="the statement file is downloaded",
+                output_path="output.downloads",
+                requested_output_evidence_source=evidence_source,
+            )
+        ]
+    )
+    return ctx
+
+
+class TestSequencedDownloadTerminalCoverage:
+    def test_imposed_spine_stops_at_the_capture_anchor_and_ends_on_the_terminal(self) -> None:
+        ctx = _download_ctx()
+        ctx.update_workflow_called = True
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert '"#view-printable"' not in code
+        assert code.index("async with page.expect_download()") > code.index('"#coverage-next"')
+
+    def test_landed_sequenced_spine_satisfies_the_under_build_guard(self) -> None:
+        ctx = _download_ctx()
+        ctx.update_workflow_called = True
+
+        imposed = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        later = _download_ctx()
+        later.update_workflow_called = True
+
+        with capture_logs() as logs:
+            guarded = workflow_update_module._persist_seam_spine_under_build_result(imposed.workflow_yaml, later)
+
+        assert guarded is None
+        assert not [log for log in logs if log["event"] == "copilot_scouted_spine_under_build"]
+
+    def test_sequenced_spine_with_runtime_output_criterion_stays_fail_closed(self) -> None:
+        ctx = _download_ctx_with_criterion("runtime_output")
+
+        imposed = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        assert imposed.violations == []
+        assert workflow_update_module._output_contract_required_paths_source(ctx).union == {"output.downloads"}
+
+    def test_retired_imposition_still_coverage_checks_a_later_under_built_persist(self) -> None:
+        ctx = _quote_ctx()
+        ctx.update_workflow_called = True
+        ctx.synthesized_goal_complete_landed = True
+
+        imposition = workflow_update_module._maybe_impose_synthesized_code_block(_quote_submitted_yaml(), ctx)
+
+        assert imposition.substitutions is None
+        assert ctx.spine_imposition_owned_attempt is False
+
+        guarded = workflow_update_module._persist_seam_spine_under_build_result(imposition.workflow_yaml, ctx)
+
+        assert guarded is not None
+        assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
