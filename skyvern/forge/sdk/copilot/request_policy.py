@@ -1723,7 +1723,11 @@ def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
 
 
 def is_turn_unsatisfiable_fallback_degraded(criterion: CompletionCriterion) -> bool:
-    return criterion.mint_degrade is not None
+    return criterion.mint_degrade == "turn_unsatisfiable_fallback"
+
+
+def is_contingent_missing_antecedent_degraded(criterion: CompletionCriterion) -> bool:
+    return criterion.mint_degrade == "contingent_missing_antecedent"
 
 
 def resolve_mint_degrade(
