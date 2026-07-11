@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _normalize_deliverable_kind,
     is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
+    is_presence_only_requested_output_criterion,
     judgment_truth_condition_key,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
@@ -393,12 +394,7 @@ def apply_requested_output_producer_floor(
     criteria = tuple(criteria)
     requested, _remaining = split_requested_output_criteria(list(criteria))
     presence_only_ids = {
-        criterion.id
-        for criterion in requested
-        if criterion.expected_output_value is None
-        and criterion.expected_output_shape is None
-        and criterion.deliverable_kind is None
-        and criterion.mint_degrade is None
+        criterion.id for criterion in requested if is_presence_only_requested_output_criterion(criterion)
     }
     if not presence_only_ids:
         return criteria, ()
@@ -407,7 +403,16 @@ def apply_requested_output_producer_floor(
     for criterion in criteria:
         if criterion.id in presence_only_ids:
             rekeyed_paths.append(criterion.output_path or "")
-            floored.append(replace(criterion, output_path=None, level="run", kind="outcome"))
+            floored.append(
+                replace(
+                    criterion,
+                    output_path=None,
+                    level="run",
+                    kind="outcome",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=criterion.floor_rekeyed_from_path or criterion.output_path,
+                )
+            )
         else:
             floored.append(criterion)
     return tuple(floored), tuple(rekeyed_paths)

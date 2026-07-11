@@ -1712,6 +1712,17 @@ def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
     return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
 
 
+def registered_output_payload_binds_output_path(
+    payloads: Sequence[Mapping[str, object]],
+    output_path: str,
+) -> bool:
+    for item in payloads:
+        value, present = _registered_output_value_for_path(item, output_path)
+        if present and not _is_empty_output_value(value):
+            return True
+    return False
+
+
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:
     value = item.get("value")
     key = _safe_str(item.get("output_parameter_key"))

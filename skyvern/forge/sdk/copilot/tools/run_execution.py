@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
+    registered_output_payload_binds_output_path,
     run_backed_repair_evidence_exists,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
@@ -57,6 +58,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     DeliveredUnverifiedTerminalState,
     degraded_contract_delivered_unverified_terminal_state,
+    floor_rekeyed_deliverable_credit,
     only_structural_requested_output_abstentions,
     zero_requested_output_criteria_credit,
 )
@@ -3178,6 +3180,36 @@ def _zero_requested_output_criteria_delivered_unverified(
         has_meaningful_registered_output=_has_meaningful_registered_output_payload(data),
     ):
         return None
+    credit = floor_rekeyed_deliverable_credit(completion_verification)
+    if credit is not None:
+        payloads = _registered_output_parameter_payloads(data)
+        payload_keys = sorted(
+            {key for item in payloads for key in [item.get("output_parameter_key")] if isinstance(key, str) and key}
+        )
+        unbound_paths = [
+            output_path
+            for output_path in credit.output_paths
+            if output_path and not registered_output_payload_binds_output_path(payloads, output_path)
+        ]
+        if unbound_paths:
+            LOG.info(
+                "copilot.completion.floor_rekeyed_credit_payload_unbound",
+                workflow_run_id=workflow_run_id,
+                criterion_ids=list(credit.criterion_ids),
+                unbound_output_paths=unbound_paths,
+                registered_output_keys=payload_keys,
+            )
+        else:
+            LOG.info(
+                "copilot.completion.floor_rekeyed_deliverable_credit",
+                workflow_run_id=workflow_run_id,
+                criterion_ids=list(credit.criterion_ids),
+                evidence_sources=list(credit.evidence_sources),
+                evidence_refs=list(credit.evidence_refs),
+                credited_output_paths=list(credit.output_paths),
+                registered_output_keys=payload_keys,
+            )
+            return None
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.suspicious_success_nudge_count = 0

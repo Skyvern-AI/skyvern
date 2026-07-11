@@ -297,6 +297,8 @@ class CompletionCriterion:
     requested_output_corroborator: bool = False
     mint_degrade: MintDegrade | None = None
     judgment_truth_condition: JudgmentTruthCondition | None = None
+    requested_output_floor_rekeyed: bool = False
+    floor_rekeyed_from_path: str | None = None
 
 
 @dataclass
@@ -1408,6 +1410,15 @@ def _non_requested_output_run_corroborator(criterion: CompletionCriterion) -> bo
         and criterion.kind == "outcome"
         and not criterion.method_mandated
         and criterion.output_path is None
+    )
+
+
+def is_presence_only_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.expected_output_value is None
+        and criterion.expected_output_shape is None
+        and criterion.deliverable_kind is None
+        and criterion.mint_degrade is None
     )
 
 
