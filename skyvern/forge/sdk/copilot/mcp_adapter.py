@@ -79,6 +79,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "synthesized_block_offered_trajectory_len",
     "synthesized_block_offered_goal_complete",
     "scouted_output_covered_paths",
+    "requested_output_extraction_candidate",
     "synthesized_block_reopened_for_output_coverage",
     "uncovered_output_rescout_context_key",
     "uncovered_output_rescout_steer_key",

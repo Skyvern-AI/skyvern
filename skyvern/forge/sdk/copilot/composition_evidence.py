@@ -53,6 +53,9 @@ _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "recor
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
 _MAX_RESULT_CONTAINERS = 8
+_MAX_KEY_VALUE_RELATIONS = 24
+_MAX_TABLE_HEADERS = 12
+_MAX_RESULT_SAMPLE_ROWS = 5
 _MAX_NAVIGATION_TARGETS = 20
 _MAX_SELECT_OPTIONS = 30
 _MAX_CHALLENGE_CONTROLS = 8
@@ -1124,6 +1127,9 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "forms": [],
         "navigation_targets": [],
         "result_containers": [],
+        "result_containers_truncated": False,
+        "key_value_relations": [],
+        "key_value_relations_truncated": False,
         **_clickable_controls_channel([]),
         "visible_text_excerpt": "",
         "anti_bot_indicators": [],
@@ -1365,7 +1371,7 @@ def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dic
     for node in candidates:
         if len(controls) >= _MAX_CLICKABLE_CONTROLS:
             break
-        tag_name = str(getattr(node, "name", "") or "").lower()
+        tag_name = str(node.name or "").lower()
         if tag_name in {"script", "style", "noscript"}:
             continue
         if hasattr(node, "find_parent") and node.find_parent("form") is not None:
@@ -1464,14 +1470,66 @@ def _result_row_text_is_content(text: str) -> bool:
     return bool(normalized) and not any(pattern in normalized for pattern in _EMPTY_RESULT_TEXT_PATTERNS)
 
 
-def _result_container_entry(node: Any) -> dict[str, Any]:
-    tag_name = str(getattr(node, "name", "") or "").lower()
+def _selector_match_count(soup: Any, selector: str) -> int:
+    try:
+        return len(soup.select(selector))
+    except Exception:
+        return 0
+
+
+def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool]:
+    relations: list[dict[str, Any]] = []
+    truncated = False
+    for node in soup.find_all(True):
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        children = [child for child in node.find_all(recursive=False) if child.name]
+        if len(children) != 2:
+            continue
+        if children[0].find(True) is not None:
+            continue
+        key_text = _schema_text(_node_text(children[0]), 120)
+        value_text = _schema_text(_node_text(children[1]), 240)
+        if not key_text or not value_text or key_text == value_text:
+            continue
+        if len(relations) >= _MAX_KEY_VALUE_RELATIONS:
+            truncated = True
+            break
+        selector = _selector_for(node)[:160]
+        match_count = _selector_match_count(soup, selector)
+        if match_count <= 0:
+            continue
+        matches = soup.select(selector)
+        try:
+            position = matches.index(node)
+        except ValueError:
+            continue
+        relations.append(
+            {
+                "key_text": key_text,
+                "container_selector": selector,
+                "container_match_count": match_count,
+                "container_position": position,
+                "value_child_index": 1,
+                "direct_child_count": len(children),
+                "visible": True,
+                "value_visible": True,
+            }
+        )
+    return relations, truncated
+
+
+def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
+    tag_name = str(node.name or "").lower()
     node_id = str(node.get("id") or "")
     selector = _selector_for(node)[:160]
     entry: dict[str, Any] = {
         "tag": tag_name,
         "id": node_id[:120],
         "selector": selector,
+        "selector_match_count": _selector_match_count(soup, selector),
+        "visible": True,
     }
     if tag_name == "table":
         entry["row_selector"] = f"{selector} tbody tr"
@@ -1485,10 +1543,32 @@ def _result_container_entry(node: Any) -> dict[str, Any]:
         data_rows = [row for row in node.select("tbody tr") if row.find("td") is not None]
         if not data_rows:
             data_rows = [row for row in node.select("tr") if row.find("td") is not None]
+        headers = [
+            {"text": _schema_text(_node_text(header), 120), "column_index": index}
+            for index, header in enumerate(node.select("thead th")[:_MAX_TABLE_HEADERS])
+            if _schema_text(_node_text(header), 120)
+        ]
+        if headers:
+            entry["headers"] = headers
+        entry["row_count"] = len(data_rows)
+        entry["rows_truncated"] = len(data_rows) > _MAX_RESULT_SAMPLE_ROWS
+        entry["span_free"] = node.select_one("th[colspan], th[rowspan], td[colspan], td[rowspan]") is None
+        entry["nested_table_free"] = node.find("table") is None
+        entry["rows"] = [
+            {
+                "row_index": row_index,
+                "visible": True,
+                "has_row_header": row.select_one(":scope > th") is not None,
+                "cells": [
+                    {"column_index": column_index, "visible": True}
+                    for column_index, _cell in enumerate(row.select(":scope > td")[:_MAX_TABLE_HEADERS])
+                ],
+            }
+            for row_index, row in enumerate(data_rows[:_MAX_RESULT_SAMPLE_ROWS])
+        ]
         sample_rows = [_schema_text(_node_text(row), 240) for row in data_rows]
         sample_rows = [row for row in sample_rows if _result_row_text_is_content(row)][:5]
         if sample_rows:
-            entry["row_count"] = len(sample_rows)
             entry["sample_rows"] = sample_rows
     else:
         text_excerpt = _schema_text(_node_text(node), 240)
@@ -1811,16 +1891,20 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         navigation_targets.append(nav_entry)
 
     result_containers: list[dict[str, Any]] = []
+    result_containers_truncated = False
     for node in all_nodes:
-        if len(result_containers) >= _MAX_RESULT_CONTAINERS:
-            break
         tag_name = str(getattr(node, "name", "") or "").lower()
         node_id = str(node.get("id") or "")
         class_value = node.get("class") or []
         class_text = " ".join(class_value) if isinstance(class_value, list) else str(class_value)
         result_identity = f"{node_id} {class_text}".lower()
         if tag_name == "table" or any(hint in result_identity for hint in _RESULT_CONTAINER_HINTS):
-            result_containers.append(_result_container_entry(node))
+            if len(result_containers) >= _MAX_RESULT_CONTAINERS:
+                result_containers_truncated = True
+                break
+            result_containers.append(_result_container_entry(node, soup=soup))
+
+    key_value_relations, key_value_relations_truncated = _key_value_relations(soup)
 
     used_selectors: set[str] = set()
     for form in forms:
@@ -1855,6 +1939,9 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        "result_containers_truncated": result_containers_truncated,
+        "key_value_relations": key_value_relations,
+        "key_value_relations_truncated": key_value_relations_truncated,
         **_clickable_controls_channel(clickable_controls),
         "visible_text_excerpt": _schema_text(visible_text, _MAX_VISIBLE_TEXT_EXCERPT_CHARS),
         "anti_bot_indicators": anti_bot_indicators,
@@ -1993,15 +2080,65 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
             "tag": tag_name,
             "id": _structured_str(node.get("id"))[:120],
             "selector": selector,
+            "selector_match_count": node.get("selector_match_count")
+            if isinstance(node.get("selector_match_count"), int)
+            else 0,
+            "visible": node.get("visible") is True,
         }
+        headers: list[dict[str, Any]] = []
+        raw_headers = node.get("headers")
+        if isinstance(raw_headers, list):
+            for header in raw_headers[:_MAX_TABLE_HEADERS]:
+                if not isinstance(header, dict):
+                    continue
+                text = _schema_text(_structured_str(header.get("text")), 120)
+                column_index = header.get("column_index")
+                if not text or not isinstance(column_index, int) or isinstance(column_index, bool) or column_index < 0:
+                    continue
+                headers.append({"text": text, "column_index": column_index})
+        if headers:
+            entry["headers"] = headers
+        row_count = node.get("row_count")
+        if isinstance(row_count, int) and not isinstance(row_count, bool) and row_count >= 0:
+            entry["row_count"] = row_count
+        entry["rows_truncated"] = node.get("rows_truncated") is True
+        entry["span_free"] = node.get("span_free") is True
+        entry["nested_table_free"] = node.get("nested_table_free") is True
+        rows: list[dict[str, Any]] = []
+        raw_rows = node.get("rows")
+        if isinstance(raw_rows, list):
+            for raw_row in raw_rows[:_MAX_RESULT_SAMPLE_ROWS]:
+                if not isinstance(raw_row, dict):
+                    continue
+                row_index = raw_row.get("row_index")
+                if not isinstance(row_index, int) or isinstance(row_index, bool) or row_index < 0:
+                    continue
+                cells: list[dict[str, Any]] = []
+                raw_cells = raw_row.get("cells")
+                if isinstance(raw_cells, list):
+                    for raw_cell in raw_cells[:_MAX_TABLE_HEADERS]:
+                        if not isinstance(raw_cell, dict):
+                            continue
+                        column_index = raw_cell.get("column_index")
+                        if not isinstance(column_index, int) or isinstance(column_index, bool) or column_index < 0:
+                            continue
+                        cells.append({"column_index": column_index, "visible": raw_cell.get("visible") is True})
+                rows.append(
+                    {
+                        "row_index": row_index,
+                        "visible": raw_row.get("visible") is True,
+                        "has_row_header": raw_row.get("has_row_header") is True,
+                        "cells": cells,
+                    }
+                )
+        entry["rows"] = rows
         sample_rows = [
             _schema_text(_structured_str(row), 240)
             for row in (node.get("sample_rows") or [])
             if isinstance(row, str) and _result_row_text_is_content(row)
         ][:5]
         if sample_rows:
-            row_count = node.get("row_count")
-            entry["row_count"] = row_count if isinstance(row_count, int) and row_count > 0 else len(sample_rows)
+            entry.setdefault("row_count", len(sample_rows))
             entry["sample_rows"] = sample_rows
         text_excerpt = _schema_text(
             _structured_str(
@@ -2012,7 +2149,8 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
         if text_excerpt:
             entry["text_excerpt"] = text_excerpt
         if tag_name == "table" or node.get("is_table") is True:
-            entry["row_selector"] = f"{selector} tbody tr"
+            reported_row_selector = _structured_str(node.get("row_selector"))[:240]
+            entry["row_selector"] = reported_row_selector or f"{selector} tbody tr"
             entry["expand_toggle_candidates"] = [
                 f"{selector} tbody tr [aria-expanded]",
                 f'{selector} tbody tr [role="button"]',
@@ -2022,6 +2160,53 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
             ]
         containers.append(entry)
     return containers
+
+
+def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
+    relations: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return relations
+    for item in value[:_MAX_KEY_VALUE_RELATIONS]:
+        if not isinstance(item, dict):
+            continue
+        key_text = _schema_text(_structured_str(item.get("key_text")), 120)
+        selector = _structured_str(item.get("container_selector"))[:160]
+        match_count = item.get("container_match_count")
+        position = item.get("container_position")
+        child_index = item.get("value_child_index")
+        child_count = item.get("direct_child_count")
+        if not key_text or not selector:
+            continue
+        if (
+            not isinstance(match_count, int)
+            or isinstance(match_count, bool)
+            or match_count < 0
+            or not isinstance(position, int)
+            or isinstance(position, bool)
+            or position < 0
+            or not isinstance(child_index, int)
+            or isinstance(child_index, bool)
+            or child_index < 0
+            or not isinstance(child_count, int)
+            or isinstance(child_count, bool)
+            or child_count <= child_index
+        ):
+            continue
+        if match_count <= position:
+            continue
+        relations.append(
+            {
+                "key_text": key_text,
+                "container_selector": selector,
+                "container_match_count": match_count,
+                "container_position": position,
+                "value_child_index": child_index,
+                "direct_child_count": child_count,
+                "visible": item.get("visible") is True,
+                "value_visible": item.get("value_visible") is True,
+            }
+        )
+    return relations
 
 
 def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
@@ -2145,6 +2330,7 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
     forms = forms[:_MAX_FORMS]
     navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
     result_containers = _structured_result_containers(data.get("result_containers"))
+    key_value_relations = _structured_key_value_relations(data.get("key_value_relations"))
     clickable_controls = _structured_clickable_controls(data.get("clickable_controls"))
     challenge_controls = _structured_challenge_controls(data.get("challenge_controls"))
     modal_overlays = _structured_modal_overlays(data.get("modal_overlays"))
@@ -2177,6 +2363,9 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        "result_containers_truncated": data.get("result_containers_truncated") is True,
+        "key_value_relations": key_value_relations,
+        "key_value_relations_truncated": data.get("key_value_relations_truncated") is True,
         **_clickable_controls_channel(clickable_controls),
         "visible_text_excerpt": visible_text,
         "anti_bot_indicators": anti_bot_indicators,

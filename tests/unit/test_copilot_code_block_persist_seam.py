@@ -47,7 +47,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _get_by_role_expr_strict,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext, FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
@@ -425,6 +425,114 @@ def _single_code_block(parsed: dict[str, object]) -> dict[str, object]:
     blocks = [block for block in workflow_blocks(parsed) if str(block.get("block_type") or "").lower() == "code"]
     assert len(blocks) == 1
     return blocks[0]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'value = (await page.locator("#record").inner_text()).strip()',
+        'parts = (await page.locator("#record").inner_text()).split("|")',
+        'value = await page.locator("#rows").nth(2).locator("td").nth(1).inner_text()',
+    ],
+)
+def test_browser_surface_admits_awaited_read_postprocessing_and_bounded_nth(code: str) -> None:
+    mutations, unscouted, ambiguous = workflow_update_module._browser_surface_for_code(code)
+
+    assert mutations == []
+    assert unscouted == []
+    assert ambiguous == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'locator = page.locator("#record")\nvalue = await locator.inner_text()',
+        'read = page.locator("#record").inner_text\nvalue = await read()',
+        'await getattr(page.locator("#record"), "inner_text")()',
+        'await page.locator("#record").nth(-1).inner_text()',
+        'await page.locator("#record").nth(10001).inner_text()',
+        'for index in range(await page.locator("#rows").count()):\n    value = await page.locator("#rows").nth(index).inner_text()',
+        'await page.locator("#record").fill("changed")',
+        'values = sorted(await page.locator("#rows").all_text_contents(), key=page.set_default_timeout)',
+    ],
+)
+def test_browser_surface_rejects_alias_dynamic_unbounded_and_mutation_forms(code: str) -> None:
+    mutations, unscouted, ambiguous = workflow_update_module._browser_surface_for_code(code)
+
+    assert mutations or unscouted or ambiguous
+
+
+def test_plan_backed_imposition_executes_generated_and_submitted_live_read_recipe() -> None:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="record_id",
+                outcome="Record Identifier",
+                output_path="output.record_id",
+            )
+        ]
+    )
+    ctx.completion_criteria_turn_state = SimpleNamespace(
+        decision=SimpleNamespace(criteria=tuple(ctx.request_policy.completion_criteria))
+    )
+    ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"record identifier": "output.record_id"})
+    ctx.flow_evidence = [
+        {
+            "step": 2,
+            "reached_via": "interaction",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "scout_interaction",
+                "interaction_tool": "click",
+                "interaction_selector": "#search-submit",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "Record Identifier",
+                        "container_selector": ".record-kv",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 1,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+    ]
+    submitted = _yaml(
+        """
+        title: Record lookup
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: extract_record
+            code: |
+              await page.locator("#search-submit").click()
+        """
+    )
+
+    result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+    assert result.violations == []
+    code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+    assert 'page.locator(".record-kv").nth(0)' in code
+    assert code.count('return {"output": {"record_id": _extraction_value_0}}') == 1
+    assert result.substitutions["extraction_candidate_source"] == "generated"
+    assert result.substitutions["extraction_plan_identity"]
+
+    submitted_result = workflow_update_module._maybe_impose_synthesized_code_block(result.workflow_yaml, ctx)
+
+    assert submitted_result.violations == []
+    assert submitted_result.substitutions["extraction_candidate_source"] == "submitted"
+    submitted_code = str(_single_code_block(parse_workflow_yaml(submitted_result.workflow_yaml))["code"])
+    assert submitted_code == code
 
 
 def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> str:

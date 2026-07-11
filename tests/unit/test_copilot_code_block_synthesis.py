@@ -33,12 +33,20 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
+    synthesize_code_block_with_extraction,
+    synthesize_extraction_suffix,
     uncovered_required_emitted_interactions,
 )
 from skyvern.forge.sdk.copilot.context import (
     FillCarry,
     StructuredContext,
     _fill_carry_from_scout_trajectory,
+)
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    LiveReadBinding,
+    LiveReadKind,
+    RequestedOutputExtractionPlan,
+    RevealAnchor,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
@@ -66,6 +74,186 @@ def real_mypy() -> None:
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
     return {"tool_name": tool_name, **fields}
+
+
+def _extraction_plan() -> RequestedOutputExtractionPlan:
+    return RequestedOutputExtractionPlan(
+        requested_output_paths=(
+            "output.records[].detail",
+            "output.records[].state",
+            "output.record_id",
+            "output.overall_state",
+        ),
+        observation_step=9,
+        observation_identity="observation-identity",
+        reveal=RevealAnchor(selector="#show-details"),
+        live_reads=(
+            LiveReadBinding(
+                output_path="output.record_id",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=0,
+                child_index=1,
+                child_count=2,
+                relation_label="Record Identifier",
+            ),
+            LiveReadBinding(
+                output_path="output.records[].detail",
+                kind=LiveReadKind.TABLE_COLUMN,
+                selector="#records",
+                selector_count=1,
+                selector_index=0,
+                row_selector="#records > tbody > tr",
+                row_count=3,
+                column_index=1,
+                headers=("Record", "Detail", "State"),
+                row_cell_counts=(3, 3, 3),
+                row_identities=("One Detail State", "Two Detail State", "Three Detail State"),
+            ),
+            LiveReadBinding(
+                output_path="output.records[].state",
+                kind=LiveReadKind.TABLE_COLUMN,
+                selector="#records",
+                selector_count=1,
+                selector_index=0,
+                row_selector="#records > tbody > tr",
+                row_count=3,
+                column_index=2,
+                headers=("Record", "Detail", "State"),
+                row_cell_counts=(3, 3, 3),
+                row_identities=("One Detail State", "Two Detail State", "Three Detail State"),
+            ),
+            LiveReadBinding(
+                output_path="output.overall_state",
+                kind=LiveReadKind.KEY_VALUE,
+                selector=".kv",
+                selector_count=2,
+                selector_index=1,
+                child_index=1,
+                child_count=2,
+                relation_label="Overall State",
+            ),
+        ),
+        identity="plan-identity",
+    )
+
+
+def test_extraction_suffix_compiles_direct_guarded_live_reads() -> None:
+    suffix = synthesize_extraction_suffix(_extraction_plan())
+
+    assert suffix is not None
+    assert 'page.locator(".kv").nth(0).locator(":scope > *").nth(1).inner_text()' in suffix.code
+    assert 'page.locator("#records > tbody > tr").count() != 3' in suffix.code
+    assert "for _extraction_index" not in suffix.code
+    assert 'page.locator("#records > tbody > tr").nth(2)' in suffix.code
+    assert '"overall_state": _extraction_value_1' in suffix.code
+    assert '"detail"' in suffix.code
+    assert '"state"' in suffix.code
+
+
+class _RecipeLocator:
+    def __init__(self, page: _RecipePage, selector: str, indices: tuple[int, ...] = ()) -> None:
+        self.page = page
+        self.selector = selector
+        self.indices = indices
+
+    def nth(self, index: int) -> _RecipeLocator:
+        return _RecipeLocator(self.page, self.selector, (*self.indices, index))
+
+    def locator(self, selector: str) -> _RecipeLocator:
+        return _RecipeLocator(self.page, f"{self.selector}|{selector}", self.indices)
+
+    async def count(self) -> int:
+        return self.page.counts[(self.selector, self.indices)]
+
+    async def is_visible(self) -> bool:
+        return self.page.visibility.get((self.selector, self.indices), True)
+
+    async def inner_text(self) -> str:
+        return self.page.text[(self.selector, self.indices)]
+
+
+class _RecipePage:
+    def __init__(self) -> None:
+        self.visibility: dict[tuple[str, tuple[int, ...]], bool] = {}
+        self.counts: dict[tuple[str, tuple[int, ...]], int] = {
+            (".kv", ()): 2,
+            (".kv|:scope > *", (0,)): 2,
+            (".kv|:scope > *", (1,)): 2,
+            ("#records", ()): 1,
+            ("#records|:scope > thead > tr > th", (0,)): 3,
+            ("#records|[colspan], [rowspan]", (0,)): 0,
+            ("#records > tbody > tr", ()): 3,
+            ("#records|:scope table", (0,)): 0,
+        }
+        self.text: dict[tuple[str, tuple[int, ...]], str] = {
+            (".kv|:scope > *", (0, 0)): "Record Identifier",
+            (".kv|:scope > *", (0, 1)): "record-123",
+            (".kv|:scope > *", (1, 0)): "Overall State",
+            (".kv|:scope > *", (1, 1)): "Ready",
+        }
+        for index, header in enumerate(("Record", "Detail", "State")):
+            self.text[("#records|:scope > thead > tr > th", (0, index))] = header
+        for row, identity in enumerate(("One Detail State", "Two Detail State", "Three Detail State")):
+            self.counts[("#records > tbody > tr|:scope > th, :scope > td", (row,))] = 3
+            self.counts[("#records > tbody > tr|:scope > th", (row,))] = 0
+            self.text[("#records > tbody > tr", (row,))] = identity
+            self.text[("#records > tbody > tr|:scope > th, :scope > td", (row, 1))] = f"Detail {row}"
+            self.text[("#records > tbody > tr|:scope > th, :scope > td", (row, 2))] = "Ready"
+
+    def locator(self, selector: str) -> _RecipeLocator:
+        return _RecipeLocator(self, selector)
+
+
+async def _execute_recipe(page: _RecipePage) -> dict[str, object]:
+    suffix = synthesize_extraction_suffix(_extraction_plan())
+    assert suffix is not None
+    namespace: dict[str, object] = {}
+    exec("async def recipe(page):\n" + textwrap.indent(suffix.code, "    "), namespace)
+    recipe = namespace["recipe"]
+    assert callable(recipe)
+    return await recipe(page)
+
+
+@pytest.mark.asyncio
+async def test_generated_recipe_executes_and_fails_closed_on_runtime_drift() -> None:
+    page = _RecipePage()
+    result = await _execute_recipe(page)
+    assert result["output"]["record_id"] == "record-123"
+    assert len(result["output"]["records"]) == 3
+
+    page.counts[(".kv", ())] = 3
+    with pytest.raises(ValueError, match="scalar selector cardinality"):
+        await _execute_recipe(page)
+
+    page.counts[(".kv", ())] = 2
+    page.visibility[("#records > tbody > tr|:scope > th, :scope > td", (1, 2))] = False
+    with pytest.raises(ValueError, match="cell is no longer visible"):
+        await _execute_recipe(page)
+
+
+def test_plan_compiler_requires_exact_reveal_and_is_idempotent() -> None:
+    trajectory = [
+        _interaction(
+            "click",
+            selector="#show-details",
+            role="button",
+            accessible_name="Show details",
+            source_url="https://example.com/records",
+        )
+    ]
+
+    first = synthesize_code_block_with_extraction(trajectory, _extraction_plan())
+    second = synthesize_code_block_with_extraction(trajectory, _extraction_plan())
+
+    assert first is not None
+    assert second is not None
+    assert first.code == second.code
+    assert first.code.count(".click()") == 1
+    assert first.extraction_plan_identity == "plan-identity"
+    assert first.extraction_fingerprint == second.extraction_fingerprint
+    assert synthesize_code_block_with_extraction([], _extraction_plan()) is None
 
 
 class TestLocatorSynthesis:
