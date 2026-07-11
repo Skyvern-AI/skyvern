@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     resolve_output_contract_actuation,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.result_evidence import loaded_result_composition_evidence_from_page
 from skyvern.forge.sdk.copilot.runtime import (
     output_contract_ladder_unresolved,
     record_author_time_gate_ablation_event,
@@ -419,6 +420,11 @@ def test_observed_values_suppresses_no_source_terminal() -> None:
     has_source = OutputContractActuationEvidence(False, True, True, True, False, OutputContractAdvisoryState.UNUSED)
     actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=has_source)
     assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
+    loaded_source = OutputContractActuationEvidence(
+        False, True, False, True, False, OutputContractAdvisoryState.UNUSED, loaded_result_source_producible=True
+    )
+    actuation = resolve_output_contract_actuation(family=OutputContractBailFamily.STATIC_RETURN, evidence=loaded_source)
+    assert actuation.kind != OutputContractActuationKind.BLOCKED_TERMINAL
 
 
 def test_classifier_maps_every_emitted_blocker_string() -> None:
@@ -516,6 +522,7 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_reject_count_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
         output_contract_armed_directive_fingerprint_by_signature={},
+        output_contract_output_owner_directive_candidates_by_signature={},
         output_contract_actuation_by_signature={},
         output_contract_actuation_count_by_signature={},
         output_contract_declick_attempted_by_signature={},
@@ -531,6 +538,8 @@ def _advisory_ctx() -> SimpleNamespace:
         scouted_output_covered_paths=set(),
         composition_page_evidence=None,
         recorded_outcome_binding_constraint=None,
+        latest_evaluate_result_composition_steer=None,
+        latest_evaluate_result_composition_signature=None,
     )
 
 
@@ -1091,6 +1100,38 @@ def test_reject_seam_adjudication_grants_advisory_within_caps_when_imposition_ea
     assert ctx.turn_halt is None
 
 
+def test_same_fresh_signature_emits_one_reject_before_typed_advisory(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ladder_ctx()
+    signature = "sig_first_contact_example"
+    evaluation = _make_evaluation(signature, block_label="collect")
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: None)
+
+    first = wu._record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="First typed deficiency.",
+        authored_structural_fingerprint="fp_first_contact",
+        workflow_yaml=_PAGE_READ_YAML,
+    )
+    first_outcome = ctx.latest_recorded_build_test_outcome
+    ctx.output_contract_bail_actuated_this_call = False
+    second = wu._record_output_contract_reject(
+        ctx,
+        evaluation,
+        summary="Same typed deficiency.",
+        authored_structural_fingerprint="fp_first_contact",
+        workflow_yaml=_PAGE_READ_YAML,
+    )
+
+    assert first["output_contract_actuation"] == OutputContractActuationKind.STRUCTURE_DIRECTIVE.value
+    assert first_outcome is not None
+    assert first_outcome.phase == "author_time_reject"
+    assert second["output_contract_actuation"] == OutputContractActuationKind.ADVISORY_RUN.value
+    assert ctx.latest_recorded_build_test_outcome is None
+    assert [entry["phase"] for entry in ctx.recorded_build_test_outcome_history] == ["author_time_reject"]
+    assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
+
+
 def test_reject_seam_metadata_required_reaches_advisory_before_no_source_terminal() -> None:
     ctx = _ladder_ctx()
     signature = "sig_metadata_required"
@@ -1366,6 +1407,55 @@ def test_advisory_grant_downgraded_to_directive_when_run_authority_forbids_dispa
     )
     assert actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE
     assert signature not in ctx.output_contract_actuation_by_signature
+
+
+def test_loaded_result_carrier_is_selector_bound_and_claimed_by_one_contract_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _advisory_ctx()
+    events: list[dict[str, object]] = []
+
+    def capture_event(_ctx: object, **kwargs: object) -> bool:
+        events.append(kwargs)
+        return False
+
+    monkeypatch.setattr(wu, "record_author_time_gate_ablation_event", capture_event)
+    ctx.latest_evaluate_result_composition_steer = loaded_result_composition_evidence_from_page(
+        {"result_containers": [{"selector": "#results", "row_count": 1, "sample_rows": ["Example customer record"]}]},
+        source_tool="evaluate",
+        source_url="https://example.com/results",
+    )
+
+    first = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=["static_return_envelope_unavailable"],
+        target_code='await page.locator("#results").click()',
+        required_paths={"output.record_id"},
+        signature="sig-a",
+        current_fingerprint="fp-a",
+    )
+
+    assert ctx.latest_evaluate_result_composition_signature == "sig-a"
+
+    ctx.output_contract_bail_actuated_this_call = False
+    second = wu._actuate_output_contract_bail(
+        ctx,
+        blockers=["static_return_envelope_unavailable"],
+        target_code='await page.locator("#results").click()',
+        required_paths={"output.other_id"},
+        signature="sig-b",
+        current_fingerprint="fp-b",
+    )
+
+    assert ctx.latest_evaluate_result_composition_signature == "sig-a"
+    assert first.kind is not OutputContractActuationKind.BLOCKED_TERMINAL
+    assert second.kind is OutputContractActuationKind.STRUCTURE_DIRECTIVE
+    first_payload = events[0]["payload"]
+    second_payload = events[1]["payload"]
+    assert isinstance(first_payload, dict)
+    assert isinstance(second_payload, dict)
+    assert first_payload["loaded_result_source_producible"] is True
+    assert second_payload["loaded_result_source_producible"] is False
 
 
 def _antecedent_ctx(*criteria: CompletionCriterion) -> CopilotContext:
@@ -1736,30 +1826,6 @@ def test_runtime_repair_contract_carries_declaration_lane_with_stable_signature(
     assert wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), post_run.union) == pre_signature
 
 
-def test_declaration_only_production_still_counts_as_abstained_candidate() -> None:
-    code = 'await page.click("#submit")\nreturn {"output": {"blocker": None}}'
-
-    assert (
-        wu._code_return_is_static_advisory_candidate(code, {"output.record_id", "output.blocker"}, {"output.blocker"})
-        is True
-    )
-
-
-def test_observation_production_disqualifies_advisory_candidate() -> None:
-    code = 'value = await page.inner_text("#r")\nreturn {"output": {"record_id": value}}'
-
-    assert (
-        wu._code_return_is_static_advisory_candidate(code, {"output.record_id", "output.blocker"}, {"output.blocker"})
-        is False
-    )
-
-
-def test_declaration_only_contract_is_never_advisory_candidate() -> None:
-    code = 'await page.click("#submit")'
-
-    assert wu._code_return_is_static_advisory_candidate(code, {"output.blocker"}, {"output.blocker"}) is False
-
-
 def _declaration_waiver_yaml(code_body: str) -> str:
     indented = "\n".join(f"      {line}" for line in code_body.splitlines())
     return (
@@ -1785,7 +1851,7 @@ def _declaration_waiver_metadata(union: set[str]) -> list[dict[str, object]]:
     ]
 
 
-def test_post_steering_advisory_never_waives_declaration_return_miss() -> None:
+def test_typed_advisory_grant_never_waives_declaration_return_miss() -> None:
     ctx = _antecedent_ctx(
         CompletionCriterion(
             id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
@@ -1794,7 +1860,7 @@ def test_post_steering_advisory_never_waives_declaration_return_miss() -> None:
     )
     union = {"output.record_id", "output.blocker"}
     signature = wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), union)
-    ctx.output_contract_reject_count_by_signature = {signature: wu._MAX_OUTPUT_CONTRACT_STEERING_REJECTS}
+    wu._grant_output_contract_advisory_run(ctx, signature)
     workflow_yaml = _declaration_waiver_yaml("result = await collect()\nreturn result")
 
     evaluation = wu._evaluate_output_contract_for_code_block(
@@ -1802,7 +1868,7 @@ def test_post_steering_advisory_never_waives_declaration_return_miss() -> None:
     )
 
     assert evaluation is not None
-    assert evaluation.payload["post_steering_static_return_advisory"] is True
+    assert evaluation.payload["actuated_static_return_advisory"] is True
     assert evaluation.payload["static_return_advisory_paths"] == ["output.record_id"]
     assert evaluation.missing_return_paths == ["output.blocker"]
     assert evaluation.can_attempt_run is False
@@ -1817,7 +1883,7 @@ def test_stamped_declaration_with_advisory_accepts_run() -> None:
     )
     union = {"output.record_id", "output.blocker"}
     signature = wu._stable_output_contract_key(wu._output_contract_scope_key(ctx), union)
-    ctx.output_contract_reject_count_by_signature = {signature: wu._MAX_OUTPUT_CONTRACT_STEERING_REJECTS}
+    wu._grant_output_contract_advisory_run(ctx, signature)
     workflow_yaml = _declaration_waiver_yaml('await page.click("#submit")\nreturn {"output": {"blocker": None}}')
 
     evaluation = wu._evaluate_output_contract_for_code_block(
