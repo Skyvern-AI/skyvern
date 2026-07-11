@@ -706,6 +706,7 @@ async def update_and_run_blocks_tool(
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
             allow_static_output_uncertainty=True,
+            formation_prepared=True,
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
 

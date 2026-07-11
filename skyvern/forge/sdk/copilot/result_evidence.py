@@ -85,6 +85,8 @@ class LoadedResultCompositionEvidence:
     table_result_container_count: int
     targets: tuple[LoadedResultCompositionTarget, ...] = ()
     structure_signature: str = ""
+    source_tool: str = ""
+    source_url: str = ""
 
 
 def _is_meaningful_data(value: Any, *, _depth: int = 0) -> bool:
@@ -326,6 +328,9 @@ def _cap_loaded_result_composition_summary(summary: dict[str, object]) -> dict[s
 
 def loaded_result_composition_evidence_from_page(
     evidence: Mapping[str, Any],
+    *,
+    source_tool: str = "",
+    source_url: str = "",
 ) -> LoadedResultCompositionEvidence | None:
     raw_containers = evidence.get("result_containers")
     if not isinstance(raw_containers, list):
@@ -342,7 +347,38 @@ def loaded_result_composition_evidence_from_page(
         table_result_container_count=sum(1 for container in meaningful if _result_container_is_table(container)),
         targets=targets,
         structure_signature=_structure_signature([_target_signature_payload(target) for target in targets]),
+        source_tool=_bounded_text(source_tool, _MAX_SELECTOR_CHARS) if source_tool.strip() else "",
+        source_url=_bounded_text(source_url, _MAX_SELECTOR_CHARS) if source_url.strip() else "",
     )
+
+
+def loaded_result_source_producible(
+    evidence: LoadedResultCompositionEvidence | None,
+    *,
+    target_code: str | None = None,
+) -> bool:
+    if evidence is None or evidence.source_tool != "evaluate" or not evidence.source_url.strip():
+        return False
+    if evidence.result_container_count < 1 or not evidence.targets or not evidence.structure_signature:
+        return False
+    if evidence.result_container_count < len(evidence.targets):
+        return False
+    for target in evidence.targets:
+        if target.structure_signature != _structure_signature(_target_signature_payload(target)):
+            return False
+    expected_signature = _structure_signature([_target_signature_payload(target) for target in evidence.targets])
+    if evidence.structure_signature != expected_signature:
+        return False
+    if target_code is not None:
+        observed_selectors = {
+            selector
+            for target in evidence.targets
+            for selector in (target.selector, target.row_selector)
+            if selector.strip()
+        }
+        if not observed_selectors or not any(selector in target_code for selector in observed_selectors):
+            return False
+    return True
 
 
 def loaded_result_composition_target_summary(evidence: LoadedResultCompositionEvidence) -> dict[str, object]:

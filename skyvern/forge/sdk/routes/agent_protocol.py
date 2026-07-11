@@ -3883,6 +3883,7 @@ async def get_runs_v2(
         description="Case-insensitive substring search (min 3 chars for trigram index).",
         examples=["login_url", "wr_abc123"],
     ),
+    run_type: Annotated[list[RunType] | None, Query()] = None,
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
     if search_key and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
@@ -3897,6 +3898,7 @@ async def get_runs_v2(
         page_size=page_size,
         status=[s.value for s in status] if status else None,
         search_key=search_key,
+        run_type=[r.value for r in run_type] if run_type else None,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
     return ORJSONResponse([item.model_dump(mode="json") for item in items])
