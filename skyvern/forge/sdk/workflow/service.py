@@ -199,6 +199,7 @@ DETECTED_PLATFORM_RUN_TAG_KEY = "skyvern.platform"
 TRIGGER_RUN_TAG_KEY = "skyvern.trigger"
 TARGET_DOMAIN_RUN_TAG_KEY = "skyvern.target_domain"
 CREATION_RUN_TAG_CALLER_ID = "system:creation-tagging"
+COMPLETION_RUN_TAG_CALLER_ID = "system:completion-tagging"
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -691,6 +692,31 @@ class WorkflowService:
                 "Failed to apply creation workflow run tags",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    async def _apply_completion_run_tags_best_effort(workflow_run: WorkflowRun) -> None:
+        try:
+            tags = {"skyvern.status": str(workflow_run.status)}
+            if workflow_run.run_with:
+                tags["skyvern.execution_mode"] = workflow_run.run_with
+            if workflow_run.failure_category:
+                primary_category = workflow_run.failure_category[0].get("category")
+                if isinstance(primary_category, str):
+                    tags["skyvern.failure_category"] = primary_category
+
+            await app.DATABASE.tags.apply_system_run_tag_changes(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                sets=tags,
+                caller_id=COMPLETION_RUN_TAG_CALLER_ID,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to apply completion workflow run tags",
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
                 exc_info=True,
             )
 
@@ -5994,6 +6020,7 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            await self._apply_completion_run_tags_best_effort(workflow_run)
             run_completed_task = asyncio.create_task(
                 app.AGENT_FUNCTION.on_workflow_run_completed(
                     organization_id=workflow_run.organization_id,
@@ -6299,6 +6326,7 @@ class WorkflowService:
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
         )
+        await self._apply_completion_run_tags_best_effort(updated)
 
         bg = asyncio.create_task(
             self._sync_task_run_from_workflow_run(updated, workflow_run_id, WorkflowRunStatus.canceled),
