@@ -29,7 +29,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import SynthesizedCodeBlock
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.config import SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD, BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import (
+    SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+)
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.enforcement import (
     KEEP_RECENT_TOOL_OUTPUTS,
@@ -123,6 +127,8 @@ class _Ctx:
         self.synthesized_block_reopened_after_failed_run = False
         self.synthesized_block_reopened_for_output_coverage = False
         self.scouted_output_covered_paths: set[str] = set()
+        self.flow_evidence: list[dict[str, object]] = []
+        self.copilot_config: CopilotConfig | None = None
         self.uncovered_output_rescout_context_key = None
         self.uncovered_output_rescout_steer_key = None
         self.latest_recorded_build_test_outcome = None
@@ -2254,6 +2260,49 @@ class TestScoutOutputCoverageGate:
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
         return ctx
 
+    @staticmethod
+    def _attach_document_plan(ctx: _Ctx, *, step: int) -> None:
+        ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"document name": "output.document_name"})
+        ctx.flow_evidence = [
+            {
+                "step": step,
+                "reached_via": "interaction",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "source_tool": "scout_interaction",
+                    "interaction_tool": "click",
+                    "interaction_selector": "button[data-action='search']",
+                    "inspection_warnings": [],
+                    "result_containers_truncated": False,
+                    "key_value_relations_truncated": False,
+                    "key_value_relations": [
+                        {
+                            "key_text": "Document Name",
+                            "container_selector": ".document-kv",
+                            "container_match_count": 1,
+                            "container_position": 0,
+                            "value_child_index": 1,
+                            "direct_child_count": 2,
+                            "visible": True,
+                            "value_visible": True,
+                        }
+                    ],
+                    "result_containers": [],
+                },
+            }
+        ]
+
+    def test_post_turn_offer_compiles_plan_recipe(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "Document Name"))
+        self._attach_document_plan(ctx, step=6)
+        ctx.synthesized_block_offered = False
+
+        message = _maybe_synthesized_block_offer_msg(ctx)
+
+        assert message is not None
+        assert 'page.locator(".document-kv").nth(0)' in str(message["content"])
+        assert 'return {"output": {"document_name": _extraction_value_0}}' in str(message["content"])
+
     def test_empty_output_set_falls_through_to_shape_heuristic(self) -> None:
         ctx = self._authoring_ctx()
         assert uncovered_requested_output_paths(ctx) == set()
@@ -2291,7 +2340,7 @@ class TestScoutOutputCoverageGate:
         assert _should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
         assert synthesized_block_persistence_signal(ctx, "click") is None
 
-    def test_value_bearing_container_covers_path_and_force_fires(self) -> None:
+    def test_value_bearing_container_coverage_without_plan_does_not_force(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
         page_evidence = {
             "result_containers": [
@@ -2302,8 +2351,8 @@ class TestScoutOutputCoverageGate:
         assert ctx.scouted_output_covered_paths == {"output.document_name"}
         assert uncovered_requested_output_paths(ctx) == set()
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
-        assert synthesized_trajectory_is_goal_complete(ctx) is True
-        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
 
     def test_empty_shell_selector_tokens_do_not_credit(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
@@ -2345,12 +2394,12 @@ class TestScoutOutputCoverageGate:
         ctx.completion_criteria_turn_state = SimpleNamespace(decision=None)
         assert uncovered_requested_output_paths(ctx) == set()
 
-    def test_all_generic_token_path_is_exempt_and_falls_through_to_shape(self) -> None:
+    def test_all_generic_token_path_still_requires_producer_plan(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.data", "the data is captured"))
         assert uncovered_requested_output_paths(ctx) == set()
         ctx.synthesized_block_offered_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
-        assert synthesized_trajectory_is_goal_complete(ctx) is True
-        assert _should_force_synthesized_block_persistence(ctx) is True
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+        assert _should_force_synthesized_block_persistence(ctx) is False
 
     def test_generic_path_exemption_keeps_specific_path_gating(self) -> None:
         ctx = self._authoring_ctx(
@@ -2542,7 +2591,7 @@ class TestScoutOutputCoverageGate:
         assert _uncovered_output_reject_admits_evaluate(ctx, "evaluate") is False
         assert consume_uncovered_output_reopen_event(ctx) is False
 
-    def test_coverage_reopen_refreshes_synthesized_offer_after_authoring(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_coverage_reopen_without_plan_does_not_refresh_offer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.enforcement.synthesize_code_block",
             lambda *args, **kwargs: SynthesizedCodeBlock(code="await page.click('button')"),
@@ -2551,7 +2600,7 @@ class TestScoutOutputCoverageGate:
         ctx.update_workflow_called = True
         assert _maybe_synthesized_block_offer_msg(ctx) is None
         ctx.synthesized_block_reopened_for_output_coverage = True
-        assert _maybe_synthesized_block_offer_msg(ctx) is not None
+        assert _maybe_synthesized_block_offer_msg(ctx) is None
 
     def test_post_hook_failure_rolls_back_coverage_credit(self) -> None:
         assert "scouted_output_covered_paths" in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS

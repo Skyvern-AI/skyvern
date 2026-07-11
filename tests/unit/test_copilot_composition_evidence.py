@@ -2217,6 +2217,128 @@ def test_structured_preserves_populated_result_container_content() -> None:
     assert records["text_excerpt"] == "Record A ready"
 
 
+def test_structured_preserves_live_key_and_table_binding_shape() -> None:
+    payload = {
+        "page_title": "Records",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#records",
+                "selector_match_count": 1,
+                "visible": True,
+                "span_free": True,
+                "nested_table_free": True,
+                "row_selector": "#records > tbody > tr",
+                "headers": [
+                    {"text": "Address", "column_index": 0},
+                    {"text": "Status", "column_index": 1},
+                ],
+                "row_count": 2,
+                "rows_truncated": False,
+                "rows": [
+                    {
+                        "row_index": row_index,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [
+                            {"column_index": 0, "visible": True},
+                            {"column_index": 1, "visible": True},
+                        ],
+                    }
+                    for row_index in range(2)
+                ],
+                "sample_rows": ["Record One Ready", "Record Two Pending"],
+            }
+        ],
+        "result_containers_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "Record Identifier",
+                "container_selector": ".kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "key_value_relations_truncated": False,
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Record details",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/records", current_url="https://example.com/records"
+    )
+
+    assert parsed is not None
+    assert parsed["key_value_relations"] == payload["key_value_relations"]
+    assert parsed["key_value_relations_truncated"] is False
+    assert parsed["result_containers_truncated"] is False
+    assert parsed["result_containers"][0]["headers"] == payload["result_containers"][0]["headers"]
+    assert parsed["result_containers"][0]["selector_match_count"] == 1
+    assert parsed["result_containers"][0]["rows_truncated"] is False
+    assert parsed["result_containers"][0]["nested_table_free"] is True
+    assert parsed["result_containers"][0]["row_selector"] == "#records > tbody > tr"
+    assert parsed["result_containers"][0]["rows"][1]["has_row_header"] is False
+    assert parsed["result_containers"][0]["rows"][1]["cells"][1] == {
+        "column_index": 1,
+        "visible": True,
+    }
+
+
+def test_html_packet_excludes_hidden_bindings_and_preserves_revealed_structure() -> None:
+    details = """
+    <div id="details" STYLE>
+      <div class="kv"><div>Record Identifier</div><div>record-123</div></div>
+      <table id="records">
+        <thead><tr><th>Address</th><th>Status</th></tr></thead>
+        <tbody><tr><td>Record One</td><td>Ready</td></tr></tbody>
+      </table>
+    </div>
+    """
+    hidden = parse_composition_html(
+        details.replace("STYLE", 'style="display:none"'),
+        inspected_url="https://example.com/records",
+        current_url="https://example.com/records",
+    )
+    revealed = parse_composition_html(
+        details.replace("STYLE", ""),
+        inspected_url="https://example.com/records",
+        current_url="https://example.com/records",
+    )
+
+    assert hidden["key_value_relations"] == []
+    assert hidden["result_containers"] == []
+    assert revealed["key_value_relations"][0]["key_text"] == "Record Identifier"
+    table = revealed["result_containers"][0]
+    assert table["selector"] == "#records"
+    assert table["selector_match_count"] == 1
+    assert table["headers"] == [
+        {"text": "Address", "column_index": 0},
+        {"text": "Status", "column_index": 1},
+    ]
+    assert table["row_count"] == 1
+    assert table["rows_truncated"] is False
+    assert table["rows"] == [
+        {
+            "row_index": 0,
+            "visible": True,
+            "has_row_header": False,
+            "cells": [
+                {"column_index": 0, "visible": True},
+                {"column_index": 1, "visible": True},
+            ],
+        }
+    ]
+
+
 def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
     payload = {
         "page_title": "",
