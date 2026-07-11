@@ -660,7 +660,7 @@ class WorkflowService:
         parameters: dict[str, Any],
     ) -> None:
         try:
-            platform = workflow_script_service.detect_workflow_platform(workflow, parameters)
+            platform = workflow_script_service.detect_workflow_platform_for_tagging(workflow, parameters)
             if not platform:
                 return
             await app.DATABASE.tags.apply_system_run_tag_changes(

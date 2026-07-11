@@ -188,6 +188,13 @@ class BaseExperimentationProvider(ABC):
         )
         return feature_flag_value
 
+    async def resolve_feature_enabled_unrecorded(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool:
+        """Resolve a flag while leaving attribution and logging to the caller."""
+        await self._prepare_feature_flag_resolution(feature_name, cached=True)
+        return await self._is_feature_enabled(feature_name, distinct_id, properties)
+
     async def is_feature_enabled_cached(
         self, feature_name: str, distinct_id: str, properties: dict | None = None
     ) -> bool:

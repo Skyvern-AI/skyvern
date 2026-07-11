@@ -298,6 +298,17 @@ def detect_workflow_platform(
     return app.AGENT_FUNCTION.detect_ats_platform(domain)
 
 
+def detect_workflow_platform_for_tagging(
+    workflow: Workflow,
+    parameters: dict[str, Any],
+) -> str | None:
+    """Detect a cloud platform for run tagging without changing cache-key behavior."""
+    domain = _extract_first_block_domain(workflow, parameters)
+    if not domain:
+        return None
+    return app.AGENT_FUNCTION.detect_platform_for_tagging(domain)
+
+
 def resolve_cache_key_value(
     workflow: Workflow,
     parameters: dict[str, Any],
