@@ -182,7 +182,7 @@ async def test_setup_workflow_run_writes_detected_platform_as_system_run_tag() -
     with (
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
         patch(
-            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform",
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
             return_value="known_platform",
         ) as detect_platform,
     ):
@@ -214,7 +214,7 @@ async def test_setup_workflow_run_skips_platform_tag_when_detection_has_no_verdi
     with (
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
         patch(
-            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform",
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
             return_value=None,
         ),
     ):
@@ -239,7 +239,7 @@ async def test_setup_workflow_run_continues_when_platform_tag_write_fails() -> N
     with (
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
         patch(
-            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform",
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
             return_value="known_platform",
         ),
     ):
