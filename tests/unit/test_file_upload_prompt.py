@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import libcst as cst
 import pytest
+import structlog
+import structlog.testing
 
 from skyvern.core.script_generations.generate_script import _build_file_upload_statement
 from skyvern.forge.prompts import prompt_engine
@@ -322,17 +323,17 @@ async def test_prompt_requires_exact_match_for_nfc_collisions(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_prompt_selecting_zero_files_completes_and_records_empty_output(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     download_dir = tmp_path / "downloads"
     _write_candidates(download_dir)
     response = {"reasoning": "No candidates match.", "files_to_upload": []}
 
-    execution = await _execute_file_upload(
-        _file_upload_block("Only upload XML files."),
-        download_dir,
-        llm_response=response,
-    )
+    with structlog.testing.capture_logs() as captured_logs:
+        execution = await _execute_file_upload(
+            _file_upload_block("Only upload XML files."),
+            download_dir,
+            llm_response=response,
+        )
 
     assert execution.result.success is True
     assert execution.result.status == BlockStatus.completed
@@ -344,9 +345,9 @@ async def test_prompt_selecting_zero_files_completes_and_records_empty_output(
         [],
     )
     zero_selection_warnings = [
-        record
-        for record in caplog.records
-        if record.levelno == logging.WARNING and "prompt selected no files" in record.getMessage()
+        event
+        for event in captured_logs
+        if event.get("log_level") == "warning" and "prompt selected no files" in event.get("event", "")
     ]
     assert len(zero_selection_warnings) == 1
     expected_fields = {
@@ -356,14 +357,9 @@ async def test_prompt_selecting_zero_files_completes_and_records_empty_output(
         "selected_count": 0,
         "reasoning": "No candidates match.",
     }
-    warning_record = zero_selection_warnings[0]
-    if isinstance(warning_record.msg, dict):
-        for field, value in expected_fields.items():
-            assert warning_record.msg[field] == value
-    else:
-        warning_message = warning_record.getMessage()
-        for field, value in expected_fields.items():
-            assert f"{field}={value}" in warning_message
+    warning_event = zero_selection_warnings[0]
+    for field, value in expected_fields.items():
+        assert warning_event[field] == value
 
 
 @pytest.mark.asyncio
