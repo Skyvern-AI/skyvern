@@ -176,6 +176,44 @@ async def test_execute_filters_with_prompt_preserving_order(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_execute_excludes_malformed_llm_output_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT"))
+    )
+    monkeypatch.setattr(email, "list_folder_messages", AsyncMock(return_value=_messages()))
+    responses = iter([{"reasoning": "missing matches"}, {"reasoning": "matches", "matches": True}])
+
+    async def match_llm(**_kwargs: Any) -> dict[str, Any]:
+        return next(responses)
+
+    monkeypatch.setattr(email.inbox.app, "SECONDARY_LLM_API_HANDLER", match_llm)
+
+    result = await _execute_block_for_test(_make_block(prompt="Find the second email"))
+
+    assert result.success is True
+    assert result.output_parameter_value is not None
+    assert result.output_parameter_value["candidate_count"] == 2
+    assert result.output_parameter_value["matched_count"] == 1
+    assert [message["id"] for message in result.output_parameter_value["emails"]] == ["msg_2"]
+
+
+@pytest.mark.asyncio
+async def test_execute_propagates_llm_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT"))
+    )
+    monkeypatch.setattr(email, "list_folder_messages", AsyncMock(return_value=_messages()))
+
+    async def fail_llm(**_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("LLM unavailable")
+
+    monkeypatch.setattr(email.inbox.app, "SECONDARY_LLM_API_HANDLER", fail_llm)
+
+    with pytest.raises(RuntimeError, match="LLM unavailable"):
+        await _execute_block_for_test(_make_block(prompt="Find invoices"))
+
+
+@pytest.mark.asyncio
 async def test_execute_missing_credential_fails() -> None:
     result = await _execute_block_for_test(_make_block(credential_id=None))
 

@@ -198,7 +198,21 @@ async def test_exchange_code_for_tokens_requires_refresh_token(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_refresh_access_token_posts_form_and_ignores_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("scopes", "expected_scopes"),
+    [
+        (["Mail.Read"], ["Mail.Read", "offline_access"]),
+        (
+            ["Mail.Read", "https://graph.microsoft.com/offline_access"],
+            ["Mail.Read", "https://graph.microsoft.com/offline_access"],
+        ),
+    ],
+)
+async def test_refresh_access_token_posts_form_and_ignores_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    scopes: list[str],
+    expected_scopes: list[str],
+) -> None:
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
     captured: dict[str, str] = {}
@@ -217,14 +231,14 @@ async def test_refresh_access_token_posts_form_and_ignores_rotation(monkeypatch:
 
     _install_microsoft_transport(monkeypatch, handler)
 
-    result = await microsoft_oauth_service.refresh_access_token("rt-1", scopes=["Mail.Read"])
+    result = await microsoft_oauth_service.refresh_access_token("rt-1", scopes=scopes)
 
     assert result["access_token"] == "at-refreshed"
     assert result["refresh_token"] == "rt-rotated"
     form = {k: v[0] for k, v in parse_qs(captured["body"]).items()}
     assert form["grant_type"] == "refresh_token"
     assert form["refresh_token"] == "rt-1"
-    assert form["scope"].split() == ["Mail.Read", "offline_access"]
+    assert form["scope"].split() == expected_scopes
 
 
 @pytest.mark.asyncio
@@ -289,7 +303,8 @@ async def test_refresh_and_rotate_propagates_rotated_token_persist_failure(
         SimpleNamespace(encrypt=AsyncMock(return_value="encrypted-rt-rotated")),
     )
 
-    with pytest.raises(RuntimeError, match="database unavailable"):
+    message = "Failed to persist rotated Microsoft refresh token; reconnect the Microsoft account"
+    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError, match=message):
         await microsoft_oauth_service.refresh_and_rotate(
             organization_id="org-1",
             credential_id="cred-1",

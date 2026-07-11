@@ -41,7 +41,16 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
 }));
 
 vi.mock("@/routes/workflows/components/GoogleOAuthCredentialSelector", () => ({
-  GoogleOAuthCredentialSelector: () => <div />,
+  GoogleOAuthCredentialSelector: ({
+    onChange,
+  }: {
+    onChange: (next: string) => void;
+  }) => (
+    <button
+      data-testid="gmail-template-change"
+      onClick={() => onChange("{{ gmail_credential_id }}")}
+    />
+  ),
 }));
 
 vi.mock(
@@ -81,6 +90,7 @@ vi.mock("../../nodes/TaskNode/ParametersMultiSelect", () => ({
       }
     >
       <option value="microsoft_credential_id">microsoft_credential_id</option>
+      <option value="gmail_credential_id">gmail_credential_id</option>
     </select>
   ),
 }));
@@ -126,4 +136,94 @@ describe("EmailInboxBlockForm", () => {
       parameterKeys: ["microsoft_credential_id"],
     });
   });
+
+  test("tracks the parameter key used by a Gmail credential template", () => {
+    mockNodes.set("email-1", {
+      id: "email-1",
+      type: "emailInbox",
+      data: {
+        ...emailInboxNodeDefaultData,
+        emailClient: "gmail",
+      },
+    });
+    render(<EmailInboxBlockForm blockId="email-1" />);
+
+    fireEvent.click(screen.getByTestId("gmail-template-change"));
+
+    expect(updateNodeData).toHaveBeenCalledWith("email-1", {
+      credentialId: "{{ gmail_credential_id }}",
+      parameterKeys: ["gmail_credential_id"],
+    });
+  });
+
+  test("replaces a stale credential parameter key", () => {
+    mockNodes.set("email-1", {
+      id: "email-1",
+      type: "emailInbox",
+      data: {
+        ...emailInboxNodeDefaultData,
+        emailClient: "gmail",
+        credentialId: "{{ microsoft_credential_id }}",
+        parameterKeys: ["microsoft_credential_id", "other_parameter"],
+      },
+    });
+    render(<EmailInboxBlockForm blockId="email-1" />);
+
+    fireEvent.click(screen.getByTestId("gmail-template-change"));
+
+    expect(updateNodeData).toHaveBeenCalledWith("email-1", {
+      credentialId: "{{ gmail_credential_id }}",
+      parameterKeys: ["other_parameter", "gmail_credential_id"],
+    });
+  });
+
+  test("preserves the previous credential key when another field uses it", () => {
+    mockNodes.set("email-1", {
+      id: "email-1",
+      type: "emailInbox",
+      data: {
+        ...emailInboxNodeDefaultData,
+        emailClient: "gmail",
+        credentialId: "{{ microsoft_credential_id }}",
+        folder: "{{ microsoft_credential_id }}",
+        parameterKeys: ["microsoft_credential_id"],
+      },
+    });
+    render(<EmailInboxBlockForm blockId="email-1" />);
+
+    fireEvent.click(screen.getByTestId("gmail-template-change"));
+
+    expect(updateNodeData).toHaveBeenCalledWith("email-1", {
+      credentialId: "{{ gmail_credential_id }}",
+      parameterKeys: ["microsoft_credential_id", "gmail_credential_id"],
+    });
+  });
+
+  test.each([
+    "{{ microsoft_credential_id.id }}",
+    "{{ microsoft_credential_id | default('INBOX') }}",
+  ])(
+    "preserves the previous credential key for a suffixed reference: %s",
+    (folder) => {
+      mockNodes.set("email-1", {
+        id: "email-1",
+        type: "emailInbox",
+        data: {
+          ...emailInboxNodeDefaultData,
+          emailClient: "gmail",
+          credentialId: "{{ microsoft_credential_id }}",
+          folder,
+          parameterKeys: ["microsoft_credential_id"],
+        },
+      });
+      render(<EmailInboxBlockForm blockId="email-1" />);
+
+      fireEvent.click(screen.getByTestId("gmail-template-change"));
+
+      expect(updateNodeData).toHaveBeenCalledWith("email-1", {
+        credentialId: "{{ gmail_credential_id }}",
+        parameterKeys: ["microsoft_credential_id", "gmail_credential_id"],
+      });
+    },
+  );
 });

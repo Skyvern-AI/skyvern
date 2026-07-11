@@ -24,6 +24,22 @@ async def test_match_email_propagates_llm_failure(monkeypatch: pytest.MonkeyPatc
         )
 
 
+@pytest.mark.asyncio
+async def test_match_email_excludes_non_dict_llm_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def malformed_llm(**_kwargs: Any) -> str:
+        return "not an object"
+
+    monkeypatch.setattr(email.inbox.app, "SECONDARY_LLM_API_HANDLER", malformed_llm)
+
+    matches = await email.match_email(
+        criteria="invoice",
+        email=email.EmailMessage(id="msg-1", subject="Invoice"),
+        organization_id="org-1",
+    )
+
+    assert matches is False
+
+
 def _mock_response(status_code: int, *, json: dict[str, Any] | None = None) -> httpx.Response:
     return httpx.Response(status_code, json=json or {})
 

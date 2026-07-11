@@ -1,10 +1,13 @@
 import httpx
-from pydantic import BaseModel
+import structlog
+from pydantic import BaseModel, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.services.email import gmail, outlook
 from skyvern.services.email.types import EmailMessage
+
+LOG = structlog.get_logger()
 
 _BODY_LIMIT = 4000
 
@@ -66,5 +69,22 @@ async def match_email(*, criteria: str, email: EmailMessage, organization_id: st
         prompt_name="match-email",
         organization_id=organization_id,
     )
-    result = EmailMatchResult.model_validate(resp)
+    if not isinstance(resp, dict):
+        LOG.warning(
+            "Failed to match email with LLM",
+            email_id=email.id,
+            organization_id=organization_id,
+            response_type=type(resp).__name__,
+        )
+        return False
+    try:
+        result = EmailMatchResult.model_validate(resp)
+    except ValidationError:
+        LOG.warning(
+            "Failed to match email with LLM",
+            email_id=email.id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return False
     return result.matches

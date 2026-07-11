@@ -412,15 +412,25 @@ async def refresh_and_rotate(
         and new_refresh_token
         and new_refresh_token != credential_secrets.refresh_token
     ):
-        encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, EncryptMethod.AES)
-        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-        await app.DATABASE.microsoft_oauth.update_active_refresh_token(
-            organization_id=organization_id,
-            credential_id=credential_id,
-            encrypted_refresh_token=encrypted_refresh_token,
-            encrypted_method=EncryptMethod.AES,
-            now=now,
-        )
+        try:
+            encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, EncryptMethod.AES)
+            now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+            await app.DATABASE.microsoft_oauth.update_active_refresh_token(
+                organization_id=organization_id,
+                credential_id=credential_id,
+                encrypted_refresh_token=encrypted_refresh_token,
+                encrypted_method=EncryptMethod.AES,
+                now=now,
+            )
+        except Exception as exc:
+            LOG.exception(
+                "Failed to persist rotated Microsoft refresh token",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            raise MicrosoftOAuthError(
+                "Failed to persist rotated Microsoft refresh token; reconnect the Microsoft account"
+            ) from exc
     return access_token
 
 

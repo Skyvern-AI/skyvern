@@ -27,6 +27,7 @@ import {
 import { GOOGLE_GMAIL_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { helpTooltips } from "../../helpContent";
+import { containsJinjaReference } from "../../jinjaReferences";
 import { useUpdate } from "../../useUpdate";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { type AppNode } from "..";
@@ -48,6 +49,11 @@ function parseNullablePositiveInteger(value: string): number | null {
 function parsePositiveInteger(value: string, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+function getTemplateParameterKey(value: string): string | null {
+  const match = /^\s*\{\{\s*([A-Za-z_]\w*)\s*\}\}\s*$/.exec(value);
+  return match?.[1] ?? null;
 }
 
 function FieldLabel({
@@ -96,6 +102,26 @@ function EmailInboxEditorBody({
     update({ emailClient, credentialId: "" });
   };
 
+  const updateCredentialId = (credentialId: string) => {
+    const parameterKey = getTemplateParameterKey(credentialId);
+    const previousParameterKey = getTemplateParameterKey(data.credentialId);
+    const previousParameterKeyIsUsedElsewhere = previousParameterKey
+      ? [data.folder, data.prompt, data.sender, data.subject].some((value) =>
+          containsJinjaReference(value, previousParameterKey),
+        )
+      : false;
+    const parameterKeys = previousParameterKeyIsUsedElsewhere
+      ? [...data.parameterKeys]
+      : data.parameterKeys.filter((key) => key !== previousParameterKey);
+    if (parameterKey && !parameterKeys.includes(parameterKey)) {
+      parameterKeys.push(parameterKey);
+    }
+    update({
+      credentialId,
+      parameterKeys,
+    });
+  };
+
   return (
     <div data-testid="email-inbox-block-form" className="space-y-4">
       <div className="space-y-3">
@@ -137,14 +163,14 @@ function EmailInboxEditorBody({
             <GoogleOAuthCredentialSelector
               nodeId={blockId}
               value={data.credentialId}
-              onChange={(next) => update({ credentialId: next })}
+              onChange={updateCredentialId}
               requiredScopes={GOOGLE_GMAIL_REQUIRED_SCOPES}
             />
           ) : (
             <MicrosoftOAuthCredentialSelector
               nodeId={blockId}
               value={data.credentialId}
-              onChange={(next) => update({ credentialId: next })}
+              onChange={updateCredentialId}
               requiredScopes={MICROSOFT_MAIL_REQUIRED_SCOPES}
             />
           )}
