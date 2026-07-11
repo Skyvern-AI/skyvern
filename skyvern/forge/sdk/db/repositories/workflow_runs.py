@@ -580,6 +580,7 @@ class WorkflowRunsRepository(BaseRepository):
         page_size: int = 10,
         status: list[str] | None = None,
         search_key: str | None = None,
+        run_type: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
@@ -626,6 +627,9 @@ class WorkflowRunsRepository(BaseRepository):
             if status:
                 query = query.filter(effective_status.in_(status))
 
+            if run_type:
+                query = query.filter(TaskRunModel.task_run_type.in_(run_type))
+
             if search_key:
                 query = query.filter(
                     or_(
@@ -653,47 +657,49 @@ class WorkflowRunsRepository(BaseRepository):
             rows = [dict(row) for row in result.mappings().all()]
 
             if search_key:
-                task_run_exists = (
-                    select(1)
-                    .select_from(TaskRunModel)
-                    .where(TaskRunModel.organization_id == WorkflowRunModel.organization_id)
-                    .where(TaskRunModel.run_id == WorkflowRunModel.workflow_run_id)
-                    .correlate_except(TaskRunModel)
-                    .exists()
-                )
-                fallback_query = (
-                    select(
-                        WorkflowRunModel.workflow_run_id.label("task_run_id"),
-                        WorkflowRunModel.workflow_run_id.label("run_id"),
-                        literal(RunType.workflow_run.value).label("task_run_type"),
-                        WorkflowRunModel.status.label("status"),
-                        WorkflowModel.title.label("title"),
-                        WorkflowRunModel.started_at.label("started_at"),
-                        WorkflowRunModel.finished_at.label("finished_at"),
-                        WorkflowRunModel.created_at.label("created_at"),
-                        WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
-                        WorkflowRunModel.script_run.label("script_run"),
-                        WorkflowRunModel.trigger_type.label("trigger_type"),
-                        WorkflowModel.title.label("searchable_text"),
-                        self._workflow_deleted_expr(
-                            WorkflowRunModel.workflow_permanent_id,
-                            WorkflowRunModel.organization_id,
-                        ),
+                # The fallback only yields workflow_run rows, so skip it when the run_type filter excludes them.
+                if not run_type or RunType.workflow_run in run_type:
+                    task_run_exists = (
+                        select(1)
+                        .select_from(TaskRunModel)
+                        .where(TaskRunModel.organization_id == WorkflowRunModel.organization_id)
+                        .where(TaskRunModel.run_id == WorkflowRunModel.workflow_run_id)
+                        .correlate_except(TaskRunModel)
+                        .exists()
                     )
-                    .select_from(WorkflowRunModel)
-                    .outerjoin(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
-                    .filter(WorkflowRunModel.organization_id == organization_id)
-                    .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                    .filter(WorkflowRunModel.debug_session_id.is_(None))
-                    .filter(WorkflowRunModel.copilot_session_id.is_(None))
-                    .filter(~task_run_exists)
-                )
-                fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
-                if status:
-                    fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
-                fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
-                fallback_result = await session.execute(fallback_query)
-                rows.extend(dict(row) for row in fallback_result.mappings().all())
+                    fallback_query = (
+                        select(
+                            WorkflowRunModel.workflow_run_id.label("task_run_id"),
+                            WorkflowRunModel.workflow_run_id.label("run_id"),
+                            literal(RunType.workflow_run.value).label("task_run_type"),
+                            WorkflowRunModel.status.label("status"),
+                            WorkflowModel.title.label("title"),
+                            WorkflowRunModel.started_at.label("started_at"),
+                            WorkflowRunModel.finished_at.label("finished_at"),
+                            WorkflowRunModel.created_at.label("created_at"),
+                            WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                            WorkflowRunModel.script_run.label("script_run"),
+                            WorkflowRunModel.trigger_type.label("trigger_type"),
+                            WorkflowModel.title.label("searchable_text"),
+                            self._workflow_deleted_expr(
+                                WorkflowRunModel.workflow_permanent_id,
+                                WorkflowRunModel.organization_id,
+                            ),
+                        )
+                        .select_from(WorkflowRunModel)
+                        .outerjoin(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                        .filter(WorkflowRunModel.organization_id == organization_id)
+                        .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                        .filter(WorkflowRunModel.debug_session_id.is_(None))
+                        .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                        .filter(~task_run_exists)
+                    )
+                    fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
+                    if status:
+                        fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                    fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
+                    fallback_result = await session.execute(fallback_query)
+                    rows.extend(dict(row) for row in fallback_result.mappings().all())
                 rows.sort(key=lambda row: row["created_at"], reverse=True)
                 rows = rows[offset : offset + page_size]
 

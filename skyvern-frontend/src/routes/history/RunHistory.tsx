@@ -22,6 +22,11 @@ import {
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import {
+  RunTypeFilterDropdown,
+  RunTypeGroup,
+  runTypeGroupToRunTypes,
+} from "@/components/RunTypeFilterDropdown";
 import { TriggerTypeBadge } from "@/components/TriggerTypeBadge";
 import {
   Pagination,
@@ -95,6 +100,29 @@ function parseStatusParam(raw: string | null): Array<Status> {
   return out;
 }
 
+const runTypeGroupValues = new Set<string>(Object.values(RunTypeGroup));
+
+function parseRunTypeParam(raw: string | null): Array<RunTypeGroup> {
+  if (!raw) {
+    return [];
+  }
+  const seen = new Set<RunTypeGroup>();
+  const out: Array<RunTypeGroup> = [];
+  for (const token of raw.split(",")) {
+    const trimmed = token.trim();
+    if (!runTypeGroupValues.has(trimmed)) {
+      continue;
+    }
+    const group = trimmed as RunTypeGroup;
+    if (seen.has(group)) {
+      continue;
+    }
+    seen.add(group);
+    out.push(group);
+  }
+  return out;
+}
+
 // Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
 function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   if (run.trigger_type) {
@@ -147,6 +175,14 @@ function RunHistory() {
     () => parseStatusParam(searchParams.get("status")),
     [searchParams],
   );
+  const runTypeGroups = useMemo(
+    () => parseRunTypeParam(searchParams.get("run_type")),
+    [searchParams],
+  );
+  const runTypeFilters = useMemo(
+    () => runTypeGroups.flatMap((group) => runTypeGroupToRunTypes[group]),
+    [runTypeGroups],
+  );
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
@@ -156,6 +192,7 @@ function RunHistory() {
     page,
     pageSize: itemsPerPage,
     statusFilters,
+    runTypeFilters,
     search: effectiveSearch,
   });
   const navigate = useNavigate();
@@ -165,6 +202,7 @@ function RunHistory() {
     page: page + 1,
     pageSize: itemsPerPage,
     statusFilters,
+    runTypeFilters,
     search: effectiveSearch,
     enabled: rawRuns?.length === itemsPerPage,
   });
@@ -378,6 +416,7 @@ function RunHistory() {
 
   const hasActiveFilters =
     statusFilters.length > 0 ||
+    runTypeGroups.length > 0 ||
     !!debouncedSearch ||
     !!workflowPermanentIdFilter;
   const showOnboardingEmpty =
@@ -448,19 +487,34 @@ function RunHistory() {
               disabled={!!workflowPermanentIdFilter}
               className="w-48 lg:w-72"
             />
-            <StatusFilterDropdown
-              values={statusFilters}
-              onChange={(filters) => {
-                const params = new URLSearchParams(searchParams);
-                if (filters.length === 0) {
-                  params.delete("status");
-                } else {
-                  params.set("status", filters.join(","));
-                }
-                params.set("page", "1");
-                setSearchParams(params, { replace: true });
-              }}
-            />
+            <div className="flex items-center gap-2">
+              <RunTypeFilterDropdown
+                values={runTypeGroups}
+                onChange={(groups) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (groups.length === 0) {
+                    params.delete("run_type");
+                  } else {
+                    params.set("run_type", groups.join(","));
+                  }
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
+              <StatusFilterDropdown
+                values={statusFilters}
+                onChange={(filters) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (filters.length === 0) {
+                    params.delete("status");
+                  } else {
+                    params.set("status", filters.join(","));
+                  }
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
+            </div>
           </div>
           <div className="overflow-hidden rounded-lg border border-border">
             <Table className="sm:table-fixed">
