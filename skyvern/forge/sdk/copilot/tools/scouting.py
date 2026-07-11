@@ -330,6 +330,16 @@ def _capped_with_eviction_accounting(
     return items[-_MAX_SCOUTED_INTERACTIONS:]
 
 
+def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
+    # len() regresses once eviction trims the list, so the next index continues from the highest recorded one.
+    highest = -1
+    for item in trajectory:
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and index > highest:
+            highest = index
+    return highest + 1 if highest >= 0 else len(trajectory)
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -408,7 +418,7 @@ def _record_scouted_interaction(
 
     trajectory = list(ctx.scout_trajectory)
     trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
-    trajectory_artifact["trajectory_index"] = len(trajectory)
+    trajectory_artifact["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(trajectory_artifact)
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
 
@@ -529,6 +539,13 @@ async def _maybe_rebind_prior_fill_carry(
     if not prior:
         ctx.fill_carry_rebound_done = True
         return
+    # Inventory is credential metadata, not page state: rehydrate it even when page
+    # validation below drops the carried fills themselves.
+    for carry in prior:
+        if carry.tool_name == "fill_credential_field" and carry.credential_id and carry.available_fields:
+            ctx.scouted_credential_field_inventory_by_credential_id.setdefault(
+                carry.credential_id, frozenset(carry.available_fields)
+            )
     rebound: list[FillCarry] = []
     for carry in prior:
         failure = await _fill_carry_validation_failure(ctx, carry, page_evidence=page_evidence, url=url)
@@ -546,7 +563,7 @@ async def _maybe_rebind_prior_fill_carry(
     ctx.fill_carry_rebound_done = True
     trajectory = list(ctx.scout_trajectory)
     for carry in rebound:
-        trajectory.append(_fill_carry_to_interaction(carry, len(trajectory)))
+        trajectory.append(_fill_carry_to_interaction(carry, _next_trajectory_index(trajectory)))
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
     LOG.info(
         "copilot_fill_carry_rebound",
@@ -1213,6 +1230,34 @@ class _UnsetEvidence:
 _EVIDENCE_UNSET = _UnsetEvidence()
 
 
+def _page_evidence_has_password_control(page_evidence: dict[str, Any]) -> bool:
+    forms = page_evidence.get("forms")
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        fields = form.get("fields")
+        if not isinstance(fields, list):
+            continue
+        for form_field in fields:
+            if isinstance(form_field, dict) and str(form_field.get("type") or "").strip().lower() == "password":
+                return True
+    return False
+
+
+def _record_scout_page_observation(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
+    observed_index: int | None = None
+    for item in ctx.scout_trajectory:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and (observed_index is None or index > observed_index):
+            observed_index = index
+    ctx.last_scout_observation_trajectory_index = observed_index
+    ctx.last_scout_observation_has_password_control = _page_evidence_has_password_control(page_evidence)
+
+
 async def _maybe_steer_evaluate_to_action(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1233,6 +1278,7 @@ async def _maybe_steer_evaluate_to_action(
             _reset_evaluate_tracker(ctx)
             return False
         record_scouted_output_coverage(ctx, parsed)
+        _record_scout_page_observation(ctx, parsed)
         loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)

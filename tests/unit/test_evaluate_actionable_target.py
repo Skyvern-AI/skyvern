@@ -107,7 +107,9 @@ def _single_max_structural_loaded_result_packet() -> dict:
 
 
 def _ctx() -> AgentContext:
-    return AgentContext.__new__(AgentContext)
+    ctx = AgentContext.__new__(AgentContext)
+    ctx.scout_trajectory = []
+    return ctx
 
 
 @pytest.mark.asyncio

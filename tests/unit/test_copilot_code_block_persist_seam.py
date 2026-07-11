@@ -41,10 +41,12 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    ScoutGap,
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _get_by_role_expr,
     _get_by_role_expr_strict,
+    credential_scout_gap,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
@@ -13212,6 +13214,18 @@ class TestScoutCaptureParityAccounting:
         assert len(ctx.scout_trajectory) == scouting_module._MAX_SCOUTED_INTERACTIONS
         assert ctx.scouted_interactions[0]["selector"] == "#item-1"
 
+    def test_trajectory_index_stays_monotonic_across_evictions(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scouted_interactions = []
+        ctx.scout_trajectory = []
+        for index in range(scouting_module._MAX_SCOUTED_INTERACTIONS + 2):
+            scouting_module._record_scouted_interaction(
+                ctx, tool_name="click", selector=f"#item-{index}", source_url="https://example.com/list"
+            )
+
+        indexes = [item["trajectory_index"] for item in ctx.scout_trajectory]
+        assert indexes == list(range(2, scouting_module._MAX_SCOUTED_INTERACTIONS + 2))
+
     def test_dedup_replacement_is_not_an_eviction(self) -> None:
         ctx = _code_only_ctx()
         ctx.scouted_interactions = []
@@ -14004,3 +14018,220 @@ class TestAmbiguousRejectCarriesOpenObligationArtifact:
 
         assert any("ambiguous browser action" in violation for violation in result.violations)
         assert not any("reuse verbatim" in violation for violation in result.violations)
+
+
+class TestCredentialScoutGapMatcher:
+    _PAGE_ONE = "https://portal.example.test/step-one"
+    _PAGE_TWO = "https://portal.example.test/step-two"
+
+    @staticmethod
+    def _fill(credential_id: str, field: str, source_url: str) -> dict[str, object]:
+        return {
+            "tool_name": "fill_credential_field",
+            "credential_id": credential_id,
+            "credential_field": field,
+            "selector": f"#{field}",
+            "source_url": source_url,
+        }
+
+    @staticmethod
+    def _click(source_url: str) -> dict[str, object]:
+        return {"tool_name": "click", "selector": "input[type='submit']", "source_url": source_url}
+
+    def test_missing_fields_reported_sorted_per_requirement(self) -> None:
+        gap = credential_scout_gap(
+            [self._fill("cred_a", "username", self._PAGE_ONE)],
+            [(frozenset({"cred_a"}), frozenset({"username", "password"}))],
+            requires_submit=False,
+        )
+        assert gap == ScoutGap(missing_fields=["password"], missing_submit=False)
+
+    def test_no_matched_fill_means_missing_submit(self) -> None:
+        gap = credential_scout_gap(
+            [self._click(self._PAGE_ONE)],
+            [(frozenset({"cred_a"}), frozenset({"username"}))],
+            requires_submit=True,
+        )
+        assert gap == ScoutGap(missing_fields=["username"], missing_submit=True)
+
+    def test_cross_requirement_accumulation_accepts_submit_on_either_matched_page(self) -> None:
+        trajectory = [
+            self._fill("cred_a", "username", self._PAGE_ONE),
+            self._fill("cred_b", "password", self._PAGE_TWO),
+            self._click(self._PAGE_ONE),
+        ]
+        gap = credential_scout_gap(
+            trajectory,
+            [
+                (frozenset({"cred_a"}), frozenset({"username"})),
+                (frozenset({"cred_b"}), frozenset({"password"})),
+            ],
+            requires_submit=True,
+        )
+        assert gap == ScoutGap(missing_fields=[], missing_submit=False)
+
+    def test_submit_on_unmatched_page_stays_missing(self) -> None:
+        trajectory = [
+            self._fill("cred_a", "username", self._PAGE_ONE),
+            self._click("https://portal.example.test/elsewhere"),
+        ]
+        gap = credential_scout_gap(
+            trajectory,
+            [(frozenset({"cred_a"}), frozenset({"username"}))],
+            requires_submit=True,
+        )
+        assert gap == ScoutGap(missing_fields=[], missing_submit=True)
+
+    def test_submit_before_latest_fill_stays_missing(self) -> None:
+        trajectory = [
+            self._click(self._PAGE_ONE),
+            self._fill("cred_a", "username", self._PAGE_ONE),
+        ]
+        gap = credential_scout_gap(
+            trajectory,
+            [(frozenset({"cred_a"}), frozenset({"username"}))],
+            requires_submit=True,
+        )
+        assert gap == ScoutGap(missing_fields=[], missing_submit=True)
+
+    def test_sourceless_fill_accepts_any_later_submit(self) -> None:
+        trajectory = [
+            self._fill("cred_a", "username", ""),
+            self._click("https://portal.example.test/elsewhere"),
+        ]
+        gap = credential_scout_gap(
+            trajectory,
+            [(frozenset({"cred_a"}), frozenset({"username"}))],
+            requires_submit=True,
+        )
+        assert gap == ScoutGap(missing_fields=[], missing_submit=False)
+
+
+class TestCredentialScoutGatePredicateCoherence:
+    _TWO_FIELD_LOGIN_YAML = _credential_code_yaml(
+        code="""
+        await page.locator("#user").fill(login_credential.username)
+        await page.locator("#pass").fill(login_credential.password)
+        await page.locator("button[type='submit']").click()
+        """,
+        credential_id="cred_1",
+    )
+
+    @staticmethod
+    def _trajectory(*steps: dict[str, object]) -> list[dict[str, object]]:
+        return list(steps)
+
+    def _gate_ctx(self, trajectory: list[dict[str, object]]) -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = trajectory
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username", "password"})}
+        return ctx
+
+    def test_predicate_complete_trajectory_passes_the_real_gate(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        trajectory = self._trajectory(
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._click(helper._PAGE_ONE),
+            helper._fill("cred_1", "password", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        )
+        ctx = self._gate_ctx(trajectory)
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+        assert workflow_update_module._credentialed_code_block_scout_gate_errors(self._TWO_FIELD_LOGIN_YAML, ctx) == []
+
+    def test_predicate_incomplete_half_login_is_also_gate_rejected(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        trajectory = self._trajectory(
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._click(helper._PAGE_ONE),
+        )
+        ctx = self._gate_ctx(trajectory)
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+        errors = workflow_update_module._credentialed_code_block_scout_gate_errors(self._TWO_FIELD_LOGIN_YAML, ctx)
+        assert errors
+        assert "password" in errors[0]
+
+
+class TestCredentialScoutReopenSeam:
+    @pytest.mark.asyncio
+    async def test_pure_credential_reject_arms_then_same_identity_does_not_re_arm(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+        yaml_text = TestCredentialScoutPersistGate._SUBMIT_CODE_YAML
+
+        result = await _update_workflow({"workflow_yaml": yaml_text}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+        first_key = ctx.credential_scout_rescout_context_key
+        assert first_key
+
+        result = await _update_workflow({"workflow_yaml": yaml_text}, ctx)
+
+        assert result["ok"] is False
+        assert ctx.synthesized_block_reopened_for_credential_scout is False
+        assert ctx.credential_scout_rescout_context_key == first_key
+
+    @pytest.mark.asyncio
+    async def test_new_binding_identity_re_arms_reopen(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._SUBMIT_CODE_YAML}, ctx)
+        first_key = ctx.credential_scout_rescout_context_key
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+
+        rebound_yaml = _credential_code_yaml(
+            code="""
+            await page.locator("#email").fill(login_credential.username)
+            await page.locator("input[type='password']").fill(login_credential.password)
+            await page.locator("#totpmfa").fill(login_credential.totp)
+            await page.locator("input[type='submit']").click()
+            await page.wait_for_load_state("load")
+            """,
+            credential_id="cred_rebound",
+        )
+        result = await _update_workflow({"workflow_yaml": rebound_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+        assert ctx.credential_scout_rescout_context_key != first_key
+
+    @pytest.mark.asyncio
+    async def test_combined_credential_and_code_safety_reject_arms_reopen(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._UNSAFE_SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert result["data"]["failure_type"] == "missing_credential_or_init"
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+        assert ctx.credential_scout_rescout_context_key
+
+    @pytest.mark.asyncio
+    async def test_gate_passing_attempt_leaves_window_closed(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._SUBMIT_CODE_YAML}, ctx)
+        assert ctx.synthesized_block_reopened_for_credential_scout is True
+
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+            _submit_interaction(),
+        ]
+        result = await _update_workflow({"workflow_yaml": TestCredentialScoutPersistGate._SUBMIT_CODE_YAML}, ctx)
+
+        assert ctx.synthesized_block_reopened_for_credential_scout is False
+        error_text = str(result.get("error") or "")
+        assert "fill_credential_field" not in error_text
+
+    def test_should_impose_after_update_attempt_honors_reopen_flag(self) -> None:
+        ctx = _code_only_ctx()
+        assert workflow_update_module._should_impose_after_update_attempt(ctx) is False
+        ctx.synthesized_block_reopened_for_credential_scout = True
+        assert workflow_update_module._should_impose_after_update_attempt(ctx) is True

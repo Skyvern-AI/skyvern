@@ -168,6 +168,7 @@ class FillCarry(BaseModel):
     control_value_satisfied: bool | None = None
     credential_id: str = ""
     credential_field: str = ""
+    available_fields: list[str] | None = None
 
 
 class LoadedResultTargetContext(BaseModel):
@@ -417,7 +418,10 @@ def _carry_bool(value: FillCarryPrimitive) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarryPrimitive]]) -> list[FillCarry]:
+def _fill_carry_from_scout_trajectory(
+    trajectory: Sequence[Mapping[str, FillCarryPrimitive]],
+    credential_field_inventory: Mapping[str, frozenset[str]] | None = None,
+) -> list[FillCarry]:
     carry: list[FillCarry] = []
     for interaction in trajectory:
         tool_name = _carry_text(interaction.get("tool_name"), max_chars=40)
@@ -460,6 +464,7 @@ def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarr
             credential_id = _carry_text(interaction.get("credential_id"))
             credential_field = _carry_text(interaction.get("credential_field"), max_chars=20)
             if credential_id and credential_field in _FILL_CARRY_CREDENTIAL_FIELDS:
+                inventory = (credential_field_inventory or {}).get(credential_id)
                 carry.append(
                     FillCarry(
                         source_url=source_url,
@@ -470,6 +475,7 @@ def _fill_carry_from_scout_trajectory(trajectory: Sequence[Mapping[str, FillCarr
                         typed_length=typed_length,
                         credential_id=credential_id,
                         credential_field=credential_field,
+                        available_fields=sorted(inventory) if inventory else None,
                     )
                 )
     return carry[-_MAX_FILL_CARRY:]
@@ -536,8 +542,10 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     )
     raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
     scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
+    raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
     fill_carry = _fill_carry_from_scout_trajectory(
-        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)]
+        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
+        credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
     )
     if (
         not raw_context

@@ -71,6 +71,8 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "code_only_target_page_evidence_seen",
     "last_evaluate_actionable_signature",
     "last_evaluate_actionable_url",
+    "last_scout_observation_trajectory_index",
+    "last_scout_observation_has_password_control",
     "latest_evaluate_result_composition_steer",
     "latest_evaluate_result_composition_signature",
     "last_auto_acted_signature",
