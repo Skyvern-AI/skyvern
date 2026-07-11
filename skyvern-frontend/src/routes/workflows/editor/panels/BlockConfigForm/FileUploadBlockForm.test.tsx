@@ -53,10 +53,12 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: (props: {
     value: string;
     onChange: (value: string) => void;
+    placeholder?: string;
   }) => (
     <textarea
       data-testid="wbi-textarea"
       value={props.value ?? ""}
+      placeholder={props.placeholder}
       onChange={(event) => props.onChange(event.target.value)}
     />
   ),
@@ -138,6 +140,7 @@ function setFileUploadNode(
   overrides: Partial<{
     storageType: "s3" | "azure" | "google_drive";
     path: string;
+    prompt: string | null;
     s3Bucket: string | null;
     awsAccessKeyId: string | null;
     awsSecretAccessKey: string | null;
@@ -156,6 +159,7 @@ function setFileUploadNode(
     data: {
       storageType: overrides.storageType ?? "s3",
       path: overrides.path ?? "{{ workflow_run_id }}",
+      prompt: overrides.prompt ?? null,
       s3Bucket: overrides.s3Bucket ?? null,
       awsAccessKeyId: overrides.awsAccessKeyId ?? null,
       awsSecretAccessKey: overrides.awsSecretAccessKey ?? null,
@@ -211,9 +215,9 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     expect(screen.queryByText("Google Account")).toBeNull();
     expect(screen.queryByText("Google Drive Folder ID")).toBeNull();
 
-    // 4 textareas (key id, bucket, region, path) and 1 password input
+    // 5 textareas (prompt, key id, bucket, region, path) and 1 password input
     const textareas = screen.getAllByTestId("wbi-textarea");
-    expect(textareas).toHaveLength(4);
+    expect(textareas).toHaveLength(5);
     const password = screen.getByTestId("wbi-password") as HTMLInputElement;
     expect(password.value).toBe("secret");
   });
@@ -242,9 +246,9 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     expect(screen.queryByText("Google Account")).toBeNull();
     expect(screen.queryByText("Google Drive Folder ID")).toBeNull();
 
-    // 3 textareas (account name, container, path) and 1 password input
+    // 4 textareas (prompt, account name, container, path) and 1 password input
     const textareas = screen.getAllByTestId("wbi-textarea");
-    expect(textareas).toHaveLength(3);
+    expect(textareas).toHaveLength(4);
     const password = screen.getByTestId("wbi-password") as HTMLInputElement;
     expect(password.value).toBe("key");
   });
@@ -263,7 +267,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
       (screen.getByTestId("google-oauth-selector") as HTMLInputElement).value,
     ).toBe("goac_123");
     expect(
-      (screen.getByTestId("wbi-textarea") as HTMLTextAreaElement).value,
+      (screen.getAllByTestId("wbi-textarea")[1] as HTMLTextAreaElement).value,
     ).toBe("folder_123");
   });
 
@@ -294,13 +298,38 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     });
   });
 
+  test("renders prompt and propagates changes", () => {
+    setFileUploadNode("f1", {
+      storageType: "google_drive",
+      prompt: "Only upload invoices",
+    });
+    render(<FileUploadBlockForm blockId="f1" />);
+
+    expect(screen.getByText("Prompt")).toBeDefined();
+    expect(
+      screen.getByText("Optional. Leave empty to upload all downloaded files."),
+    ).toBeDefined();
+    const prompt = screen.getByPlaceholderText(
+      'e.g. Only upload the PDF files whose names contain "invoice"',
+    ) as HTMLTextAreaElement;
+    expect(prompt.value).toBe("Only upload invoices");
+
+    fireEvent.change(prompt, {
+      target: { value: "Only upload {{ file_pattern }}" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("f1", {
+      prompt: "Only upload {{ file_pattern }}",
+    });
+  });
+
   test("editing s3Bucket (when s3) propagates", () => {
     setFileUploadNode("f1", { storageType: "s3" });
     render(<FileUploadBlockForm blockId="f1" />);
 
-    // Order: awsAccessKeyId, s3Bucket, regionName, path
+    // Order: prompt, awsAccessKeyId, s3Bucket, regionName, path
     const textareas = screen.getAllByTestId("wbi-textarea");
-    fireEvent.change(textareas[1] as HTMLTextAreaElement, {
+    fireEvent.change(textareas[2] as HTMLTextAreaElement, {
       target: { value: "new-bucket" },
     });
 
@@ -314,7 +343,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     render(<FileUploadBlockForm blockId="f1" />);
 
     const textareas = screen.getAllByTestId("wbi-textarea");
-    fireEvent.change(textareas[0] as HTMLTextAreaElement, {
+    fireEvent.change(textareas[1] as HTMLTextAreaElement, {
       target: { value: "AKIA-NEW" },
     });
 
@@ -340,9 +369,9 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     setFileUploadNode("f1", { storageType: "s3" });
     render(<FileUploadBlockForm blockId="f1" />);
 
-    // Order: awsAccessKeyId, s3Bucket, regionName, path
+    // Order: prompt, awsAccessKeyId, s3Bucket, regionName, path
     const textareas = screen.getAllByTestId("wbi-textarea");
-    fireEvent.change(textareas[3] as HTMLTextAreaElement, {
+    fireEvent.change(textareas[4] as HTMLTextAreaElement, {
       target: { value: "uploads/2026" },
     });
 
@@ -355,9 +384,9 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     setFileUploadNode("f1", { storageType: "azure" });
     render(<FileUploadBlockForm blockId="f1" />);
 
-    // Order: azureStorageAccountName, azureBlobContainerName, path
+    // Order: prompt, azureStorageAccountName, azureBlobContainerName, path
     const textareas = screen.getAllByTestId("wbi-textarea");
-    fireEvent.change(textareas[0] as HTMLTextAreaElement, {
+    fireEvent.change(textareas[1] as HTMLTextAreaElement, {
       target: { value: "newaccount" },
     });
 
@@ -371,7 +400,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     render(<FileUploadBlockForm blockId="f1" />);
 
     const textareas = screen.getAllByTestId("wbi-textarea");
-    fireEvent.change(textareas[1] as HTMLTextAreaElement, {
+    fireEvent.change(textareas[2] as HTMLTextAreaElement, {
       target: { value: "blocked" },
     });
     fireEvent.change(screen.getByTestId("wbi-password"), {

@@ -45,6 +45,7 @@ describe("nodeTypes composition order", () => {
         "googleSheetsWrite",
         "pdfFill",
         "splitPdf",
+        "emailInbox",
       ]),
     );
   });

@@ -8,6 +8,7 @@ import { ActionBlockForm } from "./BlockConfigForm/ActionBlockForm";
 import { CodeBlockBlockForm } from "./BlockConfigForm/CodeBlockBlockForm";
 import { ConditionalBlockForm } from "./BlockConfigForm/ConditionalBlockForm";
 import { DownloadBlockForm } from "./BlockConfigForm/DownloadBlockForm";
+import { EmailInboxBlockForm } from "./BlockConfigForm/EmailInboxBlockForm";
 import { ExtractionBlockForm } from "./BlockConfigForm/ExtractionBlockForm";
 import { FileDownloadBlockForm } from "./BlockConfigForm/FileDownloadBlockForm";
 import { FileParserBlockForm } from "./BlockConfigForm/FileParserBlockForm";
@@ -50,6 +51,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   conditional: ConditionalBlockForm,
   textPrompt: TextPromptBlockForm,
   sendEmail: SendEmailBlockForm,
+  emailInbox: EmailInboxBlockForm,
   codeBlock: CodeBlockBlockForm,
   fileParser: FileParserBlockForm,
   fileDownload: FileDownloadBlockForm,

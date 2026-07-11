@@ -405,6 +405,10 @@ const router = createBrowserRouter([
             path: "google/callback",
             element: <GoogleOAuthCallback />,
           },
+          {
+            path: "microsoft/callback",
+            element: <Navigate to="/integrations" replace />,
+          },
         ],
       },
     ],

@@ -64,6 +64,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "send_email": {
       return <EnvelopeClosedIcon className={className} />;
     }
+    case "email_inbox": {
+      return <EnvelopeClosedIcon className={className} />;
+    }
     case "task": {
       return <ListBulletIcon className={className} />;
     }

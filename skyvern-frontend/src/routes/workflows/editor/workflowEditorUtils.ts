@@ -53,6 +53,7 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
   PdfFillBlockYAML,
@@ -150,6 +151,11 @@ import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
+import {
+  emailInboxNodeDefaultData,
+  isEmailInboxNode,
+} from "./nodes/EmailInboxNode/types";
+import { validateEmailInboxNode } from "./nodes/EmailInboxNode/validate";
 import {
   googleSheetsReadNodeDefaultData,
   isGoogleSheetsReadNode,
@@ -1071,6 +1077,7 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+          prompt: block.prompt ?? null,
           storageType: block.storage_type,
           s3Bucket: block.s3_bucket ?? "",
           awsAccessKeyId: block.aws_access_key_id ?? "",
@@ -1186,6 +1193,26 @@ function convertToNode(
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
           useParentBrowserSession: block.use_parent_browser_session ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "email_inbox": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "emailInbox",
+        data: {
+          ...commonData,
+          emailClient: block.email_client ?? "gmail",
+          credentialId: block.credential_id ?? "",
+          folder: block.folder ?? "INBOX",
+          prompt: block.prompt ?? "",
+          sender: block.sender ?? "",
+          subject: block.subject ?? "",
+          newerThanDays: block.newer_than_days ?? null,
+          maxResults: block.max_results ?? 25,
+          includeBody: block.include_body ?? true,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -2614,6 +2641,17 @@ function createNode(
         },
       };
     }
+    case "emailInbox": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "emailInbox",
+        data: {
+          ...emailInboxNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "googleSheetsRead": {
       return {
         ...identifiers,
@@ -3083,6 +3121,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_upload",
         path: node.data.path,
+        prompt: node.data.prompt,
         storage_type: node.data.storageType,
         s3_bucket: node.data.s3Bucket ?? "",
         aws_access_key_id: node.data.awsAccessKeyId ?? "",
@@ -3221,6 +3260,22 @@ function getWorkflowBlock(
         wait_for_completion: node.data.waitForCompletion,
         browser_session_id: node.data.browserSessionId || null,
         use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "emailInbox": {
+      return {
+        ...base,
+        block_type: "email_inbox",
+        email_client: node.data.emailClient,
+        credential_id: node.data.credentialId || null,
+        folder: node.data.folder,
+        prompt: node.data.prompt,
+        sender: node.data.sender || null,
+        subject: node.data.subject || null,
+        newer_than_days: node.data.newerThanDays,
+        max_results: node.data.maxResults,
+        include_body: node.data.includeBody,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4450,6 +4505,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "file_upload",
           path: block.path,
+          prompt: block.prompt,
           storage_type: block.storage_type,
           s3_bucket: block.s3_bucket ?? "",
           aws_access_key_id: block.aws_access_key_id ?? "",
@@ -4578,6 +4634,23 @@ function convertBlocksToBlockYAML(
           wait_for_completion: block.wait_for_completion,
           browser_session_id: block.browser_session_id,
           use_parent_browser_session: block.use_parent_browser_session,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "email_inbox": {
+        const blockYaml: EmailInboxBlockYAML = {
+          ...base,
+          block_type: "email_inbox",
+          email_client: block.email_client,
+          credential_id: block.credential_id,
+          folder: block.folder,
+          prompt: block.prompt,
+          sender: block.sender,
+          subject: block.subject,
+          newer_than_days: block.newer_than_days,
+          max_results: block.max_results,
+          include_body: block.include_body,
           parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
@@ -4913,6 +4986,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isGoogleSheetsReadNode)
     .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+
+  nodes
+    .filter(isEmailInboxNode)
+    .forEach((node) => errors.push(...validateEmailInboxNode(node)));
 
   nodes
     .filter(isGoogleSheetsWriteNode)
