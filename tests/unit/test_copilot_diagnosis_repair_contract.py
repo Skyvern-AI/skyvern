@@ -399,7 +399,9 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
     )
 
 
-def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes() -> None:
+def test_repair_loop_state_counts_through_authoring_repair_context_identity_change() -> None:
+    # An identity change rotates the streak token but is not progress; the zero-run
+    # ceiling still does not terminalize.
     ctx = _ctx()
     ambiguous = CodeAuthoringRepairContext(
         block_label="retrieve_document_link",
@@ -431,9 +433,11 @@ def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes
     run_execution_module._update_repair_loop_state(ctx, sandbox_contract)
 
     assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 1
-    assert sandbox_contract.repair_loop_state.ceiling_reached is False
+    assert sandbox_contract.repair_loop_state.streak_token != contract.repair_loop_state.streak_token
+    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 3
+    assert sandbox_contract.repair_loop_state.ceiling_reached is True
     assert getattr(ctx, "blocker_signal", None) is None
+    assert ctx.turn_halt is None
 
 
 def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
@@ -501,6 +505,25 @@ def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
     state = _run_repair_loop_state(ctx)
     assert state.consecutive_identical_repair_count == 1
     assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+    repeat = _run_repair_loop_state(ctx)
+    assert repeat.consecutive_identical_repair_count == 2
+    assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+
+def test_uncovered_output_reopen_preserves_prior_streak_count() -> None:
+    ctx = _ctx()
+    assert _run_repair_loop_state(ctx).consecutive_identical_repair_count == 1
+    assert _run_repair_loop_state(ctx).consecutive_identical_repair_count == 2
+
+    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
+    ctx.latest_recorded_build_test_outcome = _uncovered_output_author_reject("output.document_name")
+    reopened = _run_repair_loop_state(ctx)
+
+    assert ctx.synthesized_block_reopened_for_output_coverage is True
+    assert reopened.consecutive_identical_repair_count == 2
+    assert reopened.ceiling_reached is False
+    assert ctx.consecutive_non_converging_repair_count == 2
 
 
 def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:
