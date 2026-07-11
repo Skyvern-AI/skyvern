@@ -1,7 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { Status, TaskRunListItem } from "@/api/types";
+import { Status, TaskRunListItem, TaskRunType } from "@/api/types";
 import {
   getActiveOrgQueryKeyScope,
   getOrgScopedQueryKey,
@@ -18,6 +18,7 @@ type Props = {
   page?: number;
   pageSize?: number;
   statusFilters?: Array<Status>;
+  runTypeFilters?: Array<TaskRunType>;
   search?: string;
 } & UseQueryOptions;
 
@@ -25,6 +26,7 @@ function useRunsQuery({
   page = 1,
   pageSize = 10,
   statusFilters,
+  runTypeFilters,
   search,
   ...queryOptions
 }: Props) {
@@ -33,7 +35,7 @@ function useRunsQuery({
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   return useQuery<Array<TaskRunListItem>>({
     queryKey: getOrgScopedQueryKey(
-      ["runs", { statusFilters }, page, pageSize, search],
+      ["runs", { statusFilters, runTypeFilters }, page, pageSize, search],
       activeOrgQueryKeyScope,
     ),
     queryFn: async ({ signal }) => {
@@ -44,6 +46,11 @@ function useRunsQuery({
       if (statusFilters) {
         statusFilters.forEach((status) => {
           params.append("status", status);
+        });
+      }
+      if (runTypeFilters) {
+        runTypeFilters.forEach((runType) => {
+          params.append("run_type", runType);
         });
       }
       if (search) {
