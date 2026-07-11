@@ -492,7 +492,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         get_skyvern_element = AsyncMock()
@@ -520,7 +523,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=False),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=False),
+            ),
         )
         get_skyvern_element = AsyncMock()
         get_readback_scope_element = AsyncMock()
@@ -566,7 +572,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         selected_element = _FakeCustomElement(role="listbox")
@@ -593,7 +602,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -638,7 +650,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -684,7 +699,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -722,7 +740,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         matched_states = [
@@ -788,7 +809,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -828,7 +852,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -869,7 +896,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -913,7 +943,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -980,7 +1013,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -1025,7 +1061,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -1064,7 +1103,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -1195,7 +1237,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -1274,7 +1319,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -1360,7 +1408,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(

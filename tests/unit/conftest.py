@@ -4,6 +4,7 @@
 import itertools
 import logging
 import shutil
+import sys
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,6 +56,20 @@ structlog.configure(
 def setup_forge_stub_app():
     start_forge_stub_app()
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_collapse_xp_assignment_memo():
+    # The collapse umbrella memo is process-global by design; without clearing it,
+    # an assignment memoized by one test leaks into any later test reusing the same task id.
+    def _clear() -> None:
+        handler_module = sys.modules.get("skyvern.webeye.actions.handler")
+        if handler_module is not None:
+            handler_module._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+
+    _clear()
+    yield
+    _clear()
 
 
 # -- shared copilot agent-template rendering helper --
