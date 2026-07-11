@@ -72,6 +72,7 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "last_evaluate_actionable_signature",
     "last_evaluate_actionable_url",
     "latest_evaluate_result_composition_steer",
+    "latest_evaluate_result_composition_signature",
     "last_auto_acted_signature",
     "reached_download_target",
     "synthesized_block_offered",

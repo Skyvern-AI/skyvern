@@ -62,6 +62,7 @@ class OutputContractActuationEvidence:
     consumed_run_output_observed: bool = False
     consumed_run_bound_required_path: bool = False
     consumed_run_carried_page_extraction: bool = False
+    loaded_result_source_producible: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,12 +96,15 @@ def resolve_output_contract_actuation(
     grantable_source = (
         evidence.advisory_run_grantable and evidence.advisory_state != OutputContractAdvisoryState.CONSUMED
     )
-    observable_source = evidence.observed_required_values or not evidence.click_only_spine
+    observable_source = (
+        evidence.observed_required_values or evidence.loaded_result_source_producible or not evidence.click_only_spine
+    )
     producible_source = observable_source or grantable_source
     progressed = evidence.actuation_progress_exhausted or evidence.prior_actuation
     if (
         evidence.click_only_spine
         and not evidence.observed_required_values
+        and not evidence.loaded_result_source_producible
         and evidence.declick_attempt_failed
         and not grantable_source
     ):
