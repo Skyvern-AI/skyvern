@@ -1244,7 +1244,7 @@ async def update_workflow(
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowDefinitionValidationException as e:
         raise e
-    except (SkyvernHTTPException, ValidationError) as e:
+    except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         # Bubble up well-formed client errors so they are not converted to 500s
         raise e
     except Exception as e:
