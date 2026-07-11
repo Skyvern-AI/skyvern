@@ -2881,6 +2881,7 @@ async def upload_file(
     sftp_remote_path: str | None = None,
     sftp_host_key: str | None = None,
     path: str | None = None,
+    prompt: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     if s3_bucket:
@@ -2915,6 +2916,8 @@ async def upload_file(
         sftp_remote_path = _render_template_with_label(sftp_remote_path, label)
     if sftp_host_key:
         sftp_host_key = _render_template_with_label(sftp_host_key, label)
+    if prompt:
+        prompt = _render_template_with_label(prompt, label)
     if path:
         path = _render_template_with_label(path, label)
     file_upload_block = FileUploadBlock(
@@ -2939,6 +2942,7 @@ async def upload_file(
         sftp_private_key_passphrase=sftp_private_key_passphrase,
         sftp_remote_path=sftp_remote_path,
         sftp_host_key=sftp_host_key,
+        prompt=prompt,
         path=path,
     )
     await file_upload_block.execute_safe(

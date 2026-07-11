@@ -644,6 +644,7 @@ def block_yaml_to_block(
             sftp_private_key_passphrase=block_yaml.sftp_private_key_passphrase,
             sftp_remote_path=block_yaml.sftp_remote_path,
             sftp_host_key=block_yaml.sftp_host_key,
+            prompt=block_yaml.prompt,
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:

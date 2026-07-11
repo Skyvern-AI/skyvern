@@ -2140,6 +2140,7 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         "sftp_private_key_passphrase",
         "sftp_remote_path",
         "sftp_host_key",
+        "prompt",
         "path",
     ]:
         if block.get(key) is not None:

@@ -933,6 +933,10 @@ class FileUploadBlockYAML(BlockYAML):
     sftp_private_key_passphrase: str | None = None
     sftp_remote_path: str | None = None
     sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
 
 
