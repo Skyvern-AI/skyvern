@@ -670,7 +670,7 @@ class WorkflowService:
                 tags[TARGET_DOMAIN_RUN_TAG_KEY] = domain
             try:
                 platform = workflow_script_service.detect_workflow_platform_for_tagging(
-                    workflow, parameters, domain_override=domain
+                    workflow, parameters, domain_override=(domain or None)
                 )
                 if platform:
                     tags[DETECTED_PLATFORM_RUN_TAG_KEY] = platform
