@@ -761,7 +761,7 @@ class CopilotContext(AgentContext):
     repeated_failure_streak_count: int = 0
     last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
-    # Unlike the identity-keyed repair ceiling, this climbs even when every
+    # Unlike the progress-gated repair ceiling, this climbs even when every
     # rejection is different; it resets only on an accepted persist.
     code_authoring_guardrail_reject_count: int = 0
     # True when the most-recent such rejection deferred to the credential-scout
