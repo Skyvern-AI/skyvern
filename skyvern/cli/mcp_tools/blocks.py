@@ -23,6 +23,7 @@ from skyvern.schemas.workflows import (
     CodeBlockYAML,
     ConditionalBlockYAML,
     DownloadToS3BlockYAML,
+    EmailInboxBlockYAML,
     ExtractionBlockYAML,
     FileDownloadBlockYAML,
     FileParserBlockYAML,
@@ -87,6 +88,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.SPLIT_PDF.value: SplitPdfBlockYAML,
     BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
     BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
+    BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
     BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
 }
 
@@ -121,6 +123,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "split_pdf": "Split one PDF into multiple PDFs by prompt and save each to S3",
     "workflow_trigger": "Trigger another workflow by permanent ID, with optional payload and wait-for-completion",
     "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
+    "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
 }
 
@@ -276,6 +279,14 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "range": "A1:D100",
         "credential_id": "{{ google_credential_id }}",
         "has_header_row": True,
+    },
+    "email_inbox": {
+        "block_type": "email_inbox",
+        "label": "find_invoice_email",
+        "email_client": "gmail",
+        "credential_id": "{{ gmail_credential_id }}",
+        "folder": "INBOX",
+        "prompt": "Find invoice approval emails that need a reply.",
     },
     "google_sheets_write": {
         "block_type": "google_sheets_write",

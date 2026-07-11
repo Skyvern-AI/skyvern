@@ -102,6 +102,18 @@ export const helpTooltips = {
     hasHeaderRow:
       "If enabled, the first row is used as column headers for the output objects",
   },
+  email_inbox: {
+    ...baseHelpTooltipContent,
+    emailClient: "Choose Gmail or Outlook as the inbox provider.",
+    credentialId: "The connected email account used to read inbox messages.",
+    folder: "Gmail label e.g. INBOX / Outlook folder e.g. inbox.",
+    prompt: "Describe which emails to keep. Leave blank to keep all.",
+    sender: "Only include emails from this sender.",
+    subject: "Only include emails matching this subject.",
+    newerThanDays: "Only include emails newer than this many days.",
+    maxResults: "Maximum number of emails to return.",
+    includeBody: "Include email body text in matching results.",
+  },
   google_sheets_write: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:

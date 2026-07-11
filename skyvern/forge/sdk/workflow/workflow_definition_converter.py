@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     WorkflowTriggerBlock,
 )
+from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
@@ -934,6 +935,21 @@ def block_yaml_to_block(
             credential_id=block_yaml.credential_id,
             has_header_row=block_yaml.has_header_row,
             parameters=google_sheets_read_parameters,
+        )
+    elif block_yaml.block_type == BlockType.EMAIL_INBOX:
+        email_inbox_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return EmailInboxBlock(
+            **base_kwargs,
+            email_client=block_yaml.email_client,
+            credential_id=block_yaml.credential_id,
+            folder=block_yaml.folder,
+            prompt=block_yaml.prompt,
+            sender=block_yaml.sender,
+            subject=block_yaml.subject,
+            newer_than_days=block_yaml.newer_than_days,
+            max_results=block_yaml.max_results,
+            include_body=block_yaml.include_body,
+            parameters=email_inbox_parameters,
         )
     elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:
         google_sheets_write_parameters = _resolve_block_parameters(block_yaml, parameters)

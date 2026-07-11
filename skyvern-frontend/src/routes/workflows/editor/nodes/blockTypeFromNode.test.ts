@@ -12,6 +12,10 @@ describe("blockTypeFromNode", () => {
     );
   });
 
+  it("maps emailInbox to email_inbox", () => {
+    expect(blockTypeFromNode({ type: "emailInbox" })).toBe("email_inbox");
+  });
+
   it("maps googleSheetsWrite to google_sheets_write", () => {
     expect(blockTypeFromNode({ type: "googleSheetsWrite" })).toBe(
       "google_sheets_write",

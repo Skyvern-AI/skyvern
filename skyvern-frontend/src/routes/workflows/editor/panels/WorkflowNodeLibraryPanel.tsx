@@ -293,6 +293,17 @@ const nodeLibraryItems: Array<{
     description: "Trigger another agent",
   },
   {
+    nodeType: "emailInbox",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.EmailInbox}
+        className="size-6"
+      />
+    ),
+    title: "Email Inbox",
+    description: "Search Gmail or Outlook inboxes",
+  },
+  {
     nodeType: "googleSheetsRead",
     icon: (
       <WorkflowBlockIcon

@@ -444,6 +444,7 @@ class BlockType(StrEnum):
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
+    EMAIL_INBOX = "email_inbox"
 
 
 class AIFallbackMode(StrEnum):
@@ -1265,6 +1266,20 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class EmailInboxBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
+    email_client: Literal["gmail", "outlook"]
+    credential_id: str | None = None
+    folder: str | None = None
+    prompt: str | None = None
+    sender: str | None = None
+    subject: str | None = None
+    newer_than_days: int | None = None
+    max_results: int = 25
+    include_body: bool = True
+    parameter_keys: list[str] | None = None
+
+
 class GoogleSheetsWriteBlockYAML(BlockYAML):
     block_type: Literal[BlockType.GOOGLE_SHEETS_WRITE] = BlockType.GOOGLE_SHEETS_WRITE  # type: ignore
     spreadsheet_url: str
@@ -1321,6 +1336,7 @@ BLOCK_YAML_SUBCLASSES = (
     | SplitPdfBlockYAML
     | WorkflowTriggerBlockYAML
     | GoogleSheetsReadBlockYAML
+    | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]

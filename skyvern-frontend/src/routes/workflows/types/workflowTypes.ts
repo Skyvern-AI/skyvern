@@ -219,6 +219,7 @@ export type WorkflowBlock =
   | HttpRequestBlock
   | PrintPageBlock
   | WorkflowTriggerBlock
+  | EmailInboxBlock
   | GoogleSheetsReadBlock
   | GoogleSheetsWriteBlock
   | PdfFillBlock
@@ -250,6 +251,7 @@ export const WorkflowBlockTypes = {
   HttpRequest: "http_request",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
+  EmailInbox: "email_inbox",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
   PDFFill: "pdf_fill",
@@ -618,6 +620,20 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   wait_for_completion: boolean;
   browser_session_id: string | null;
   use_parent_browser_session: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type EmailInboxBlock = WorkflowBlockBase & {
+  block_type: "email_inbox";
+  email_client: "gmail" | "outlook";
+  credential_id: string | null;
+  folder: string;
+  prompt: string;
+  sender: string | null;
+  subject: string | null;
+  newer_than_days: number | null;
+  max_results: number;
+  include_body: boolean;
   parameters: Array<WorkflowParameter>;
 };
 
