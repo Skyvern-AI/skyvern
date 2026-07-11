@@ -44,6 +44,10 @@ class TestIsSafeCodeRejectsImports:
 
 
 class TestIsSafeCodeRejectsDunderAccess:
+    def test_single_underscore_attribute(self) -> None:
+        with pytest.raises(InsecureCodeDetected, match="private"):
+            CodeBlock.is_safe_code("page._session._nonce")
+
     def test_dunder_class(self) -> None:
         with pytest.raises(InsecureCodeDetected, match="private"):
             CodeBlock.is_safe_code("x.__class__")
