@@ -54,9 +54,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    freeze_requested_output_extraction_candidate,
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
+    synthesize_code_block_with_extraction,
     trajectory_has_browser_fill_interaction,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
@@ -64,6 +66,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     apply_requested_output_producer_floor,
     build_turn_state,
     reconcile_completion_criteria,
+    requested_output_paths,
 )
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.config import (
@@ -97,6 +100,8 @@ from skyvern.forge.sdk.copilot.enforcement import (
     log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
     recycle_admits_present_completion_contract_ask,
+    requested_output_extraction_plan,
+    requested_output_extraction_plan_changed,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
@@ -1029,11 +1034,23 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     trajectory_len = len(ctx.scout_trajectory)
     previous_offer_len = ctx.synthesized_block_offered_trajectory_len
     trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    extraction_plan = requested_output_extraction_plan(ctx)
+    request_policy = getattr(ctx, "request_policy", None)
+    if (
+        request_policy is not None
+        and requested_output_paths(request_policy.completion_criteria)
+        and extraction_plan is None
+    ):
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="extraction_plan_unavailable")
+        return ""
+    plan_changed = requested_output_extraction_plan_changed(ctx, extraction_plan)
+    reopened = reopened or plan_changed
     if (
         ctx.synthesized_block_offered
         and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
         and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
         and not reopened
+        and not plan_changed
     ):
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
@@ -1055,7 +1072,19 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         trajectory_len=len(ctx.scout_trajectory),
         fill_step_count=fill_step_count,
     )
-    synthesized = synthesize_code_block(ctx.scout_trajectory, reached_download_target=ctx.reached_download_target)
+    synthesized = (
+        synthesize_code_block_with_extraction(
+            ctx.scout_trajectory,
+            extraction_plan,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if extraction_plan is not None
+        else synthesize_code_block(
+            ctx.scout_trajectory,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+    )
     if synthesized is None:
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
@@ -1063,6 +1092,15 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
             trajectory_len=len(ctx.scout_trajectory),
         )
         return ""
+    if extraction_plan is not None:
+        candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
+        if candidate is None:
+            return ""
+        existing_candidate = ctx.requested_output_extraction_candidate
+        if existing_candidate is not None and existing_candidate != candidate and not reopened:
+            LOG.warning("copilot_requested_output_extraction_candidate_mismatch")
+            return ""
+        ctx.requested_output_extraction_candidate = candidate
     ctx.synthesized_block_offered = True
     ctx.synthesized_block_offered_trajectory_len = trajectory_len
     ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete

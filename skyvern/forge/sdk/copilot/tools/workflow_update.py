@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
+from enum import StrEnum
 from typing import Annotated, Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 
@@ -52,6 +53,7 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _BARE_TAG_RE,
+    _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
@@ -62,11 +64,13 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _parse_role_name,
     artifact_dependency_id,
     artifact_observation_ref_id,
+    freeze_requested_output_extraction_candidate,
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
     render_missing_rung_call_sources,
     synthesize_code_block,
+    synthesize_code_block_with_extraction,
     uncovered_required_emitted_interactions,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -86,6 +90,9 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _CHURN_REASON_CODES,
     _record_code_authoring_guardrail_reject,
     _scouted_spine_open_obligation,
+    requested_output_extraction_plan,
+    requested_output_extraction_plan_changed,
+    synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
@@ -5673,6 +5680,12 @@ class _BrowserBindings(NamedTuple):
     method_aliases: set[str]
 
 
+class _BrowserExpressionKind(StrEnum):
+    LOCATOR = "locator"
+    SCALAR = "scalar"
+    OTHER = "other"
+
+
 def _code_block_label(block: Mapping[str, Any]) -> str:
     return str(block.get("label") or "").strip() or "unlabeled code block"
 
@@ -5701,6 +5714,15 @@ def _direct_page_method_signature(node: ast.AST) -> str | None:
     if not isinstance(node, ast.Name) or node.id != "page":
         return None
     return "page"
+
+
+def _bounded_nth_constant(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+        and 0 <= node.value <= 10_000
+    )
 
 
 def _browser_mutation_signature_for_call(node: ast.Call) -> _BrowserMutationSignature | None:
@@ -5828,18 +5850,104 @@ def _is_dynamic_browser_dispatch(node: ast.Call, bindings: _BrowserBindings) -> 
     return _expr_contains_browser_receiver(func.args[0], bindings)
 
 
+def _browser_expression_kind(node: ast.AST, bindings: _BrowserBindings) -> _BrowserExpressionKind:
+    # Alias trust is intentionally limited to compiler-owned scout variables;
+    # submitted-code aliases never gain browser-read authority by assignment.
+    if isinstance(node, ast.Name) and node.id in bindings.locator_aliases and node.id in _INTERNAL_SCOUT_VARS:
+        return _BrowserExpressionKind.LOCATOR
+    if _direct_locator_receiver_signature(node) is not None:
+        return _BrowserExpressionKind.LOCATOR
+    if isinstance(node, ast.Attribute) and node.attr in {"first", "last"}:
+        if _browser_expression_kind(node.value, bindings) == _BrowserExpressionKind.LOCATOR:
+            return _BrowserExpressionKind.LOCATOR
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        receiver_kind = _browser_expression_kind(node.func.value, bindings)
+        if (
+            node.func.attr in {"locator", "get_by_role", "frame_locator"}
+            and receiver_kind == _BrowserExpressionKind.LOCATOR
+        ):
+            return _BrowserExpressionKind.LOCATOR
+        if node.func.attr == "nth" and receiver_kind == _BrowserExpressionKind.LOCATOR and len(node.args) == 1:
+            index = node.args[0]
+            if _bounded_nth_constant(index):
+                return _BrowserExpressionKind.LOCATOR
+        if node.func.attr in _LOCATOR_READ_METHODS and receiver_kind == _BrowserExpressionKind.LOCATOR:
+            return _BrowserExpressionKind.SCALAR
+        if (
+            node.func.attr in _PAGE_READ_METHODS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "page"
+        ):
+            return _BrowserExpressionKind.SCALAR
+        if (
+            node.func.attr
+            in {
+                "casefold",
+                "endswith",
+                "join",
+                "lower",
+                "lstrip",
+                "replace",
+                "rsplit",
+                "rstrip",
+                "split",
+                "startswith",
+                "strip",
+                "upper",
+            }
+            and receiver_kind == _BrowserExpressionKind.SCALAR
+        ):
+            return _BrowserExpressionKind.SCALAR
+    if isinstance(node, ast.Await):
+        return _browser_expression_kind(node.value, bindings)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id
+        in {
+            "all",
+            "any",
+            "bool",
+            "dict",
+            "enumerate",
+            "float",
+            "int",
+            "len",
+            "list",
+            "max",
+            "min",
+            "range",
+            "set",
+            "sorted",
+            "str",
+            "sum",
+            "tuple",
+        }
+    ):
+        values = [*node.args, *(keyword.value for keyword in node.keywords)]
+        kinds = [_browser_expression_kind(value, bindings) for value in values]
+        if (
+            any(kind == _BrowserExpressionKind.SCALAR for kind in kinds)
+            and all(kind != _BrowserExpressionKind.LOCATOR for kind in kinds)
+            and all(
+                kind == _BrowserExpressionKind.SCALAR or not _expr_contains_browser_receiver(value, bindings)
+                for value, kind in zip(values, kinds, strict=True)
+            )
+        ):
+            return _BrowserExpressionKind.SCALAR
+    return _BrowserExpressionKind.OTHER
+
+
 def _is_allowed_browser_read_call(node: ast.Call, bindings: _BrowserBindings) -> bool:
     func = node.func
     if not isinstance(func, ast.Attribute):
         return False
     if func.attr in _PAGE_FACTORY_METHODS:
-        return isinstance(func.value, ast.Name) and func.value.id == "page"
+        return _browser_expression_kind(node, bindings) == _BrowserExpressionKind.LOCATOR
     if func.attr in _PAGE_READ_METHODS and isinstance(func.value, ast.Name) and func.value.id == "page":
         return True
     if func.attr in _LOCATOR_READ_METHODS:
-        return _direct_locator_receiver_signature(func.value) is not None or (
-            isinstance(func.value, ast.Name) and func.value.id in bindings.locator_aliases
-        )
+        return _browser_expression_kind(func.value, bindings) == _BrowserExpressionKind.LOCATOR
     return False
 
 
@@ -5853,7 +5961,11 @@ def _browser_surface_for_code(code: str) -> tuple[list[_BrowserMutationSignature
     page_aliases = _collect_page_aliases(tree)
     locator_aliases = _collect_locator_aliases(tree)
     method_aliases = _collect_browser_method_aliases(tree, page_aliases, locator_aliases)
-    bindings = _BrowserBindings(page_aliases, locator_aliases, method_aliases)
+    bindings = _BrowserBindings(
+        page_aliases,
+        locator_aliases,
+        method_aliases,
+    )
     # ast.walk yields breadth-first; the coverage scan (uncovered_required_emitted_interactions)
     # matches draft calls as an ordered subsequence, so enumerate Call nodes in source order or a
     # nested-but-present rung is falsely reported uncovered.
@@ -5874,6 +5986,11 @@ def _browser_surface_for_code(code: str) -> tuple[list[_BrowserMutationSignature
             continue
         if _is_dynamic_browser_dispatch(node, bindings):
             ambiguous.append(_call_name(node))
+            continue
+        if _browser_expression_kind(node, bindings) in {
+            _BrowserExpressionKind.LOCATOR,
+            _BrowserExpressionKind.SCALAR,
+        }:
             continue
         if _is_allowed_browser_read_call(node, bindings):
             continue
@@ -6351,7 +6468,6 @@ def _selector_refines(bare: str, candidate: str) -> bool:
             and bool(candidate_name)
             and not candidate_suffix
         )
-
     if not _BARE_TAG_RE.match(bare):
         return False
     if not candidate.startswith(bare) or _is_positional_selector(candidate):
@@ -7479,18 +7595,50 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     if not _submitted_code_block_changed(code_block, prior_yaml):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
-    synthesized = synthesize_code_block(
-        scout_trajectory,
-        strict_selectors=True,
-        reached_download_target=ctx.reached_download_target,
+    extraction_plan = requested_output_extraction_plan(ctx)
+    extraction_candidate_refresh_allowed = synthesized_persistence_reopened(
+        ctx
+    ) or requested_output_extraction_plan_changed(ctx, extraction_plan)
+    synthesized = (
+        synthesize_code_block_with_extraction(
+            scout_trajectory,
+            extraction_plan,
+            strict_selectors=True,
+            reached_download_target=ctx.reached_download_target,
+        )
+        if extraction_plan is not None
+        else synthesize_code_block(
+            scout_trajectory,
+            strict_selectors=True,
+            reached_download_target=ctx.reached_download_target,
+        )
     )
     if synthesized is None:
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
         )
+    if extraction_plan is not None:
+        candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
+        if candidate is None:
+            return _SynthesizedCodeImpositionResult(
+                workflow_yaml=workflow_yaml,
+                violations=["Unable to impose synthesized code block: extraction candidate is incomplete."],
+            )
+        existing_candidate = ctx.requested_output_extraction_candidate
+        if (
+            existing_candidate is not None
+            and existing_candidate != candidate
+            and not extraction_candidate_refresh_allowed
+        ):
+            return _SynthesizedCodeImpositionResult(
+                workflow_yaml=workflow_yaml,
+                violations=["Unable to impose synthesized code block: extraction candidate identity changed."],
+            )
+        ctx.requested_output_extraction_candidate = candidate
 
-    if _separated_spine_already_imposed(code_blocks, code_block, synthesized.code):
+    synthesized_spine_code = synthesized.interaction_code or synthesized.code
+    if _separated_spine_already_imposed(code_blocks, code_block, synthesized_spine_code):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
     diagnostics = synthesized.diagnostics
@@ -7530,13 +7678,27 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         code_blocks=code_blocks,
         selected_code_block=code_block,
         submitted_selected_code=submitted_code,
-        synthesized_code=synthesized.code,
+        synthesized_code=synthesized_spine_code,
         prior_yaml=prior_yaml,
         synthesized_diagnostics=diagnostics,
     )
     violations.extend(surface_validation.violations)
     ambiguous_reject_present = any(record.kind == "ambiguous" for record in surface_validation.provenance)
-    extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized.code)
+    submitted_extraction_suffix = _submitted_suffix_after_synthesized_code(submitted_code, synthesized_spine_code)
+    extraction_suffix = submitted_extraction_suffix or synthesized.extraction_code
+    extraction_candidate_source = "submitted" if submitted_extraction_suffix else "generated"
+    if (
+        submitted_extraction_suffix
+        and synthesized.extraction_code
+        and submitted_extraction_suffix.strip() != synthesized.extraction_code.strip()
+    ):
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=[
+                "Unable to impose synthesized code block: submitted extraction candidate does not execute the "
+                "captured requested-output plan recipe."
+            ],
+        )
     if extraction_suffix:
         suffix_mutations, _, suffix_ambiguous = _browser_surface_for_code(extraction_suffix)
         selected_label = _code_block_label(code_block)
@@ -7616,7 +7778,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         textwrap.dedent(submitted_code), parameter_reconciliation
     )
     reconciled_synthesized_code = _apply_parameter_reconciliation_to_code(
-        textwrap.dedent(synthesized.code), parameter_reconciliation
+        textwrap.dedent(synthesized_spine_code), parameter_reconciliation
     )
     submitted_contains_full_spine = _browser_surface_contains_full_action_spine(
         reconciled_submitted_code, reconciled_synthesized_code
@@ -7640,7 +7802,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         metadata_declares_goal_values
         and submitted_contains_full_spine
         and not extraction_suffix
-        and not _is_submitted_code_synthesized_only(submitted_code, synthesized.code)
+        and not _is_submitted_code_synthesized_only(submitted_code, synthesized_spine_code)
     )
     append_selected_extraction = (
         metadata_declares_goal_values
@@ -7667,6 +7829,14 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         "selector_provenance": diagnostics.locator_provenance,
         "prior_source": prior_source,
     }
+    if extraction_plan is not None:
+        substitutions.update(
+            {
+                "extraction_plan_identity": extraction_plan.identity,
+                "extraction_candidate_fingerprint": synthesized.extraction_fingerprint,
+                "extraction_candidate_source": extraction_candidate_source,
+            }
+        )
     reconciled_extraction_suffix = (
         _submitted_suffix_after_synthesized_code(reconciled_submitted_code, reconciled_synthesized_code)
         if preserve_submitted_extraction
@@ -7734,9 +7904,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             return split_under_build
         substitutions["separated_browser_stage_count"] = len(durable_stage_codes)
     else:
-        imposed_code = textwrap.dedent(submitted_code if preserve_submitted_extraction else synthesized.code).lstrip(
-            "\n"
-        )
+        imposed_code = textwrap.dedent(
+            submitted_code if preserve_submitted_extraction else synthesized_spine_code
+        ).lstrip("\n")
         if extraction_suffix:
             imposed_code = imposed_code.rstrip() + "\n" + extraction_suffix.rstrip() + "\n"
         elif append_selected_extraction:
@@ -7769,6 +7939,15 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         selected_extraction_metadata_disposition = "self_authored_extraction_preserved"
     elif extraction_suffix or append_selected_extraction:
         selected_extraction_metadata_disposition = "sibling_or_suffix_extraction_preserved"
+    if extraction_plan is not None:
+        LOG.info(
+            "copilot_requested_output_extraction_candidate_imposed",
+            canonical_paths=list(extraction_plan.requested_output_paths),
+            extraction_plan_identity=extraction_plan.identity,
+            observation_step=extraction_plan.observation_step,
+            candidate_source=extraction_candidate_source,
+            candidate_fingerprint=synthesized.extraction_fingerprint,
+        )
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
         substitutions=substitutions,

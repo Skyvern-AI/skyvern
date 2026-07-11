@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+    freeze_requested_output_extraction_candidate,
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
@@ -45,6 +46,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     render_missing_rung_call_sources,
     render_synthesized_offer_text,
     synthesize_code_block,
+    synthesize_code_block_with_extraction,
     trajectory_has_browser_fill_interaction,
     uncovered_required_emitted_interactions,
 )
@@ -87,6 +89,10 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    RequestedOutputExtractionPlan,
+    derive_requested_output_extraction_plan,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
     completion_criterion_requires_browser_fill_delivery,
     normalize_response_scaffolding,
@@ -2226,8 +2232,13 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     near-duplicate repeats, but a materially longer scout trajectory can refresh
     the deterministic code before the model authors the workflow.
     """
+    extraction_plan = requested_output_extraction_plan(ctx)
+    requested_extraction = bool(_requested_output_paths_for_ctx(ctx))
+    if requested_extraction and extraction_plan is None:
+        return None
+    plan_changed = requested_output_extraction_plan_changed(ctx, extraction_plan)
     reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
-    reopened = synthesized_persistence_reopened(ctx)
+    reopened = synthesized_persistence_reopened(ctx) or plan_changed
     if getattr(ctx, "update_workflow_called", False) and not reopened:
         return None
     if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
@@ -2249,11 +2260,29 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
         and not reopened
     ):
         return None
-    synthesized = synthesize_code_block(
-        trajectory, reached_download_target=getattr(ctx, "reached_download_target", None)
+    synthesized = (
+        synthesize_code_block_with_extraction(
+            trajectory,
+            extraction_plan,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if extraction_plan is not None
+        else synthesize_code_block(
+            trajectory,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
     )
     if synthesized is None:
         return None
+    if extraction_plan is not None:
+        candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
+        if candidate is None:
+            return None
+        existing_candidate = getattr(ctx, "requested_output_extraction_candidate", None)
+        if existing_candidate is not None and existing_candidate != candidate and not reopened:
+            return None
+        ctx.requested_output_extraction_candidate = candidate
 
     ctx.synthesized_block_offered = True
     ctx.synthesized_block_offered_trajectory_len = trajectory_len
@@ -2400,6 +2429,39 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
+def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    if not requested_paths:
+        return None
+    labels_by_path: dict[str, tuple[str, ...]] = {}
+    for criterion in _pre_run_gated_completion_criteria(ctx):
+        if criterion.output_path in requested_paths and criterion.outcome.strip():
+            labels_by_path.setdefault(criterion.output_path, ())
+            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+    if set(labels_by_path) != requested_paths:
+        return None
+    return derive_requested_output_extraction_plan(
+        flow_evidence=ctx.flow_evidence,
+        labels_by_path=labels_by_path,
+    )
+
+
+def requested_output_extraction_plan_changed(ctx: AgentContext, current: RequestedOutputExtractionPlan | None) -> bool:
+    if current is None or len(ctx.flow_evidence) < 2:
+        return False
+    labels_by_path: dict[str, tuple[str, ...]] = {}
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    for criterion in _pre_run_gated_completion_criteria(ctx):
+        if criterion.output_path in requested_paths and criterion.outcome.strip():
+            labels_by_path.setdefault(criterion.output_path, ())
+            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+    previous = derive_requested_output_extraction_plan(
+        flow_evidence=ctx.flow_evidence[:-1],
+        labels_by_path=labels_by_path,
+    )
+    return previous is not None and previous.identity != current.identity
+
+
 def record_scouted_output_coverage(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
     coverage_tokens = _requested_output_coverage_tokens(ctx)
     if not coverage_tokens:
@@ -2420,6 +2482,10 @@ def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
     with no requested-output path left uncovered; an empty requested-output set falls through to the shape heuristic
     byte-identically, so an entry ``synthesize_code_block`` would drop never counts as complete."""
     if uncovered_requested_output_paths(ctx):
+        return False
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    plan = requested_output_extraction_plan(ctx)
+    if requested_paths and (plan is None or not requested_paths.issubset(set(plan.requested_output_paths))):
         return False
     trajectory = getattr(ctx, "scout_trajectory", None)
     if not isinstance(trajectory, list) or not trajectory:

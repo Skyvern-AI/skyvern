@@ -9,6 +9,7 @@ that runs on the raw ``page`` object the copilot code block executes against.
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 import keyword
@@ -21,6 +22,13 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    FrozenRequestedOutputExtractionCandidate,
+    LiveReadBinding,
+    LiveReadKind,
+    RequestedOutputExtractionPlan,
+    output_path_segments,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.utils.strings import escape_code_fences
 
@@ -176,6 +184,22 @@ class SynthesizedCodeBlock:
     notes: list[str] = field(default_factory=list)
     diagnostics: SynthesisDiagnostics = field(default_factory=SynthesisDiagnostics)
     steps: list[dict[str, Any]] = field(default_factory=list)
+    interaction_code: str = ""
+    extraction_code: str = ""
+    extraction_fingerprint: str = ""
+    extraction_plan_identity: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesizedExtractionSuffix:
+    code: str
+    fingerprint: str
+
+
+@dataclass
+class _ExtractionReturnNode:
+    children: dict[str, _ExtractionReturnNode] = field(default_factory=dict)
+    value_expression: str = ""
 
 
 # str.splitlines() and several parsers treat these codepoints as line boundaries, so a raw one in a
@@ -1235,6 +1259,188 @@ def render_missing_rung_call_sources(uncovered: Sequence[Mapping[str, Any]]) -> 
     return "Missing rung source to reuse verbatim:\n```python\n" + "\n".join(sources) + "\n```"
 
 
+def _return_node_expression(node: _ExtractionReturnNode) -> str:
+    if node.value_expression:
+        return node.value_expression
+    items = ", ".join(
+        f"{json.dumps(key)}: {_return_node_expression(child)}" for key, child in sorted(node.children.items())
+    )
+    return "{" + items + "}"
+
+
+def _set_return_expression(root: _ExtractionReturnNode, segments: Sequence[tuple[str, bool]], expression: str) -> None:
+    current = root
+    for name, _is_array in segments:
+        current = current.children.setdefault(name, _ExtractionReturnNode())
+    current.value_expression = expression
+
+
+def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
+    segments = output_path_segments(binding.output_path)
+    for index, (_name, is_array) in enumerate(segments):
+        if is_array:
+            return segments[: index + 1]
+    return ()
+
+
+def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> SynthesizedExtractionSuffix | None:
+    if not plan.live_reads:
+        return None
+    lines: list[str] = []
+    return_root = _ExtractionReturnNode()
+    scalar_bindings = [binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE]
+    for index, binding in enumerate(scalar_bindings):
+        variable = f"_extraction_value_{index}"
+        container = f"page.locator({json.dumps(binding.selector)})"
+        target = f"{container}.nth({binding.selector_index})"
+        children = f'{target}.locator(":scope > *")'
+        lines.extend(
+            [
+                f"if await {container}.count() != {binding.selector_count}:",
+                f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
+                f"if not await {target}.is_visible():",
+                f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
+                f"if await {children}.count() != {binding.child_count}:",
+                f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
+                f"if not await {children}.nth(0).is_visible():",
+                f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
+                f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
+                f'{_INDENT}raise ValueError("Observed scalar label changed")',
+                f"if not await {children}.nth({binding.child_index}).is_visible():",
+                f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
+                f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
+            ]
+        )
+        _set_return_expression(return_root, output_path_segments(binding.output_path), variable)
+
+    table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
+    for binding in plan.live_reads:
+        if binding.kind != LiveReadKind.TABLE_COLUMN:
+            continue
+        prefix = _array_prefix(binding)
+        if not prefix or not binding.row_selector or binding.row_count <= 0:
+            return None
+        table_groups.setdefault((binding.row_selector, binding.row_count, prefix), []).append(binding)
+    for group_index, ((row_selector, row_count, prefix), bindings) in enumerate(sorted(table_groups.items())):
+        records_variable = f"_extraction_records_{group_index}"
+        record_root = _ExtractionReturnNode()
+        exemplar = bindings[0]
+        table = f"page.locator({json.dumps(exemplar.selector)})"
+        selected_table = f"{table}.nth({exemplar.selector_index})"
+        rows = f"page.locator({json.dumps(row_selector)})"
+        headers = f'{table}.nth({exemplar.selector_index}).locator(":scope > thead > tr > th")'
+        lines.append(f"if await {table}.count() != {exemplar.selector_count}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table identity changed")')
+        lines.append(f"if not await {table}.nth({exemplar.selector_index}).is_visible():")
+        lines.append(f'{_INDENT}raise ValueError("Observed table is no longer visible")')
+        lines.append(f'if await {selected_table}.locator(":scope table").count() != 0:')
+        lines.append(f'{_INDENT}raise ValueError("Observed table gained a nested table")')
+        lines.append(f'if await {table}.nth({exemplar.selector_index}).locator("[colspan], [rowspan]").count() != 0:')
+        lines.append(f'{_INDENT}raise ValueError("Observed table gained spanning cells")')
+        lines.append(f"if await {headers}.count() != {len(exemplar.headers)}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table header cardinality changed")')
+        for header_index, header_text in enumerate(exemplar.headers):
+            lines.append(f"if (await {headers}.nth({header_index}).inner_text()).strip() != {json.dumps(header_text)}:")
+            lines.append(f'{_INDENT}raise ValueError("Observed table header identity changed")')
+        lines.append(f"if await {rows}.count() != {row_count}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table row count changed")')
+        lines.append(f"{records_variable} = []")
+        for row_index in range(row_count):
+            row = f"{rows}.nth({row_index})"
+            cells = f'{row}.locator(":scope > th, :scope > td")'
+            lines.append(f"if not await {row}.is_visible():")
+            lines.append(f'{_INDENT}raise ValueError("Observed table row is no longer visible")')
+            lines.append(f"if await {cells}.count() != {exemplar.row_cell_counts[row_index]}:")
+            lines.append(f'{_INDENT}raise ValueError("Observed table direct-cell cardinality changed")')
+            lines.append(f'if await {row}.locator(":scope > th").count() != 0:')
+            lines.append(f'{_INDENT}raise ValueError("Observed table row gained a row header")')
+            lines.append(
+                f'if " ".join((await {row}.inner_text()).split()) != {json.dumps(exemplar.row_identities[row_index])}:'
+            )
+            lines.append(f'{_INDENT}raise ValueError("Observed table row identity changed")')
+            for binding_index, binding in enumerate(sorted(bindings, key=lambda item: item.output_path)):
+                value_variable = f"_extraction_cell_{group_index}_{row_index}_{binding_index}"
+                lines.append(f"if not await {cells}.nth({binding.column_index}).is_visible():")
+                lines.append(f'{_INDENT}raise ValueError("Observed table cell is no longer visible")')
+                lines.append(f"{value_variable} = (await {cells}.nth({binding.column_index}).inner_text()).strip()")
+                _set_return_expression(
+                    record_root, output_path_segments(binding.output_path)[len(prefix) :], value_variable
+                )
+            lines.append(f"{records_variable}.append({_return_node_expression(record_root)})")
+        _set_return_expression(return_root, prefix, records_variable)
+
+    lines.append(f"return {_return_node_expression(return_root)}")
+    code = "\n".join(lines) + "\n"
+    fingerprint_material = repr((plan.identity, plan.observation_identity, plan.reveal, code))
+    return SynthesizedExtractionSuffix(code=code, fingerprint=hashlib.sha256(fingerprint_material.encode()).hexdigest())
+
+
+def _trajectory_contains_reveal(trajectory: Sequence[Mapping[str, Any]], plan: RequestedOutputExtractionPlan) -> bool:
+    return any(
+        str(interaction.get("tool_name") or "") == "click"
+        and (
+            (bool(plan.reveal.selector) and str(interaction.get("selector") or "") == plan.reveal.selector)
+            or (
+                bool(plan.reveal.role and plan.reveal.name)
+                and str(interaction.get("role") or "") == plan.reveal.role
+                and str(interaction.get("accessible_name") or "") == plan.reveal.name
+            )
+        )
+        for interaction in trajectory
+    )
+
+
+def synthesize_code_block_with_extraction(
+    trajectory: Sequence[Mapping[str, Any]],
+    extraction_plan: RequestedOutputExtractionPlan,
+    *,
+    strict_selectors: bool = False,
+    reached_download_target: ReachedDownloadTarget | None = None,
+) -> SynthesizedCodeBlock | None:
+    if not _trajectory_contains_reveal(trajectory, extraction_plan):
+        return None
+    interaction = synthesize_code_block(
+        trajectory,
+        strict_selectors=strict_selectors,
+        reached_download_target=reached_download_target,
+    )
+    suffix = synthesize_extraction_suffix(extraction_plan)
+    if interaction is None or suffix is None:
+        return None
+    interaction_code = interaction.code.rstrip() + "\n"
+    interaction.code = interaction_code + suffix.code
+    interaction.interaction_code = interaction_code
+    interaction.extraction_code = suffix.code
+    interaction.extraction_fingerprint = suffix.fingerprint
+    interaction.extraction_plan_identity = extraction_plan.identity
+    return interaction
+
+
+def freeze_requested_output_extraction_candidate(
+    synthesized: SynthesizedCodeBlock,
+    plan: RequestedOutputExtractionPlan,
+    *,
+    source: str,
+) -> FrozenRequestedOutputExtractionCandidate | None:
+    if (
+        not synthesized.extraction_code
+        or not synthesized.extraction_fingerprint
+        or synthesized.extraction_plan_identity != plan.identity
+    ):
+        return None
+    return FrozenRequestedOutputExtractionCandidate(
+        plan_identity=plan.identity,
+        observation_identity=plan.observation_identity,
+        requested_output_paths=plan.requested_output_paths,
+        reveal=plan.reveal,
+        interaction_code=synthesized.interaction_code,
+        extraction_code=synthesized.extraction_code,
+        source=source,
+        admission_result="admitted",
+        fingerprint=synthesized.extraction_fingerprint,
+    )
+
+
 # Model-owned slots the synthesizer cannot prove; the model fills these.
 _FILL_DECLARED_GOAL = "<fill: the durable goal this block accomplishes>"
 _FILL_CLAIM_ID = "claim:<fill>"
@@ -1372,16 +1578,25 @@ def render_synthesized_offer_text(
     """Render the offer body the copilot sees for a synthesized block (pure)."""
     param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key") and not p.get("credential_id")]
     credential_parameters = [p for p in synthesized.parameters if p.get("key") and p.get("credential_id")]
+    extraction_instruction = (
+        "The same interaction-reached evidence compiled the requested keyed extraction suffix; preserve both "
+        "the reveal and extraction segments VERBATIM."
+        if synthesized.extraction_code
+        else (
+            "Hand-author a contract-shaped keyed structure for any requested outputs, never a flat "
+            "`page.inner_text(...)` / `text_content(...)` blob."
+        )
+    )
     parts = [
         "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
-        f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks; hand-author the "
-        "data-capture step it does not cover so the block `return`s a keyed structure (a dict, or an array "
-        "of objects for repeated records) — never a flat `page.inner_text(...)` / `text_content(...)` blob.",
+        f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks. {extraction_instruction}",
         "```python",
         synthesized.code.rstrip("\n"),
         "```",
     ]
+    if synthesized.extraction_plan_identity:
+        parts.append(f"Extraction plan identity: `{synthesized.extraction_plan_identity}`.")
     if param_keys:
         default_keys = [
             str(p.get("key") or "")
