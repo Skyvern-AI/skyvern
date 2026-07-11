@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
     carry_degraded_criterion_ids,
+    carry_floor_rekeyed_criterion_ids,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
@@ -414,6 +415,7 @@ async def _maybe_run_completion_verification_from_page_observation(
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
         verification = carry_degraded_criterion_ids(verification, criteria)
+        verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
         copilot_ctx.completion_verification_result = verification
         record_completion_verification(copilot_ctx, verification)
         _record_adjudication_on_turn_state(copilot_ctx, verification)
@@ -570,6 +572,7 @@ async def _maybe_run_completion_verification_from_page_observation(
             )
 
     verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     if (
         isinstance(existing, CompletionVerificationResult)
         and not verification.is_fully_satisfied()
@@ -1202,7 +1205,10 @@ async def _maybe_run_completion_verification(
     criteria = _completion_verification_criteria(copilot_ctx)
     criteria = _reconcile_download_completion_criterion(copilot_ctx, result, criteria)
     verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
-    return carry_degraded_criterion_ids(verification, criteria) if verification is not None else None
+    if verification is None:
+        return None
+    verification = carry_degraded_criterion_ids(verification, criteria)
+    return carry_floor_rekeyed_criterion_ids(verification, criteria)
 
 
 async def _completion_verification_from_run_result(

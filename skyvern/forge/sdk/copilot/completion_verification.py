@@ -113,6 +113,8 @@ class CompletionVerificationResult:
     contingent_antecedent_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
     structural_unfired_criterion_ids: list[str] = field(default_factory=list)
     degraded_criterion_ids: list[str] = field(default_factory=list)
+    floor_rekeyed_criterion_ids: list[str] = field(default_factory=list)
+    floor_rekeyed_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
     requested_output_criteria_count: int = 0
 
     def is_fully_satisfied(self) -> bool:
@@ -1959,6 +1961,7 @@ _INDEPENDENT_REQUESTED_OUTPUT_CORROBORATOR_SOURCES = frozenset(
     {"independent_page_evidence", "registered_output_parameter", "registered_artifact_content"}
 )
 _SELF_EMITTED_EVIDENCE_SOURCES = frozenset({"runtime_output", "same_record_context"})
+_FLOOR_REKEYED_DELIVERABLE_CREDIT_SOURCES: frozenset[EvidenceSourceKind] = frozenset({"independent_page_evidence"})
 
 
 def _is_satisfied_observed_end_state_verdict(verdict: CriterionVerdict) -> bool:
@@ -2033,6 +2036,20 @@ def _has_independent_satisfied_requested_output_corroborator(
         and verdict.evidence_source in _INDEPENDENT_REQUESTED_OUTPUT_CORROBORATOR_SOURCES
         for verdict in verdict_by_id.values()
     )
+
+
+def _judgment_tier_satisfied_corroborator(
+    verdict_by_id: dict[str, CriterionVerdict],
+    criterion_id: str,
+) -> CriterionVerdict | None:
+    for verdict in verdict_by_id.values():
+        if (
+            verdict.satisfied
+            and _is_requested_output_corroborator_id(verdict.criterion_id, criterion_id)
+            and verdict.evidence_source in _FLOOR_REKEYED_DELIVERABLE_CREDIT_SOURCES
+        ):
+            return verdict
+    return None
 
 
 def _is_requested_output_corroborator_id(candidate_id: str, criterion_id: str) -> bool:
@@ -2175,6 +2192,8 @@ def combine_verification_results(
     contingent_path_by_id = dict(contingent_antecedent_output_path_by_criterion_id or {})
     structural_unfired_ids = list(structural_unfired_criterion_ids)
     degraded_ids: list[str] = []
+    floor_rekeyed_ids: list[str] = []
+    floor_rekeyed_path_by_id: dict[str, str] = {}
     if run_result is not None:
         contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
         contingent_on_by_id.update(run_result.contingent_on_by_criterion_id)
@@ -2183,6 +2202,8 @@ def combine_verification_results(
             dict.fromkeys([*structural_unfired_ids, *run_result.structural_unfired_criterion_ids])
         )
         degraded_ids = list(dict.fromkeys([*degraded_ids, *run_result.degraded_criterion_ids]))
+        floor_rekeyed_ids = list(dict.fromkeys([*floor_rekeyed_ids, *run_result.floor_rekeyed_criterion_ids]))
+        floor_rekeyed_path_by_id.update(run_result.floor_rekeyed_output_path_by_criterion_id)
     if run_result is not None and run_result.status != "evaluated":
         return CompletionVerificationResult(
             status=run_result.status,
@@ -2193,6 +2214,8 @@ def combine_verification_results(
             contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
             structural_unfired_criterion_ids=structural_unfired_ids,
             degraded_criterion_ids=degraded_ids,
+            floor_rekeyed_criterion_ids=floor_rekeyed_ids,
+            floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
             requested_output_criteria_count=requested_output_criteria_count,
         )
     if run_result is not None:
@@ -2223,6 +2246,8 @@ def combine_verification_results(
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
         structural_unfired_criterion_ids=structural_unfired_ids,
         degraded_criterion_ids=degraded_ids,
+        floor_rekeyed_criterion_ids=floor_rekeyed_ids,
+        floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
         requested_output_criteria_count=requested_output_criteria_count,
     )
 
@@ -2336,6 +2361,47 @@ def zero_requested_output_criteria_credit(
     )
 
 
+@dataclass(frozen=True)
+class FloorRekeyedDeliverableCredit:
+    criterion_ids: tuple[str, ...]
+    evidence_sources: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    output_paths: tuple[str, ...]
+
+
+def floor_rekeyed_deliverable_credit(
+    result: CompletionVerificationResult | None,
+) -> FloorRekeyedDeliverableCredit | None:
+    """Credit a floor-rekeyed presence-only deliverable on a fully satisfied run when every marked
+    criterion carries its own satisfied requested-output corroborator whose derived evidence_source is
+    judgment-tier. Registered-output and self-emitted corroboration earn no credit and keep hedging."""
+    if result is None or result.status != "evaluated" or not result.is_fully_satisfied():
+        return None
+    marked_ids = list(dict.fromkeys(result.floor_rekeyed_criterion_ids))
+    if not marked_ids:
+        return None
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    evidence_sources: list[str] = []
+    evidence_refs: list[str] = []
+    output_paths: list[str] = []
+    for criterion_id in marked_ids:
+        marked = verdict_by_id.get(criterion_id)
+        if marked is None:
+            return None
+        corroborator = _judgment_tier_satisfied_corroborator(verdict_by_id, criterion_id)
+        if corroborator is None or corroborator.evidence_source is None:
+            return None
+        evidence_sources.append(corroborator.evidence_source)
+        evidence_refs.append(corroborator.evidence_ref or "")
+        output_paths.append(result.floor_rekeyed_output_path_by_criterion_id.get(criterion_id, ""))
+    return FloorRekeyedDeliverableCredit(
+        criterion_ids=tuple(marked_ids),
+        evidence_sources=tuple(evidence_sources),
+        evidence_refs=tuple(evidence_refs),
+        output_paths=tuple(output_paths),
+    )
+
+
 def carry_degraded_criterion_ids(
     result: CompletionVerificationResult,
     criteria: Iterable[CompletionCriterion],
@@ -2345,6 +2411,25 @@ def carry_degraded_criterion_ids(
         return result
     merged = list(dict.fromkeys([*result.degraded_criterion_ids, *degraded]))
     return replace(result, degraded_criterion_ids=merged)
+
+
+def carry_floor_rekeyed_criterion_ids(
+    result: CompletionVerificationResult,
+    criteria: Iterable[CompletionCriterion],
+) -> CompletionVerificationResult:
+    marked = [criterion for criterion in criteria if criterion.requested_output_floor_rekeyed]
+    if not marked and not result.floor_rekeyed_criterion_ids:
+        return result
+    merged = list(dict.fromkeys([*result.floor_rekeyed_criterion_ids, *(criterion.id for criterion in marked)]))
+    output_path_by_id = dict(result.floor_rekeyed_output_path_by_criterion_id)
+    for criterion in marked:
+        if criterion.floor_rekeyed_from_path:
+            output_path_by_id.setdefault(criterion.id, criterion.floor_rekeyed_from_path)
+    return replace(
+        result,
+        floor_rekeyed_criterion_ids=merged,
+        floor_rekeyed_output_path_by_criterion_id=output_path_by_id,
+    )
 
 
 async def evaluate_completion_criteria(
