@@ -43,8 +43,13 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => false,
 }));
 
+const runsQueryCalls: Array<Record<string, unknown>> = [];
+
 vi.mock("@/hooks/useRunsQuery", () => ({
-  useRunsQuery: () => runsQueryResult,
+  useRunsQuery: (props: Record<string, unknown>) => {
+    runsQueryCalls.push(props);
+    return runsQueryResult;
+  },
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
@@ -58,6 +63,34 @@ vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
 vi.mock("@/components/StatusFilterDropdown", () => ({
   StatusFilterDropdown: () => <div data-testid="status-filter" />,
 }));
+
+vi.mock("@/components/RunTypeFilterDropdown", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/RunTypeFilterDropdown")>();
+  return {
+    ...actual,
+    RunTypeFilterDropdown: ({
+      values,
+      onChange,
+    }: {
+      values: Array<string>;
+      onChange: (values: Array<string>) => void;
+    }) => (
+      <button
+        data-testid="run-type-filter"
+        onClick={() =>
+          onChange(
+            values.includes("agent")
+              ? values.filter((value) => value !== "agent")
+              : [...values, "agent"],
+          )
+        }
+      >
+        toggle-agent
+      </button>
+    ),
+  };
+});
 
 vi.mock("@/components/TriggerTypeBadge", () => ({
   TriggerTypeBadge: ({ triggerType }: { triggerType: string }) => (
@@ -124,6 +157,7 @@ function activateSearch() {
 
 afterEach(() => {
   runsData.splice(0, runsData.length, workflowRun);
+  runsQueryCalls.length = 0;
   cleanup();
   vi.clearAllMocks();
 });
@@ -161,5 +195,29 @@ describe("RunHistory inputs during filtering", () => {
     renderRunHistory();
 
     expect(screen.getByTestId("trigger-type-mcp")).toBeTruthy();
+  });
+
+  it("expands the selected run-type group into raw run types for the runs query", () => {
+    renderRunHistory();
+
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual(
+      [],
+    );
+
+    fireEvent.click(screen.getByTestId("run-type-filter"));
+
+    // The curated Agent group expands to the engine-specific CUA run types.
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual([
+      TaskRunType.OpenaiCua,
+      TaskRunType.AnthropicCua,
+      TaskRunType.UiTars,
+      TaskRunType.YutoriNavigator,
+    ]);
+
+    fireEvent.click(screen.getByTestId("run-type-filter"));
+
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual(
+      [],
+    );
   });
 });
