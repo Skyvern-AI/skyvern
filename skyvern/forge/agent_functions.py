@@ -1755,6 +1755,10 @@ class AgentFunction:
         """
         return None
 
+    def detect_platform_for_tagging(self, url_or_domain: str | None) -> str | None:
+        """Detect a cloud platform for run tagging. OSS intentionally does not tag."""
+        return None
+
     def match_field_to_canonical_category(self, field_label: str) -> Any:
         """Match a form field label to a canonical category for zero-LLM matching.
 
