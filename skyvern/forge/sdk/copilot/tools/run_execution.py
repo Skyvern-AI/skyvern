@@ -3425,9 +3425,8 @@ def _update_repair_loop_state(copilot_ctx: CopilotContext, contract: DiagnosisRe
             ceiling_reached=False,
         )
         return
-    prior_signature = copilot_ctx.last_repair_non_convergence_signature
     prior_count = copilot_ctx.consecutive_non_converging_repair_count
-    count = prior_count + 1 if signature == prior_signature else 1
+    count = prior_count + 1
     requirement = copilot_ctx.recorded_outcome_grounding_requirement
     if isinstance(requirement, RecordedOutcomeGroundingRequirement):
         latest = copilot_ctx.latest_recorded_build_test_outcome
