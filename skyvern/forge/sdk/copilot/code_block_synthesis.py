@@ -17,8 +17,9 @@ import re
 import textwrap
 import tokenize
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
@@ -66,6 +67,108 @@ _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
 # accessor ``.fill(await <param>.otp())`` — distinguishes a login fill from a plain
 # ``.fill(str(<key>))`` text input.
 CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|await\s+[A-Za-z_]\w*\.otp\(\))\s*\)")
+# Credential fields the scout must fill live before a code block reading them may persist;
+# `.otp()` resolves at runtime only, so totp never requires (or credits) a live scout fill.
+LIVE_SCOUT_CREDENTIAL_FIELDS = frozenset({"username", "password"})
+_CREDENTIAL_FIELD_ACCESS_RE = re.compile(
+    r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
+)
+_CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
+_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
+
+
+class CredentialFieldAccess(NamedTuple):
+    parameter_key: str
+    field: str
+    requires_live_scout: bool
+
+
+def _credential_field_accesses(code: str) -> list[CredentialFieldAccess]:
+    accesses: list[CredentialFieldAccess] = []
+    for match in _CREDENTIAL_FIELD_ACCESS_RE.finditer(code):
+        field = match.group("field")
+        if field:
+            accesses.append(
+                CredentialFieldAccess(
+                    parameter_key=match.group("parameter"),
+                    field=field,
+                    requires_live_scout=True,
+                )
+            )
+            continue
+        if match.group("otp_method"):
+            accesses.append(
+                CredentialFieldAccess(
+                    parameter_key=match.group("parameter"),
+                    field="totp",
+                    requires_live_scout=False,
+                )
+            )
+    return accesses
+
+
+class ScoutGap(NamedTuple):
+    missing_fields: list[str]
+    missing_submit: bool
+
+
+def first_matched_post_fill_submit_index(
+    trajectory: Sequence[Mapping[str, Any]],
+    latest_fill_index: int,
+    matched_source_urls: AbstractSet[str],
+) -> int | None:
+    for index, interaction in enumerate(trajectory):
+        if index <= latest_fill_index:
+            continue
+        if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+            continue
+        source_url = str(interaction.get("source_url") or "").strip()
+        if matched_source_urls and source_url not in matched_source_urls:
+            continue
+        return index
+    return None
+
+
+def credential_scout_gap(
+    trajectory: Sequence[Mapping[str, Any]],
+    requirements: Sequence[tuple[AbstractSet[str], AbstractSet[str]]],
+    *,
+    requires_submit: bool,
+) -> ScoutGap:
+    """Match one block's credential requirements — (allowed_credential_ids, required_fields) tuples —
+    against the scout trajectory: fill indexes and source urls accumulate across requirement tuples, and
+    a single post-latest-fill submit on a matched source url satisfies ``requires_submit`` globally."""
+    matched_fill_indexes: list[int] = []
+    matched_source_urls: set[str] = set()
+    missing_fields: list[str] = []
+    for allowed_credential_ids, required_fields in requirements:
+        matched_fields: set[str] = set()
+        for index, interaction in enumerate(trajectory):
+            if str(interaction.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+                continue
+            if str(interaction.get("credential_id") or "").strip() not in allowed_credential_ids:
+                continue
+            field = str(interaction.get("credential_field") or "").strip()
+            if field not in required_fields:
+                continue
+            matched_fields.add(field)
+            matched_fill_indexes.append(index)
+            source_url = str(interaction.get("source_url") or "").strip()
+            if source_url:
+                matched_source_urls.add(source_url)
+        for field in sorted(required_fields - matched_fields):
+            missing_fields.append(field)
+
+    missing_submit = False
+    if requires_submit:
+        latest_fill_index = max(matched_fill_indexes, default=-1)
+        missing_submit = (
+            latest_fill_index < 0
+            or first_matched_post_fill_submit_index(trajectory, latest_fill_index, matched_source_urls) is None
+        )
+    return ScoutGap(missing_fields=missing_fields, missing_submit=missing_submit)
+
+
 _ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
 _OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(

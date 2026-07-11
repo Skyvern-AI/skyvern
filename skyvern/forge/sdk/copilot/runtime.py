@@ -348,7 +348,7 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
-    prior_fill_carry: list[dict[str, str | int | bool | None]] = field(default_factory=list)
+    prior_fill_carry: list[dict[str, str | int | bool | list[str] | None]] = field(default_factory=list)
     fill_carry_rebound_done: bool = False
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
@@ -432,9 +432,18 @@ class AgentContext:
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     synthesized_block_reopened_after_failed_run: bool = False
     synthesized_block_reopened_for_output_coverage: bool = False
+    synthesized_block_reopened_for_credential_scout: bool = False
     scouted_output_covered_paths: set[str] = field(default_factory=set)
     uncovered_output_rescout_context_key: str | None = None
     uncovered_output_rescout_steer_key: str | None = None
+    credential_scout_rescout_context_key: str | None = None
+    # Which requires-live-scout fields (username/password, non-empty) each scouted credential
+    # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
+    scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
+    # showed a password-type control; orders page evidence against post-fill submits across evictions.
+    last_scout_observation_trajectory_index: int | None = None
+    last_scout_observation_has_password_control: bool = False
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0

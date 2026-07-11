@@ -37,7 +37,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    CREDENTIAL_FILL_TOOL_NAME,
+    LIVE_SCOUT_CREDENTIAL_FIELDS,
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+    credential_scout_gap,
+    first_matched_post_fill_submit_index,
     freeze_requested_output_extraction_candidate,
     is_durable_fallback_entry_target,
     is_generic_entry_opener_click,
@@ -2339,6 +2343,8 @@ def synthesized_persistence_reopened_after_failed_run(ctx: Any) -> bool:
 def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
     if ctx.synthesized_block_reopened_for_output_coverage:
         return True
+    if ctx.synthesized_block_reopened_for_credential_scout:
+        return True
     return synthesized_persistence_reopened_after_failed_run(ctx)
 
 
@@ -2477,10 +2483,80 @@ def record_scouted_output_coverage(ctx: AgentContext, page_evidence: dict[str, A
     )
 
 
+def _credential_flow_filled_fields_by_credential(interactions: list[dict[str, Any]]) -> dict[str, set[str]]:
+    filled: dict[str, set[str]] = {}
+    for item in interactions:
+        if str(item.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+            continue
+        field_name = str(item.get("credential_field") or "").strip()
+        if field_name not in LIVE_SCOUT_CREDENTIAL_FIELDS:
+            continue
+        credential_id = str(item.get("credential_id") or "").strip()
+        if not credential_id:
+            continue
+        filled.setdefault(credential_id, set()).add(field_name)
+    return filled
+
+
+def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any]], credential_id: str) -> bool:
+    """The password requirement stands until a page observation lands after a post-fill submit that
+    ``credential_scout_gap`` itself would credit (fill-source-url matched), and stays whenever that
+    latest observed page still shows a password-type control."""
+    latest_fill_index = -1
+    fill_source_urls: set[str] = set()
+    for index, item in enumerate(interactions):
+        if (
+            str(item.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME
+            or str(item.get("credential_id") or "").strip() != credential_id
+            or str(item.get("credential_field") or "").strip() not in LIVE_SCOUT_CREDENTIAL_FIELDS
+        ):
+            continue
+        latest_fill_index = index
+        source_url = str(item.get("source_url") or "").strip()
+        if source_url:
+            fill_source_urls.add(source_url)
+    submit_index = first_matched_post_fill_submit_index(interactions, latest_fill_index, fill_source_urls)
+    if submit_index is None:
+        return True
+    submit_trajectory_index = interactions[submit_index].get("trajectory_index")
+    observed_index = getattr(ctx, "last_scout_observation_trajectory_index", None)
+    if (
+        not isinstance(submit_trajectory_index, int)
+        or not isinstance(observed_index, int)
+        or observed_index < submit_trajectory_index
+    ):
+        return True
+    return bool(getattr(ctx, "last_scout_observation_has_password_control", False))
+
+
+def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
+    """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
+    credentials (username/password fills) must have every required field filled plus a post-fill
+    submit before the synthesized trajectory may grade goal-complete."""
+    interactions = [item for item in trajectory if isinstance(item, dict)]
+    filled_by_credential = _credential_flow_filled_fields_by_credential(interactions)
+    if not filled_by_credential:
+        return False
+    raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    inventory: Mapping[str, frozenset[str]] = raw_inventory if isinstance(raw_inventory, Mapping) else {}
+    requirements: list[tuple[frozenset[str], frozenset[str]]] = []
+    for credential_id, filled_fields in filled_by_credential.items():
+        required_fields = set(filled_fields)
+        if "password" in inventory.get(credential_id, frozenset()) and _credential_password_demand_holds(
+            ctx, interactions, credential_id
+        ):
+            required_fields.add("password")
+        requirements.append((frozenset({credential_id}), frozenset(required_fields)))
+    # requires_submit is always True here: the predicate is deliberately stricter than the persist
+    # gate, which demands a submit only when the block's code itself performs one.
+    gap = credential_scout_gap(interactions, requirements, requires_submit=True)
+    return bool(gap.missing_fields) or gap.missing_submit
+
+
 def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
     """Complete once the scout trajectory covers a durable entry followed by a commit (or a reached download target)
-    with no requested-output path left uncovered; an empty requested-output set falls through to the shape heuristic
-    byte-identically, so an entry ``synthesize_code_block`` would drop never counts as complete."""
+    with no requested-output path left uncovered and no engaged credential flow left unscouted; empty requested-output
+    and credential-fill sets fall through to the shape heuristic byte-identically."""
     if uncovered_requested_output_paths(ctx):
         return False
     requested_paths = _requested_output_paths_for_ctx(ctx)
@@ -2489,6 +2565,8 @@ def synthesized_trajectory_is_goal_complete(ctx: Any) -> bool:
         return False
     trajectory = getattr(ctx, "scout_trajectory", None)
     if not isinstance(trajectory, list) or not trajectory:
+        return False
+    if _credential_flow_scout_gap_incomplete(ctx, trajectory):
         return False
     download = getattr(ctx, "reached_download_target", None)
     if isinstance(download, ReachedDownloadTarget) and download.selector:
@@ -2554,6 +2632,8 @@ def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str
     if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
         return False
     if uncovered_requested_output_paths(ctx):
+        return False
+    if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
         return False
     if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
         return False
@@ -2667,6 +2747,21 @@ def _actuation_obligation_admits_required_fill_tool(ctx: CopilotContext, tool_na
     return tool_name == _actuation_obligation_required_fill_tool(ctx)
 
 
+def arm_credential_scout_reopen(ctx: AgentContext, identity_digest: str) -> bool:
+    """Arm a one-shot scout-window reopen for the first author-time credential-scout reject per
+    (structural identity + credential binding) digest. A repeat identical reject returns False and
+    falls through so it counts normally toward the repair ceiling."""
+    if ctx.credential_scout_rescout_context_key == identity_digest:
+        return False
+    ctx.credential_scout_rescout_context_key = identity_digest
+    ctx.synthesized_block_reopened_for_credential_scout = True
+    return True
+
+
+def _credential_scout_reopen_admits_evaluate(ctx: CopilotContext, tool_name: str) -> bool:
+    return tool_name == "evaluate" and bool(ctx.synthesized_block_reopened_for_credential_scout)
+
+
 def consume_uncovered_output_reopen_event(ctx: CopilotContext) -> bool:
     """Arm a one-shot scout-window reopen for the first author-time reject citing an uncovered
     requested-output path. Returns True only on that first reject per structural identity; a
@@ -2773,6 +2868,8 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
     if ambiguous_selector_rescout_state == "allow":
         return None
     if _uncovered_output_reject_admits_evaluate(ctx, tool_name):
+        return None
+    if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
         return None
     if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
         return None

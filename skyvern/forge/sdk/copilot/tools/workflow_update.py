@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
+    _stable_hash,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
@@ -53,17 +54,20 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _BARE_TAG_RE,
+    _CODE_SUBMIT_ACTION_RE,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
+    _credential_field_accesses,
     _get_by_role_expr_strict,
     _is_positional_selector,
     _parse_role_name,
     artifact_dependency_id,
     artifact_observation_ref_id,
+    credential_scout_gap,
     freeze_requested_output_extraction_candidate,
     locator_selector_literals,
     missing_rung_text,
@@ -90,6 +94,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _CHURN_REASON_CODES,
     _record_code_authoring_guardrail_reject,
     _scouted_spine_open_obligation,
+    arm_credential_scout_reopen,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
     synthesized_persistence_reopened,
@@ -385,41 +390,6 @@ _CODE_ARTIFACT_REQUIRED_LIST_FIELDS = (
     "completion_criteria",
     "terminal_verifier_expectations",
 )
-_CREDENTIAL_FIELD_ACCESS_RE = re.compile(
-    r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
-)
-_CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
-_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
-
-
-class CredentialFieldAccess(NamedTuple):
-    parameter_key: str
-    field: str
-    requires_live_scout: bool
-
-
-def _credential_field_accesses(code: str) -> list[CredentialFieldAccess]:
-    accesses: list[CredentialFieldAccess] = []
-    for match in _CREDENTIAL_FIELD_ACCESS_RE.finditer(code):
-        field = match.group("field")
-        if field:
-            accesses.append(
-                CredentialFieldAccess(
-                    parameter_key=match.group("parameter"),
-                    field=field,
-                    requires_live_scout=True,
-                )
-            )
-            continue
-        if match.group("otp_method"):
-            accesses.append(
-                CredentialFieldAccess(
-                    parameter_key=match.group("parameter"),
-                    field="totp",
-                    requires_live_scout=False,
-                )
-            )
-    return accesses
 
 
 def _code_artifact_metadata_as_tool_argument(
@@ -1300,6 +1270,24 @@ def _credential_scout_reject_payload(workflow_yaml: str) -> Mapping[str, object]
     if not entries:
         return None
     return {"credential_scout_requirements": entries}
+
+
+def _credential_scout_reopen_identity_digest(workflow_yaml: str) -> str:
+    structural_identity = "author_time:" + _stable_hash(_credential_scout_reject_payload(workflow_yaml) or {})
+    accessed_parameter_keys: set[str] = set()
+    for block in _workflow_yaml_code_blocks_by_label(workflow_yaml).values():
+        code = str(block.get("code") or "")
+        accessed_parameter_keys.update(
+            access.parameter_key for access in _credential_field_accesses(code) if access.requires_live_scout
+        )
+    credential_params_by_key: dict[str, set[str]] = {}
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if isinstance(parsed, dict):
+        workflow_definition = parsed.get("workflow_definition")
+        if isinstance(workflow_definition, dict):
+            credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
+    binding = {key: sorted(ids) for key, ids in credential_params_by_key.items() if key in accessed_parameter_keys}
+    return f"{structural_identity}|{_stable_hash(binding)}"
 
 
 def _code_artifact_metadata_reject_payload(
@@ -5457,6 +5445,7 @@ def _should_impose_after_update_attempt(ctx: AgentContext) -> bool:
     return (
         (isinstance(target, ReachedDownloadTarget) and not target.already_registered and bool(target.selector.strip()))
         or synthesized_persistence_reopened_after_failed_run(ctx)
+        or ctx.synthesized_block_reopened_for_credential_scout
         or _author_time_reject_reopens_synthesized_imposition(ctx)
     )
 
@@ -8891,45 +8880,13 @@ def _credentialed_code_block_scout_gate_errors(
         if not required_fields_by_parameter:
             continue
 
-        matched_fill_indexes: list[int] = []
-        matched_source_urls: set[str] = set()
-        missing_fields: list[str] = []
-        for allowed_credential_ids, required_fields in required_fields_by_parameter.values():
-            matched_fields: set[str] = set()
-            for index, interaction in enumerate(scout_trajectory):
-                if str(interaction.get("tool_name") or "").strip() != "fill_credential_field":
-                    continue
-                if str(interaction.get("credential_id") or "").strip() not in allowed_credential_ids:
-                    continue
-                field = str(interaction.get("credential_field") or "").strip()
-                if field not in required_fields:
-                    continue
-                matched_fields.add(field)
-                matched_fill_indexes.append(index)
-                source_url = str(interaction.get("source_url") or "").strip()
-                if source_url:
-                    matched_source_urls.add(source_url)
-            for field in sorted(required_fields - matched_fields):
-                missing_fields.append(field)
-
-        requires_submit = bool(_CODE_SUBMIT_ACTION_RE.search(code))
-        missing_submit = False
-        if requires_submit:
-            latest_fill_index = max(matched_fill_indexes, default=-1)
-            if latest_fill_index < 0:
-                missing_submit = True
-            else:
-                missing_submit = True
-                for index, interaction in enumerate(scout_trajectory):
-                    if index <= latest_fill_index:
-                        continue
-                    if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
-                        continue
-                    source_url = str(interaction.get("source_url") or "").strip()
-                    if matched_source_urls and source_url not in matched_source_urls:
-                        continue
-                    missing_submit = False
-                    break
+        gap = credential_scout_gap(
+            scout_trajectory,
+            list(required_fields_by_parameter.values()),
+            requires_submit=bool(_CODE_SUBMIT_ACTION_RE.search(code)),
+        )
+        missing_fields = gap.missing_fields
+        missing_submit = gap.missing_submit
 
         if not missing_fields and not missing_submit:
             continue
@@ -9053,6 +9010,8 @@ async def _update_workflow(
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+    # Consume the one-shot credential-scout reopen before the gate below so a fresh reject can re-arm it.
+    ctx.synthesized_block_reopened_for_credential_scout = False
     if imposition.violations:
         if (
             imposition.repair_context is not None
@@ -9407,6 +9366,7 @@ async def _update_workflow(
             repair_context=code_authoring_repair_context,
         )
     if credential_scout_errors and code_safety_errors and code_artifact_metadata_error is None:
+        arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
         return reject(
             error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
             user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
@@ -9447,6 +9407,7 @@ async def _update_workflow(
             structural_payload=_credential_scout_reject_payload(workflow_yaml),
         )
         _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
+        arm_credential_scout_reopen(ctx, _credential_scout_reopen_identity_digest(workflow_yaml))
         return reject(
             error=_credential_scout_reject_error_text(ctx, credential_scout_errors),
             user_facing_summary=CREDENTIAL_SCOUT_VERIFY_REPLY,
