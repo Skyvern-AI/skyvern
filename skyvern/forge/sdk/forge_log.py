@@ -6,11 +6,10 @@ from pathlib import Path
 from types import TracebackType
 
 import structlog
-from structlog.typing import EventDict
-
 from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
+from structlog.typing import EventDict
 
 # Bearer JWTs occasionally leak into log messages via WebSocket connection
 # URLs that pass `?token=Bearer%20<jwt>` as a query string. Redact before
@@ -461,13 +460,17 @@ def setup_logger() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=[
+                add_error_processor,
+                structlog.processors.format_exc_info,
+            ],
             processors=[
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
                 renderer,
-            ]
+            ],
         )
     )
     root_logger = logging.getLogger()

@@ -136,6 +136,7 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "contingent_on": criterion.contingent_on,
             "contingent_antecedent_output_path": criterion.contingent_antecedent_output_path,
             "deliverable_kind": criterion.deliverable_kind,
+            "declared_deliverable_kind": criterion.declared_deliverable_kind,
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
@@ -216,6 +217,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
                 deliverable_kind=_normalize_deliverable_kind(item.get("deliverable_kind")),
+                declared_deliverable_kind=_normalize_deliverable_kind(item.get("declared_deliverable_kind")),
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
@@ -243,7 +245,8 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     deliverable_kind_key = (
-        f"{criterion.deliverable_kind or ''}\x1fmint_degrade:{criterion.mint_degrade or ''}"
+        f"{criterion.deliverable_kind or ''}\x1fdeclared:{criterion.declared_deliverable_kind or ''}"
+        f"\x1fmint_degrade:{criterion.mint_degrade or ''}"
         f"\x1fjudgment:{judgment_truth_condition_key(criterion.judgment_truth_condition)}"
     )
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
