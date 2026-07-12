@@ -4,7 +4,8 @@ import ast
 import json
 import re
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from dataclasses import replace
 from typing import Any, Literal, Protocol
 
 import structlog
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     lookup_requested_output_path_alias,
     schema_output_path_aliases_from_criteria,
 )
+from skyvern.forge.sdk.copilot.task_output_envelope import _TASK_ENVELOPE_BLOCK_TYPES, _TASK_OUTPUT_PAYLOAD_FIELDS
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
@@ -287,6 +289,92 @@ def grade_requested_output_criteria(
             )
         )
     return verdicts
+
+
+def floor_rekeyed_path_backing(
+    copilot_ctx: _GroundingCtx,
+    criteria: list[CompletionCriterion],
+    emission_block_outputs: Mapping[str, Any],
+    emission_block_output_sources: Mapping[str, EvidenceSourceKind],
+    emission_block_types: Mapping[str, str | None],
+    runtime_envelope_labels: Collection[str] = frozenset(),
+) -> dict[str, bool]:
+    """Which floor-rekeyed markers have a meaningful runtime/registered value at their original
+    ``floor_rekeyed_from_path`` in an emission-only evidence view (page and artifact observations
+    excluded by construction), resolved with the requested-output grader's accepted-producer-label,
+    alias, and projection machinery. The rule is identical whether or not the artifact emitted
+    anything: absent emission reads as unbacked."""
+    marked = [criterion for criterion in criteria if criterion.requested_output_floor_rekeyed]
+    if not marked:
+        return {}
+    effective_criteria = [
+        replace(criterion, output_path=criterion.floor_rekeyed_from_path)
+        for criterion in marked
+        if criterion.floor_rekeyed_from_path
+    ]
+    aliases = schema_output_path_aliases_from_criteria(effective_criteria)
+    metadata = _grounding_code_artifact_metadata(copilot_ctx)
+    raw_authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, metadata=metadata)
+    authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, aliases, metadata=metadata)
+    independent_labels = {
+        label for label, source in emission_block_output_sources.items() if source in _INDEPENDENT_EVIDENCE_SOURCES
+    }
+    envelope_labels = {
+        label
+        for label in emission_block_outputs
+        if (emission_block_types.get(label) or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES
+    }
+    backing: dict[str, bool] = {}
+    for criterion in marked:
+        path = _normalize_output_path(criterion.floor_rekeyed_from_path)
+        backing[criterion.id] = _floor_rekeyed_path_emission_present(
+            path,
+            emission_block_outputs,
+            authored_paths_by_label,
+            raw_authored_paths_by_label,
+            independent_labels,
+            envelope_labels,
+            runtime_envelope_labels,
+        )
+    return backing
+
+
+def _floor_rekeyed_path_emission_present(
+    path: str,
+    block_outputs: Mapping[str, Any],
+    authored_paths_by_label: dict[str, set[str]],
+    raw_authored_paths_by_label: dict[str, set[str]],
+    independent_labels: set[str],
+    envelope_labels: set[str],
+    runtime_envelope_labels: Collection[str],
+) -> bool:
+    if not path:
+        return False
+    accepted_labels = {label for label, paths in authored_paths_by_label.items() if path in paths}
+    if accepted_labels:
+        candidate_labels = accepted_labels
+        accepted_authored_paths = set().union(*(authored_paths_by_label[label] for label in accepted_labels))
+        accepted_raw_authored_paths = set().union(
+            *(raw_authored_paths_by_label.get(label, set()) for label in accepted_labels)
+        )
+        projection_roots = _runtime_projection_roots(accepted_authored_paths | accepted_raw_authored_paths)
+        if accepted_labels & envelope_labels:
+            projection_roots |= set(_TASK_OUTPUT_PAYLOAD_FIELDS)
+    elif envelope_labels:
+        if len(runtime_envelope_labels) > 1:
+            # No authored contract names the producer, so with more than one task-envelope block the
+            # emission is unattributable and a coincidental match in an unrelated block must not back
+            # it. A single envelope block is the unambiguous producer.
+            return False
+        candidate_labels = envelope_labels
+        projection_roots = set(_TASK_OUTPUT_PAYLOAD_FIELDS)
+    else:
+        return False
+    accepted_runtime_output_items = _accepted_runtime_outputs(block_outputs, candidate_labels, independent_labels)
+    if not accepted_runtime_output_items:
+        return False
+    match_state, _ref = _runtime_output_path_presence(dict(accepted_runtime_output_items), path, projection_roots)
+    return match_state == "present"
 
 
 def _carrier_confirmation(

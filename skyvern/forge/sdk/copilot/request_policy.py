@@ -281,6 +281,9 @@ class CompletionCriterion:
     contingent_on: str | None = None
     contingent_antecedent_output_path: str | None = None
     deliverable_kind: Literal["registered_download"] | None = None
+    # Author-time seam signal only: unlike ``deliverable_kind`` it survives canonicalization onto
+    # non-canonical output paths, so it is never rendered to the completion verifier.
+    declared_deliverable_kind: Literal["registered_download"] | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -925,6 +928,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
                 deliverable_kind=deliverable_kind,
+                declared_deliverable_kind=deliverable_kind,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=cast(CriterionLevel, level_raw)
@@ -1560,6 +1564,7 @@ def _apply_requested_output_completion_criteria(
     )
 
     metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
+    declared_kind_by_output_path: dict[str, Literal["registered_download"]] = {}
     for criterion in policy.completion_criteria:
         if criterion.level == "definition" or criterion.method_mandated:
             continue
@@ -1567,6 +1572,7 @@ def _apply_requested_output_completion_criteria(
             not criterion.contingent_on
             and not criterion.contingent_antecedent_output_path
             and not criterion.deliverable_kind
+            and not criterion.declared_deliverable_kind
         ):
             continue
         for field_name, output_path, _field_label in requested_specs:
@@ -1574,6 +1580,8 @@ def _apply_requested_output_completion_criteria(
                 deliverable_kind = (
                     criterion.deliverable_kind if output_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
                 )
+                if criterion.output_path == output_path and criterion.declared_deliverable_kind:
+                    declared_kind_by_output_path.setdefault(output_path, criterion.declared_deliverable_kind)
                 metadata_by_output_path.setdefault(
                     output_path,
                     (
@@ -1606,6 +1614,7 @@ def _apply_requested_output_completion_criteria(
             contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
             contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
             deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+            declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
             judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
         )
         for _field_name, output_path, field_label in requested_specs
@@ -1658,6 +1667,7 @@ def _apply_validation_classification_completion_criteria(policy: RequestPolicy) 
                 expected_output_shape=None,
                 requested_output_evidence_source="runtime_output",
                 deliverable_kind=None,
+                declared_deliverable_kind=None,
                 terminal_action_family=None,
                 classification_output_key=output_key,
                 expected_classification=expected,

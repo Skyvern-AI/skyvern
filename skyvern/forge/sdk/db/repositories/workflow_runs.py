@@ -1433,13 +1433,19 @@ class WorkflowRunsRepository(BaseRepository):
             workflow_run_parameters = (
                 await session.scalars(select(WorkflowRunParameterModel).filter_by(workflow_run_id=workflow_run_id))
             ).all()
+            if not workflow_run_parameters:
+                return []
+            if self._workflow_parameter_reader is None:
+                raise RuntimeError("workflow_parameter_reader dependency not set")
+            workflow_parameters_by_id = {
+                workflow_parameter.workflow_parameter_id: workflow_parameter
+                for workflow_parameter in await self._workflow_parameter_reader.get_workflow_parameters_by_ids(
+                    [workflow_run_parameter.workflow_parameter_id for workflow_run_parameter in workflow_run_parameters]
+                )
+            }
             results = []
             for workflow_run_parameter in workflow_run_parameters:
-                if self._workflow_parameter_reader is None:
-                    raise RuntimeError("workflow_parameter_reader dependency not set")
-                workflow_parameter = await self._workflow_parameter_reader.get_workflow_parameter(
-                    workflow_run_parameter.workflow_parameter_id
-                )
+                workflow_parameter = workflow_parameters_by_id.get(workflow_run_parameter.workflow_parameter_id)
                 if not workflow_parameter:
                     raise WorkflowParameterNotFound(workflow_parameter_id=workflow_run_parameter.workflow_parameter_id)
                 results.append(

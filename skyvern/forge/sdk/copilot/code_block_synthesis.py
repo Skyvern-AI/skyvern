@@ -1421,6 +1421,35 @@ def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
     return ()
 
 
+def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *, guard_empty: bool) -> list[str]:
+    container = f"page.locator({json.dumps(binding.selector)})"
+    target = f"{container}.nth({binding.selector_index})"
+    children = f'{target}.locator(":scope > *")'
+    statements = [
+        f"if await {container}.count() != {binding.selector_count}:",
+        f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
+        f"if not await {target}.is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
+        f"if await {children}.count() != {binding.child_count}:",
+        f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
+        f"if not await {children}.nth(0).is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
+        f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
+        f'{_INDENT}raise ValueError("Observed scalar label changed")',
+        f"if not await {children}.nth({binding.child_index}).is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
+        f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
+    ]
+    if guard_empty:
+        statements.extend(
+            [
+                f"if not {variable}:",
+                f'{_INDENT}raise ValueError("Observed scalar value is empty")',
+            ]
+        )
+    return statements
+
+
 def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> SynthesizedExtractionSuffix | None:
     if not plan.live_reads:
         return None
@@ -1429,26 +1458,7 @@ def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> Synthes
     scalar_bindings = [binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE]
     for index, binding in enumerate(scalar_bindings):
         variable = f"_extraction_value_{index}"
-        container = f"page.locator({json.dumps(binding.selector)})"
-        target = f"{container}.nth({binding.selector_index})"
-        children = f'{target}.locator(":scope > *")'
-        lines.extend(
-            [
-                f"if await {container}.count() != {binding.selector_count}:",
-                f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
-                f"if not await {target}.is_visible():",
-                f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
-                f"if await {children}.count() != {binding.child_count}:",
-                f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
-                f"if not await {children}.nth(0).is_visible():",
-                f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
-                f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
-                f'{_INDENT}raise ValueError("Observed scalar label changed")',
-                f"if not await {children}.nth({binding.child_index}).is_visible():",
-                f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
-                f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
-            ]
-        )
+        lines.extend(_key_value_scalar_read_statements(binding, variable, guard_empty=False))
         _set_return_expression(return_root, output_path_segments(binding.output_path), variable)
 
     table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
@@ -1511,6 +1521,139 @@ def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> Synthes
     code = "\n".join(lines) + "\n"
     fingerprint_material = repr((plan.identity, plan.observation_identity, plan.reveal, code))
     return SynthesizedExtractionSuffix(code=code, fingerprint=hashlib.sha256(fingerprint_material.encode()).hexdigest())
+
+
+_ENVELOPE_SCALAR_VAR_BASE = "_envelope_value"
+
+
+@dataclass(frozen=True, slots=True)
+class ProducedStaticReturnEnvelope:
+    code: str
+    keyed_paths: tuple[str, ...]
+
+
+def _snippet_scope_returns(statements: Sequence[ast.stmt]) -> list[ast.Return]:
+    found: list[ast.Return] = []
+    for statement in statements:
+        if isinstance(statement, ast.Return):
+            found.append(statement)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for child in ast.iter_child_nodes(statement):
+            if isinstance(child, ast.stmt):
+                found.extend(_snippet_scope_returns([child]))
+            elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
+                found.extend(_snippet_scope_returns(child.body))
+    return found
+
+
+def _bound_or_referenced_identifiers(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                names.add(node.name)
+        elif isinstance(node, ast.alias):
+            if node.asname:
+                names.add(node.asname)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.MatchAs):
+            if node.name:
+                names.add(node.name)
+    return names
+
+
+def produce_covered_static_return_envelope(
+    code: str,
+    *,
+    plan: RequestedOutputExtractionPlan | None,
+    scalar_required_paths: set[str],
+    declaration_paths: set[str],
+    download_required_paths: set[str],
+    expects_download: bool,
+) -> ProducedStaticReturnEnvelope | None:
+    """Author the unique terminal keyed return covering every scout-bound scalar path, plus
+    None-default declaration children and the resolved download descriptor for the mixed shape.
+
+    Fail-closed: emits only when it owns the sole terminal return (zero returns, or the single
+    generator-owned download-idiom return), when every scalar path is plan-bound, and when no
+    minted local collides with an identifier already in the block."""
+    if download_required_paths and not expects_download:
+        return None
+    if not scalar_required_paths:
+        return None
+    if plan is None:
+        return None
+    stripped_code = textwrap.dedent(code).strip()
+    if not stripped_code:
+        return None
+    try:
+        tree = ast.parse(stripped_code)
+    except SyntaxError:
+        return None
+
+    bindings_by_path = {
+        binding.output_path: binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE
+    }
+    ordered_scalar_paths = sorted(scalar_required_paths)
+    if any(path not in bindings_by_path for path in ordered_scalar_paths):
+        return None
+
+    minted_vars = [f"{_ENVELOPE_SCALAR_VAR_BASE}_{index}" for index in range(len(ordered_scalar_paths))]
+    existing_names = _bound_or_referenced_identifiers(tree)
+    if any(var in existing_names for var in minted_vars):
+        return None
+
+    returns = _snippet_scope_returns(tree.body)
+    download_descriptor_key = ""
+    download_descriptor_expr = ""
+    if download_required_paths:
+        if len(returns) != 1 or returns[0] not in tree.body:
+            return None
+        idiom_return = returns[0]
+        if idiom_return.col_offset != 0:
+            return None
+        if not isinstance(idiom_return.value, ast.Dict) or len(idiom_return.value.keys) != 1:
+            return None
+        descriptor_key_node = idiom_return.value.keys[0]
+        if not isinstance(descriptor_key_node, ast.Constant) or not isinstance(descriptor_key_node.value, str):
+            return None
+        descriptor_value = idiom_return.value.values[0]
+        if not isinstance(descriptor_value, (ast.Name, ast.Attribute)):
+            return None
+        download_descriptor_key = descriptor_key_node.value
+        download_descriptor_expr = ast.unparse(descriptor_value)
+        preserved_lines = stripped_code.splitlines()[: idiom_return.lineno - 1]
+    else:
+        if returns:
+            return None
+        preserved_lines = stripped_code.splitlines()
+
+    return_root = _ExtractionReturnNode()
+    scalar_statements: list[str] = []
+    for path, variable in zip(ordered_scalar_paths, minted_vars):
+        scalar_statements.extend(_key_value_scalar_read_statements(bindings_by_path[path], variable, guard_empty=True))
+        _set_return_expression(return_root, output_path_segments(path), variable)
+    for path in sorted(declaration_paths):
+        _set_return_expression(return_root, output_path_segments(path), "None")
+    if download_descriptor_key:
+        return_root.children.setdefault(
+            download_descriptor_key, _ExtractionReturnNode()
+        ).value_expression = download_descriptor_expr
+
+    body_lines = list(preserved_lines)
+    body_lines.extend(scalar_statements)
+    body_lines.append(f"return {_return_node_expression(return_root)}")
+    produced_code = "\n".join(body_lines).strip() + "\n"
+    keyed_paths = tuple(sorted(scalar_required_paths | declaration_paths))
+    return ProducedStaticReturnEnvelope(code=produced_code, keyed_paths=keyed_paths)
 
 
 def _trajectory_contains_reveal(trajectory: Sequence[Mapping[str, Any]], plan: RequestedOutputExtractionPlan) -> bool:
