@@ -579,7 +579,9 @@ class TestGemini3ReasoningEffortExperiment:
 # values), and the fallbacks list expands into per-hop entries.
 
 
-def _make_three_tier_router_config(*, fallback_groups: list[str]) -> LLMRouterConfig:
+def _make_three_tier_router_config(
+    *, fallback_groups: list[str], redis_max_connections: int | None = None
+) -> LLMRouterConfig:
     """Synthetic 3+ tier router config that doesn't depend on the cloud
     `LLMConfigRegistry` registration that's conditional on prod env vars."""
     deployments = [
@@ -597,6 +599,7 @@ def _make_three_tier_router_config(*, fallback_groups: list[str]) -> LLMRouterCo
         redis_host="localhost",
         redis_port=6379,
         redis_password="",
+        redis_max_connections=redis_max_connections,
         main_model_group="primary-group",
         fallback_model_group=fallback_groups,
         routing_strategy="simple-shuffle",
@@ -647,6 +650,31 @@ def test_router_constructor_receives_default_timeout(monkeypatch: pytest.MonkeyP
     assert captured.get("timeout") == api_handler_factory.settings.LLM_CONFIG_TIMEOUT, (
         f"Router must be constructed with timeout=settings.LLM_CONFIG_TIMEOUT; got timeout={captured.get('timeout')!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("redis_max_connections", "expected_cache_kwargs"),
+    [(10, {"max_connections": 10}), (None, {})],
+)
+def test_router_constructor_receives_redis_connection_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_max_connections: int | None,
+    expected_cache_kwargs: dict[str, int],
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["fallback"], redis_max_connections=redis_max_connections)
+    _stub_for_router_test(monkeypatch, llm_key="TEST_REDIS_CONNECTION_POOL", config=config)
+
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_REDIS_CONNECTION_POOL")
+
+    assert captured["cache_kwargs"] == expected_cache_kwargs
 
 
 def test_router_fallbacks_payload_expands_per_hop(monkeypatch: pytest.MonkeyPatch) -> None:
