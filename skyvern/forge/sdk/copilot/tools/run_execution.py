@@ -59,6 +59,8 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     DeliveredUnverifiedTerminalState,
     degraded_contract_delivered_unverified_terminal_state,
     floor_rekeyed_deliverable_credit,
+    floor_rekeyed_emission_lane_fields,
+    floor_rekeyed_emission_withhold,
     only_structural_requested_output_abstentions,
     zero_requested_output_criteria_credit,
 )
@@ -2669,6 +2671,15 @@ def _delivered_unverified_registered_outputs(data: Mapping[str, Any]) -> dict[st
     return observed
 
 
+def _emit_floor_rekeyed_emission_lane(
+    completion_verification: CompletionVerificationResult | None, workflow_run_id: str | None
+) -> None:
+    fields = floor_rekeyed_emission_lane_fields(completion_verification)
+    if fields is None:
+        return
+    LOG.info("copilot.completion.floor_rekeyed_emission_lane", workflow_run_id=workflow_run_id, **fields)
+
+
 def _record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
 ) -> RecordedRunOutcome | None:
@@ -2700,6 +2711,7 @@ def _record_run_blocks_result(
         _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
+        _emit_floor_rekeyed_emission_lane(completion_verification, run_id if isinstance(run_id, str) else None)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
     copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
     copilot_ctx.delivered_unverified_terminal = False
@@ -3175,41 +3187,46 @@ def _zero_requested_output_criteria_delivered_unverified(
     data: Mapping[str, Any],
     workflow_run_id: str | None,
 ) -> RecordedRunOutcome | None:
-    if not zero_requested_output_criteria_credit(
+    emission_withhold = floor_rekeyed_emission_withhold(completion_verification)
+    registered_output_meaningful = _has_meaningful_registered_output_payload(data)
+    credit_withhold = zero_requested_output_criteria_credit(
         completion_verification,
-        has_meaningful_registered_output=_has_meaningful_registered_output_payload(data),
-    ):
+        has_meaningful_registered_output=registered_output_meaningful,
+    )
+    if emission_withhold is None and not credit_withhold:
         return None
-    credit = floor_rekeyed_deliverable_credit(completion_verification)
-    if credit is not None:
-        payloads = _registered_output_parameter_payloads(data)
-        payload_keys = sorted(
-            {key for item in payloads for key in [item.get("output_parameter_key")] if isinstance(key, str) and key}
-        )
-        unbound_paths = [
-            output_path
-            for output_path in credit.output_paths
-            if output_path and not registered_output_payload_binds_output_path(payloads, output_path)
-        ]
-        if unbound_paths:
-            LOG.info(
-                "copilot.completion.floor_rekeyed_credit_payload_unbound",
-                workflow_run_id=workflow_run_id,
-                criterion_ids=list(credit.criterion_ids),
-                unbound_output_paths=unbound_paths,
-                registered_output_keys=payload_keys,
+    if emission_withhold is None:
+        credit = floor_rekeyed_deliverable_credit(completion_verification)
+        if credit is not None:
+            payloads = _registered_output_parameter_payloads(data)
+            payload_keys = sorted(
+                {key for item in payloads for key in [item.get("output_parameter_key")] if isinstance(key, str) and key}
             )
-        else:
-            LOG.info(
-                "copilot.completion.floor_rekeyed_deliverable_credit",
-                workflow_run_id=workflow_run_id,
-                criterion_ids=list(credit.criterion_ids),
-                evidence_sources=list(credit.evidence_sources),
-                evidence_refs=list(credit.evidence_refs),
-                credited_output_paths=list(credit.output_paths),
-                registered_output_keys=payload_keys,
-            )
-            return None
+            unbound_paths = [
+                output_path
+                for output_path in credit.output_paths
+                if output_path and not registered_output_payload_binds_output_path(payloads, output_path)
+            ]
+            if unbound_paths:
+                LOG.info(
+                    "copilot.completion.floor_rekeyed_credit_payload_unbound",
+                    workflow_run_id=workflow_run_id,
+                    criterion_ids=list(credit.criterion_ids),
+                    unbound_output_paths=unbound_paths,
+                    backed_by_criterion_id=dict(completion_verification.floor_rekeyed_backed_by_criterion_id),
+                    registered_output_keys=payload_keys,
+                )
+            else:
+                LOG.info(
+                    "copilot.completion.floor_rekeyed_deliverable_credit",
+                    workflow_run_id=workflow_run_id,
+                    criterion_ids=list(credit.criterion_ids),
+                    evidence_sources=list(credit.evidence_sources),
+                    evidence_refs=list(credit.evidence_refs),
+                    credited_output_paths=list(credit.output_paths),
+                    registered_output_keys=payload_keys,
+                )
+                return None
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.suspicious_success_nudge_count = 0
@@ -3219,17 +3236,27 @@ def _zero_requested_output_criteria_delivered_unverified(
     copilot_ctx.delivered_unverified_workflow_run_id = workflow_run_id
     copilot_ctx.delivered_unverified_observed_outputs = _delivered_unverified_registered_outputs(data)
     stash_delivered_unverified_turn_halt(copilot_ctx, workflow_run_id=workflow_run_id)
-    LOG.info(
-        "copilot.completion.zero_requested_output_credit_withheld",
-        workflow_run_id=workflow_run_id,
-        requested_output_criteria_count=0,
-        registered_output_meaningful=True,
-    )
+    if emission_withhold is not None:
+        LOG.info(
+            "copilot.completion.floor_rekeyed_emission_withheld",
+            workflow_run_id=workflow_run_id,
+            requested_output_criteria_count=completion_verification.requested_output_criteria_count,
+            registered_output_meaningful=registered_output_meaningful,
+            floor_rekeyed_unbacked_criterion_ids=list(emission_withhold.criterion_ids),
+            floor_rekeyed_unbacked_output_paths=list(emission_withhold.unbacked_output_paths),
+        )
+        display_reason = "The latest run did not produce the requested output, so it was not verified."
+    else:
+        LOG.info(
+            "copilot.completion.zero_requested_output_credit_withheld",
+            workflow_run_id=workflow_run_id,
+            requested_output_criteria_count=0,
+            registered_output_meaningful=True,
+        )
+        display_reason = "The latest run returned output, but it was not independently verified."
     return RecordedRunOutcome(
         verdict="not_evaluated",
-        display_reason=run_outcome_display_reason(
-            "The latest run returned output, but it was not independently verified."
-        ),
+        display_reason=run_outcome_display_reason(display_reason),
         workflow_run_id=workflow_run_id,
     )
 
