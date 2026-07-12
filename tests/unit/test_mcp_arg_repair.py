@@ -42,14 +42,15 @@ async def test_raw_arguments_json_string_wrapper_is_unwrapped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_sibling_arg_wins_over_wrapped_value() -> None:
-    # An explicit top-level arg must never be clobbered by the wrapper.
+async def test_raw_arguments_with_sibling_arg_is_not_unwrapped() -> None:
+    # Only a SOLE raw_arguments is unwrapped. With a real sibling arg present the
+    # call is ambiguous (the blob may be garbage or inject stray keys), so it is
+    # left to error rather than merged — no masking.
     res = await _call(
         "skyvern_block_schema",
         {"block_type": "navigation", "raw_arguments": {"block_type": "extraction"}},
     )
-    assert res.is_error is False
-    assert res.structured_content["data"]["block_type"] == "navigation"
+    assert res.is_error is True
 
 
 @pytest.mark.asyncio
@@ -57,4 +58,11 @@ async def test_non_object_raw_arguments_is_not_masked() -> None:
     # A non-object raw_arguments is a genuinely malformed call; it must still
     # error rather than be silently swallowed.
     res = await _call("skyvern_block_schema", {"raw_arguments": "navigation"})
+    assert res.is_error is True
+
+
+@pytest.mark.asyncio
+async def test_json_array_string_raw_arguments_is_not_masked() -> None:
+    # A JSON-*array* string is not an object payload; it must still error.
+    res = await _call("skyvern_block_schema", {"raw_arguments": '["navigation"]'})
     assert res.is_error is True

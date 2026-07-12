@@ -24,17 +24,21 @@ LOG = structlog.get_logger(__name__)
 
 
 def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
-    """Lift args wrapped in a stray ``raw_arguments`` object up to the top level.
+    """Lift args wrapped in a stray *sole* ``raw_arguments`` object to the top level.
 
-    Some callers serialize the whole tool-call payload as
+    Some callers serialize the WHOLE tool-call payload as
     ``{"raw_arguments": {...actual args...}}`` instead of spreading the args. No
-    ``skyvern_`` tool declares a ``raw_arguments`` parameter, so a dict (or a
-    JSON-object string) under that key is unambiguously the misplaced payload.
-    Existing top-level keys win, so an explicit arg is never clobbered by the
-    wrapper. A non-object ``raw_arguments`` is left untouched so the call still
-    errors instead of being silently swallowed.
+    ``skyvern_`` tool declares a ``raw_arguments`` parameter, so when it is the
+    SOLE argument and holds a dict (or a JSON-object string) it is unambiguously
+    the misplaced payload — lift its keys up.
+
+    Restricted to the sole-key case on purpose: if real sibling args sit next to
+    ``raw_arguments`` the call is ambiguous (the blob may be garbage, or duplicate
+    a top-level arg), so it is left to error rather than merging stray keys into
+    an otherwise-valid call. A non-object ``raw_arguments`` is likewise left to
+    error instead of being silently swallowed.
     """
-    if "raw_arguments" not in arguments:
+    if list(arguments) != ["raw_arguments"]:
         return
     raw = arguments["raw_arguments"]
     if isinstance(raw, str):
@@ -44,9 +48,8 @@ def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
             return
     if not isinstance(raw, dict):
         return
-    arguments.pop("raw_arguments", None)
-    for key, value in raw.items():
-        arguments.setdefault(key, value)
+    arguments.pop("raw_arguments")
+    arguments.update(raw)
 
 
 def repair_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> None:
