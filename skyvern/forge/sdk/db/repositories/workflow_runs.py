@@ -356,13 +356,16 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         credits: int,
         is_cached: bool = False,
+        topup_credits: int = 0,
     ) -> None:
         col = WorkflowRunModel.cached_credits_used if is_cached else WorkflowRunModel.credits_used
+        values: dict = {col: func.coalesce(col, 0) + credits}
+        if topup_credits:
+            topup_col = WorkflowRunModel.topup_credits_used
+            values[topup_col] = func.coalesce(topup_col, 0) + topup_credits
         async with self.Session() as session:
             result = await session.execute(
-                update(WorkflowRunModel)
-                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
-                .values({col: func.coalesce(col, 0) + credits})
+                update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == workflow_run_id).values(values)
             )
             if result.rowcount == 0:
                 LOG.warning(
