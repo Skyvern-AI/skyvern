@@ -461,13 +461,17 @@ def setup_logger() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=[
+                add_error_processor,
+                structlog.processors.format_exc_info,
+            ],
             processors=[
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
                 renderer,
-            ]
+            ],
         )
     )
     root_logger = logging.getLogger()

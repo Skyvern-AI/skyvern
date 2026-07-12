@@ -116,6 +116,7 @@ class CompletionVerificationResult:
     degraded_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
+    floor_rekeyed_backed_by_criterion_id: dict[str, bool] = field(default_factory=dict)
     contingent_degraded_criterion_ids: list[str] = field(default_factory=list)
     requested_output_criteria_count: int = 0
 
@@ -2218,6 +2219,7 @@ def combine_verification_results(
     degraded_ids: list[str] = []
     floor_rekeyed_ids: list[str] = []
     floor_rekeyed_path_by_id: dict[str, str] = {}
+    floor_rekeyed_backed_by_id: dict[str, bool] = {}
     contingent_degraded_ids: list[str] = []
     if run_result is not None:
         contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
@@ -2229,6 +2231,7 @@ def combine_verification_results(
         degraded_ids = list(dict.fromkeys([*degraded_ids, *run_result.degraded_criterion_ids]))
         floor_rekeyed_ids = list(dict.fromkeys([*floor_rekeyed_ids, *run_result.floor_rekeyed_criterion_ids]))
         floor_rekeyed_path_by_id.update(run_result.floor_rekeyed_output_path_by_criterion_id)
+        floor_rekeyed_backed_by_id.update(run_result.floor_rekeyed_backed_by_criterion_id)
         contingent_degraded_ids = list(
             dict.fromkeys([*contingent_degraded_ids, *run_result.contingent_degraded_criterion_ids])
         )
@@ -2244,6 +2247,7 @@ def combine_verification_results(
             degraded_criterion_ids=degraded_ids,
             floor_rekeyed_criterion_ids=floor_rekeyed_ids,
             floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
+            floor_rekeyed_backed_by_criterion_id=floor_rekeyed_backed_by_id,
             contingent_degraded_criterion_ids=contingent_degraded_ids,
             requested_output_criteria_count=requested_output_criteria_count,
         )
@@ -2478,6 +2482,86 @@ def carry_floor_rekeyed_criterion_ids(
         floor_rekeyed_criterion_ids=merged,
         floor_rekeyed_output_path_by_criterion_id=output_path_by_id,
     )
+
+
+def carry_floor_rekeyed_path_backing(
+    result: CompletionVerificationResult,
+    backing_by_criterion_id: Mapping[str, bool],
+) -> CompletionVerificationResult:
+    if not backing_by_criterion_id and not result.floor_rekeyed_backed_by_criterion_id:
+        return result
+    merged = dict(result.floor_rekeyed_backed_by_criterion_id)
+    merged.update(backing_by_criterion_id)
+    return replace(result, floor_rekeyed_backed_by_criterion_id=merged)
+
+
+@dataclass(frozen=True)
+class FloorRekeyedEmissionWithhold:
+    criterion_ids: tuple[str, ...]
+    unbacked_output_paths: tuple[str, ...]
+    backed_output_paths: tuple[str, ...]
+
+
+def floor_rekeyed_effective_marked_ids(result: CompletionVerificationResult) -> list[str]:
+    """Floor-rekeyed markers that required an emission this run: the marked set minus the
+    structurally-unfired contingent (abstained) markers, which needed no emission to fire."""
+    abstained = result.abstained_criterion_ids()
+    return [criterion_id for criterion_id in result.floor_rekeyed_criterion_ids if criterion_id not in abstained]
+
+
+def floor_rekeyed_emission_withhold(
+    result: CompletionVerificationResult | None,
+) -> FloorRekeyedEmissionWithhold | None:
+    """A fully satisfied run whose floor-rekeyed emission markers lack a meaningful runtime value at
+    their original path delivered no emission that corroboration can substitute for. Keyed on the typed
+    marker id-set (never payload emptiness) so never-minted reach-state and structurally-unfired
+    contingent markers are untouched, and a missing backing entry reads as unbacked to fail closed."""
+    if result is None or result.status != "evaluated" or not result.is_fully_satisfied():
+        return None
+    effective_ids = floor_rekeyed_effective_marked_ids(result)
+    if not effective_ids:
+        return None
+    unbacked_ids: list[str] = []
+    unbacked_paths: list[str] = []
+    backed_paths: list[str] = []
+    for criterion_id in effective_ids:
+        path = result.floor_rekeyed_output_path_by_criterion_id.get(criterion_id, "")
+        if result.floor_rekeyed_backed_by_criterion_id.get(criterion_id, False):
+            backed_paths.append(path)
+        else:
+            unbacked_ids.append(criterion_id)
+            unbacked_paths.append(path)
+    if not unbacked_ids:
+        return None
+    return FloorRekeyedEmissionWithhold(
+        criterion_ids=tuple(unbacked_ids),
+        unbacked_output_paths=tuple(unbacked_paths),
+        backed_output_paths=tuple(backed_paths),
+    )
+
+
+def floor_rekeyed_emission_lane_fields(result: CompletionVerificationResult | None) -> dict[str, Any] | None:
+    """Structured fingerprint fields for the floor-rekeyed emission lane, emitted whenever an
+    evaluated result carries markers — on satisfied and unsatisfied results alike, independent of
+    outcome."""
+    if result is None or result.status != "evaluated" or not result.floor_rekeyed_criterion_ids:
+        return None
+    effective_ids = floor_rekeyed_effective_marked_ids(result)
+    backed_ids = [cid for cid in effective_ids if result.floor_rekeyed_backed_by_criterion_id.get(cid, False)]
+    unbacked_ids = [cid for cid in effective_ids if cid not in backed_ids]
+    withhold = floor_rekeyed_emission_withhold(result)
+    return {
+        "criterion_ids": list(result.floor_rekeyed_criterion_ids),
+        "effective_criterion_ids": list(effective_ids),
+        "abstained_excluded_criterion_ids": sorted(set(result.floor_rekeyed_criterion_ids) - set(effective_ids)),
+        "backed_criterion_ids": backed_ids,
+        "unbacked_criterion_ids": unbacked_ids,
+        "backed_output_paths": [result.floor_rekeyed_output_path_by_criterion_id.get(cid, "") for cid in backed_ids],
+        "unbacked_output_paths": [
+            result.floor_rekeyed_output_path_by_criterion_id.get(cid, "") for cid in unbacked_ids
+        ],
+        "engaged": withhold is not None,
+    }
 
 
 async def evaluate_completion_criteria(
