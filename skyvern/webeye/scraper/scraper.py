@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import structlog
 from opentelemetry import trace as otel_trace
-from playwright._impl._errors import TimeoutError
+from playwright._impl._errors import TargetClosedError, TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.config import settings
@@ -289,6 +289,11 @@ async def _frame_element_is_visible(
     try:
         async with asyncio.timeout(timeout):
             return await frame_element.is_visible()
+    except TargetClosedError:
+        # The page/context/browser is gone -- surface this loudly instead of masking a
+        # dead browser as an invisible frame, which would let the scrape return partial
+        # content as success. SKY-12311.
+        raise
     except Exception:
         LOG.warning("Frame element visibility check failed or timed out; skipping frame", exc_info=True)
         return False

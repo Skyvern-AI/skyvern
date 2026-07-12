@@ -56,12 +56,14 @@ class DefaultInputStrategy(InputEventStrategy):
         try:
             await locator.clear(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         except PlaywrightError as e:
-            # Clearing a non-editable element (not an <input>/<textarea>/[contenteditable])
-            # is a no-op by definition -- swallow that specific validation error instead of
-            # crashing the action. Real failures (timeout, detached, etc.) still propagate.
-            # SKY-12337.
-            if "contenteditable" in str(e):
-                LOG.info("Skip clearing a non-editable element", exc_info=True)
+            # Clearing a non-editable element is a no-op by definition -- swallow only
+            # Playwright's exact validation diagnostic. Match the full phrase, not just
+            # "contenteditable": a genuine clear() timeout embeds the resolved element
+            # (e.g. <div contenteditable="true">) in its call log, and swallowing that
+            # would leave stale text for the next type() to append onto. Real failures
+            # (timeout, detached, target closed) still propagate. SKY-12337.
+            if "is not an <input>, <textarea> or [contenteditable] element" in str(e):
+                LOG.info("Skip clearing a non-editable element")
                 return
             raise
 

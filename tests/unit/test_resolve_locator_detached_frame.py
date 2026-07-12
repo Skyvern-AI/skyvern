@@ -11,6 +11,7 @@ already signals with ``NoneFrameError`` -- so it must be normalized to
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Error as PlaywrightError
 
 from skyvern.exceptions import NoneFrameError
@@ -38,6 +39,34 @@ async def test_resolve_locator_normalizes_detached_content_frame_to_none_frame_e
     page.query_selector = AsyncMock(return_value=detached_handle)
 
     with pytest.raises(NoneFrameError):
+        await resolve_locator(scrape_page, page, frame_id, "div.target")
+
+
+@pytest.mark.asyncio
+async def test_resolve_locator_normalizes_detached_query_selector_to_none_frame_error() -> None:
+    # An already-detached parent frame fails at query_selector, not content_frame.
+    frame_id = "iframe-1"
+    scrape_page = _scrape_page_with_single_iframe(frame_id)
+
+    page = MagicMock()
+    page.query_selector = AsyncMock(side_effect=PlaywrightError("Frame was detached"))
+
+    with pytest.raises(NoneFrameError):
+        await resolve_locator(scrape_page, page, frame_id, "div.target")
+
+
+@pytest.mark.asyncio
+async def test_resolve_locator_reraises_target_closed_error() -> None:
+    # A closed/crashed target is NOT a DOM race -- it must surface, not be masked as NoneFrameError.
+    frame_id = "iframe-1"
+    scrape_page = _scrape_page_with_single_iframe(frame_id)
+
+    handle = MagicMock()
+    handle.content_frame = AsyncMock(side_effect=TargetClosedError("Target page, context or browser has been closed"))
+    page = MagicMock()
+    page.query_selector = AsyncMock(return_value=handle)
+
+    with pytest.raises(TargetClosedError):
         await resolve_locator(scrape_page, page, frame_id, "div.target")
 
 

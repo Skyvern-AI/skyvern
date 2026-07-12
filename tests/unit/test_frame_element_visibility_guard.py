@@ -12,6 +12,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.webeye.scraper import scraper
@@ -31,6 +32,17 @@ async def test_frame_element_is_visible_false_on_playwright_timeout() -> None:
         side_effect=PlaywrightTimeoutError("ElementHandle.is_visible: Timeout 30000ms exceeded.")
     )
     assert await scraper._frame_element_is_visible(handle) is False
+
+
+@pytest.mark.asyncio
+async def test_frame_element_is_visible_reraises_target_closed() -> None:
+    # A dead browser/page must surface, not be masked as an invisible (skippable) frame.
+    handle = MagicMock()
+    handle.is_visible = AsyncMock(
+        side_effect=TargetClosedError("ElementHandle.is_visible: Target page, context or browser has been closed")
+    )
+    with pytest.raises(TargetClosedError):
+        await scraper._frame_element_is_visible(handle)
 
 
 @pytest.mark.asyncio
