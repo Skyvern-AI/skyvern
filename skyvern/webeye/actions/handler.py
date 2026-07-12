@@ -52,6 +52,7 @@ from skyvern.exceptions import (
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
+    MissingElementInIframe,
     MissingFileUrl,
     MultipleElementsFound,
     NoAutoCompleteOptionMeetCondition,
@@ -59,6 +60,7 @@ from skyvern.exceptions import (
     NoElementMatchedForTargetOption,
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
+    NoneFrameError,
     NoSuitableAutoCompleteOption,
     OptionIndexOutOfBound,
     PhoneNumberInputMismatch,
@@ -2257,7 +2259,18 @@ class ActionHandler:
                 )
                 actions_result.append(ActionFailure(Exception(f"Unsupported action type: {type(action)}")))
                 return actions_result
-        except MissingElement as e:
+        except (
+            MissingElement,
+            MissingElementDict,
+            MissingElementInCSSMap,
+            MissingElementInIframe,
+            NoneFrameError,
+        ) as e:
+            # The element/iframe the action referenced is no longer resolvable in the
+            # live DOM (detached iframe, stale element id from a re-render or a
+            # dynamically injected captcha). This is an expected, recoverable race --
+            # fail the action so the agent re-scrapes and retries, but don't log it as
+            # an unhandled exception. SKY-12325, SKY-12317.
             LOG.info(
                 "Known exceptions",
                 action=action,

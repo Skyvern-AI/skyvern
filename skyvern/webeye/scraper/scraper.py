@@ -274,6 +274,26 @@ async def scrape_website(
         )
 
 
+async def _frame_element_is_visible(
+    frame_element: ElementHandle,
+    timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS / 1000,
+) -> bool:
+    """Bounded visibility probe for an iframe's ElementHandle.
+
+    ``ElementHandle.is_visible()`` takes no timeout and falls back to Playwright's
+    built-in 30s action timeout; on a detached / mid-navigation cross-process frame
+    it can stall the whole scrape and then raise ``Timeout 30000ms exceeded``
+    (SKY-12311). Bound it and treat a hang/error as "not visible" so we skip the
+    frame instead of stalling or crashing.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            return await frame_element.is_visible()
+    except Exception:
+        LOG.warning("Frame element visibility check failed or timed out; skipping frame", exc_info=True)
+        return False
+
+
 async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None = None) -> str:
     """
     Get all the visible text in the iframe.
@@ -314,7 +334,7 @@ async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None
             continue
 
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
-        if not await child_frame_element.is_visible():
+        if not await _frame_element_is_visible(child_frame_element):
             continue
 
         text += await get_frame_text(child_frame, scrape_exclude)
@@ -617,7 +637,7 @@ async def add_frame_interactable_elements(
     try:
         frame_element = await frame.frame_element()
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
-        if not await frame_element.is_visible():
+        if not await _frame_element_is_visible(frame_element):
             return elements, element_tree
         skyvern_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
         if not skyvern_id:

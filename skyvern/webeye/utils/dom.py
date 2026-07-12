@@ -8,7 +8,9 @@ from random import uniform
 from urllib.parse import urljoin, urlparse
 
 import structlog
-from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import ElementHandle
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
@@ -75,7 +77,14 @@ async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css:
         if frame_handler is None:
             raise NoneFrameError(frame_id=child_frame)
 
-        content_frame = await frame_handler.content_frame()
+        try:
+            content_frame = await frame_handler.content_frame()
+        except PlaywrightError as e:
+            # The iframe detached between query_selector and content_frame (e.g.
+            # navigation / re-render). That is the same "frame is gone" condition
+            # NoneFrameError already signals, so normalize instead of leaking the
+            # raw Playwright error. SKY-12186.
+            raise NoneFrameError(frame_id=child_frame) from e
         if content_frame is None:
             raise NoneFrameError(frame_id=child_frame)
         current_frame = content_frame
@@ -919,6 +928,17 @@ class SkyvernElement:
         await self.get_locator().fill(text, timeout=timeout)
 
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        # Only editable / text-input-capable elements can be cleared. Clearing a
+        # non-text element (e.g. an h2 the LLM mis-picked) raises
+        # "not an <input>, <textarea> or [contenteditable] element" -- skip it
+        # instead so the doomed clear and its noisy exception never run. SKY-12337.
+        if not await self.supports_text_input():
+            LOG.info(
+                "Skip clearing a non-text-input element",
+                element_id=self.get_id(),
+                tag_name=self.get_tag_name(),
+            )
+            return
         locator = self.get_locator()
         await EventStrategyFactory.clear_field(locator.page, locator, char_count=0)
 
