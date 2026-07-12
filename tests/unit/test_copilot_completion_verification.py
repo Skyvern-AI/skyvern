@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
     _schema_boolean_output_paths,
     _value_matches_expected,
+    floor_rekeyed_path_backing,
     grade_requested_output_criteria,
     split_requested_output_criteria,
 )
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     DeliveredUnverifiedTerminalState,
     EvidenceSourceKind,
     FloorRekeyedDeliverableCredit,
+    FloorRekeyedEmissionWithhold,
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
@@ -48,6 +50,8 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     degraded_contract_delivered_unverified_terminal_state,
     evaluate_completion_criteria,
     floor_rekeyed_deliverable_credit,
+    floor_rekeyed_emission_lane_fields,
+    floor_rekeyed_emission_withhold,
     grade_definition_criteria,
     grade_fallback_floor_reached_end_state_criteria,
     grade_present_value_criteria,
@@ -126,6 +130,7 @@ from skyvern.forge.sdk.copilot.tools.completion import (
     _POST_RUN_PAGE_OBSERVATION_LABEL,
     _artifact_health_blocker_from_result,
     _completion_verification_from_run_result,
+    _floor_rekeyed_emission_evidence,
     _reconcile_download_completion_criterion,
 )
 from skyvern.forge.sdk.copilot.tools.composition_capture import _active_run_terminal_monitor_enabled
@@ -3448,6 +3453,7 @@ def _floor_rekeyed_result(
     verdicts: list[CriterionVerdict],
     marked_ids: list[str],
     output_path_by_id: dict[str, str] | None = None,
+    backed_by_id: dict[str, bool] | None = None,
 ) -> CompletionVerificationResult:
     return CompletionVerificationResult(
         status="evaluated",
@@ -3455,6 +3461,7 @@ def _floor_rekeyed_result(
         verdicts=list(verdicts),
         floor_rekeyed_criterion_ids=list(marked_ids),
         floor_rekeyed_output_path_by_criterion_id=dict(output_path_by_id or {}),
+        floor_rekeyed_backed_by_criterion_id=dict(backed_by_id or {}),
     )
 
 
@@ -3670,6 +3677,7 @@ def test_floor_rekeyed_credit_grants_when_floor_path_binds_delivered_payload() -
         _floored_run_plane_verdicts(corroborator_source="independent_page_evidence"),
         ["deliverable"],
         {"deliverable": "output.document_name"},
+        backed_by_id={"deliverable": True},
     )
 
     with capture_logs() as logs:
@@ -3692,6 +3700,7 @@ def test_floor_rekeyed_credit_withheld_when_floor_path_absent_from_payload() -> 
         _floored_run_plane_verdicts(corroborator_source="independent_page_evidence"),
         ["deliverable"],
         {"deliverable": "output.document_name"},
+        backed_by_id={"deliverable": True},
     )
 
     with capture_logs() as logs:
@@ -3709,7 +3718,7 @@ def test_floor_rekeyed_credit_withheld_when_floor_path_absent_from_payload() -> 
     assert any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
 
 
-def test_floor_rekeyed_deliverable_reaches_verified_success() -> None:
+def test_floor_rekeyed_deliverable_withholds_without_runtime_backing() -> None:
     ctx = _ctx_with_blocks("code")
     verification = _floor_rekeyed_result(
         _corroborated_abstention_verdicts(
@@ -3717,6 +3726,7 @@ def test_floor_rekeyed_deliverable_reaches_verified_success() -> None:
             corroborator_evidence_ref=_PAGE_EVIDENCE_DELIVERABLE_REF,
         ),
         ["deliverable"],
+        {"deliverable": "output.document_name"},
     )
 
     with capture_logs() as logs:
@@ -3725,13 +3735,15 @@ def test_floor_rekeyed_deliverable_reaches_verified_success() -> None:
         )
 
     assert recorded is not None
-    assert recorded.verdict == "demonstrated"
-    assert ctx.delivered_unverified_terminal is False
-    assert ctx.turn_halt is None
-    granted = [entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit"]
-    assert granted and granted[0]["criterion_ids"] == ["deliverable"]
-    assert granted[0]["evidence_sources"] == ["independent_page_evidence"]
-    assert not any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind.value == "delivered_unverified"
+    assert not any(entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit" for entry in logs)
+    lane = [entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_emission_lane"]
+    assert lane and lane[0]["engaged"] is True
+    assert lane[0]["unbacked_criterion_ids"] == ["deliverable"]
+    assert any(entry.get("event") == "copilot.completion.floor_rekeyed_emission_withheld" for entry in logs)
 
 
 def _floored_policy_criteria(criteria: list[CompletionCriterion], user_message: str) -> list[CompletionCriterion]:
@@ -3821,6 +3833,16 @@ async def test_floor_rekeyed_deliverable_is_credited_through_the_verification_pr
     )
     ctx = _ctx_with_blocks("code")
     ctx.request_policy = policy
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_bill
+              code: |
+                return {"doc_status": "Delivered"}
+        """
+    ).strip()
     ctx.composition_page_evidence = {
         "workflow_run_id": "wr_x",
         "observed_after_workflow_run": True,
@@ -3862,8 +3884,454 @@ def test_floor_rekeyed_runtime_output_only_still_withholds() -> None:
     assert ctx.delivered_unverified_terminal is True
     assert ctx.turn_halt is not None
     assert ctx.turn_halt.kind.value == "delivered_unverified"
-    assert any(entry.get("event") == "copilot.completion.zero_requested_output_credit_withheld" for entry in logs)
+    assert any(entry.get("event") == "copilot.completion.floor_rekeyed_emission_withheld" for entry in logs)
     assert not any(entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit" for entry in logs)
+
+
+def _backing_ctx(returns_literal: str, block_label: str = "extract_bill") -> CopilotContext:
+    ctx = _run_ctx()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=block_label, block_type="code")])
+    )
+    ctx.last_workflow_yaml = textwrap.dedent(
+        f"""
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: {block_label}
+              code: |
+                return {returns_literal}
+        """
+    ).strip()
+    return ctx
+
+
+def _marked_output_criterion(path: str, cid: str = "c1") -> CompletionCriterion:
+    return CompletionCriterion(
+        id=cid,
+        outcome="The requested deliverable is returned.",
+        level="run",
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path=path,
+    )
+
+
+def _backing_for(ctx: CopilotContext, criteria: list[CompletionCriterion], run_data: dict) -> dict[str, bool]:
+    block_outputs, sources, block_types, runtime_envelope_labels = _floor_rekeyed_emission_evidence(ctx, run_data)
+    return floor_rekeyed_path_backing(
+        ctx, criteria, block_outputs, sources, block_types, runtime_envelope_labels=runtime_envelope_labels
+    )
+
+
+def test_backing_backs_registered_scalar_at_floor_path() -> None:
+    ctx = _backing_ctx('{"doc_status": "Delivered"}')
+    run_data = _registered_output_result({"doc_status": "Delivered"})["data"]
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.doc_status")], run_data)
+
+    assert backing == {"c1": True}
+
+
+def test_backing_does_not_back_metadata_only_envelope() -> None:
+    envelope_type = next(iter(_TASK_ENVELOPE_BLOCK_TYPES))
+    ctx = _backing_ctx('{"doc_status": "Delivered"}')
+    envelope = {
+        "task_id": "t1",
+        "status": "completed",
+        "extracted_information": None,
+        "downloaded_files": None,
+        "downloaded_file_urls": None,
+    }
+    run_data = _registered_output_result(envelope, block_type=envelope_type)["data"]
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.doc_status")], run_data)
+
+    assert backing == {"c1": False}
+
+
+def _task_envelope_ctx(label: str = "run_task") -> CopilotContext:
+    ctx = _run_ctx()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=label, block_type="task_v2")])
+    )
+    ctx.last_workflow_yaml = textwrap.dedent(
+        f"""
+        workflow_definition:
+          blocks:
+            - block_type: task_v2
+              label: {label}
+        """
+    ).strip()
+    return ctx
+
+
+def _task_envelope_run_data(label: str, extracted_information: dict[str, Any] | None) -> dict:
+    return {
+        "workflow_run_id": "wr_x",
+        "overall_status": "completed",
+        "executed_block_labels": [label],
+        "current_url": "https://example.com/account",
+        "blocks": [
+            {
+                "label": label,
+                "block_type": "task_v2",
+                "status": "completed",
+                "extracted_data": {
+                    "task_id": "t1",
+                    "status": "completed",
+                    "extracted_information": extracted_information,
+                    "downloaded_files": None,
+                    "downloaded_file_urls": None,
+                },
+            }
+        ],
+        "registered_output_parameter_values": [],
+    }
+
+
+def test_backing_backs_contract_less_task_envelope_extracted_information() -> None:
+    ctx = _task_envelope_ctx()
+    run_data = _task_envelope_run_data("run_task", {"job_title": "Staff Engineer"})
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.job_title")], run_data)
+
+    assert backing == {"c1": True}
+
+
+def test_backing_does_not_back_metadata_only_task_envelope() -> None:
+    ctx = _task_envelope_ctx()
+    run_data = _task_envelope_run_data("run_task", None)
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.job_title")], run_data)
+
+    assert backing == {"c1": False}
+
+
+def _mixed_authored_and_envelope_ctx() -> CopilotContext:
+    ctx = _run_ctx()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(label="extract_bill", block_type="code"),
+                SimpleNamespace(label="run_task", block_type="task_v2"),
+            ]
+        )
+    )
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: extract_bill
+              code: |
+                return {"job_title": "authored placeholder"}
+            - block_type: task_v2
+              label: run_task
+        """
+    ).strip()
+    return ctx
+
+
+def test_backing_does_not_cross_back_authored_marker_from_foreign_task_envelope() -> None:
+    ctx = _mixed_authored_and_envelope_ctx()
+    run_data = {
+        "workflow_run_id": "wr_x",
+        "overall_status": "completed",
+        "executed_block_labels": ["extract_bill", "run_task"],
+        "current_url": "https://example.com/account",
+        "blocks": [
+            {
+                "label": "extract_bill",
+                "block_type": "code",
+                "status": "completed",
+                "extracted_data": {"note": "done"},
+            },
+            {
+                "label": "run_task",
+                "block_type": "task_v2",
+                "status": "completed",
+                "extracted_data": {
+                    "task_id": "t1",
+                    "status": "completed",
+                    "extracted_information": {"job_title": "Staff Engineer"},
+                    "downloaded_files": None,
+                    "downloaded_file_urls": None,
+                },
+            },
+        ],
+        "registered_output_parameter_values": [],
+    }
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.job_title")], run_data)
+
+    assert backing == {"c1": False}
+
+
+def test_backing_does_not_back_unrelated_field() -> None:
+    ctx = _backing_ctx('{"doc_status": "Delivered"}')
+    run_data = _registered_output_result({"doc_status": "Delivered"})["data"]
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.unrelated_field")], run_data)
+
+    assert backing == {"c1": False}
+
+
+def _two_contract_less_task_envelope_ctx() -> CopilotContext:
+    ctx = _run_ctx()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(label="run_task", block_type="task_v2"),
+                SimpleNamespace(label="run_task_2", block_type="task_v2"),
+            ]
+        )
+    )
+    ctx.last_workflow_yaml = textwrap.dedent(
+        """
+        workflow_definition:
+          blocks:
+            - block_type: task_v2
+              label: run_task
+            - block_type: task_v2
+              label: run_task_2
+        """
+    ).strip()
+    return ctx
+
+
+def test_backing_fails_closed_across_ambiguous_contract_less_task_envelopes() -> None:
+    # The criterion's real producer (run_task) emits nothing at the path; an unrelated task
+    # envelope (run_task_2) coincidentally emits it. With no authored contract naming the
+    # producer and more than one candidate envelope, the emission is unattributable and must
+    # fail closed rather than pool the coincidental match.
+    ctx = _two_contract_less_task_envelope_ctx()
+    run_data = {
+        "workflow_run_id": "wr_x",
+        "overall_status": "completed",
+        "executed_block_labels": ["run_task", "run_task_2"],
+        "current_url": "https://example.com/account",
+        "blocks": [
+            {
+                "label": "run_task",
+                "block_type": "task_v2",
+                "status": "completed",
+                "extracted_data": {
+                    "task_id": "t1",
+                    "status": "completed",
+                    "extracted_information": None,
+                    "downloaded_files": None,
+                    "downloaded_file_urls": None,
+                },
+            },
+            {
+                "label": "run_task_2",
+                "block_type": "task_v2",
+                "status": "completed",
+                "extracted_data": {
+                    "task_id": "t2",
+                    "status": "completed",
+                    "extracted_information": {"job_title": "Staff Engineer"},
+                    "downloaded_files": None,
+                    "downloaded_file_urls": None,
+                },
+            },
+        ],
+        "registered_output_parameter_values": [],
+    }
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.job_title")], run_data)
+
+    assert backing == {"c1": False}
+
+
+def test_emission_evidence_gates_hollow_top_level_output() -> None:
+    # A hollow top-level ``*_output`` payload must not enter the emission view as backing
+    # evidence — the same meaningfulness gate _build_run_evidence_snapshot applies.
+    ctx = _backing_ctx('{"doc_status": "Delivered"}')
+    run_data = {
+        "workflow_run_id": "wr_x",
+        "overall_status": "completed",
+        "executed_block_labels": [],
+        "current_url": "https://example.com/account",
+        "blocks": [],
+        "output": {"extract_bill_output": {"extracted_information": None}},
+        "registered_output_parameter_values": [],
+    }
+
+    block_outputs, _sources, _types, _envs = _floor_rekeyed_emission_evidence(ctx, run_data)
+
+    assert "extract_bill_output" not in block_outputs
+
+
+def test_backing_empty_artifact_is_unbacked() -> None:
+    ctx = _backing_ctx('{"doc_status": "Delivered"}')
+
+    backing = _backing_for(ctx, [_marked_output_criterion("output.doc_status")], None)
+
+    assert backing == {"c1": False}
+
+
+def test_emission_evidence_excludes_page_observation_sources() -> None:
+    ctx = _backing_ctx('{"doc_status": "Delivered"}')
+    run_data = _registered_output_result({"doc_status": "Delivered"})["data"]
+
+    _, sources, _types, _envs = _floor_rekeyed_emission_evidence(ctx, run_data)
+
+    assert sources
+    assert set(sources.values()) <= {"runtime_output", "registered_output_parameter"}
+
+
+def _emission_result(
+    *,
+    backed: dict[str, bool],
+    paths: dict[str, str] | None = None,
+    marked: tuple[str, ...] = ("c1",),
+    contingent: tuple[str, ...] = (),
+    structural_unfired: tuple[str, ...] = (),
+    extra_verdicts: tuple[CriterionVerdict, ...] = (),
+) -> CompletionVerificationResult:
+    verdicts = [
+        CriterionVerdict(
+            criterion_id=cid, state="satisfied", reason_code="evidence_confirms", evidence_ref="observed_end_state_url"
+        )
+        for cid in marked
+    ]
+    criterion_ids = [*marked, *(verdict.criterion_id for verdict in extra_verdicts)]
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=criterion_ids,
+        verdicts=[*verdicts, *extra_verdicts],
+        floor_rekeyed_criterion_ids=list(marked),
+        floor_rekeyed_output_path_by_criterion_id=dict(paths or {}),
+        floor_rekeyed_backed_by_criterion_id=dict(backed),
+        contingent_criterion_ids=list(contingent),
+        structural_unfired_criterion_ids=list(structural_unfired),
+    )
+
+
+def test_floor_rekeyed_emission_withhold_engages_when_marker_unbacked() -> None:
+    withhold = floor_rekeyed_emission_withhold(
+        _emission_result(backed={"c1": False}, paths={"c1": "output.doc_status"})
+    )
+
+    assert isinstance(withhold, FloorRekeyedEmissionWithhold)
+    assert withhold.criterion_ids == ("c1",)
+    assert withhold.unbacked_output_paths == ("output.doc_status",)
+
+
+def test_floor_rekeyed_emission_withhold_none_when_backed() -> None:
+    assert floor_rekeyed_emission_withhold(_emission_result(backed={"c1": True})) is None
+
+
+def test_floor_rekeyed_emission_withhold_missing_entry_fails_closed() -> None:
+    assert floor_rekeyed_emission_withhold(_emission_result(backed={})) is not None
+
+
+def test_floor_rekeyed_emission_withhold_ignores_empty_marker_set() -> None:
+    reach_state = _evaluated(("login", True))
+
+    assert floor_rekeyed_emission_withhold(reach_state) is None
+
+
+def test_floor_rekeyed_emission_withhold_excludes_structurally_unfired_contingent_marker() -> None:
+    result = _emission_result(
+        backed={},
+        marked=("c1",),
+        contingent=("c1",),
+        structural_unfired=("c1",),
+        extra_verdicts=(
+            CriterionVerdict(
+                criterion_id="ok", state="satisfied", reason_code="evidence_confirms", evidence_ref="observed_end_state"
+            ),
+        ),
+    )
+
+    assert result.is_fully_satisfied() is True
+    assert floor_rekeyed_emission_withhold(result) is None
+
+
+def test_floor_rekeyed_emission_withhold_keyed_on_marker_not_artifact_richness() -> None:
+    lean = _emission_result(backed={"c1": False})
+    rich = _emission_result(
+        backed={"c1": False},
+        extra_verdicts=(
+            CriterionVerdict(
+                criterion_id="ok", state="satisfied", reason_code="evidence_confirms", evidence_ref="observed_end_state"
+            ),
+        ),
+    )
+
+    assert floor_rekeyed_emission_withhold(lean) is not None
+    assert floor_rekeyed_emission_withhold(rich) is not None
+
+
+def test_floor_rekeyed_emission_lane_fields_fire_on_satisfied_and_unsatisfied_results() -> None:
+    satisfied = _emission_result(backed={"c1": False}, paths={"c1": "output.doc_status"})
+    unsatisfied = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c1"],
+        verdicts=[CriterionVerdict(criterion_id="c1", state="unsatisfied", reason_code="no_evidence")],
+        floor_rekeyed_criterion_ids=["c1"],
+        floor_rekeyed_backed_by_criterion_id={"c1": False},
+    )
+
+    satisfied_fields = floor_rekeyed_emission_lane_fields(satisfied)
+    unsatisfied_fields = floor_rekeyed_emission_lane_fields(unsatisfied)
+
+    assert satisfied_fields is not None and satisfied_fields["engaged"] is True
+    assert unsatisfied_fields is not None and unsatisfied_fields["engaged"] is False
+
+
+def test_floor_rekeyed_emission_shallow_bound_but_unbacked_withholds() -> None:
+    ctx = _ctx_with_blocks("code")
+    verification = _floor_rekeyed_result(
+        _floored_run_plane_verdicts(corroborator_source="independent_page_evidence"),
+        ["deliverable"],
+        {"deliverable": "output.document_name"},
+        backed_by_id={"deliverable": False},
+    )
+
+    with capture_logs() as logs:
+        recorded = _record_run_blocks_result(
+            ctx,
+            _registered_output_result({"document_name": "Resale certificate"}),
+            completion_verification=verification,
+        )
+
+    assert recorded is not None
+    assert recorded.verdict == "not_evaluated"
+    assert ctx.delivered_unverified_terminal is True
+    lane = [entry for entry in logs if entry.get("event") == "copilot.completion.floor_rekeyed_emission_lane"]
+    assert lane and lane[0]["engaged"] is True
+    assert not any(entry.get("event") == "copilot.completion.floor_rekeyed_deliverable_credit" for entry in logs)
+
+
+def test_registered_output_meaningfulness_gate_drops_hollow_envelope() -> None:
+    envelope_type = next(iter(_TASK_ENVELOPE_BLOCK_TYPES))
+    ctx = _ctx_with_blocks("code")
+    hollow = _registered_output_result(
+        {
+            "task_id": "t",
+            "status": "completed",
+            "extracted_information": None,
+            "downloaded_files": None,
+            "downloaded_file_urls": None,
+        },
+        block_type=envelope_type,
+    )
+
+    snapshot = _build_run_evidence_snapshot(ctx, hollow)
+
+    assert "bill_statement" not in snapshot.block_outputs
+
+
+def test_registered_output_meaningfulness_gate_keeps_real_scalar() -> None:
+    ctx = _ctx_with_blocks("code")
+    real = _registered_output_result({"doc_status": "Delivered"})
+
+    snapshot = _build_run_evidence_snapshot(ctx, real)
+
+    assert snapshot.block_outputs.get("bill_statement") == {"doc_status": "Delivered"}
 
 
 def test_zero_requested_output_criteria_withholds_verified_success() -> None:
