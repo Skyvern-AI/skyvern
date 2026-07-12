@@ -158,6 +158,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_turn, current_turn_owner
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     credential_param_ids,
     parse_workflow_yaml,
@@ -3455,6 +3456,7 @@ def _grant_output_contract_advisory_run(ctx: AgentContext, signature: str) -> No
     if _output_contract_advisory_state(ctx, signature) == OutputContractAdvisoryState.GRANTED:
         return
     ctx.output_contract_actuation_by_signature[signature] = OutputContractAdvisoryState.GRANTED
+    claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
     LOG.info(
         "copilot_output_contract_advisory_run_granted",
         canonical_output_contract_signature=signature,
@@ -4084,6 +4086,30 @@ def _impose_output_contract_envelope_after_steering(
     return workflow_yaml, scaffolded_metadata, applied or declaration_stamped
 
 
+def _has_granted_output_contract_advisory_run(ctx: AgentContext) -> bool:
+    return any(
+        state == OutputContractAdvisoryState.GRANTED for state in ctx.output_contract_actuation_by_signature.values()
+    )
+
+
+def _metadata_preflight_reject_yields_to_ladder(ctx: AgentContext) -> bool:
+    """Register the preflight reject's claim and report whether it must yield to a live GRANTED advisory run.
+
+    The reject always registers its (transient) claim. It yields only when a GRANTED advisory — the ladder's
+    decision to dispatch despite deficiencies — owns the turn: yielding lets the forced dispatch consume the grant
+    instead of re-blocking it. An ordinary reject cycle (a landed actuation without a grant) is the ladder's own
+    mechanism, not a contradiction, so the reject still fires; and it does not yield to a genuinely-terminal owner
+    (e.g. a just-committed early terminal), which legitimately ends the turn rather than dispatching a run behind it.
+    """
+    owner = current_turn_owner(ctx)
+    claim_turn(ctx, TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT)
+    return (
+        _has_granted_output_contract_advisory_run(ctx)
+        and owner is not None
+        and owner.claimant is TurnClaimant.OUTPUT_CONTRACT_ACTUATION
+    )
+
+
 def _metadata_contract_run_preflight_reject(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -4119,6 +4145,8 @@ def _metadata_contract_run_preflight_reject(
         )
         if convergence_reject.commit_early_terminal:
             _commit_recorded_outcome_early_terminal(ctx)
+        if _metadata_preflight_reject_yields_to_ladder(ctx):
+            return None
         return {
             "ok": False,
             "error": (
@@ -4167,6 +4195,8 @@ def _metadata_contract_run_preflight_reject(
     payload["reason_code"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
     payload["reject_reason"] = _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE
     block_label = evaluation.block_label or "the target output block"
+    if _metadata_preflight_reject_yields_to_ladder(ctx):
+        return None
     return {
         "ok": False,
         "error": (
@@ -5039,6 +5069,7 @@ def _signal_is_churn(signal: CopilotToolBlockerSignal | None) -> bool:
 def _clear_held_churn_signals(ctx: AgentContext) -> None:
     if _signal_is_churn(ctx.blocker_signal):
         ctx.blocker_signal = None
+        ctx.blocker_signal_claimant = None
     if _signal_is_churn(ctx.latest_tool_blocker_signal):
         ctx.latest_tool_blocker_signal = None
 

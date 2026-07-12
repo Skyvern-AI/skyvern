@@ -17,11 +17,13 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    SCHEMA_INCOMPATIBILITY_REASON_CODE as SCHEMA_INCOMPATIBILITY_REASON_CODE,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
 )
 
-SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 SCHEMA_INCOMPATIBILITY_FAILURE_TYPE = "schema_incompatibility"
 SCHEMA_INCOMPATIBILITY_BLOCKED_TOOL = "update_and_run_blocks"
 
