@@ -241,6 +241,35 @@ def test_block_validate_non_promotable_alias_left_to_error() -> None:
     assert args == {"block": 7}
 
 
+def test_copilot_prehook_covers_every_middleware_block_alias_error() -> None:
+    # INVARIANT: on the copilot path the validate_block pre-hook
+    # (_normalize_block_json_alias) strips ALL block aliases before this
+    # middleware runs, so the (stricter) middleware is a no-op and can never
+    # newly error a copilot call that the pre-hook previously passed. This holds
+    # only while the two _BLOCK_JSON_ALIASES tuples stay identical — asserted
+    # here so a future resync/divergence that re-weakens the remote boundary
+    # fails loudly.
+    from skyvern.cli.mcp_tools.arg_repair import _BLOCK_JSON_ALIASES as MW_ALIASES
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _BLOCK_JSON_ALIASES as PREHOOK_ALIASES
+    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _normalize_block_json_alias
+
+    assert PREHOOK_ALIASES == MW_ALIASES
+
+    for case in (
+        {"block": '{"a":1}', "definition": '{"b":2}'},  # conflicting distinct
+        {"block_json": '{"a":1}', "block": '{"b":2}'},  # distinct alongside canonical
+        {"block_json": 7, "block": '{"x":1}'},  # non-string canonical
+        {"block": 7},  # non-promotable alias
+        {"block": '{"x":1}', "definition": '{"x":1}'},  # identical across names
+    ):
+        params = dict(case)
+        _normalize_block_json_alias(params)  # copilot pre-hook runs first
+        assert not any(alias in params for alias in MW_ALIASES), case
+        before = dict(params)
+        repair_tool_arguments("skyvern_block_validate", params)  # then the middleware
+        assert params == before, case  # middleware is a no-op on the copilot path
+
+
 # --- deliberately NOT masked: wrong-tool block_schema (SKY-12140 / SKY-12141) ---
 
 
