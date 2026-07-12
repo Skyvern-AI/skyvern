@@ -177,6 +177,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHalt,
     TurnHaltKind,
+    expire_output_contract_ladder_at_turn_end,
     raise_if_turn_halt,
     turn_halt_to_trace_data,
 )
@@ -197,6 +198,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     derive_response_kind,
     with_copilot_code_mode_diagnostics,
 )
+from skyvern.forge.sdk.copilot.turn_ownership import blocker_signal_render_allowed
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -2120,6 +2122,7 @@ def _build_turn_halt_exit_result(
         # reframed reason must live there, not just in the local reply.
         if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
             ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
+            ctx.blocker_signal_claimant = None
     elif isinstance(signal, CopilotToolBlockerSignal):
         user_response = signal.user_facing_reason
     else:
@@ -2523,6 +2526,8 @@ def _finalize_result_with_blocker_override(
     if not isinstance(local_signal, CopilotToolBlockerSignal):
         return result
     if not local_signal.renders_final_reply:
+        return result
+    if not blocker_signal_render_allowed(ctx, local_signal):
         return result
     if local_signal.internal_reason_code in _INVOLUNTARY_BLOCKER_REASON_CODES and outcome_fully_verified(ctx):
         preserved = _verified_terminal_preserve_result(ctx, result, exit_site=exit_site)
@@ -3213,7 +3218,11 @@ async def _translate_to_agent_result(
     # Bind the signal to a local so the proposal-cascade gating below can't
     # desync from the inline override if ctx mutates mid-translate.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    render_blocker_reply = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    render_blocker_reply = (
+        local_blocker_signal is not None
+        and local_blocker_signal.renders_final_reply
+        and blocker_signal_render_allowed(ctx, local_blocker_signal)
+    )
     blocker_active = render_blocker_reply
     if local_blocker_signal is not None and render_blocker_reply:
         # Override only user-visible text + resp_type so REPLACE_WORKFLOW and ASK_QUESTION gating skip the model's side-effect path; the shim is the sole renderer.
@@ -4151,7 +4160,11 @@ def _build_output_policy_blocked_result(
     # steering-only blockers should still flow through normal output-policy
     # salvage so internal tool text is scrubbed and saved drafts can surface.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    blocker_active = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    blocker_active = (
+        local_blocker_signal is not None
+        and local_blocker_signal.renders_final_reply
+        and blocker_signal_render_allowed(ctx, local_blocker_signal)
+    )
     preserved_workflow = (
         ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
     )
@@ -4321,6 +4334,31 @@ def _build_output_policy_blocked_result(
     )
 
 
+def _result_carries_terminal_outcome(result: AgentResult) -> bool:
+    if result.cancelled or result.response_type == "ASK_QUESTION":
+        return True
+    return result.turn_outcome is not None and bool(result.turn_outcome.terminal_reason)
+
+
+def _reconcile_turn_end_ownership(
+    ctx: CopilotContext | None, result: AgentResult, *, preserve_result: bool = False
+) -> AgentResult:
+    """Turn-end obligation: a GRANTED advisory signature always expires here, and only a silent
+    non-terminal reply is replaced by the stalled terminal; its own try keeps a reconcile failure
+    from masking the turn's real result."""
+    if ctx is None:
+        return result
+    try:
+        rewrite = not (preserve_result or _result_carries_terminal_outcome(result) or outcome_fully_verified(ctx))
+        halt = expire_output_contract_ladder_at_turn_end(ctx, emit_stalled_terminal=rewrite)
+        if halt is None:
+            return result
+        return _build_turn_halt_exit_result(ctx, result.global_llm_context, halt)
+    except Exception:
+        LOG.warning("copilot_turn_end_ownership_reconcile_failed", exc_info=True)
+        return result
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -4345,12 +4383,12 @@ async def run_copilot_agent(
     if turn_id is None:
         turn_id = uuid.uuid4().hex
     normalized_turn_index = turn_index if turn_index is not None else 0
+    ctx_sink: list[CopilotContext] = []
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
         # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
         ensure_tracing_initialized()
-        ctx_sink: list[CopilotContext] = []
         with _copilot_turn_span(
             chat_request=chat_request,
             chat_history=chat_history,
@@ -4358,7 +4396,7 @@ async def run_copilot_agent(
             turn_id=turn_id,
         ) as turn_span:
             try:
-                return await _run_copilot_turn_impl(
+                result = await _run_copilot_turn_impl(
                     stream=stream,
                     organization_id=organization_id,
                     chat_request=chat_request,
@@ -4377,6 +4415,7 @@ async def run_copilot_agent(
                     stored_completion_criteria=stored_completion_criteria,
                     prior_turn_outcome=prior_turn_outcome,
                 )
+                return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, result)
             except Exception as exc:
                 LOG.error(
                     "Copilot turn unhandled error",
@@ -4399,7 +4438,10 @@ async def run_copilot_agent(
                     turn_id=turn_id,
                     turn_index=normalized_turn_index,
                 )
-                return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+                error_result = _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+                return _reconcile_turn_end_ownership(
+                    ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True
+                )
             finally:
                 finalize_outcome_verification_trace(ctx_sink[0] if ctx_sink else None, turn_span)
     except Exception as exc:
@@ -4423,7 +4465,8 @@ async def run_copilot_agent(
             turn_id=turn_id,
             turn_index=normalized_turn_index,
         )
-        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
+        error_result = _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
+        return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True)
 
 
 async def _run_copilot_turn_impl(

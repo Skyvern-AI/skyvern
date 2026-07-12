@@ -88,6 +88,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
 )
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, current_turn_owner
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit.conftest import make_copilot_context
 
@@ -149,6 +150,13 @@ class _Ctx:
         self.reached_download_target: ReachedDownloadTarget | None = None
         self.author_time_gate_ablation_events = []
         self.request_policy = None
+        self.blocker_signal = None
+        self.blocker_signal_claimant = None
+        self.turn_halt = None
+        self.turn_ownership = None
+        self.gate_precedence_conflict_events: list[object] = []
+        self.output_contract_actuation_by_signature: dict[str, object] = {}
+        self.output_contract_actuation_count_by_signature: dict[str, int] = {}
 
 
 class TestSynthesizedOfferPersistenceGate:
@@ -387,6 +395,34 @@ class TestSynthesizedOfferPersistenceGate:
         click_signal = synthesized_block_persistence_signal(ctx, "click")
         assert isinstance(click_signal, CopilotToolBlockerSignal)
         assert click_signal.internal_reason_code == SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+
+    def test_actuation_obligation_fill_admission_registers_precedence_claim(self) -> None:
+        ctx = _Ctx()
+        ctx.turn_intent = TurnIntent(
+            mode=TurnIntentMode.BUILD,
+            authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+            required_context={RequiredContextKey.BROWSER_STATE},
+        )
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="form-submit",
+                    outcome="form fields are filled",
+                    kind="terminal_action",
+                    terminal_action_family="form",
+                )
+            ],
+        )
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.synthesized_block_offered = True
+        ctx.synthesized_block_offered_trajectory_len = 1
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "button.start", "accessible_name": "Start"}]
+
+        assert synthesized_block_persistence_signal(ctx, "type_text") is None
+
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.ACTUATION_OBLIGATION_FILL in ctx.turn_ownership.claims
+        assert current_turn_owner(ctx) is None
 
     def test_actuation_obligation_admits_required_fill_tool_for_method_mandated_run_contract(self) -> None:
         ctx = _Ctx()
@@ -2599,6 +2635,22 @@ class TestScoutOutputCoverageGate:
         )
         assert event.log_only is True
 
+    def test_steer_yields_to_live_ladder_and_one_shot_key_survives(self) -> None:
+        ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
+        ctx.update_workflow_called = True
+        ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
+        consume_uncovered_output_reopen_event(ctx)
+        ctx.output_contract_actuation_by_signature = {"sig_a": OutputContractAdvisoryState.GRANTED}
+        ctx.output_contract_actuation_count_by_signature = {}
+
+        assert uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks") is None
+        assert ctx.uncovered_output_rescout_steer_key is None
+
+        ctx.output_contract_actuation_by_signature = {"sig_a": OutputContractAdvisoryState.CONSUMED}
+        steer = uncovered_output_reject_scout_steer_signal(ctx, "update_and_run_blocks")
+        assert isinstance(steer, CopilotToolBlockerSignal)
+        assert ctx.uncovered_output_rescout_steer_key is not None
+
     def test_steer_inert_without_reopen_latch(self) -> None:
         ctx = self._authoring_ctx(_criterion("output.document_name", "the order status document name is captured"))
         ctx.latest_recorded_build_test_outcome = _author_time_reject_outcome("output.document_name")
@@ -3054,6 +3106,16 @@ class TestCredentialScoutReopen:
         assert synthesized_block_persistence_signal(ctx, "evaluate") is not None
         ctx.synthesized_block_reopened_for_credential_scout = True
         assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+    def test_reopen_admission_registers_precedence_claim(self) -> None:
+        ctx = self._offered_complete_ctx()
+        ctx.synthesized_block_reopened_for_credential_scout = True
+
+        assert synthesized_block_persistence_signal(ctx, "evaluate") is None
+
+        assert ctx.turn_ownership is not None
+        assert TurnClaimant.CREDENTIAL_SCOUT_REOPEN in ctx.turn_ownership.claims
+        assert current_turn_owner(ctx) is None
 
     def test_reopen_reopens_offer_refresh_window(self) -> None:
         ctx = self._offered_complete_ctx()

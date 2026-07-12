@@ -48,6 +48,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -139,7 +140,7 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS = frozenset(
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
     return payload
 
@@ -152,7 +153,7 @@ def _stash_and_emit_current_page_terminal_challenge_blocker(ctx: Any, tool_name:
     )
     if signal is None:
         return None
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_current_page_terminal_challenge")
     return payload
 
@@ -335,7 +336,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     None,
                 ),
             )
-            payload = stash_blocker_signal(copilot_ctx, persistence_signal)
+            payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
             result = {"ok": False, "error": payload}
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result)

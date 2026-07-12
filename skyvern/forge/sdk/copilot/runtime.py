@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
+    from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
@@ -490,6 +491,13 @@ class AgentContext:
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
     author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
+    # Single-owner turn-precedence contract. One mechanism owns a turn's steering
+    # at a time; a contradicting weaker claim is recorded here and yields.
+    turn_ownership: TurnOwnership | None = None
+    gate_precedence_conflict_events: list[GatePrecedenceConflictEvent] = field(default_factory=list)
+    # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
+    # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
+    blocker_signal_claimant: TurnClaimant | None = None
 
 
 def copilot_author_time_gate_log_only_enabled() -> bool:

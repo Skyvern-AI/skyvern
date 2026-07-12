@@ -11,7 +11,7 @@ import structlog
 import yaml
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
 )
@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskV2Block
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -320,7 +321,7 @@ def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
 
 
 def _emit_tool_blocker_signal(ctx: AgentContext, signal: CopilotToolBlockerSignal) -> str:
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="tool_blocker_signal")
     return payload
 

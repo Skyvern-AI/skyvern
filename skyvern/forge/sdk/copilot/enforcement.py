@@ -128,7 +128,6 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     AuthorTimeGateAblationPayload,
-    output_contract_ladder_unresolved,
     record_author_time_gate_ablation_event,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -145,6 +144,13 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_ownership import (
+    ClaimOutcome,
+    TurnClaimant,
+    claim_and_stash_blocker_signal,
+    claim_turn,
+    emit_blocker_signal_payload,
+)
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -578,7 +584,8 @@ def _record_code_authoring_guardrail_reject(
     # halt kind, so the churn stop defers to it rather than overriding.
     if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
         return
-    if output_contract_ladder_unresolved(ctx):
+    claimant = TurnClaimant.CREDENTIAL_PRIORITY_CHURN if defer_churn_stop else TurnClaimant.CODE_AUTHORING_CHURN
+    if claim_and_stash_blocker_signal(ctx, claimant, signal, force_stash=True) is None:
         return
     try:
         unresolved_obligation = _scouted_spine_open_obligation(ctx)
@@ -587,8 +594,6 @@ def _record_code_authoring_guardrail_reject(
         unresolved_obligation = []
     if unresolved_obligation:
         _log_scouted_spine_unresolved(unresolved_obligation, site="churn_stop")
-    stash_blocker_signal(ctx, signal)
-    ctx.blocker_signal = signal
 
 
 def no_forward_progress_interaction_stop_signal(ctx: Any) -> CopilotToolBlockerSignal:
@@ -635,8 +640,7 @@ def register_no_progress_interaction_click(ctx: Any, *, outcome: str) -> None:
     if blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
         return
     signal = no_forward_progress_interaction_stop_signal(ctx)
-    stash_blocker_signal(ctx, signal)
-    ctx.blocker_signal = signal
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.LOOP_DETECTED, signal, force_stash=True)
 
 
 def _needs_code_authoring_churn_halt(ctx: Any) -> bool:
@@ -1717,12 +1721,12 @@ def _check_enforcement(
     if not getattr(ctx, "last_test_non_retriable_nav_error", None):
         churn_signal = _churn_signal_if_halting(ctx)
         if churn_signal is not None:
-            stash_blocker_signal(ctx, churn_signal)
+            emit_blocker_signal_payload(ctx, churn_signal)
             stash_turn_halt_from_blocker_signal(ctx, churn_signal, source="enforcement_backstop")
             raise_if_turn_halt(ctx)
         if _needs_no_progress_interaction_halt(ctx):
             no_progress_signal = no_forward_progress_interaction_stop_signal(ctx)
-            stash_blocker_signal(ctx, no_progress_signal)
+            emit_blocker_signal_payload(ctx, no_progress_signal)
             stash_turn_halt_from_blocker_signal(ctx, no_progress_signal, source="enforcement_backstop")
             raise_if_turn_halt(ctx)
 
@@ -2837,6 +2841,9 @@ def uncovered_output_reject_scout_steer_signal(ctx: AgentContext, tool_name: str
         payload=payload,
     ):
         return None
+    # Commit-after-claim: a yielded steer must not burn the one-shot rescout key.
+    if claim_turn(ctx, TurnClaimant.UNCOVERED_OUTPUT_RESCOUT_STEER) is ClaimOutcome.YIELDED:
+        return None
     ctx.uncovered_output_rescout_steer_key = key
     named_paths = ", ".join(sorted(active))
     return CopilotToolBlockerSignal(
@@ -2900,8 +2907,10 @@ def synthesized_block_persistence_signal(ctx: Any, tool_name: str) -> CopilotToo
     if _uncovered_output_reject_admits_evaluate(ctx, tool_name):
         return None
     if _credential_scout_reopen_admits_evaluate(ctx, tool_name):
+        claim_turn(ctx, TurnClaimant.CREDENTIAL_SCOUT_REOPEN)
         return None
     if _actuation_obligation_admits_required_fill_tool(ctx, tool_name):
+        claim_turn(ctx, TurnClaimant.ACTUATION_OBLIGATION_FILL)
         return None
     if (
         ambiguous_selector_rescout_state != "block"
@@ -3014,6 +3023,10 @@ async def run_with_enforcement(
         ):
             force_synthesized_block_persistence = _should_force_synthesized_block_persistence(ctx)
             force_advisory_run_dispatch = _should_force_advisory_run_dispatch(ctx)
+            # The advisory-dispatch force claims the actuation ladder itself (same-claimant), so the
+            # grant-consumption path can never self-deadlock.
+            if force_advisory_run_dispatch:
+                claim_turn(ctx, TurnClaimant.OUTPUT_CONTRACT_ACTUATION)
             force_run_dispatch = force_synthesized_block_persistence or force_advisory_run_dispatch
             current_runner_kwargs = (
                 _runner_kwargs_with_forced_tool_choice(runner_kwargs, SYNTHESIZED_BLOCK_PERSISTENCE_TOOL)
