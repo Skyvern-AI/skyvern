@@ -74,14 +74,15 @@ def _coerce_str_to_str_list(value: Any) -> Any:
     Two unambiguous shapes are repaired: a JSON/py-literal list whose elements
     are ALL strings (``'["a","b"]'`` or ``"['a','b']"`` -> ``["a","b"]``), and a
     single bare key (``"a"`` -> ``["a"]``). Anything else — a list with
-    non-string or nested elements, an unparseable ``[...]`` string, an
-    over-long string, or a non-string value — is left untouched so it still
-    errors at validation instead of being silently turned into phantom keys.
+    non-string or nested elements, an unparseable or object/tuple ``[({``-shaped
+    string, an over-long string, or a non-string value — is left untouched so it
+    still errors at validation instead of being silently turned into phantom
+    keys. (A bare key never starts with ``[``, ``(`` or ``{``.)
     """
     if not isinstance(value, str) or len(value) > _MAX_COERCE_STR_LEN:
         return value
     stripped = value.strip()
-    if stripped[:1] in "[(":
+    if stripped[:1] in "[({":
         for parser in (json.loads, ast.literal_eval):
             try:
                 parsed = parser(stripped)

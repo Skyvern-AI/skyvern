@@ -136,6 +136,14 @@ def test_parameter_keys_oversized_string_not_parsed() -> None:
     assert args["parameter_keys"] == huge
 
 
+def test_parameter_keys_json_object_string_not_masked() -> None:
+    # A JSON-object-looking string is not a bare key; it must be left to error,
+    # not wrapped into a single phantom key. No real key starts with '{'.
+    args = {"parameter_keys": '{"a": 1}'}
+    repair_tool_arguments("skyvern_code_block_lint", args)
+    assert args["parameter_keys"] == '{"a": 1}'
+
+
 # --- mechanism (b): extract schema dict -> json string (SKY-12338) ---
 
 
