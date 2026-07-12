@@ -16,6 +16,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import enforcement
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
     build_output_source_unobservable_blocker_signal,
 )
@@ -40,6 +41,11 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.tools import workflow_update as wu
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind, turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import (
+    TurnClaimant,
+    claim_and_stash_blocker_signal,
+    current_turn_owner,
+)
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _ALL_SPLIT_BLOCKERS = [
@@ -519,6 +525,9 @@ _FINGERPRINT = "fp_stage_topology"
 
 def _advisory_ctx() -> SimpleNamespace:
     return SimpleNamespace(
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
         output_contract_reject_count_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
         output_contract_armed_directive_fingerprint_by_signature={},
@@ -734,6 +743,95 @@ def test_log_only_metadata_preflight_skips_run_attemptable_without_advisory(
     assert result is None
     assert ctx.author_time_gate_ablation_events == []
     assert ctx.output_contract_reject_count_by_signature == {}
+
+
+def _genuine_terminal_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="stop",
+        user_facing_reason="I can't get past this page, so I'll stop here.",
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        renders_final_reply=True,
+        internal_reason_code="probable_site_block_stop",
+        blocked_tool="update_workflow",
+    )
+
+
+def test_metadata_preflight_yields_to_live_ladder_and_records_conflict() -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is True
+    assert any(
+        event.owner == "output_contract_actuation" and event.yielded == "metadata_run_preflight_reject"
+        for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_metadata_preflight_does_not_yield_without_a_live_grant() -> None:
+    ctx = make_copilot_ctx()
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
+    assert ctx.gate_precedence_conflict_events == []
+
+
+def test_metadata_preflight_does_not_yield_during_ordinary_reject_without_a_grant() -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_count_by_signature["sig_landed"] = 1
+    assert output_contract_ladder_unresolved(ctx) is True
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
+
+
+def test_metadata_preflight_does_not_yield_to_a_genuine_terminal_owner() -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
+    terminal = _genuine_terminal_signal()
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, terminal)
+    ctx.turn_halt = turn_halt_from_blocker_signal(terminal, source="test")
+    assert current_turn_owner(ctx).claimant is TurnClaimant.GENUINELY_TERMINAL
+
+    assert wu._metadata_preflight_reject_yields_to_ladder(ctx) is False
+
+
+def test_metadata_preflight_reject_returns_none_at_call_site_while_ladder_owns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx()
+    ctx.output_contract_actuation_by_signature["sig_live"] = OutputContractAdvisoryState.GRANTED
+    monkeypatch.setattr(
+        wu,
+        "_recorded_outcome_convergence_reject",
+        lambda *args, **kwargs: wu._ConvergenceReject("sig_target", "frontier_unchanged", False),
+    )
+    monkeypatch.setattr(wu, "_workflow_yaml_code_blocks_by_label", lambda *args: {})
+    monkeypatch.setattr(wu, "_record_author_time_reject_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda *args, **kwargs: None)
+
+    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
+
+    assert result is None
+    assert any(event.yielded == "metadata_run_preflight_reject" for event in ctx.gate_precedence_conflict_events)
+
+
+def test_metadata_preflight_reject_still_rejects_without_a_live_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx()
+    monkeypatch.setattr(
+        wu,
+        "_recorded_outcome_convergence_reject",
+        lambda *args, **kwargs: wu._ConvergenceReject("sig_target", "frontier_unchanged", False),
+    )
+    monkeypatch.setattr(wu, "_workflow_yaml_code_blocks_by_label", lambda *args: {})
+    monkeypatch.setattr(wu, "_record_author_time_reject_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda *args, **kwargs: None)
+
+    result = wu._metadata_contract_run_preflight_reject(ctx, "workflow: yaml", {})
+
+    assert result is not None
+    assert result["ok"] is False
 
 
 def test_credential_scout_submit_gate_still_blocks_with_author_time_log_only(

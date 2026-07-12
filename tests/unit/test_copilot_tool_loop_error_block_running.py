@@ -49,6 +49,9 @@ def _ctx(**overrides: Any) -> Any:
         "output_contract_actuation_count_by_signature": {},
         "output_contract_armed_directive_fingerprint_by_signature": {},
         "output_contract_dispatch_reopened_by_signature": {},
+        "turn_ownership": None,
+        "blocker_signal_claimant": None,
+        "gate_precedence_conflict_events": [],
     }
     base.update(overrides)
     return SimpleNamespace(**base)

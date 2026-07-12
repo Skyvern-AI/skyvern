@@ -214,7 +214,13 @@ async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
     stream.is_disconnected = AsyncMock(return_value=True)
     stream.send = AsyncMock(return_value=True)
 
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -246,7 +252,13 @@ async def test_tool_call_sse_uses_product_safe_activity_label() -> None:
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -284,7 +296,13 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
 
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     with pytest.raises(asyncio.CancelledError):
         await stream_to_sse(result, stream, ctx)
@@ -422,7 +440,13 @@ async def test_tool_result_sse_summary_translates_loop_detected_failure() -> Non
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
 
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -485,6 +509,11 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
         tool_blocker_signals=[signal],
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
     )
 
     await stream_to_sse(result, stream, ctx)
@@ -552,6 +581,11 @@ async def test_stream_to_sse_cancels_and_stops_on_terminal_turn_halt() -> None:
         tool_blocker_signals=[signal],
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
     )
 
     with pytest.raises(CopilotTurnHalt):
@@ -587,7 +621,13 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     with pytest.raises(CopilotUnrecoverableToolError):
         await stream_to_sse(result, stream, ctx)
@@ -631,7 +671,13 @@ async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
 
-    ctx = SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None)
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
