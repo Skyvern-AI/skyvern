@@ -51,13 +51,15 @@ def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
     Restricted to the sole-key case on purpose: if real sibling args sit next to
     ``raw_arguments`` the call is ambiguous (the blob may be garbage, or duplicate
     a top-level arg), so it is left to error rather than merging stray keys into
-    an otherwise-valid call. A non-object ``raw_arguments`` is likewise left to
-    error instead of being silently swallowed.
+    an otherwise-valid call. A non-object (or over-long) ``raw_arguments`` is
+    likewise left to error instead of being silently swallowed.
     """
     if list(arguments) != ["raw_arguments"]:
         return
     raw = arguments["raw_arguments"]
     if isinstance(raw, str):
+        if len(raw) > _MAX_COERCE_STR_LEN:
+            return  # never parse unbounded remote input before validation
         try:
             raw = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
@@ -101,33 +103,55 @@ def _coerce_json_object_to_str(value: Any) -> Any:
     A JSON Schema passed as an object (dict) instead of its serialized string
     form has one unambiguous reading. A list is not a valid schema object and
     scalars are not schemas, so both are left untouched to error rather than
-    being pushed downstream as an invalid schema.
+    being pushed downstream as an invalid schema. An over-long serialization is
+    also left to error so an unbounded string never crosses the boundary.
     """
     if isinstance(value, dict):
-        return json.dumps(value)
+        dumped = json.dumps(value)
+        if len(dumped) <= _MAX_COERCE_STR_LEN:
+            return dumped
     return value
 
 
 def _promote_block_json_alias(arguments: dict[str, Any]) -> None:
     """Promote a misnamed block-definition arg to ``block_json`` in place.
 
-    An explicit non-empty ``block_json`` always wins; only the first usable
-    alias is promoted, and every stray alias key is dropped so it cannot trip
-    the unexpected-keyword check.
+    Only the unambiguous single-payload case is repaired; ambiguity is left to
+    error rather than silently resolved:
+
+    - if ``block_json`` is already present, nothing is promoted over it and stray
+      aliases are left in place — otherwise a distinct alias would be silently
+      discarded, or a malformed non-string ``block_json`` silently overwritten;
+    - with no ``block_json``, an alias is promoted only when exactly ONE distinct,
+      promotable (str, or dict/list within the size cap) payload is present.
+      Multiple distinct payloads, or any non-promotable / over-long value, are
+      left to error.
+
+    Intentionally stricter than the copilot pre-hook copy
+    (``_normalize_block_json_alias``), which runs first on the copilot path; this
+    is the remote-facing boundary and must not silently discard a conflicting arg.
     """
-    has_block_json = isinstance(arguments.get("block_json"), str) and bool(arguments["block_json"].strip())
-    promoted: str | None = None
+    if "block_json" in arguments:
+        return
+    serialized: dict[str, str | None] = {}
     for alias in _BLOCK_JSON_ALIASES:
         if alias not in arguments:
             continue
-        value = arguments.pop(alias)
-        if has_block_json or promoted is not None:
-            continue
+        value = arguments[alias]
         if isinstance(value, str):
-            promoted = value
+            serialized[alias] = value
         elif isinstance(value, (dict, list)):
-            promoted = json.dumps(value)
-    if promoted is not None:
+            dumped = json.dumps(value)
+            serialized[alias] = dumped if len(dumped) <= _MAX_COERCE_STR_LEN else None
+        else:
+            serialized[alias] = None
+    if not serialized:
+        return
+    distinct = {payload for payload in serialized.values() if payload is not None}
+    if len(distinct) == 1 and None not in serialized.values():
+        promoted = next(iter(distinct))
+        for alias in serialized:
+            arguments.pop(alias)
         arguments["block_json"] = promoted
 
 

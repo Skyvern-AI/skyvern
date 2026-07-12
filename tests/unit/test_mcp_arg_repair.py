@@ -80,6 +80,14 @@ async def test_json_array_string_raw_arguments_is_not_masked() -> None:
     _assert_invalid_input(res, ["raw_arguments"])
 
 
+def test_oversized_raw_arguments_string_not_parsed() -> None:
+    # An unbounded raw_arguments string is never parsed before validation.
+    huge = '{"block_type":"' + "n" * 60000 + '"}'
+    args = {"raw_arguments": huge}
+    repair_tool_arguments("skyvern_block_schema", args)
+    assert args == {"raw_arguments": huge}
+
+
 # --- mechanism (b): parameter_keys str -> list (SKY-12048 / SKY-12049) ---
 
 
@@ -169,6 +177,15 @@ def test_extract_schema_list_not_masked() -> None:
     assert args["schema"] == schema_list
 
 
+def test_extract_schema_oversized_dict_not_serialized() -> None:
+    # An unbounded dict is left to error rather than serialized into an
+    # unbounded string that crosses the boundary.
+    big = {f"k{i}": "v" for i in range(20000)}
+    args = {"prompt": "x", "schema": big}
+    repair_tool_arguments("skyvern_extract", args)
+    assert args["schema"] is big
+
+
 # --- mechanism (b): block_json alias for validate (SKY-11133) ---
 
 
@@ -187,11 +204,41 @@ def test_block_validate_dict_alias_serialized() -> None:
     assert "definition" not in args
 
 
-def test_block_validate_existing_block_json_wins_and_stray_dropped() -> None:
+def test_block_validate_identical_aliases_promoted() -> None:
+    # One payload under two names is unambiguous — promote it.
+    args = {"block": '{"x":1}', "definition": '{"x":1}'}
+    repair_tool_arguments("skyvern_block_validate", args)
+    assert args == {"block_json": '{"x":1}'}
+
+
+def test_block_validate_distinct_alias_alongside_block_json_left_to_error() -> None:
+    # A distinct alias next to a present block_json is ambiguous; it must NOT be
+    # silently dropped (that discards a payload). Leave both to error.
     args = {"block_json": '{"a":1}', "block": '{"b":2}'}
     repair_tool_arguments("skyvern_block_validate", args)
-    assert args["block_json"] == '{"a":1}'
-    assert "block" not in args
+    assert args == {"block_json": '{"a":1}', "block": '{"b":2}'}
+
+
+def test_block_validate_conflicting_distinct_aliases_left_to_error() -> None:
+    # Two distinct payloads under different aliases — do not first-wins-pick one.
+    args = {"block": '{"a":1}', "definition": '{"b":2}'}
+    repair_tool_arguments("skyvern_block_validate", args)
+    assert args == {"block": '{"a":1}', "definition": '{"b":2}'}
+
+
+def test_block_validate_non_string_canonical_not_overwritten() -> None:
+    # A malformed non-string block_json must error, not be silently overwritten
+    # by an alias.
+    args = {"block_json": 7, "block": '{"x":1}'}
+    repair_tool_arguments("skyvern_block_validate", args)
+    assert args == {"block_json": 7, "block": '{"x":1}'}
+
+
+def test_block_validate_non_promotable_alias_left_to_error() -> None:
+    # A non-string/non-dict alias value is malformed; leave it to error.
+    args = {"block": 7}
+    repair_tool_arguments("skyvern_block_validate", args)
+    assert args == {"block": 7}
 
 
 # --- deliberately NOT masked: wrong-tool block_schema (SKY-12140 / SKY-12141) ---
