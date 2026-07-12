@@ -2425,6 +2425,30 @@ def _requested_output_coverage_tokens(ctx: AgentContext) -> dict[str, frozenset[
     }
 
 
+def _registered_download_deliverable_paths(ctx: AgentContext) -> set[str]:
+    return {
+        criterion.output_path
+        for criterion in _pre_run_gated_completion_criteria(ctx)
+        if criterion.declared_deliverable_kind == "registered_download" and criterion.output_path
+    }
+
+
+def download_satisfied_requested_output_paths(ctx: AgentContext) -> set[str]:
+    """Requested-output paths a reached download registration satisfies at runtime rather than a
+    page-scalar read: the registered-download alias paths plus the paths the classifier declared as
+    ``registered_download`` deliverables. Empty unless a download target with a captured selector
+    was reached. Author-time seam classification only — it never credits scout coverage."""
+    download = ctx.reached_download_target
+    if download is None or not download.selector:
+        return set()
+    requested = _requested_output_paths_for_ctx(ctx)
+    # The scout reads page scalars; it can never read a file that exists only once a download fires.
+    # So a declared download kind on a path the scout DID cover is a classifier false positive, and the
+    # path stays a live-read scalar. The canonical alias paths are download-registered by definition.
+    declared = _registered_download_deliverable_paths(ctx) - set(ctx.scouted_output_covered_paths)
+    return requested & (REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS | declared)
+
+
 def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     """Requested-output paths not yet credited by scouted evidence. A path whose identifying
     tokens are all generic (e.g. ``output.data``) is uncoverable by token match and is exempted,
@@ -2433,15 +2457,32 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     if not requested:
         return set()
     tokens_by_path = _requested_output_coverage_tokens(ctx)
-    covered: set[str] = set(ctx.scouted_output_covered_paths)
-    download = ctx.reached_download_target
-    if download is not None and download.selector:
-        covered |= REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+    covered: set[str] = set(ctx.scouted_output_covered_paths) | download_satisfied_requested_output_paths(ctx)
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
 def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
     requested_paths = _requested_output_paths_for_ctx(ctx)
+    if not requested_paths:
+        return None
+    labels_by_path: dict[str, tuple[str, ...]] = {}
+    for criterion in _pre_run_gated_completion_criteria(ctx):
+        if criterion.output_path in requested_paths and criterion.outcome.strip():
+            labels_by_path.setdefault(criterion.output_path, ())
+            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+    if set(labels_by_path) != requested_paths:
+        return None
+    return derive_requested_output_extraction_plan(
+        flow_evidence=ctx.flow_evidence,
+        labels_by_path=labels_by_path,
+    )
+
+
+def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+    """Extraction plan over the page-scalar subset of requested outputs (requested minus the
+    download-registered paths), for the mixed download+scalar shape whose download half is
+    satisfied by execution registration rather than a static keyed read."""
+    requested_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
     if not requested_paths:
         return None
     labels_by_path: dict[str, tuple[str, ...]] = {}
@@ -2598,10 +2639,11 @@ def synthesized_trajectory_is_goal_complete(ctx: AgentContext) -> bool:
         return False
     if _request_expects_unreached_download(ctx):
         return False
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    plan = requested_output_extraction_plan(ctx)
-    if requested_paths and (plan is None or not requested_paths.issubset(set(plan.requested_output_paths))):
-        return False
+    scalar_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
+    if scalar_paths:
+        plan = requested_scalar_output_extraction_plan(ctx)
+        if plan is None or not scalar_paths.issubset(set(plan.requested_output_paths)):
+            return False
     if _credential_flow_scout_gap_incomplete(ctx, ctx.scout_trajectory):
         return False
     return synthesized_trajectory_reaches_goal(ctx)
