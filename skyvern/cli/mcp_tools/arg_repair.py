@@ -14,6 +14,7 @@ regresses into hiding tool-selection problems.
 
 from __future__ import annotations
 
+import ast
 import json
 from typing import Any
 
@@ -21,6 +22,12 @@ import structlog
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 
 LOG = structlog.get_logger(__name__)
+
+# ``skyvern_block_validate`` takes ``block_json`` (a JSON string of one block
+# definition); the model sometimes names it under one of these shorter keys.
+# Mirror of the copilot-side pre-hook (``_normalize_block_json_alias``) so the
+# REMOTE MCP path is covered too — the copilot-only shim missed it (SKY-11133).
+_BLOCK_JSON_ALIASES = ("block", "block_definition", "definition", "block_yaml")
 
 
 def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
@@ -52,14 +59,84 @@ def _unwrap_raw_arguments(arguments: dict[str, Any]) -> None:
     arguments.update(raw)
 
 
+def _coerce_str_to_str_list(value: Any) -> Any:
+    """Coerce a stringified list or a bare string into ``list[str]``.
+
+    LLMs sometimes serialize a list arg to a string — either a JSON/py-literal
+    list (``'["a","b"]'`` or ``"['a','b']"``) or a single bare key (``"a"``).
+    Both have exactly one unambiguous list reading. Non-string values (an actual
+    list, or a scalar like an int) pass through untouched so a genuinely
+    malformed value still errors instead of being masked.
+    """
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if stripped[:1] in "[(" and stripped[-1:] in ")]":
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(stripped)
+            except (ValueError, SyntaxError, TypeError):
+                continue
+            if isinstance(parsed, (list, tuple)):
+                return [str(item) for item in parsed]
+    return [value]
+
+
+def _coerce_json_object_to_str(value: Any) -> Any:
+    """Serialize a dict/list arg to a JSON string for a string-typed param.
+
+    A JSON Schema passed as an object instead of its serialized string form has
+    one unambiguous reading. Strings and scalars pass through unchanged.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return value
+
+
+def _promote_block_json_alias(arguments: dict[str, Any]) -> None:
+    """Promote a misnamed block-definition arg to ``block_json`` in place.
+
+    An explicit non-empty ``block_json`` always wins; only the first usable
+    alias is promoted, and every stray alias key is dropped so it cannot trip
+    the unexpected-keyword check.
+    """
+    has_block_json = isinstance(arguments.get("block_json"), str) and bool(arguments["block_json"].strip())
+    promoted: str | None = None
+    for alias in _BLOCK_JSON_ALIASES:
+        if alias not in arguments:
+            continue
+        value = arguments.pop(alias)
+        if has_block_json or promoted is not None:
+            continue
+        if isinstance(value, str):
+            promoted = value
+        elif isinstance(value, (dict, list)):
+            promoted = json.dumps(value)
+    if promoted is not None:
+        arguments["block_json"] = promoted
+
+
 def repair_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> None:
     """Mutate ``arguments`` in place to fix unambiguous arg-shape mistakes.
 
     ``tool_name`` is the raw MCP tool name (e.g. ``skyvern_navigate``). The
     middleware wraps this whole pass so any repair bug degrades to passthrough
     rather than a failed tool call.
+
+    Deliberately NOT handled: a full block definition sent to
+    ``skyvern_block_schema`` (which takes a ``block_type`` string, not a
+    definition). That is a wrong-tool call — the model meant
+    ``skyvern_block_validate`` — so coercing it would mask a tool-selection bug
+    (SKY-12140 / SKY-12141). It must keep erroring.
     """
     _unwrap_raw_arguments(arguments)
+
+    if tool_name == "skyvern_code_block_lint" and "parameter_keys" in arguments:
+        arguments["parameter_keys"] = _coerce_str_to_str_list(arguments["parameter_keys"])
+    elif tool_name == "skyvern_extract" and "schema" in arguments:
+        arguments["schema"] = _coerce_json_object_to_str(arguments["schema"])
+    elif tool_name == "skyvern_block_validate":
+        _promote_block_json_alias(arguments)
 
 
 class ArgRepairMiddleware(Middleware):
