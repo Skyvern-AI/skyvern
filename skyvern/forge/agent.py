@@ -170,7 +170,7 @@ from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context, is_browser_crashed_error
 
 LOG = structlog.get_logger()
 BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
@@ -3304,8 +3304,14 @@ class ForgeAgent:
                             step=step,
                         )
                     )
-        except Exception:
-            LOG.exception("Failed to record html after action")
+        except Exception as e:
+            # Recording the HTML artifact is best-effort; a renderer/target crash here
+            # does not affect the action outcome. Downgrade the environmental crash to a
+            # warning; real artifact-recording failures stay loud. SKY-12344.
+            if is_browser_crashed_error(e):
+                LOG.warning("Browser crashed/closed while recording html after action; skipping html artifact")
+            else:
+                LOG.exception("Failed to record html after action")
 
         if artifacts:
             _tracer = otel_trace.get_tracer("skyvern")

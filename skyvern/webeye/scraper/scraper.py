@@ -34,7 +34,7 @@ from skyvern.webeye.scraper.scraped_page import (
     ScrapeExcludeFunc,
     json_to_html,
 )
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import SkyvernFrame, is_browser_crashed_error
 
 LOG = structlog.get_logger()
 
@@ -546,12 +546,15 @@ async def scrape_web_unsafe(
         html = await skyvern_frame.get_content()
         if page.viewport_size:
             window_dimension = Resolution(width=page.viewport_size["width"], height=page.viewport_size["height"])
-    except Exception:
-        LOG.error(
-            "Failed out to get HTML content",
-            url=url,
-            exc_info=True,
-        )
+    except Exception as e:
+        # The element tree was already captured above; an empty html here degrades only
+        # the HTML artifact and a secondary heuristic. A renderer/target crash is an
+        # environmental event the run already tolerates -- log it as a warning rather
+        # than polluting error-tracking. Real content-read bugs stay loud. SKY-12344.
+        if is_browser_crashed_error(e):
+            LOG.warning("Browser crashed/closed while reading page HTML; continuing with empty HTML", url=url)
+        else:
+            LOG.error("Failed out to get HTML content", url=url, exc_info=True)
 
     _record_scrape_span_attrs(
         elements=elements,
