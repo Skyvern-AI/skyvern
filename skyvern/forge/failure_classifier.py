@@ -76,9 +76,9 @@ def classify_from_failure_reason(
 
     # Proxy errors — check before browser errors so proxy failures don't fall into BROWSER_ERROR.
     # The exception name may contain "Browser" (e.g. UnknownErrorWhileCreatingBrowserContext) but the
-    # root cause is proxy pool exhaustion.
-    _proxy_exc_keywords = ["NoProxy", "ProxyError"]
-    _proxy_reason_keywords = ["no proxy available", "proxy unavailable"]
+    # root cause is proxy pool exhaustion or proxy connectivity failure.
+    _proxy_exc_keywords = ["NoProxy", "ProxyError", "GetOutboundIP"]
+    _proxy_reason_keywords = ["no proxy available", "proxy unavailable", "failed to get outbound ip"]
     if any(kw in exc_name for kw in _proxy_exc_keywords) or any(kw in reason for kw in _proxy_reason_keywords):
         categories.append(
             {

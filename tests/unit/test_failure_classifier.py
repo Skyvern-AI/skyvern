@@ -16,6 +16,41 @@ class UnknownErrorWhileCreatingBrowserContext(Exception):
 class ProxyErrorOccurred(Exception):
     pass
 
+    def test_get_outbound_ip_failed_exception_is_proxy_not_browser(self) -> None:
+        """GetOutboundIPFailed should be PROXY_ERROR, not BROWSER_ERROR."""
+
+        class GetOutboundIPFailed(Exception):
+            pass
+
+        result = classify_from_failure_reason(
+            "Failed to create browser context for dynamic-browser (GetOutboundIPFailed). "
+            "Failed to get outbound ip (proxy_network=joinmassive-isp-dedicated): "
+            "https://checkip.amazonaws.com=ProxyError",
+            exception=GetOutboundIPFailed(),
+        )
+        assert result is not None
+        assert result[0]["category"] == "PROXY_ERROR"
+        categories = [r["category"] for r in result]
+        assert "BROWSER_ERROR" not in categories
+
+    def test_get_outbound_ip_failed_reason_without_exception(self) -> None:
+        """GetOutboundIPFailed in failure_reason text alone should yield PROXY_ERROR.
+
+        The workflow run failure path calls classify_from_failure_reason without exception=,
+        so the proxy classification must be driven by the failure_reason text.
+        """
+        reason = (
+            "goto_url block failed. failure reason: Failed to create browser context for dynamic-browser "
+            "(GetOutboundIPFailed). Failed to get outbound ip (proxy_network=joinmassive-isp-dedicated): "
+            "https://checkip.amazonaws.com=ProxyError, https://ipinfo.io/ip=ProxyError"
+        )
+        result = classify_from_failure_reason(reason, fallback_to_unknown=True)
+        assert result is not None
+        assert result[0]["category"] == "PROXY_ERROR"
+        categories = [r["category"] for r in result]
+        assert "UNKNOWN" not in categories
+        assert "BROWSER_ERROR" not in categories
+
 
 class BrowserCrashError(Exception):
     pass
