@@ -114,6 +114,28 @@ def test_parameter_keys_non_string_scalar_not_masked() -> None:
     assert args["parameter_keys"] == 5
 
 
+def test_parameter_keys_nested_list_not_masked() -> None:
+    # A list whose elements are not strings must NOT be str()-flattened into
+    # phantom keys — leave the raw value so it still errors at validation.
+    args = {"parameter_keys": '[["a", "b"]]'}
+    repair_tool_arguments("skyvern_code_block_lint", args)
+    assert args["parameter_keys"] == '[["a", "b"]]'
+
+
+def test_parameter_keys_non_string_elements_not_masked() -> None:
+    args = {"parameter_keys": "[1, 2]"}
+    repair_tool_arguments("skyvern_code_block_lint", args)
+    assert args["parameter_keys"] == "[1, 2]"
+
+
+def test_parameter_keys_oversized_string_not_parsed() -> None:
+    # An unbounded attacker-controlled string is left unparsed (DoS guard).
+    huge = "[" + ",".join(["1"] * 40000) + "]"
+    args = {"parameter_keys": huge}
+    repair_tool_arguments("skyvern_code_block_lint", args)
+    assert args["parameter_keys"] == huge
+
+
 # --- mechanism (b): extract schema dict -> json string (SKY-12338) ---
 
 
@@ -128,6 +150,15 @@ def test_extract_schema_string_untouched() -> None:
     args = {"prompt": "x", "schema": '{"type":"object"}'}
     repair_tool_arguments("skyvern_extract", args)
     assert args["schema"] == '{"type":"object"}'
+
+
+def test_extract_schema_list_not_masked() -> None:
+    # A JSON *array* is not a valid schema object; do not serialize it past the
+    # boundary — leave it so pydantic still rejects the non-string value.
+    schema_list = [{"type": "object"}]
+    args = {"prompt": "x", "schema": schema_list}
+    repair_tool_arguments("skyvern_extract", args)
+    assert args["schema"] == schema_list
 
 
 # --- mechanism (b): block_json alias for validate (SKY-11133) ---
