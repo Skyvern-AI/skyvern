@@ -32,6 +32,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import TOTPExpiredError, UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    CaptchaSolveError,
     CardNumberInputMismatch,
     EmptySelect,
     ErrEmptyTweakValue,
@@ -2344,6 +2345,14 @@ class ActionHandler:
             actions_result.append(ActionFailure(e))
         except ImaginarySecretValue as e:
             LOG.exception("Imaginary secret value", action=action, exc_info=True)
+            actions_result.append(ActionFailure(e))
+        except CaptchaSolveError as e:
+            LOG.warning(
+                "Captcha solve failed",
+                action=action,
+                exception_type=type(e).__name__,
+                exception_message=str(e),
+            )
             actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
