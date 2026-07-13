@@ -62,6 +62,7 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
+    NoTOTPSecretFound,
     OptionIndexOutOfBound,
     PhoneNumberInputMismatch,
     SkyvernException,
@@ -95,6 +96,8 @@ from skyvern.forge.sdk.services.credentials import (
     AzureVaultConstants,
     OnePasswordConstants,
     generate_totp_code,
+    is_unresolved_totp_placeholder,
+    is_unresolved_totp_value,
     parse_totp_config,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -3009,8 +3012,53 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     if not action.element_id:
         # This is a CUA type action
-        await EventStrategyFactory.type_text(page, None, action.text)
+        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+        if text_result is None:
+            return [ActionFailure(FailedToFetchSecret())]
+        if is_unresolved_totp_placeholder(text_result):
+            return [ActionFailure(NoTOTPSecretFound())]
+        cua_text = text_result
+        if cua_text in (BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP):
+            try:
+                cua_totp_secret = get_totp_secret_with_task(task=task, parameter=action.text)
+                cua_text = generate_totp_value_from_secret(cua_totp_secret)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
+        elif is_unresolved_totp_value(cua_text):
+            return [ActionFailure(NoTOTPSecretFound())]
+        await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
+
+    totp_secret: str | None = None
+    is_multi_field_totp = bool(action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
+    if is_multi_field_totp:
+        text = ""
+        current_text_target = action.text
+        is_totp_value = False
+        is_secret_value = True
+    else:
+        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+        if text_result is None:
+            return [ActionFailure(FailedToFetchSecret())]
+        if is_unresolved_totp_placeholder(text_result):
+            return [ActionFailure(NoTOTPSecretFound())]
+        is_totp_value = text_result in (
+            BitwardenConstants.TOTP,
+            OnePasswordConstants.TOTP,
+            AzureVaultConstants.TOTP,
+        )
+        if not is_totp_value and is_unresolved_totp_value(text_result):
+            return [ActionFailure(NoTOTPSecretFound())]
+        if is_totp_value:
+            try:
+                totp_secret = get_totp_secret_with_task(task=task, parameter=action.text)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
+            text = ""
+        else:
+            text = text_result
+        current_text_target = text_result
+        is_secret_value = is_totp_value or text != action.text
 
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
@@ -3019,27 +3067,11 @@ async def handle_input_text_action(
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
-    if current_text == action.text:
+    if not is_totp_value and current_text == current_text_target:
         return [ActionSuccess()]
 
     # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
-
-    # Check if this is multi-field TOTP first - if so, skip secret resolution
-    if action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"):
-        # For multi-field TOTP, we'll set text directly in the TOTP logic below
-        text: str = ""
-    else:
-        # For regular inputs, resolve secrets
-        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
-        if text_result is None:
-            return [ActionFailure(FailedToFetchSecret())]
-        text = text_result
-
-    is_totp_value = (
-        text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP or text == AzureVaultConstants.TOTP
-    )
-    is_secret_value = text != action.text
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
@@ -3050,14 +3082,20 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    select_action = SelectOptionAction(
-        reasoning=action.reasoning,
-        element_id=skyvern_element.get_id(),
-        option=SelectOption(label=text),
-        intention=action.intention,
-        input_or_select_context=action.input_or_select_context,
-    )
     if await skyvern_element.get_selectable():
+        select_text = text
+        if is_totp_value:
+            try:
+                select_text = generate_totp_value_from_secret(totp_secret)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
+        select_action = SelectOptionAction(
+            reasoning=action.reasoning,
+            element_id=skyvern_element.get_id(),
+            option=SelectOption(label=select_text),
+            intention=action.intention,
+            input_or_select_context=action.input_or_select_context,
+        )
         LOG.info(
             "Input element is selectable, doing select actions",
             element_id=skyvern_element.get_id(),
@@ -3065,6 +3103,14 @@ async def handle_input_text_action(
         )
         action.set_has_mini_agent()
         return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+    select_action = SelectOptionAction(
+        reasoning=action.reasoning,
+        element_id=skyvern_element.get_id(),
+        option=SelectOption(label=text),
+        intention=action.intention,
+        input_or_select_context=action.input_or_select_context,
+    )
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
@@ -3285,7 +3331,10 @@ async def handle_input_text_action(
     class_name: str | None = await skyvern_element.get_attr("class")
     if class_name and "blinking-cursor" in class_name.lower():
         if is_totp_value:
-            text = generate_totp_value_with_task(task=task, parameter=action.text)
+            try:
+                text = generate_totp_value_from_secret(totp_secret)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
         await skyvern_element.press_fill(text=text)
         return [ActionSuccess()]
 
@@ -3340,7 +3389,10 @@ async def handle_input_text_action(
 
     if is_totp_value:
         LOG.info("Skipping the auto completion logic since it's a TOTP input")
-        text = generate_totp_value_with_task(task=task, parameter=action.text)
+        try:
+            text = generate_totp_value_from_secret(totp_secret)
+        except NoTOTPSecretFound as exc:
+            return [ActionFailure(exc)]
         await skyvern_element.input(text)
         return [ActionSuccess()]
 
@@ -4787,33 +4839,125 @@ def get_actual_value_of_parameter_if_secret_with_task(task: Task, parameter: str
     return get_actual_value_of_parameter_if_secret(task.workflow_run_id, parameter)
 
 
-def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
+def get_totp_secret(workflow_run_id: str, parameter: str) -> str:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if not workflow_run_context:
+        raise NoTOTPSecretFound()
     totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
     totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
     if not totp_secret:
-        LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
-        return parameter
-    return generate_totp_code(totp_secret)
+        LOG.warning("No TOTP secret found")
+        raise NoTOTPSecretFound()
+    if parse_totp_config(totp_secret) is None:
+        LOG.warning("Failed to parse TOTP credential secret")
+        raise NoTOTPSecretFound()
+    return totp_secret
+
+
+def get_totp_secret_with_task(task: Task, parameter: str) -> str:
+    if task.workflow_run_id is None:
+        raise NoTOTPSecretFound()
+    return get_totp_secret(task.workflow_run_id, parameter)
+
+
+def generate_totp_value_from_secret(totp_secret: str | None) -> str:
+    if not totp_secret:
+        raise NoTOTPSecretFound()
+    try:
+        return generate_totp_code(totp_secret)
+    except Exception as exc:
+        LOG.warning("Failed to generate TOTP from credential secret", exception_type=type(exc).__name__)
+        raise NoTOTPSecretFound() from exc
+
+
+def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
+    return generate_totp_value_from_secret(get_totp_secret(workflow_run_id, parameter))
 
 
 def generate_totp_value_with_task(task: Task, parameter: str) -> str:
     if task.workflow_run_id is None:
-        return parameter
+        raise NoTOTPSecretFound()
     return generate_totp_value(task.workflow_run_id, parameter)
 
 
 async def _did_page_respond(
     incremental_scraped: IncrementalScrapePage,
+    frame: Page | Frame,
+    original_url: str,
     skyvern_frame: SkyvernFrame | None = None,
 ) -> bool:
     try:
         if skyvern_frame:
             await skyvern_frame.safe_wait_for_animation_end(caller="page_respond")
-        return (await incremental_scraped.get_incremental_elements_num()) > 0
+        return frame.url != original_url or (await incremental_scraped.get_incremental_elements_num()) > 0
     except Exception:
         LOG.debug("Failed to check incremental elements after click", exc_info=True)
         return True
+
+
+async def _click_in_javascript_and_verify(
+    action: ClickAction | UploadFileAction,
+    page: Page,
+    skyvern_element: SkyvernElement,
+    incremental_scraped: IncrementalScrapePage,
+    skyvern_frame: SkyvernFrame | None,
+    *,
+    anchor: str,
+    no_response_msg: str,
+) -> ActionResult:
+    try:
+        frame = skyvern_frame.get_frame() if skyvern_frame else page
+        original_url = frame.url
+        await skyvern_element.click_in_javascript()
+        if await _did_page_respond(incremental_scraped, frame, original_url, skyvern_frame):
+            return ActionSuccess()
+        LOG.info(
+            "Chain click: JS click did not trigger a page response",
+            action=action,
+            element=str(skyvern_element),
+        )
+        return ActionFailure(FailToClick(action.element_id, anchor=anchor, msg=no_response_msg))
+    except Exception as e:
+        return ActionFailure(FailToClick(action.element_id, anchor=anchor, msg=str(e)))
+
+
+async def _is_likely_sibling_control(element: SkyvernElement, timeout: int) -> bool:
+    try:
+        metrics = await element.get_locator().evaluate(
+            """(element) => {
+                const rect = element.getBoundingClientRect();
+                const root = document.documentElement;
+                return {
+                    width: rect.width,
+                    height: rect.height,
+                    viewport_width: window.innerWidth || root.clientWidth || 0,
+                    viewport_height: window.innerHeight || root.clientHeight || 0,
+                    inside_modal: Boolean(element.closest(
+                        'dialog,[role="dialog" i],[role="alertdialog" i],[aria-modal="true" i]'
+                    )),
+                };
+            }""",
+            timeout=timeout,
+        )
+    except Exception:
+        LOG.debug("Failed to classify blocking sibling", exc_info=True, element_id=element.get_id())
+        return False
+
+    if not isinstance(metrics, dict) or metrics.get("inside_modal") is not False:
+        return False
+    width = metrics.get("width")
+    height = metrics.get("height")
+    viewport_width = metrics.get("viewport_width")
+    viewport_height = metrics.get("viewport_height")
+    dimensions = (width, height, viewport_width, viewport_height)
+    numeric_dimensions: list[float] = []
+    for value in dimensions:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return False
+        numeric_dimensions.append(float(value))
+    numeric_width, numeric_height, numeric_viewport_width, numeric_viewport_height = numeric_dimensions
+    # ponytail: non-modal overlays are size-gated; add style/z-index signals if smaller overlays surface.
+    return numeric_width < numeric_viewport_width / 2 and numeric_height < numeric_viewport_height / 2
 
 
 def _get_click_count(action: ClickAction | UploadFileAction) -> int:
@@ -5032,6 +5176,46 @@ async def chain_click(
                         )
                         action_results.append(ActionSuccess())
                         return action_results
+
+                # A non-anchor click (e.g. a primary form submit) blocked by an
+                # untracked overlay (a consent / opt-out / FCRA modal over the
+                # control): a coordinate click would land on whatever pixel is on
+                # top — the overlay's own button — so dispatch on the intended
+                # element instead (element.click() fires on the target node,
+                # bypassing hit-testing and never touching the overlay). This
+                # needs the observer to confirm the click landed; without one we
+                # fail cleanly rather than guess, like the blocker path below.
+                if (
+                    isinstance(action, ClickAction)
+                    and not action.file_url
+                    and not action.download
+                    and action.x is None
+                    and action.y is None
+                    and click_count == 1
+                    and incremental_scraped is not None
+                    and skyvern_element.get_tag_name() != InteractiveElement.A
+                ):
+                    LOG.info(
+                        "Chain click: click blocked by an untracked overlay; dispatching on the intended element "
+                        "instead of coordinate-clicking into the overlay",
+                        action=action,
+                        element=str(skyvern_element),
+                        locator=locator,
+                    )
+                    action_results.append(
+                        await _click_in_javascript_and_verify(
+                            action,
+                            page,
+                            skyvern_element,
+                            incremental_scraped,
+                            skyvern_frame,
+                            anchor="overlay_blocked",
+                            no_response_msg=(
+                                "click blocked by overlay; no page response after intended-element dispatch"
+                            ),
+                        )
+                    )
+                    return action_results
             else:
                 # Element is visible and elementFromPoint returns the target itself,
                 # but Playwright's click still failed (e.g. element transiently
@@ -5075,9 +5259,11 @@ async def chain_click(
                 element=str(blocking_element),
                 locator=locator,
             )
-            if await blocking_element.is_parent_of(
-                await skyvern_element.get_element_handler()
-            ) or await blocking_element.is_sibling_of(await skyvern_element.get_element_handler()):
+            target_handler = await skyvern_element.get_element_handler()
+            if await blocking_element.is_parent_of(target_handler) or (
+                await blocking_element.is_sibling_of(target_handler)
+                and (incremental_scraped is None or await _is_likely_sibling_control(blocking_element, timeout))
+            ):
                 LOG.info(
                     "Chain click: element is blocked by other elements, going to click on the blocking element",
                     action=action,
@@ -5099,28 +5285,23 @@ async def chain_click(
 
         # JS click dispatches directly on the DOM node, bypassing hit-testing.
         LOG.info(
-            "Chain click: blocker is not parent/sibling, trying JS click on original element",
+            "Chain click: blocker is not a safe retarget, trying JS click on original element",
             action=action,
             element=str(skyvern_element),
             locator=locator,
         )
-        try:
-            await skyvern_element.click_in_javascript()
-            if await _did_page_respond(incremental_scraped, skyvern_frame):
-                action_results.append(ActionSuccess())
-                return action_results
-            LOG.info(
-                "Chain click: JS click did not trigger a page response",
-                action=action,
-                element=str(skyvern_element),
+        action_results.append(
+            await _click_in_javascript_and_verify(
+                action,
+                page,
+                skyvern_element,
+                incremental_scraped,
+                skyvern_frame,
+                anchor="self_js",
+                no_response_msg="no page response after click",
             )
-            action_results.append(
-                ActionFailure(FailToClick(action.element_id, anchor="self_js", msg="no page response after click"))
-            )
-            return action_results
-        except Exception as e:
-            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
-            return action_results
+        )
+        return action_results
 
     finally:
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
