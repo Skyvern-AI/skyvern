@@ -1420,6 +1420,60 @@ def _select_value_is_ambiguous(options: list[SkyvernOptionType], value: str | No
     return sum(1 for option in options if option.get("value") == value) > 1
 
 
+# A focus-click before select_option only needs to focus a visible <select>; if an overlay
+# intercepts it we want to bail fast and let select_option commit via the DOM, not stall for the
+# full BROWSER_ACTION_TIMEOUT_MS on every covered select. (SKY-11618)
+_SELECT_FOCUS_CLICK_TIMEOUT_MS = 1000
+
+
+async def _best_effort_focus_click_before_select(*, locator: Locator, action: actions.SelectOptionAction) -> None:
+    """Click a native <select> to focus it before select_option.
+
+    Best-effort: an overlay (e.g. a consent/opt-out modal) can intercept this click, but
+    select_option commits the value via the DOM regardless — a failed focus-click must not
+    abort the selection. Uses a short timeout so an intercepted click bails fast. (SKY-11618)
+    """
+    try:
+        await locator.click(timeout=_SELECT_FOCUS_CLICK_TIMEOUT_MS)
+    except Exception:
+        LOG.info(
+            "Failed to click before select action; continuing to select_option",
+            exc_info=True,
+            action=action,
+            locator=locator,
+        )
+
+
+_DROPDOWN_SURROGATE_ROLES = frozenset({"combobox", "listbox", "option"})
+# aria-haspopup values that advertise a dropdown-style popup (a styled-select trigger). Per ARIA,
+# "true" is equivalent to "menu"; only "dialog" (and "false") denote a non-dropdown popup, so those
+# are excluded — a consent/opt-out modal trigger uses "dialog" and must not qualify.
+_DROPDOWN_SURROGATE_HASPOPUP = frozenset({"listbox", "menu", "tree", "grid", "true"})
+
+
+async def _is_dropdown_surrogate_blocker(element: SkyvernElement) -> bool:
+    """True when a blocking element looks like a styled-dropdown surrogate for a native <select>
+    (another <select>, a combobox/listbox/option widget, or a trigger with a dropdown
+    aria-haspopup) rather than an unrelated overlay such as a consent/opt-out modal.
+
+    Used only on the fallback after native select_option fails: a failed native selection does not
+    prove the overlapping element is a real dropdown, so we require this evidence before retargeting
+    the select action onto it — otherwise an unrelated modal could hijack the selection. Rejecting a
+    genuine-but-unrecognized trigger here is safe: it returns the honest native-select failure rather
+    than click-navigating the wrong element. (SKY-11618)
+    """
+    if element.get_tag_name() == InteractiveElement.SELECT:
+        return True
+    try:
+        role = (await element.get_attr("role") or "").strip().lower()
+        if role in _DROPDOWN_SURROGATE_ROLES:
+            return True
+        haspopup = (await element.get_attr("aria-haspopup") or "").strip().lower()
+    except Exception:
+        return False
+    return haspopup in _DROPDOWN_SURROGATE_HASPOPUP
+
+
 async def _select_deterministic_normal_option(
     *,
     action: actions.SelectOptionAction,
@@ -1432,19 +1486,7 @@ async def _select_deterministic_normal_option(
     action_result: list[ActionResult] = []
     is_success = False
 
-    try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
-    except Exception as e:
-        LOG.info(
-            "Failed to click before select action",
-            exc_info=True,
-            action=action,
-            locator=locator,
-        )
-        action_result.append(ActionFailure(e))
-        return action_result
+    await _best_effort_focus_click_before_select(locator=locator, action=action)
 
     value = matched_value if matched_value is not None else matched_label
     if value is not None and not _select_value_is_ambiguous(skyvern_element.get_options(), value):
@@ -3839,44 +3881,75 @@ async def handle_select_option_action(
             action=action,
         )
 
+        # Idempotent no-op: if the requested value is already selected, we're done — regardless of
+        # visibility. (normal_select does this check too, but the hidden-select path below skips
+        # normal_select, so run it here to avoid a false failure on an already-correct hidden select.)
+        try:
+            current_selected = await skyvern_element.get_attr("selected")
+            if current_selected and current_selected in (action.option.label, action.option.value):
+                return [ActionSuccess()]
+        except Exception:
+            LOG.info("Failed to confirm current <select> value; proceeding with the select action")
+
+        # A VISIBLE native <select> is the real control: drive it via select_option (which commits
+        # the value through the DOM even under an overlay such as a consent/opt-out modal). Try that
+        # first and, on failure, only click-navigate a genuine dropdown surrogate so an unrelated
+        # modal can't hijack it. A hidden native <select> (display:none behind a styled dropdown)
+        # can't be driven by select_option — the overlapping element IS the styled widget that
+        # replaced it, so click-navigate that widget directly (the pre-refactor behavior). (SKY-11618)
+        select_is_visible = await skyvern_element.is_visible()
+        normal_select_result: list[ActionResult] | None = None
+        if select_is_visible:
+            try:
+                normal_select_result = await normal_select(
+                    action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+                )
+            except Exception as e:
+                # normal_select can raise before returning (e.g. an LLM/provider error). Don't lose
+                # the styled-dropdown fallback below — record the failure and keep going.
+                LOG.warning("normal_select raised; falling back to blocking-element detection", exc_info=True)
+                normal_select_result = [ActionFailure(exception=e)]
+            if _normal_select_successful(normal_select_result):
+                return normal_select_result
+
+        blocking_element: SkyvernElement | None = None
+        exist = False
         try:
             await skyvern_element.scroll_into_view()
             blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
-        except Exception:
-            LOG.warning(
-                "Failed to find the blocking element, continue to select on the original <select>",
-                exc_info=True,
-            )
-            return await normal_select(
-                action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
-            )
-
-        if not exist:
-            return await normal_select(
-                action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
-            )
-
-        if blocking_element is None:
-            LOG.info("Try to scroll the element into view, then detecting the blocking element")
-            try:
+            if not exist or blocking_element is None:
                 await skyvern_element.scroll_into_view()
                 blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
-            except Exception:
-                LOG.warning(
-                    "Failed to find the blocking element when scrolling into view, fallback to normal select",
-                    action=action,
-                    exc_info=True,
-                )
-                return await normal_select(
-                    action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
-                )
+        except Exception:
+            LOG.warning("Failed to find the blocking element for <select>", action=action, exc_info=True)
+            blocking_element, exist = None, False
 
         if not exist or blocking_element is None:
-            return await normal_select(
-                action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+            # No styled widget to click-navigate. Return the visible native failure if we ran it; a
+            # hidden <select> with no surrogate can't be driven at all, so fail fast (don't run
+            # select_option on a hidden node — it would only burn the visibility timeout).
+            if normal_select_result is not None:
+                return normal_select_result
+            return [ActionFailure(EmptySelect(element_id=action.element_id))]
+
+        # For a VISIBLE <select>, require dropdown-surrogate evidence before retargeting, so an
+        # unrelated overlay (e.g. a consent/opt-out modal) can't hijack a failed selection. For a
+        # hidden backing <select>, the overlapping element is the styled widget that replaced it —
+        # click-navigate it regardless (its dropdown role may sit on an ancestor of the hit node).
+        if select_is_visible and not await _is_dropdown_surrogate_blocker(blocking_element):
+            LOG.info(
+                "<select> blocked by a non-dropdown element (likely an overlay); returning the native "
+                "select result instead of click-navigating it",
+                blocking_element=blocking_element.get_id(),
             )
+            return (
+                normal_select_result
+                if normal_select_result is not None
+                else [ActionFailure(EmptySelect(element_id=action.element_id))]
+            )
+
         LOG.info(
-            "<select> is blocked by another element, going to select on the blocking element",
+            "<select> not set via select_option; selecting on the blocking (styled-dropdown) element",
             blocking_element=blocking_element.get_id(),
         )
         select_action = SelectOptionAction(
@@ -7527,19 +7600,7 @@ async def normal_select(
         ),
     )
 
-    try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
-    except Exception as e:
-        LOG.info(
-            "Failed to click before select action",
-            exc_info=True,
-            action=action,
-            locator=locator,
-        )
-        action_result.append(ActionFailure(e))
-        return action_result
+    await _best_effort_focus_click_before_select(locator=locator, action=action)
 
     if not is_success and value is not None:
         try:
