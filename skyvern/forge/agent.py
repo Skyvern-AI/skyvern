@@ -378,6 +378,24 @@ async def _cancel_pending_prefetch_task(task: asyncio.Task | None) -> None:
         await task
 
 
+class _BackgroundArtifactTaskTracker:
+    # Instantiated fresh per agent_step call so the in-flight artifact task is isolated
+    # to that call. A shared (module-global or instance) tracker would let concurrent
+    # agent_step invocations await each other's background writes.
+    def __init__(self) -> None:
+        self.task: asyncio.Task | None = None
+
+    async def drain(self) -> None:
+        if self.task is None:
+            return
+        task = self.task
+        self.task = None
+        try:
+            await task
+        except Exception:
+            LOG.warning("Background artifact task failed, continuing", exc_info=True)
+
+
 def _build_totp_timeout_reasoning(task: Task) -> str:
     # Mirror poll_otp_value's URL-then-identifier precedence so we only report the
     # source that was actually queried. URL goes through strip_query_params to keep
@@ -1480,18 +1498,7 @@ class ForgeAgent:
             cua_response=None,
         )
         prefetched_summary_task: asyncio.Task[dict[str, Any]] | None = None
-        current_artifact_task: asyncio.Task | None = None
-
-        async def await_background_artifact_task() -> None:
-            nonlocal current_artifact_task
-            if current_artifact_task is None:
-                return
-            task = current_artifact_task
-            current_artifact_task = None
-            try:
-                await task
-            except Exception:
-                LOG.warning("Background artifact task failed, continuing", exc_info=True)
+        artifact_tracker = _BackgroundArtifactTaskTracker()
 
         try:
             LOG.info(
@@ -1602,302 +1609,30 @@ class ForgeAgent:
                 )
                 return step, detailed_agent_step_output
 
-            # Execute the actions
-            LOG.info(
-                "Executing actions",
-                sampling=True,
-                step_order=step.order,
-                step_retry=step.retry_index,
+            actions, early_return = await self._execute_step_actions(
+                task=task,
+                step=step,
+                browser_state=browser_state,
+                engine=engine,
+                scraped_page=scraped_page,
+                complete_verification=complete_verification,
                 actions=actions,
+                detailed_agent_step_output=detailed_agent_step_output,
+                pdf_auto_download_src=pdf_auto_download_src,
+                pdf_auto_download_used_bytes=pdf_auto_download_used_bytes,
+                _step_span=_step_span,
+                artifact_tracker=artifact_tracker,
             )
-            action_results: list[ActionResult] = []
-            detailed_agent_step_output.action_results = action_results
-            # filter out wait action if there are other actions in the list
-            # we do this because WAIT action is considered as a failure
-            # which will block following actions if we don't remove it from the list
-            # if the list only contains WAIT action, we will execute WAIT action(s)
-            if len(actions) > 1:
-                wait_actions_to_skip = [action for action in actions if action.action_type == ActionType.WAIT]
-                wait_actions_len = len(wait_actions_to_skip)
-                # if there are wait actions and there are other actions in the list, skip wait actions
-                # if we are using cached action plan, we don't skip wait actions
-                if wait_actions_len > 0 and wait_actions_len < len(actions):
-                    actions = [action for action in actions if action.action_type != ActionType.WAIT]
-                    LOG.info(
-                        "Skipping wait actions",
-                        wait_actions_to_skip=wait_actions_to_skip,
-                        actions=actions,
-                    )
-
-            # initialize list of tuples and set actions as the first element of each tuple so that in the case
-            # of an exception, we can still see all the actions
-            detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
-
-            # build a linked action chain by the action_idx
-            action_linked_list: list[ActionLinkedNode] = []
-            element_id_to_action_index: dict[str, int] = dict()
-            for action_idx, action in enumerate(actions):
-                node = ActionLinkedNode(action=action)
-                action_linked_list.append(node)
-
-                if not isinstance(action, WebAction):
-                    continue
-
-                previous_action_idx = element_id_to_action_index.get(action.element_id)
-                if previous_action_idx is not None:
-                    previous_node = action_linked_list[previous_action_idx]
-                    previous_node.next = node
-
-                element_id_to_action_index[action.element_id] = action_idx
-
-            element_id_to_last_action: dict[str, int] = dict()
-            try:
-                wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
-                base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
-            except Exception:
-                base_delay = 0.5
-            for action_idx, action_node in enumerate(action_linked_list):
-                await await_background_artifact_task()
-
-                context = skyvern_context.ensure_context()
-                if context.refresh_working_page:
-                    LOG.warning(
-                        "Detected the signal to reload the page, going to reload and skip the rest of the actions",
-                        step_order=step.order,
-                    )
-                    await browser_state.reload_page()
-                    context.refresh_working_page = False
-                    action_result = ActionSuccess()
-                    action_result.step_order = step.order
-                    action_result.step_retry_number = step.retry_index
-                    action = ReloadPageAction(
-                        reasoning="Something wrong with the current page, reload to continue",
-                        status=ActionStatus.completed,
-                        organization_id=task.organization_id,
-                        workflow_run_id=task.workflow_run_id,
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        step_order=step.order,
-                        action_order=action_idx,
-                    )
-                    detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
-                    action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
-                    current_artifact_task = asyncio.create_task(
-                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
-                    )
-                    break
-
-                action = action_node.action
-                if isinstance(action, WebAction):
-                    previous_action_idx = element_id_to_last_action.get(action.element_id)
-                    if previous_action_idx is not None:
-                        LOG.warning(
-                            "Duplicate action element id.",
-                            step_order=step.order,
-                            action=action,
-                        )
-
-                        previous_action, previous_result = detailed_agent_step_output.actions_and_results[
-                            previous_action_idx
-                        ]
-                        if len(previous_result) > 0 and previous_result[-1].success:
-                            LOG.info(
-                                "Previous action succeeded, but we'll still continue.",
-                                step_order=step.order,
-                                previous_action=previous_action,
-                                previous_result=previous_result,
-                            )
-                        else:
-                            LOG.warning(
-                                "Previous action failed, so handle the next action.",
-                                step_order=step.order,
-                                previous_action=previous_action,
-                                previous_result=previous_result,
-                            )
-
-                    element_id_to_last_action[action.element_id] = action_idx
-
-                if engine != RunEngine.openai_cua:
-                    self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
-                current_page = await browser_state.must_get_working_page()
-                if isinstance(action, CompleteAction) and not complete_verification:
-                    # Do not verify the complete action when complete_verification is False
-                    # set verified to True will skip the completion verification
-                    action.verified = True
-
-                # Pass TOTP secret to handler for multi-field TOTP sequences
-                # Handler will generate TOTP at execution time
-                if (
-                    action.action_type == ActionType.INPUT_TEXT
-                    and self._is_multi_field_totp_sequence(actions)
-                    and (totp_secret := skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_secret"))
-                ):
-                    # Pass TOTP secret to handler for execution-time generation
-                    action.totp_timing_info = {
-                        "is_totp_sequence": True,
-                        "action_index": action_idx,
-                        "totp_secret": totp_secret,
-                        "is_retry": step.retry_index > 0,
-                    }
-
-                # Tell the handler to skip the auto-completion Tab hack when the
-                # next batched action would be broken by a focus change — e.g. a
-                # KEYPRESS Enter or another action on the same element.
-                if action.action_type == ActionType.INPUT_TEXT:
-                    next_action = (
-                        action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
-                    )
-                    if isinstance(next_action, KeypressAction) or (
-                        isinstance(next_action, WebAction) and next_action.element_id == action.element_id
-                    ):
-                        action.skip_auto_complete_tab = True
-                    action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
-
-                results = await ActionHandler.handle_action(
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
-                    page=current_page,
-                    action=action,
-                )
-                await app.AGENT_FUNCTION.post_action_execution(action)
-                detailed_agent_step_output.actions_and_results[action_idx] = (
-                    action,
-                    results,
-                )
-
-                # Determine wait time between actions
-                wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
-
-                # For multi-field TOTP sequences, use zero delay between all digits for fast execution
-                if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
-                    current_text = action.text if hasattr(action, "text") else None
-
-                    if current_text and len(current_text) == 1 and current_text.isdigit():
-                        # Zero delay between all TOTP digits for fast execution
-                        wait_time = 0.0
-                        LOG.debug(
-                            "TOTP: zero delay for digit",
-                            task_id=task.task_id,
-                            action_idx=action_idx,
-                            digit=current_text,
-                        )
-
-                # Skip sleep and post-action artifacts for page-level SCROLL to preserve
-                # scroll-driven JS state. Many pages enable buttons only while scrolled to
-                # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
-                # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
-                # page position, so they keep normal sleep and artifact recording.
-                is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
-                    r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
-                )
-                if is_page_level_scroll:
-                    wait_time = 0.0
-
-                _step_span.add_event(
-                    "action.post_wait",
-                    attributes={"wait_time_ms": int(wait_time * 1000), "action_idx": action_idx},
-                )
-                await asyncio.sleep(wait_time)
-                if not is_page_level_scroll:
-                    current_artifact_task = asyncio.create_task(
-                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
-                    )
-                else:
-                    LOG.info(
-                        "Skipping post-action artifacts for page-level scroll",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                    )
-                for result in results:
-                    result.step_retry_number = step.retry_index
-                    result.step_order = step.order
-                step.output = detailed_agent_step_output.to_agent_step_output()
-                action_results.extend(results)
-                # Check the last result for this action. If that succeeded, assume the entire action is successful
-                if results and results[-1].success:
-                    if pdf_auto_download_src and isinstance(action, DownloadFileAction):
-                        actually_downloaded = pdf_auto_download_used_bytes or results[-1].download_triggered
-                        if actually_downloaded:
-                            mark_pdf_source_downloaded(pdf_auto_download_src)
-                        pdf_auto_download_src = None
-                    LOG.info(
-                        "Action succeeded",
-                        sampling=True,
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                    )
-                    if results[-1].skip_remaining_actions:
-                        LOG.warning(
-                            "Going to stop executing the remaining actions",
-                            step_order=step.order,
-                            step_retry=step.retry_index,
-                            action_idx=action_idx,
-                            action=action,
-                            action_result=results,
-                        )
-                        break
-
-                elif results and isinstance(action, DecisiveAction):
-                    LOG.warning(
-                        "DecisiveAction failed, but not stopping execution and not retrying the step",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                    )
-                elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
-                    LOG.warning(
-                        "Action failed, but not stopping execution",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                    )
-                else:
-                    if action_node.next is not None:
-                        LOG.warning(
-                            "Action failed, but have duplicated element id in the action list. Continue excuting.",
-                            step_order=step.order,
-                            step_retry=step.retry_index,
-                            action_idx=action_idx,
-                            action=action,
-                            next_action=action_node.next.action,
-                            action_result=results,
-                        )
-                        continue
-
-                    LOG.warning(
-                        "Action failed, marking step as failed",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                        actions_and_results=detailed_agent_step_output.actions_and_results,
-                    )
-                    # if the action failed, don't execute the rest of the actions, mark the step as failed, and retry
-                    failed_step = await self.update_step(
-                        step=step,
-                        status=StepStatus.failed,
-                        output=detailed_agent_step_output.to_agent_step_output(),
-                    )
-                    return failed_step, detailed_agent_step_output.get_clean_detailed_output()
-
-            await await_background_artifact_task()
+            if early_return is not None:
+                return early_return
+            assert detailed_agent_step_output.actions_and_results is not None
 
             LOG.info(
                 "Actions executed successfully, marking step as completed",
                 sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
-                action_results=action_results,
+                action_results=detailed_agent_step_output.action_results,
             )
 
             # Clean up TOTP cache after multi-field TOTP sequence completion
@@ -2052,7 +1787,314 @@ class ForgeAgent:
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
         finally:
             await _cancel_pending_prefetch_task(prefetched_summary_task)
-            await await_background_artifact_task()
+            await artifact_tracker.drain()
+
+    async def _execute_step_actions(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+        scraped_page: ScrapedPage,
+        complete_verification: bool,
+        actions: list[Action],
+        detailed_agent_step_output: DetailedAgentStepOutput,
+        pdf_auto_download_src: str | None,
+        pdf_auto_download_used_bytes: bool,
+        _step_span: otel_trace.Span,
+        artifact_tracker: _BackgroundArtifactTaskTracker,
+    ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
+        # Execute the actions
+        LOG.info(
+            "Executing actions",
+            sampling=True,
+            step_order=step.order,
+            step_retry=step.retry_index,
+            actions=actions,
+        )
+        action_results: list[ActionResult] = []
+        detailed_agent_step_output.action_results = action_results
+        # filter out wait action if there are other actions in the list
+        # we do this because WAIT action is considered as a failure
+        # which will block following actions if we don't remove it from the list
+        # if the list only contains WAIT action, we will execute WAIT action(s)
+        if len(actions) > 1:
+            wait_actions_to_skip = [action for action in actions if action.action_type == ActionType.WAIT]
+            wait_actions_len = len(wait_actions_to_skip)
+            # if there are wait actions and there are other actions in the list, skip wait actions
+            # if we are using cached action plan, we don't skip wait actions
+            if wait_actions_len > 0 and wait_actions_len < len(actions):
+                actions = [action for action in actions if action.action_type != ActionType.WAIT]
+                LOG.info(
+                    "Skipping wait actions",
+                    wait_actions_to_skip=wait_actions_to_skip,
+                    actions=actions,
+                )
+
+        # initialize list of tuples and set actions as the first element of each tuple so that in the case
+        # of an exception, we can still see all the actions
+        detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
+
+        # build a linked action chain by the action_idx
+        action_linked_list: list[ActionLinkedNode] = []
+        element_id_to_action_index: dict[str, int] = dict()
+        for action_idx, action in enumerate(actions):
+            node = ActionLinkedNode(action=action)
+            action_linked_list.append(node)
+
+            if not isinstance(action, WebAction):
+                continue
+
+            previous_action_idx = element_id_to_action_index.get(action.element_id)
+            if previous_action_idx is not None:
+                previous_node = action_linked_list[previous_action_idx]
+                previous_node.next = node
+
+            element_id_to_action_index[action.element_id] = action_idx
+
+        element_id_to_last_action: dict[str, int] = dict()
+        try:
+            wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
+            base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
+        except Exception:
+            base_delay = 0.5
+        for action_idx, action_node in enumerate(action_linked_list):
+            await artifact_tracker.drain()
+
+            context = skyvern_context.ensure_context()
+            if context.refresh_working_page:
+                LOG.warning(
+                    "Detected the signal to reload the page, going to reload and skip the rest of the actions",
+                    step_order=step.order,
+                )
+                await browser_state.reload_page()
+                context.refresh_working_page = False
+                action_result = ActionSuccess()
+                action_result.step_order = step.order
+                action_result.step_retry_number = step.retry_index
+                action = ReloadPageAction(
+                    reasoning="Something wrong with the current page, reload to continue",
+                    status=ActionStatus.completed,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=action_idx,
+                )
+                detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
+                action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
+                artifact_tracker.task = asyncio.create_task(
+                    self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                )
+                break
+
+            action = action_node.action
+            if isinstance(action, WebAction):
+                previous_action_idx = element_id_to_last_action.get(action.element_id)
+                if previous_action_idx is not None:
+                    LOG.warning(
+                        "Duplicate action element id.",
+                        step_order=step.order,
+                        action=action,
+                    )
+
+                    previous_action, previous_result = detailed_agent_step_output.actions_and_results[
+                        previous_action_idx
+                    ]
+                    if len(previous_result) > 0 and previous_result[-1].success:
+                        LOG.info(
+                            "Previous action succeeded, but we'll still continue.",
+                            step_order=step.order,
+                            previous_action=previous_action,
+                            previous_result=previous_result,
+                        )
+                    else:
+                        LOG.warning(
+                            "Previous action failed, so handle the next action.",
+                            step_order=step.order,
+                            previous_action=previous_action,
+                            previous_result=previous_result,
+                        )
+
+                element_id_to_last_action[action.element_id] = action_idx
+
+            if engine != RunEngine.openai_cua:
+                self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
+            current_page = await browser_state.must_get_working_page()
+            if isinstance(action, CompleteAction) and not complete_verification:
+                # Do not verify the complete action when complete_verification is False
+                # set verified to True will skip the completion verification
+                action.verified = True
+
+            # Pass TOTP secret to handler for multi-field TOTP sequences
+            # Handler will generate TOTP at execution time
+            if (
+                action.action_type == ActionType.INPUT_TEXT
+                and self._is_multi_field_totp_sequence(actions)
+                and (totp_secret := skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_secret"))
+            ):
+                # Pass TOTP secret to handler for execution-time generation
+                action.totp_timing_info = {
+                    "is_totp_sequence": True,
+                    "action_index": action_idx,
+                    "totp_secret": totp_secret,
+                    "is_retry": step.retry_index > 0,
+                }
+
+            # Tell the handler to skip the auto-completion Tab hack when the
+            # next batched action would be broken by a focus change — e.g. a
+            # KEYPRESS Enter or another action on the same element.
+            if action.action_type == ActionType.INPUT_TEXT:
+                next_action = (
+                    action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
+                )
+                if isinstance(next_action, KeypressAction) or (
+                    isinstance(next_action, WebAction) and next_action.element_id == action.element_id
+                ):
+                    action.skip_auto_complete_tab = True
+                action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
+
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=current_page,
+                action=action,
+            )
+            await app.AGENT_FUNCTION.post_action_execution(action)
+            detailed_agent_step_output.actions_and_results[action_idx] = (
+                action,
+                results,
+            )
+
+            # Determine wait time between actions
+            wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
+
+            # For multi-field TOTP sequences, use zero delay between all digits for fast execution
+            if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
+                current_text = action.text if hasattr(action, "text") else None
+
+                if current_text and len(current_text) == 1 and current_text.isdigit():
+                    # Zero delay between all TOTP digits for fast execution
+                    wait_time = 0.0
+                    LOG.debug(
+                        "TOTP: zero delay for digit",
+                        task_id=task.task_id,
+                        action_idx=action_idx,
+                        digit=current_text,
+                    )
+
+            # Skip sleep and post-action artifacts for page-level SCROLL to preserve
+            # scroll-driven JS state. Many pages enable buttons only while scrolled to
+            # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
+            # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
+            # page position, so they keep normal sleep and artifact recording.
+            is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
+                r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
+            )
+            if is_page_level_scroll:
+                wait_time = 0.0
+
+            _step_span.add_event(
+                "action.post_wait",
+                attributes={"wait_time_ms": int(wait_time * 1000), "action_idx": action_idx},
+            )
+            await asyncio.sleep(wait_time)
+            if not is_page_level_scroll:
+                artifact_tracker.task = asyncio.create_task(
+                    self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                )
+            else:
+                LOG.info(
+                    "Skipping post-action artifacts for page-level scroll",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                )
+            for result in results:
+                result.step_retry_number = step.retry_index
+                result.step_order = step.order
+            step.output = detailed_agent_step_output.to_agent_step_output()
+            action_results.extend(results)
+            # Check the last result for this action. If that succeeded, assume the entire action is successful
+            if results and results[-1].success:
+                if pdf_auto_download_src and isinstance(action, DownloadFileAction):
+                    actually_downloaded = pdf_auto_download_used_bytes or results[-1].download_triggered
+                    if actually_downloaded:
+                        mark_pdf_source_downloaded(pdf_auto_download_src)
+                    pdf_auto_download_src = None
+                LOG.info(
+                    "Action succeeded",
+                    sampling=True,
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                )
+                if results[-1].skip_remaining_actions:
+                    LOG.warning(
+                        "Going to stop executing the remaining actions",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                        action=action,
+                        action_result=results,
+                    )
+                    break
+
+            elif results and isinstance(action, DecisiveAction):
+                LOG.warning(
+                    "DecisiveAction failed, but not stopping execution and not retrying the step",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                )
+            elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
+                LOG.warning(
+                    "Action failed, but not stopping execution",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                )
+            else:
+                if action_node.next is not None:
+                    LOG.warning(
+                        "Action failed, but have duplicated element id in the action list. Continue excuting.",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                        action=action,
+                        next_action=action_node.next.action,
+                        action_result=results,
+                    )
+                    continue
+
+                LOG.warning(
+                    "Action failed, marking step as failed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                    actions_and_results=detailed_agent_step_output.actions_and_results,
+                )
+                # if the action failed, don't execute the rest of the actions, mark the step as failed, and retry
+                failed_step = await self.update_step(
+                    step=step,
+                    status=StepStatus.failed,
+                    output=detailed_agent_step_output.to_agent_step_output(),
+                )
+                return actions, (failed_step, detailed_agent_step_output.get_clean_detailed_output())
+
+        await artifact_tracker.drain()
+        return actions, None
 
     async def _generate_step_actions(
         self,

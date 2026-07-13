@@ -28,11 +28,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
+    has_witnessed_value_content,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    mint_scout_observation_contract_for_ctx,
     record_scouted_output_coverage,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
@@ -615,6 +617,13 @@ def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: flo
     return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
 
 
+def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
+    if not isinstance(packet, dict):
+        return 0
+    value = packet.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
 def _mint_current_loaded_result_source(
     ctx: AgentContext,
     page_evidence: dict[str, Any] | None,
@@ -663,6 +672,12 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
             else:
                 ctx.last_scout_act_observe_recapture_attempted = True
+                # A card that renders asynchronously after the click is absent from the first
+                # capture; settle briefly so the single recapture can witness it before crediting.
+                settle_seconds = min(settings.COPILOT_CLICK_SETTLE_DELAY_SECONDS, remaining_seconds)
+                if settle_seconds > 0:
+                    await asyncio.sleep(settle_seconds)
+                    remaining_seconds = timeout_seconds - (time.monotonic() - started)
                 try:
                     recaptured = await _composition_get_structured_evidence(
                         ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
@@ -694,6 +709,8 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
         url=url,
+        result_container_count=_evidence_list_len(parsed, "result_containers"),
+        key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
     )
@@ -721,11 +738,18 @@ async def _register_scout_interaction_observation(
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
         parsed = await _scout_act_observe_page_evidence(ctx, url=url)
-        if parsed is not None and has_bounded_page_schema(parsed):
+        # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
+        # that rendered witnessed value content is bindable even when it exposes no actionable schema.
+        if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
             # Identity keys overwrite the parsed packet so the entry stays a
             # scout_interaction observation, with the schema merged before append.
             evidence = {**parsed, **evidence}
             page_evidence = evidence
+            contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+            ctx.scout_observation_contract = contract
+            record_scouted_output_coverage(
+                ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
+            )
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
@@ -1275,10 +1299,16 @@ async def _maybe_steer_evaluate_to_action(
             if isinstance(page_evidence, _UnsetEvidence)
             else page_evidence
         )
-        if parsed is None or not has_actionable_steer_content(parsed):
+        if parsed is None:
             _reset_evaluate_tracker(ctx)
             return False
-        record_scouted_output_coverage(ctx, parsed)
+        contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+        ctx.scout_observation_contract = contract
+        if not has_actionable_steer_content(parsed):
+            record_scouted_output_coverage(ctx, parsed, contract=contract, include_lexical=False)
+            _reset_evaluate_tracker(ctx)
+            return False
+        record_scouted_output_coverage(ctx, parsed, contract=contract)
         _record_scout_page_observation(ctx, parsed)
         loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:

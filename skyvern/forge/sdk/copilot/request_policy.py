@@ -251,6 +251,9 @@ _OUTPUT_FIELD_WORDS = frozenset(
     "amount amounts domain domains name names number numbers owner owners phone phones rate rates specialties specialty "
     "status statuses taxonomy total totals url urls website websites".split()
 )
+# Intentionally distinct from enforcement._COVERAGE_GENERIC_TOKENS: this list filters intent prose when
+# parsing requested-output field names, so it drops phrase-level noise ("each", "profile", "structured");
+# the coverage list filters path leaf tokens only. Not unified — the consumers differ.
 _OUTPUT_GENERIC_WORDS = frozenset(
     "a all an data detail details each entity final for information its of output outputs profile record records "
     "result results structured the value values".split()

@@ -26,14 +26,22 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _READONLY_DEFERRED_VAR,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
+    SCOUTED_SPINE_TRUNCATED_REASON_CODE,
+    TRUNCATED_FINDING,
+    UNFORGIVEN_DROP_FINDING,
+    UNRECORDED_INDEX_FINDING,
     ProducedStaticReturnEnvelope,
+    SynthesisDiagnostics,
     _get_by_role_expr,
     _get_by_role_expr_strict,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     is_optional_dismissal_only_trajectory,
+    obligation_finding_reason_code,
     produce_covered_static_return_envelope,
     render_synthesized_offer_text,
+    spine_partition_findings,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
     synthesize_extraction_suffix,
@@ -972,6 +980,123 @@ class TestActionSynthesis:
         assert 'await _scout_entry_target.wait_for(state="visible")' not in result.code
         assert forbidden_snippet not in result.code
         ast.parse("async def _block(page):\n" + result.code)
+
+    def test_terminal_anonymous_structural_click_after_required_is_emitted_as_required(self) -> None:
+        terminal_selector = (
+            'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]/*[name()="div"][2]/*[name()="button"][2]'
+        )
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+            _interaction(
+                "click",
+                selector="button.primary",
+                source_url="https://example.com/find",
+                role="button",
+                accessible_name="Search",
+            ),
+            _interaction(
+                "click",
+                selector=terminal_selector,
+                source_url="https://example.com/results",
+                role="button",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert "button:has-text('Accept')" not in result.code
+        assert "_scout_optional_dismissal" not in result.code
+        terminal_records = [
+            record for record in result.diagnostics.emitted_interactions if record.get("trajectory_index") == 2
+        ]
+        assert len(terminal_records) == 1
+        assert not terminal_records[0].get("lane")
+        assert terminal_records[0]["method"] == "click"
+        assert terminal_records[0]["selector"] == terminal_selector
+
+    def test_terminal_dismissal_click_before_empty_key_press_is_still_reclassified_required(self) -> None:
+        # A trailing empty-key press_key is dropped (missing_key) and emits nothing, so it must not steal the
+        # terminal index from the anonymous-structural dismissal click before it and defeat the reclassify.
+        terminal_selector = (
+            'xpath=/*[name()="html"][1]/*[name()="body"][1]/*[name()="div"][1]/*[name()="div"][2]/*[name()="button"][2]'
+        )
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+            _interaction(
+                "click",
+                selector=terminal_selector,
+                source_url="https://example.com/results",
+                role="button",
+            ),
+            _interaction("press_key", key="", source_url="https://example.com/results"),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert "_scout_optional_dismissal" not in result.code
+        terminal_records = [
+            record for record in result.diagnostics.emitted_interactions if record.get("trajectory_index") == 1
+        ]
+        assert len(terminal_records) == 1
+        assert not terminal_records[0].get("lane")
+        assert terminal_records[0]["method"] == "click"
+        assert terminal_records[0]["selector"] == terminal_selector
+
+    def test_terminal_structural_click_without_prior_required_stays_in_lane(self) -> None:
+        trajectory = [
+            _interaction(
+                "click",
+                selector=".btns button:nth-of-type(2)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert '_scout_optional_dismissal = page.locator(".btns button:nth-of-type(2)")' in result.code
+        assert 'await page.locator(".btns button:nth-of-type(2)").click()' not in result.code
+
+    def test_terminal_text_matched_dismissal_after_required_stays_in_lane(self) -> None:
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#locInput",
+                source_url="https://example.com/find",
+                role="textbox",
+                accessible_name="City, county, or ZIP code",
+                typed_value="Example City",
+            ),
+            _interaction(
+                "click",
+                selector="button:not(.decline)",
+                source_url="https://example.com/find",
+                role="button",
+            ),
+        ]
+
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+
+        assert result is not None
+        assert "_scout_optional_dismissal = page.locator(\"button:has-text('Accept')\")" in result.code
+        assert 'await page.locator("button:not(.decline)").click()' not in result.code
 
     def test_optional_dismissal_with_durable_target_is_offerable(self) -> None:
         trajectory = [
@@ -2962,6 +3087,132 @@ class TestEmittedInteractionPartition:
         assert diagnostics.forgiven_interactions == [
             {"trajectory_index": 1, "tool_name": "click", "lane": "entry_replay_prefix"}
         ]
+
+
+def _covering_draft_calls(diagnostics: SynthesisDiagnostics) -> list[tuple[str, str]]:
+    return [
+        (str(record.get("method") or ""), str(record.get("locator") or ""))
+        for record in diagnostics.emitted_interactions
+        if not str(record.get("lane") or "")
+    ]
+
+
+class TestSpinePartitionFindings:
+    def _spine_trajectory(self) -> list[dict[str, Any]]:
+        return [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+
+    def test_retained_manifest_covers_every_partition_index(self) -> None:
+        result = synthesize_code_block(self._spine_trajectory(), strict_selectors=True)
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.retained_trajectory_indices == list(range(2))
+        recorded = (
+            {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+            | {record["trajectory_index"] for record in diagnostics.dropped_interactions}
+            | {record["trajectory_index"] for record in diagnostics.forgiven_interactions}
+        )
+        assert set(diagnostics.retained_trajectory_indices) == recorded
+
+    def test_covered_draft_has_no_findings(self) -> None:
+        result = synthesize_code_block(self._spine_trajectory(), strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        assert spine_partition_findings(result.diagnostics, draft_calls, self._spine_trajectory()) == []
+
+    def test_unforgiven_drop_is_a_typed_finding(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "press_key", "key": ""},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
+        kinds = {finding.kind for finding in findings}
+        assert UNFORGIVEN_DROP_FINDING in kinds
+        drop_finding = next(finding for finding in findings if finding.kind == UNFORGIVEN_DROP_FINDING)
+        assert obligation_finding_reason_code(drop_finding) == SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+
+    def test_entry_opener_drop_is_forgiven_not_flagged(self) -> None:
+        trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "button",
+                "role": "button",
+                "accessible_name": "Open menu",
+                "source_url": "https://example.com/records",
+            },
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        draft_calls = _covering_draft_calls(result.diagnostics)
+        findings = spine_partition_findings(result.diagnostics, draft_calls, trajectory)
+        assert all(finding.kind != UNFORGIVEN_DROP_FINDING for finding in findings)
+
+    def test_truncation_leaves_post_break_indices_in_manifest_only(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": f"#stage-{index}", "source_url": "https://example.com/records"}
+            for index in range(_MAX_STEPS + 3)
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        diagnostics = result.diagnostics
+        assert diagnostics.truncated is True
+        assert diagnostics.retained_trajectory_indices == list(range(len(trajectory)))
+        recorded = {record["trajectory_index"] for record in diagnostics.emitted_interactions}
+        post_break = set(diagnostics.retained_trajectory_indices) - recorded
+        assert post_break
+        findings = spine_partition_findings(diagnostics, _covering_draft_calls(diagnostics), trajectory)
+        kinds = {finding.kind for finding in findings}
+        assert TRUNCATED_FINDING in kinds
+        assert UNRECORDED_INDEX_FINDING in kinds
+        truncated_finding = next(finding for finding in findings if finding.kind == TRUNCATED_FINDING)
+        assert obligation_finding_reason_code(truncated_finding) == SCOUTED_SPINE_TRUNCATED_REASON_CODE
+
+
+_STRUCTURAL_BUTTON_XPATH = 'xpath=/*[name()="body"][1]/*[name()="button"][3]'
+
+
+class TestTerminalDismissalReclassification:
+    def test_anonymous_structural_terminal_click_after_required_work_is_required(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": _STRUCTURAL_BUTTON_XPATH},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "_scout_optional_dismissal" not in result.code
+        assert "button:has-text('Accept')" not in result.code
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert not str(by_index[1].get("lane") or "")
+
+    def test_named_terminal_dismissal_keeps_the_optional_lane(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {
+                "tool_name": "click",
+                "selector": _STRUCTURAL_BUTTON_XPATH,
+                "role": "button",
+                "accessible_name": "Accept all cookies",
+            },
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "_scout_optional_dismissal" in result.code
+        by_index = {record["trajectory_index"]: record for record in result.diagnostics.emitted_interactions}
+        assert by_index[1].get("lane") == "optional_dismissal"
+
+    def test_dismissal_only_single_step_keeps_the_optional_lane(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": _STRUCTURAL_BUTTON_XPATH, "source_url": "https://example.com/records"},
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "_scout_optional_dismissal" in result.code
 
 
 class TestUncoveredRequiredEmittedInteractions:

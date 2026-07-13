@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,10 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.enforcement import MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.result_evidence import (
+    ScoutObservationContract,
+    mint_scout_observation_contract,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.run_execution import _update_repair_loop_state
@@ -157,6 +162,43 @@ def _contract() -> DiagnosisRepairContract:
         repair_decision=RepairDecision(next_action=RepairNextAction.REPAIR),
         verification_result=VerificationResult(run_status="failed"),
     )
+
+
+def _scout_contract(
+    *,
+    has_bounded_page_schema: bool = True,
+    workflow_run_id: str | None = None,
+    observed_after_workflow_run: bool = False,
+) -> ScoutObservationContract:
+    page = {
+        "current_url": "https://example.com/results",
+        "inspection_warnings": [],
+        "result_containers_truncated": False,
+        "key_value_relations_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "NPI",
+                "container_selector": ".kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "result_containers": [],
+    }
+    contract = mint_scout_observation_contract(
+        page,
+        labels_by_path={"output.npi": ("NPI",)},
+        url="https://example.com/results",
+        has_bounded_page_schema=has_bounded_page_schema,
+        workflow_run_id=workflow_run_id,
+        observed_after_workflow_run=observed_after_workflow_run,
+    )
+    assert contract is not None
+    return contract
 
 
 def _bounded_inspect_evidence(**updates: object) -> dict[str, object]:
@@ -969,3 +1011,73 @@ def test_update_repair_loop_state_clears_stale_requirement_when_outcome_not_auth
 
     assert ctx.recorded_outcome_grounding_requirement is None
     assert ctx.recorded_outcome_binding_constraint is None
+
+
+def test_scout_contract_grounds_no_run_requirement_after_composition_miss() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    ctx.scout_observation_contract = _scout_contract()
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+    payload = ctx.recorded_outcome_grounding_requirement.payload
+    assert payload is not None
+    assert payload.source_tool == "evaluate"
+    assert payload.capture_degraded is False
+    assert "source_tool: evaluate" in _recorded_build_test_outcome_prompt(ctx)
+
+
+def test_degraded_scout_contract_admitted_with_capture_degraded_recorded() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    ctx.scout_observation_contract = _scout_contract(has_bounded_page_schema=False)
+
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+    payload = ctx.recorded_outcome_grounding_requirement.payload
+    assert payload is not None
+    assert payload.capture_degraded is True
+    assert payload.diagnostic_reason == "capture_degraded"
+
+
+def test_arming_no_run_requirement_clears_prior_scout_contract() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    ctx.scout_observation_contract = _scout_contract()
+
+    arm_recorded_outcome_grounding_requirement(ctx)
+
+    assert ctx.scout_observation_contract is None
+    ctx.composition_page_evidence = None
+    assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+
+def test_run_required_requirement_rejects_unstamped_scout_contract() -> None:
+    outcome = _outcome()
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    ctx.scout_observation_contract = _scout_contract()
+
+    with capture_logs() as logs:
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
+    assert event["reject_reason"] == "run_id_mismatch"
+
+
+def test_tampered_scout_contract_rejected_by_grounding_lane() -> None:
+    outcome = _outcome(phase="scout_evaluate", workflow_run_id=None, attempted_tool="evaluate")
+    ctx = _ctx(outcome)
+    arm_recorded_outcome_grounding_requirement(ctx)
+    ctx.composition_page_evidence = None
+    contract = _scout_contract()
+    ctx.scout_observation_contract = replace(contract, source_url="https://evil.example.com/injected")
+
+    with capture_logs() as logs:
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is False
+
+    event = next(log for log in logs if log["event"] == "copilot recorded outcome grounding rejected")
+    assert event["reject_reason"] == "not_inspect_source"

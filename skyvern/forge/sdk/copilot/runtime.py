@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-    from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
+    from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence, ScoutObservationContract
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
@@ -445,6 +445,7 @@ class AgentContext:
     synthesized_block_reopened_for_output_coverage: bool = False
     synthesized_block_reopened_for_credential_scout: bool = False
     scouted_output_covered_paths: set[str] = field(default_factory=set)
+    scout_observation_contract: ScoutObservationContract | None = None
     uncovered_output_rescout_context_key: str | None = None
     uncovered_output_rescout_steer_key: str | None = None
     credential_scout_rescout_context_key: str | None = None

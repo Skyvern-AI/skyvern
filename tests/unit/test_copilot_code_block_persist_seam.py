@@ -16,6 +16,7 @@ import yaml
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -42,12 +43,14 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _MAX_STEPS,
     ProducedStaticReturnEnvelope,
     ScoutGap,
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _get_by_role_expr,
     _get_by_role_expr_strict,
+    _stable_same_kind_bare_click_refiner,
     credential_scout_gap,
     produce_covered_static_return_envelope,
 )
@@ -11248,6 +11251,37 @@ class TestWholeTrajectoryImposition:
         assert code.index('page.locator("#zip")') < code.index('page.locator("#continue")')
         assert code.index('page.locator("#continue")') < code.index('page.locator("#coverage-next")')
 
+    def test_entry_opener_drop_is_instrumented_not_silently_forgiven(self) -> None:
+        ctx = _quote_ctx()
+        ctx.scout_trajectory.insert(
+            0,
+            {"tool_name": "click", "selector": "button", "source_url": _QUOTE_URL, "trajectory_index": 0},
+        )
+        submitted = _yaml(
+            """
+            title: Quote
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: quote_flow
+                code: |
+                  await page.locator("#zip").fill(str(zip_code))
+                  await page.locator("#continue").click()
+                  await page.locator("#electricDate").fill("2026-07-01")
+                  await page.locator("#coverage-next").click()
+            """
+        )
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(submitted, ctx)
+
+        assert result.violations == []
+        assert result.substitutions is not None
+        forgiven = result.substitutions["forgiven_entry_opener_drops"]
+        assert [record["reason_code"] for record in forgiven] == ["ambiguous_bare_selector"]
+        assert forgiven[0]["forgiveness"] == "entry_opener_superseded_by_locator_provenance"
+        assert any(entry.get("event") == "copilot_imposition_forgave_entry_opener_drop" for entry in logs)
+
     def test_imposes_over_unscouted_selected_block_extra_click(self) -> None:
         ctx = _quote_ctx()
         submitted = _yaml(
@@ -12629,19 +12663,17 @@ class TestBareDropSupersession:
 
     def test_stable_bare_click_refiner_accepts_only_same_kind_text_and_role_anchors(self) -> None:
         assert (
-            workflow_update_module._stable_same_kind_bare_click_refiner(
-                "button", "xpath=//button[normalize-space()='Check Order Status']"
-            )
+            _stable_same_kind_bare_click_refiner("button", "xpath=//button[normalize-space()='Check Order Status']")
             is True
         )
-        assert workflow_update_module._stable_same_kind_bare_click_refiner("button", 'role=button[name="Next"]') is True
+        assert _stable_same_kind_bare_click_refiner("button", 'role=button[name="Next"]') is True
         for candidate in (
             "xpath=//a[normalize-space()='Check Order Status']",
             'role=link[name="Next"]',
             "xpath=(//button[normalize-space()='Check Order Status'])[2]",
             "xpath=//button[contains(normalize-space(), 'Check')]",
         ):
-            assert workflow_update_module._stable_same_kind_bare_click_refiner("button", candidate) is False
+            assert _stable_same_kind_bare_click_refiner("button", candidate) is False
 
     def test_supersession_true_returns_pairing_record(self) -> None:
         dropped = {
@@ -14018,6 +14050,225 @@ class TestScoutedSpineTurnEndCheckpoint:
         standard.block_authoring_policy = BlockAuthoringPolicy.STANDARD
         assert enforcement_module._scouted_spine_turn_end_nudge(standard) is None
 
+    def test_dropped_unforgiven_interaction_nudges_despite_full_rung_coverage(self) -> None:
+        ctx = _checkpoint_eligible_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#stage-a",
+                "source_url": "https://example.com/records",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#stage-b", "trajectory_index": 2},
+        ]
+        ctx.persisted_draft_browser_calls = [
+            ("click", 'page.locator("#stage-a")'),
+            ("click", 'page.locator("#stage-b")'),
+        ]
+
+        findings = enforcement_module._scouted_spine_open_obligation(ctx)
+        assert any(finding.kind == code_block_synthesis_module.UNFORGIVEN_DROP_FINDING for finding in findings)
+
+        nudge = enforcement_module._scouted_spine_turn_end_nudge(ctx)
+        assert nudge is not None
+        assert code_block_synthesis_module.SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE in nudge
+        assert ctx.last_code_authoring_repair_context is not None
+        assert (
+            ctx.last_code_authoring_repair_context.reason_code
+            == code_block_synthesis_module.SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+        )
+
+
+class TestPartitionAwareImpositionFastPath:
+    def _synthesize(self, trajectory: list[dict[str, object]]) -> SynthesizedCodeBlock:
+        result = workflow_update_module.synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        return result
+
+    def _covering_blocks(self, synthesized: SynthesizedCodeBlock) -> list[dict[str, object]]:
+        return [{"code": synthesized.interaction_code or synthesized.code}]
+
+    def test_clean_covered_draft_allows_early_return(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+        synthesized = self._synthesize(trajectory)
+        assert (
+            workflow_update_module._draft_leaves_scouted_partition_open(
+                self._covering_blocks(synthesized), synthesized=synthesized, scout_trajectory=trajectory
+            )
+            is False
+        )
+
+    def test_covered_but_dropped_unforgiven_blocks_early_return(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": "#stage-a", "source_url": "https://example.com/records"},
+            {"tool_name": "press_key", "key": ""},
+            {"tool_name": "click", "selector": "#stage-b"},
+        ]
+        synthesized = self._synthesize(trajectory)
+        assert (
+            workflow_update_module._draft_leaves_scouted_partition_open(
+                self._covering_blocks(synthesized), synthesized=synthesized, scout_trajectory=trajectory
+            )
+            is True
+        )
+
+    def test_covered_but_truncated_blocks_early_return(self) -> None:
+        trajectory = [
+            {"tool_name": "click", "selector": f"#stage-{index}", "source_url": "https://example.com/records"}
+            for index in range(_MAX_STEPS + 2)
+        ]
+        synthesized = self._synthesize(trajectory)
+        assert synthesized.diagnostics.truncated is True
+        assert (
+            workflow_update_module._draft_leaves_scouted_partition_open(
+                self._covering_blocks(synthesized), synthesized=synthesized, scout_trajectory=trajectory
+            )
+            is True
+        )
+
+
+class TestFinalYamlStructuralGate:
+    def test_dangling_next_block_label_is_flagged(self) -> None:
+        parsed = {
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "code", "label": "a", "next_block_label": "missing"},
+                    {"block_type": "code", "label": "b"},
+                ]
+            }
+        }
+        violation = workflow_update_module._dangling_next_block_label_violation(parsed)
+        assert violation is not None
+        assert "missing" in violation
+
+    def test_final_yaml_structural_gate_is_scoped_to_code_authoring(self) -> None:
+        ctx = _records_spine_ctx()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+        dangling_yaml = _yaml(
+            """
+            title: Records
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: a
+                next_block_label: missing
+              - block_type: code
+                label: b
+            """
+        )
+        assert (
+            workflow_update_module._final_yaml_structural_violations(
+                ctx,
+                dangling_yaml,
+                minted_parameter_keys=[],
+                promoted_parameter_keys=[],
+                carried_by_imposition=False,
+            )
+            == []
+        )
+        assert (
+            workflow_update_module._dangling_next_block_label_violation(parse_workflow_yaml(dangling_yaml)) is not None
+        )
+
+    def test_resolved_next_block_label_passes(self) -> None:
+        parsed = {
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "code", "label": "a", "next_block_label": "b"},
+                    {"block_type": "code", "label": "b"},
+                ]
+            }
+        }
+        assert workflow_update_module._dangling_next_block_label_violation(parsed) is None
+
+    def test_orphan_minted_parameter_is_flagged_and_referenced_is_not(self) -> None:
+        parsed = {
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "code", "label": "a", "code": "await page.locator('#x').fill(str(used_key))"},
+                ]
+            }
+        }
+        violation = workflow_update_module._orphan_minted_parameter_violation(parsed, ["used_key", "orphan_key"])
+        assert violation is not None
+        assert "orphan_key" in violation
+        assert "used_key" not in violation
+
+    def test_preexisting_authored_param_outside_manifest_is_untouched(self) -> None:
+        parsed = {
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "code", "label": "a", "code": "await page.locator('#x').click()"},
+                ],
+                "parameters": [{"key": "unused_authored_input", "parameter_type": "workflow"}],
+            }
+        }
+        assert workflow_update_module._orphan_minted_parameter_violation(parsed, []) is None
+
+    def test_scaffolding_only_body_flagged_only_when_carried_by_imposition(self) -> None:
+        ctx = _records_spine_ctx()
+        scaffolding_yaml = _records_block_yaml("await page.goto('https://example.com/records')")
+        carried = workflow_update_module._final_yaml_structural_violations(
+            ctx,
+            scaffolding_yaml,
+            minted_parameter_keys=[],
+            promoted_parameter_keys=[],
+            carried_by_imposition=True,
+        )
+        assert any("no load-bearing" in violation for violation in carried)
+        not_carried = workflow_update_module._final_yaml_structural_violations(
+            ctx,
+            scaffolding_yaml,
+            minted_parameter_keys=[],
+            promoted_parameter_keys=[],
+            carried_by_imposition=False,
+        )
+        assert not any("no load-bearing" in violation for violation in not_carried)
+
+    def test_load_bearing_body_passes_the_gate(self) -> None:
+        ctx = _records_spine_ctx()
+        real_yaml = _records_block_yaml("await page.locator('#stage-a').click()")
+        assert (
+            workflow_update_module._final_yaml_structural_violations(
+                ctx,
+                real_yaml,
+                minted_parameter_keys=[],
+                promoted_parameter_keys=[],
+                carried_by_imposition=True,
+            )
+            == []
+        )
+
+    def test_stub_reproducing_raw_prompt_is_flagged(self) -> None:
+        ctx = _records_spine_ctx()
+        ctx.turn_context_packet = SimpleNamespace(
+            transcript_context=SimpleNamespace(earliest_user_turn="Log me in and stop")
+        )
+        stub_yaml = _yaml(
+            """
+            title: Records
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: search_registry
+                description: Log me in and stop
+                code: |
+                  await page.goto("https://example.com/records")
+            """
+        )
+        violations = workflow_update_module._final_yaml_structural_violations(
+            ctx,
+            stub_yaml,
+            minted_parameter_keys=[],
+            promoted_parameter_keys=[],
+            carried_by_imposition=True,
+        )
+        assert any("raw user request" in violation for violation in violations)
+
 
 def _full_coverage_calls() -> list[tuple[str, str]]:
     return [
@@ -14718,6 +14969,62 @@ class TestAdmittedImpositionOwnsSpineCoverage:
         assert result.substitutions is None
         assert any("`coverage_step`" in violation for violation in result.violations)
         assert result.workflow_yaml == submitted
+
+    def test_graph_referenced_stale_rung_steers_instead_of_being_dropped(self) -> None:
+        # A surviving block's next_block_label points at the stale rung; dropping it would manufacture the
+        # dangling reference the AC4 gate rejects, so it must refuse-with-provenance, not silently delete.
+        stale = {
+            "block_type": "code",
+            "label": "extract_priority_resale_document",
+            "code": "await page.locator('#doc').click()",
+        }
+        parsed: dict = {
+            "workflow_definition": {
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "order_lookup",
+                        "next_block_label": "extract_priority_resale_document",
+                        "code": "await page.goto('https://example.com')",
+                    },
+                    stale,
+                ]
+            }
+        }
+
+        result = workflow_update_module._drop_stale_spine_rung_blocks(
+            parsed, [stale], carrier_label="carrier", provenance=[]
+        )
+
+        assert result.violation is not None
+        assert "`extract_priority_resale_document`" in result.violation
+        assert result.replaced_labels == []
+        remaining = [block.get("label") for block in parsed["workflow_definition"]["blocks"]]
+        assert "extract_priority_resale_document" in remaining
+
+    def test_unreferenced_stale_rung_is_still_dropped(self) -> None:
+        stale = {
+            "block_type": "code",
+            "label": "orphan_rung",
+            "code": "await page.locator('#doc').click()",
+        }
+        parsed: dict = {
+            "workflow_definition": {
+                "blocks": [
+                    {"block_type": "code", "label": "carrier", "code": "await page.goto('https://example.com')"},
+                    stale,
+                ]
+            }
+        }
+
+        result = workflow_update_module._drop_stale_spine_rung_blocks(
+            parsed, [stale], carrier_label="carrier", provenance=[]
+        )
+
+        assert result.violation is None
+        assert result.replaced_labels == ["orphan_rung"]
+        remaining = [block.get("label") for block in parsed["workflow_definition"]["blocks"]]
+        assert "orphan_rung" not in remaining
 
     def test_admitted_imposition_is_not_answered_by_the_persist_seam_guard(self) -> None:
         ctx = _quote_ctx()
