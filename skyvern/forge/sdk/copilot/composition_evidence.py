@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     interactive_challenge_controls,
     vision_challenge_carrier,
 )
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.reached_download_target import (
     NAV_TARGET_DOWNLOAD_KIND_KEY,
     classify_download_affordance,
@@ -595,7 +596,7 @@ def _post_run_observed_url_goto_error(
 
     labels = ", ".join(block["label"] for block in offending[:5])
     return (
-        "Workflow validation failed: the draft is trying to persist a post-run browser URL as a new goto_url "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}the draft is trying to persist a post-run browser URL as a new goto_url "
         "block after an incomplete or budgeted run. That URL may encode record-specific, result-page, or "
         "session state. Keep the reusable entrypoint and verified upstream blocks, then either extract from "
         "the observed current page, split or replace the budgeted frontier into smaller reusable UI actions, "
@@ -1071,14 +1072,14 @@ def composition_page_evidence_error(
             )
             if string_step is not None:
                 return (
-                    "Workflow validation failed: a block_observation_refs entry uses observation_step "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block_observation_refs entry uses observation_step "
                     f"{string_step!r} as a string. Pass the integer observation_step returned by "
                     "inspect_page_for_composition or evaluate for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             if _required_observation_ref_missing(block, block_observation_refs):
                 return (
-                    "Workflow validation failed: a click-reached block requires a block_observation_refs entry. "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a click-reached block requires a block_observation_refs entry. "
                     "Pass an interaction- or post_run-reached observation_step for click-reached blocks before "
                     "composing them. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
@@ -1086,7 +1087,7 @@ def composition_page_evidence_error(
             if wrong_reached_via is not None:
                 step, reached_via = wrong_reached_via
                 return (
-                    "Workflow validation failed: a block references observation_step "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{step}, but that observed page was reached via {reached_via!r}. "
                     "Pass an interaction- or post_run-reached observation_step for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
@@ -1099,14 +1100,14 @@ def composition_page_evidence_error(
                     else "that observation step was not found in flow evidence"
                 )
                 return (
-                    "Workflow validation failed: a block references observation_step "
+                    f"{INTERNAL_VALIDATION_FAILURE_PREFIX}a block references observation_step "
                     f"{missing_step}, but {missing_reason}. "
                     "Inspect or evaluate the reached page again and pass the new observation_step in "
                     "block_observation_refs before composing page-dependent blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             return (
-                "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
+                f"{INTERNAL_VALIDATION_FAILURE_PREFIX}page-dependent build blocks need observed page evidence before they are "
                 f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
                 "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
                 f"Offending blocks: {_format_page_block_findings([block])}"

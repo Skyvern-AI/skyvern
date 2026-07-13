@@ -87,6 +87,9 @@ class TurnNarrativePayload(TypedDict):
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
     # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
     credentialPrompt: NotRequired[dict[str, str]]
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
+    # credential pause (credential_pause.py) resolved during this turn.
+    credentialPause: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -667,6 +670,15 @@ class CopilotContext(AgentContext):
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
     requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+
+    # Mid-build credential pause (credential_pause.py). last_run_skipped_unbound_credentials
+    # is set by tools/__init__.py's update_and_run_blocks skip branch; client_supports_credential_pause
+    # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
+    last_run_skipped_unbound_credentials: bool = False
+    client_supports_credential_pause: bool = False
+    credential_pause_used: bool = False
+    copilot_credential_pause_seconds: float = 0.0
+    credential_pause_outcome: str | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
