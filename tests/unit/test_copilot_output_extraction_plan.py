@@ -6,8 +6,30 @@ from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_str
 from skyvern.forge.sdk.copilot.mcp_adapter import _restore_post_hook_context, _snapshot_post_hook_context
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     LiveReadKind,
+    ShapeExpectation,
+    ValueCardinality,
+    ValueShape,
+    _key_value_shape_bindings,
+    _table_shape_bindings,
+    array_parent_path,
     derive_requested_output_extraction_plan,
+    resolve_shape_expectations_by_path,
+    value_matches_shape,
 )
+
+_SYNTHETIC_SHAPE_REGISTRY = {
+    "widget_id": ShapeExpectation(ValueShape.NUMERIC_ID, ValueCardinality.SCALAR, id_digit_length=8),
+    "depot": ShapeExpectation(ValueShape.POSTAL_ADDRESS, ValueCardinality.COLUMN),
+    "phase": ShapeExpectation(ValueShape.CATEGORICAL_TOKEN, ValueCardinality.COLUMN),
+    "final_phase": ShapeExpectation(ValueShape.CATEGORICAL_TOKEN, ValueCardinality.SCALAR),
+}
+_SYNTHETIC_REQUESTED_PATHS = {
+    "output.widget_id",
+    "output.sites",
+    "output.sites[].depot",
+    "output.sites[].phase",
+    "output.final_phase",
+}
 
 LABELS_BY_PATH = {
     "output.record_id": ("Record Identifier",),
@@ -221,3 +243,160 @@ def test_jit_plan_cannot_see_flow_evidence_rolled_back_after_failed_hook() -> No
         )
         is None
     )
+
+
+def test_numeric_id_matches_only_exact_digit_length() -> None:
+    expectation = _SYNTHETIC_SHAPE_REGISTRY["widget_id"]
+    assert value_matches_shape("12345678", expectation) is True
+    assert value_matches_shape("1234567", expectation) is False
+    assert value_matches_shape("123456789", expectation) is False
+    assert value_matches_shape("1234abcd", expectation) is False
+
+
+def test_postal_address_requires_number_lead_alpha_and_region_token() -> None:
+    expectation = _SYNTHETIC_SHAPE_REGISTRY["depot"]
+    assert value_matches_shape("221 Baker Street Boston MA", expectation) is True
+    assert value_matches_shape("500 Industrial Way Fremont CA", expectation) is True
+    assert value_matches_shape("500 Industrial Way Fremont 94538", expectation) is True
+    assert value_matches_shape("Industrial Way Fremont CA", expectation) is False
+    assert value_matches_shape("500 Way", expectation) is False
+
+
+def test_categorical_token_excludes_digits_commas_and_long_phrases() -> None:
+    expectation = _SYNTHETIC_SHAPE_REGISTRY["final_phase"]
+    assert value_matches_shape("Complete", expectation) is True
+    assert value_matches_shape("In Progress", expectation) is True
+    assert value_matches_shape("Not Yet Started Phase", expectation) is False
+    assert value_matches_shape("Phase 2", expectation) is False
+    assert value_matches_shape("Acme, Inc", expectation) is False
+
+
+def test_free_text_expectation_never_matches() -> None:
+    expectation = ShapeExpectation(ValueShape.FREE_TEXT, ValueCardinality.SCALAR)
+    assert value_matches_shape("anything at all", expectation) is False
+
+
+def test_resolve_maps_leaf_segments_and_enforces_cardinality_and_leaf_only() -> None:
+    resolved = resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, _SYNTHETIC_SHAPE_REGISTRY)
+    assert resolved == {
+        "output.widget_id": _SYNTHETIC_SHAPE_REGISTRY["widget_id"],
+        "output.sites[].depot": _SYNTHETIC_SHAPE_REGISTRY["depot"],
+        "output.sites[].phase": _SYNTHETIC_SHAPE_REGISTRY["phase"],
+        "output.final_phase": _SYNTHETIC_SHAPE_REGISTRY["final_phase"],
+    }
+    assert "output.sites" not in resolved
+
+
+def test_resolve_excludes_cardinality_mismatch() -> None:
+    registry = {"widget_id": ShapeExpectation(ValueShape.NUMERIC_ID, ValueCardinality.COLUMN, id_digit_length=8)}
+    assert resolve_shape_expectations_by_path({"output.widget_id"}, registry) == {}
+
+
+def test_resolve_returns_empty_without_registry() -> None:
+    assert resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, None) == {}
+    assert resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, {}) == {}
+
+
+def test_array_parent_path_only_for_array_leaves() -> None:
+    assert array_parent_path("output.sites[].depot") == "output.sites"
+    assert array_parent_path("output.widget_id") is None
+
+
+def _shape_kv_relation(value_text: str) -> dict[str, object]:
+    return {
+        "key_text": "Reference",
+        "value_text": value_text,
+        "container_selector": ".kv",
+        "container_match_count": 1,
+        "container_position": 0,
+        "value_child_index": 1,
+        "direct_child_count": 2,
+        "visible": True,
+        "value_visible": True,
+    }
+
+
+def test_key_value_shape_binding_matches_scalar_shape_on_value_text() -> None:
+    resolved = resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, _SYNTHETIC_SHAPE_REGISTRY)
+    bindings = _key_value_shape_bindings({"key_value_relations": [_shape_kv_relation("12345678")]}, resolved)
+    assert [binding.output_path for binding in bindings] == ["output.widget_id"]
+    assert bindings[0].kind == LiveReadKind.KEY_VALUE
+
+
+def test_key_value_shape_binding_requires_present_value_text() -> None:
+    resolved = resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, _SYNTHETIC_SHAPE_REGISTRY)
+    relation = _shape_kv_relation("12345678")
+    del relation["value_text"]
+    assert _key_value_shape_bindings({"key_value_relations": [relation]}, resolved) == []
+
+
+def _shape_table_packet() -> dict[str, object]:
+    return {
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#sites",
+                "selector_match_count": 1,
+                "visible": True,
+                "span_free": True,
+                "nested_table_free": True,
+                "row_selector": "#sites tbody tr",
+                "headers": [
+                    {"text": "Location", "column_index": 0},
+                    {"text": "Stage", "column_index": 1},
+                ],
+                "row_count": 3,
+                "rows_truncated": False,
+                "sample_rows": ["r0", "r1", "r2"],
+                "rows": [
+                    {
+                        "row_index": 0,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [
+                            {
+                                "column_index": 0,
+                                "visible": True,
+                                "has_text": True,
+                                "text": "221 Baker Street Boston MA",
+                            },
+                            {"column_index": 1, "visible": True, "has_text": True, "text": "Complete"},
+                        ],
+                    },
+                    {
+                        "row_index": 1,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [
+                            {"column_index": 0, "visible": True, "has_text": True, "text": "17 Elm Avenue Boston MA"},
+                            {"column_index": 1, "visible": True, "has_text": True, "text": "Complete"},
+                        ],
+                    },
+                    {
+                        "row_index": 2,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [
+                            {"column_index": 0, "visible": True, "has_text": True, "text": "9 Oak Road Reno NV 89501"},
+                            {"column_index": 1, "visible": True, "has_text": True, "text": "Pending"},
+                        ],
+                    },
+                ],
+            }
+        ]
+    }
+
+
+def test_table_shape_bindings_match_columns_by_value_shape() -> None:
+    resolved = resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, _SYNTHETIC_SHAPE_REGISTRY)
+    bindings = _table_shape_bindings(_shape_table_packet(), resolved)
+    bound = {binding.output_path: binding.column_index for binding in bindings}
+    assert bound == {"output.sites[].depot": 0, "output.sites[].phase": 1}
+
+
+def test_categorical_column_requires_repetition() -> None:
+    resolved = resolve_shape_expectations_by_path(_SYNTHETIC_REQUESTED_PATHS, _SYNTHETIC_SHAPE_REGISTRY)
+    packet = _shape_table_packet()
+    packet["result_containers"][0]["rows"][1]["cells"][1]["text"] = "Started"
+    bindings = _table_shape_bindings(packet, resolved)
+    assert [binding.output_path for binding in bindings] == ["output.sites[].depot"]
