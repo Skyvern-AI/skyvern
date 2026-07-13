@@ -3660,77 +3660,13 @@ class WorkflowService:
                     and branch_metadata
                     and is_adaptive_caching(workflow, workflow_run)
                 ):
-                    try:
-                        # Extract the branch expressions and results for the reviewer.
-                        # Evaluations from ConditionalBlock.execute() stop at the first
-                        # matched branch (break on match), so unevaluated branches
-                        # (including the default) may be missing. We merge runtime
-                        # evaluations with the full branch definitions so the script
-                        # reviewer always sees every branch — this is critical for the
-                        # branch-return validator which checks that generated code only
-                        # returns labels/indices from the defined branches.
-                        evaluations = branch_metadata.get("evaluations", [])
-                        eval_by_index: dict[int, dict] = {}
-                        for ev in evaluations:
-                            idx = ev.get("branch_index")
-                            if idx is not None:
-                                eval_by_index[idx] = ev
-
-                        expressions = []
-                        if hasattr(block, "ordered_branches"):
-                            for idx, b in enumerate(block.ordered_branches):
-                                ev = eval_by_index.get(idx)
-                                expr_info = {
-                                    "original_expression": (
-                                        ev.get("original_expression")
-                                        if ev
-                                        else (b.criteria.expression if b.criteria else None)
-                                    ),
-                                    "rendered_expression": ev.get("rendered_expression") if ev else None,
-                                    "result": ev.get("result") if ev else None,
-                                    "is_default": ev.get("is_default", b.is_default) if ev else b.is_default,
-                                    "next_block_label": b.next_block_label,
-                                }
-                                expressions.append(expr_info)
-                        else:
-                            # Fallback: no ordered_branches, use evaluations as-is
-                            for ev in evaluations:
-                                expressions.append(
-                                    {
-                                        "original_expression": ev.get("original_expression"),
-                                        "rendered_expression": ev.get("rendered_expression"),
-                                        "result": ev.get("result"),
-                                        "is_default": ev.get("is_default", False),
-                                        "next_block_label": ev.get("next_block_label"),
-                                    }
-                                )
-                        cond_context = skyvern_context.current()
-                        cond_episode = await app.DATABASE.scripts.create_fallback_episode(
-                            organization_id=organization_id,
-                            workflow_permanent_id=workflow.workflow_permanent_id,
-                            workflow_run_id=workflow_run_id,
-                            block_label=block.label,
-                            fallback_type="conditional_agent",
-                            error_message=None,
-                            script_revision_id=cond_context.script_revision_id if cond_context else None,
-                            agent_actions={
-                                "block_type": "conditional",
-                                "branch_taken": branch_metadata.get("branch_taken"),
-                                "branch_index": branch_metadata.get("branch_index"),
-                                "expressions": expressions,
-                            },
-                        )
-                        await app.DATABASE.scripts.update_fallback_episode(
-                            episode_id=cond_episode.episode_id,
-                            organization_id=organization_id,
-                            fallback_succeeded=True,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to record conditional episode",
-                            block_label=block.label,
-                            exc_info=True,
-                        )
+                    await self._record_conditional_agent_episode(
+                        workflow=workflow,
+                        block=block,
+                        branch_metadata=branch_metadata,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
 
             if not workflow_run_block_result:
                 if attempt.script_exception is not None:
@@ -3743,54 +3679,17 @@ class WorkflowService:
                 )
                 return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
 
-            # Determine which block statuses are eligible for caching
-            cacheable_statuses = {BlockStatus.completed}
-            if workflow.generate_script_on_terminal:
-                cacheable_statuses.add(BlockStatus.terminated)
-
-            if (
-                not block_executed_with_code
-                and block.label
-                and block.label not in script_blocks_by_label
-                and workflow_run_block_result.status in cacheable_statuses
-                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                # For traditional caching (code_version < 2), only track blocks
-                # for regeneration when actually running with code. Agent-mode runs
-                # should not trigger regeneration — doing so creates an infinite loop
-                # where every run deletes and regenerates the script because blocks
-                # always execute via agent and are never in script_blocks_by_label.
-                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
-            ):
-                blocks_to_update.add(block.label)
-
-            # NOTE: continue_on_failure block failures are handled by the Script
-            # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
-            # regenerating the entire script here. The fallback episode is already
-            # recorded and the reviewer will patch the specific block that failed.
-            # See _trigger_script_reviewer() for the capped reviewer flow.
-
-            # Track uncached loop block children for regeneration.
-            # Loop block children execute via block.py's execute_*_loop_helper(),
-            # bypassing _execute_single_block. Recursively walk all nesting levels
-            # so deeply nested blocks (e.g., file_download inside a double-nested
-            # loop) get cached functions generated.
-            if (
-                isinstance(block, (ForLoopBlock, WhileLoopBlock))
-                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
-                and workflow_run_block_result.status in cacheable_statuses
-            ):
-                previous_labels = set(blocks_to_update)
-                _collect_uncached_loop_children(block, script_blocks_by_label, blocks_to_update)
-                new_labels = sorted(blocks_to_update - previous_labels)
-                if new_labels:
-                    LOG.info(
-                        "Loop block child blocks marked for caching",
-                        parent_label=block.label,
-                        child_labels=new_labels,
-                        child_count=len(new_labels),
-                        workflow_run_id=workflow_run_id,
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                    )
+            self._track_blocks_for_script_generation(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                workflow_run_id=workflow_run_id,
+                block=block,
+                workflow_run_block_result=workflow_run_block_result,
+                block_executed_with_code=block_executed_with_code,
+                is_script_run=is_script_run,
+                script_blocks_by_label=script_blocks_by_label,
+                blocks_to_update=blocks_to_update,
+            )
 
             workflow_run, should_stop = await self._handle_block_result_status(
                 block=block,
@@ -3822,6 +3721,147 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id, failure_reason=failure_reason
             )
             return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+    async def _record_conditional_agent_episode(
+        self,
+        *,
+        workflow: Workflow,
+        block: ConditionalBlock,
+        branch_metadata: dict[str, Any],
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            # Extract the branch expressions and results for the reviewer.
+            # Evaluations from ConditionalBlock.execute() stop at the first
+            # matched branch (break on match), so unevaluated branches
+            # (including the default) may be missing. We merge runtime
+            # evaluations with the full branch definitions so the script
+            # reviewer always sees every branch — this is critical for the
+            # branch-return validator which checks that generated code only
+            # returns labels/indices from the defined branches.
+            evaluations = branch_metadata.get("evaluations", [])
+            eval_by_index: dict[int, dict] = {}
+            for ev in evaluations:
+                idx = ev.get("branch_index")
+                if idx is not None:
+                    eval_by_index[idx] = ev
+
+            expressions = []
+            if hasattr(block, "ordered_branches"):
+                for idx, b in enumerate(block.ordered_branches):
+                    ev = eval_by_index.get(idx)
+                    expr_info = {
+                        "original_expression": (
+                            ev.get("original_expression") if ev else (b.criteria.expression if b.criteria else None)
+                        ),
+                        "rendered_expression": ev.get("rendered_expression") if ev else None,
+                        "result": ev.get("result") if ev else None,
+                        "is_default": ev.get("is_default", b.is_default) if ev else b.is_default,
+                        "next_block_label": b.next_block_label,
+                    }
+                    expressions.append(expr_info)
+            else:
+                # Fallback: no ordered_branches, use evaluations as-is
+                for ev in evaluations:
+                    expressions.append(
+                        {
+                            "original_expression": ev.get("original_expression"),
+                            "rendered_expression": ev.get("rendered_expression"),
+                            "result": ev.get("result"),
+                            "is_default": ev.get("is_default", False),
+                            "next_block_label": ev.get("next_block_label"),
+                        }
+                    )
+            cond_context = skyvern_context.current()
+            cond_episode = await app.DATABASE.scripts.create_fallback_episode(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                block_label=block.label,
+                fallback_type="conditional_agent",
+                error_message=None,
+                script_revision_id=cond_context.script_revision_id if cond_context else None,
+                agent_actions={
+                    "block_type": "conditional",
+                    "branch_taken": branch_metadata.get("branch_taken"),
+                    "branch_index": branch_metadata.get("branch_index"),
+                    "expressions": expressions,
+                },
+            )
+            await app.DATABASE.scripts.update_fallback_episode(
+                episode_id=cond_episode.episode_id,
+                organization_id=organization_id,
+                fallback_succeeded=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record conditional episode",
+                block_label=block.label,
+                exc_info=True,
+            )
+
+    def _track_blocks_for_script_generation(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        block: BlockTypeVar,
+        workflow_run_block_result: BlockResult,
+        block_executed_with_code: bool,
+        is_script_run: bool,
+        script_blocks_by_label: dict[str, Any],
+        blocks_to_update: set[str],
+    ) -> None:
+        # Determine which block statuses are eligible for caching
+        cacheable_statuses = {BlockStatus.completed}
+        if workflow.generate_script_on_terminal:
+            cacheable_statuses.add(BlockStatus.terminated)
+
+        if (
+            not block_executed_with_code
+            and block.label
+            and block.label not in script_blocks_by_label
+            and workflow_run_block_result.status in cacheable_statuses
+            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            # For traditional caching (code_version < 2), only track blocks
+            # for regeneration when actually running with code. Agent-mode runs
+            # should not trigger regeneration — doing so creates an infinite loop
+            # where every run deletes and regenerates the script because blocks
+            # always execute via agent and are never in script_blocks_by_label.
+            and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+        ):
+            blocks_to_update.add(block.label)
+
+        # NOTE: continue_on_failure block failures are handled by the Script
+        # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
+        # regenerating the entire script here. The fallback episode is already
+        # recorded and the reviewer will patch the specific block that failed.
+        # See _trigger_script_reviewer() for the capped reviewer flow.
+
+        # Track uncached loop block children for regeneration.
+        # Loop block children execute via block.py's execute_*_loop_helper(),
+        # bypassing _execute_single_block. Recursively walk all nesting levels
+        # so deeply nested blocks (e.g., file_download inside a double-nested
+        # loop) get cached functions generated.
+        if (
+            isinstance(block, (ForLoopBlock, WhileLoopBlock))
+            and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+            and workflow_run_block_result.status in cacheable_statuses
+        ):
+            previous_labels = set(blocks_to_update)
+            _collect_uncached_loop_children(block, script_blocks_by_label, blocks_to_update)
+            new_labels = sorted(blocks_to_update - previous_labels)
+            if new_labels:
+                LOG.info(
+                    "Loop block child blocks marked for caching",
+                    parent_label=block.label,
+                    child_labels=new_labels,
+                    child_count=len(new_labels),
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                )
 
     async def _try_execute_block_with_script(
         self,
