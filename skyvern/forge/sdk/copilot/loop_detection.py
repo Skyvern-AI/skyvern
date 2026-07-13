@@ -2,9 +2,9 @@
 
 Two independent guards:
 
-* ``detect_tool_loop`` fires on strictly consecutive same-tool streaks
-  (A-A-A). Resets the moment the tool name changes, so oscillating
-  patterns (A-B-A-B) bypass it by design.
+* ``detect_tool_loop`` fires on strictly consecutive same-identity streaks
+  (A-A-A over one tool_step_identity). Resets the moment the identity
+  changes, so oscillating and argument-distinct patterns bypass it by design.
 * ``detect_failed_tool_step_loop`` fires on N repeated failures of the
   same (tool, args) pair, even when other tools dispatch in between.
   Block-running credential/config failures are keyed by failure category
@@ -53,10 +53,12 @@ WORKFLOW_RUN_CREATION_TOOL_NAMES = frozenset({"run_blocks_and_collect_debug", "u
 def detect_tool_loop(
     tracker: list[str],
     tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
     threshold: int = MAX_CONSECUTIVE_SAME_TOOL,
 ) -> str | None:
-    """Track tool invocation order and return a loop error message when threshold is hit."""
-    tracker.append(tool_name)
+    """Track tool step identities and return a loop error message when threshold is hit."""
+    identity = tool_step_identity(tool_name, arguments)
+    tracker.append(identity)
 
     if len(tracker) >= threshold and len(set(tracker[-threshold:])) == 1:
         tracker.clear()
@@ -69,16 +71,23 @@ def detect_tool_loop(
 
     if len(tracker) >= 2 and tracker[-1] != tracker[-2]:
         tracker.clear()
-        tracker.append(tool_name)
+        tracker.append(identity)
 
     return None
 
 
-def record_consecutive_tool_result_boundary(tracker: list[str], tool_name: str) -> None:
-    if tracker and tracker[-1] == tool_name:
+def record_consecutive_tool_result_boundary(
+    tracker: list[str],
+    tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
+) -> None:
+    # No-op on a same-name boundary regardless of arguments: streak identity is owned by
+    # admission-time detect_tool_loop, so re-seeding on completion order could clobber a
+    # live argument-distinct streak.
+    if tracker and tracker[-1].startswith(f"{tool_name}:"):
         return
     tracker.clear()
-    tracker.append(tool_name)
+    tracker.append(tool_step_identity(tool_name, arguments))
 
 
 def _result_records_workflow_progress(tool_name: str, result: Mapping[str, Any]) -> bool:
@@ -100,6 +109,7 @@ def record_consecutive_tool_result_boundary_for_ctx(
     ctx: Any,
     tool_name: str,
     result: Mapping[str, Any],
+    arguments: Mapping[str, Any] | None = None,
 ) -> None:
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
     if not isinstance(tracker, list):
@@ -107,7 +117,7 @@ def record_consecutive_tool_result_boundary_for_ctx(
     if _result_records_workflow_progress(tool_name, result):
         tracker.clear()
         return
-    record_consecutive_tool_result_boundary(tracker, tool_name)
+    record_consecutive_tool_result_boundary(tracker, tool_name, arguments)
 
 
 def _normalize_step_argument(value: Any) -> Any:
@@ -285,7 +295,7 @@ def record_tool_step_result_for_ctx(
     tracker = _ctx_failed_step_tracker(ctx)
     if tracker is not None:
         record_tool_step_result(tracker, tool_name, arguments, result)
-    record_consecutive_tool_result_boundary_for_ctx(ctx, tool_name, result)
+    record_consecutive_tool_result_boundary_for_ctx(ctx, tool_name, result, arguments)
     # Strict ``is True`` check: a malformed result dict missing ``ok`` entirely
     # must not be treated as success and accidentally clear a blocker signal.
     if result.get("ok") is True:

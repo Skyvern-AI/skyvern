@@ -1568,7 +1568,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
         and not output_contract_owns_turn
     ):
-        detected = detect_tool_loop(tracker, tool_name)
+        detected = detect_tool_loop(tracker, tool_name, arguments)
         if detected is not None:
             return _emit_tool_blocker_signal(
                 ctx,

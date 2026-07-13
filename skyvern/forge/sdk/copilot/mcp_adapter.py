@@ -351,7 +351,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
-        loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
+        loop_error = detect_tool_loop(tracker, tool_name, arguments) if isinstance(tracker, list) else None
         if loop_error:
             LOG.warning(
                 "Tool loop detected, skipping execution",
