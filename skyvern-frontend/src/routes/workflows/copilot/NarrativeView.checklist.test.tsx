@@ -123,7 +123,8 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
 
   it("hosts FBlockRun exactly once, inside the Test-run nest — no double-render with the legacy flat list", () => {
     render(<NarrativeView turn={testActiveTurn()} uxV1 />);
-    expect(screen.getAllByText("block_1")).toHaveLength(1);
+    // uxV1 humanizes the primary block label ("block_1" -> "Block 1").
+    expect(screen.getAllByText("Block 1")).toHaveLength(1);
   });
 
   it("a11y: nest-less rows render a plain div, not a button", () => {
@@ -311,5 +312,32 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     expect(screen.queryByText("Explore site")).toBeNull();
     expect(screen.queryByText("Draft code")).toBeNull();
     expect(screen.queryByText("Test-run")).toBeNull();
+  });
+
+  it("humanizes the primary block label under uxV1, keeping the raw label in a title attribute", () => {
+    const turn = testActiveTurn();
+    turn.blocks = [
+      runningBlock({
+        state: "completed",
+        endedAt: "2026-06-10T00:00:10Z",
+        label: "extract_first_comments_from_top_three_posts_v2",
+      }),
+    ];
+    render(<NarrativeView turn={turn} uxV1 />);
+    const label = screen.getByText(
+      "Extract First Comments From Top Three Posts",
+    );
+    expect(label.getAttribute("title")).toBe(
+      "extract_first_comments_from_top_three_posts_v2",
+    );
+    expect(
+      screen.queryByText("extract_first_comments_from_top_three_posts_v2"),
+    ).toBeNull();
+  });
+
+  it("flag-off parity: block labels render raw, unhumanized, when uxV1 is absent", () => {
+    render(<NarrativeView turn={testActiveTurn()} />);
+    expect(screen.getByText("block_1")).toBeTruthy();
+    expect(screen.queryByText("Block 1")).toBeNull();
   });
 });

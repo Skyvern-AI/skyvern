@@ -1,8 +1,15 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { EMPTY_NARRATIVE, type TurnNarrativeState } from "../narrativeState";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { getReviewGateVerdict } from "./ReviewGateCard";
+import { ReviewGateCard, getReviewGateVerdict } from "./ReviewGateCard";
+
+afterEach(() => {
+  cleanup();
+});
 
 const turn = (
   overrides: Partial<TurnNarrativeState> = {},
@@ -71,5 +78,49 @@ describe("getReviewGateVerdict", () => {
     expect(
       getReviewGateVerdict(turn({ proposalDisposition: null }), null),
     ).toBe(null);
+  });
+});
+
+describe("ReviewGateCard — block label humanization", () => {
+  const noop = () => {};
+
+  it("humanizes Added/Removed block labels, keeping the raw label in a title attribute", () => {
+    render(
+      <ReviewGateCard
+        turn={turn({
+          draft: {
+            blockCount: 1,
+            blockLabels: ["extract_titles_v2"],
+            summary: null,
+          },
+          blocks: [
+            {
+              workflowRunBlockId: "wrb_1",
+              label: "old_extract_step",
+              blockType: "task",
+              state: "drafted",
+              lastSeenIteration: 0,
+              activity: [],
+              startedAt: null,
+              endedAt: null,
+            },
+          ],
+        })}
+        pending={false}
+        verdict={null}
+        actionsEnabled={false}
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    const added = screen.getByText("+ Extract Titles");
+    expect(added.getAttribute("title")).toBe("extract_titles_v2");
+    expect(screen.queryByText("+ extract_titles_v2")).toBeNull();
+
+    const removed = screen.getByText("- Old Extract Step");
+    expect(removed.getAttribute("title")).toBe("old_extract_step");
   });
 });
