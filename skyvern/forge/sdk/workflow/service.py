@@ -5113,6 +5113,8 @@ class WorkflowService:
         run_with: str | None = None,
         ai_fallback: bool = True,
         task_version: Literal["v1", "v2"] = "v1",
+        extracted_information_schema: dict[str, Any] | list | str | None = None,
+        generate_script: bool = False,
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -5177,6 +5179,7 @@ class WorkflowService:
                         label="extract_data",
                         title="Extract Data",
                         data_extraction_goal=data_extraction_goal,
+                        data_schema=extracted_information_schema,
                         output_parameter=OutputParameter(
                             output_parameter_id=str(uuid.uuid4()),
                             key="extract_data_output",
@@ -5251,6 +5254,7 @@ class WorkflowService:
             status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
+            generate_script_on_terminal=generate_script,
         )
 
         return new_workflow

@@ -891,6 +891,8 @@ async def create_workflow_from_prompt(
             run_with=request.run_with,
             ai_fallback=request.ai_fallback if request.ai_fallback is not None else True,
             task_version=task_version,
+            extracted_information_schema=request.extracted_information_schema,
+            generate_script=bool(request.generate_script),
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
