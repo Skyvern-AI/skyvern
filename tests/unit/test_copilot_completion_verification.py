@@ -1688,18 +1688,40 @@ def test_validation_classification_grader_credits_repeated_matching_boolean_valu
         ),
     ],
 )
-def test_validation_classification_grader_fails_closed_for_incomplete_contract(
+def test_validation_classification_grader_abstains_on_incomplete_contract(
     criterion: CompletionCriterion,
 ) -> None:
+    # SKY-12340: an incomplete typed contract (missing output key or expected value) cannot grade
+    # anything, so it degrades to a non-sinking abstention like the definition grader instead of a
+    # sinking unsatisfied/no_evidence verdict that would disown a delivered sibling output.
     snapshot = RunEvidenceSnapshot(block_outputs={"classify_path": {"path_classification": "login_gated"}})
 
     verdicts = grade_validation_classification_criteria([criterion], snapshot)
 
     assert len(verdicts) == 1
     assert verdicts[0].criterion_id == "c_validation"
-    assert verdicts[0].state == "unsatisfied"
-    assert verdicts[0].reason_code == "no_evidence"
+    assert verdicts[0].state == "unknown"
+    assert verdicts[0].reason_code == "validation_classification_incomplete_contract"
     assert verdicts[0].missing_evidence == "incomplete typed classification contract"
+
+
+def test_incomplete_validation_classification_abstention_does_not_sink_confirmed_run() -> None:
+    # Direction 1 (real delivery credits): an incomplete-contract abstention must not veto a run
+    # whose delivered sibling output is confirmed.
+    incomplete = CriterionVerdict(
+        criterion_id="c0", state="unknown", reason_code="validation_classification_incomplete_contract"
+    )
+    confirmed = CriterionVerdict(criterion_id="c1", state="satisfied", reason_code="evidence_confirms")
+    assert _mixed(incomplete, confirmed).is_fully_satisfied() is True
+
+
+def test_incomplete_validation_classification_abstention_alone_never_satisfies() -> None:
+    # Direction 2 (fail-closed): a value-less classification criterion can never manufacture success
+    # on its own — an abstention-only result is not fully satisfied.
+    incomplete = CriterionVerdict(
+        criterion_id="c0", state="unknown", reason_code="validation_classification_incomplete_contract"
+    )
+    assert _mixed(incomplete).is_fully_satisfied() is False
 
 
 @pytest.mark.parametrize(
@@ -5054,10 +5076,13 @@ async def test_validation_classification_missing_or_prose_only_evidence_cannot_b
     ],
 )
 @pytest.mark.asyncio
-async def test_validation_classification_incomplete_contract_cannot_be_judge_approved(
+async def test_validation_classification_incomplete_contract_abstains_without_blocking_satisfied_sibling(
     monkeypatch: pytest.MonkeyPatch,
     criterion: CompletionCriterion,
 ) -> None:
+    # SKY-12340: the incomplete contract still cannot be judge-approved (its deterministic verdict
+    # stays a non-sinking abstention, never satisfied), but it no longer sinks a run whose genuine
+    # sibling output is satisfied.
     calls = 0
 
     async def handler(**_: object) -> dict:
@@ -5089,12 +5114,14 @@ async def test_validation_classification_incomplete_contract_cannot_be_judge_app
 
     assert calls == 1
     assert verification is not None
-    assert verification.is_fully_satisfied() is False
     verdict_by_id = {verdict.criterion_id: verdict for verdict in verification.verdicts}
-    assert verdict_by_id["c_validation"].state == "unsatisfied"
-    assert verdict_by_id["c_validation"].reason_code == "no_evidence"
+    # Judge said satisfied, but the incomplete contract abstains deterministically — never credited.
+    assert verdict_by_id["c_validation"].state == "unknown"
+    assert verdict_by_id["c_validation"].reason_code == "validation_classification_incomplete_contract"
     assert verdict_by_id["c_validation"].missing_evidence == "incomplete typed classification contract"
     assert verdict_by_id["c_other"].satisfied is True
+    # The abstention does not disown the genuinely satisfied sibling.
+    assert verification.is_fully_satisfied() is True
 
 
 @pytest.mark.asyncio
@@ -5916,10 +5943,12 @@ async def test_page_observation_validation_classification_cannot_be_judge_approv
     ],
 )
 @pytest.mark.asyncio
-async def test_page_observation_validation_classification_incomplete_contract_cannot_be_judge_approved(
+async def test_page_observation_validation_classification_incomplete_contract_abstains_without_blocking_sibling(
     monkeypatch: pytest.MonkeyPatch,
     criterion: CompletionCriterion,
 ) -> None:
+    # SKY-12340: same abstention on the page-observation path — the incomplete contract is never
+    # judge-credited, but no longer sinks a run whose genuine sibling is satisfied.
     handler_calls = 0
 
     async def handler(**_: object) -> dict:
@@ -5961,12 +5990,12 @@ async def test_page_observation_validation_classification_incomplete_contract_ca
 
     assert handler_calls == 1
     assert result is not None
-    assert result.is_fully_satisfied() is False
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
-    assert verdict_by_id["c_validation"].state == "unsatisfied"
-    assert verdict_by_id["c_validation"].reason_code == "no_evidence"
+    assert verdict_by_id["c_validation"].state == "unknown"
+    assert verdict_by_id["c_validation"].reason_code == "validation_classification_incomplete_contract"
     assert verdict_by_id["c_validation"].missing_evidence == "incomplete typed classification contract"
     assert verdict_by_id["c_page"].satisfied is True
+    assert result.is_fully_satisfied() is True
 
 
 @pytest.mark.asyncio
