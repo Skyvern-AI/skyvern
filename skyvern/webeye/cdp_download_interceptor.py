@@ -129,6 +129,23 @@ _FILENAME_PATH_SEPARATOR_RE = re.compile(r"[\\/]+")
 _FILENAME_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
+# Substrings that identify a CDP interception which was already resolved/cancelled, or whose
+# target/frame detached, before our async handler could respond — a benign race between
+# Fetch.requestPaused firing and us sending continue/fulfill (common for telemetry requests
+# cancelled by navigation). Retrying is futile; these must not surface as error-level failures.
+# Matched case-insensitively against the raised error message.
+_STALE_INTERCEPTION_ERROR_SUBSTRINGS = (
+    "invalid interceptionid",
+    "target closed",
+    "session closed",
+    "has been closed",
+)
+
+
+def _is_stale_interception_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(substr in message for substr in _STALE_INTERCEPTION_ERROR_SUBSTRINGS)
+
 
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
     """Convert CDP header list [{name, value}] to a lowercase-keyed dict (last value wins)."""
@@ -755,6 +772,18 @@ class CDPDownloadInterceptor:
             else:
                 await self._continue_response(cdp_session, request_id)
         except Exception as e:
+            if _is_stale_interception_error(e):
+                # The interception was resolved/cancelled or its target detached before we
+                # responded (SKY-11964). Retrying continue/fulfill would fail identically, so
+                # drop it quietly — real download flows aren't stalled by a request that no
+                # longer exists.
+                LOG.debug(
+                    "CDP interception went stale before response (benign race)",
+                    request_id=request_id,
+                    url=url,
+                    error=str(e),
+                )
+                return
             LOG.error(
                 "Error handling CDP request",
                 request_id=request_id,
@@ -875,8 +904,17 @@ class CDPDownloadInterceptor:
         try:
             await self._fulfill_with_body(cdp_session, request_id, response_status, raw_response_headers, data)
         except Exception as e:
-            LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
-            # Can't continue response after body extraction, just log the error
+            # The file is already saved to disk at this point; only the browser-side replay failed.
+            # A stale interception here (target navigated/closed) is a benign race, not an error.
+            if _is_stale_interception_error(e):
+                LOG.debug(
+                    "fulfillRequest hit stale interception after download (benign race)",
+                    filename=filename,
+                    url=url,
+                    error=str(e),
+                )
+            else:
+                LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
 
     async def _fulfill_with_body(
         self,
