@@ -3,6 +3,8 @@ from http import HTTPStatus
 import pytest
 
 from skyvern.exceptions import (
+    CaptchaNotSolvedInTime,
+    CaptchaSolveError,
     CdpConnectionConfigurationError,
     SkyvernException,
     SkyvernExtraNotInstalled,
@@ -34,6 +36,15 @@ def test_unknown_error_while_creating_browser_context_strips_call_log() -> None:
     assert "timed out after 180 seconds" in message
     assert "Please try re-running." in message
     assert "support@skyvern.com" in message
+
+
+def test_captcha_not_solved_in_time_is_captcha_solve_error() -> None:
+    # The action handler catches CaptchaSolveError before its generic arm; this
+    # subclass relationship is what routes captcha-solve failures to the handled
+    # log path instead of "Unhandled exception in action handler".
+    error = CaptchaNotSolvedInTime("task_123", "unsolved")
+    assert isinstance(error, CaptchaSolveError)
+    assert isinstance(error, SkyvernException)
 
 
 def test_unknown_error_preserves_cdp_configuration_guidance() -> None:
