@@ -67,6 +67,7 @@ import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { shouldArmDraftingGapTimer } from "./copilotPhases";
 import { NarrativeView } from "./NarrativeView";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
+import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
 import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
@@ -392,34 +393,55 @@ const formatChatTimestamp = (value: string) => {
 interface MessageItemProps {
   message: ChatMessage;
   footer?: React.ReactNode;
+  // Replaces the timestamp with a spinner + cancel affordance while this
+  // message is the currently-queued (not yet sent) prompt.
+  queuedStatus?: { text: string; onCancel: () => void } | null;
 }
 
-const MessageItem = memo(({ message, footer }: MessageItemProps) => {
-  if (message.sender === "user") {
-    return (
-      <div className="flex justify-end">
-        <div className="relative max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
-          <p className="whitespace-pre-wrap pr-12">{message.content}</p>
-          {message.timestamp ? (
-            <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-elevation1/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-              {formatChatTimestamp(message.timestamp)}
-            </span>
-          ) : null}
+const MessageItem = memo(
+  ({ message, footer, queuedStatus }: MessageItemProps) => {
+    if (message.sender === "user") {
+      return (
+        <div className="flex justify-end">
+          <div className="relative max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
+            <p className="whitespace-pre-wrap pr-12">{message.content}</p>
+            {queuedStatus ? (
+              <div className="mt-2 flex items-center gap-1.5 border-t border-white/10 pt-2 text-[11.5px] text-slate-400">
+                <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
+                <span className="min-w-0 flex-1 truncate">
+                  {queuedStatus.text}
+                </span>
+                <button
+                  type="button"
+                  onClick={queuedStatus.onCancel}
+                  title="Cancel queued message"
+                  aria-label="Cancel queued message"
+                  className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                >
+                  <Cross2Icon className="h-3 w-3" />
+                </button>
+              </div>
+            ) : message.timestamp ? (
+              <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-elevation1/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                {formatChatTimestamp(message.timestamp)}
+              </span>
+            ) : null}
+          </div>
         </div>
+      );
+    }
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-slate-200">
+          {message.content}
+        </p>
+        {footer ? (
+          <div className="flex flex-wrap gap-2 pl-1">{footer}</div>
+        ) : null}
       </div>
     );
-  }
-  return (
-    <div className="flex flex-col gap-2">
-      <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-slate-200">
-        {message.content}
-      </p>
-      {footer ? (
-        <div className="flex flex-wrap gap-2 pl-1">{footer}</div>
-      ) : null}
-    </div>
-  );
-});
+  },
+);
 
 // Studio-only run status line, distinct from ai prose: no bubble, no footer.
 function RunLifecycleLine({ content }: { content: string }) {
@@ -2438,8 +2460,9 @@ export function WorkflowCopilotChat({
     queuedPrompt?.reason === "working"
       ? "Queued — sends when this turn finishes."
       : "Prompt queued. Waiting for live browser...";
-  // S4's Queued chip already surfaces queuedPromptWaitingStatus; don't
-  // duplicate it as a second status line above the composer.
+  // queuedPromptWaitingStatus already surfaces via the composer chip
+  // (working reason) or the queued bubble's footer (live_browser reason);
+  // don't duplicate it as a second status line above the composer.
   const browserStatusText = queuedPrompt
     ? copilotUxV1Enabled && copilotV2Enabled
       ? null
@@ -2781,6 +2804,17 @@ export function WorkflowCopilotChat({
                         ) : null}
                       </>
                     ) : null}
+                    {copilotUxV1Enabled &&
+                    isLastMessage &&
+                    shouldShowConfirmCard(message.narrative) ? (
+                      <ConfirmCard
+                        onConfirm={() => handleSend("Confirmed.")}
+                        onChangeInstead={() => {
+                          textareaRef.current?.focus();
+                          adjustTextareaHeight();
+                        }}
+                      />
+                    ) : null}
                     {docked &&
                     isLastMessage &&
                     shouldShowFixCard(message.narrative) ? (
@@ -2803,6 +2837,17 @@ export function WorkflowCopilotChat({
                 <MessageItem
                   key={message.id}
                   message={message}
+                  queuedStatus={
+                    copilotUxV1Enabled &&
+                    copilotV2Enabled &&
+                    queuedPrompt?.reason === "live_browser" &&
+                    queuedPrompt.id === message.id
+                      ? {
+                          text: queuedPromptWaitingStatus,
+                          onCancel: cancelQueuedPrompt,
+                        }
+                      : null
+                  }
                   footer={
                     copilotUxV1Enabled && isGateOwnerOrLast ? (
                       <ReviewGateCard
@@ -2961,7 +3006,10 @@ export function WorkflowCopilotChat({
             pending · Review
           </button>
         ) : null}
-        {copilotUxV1Enabled && copilotV2Enabled && queuedPrompt ? (
+        {copilotUxV1Enabled &&
+        copilotV2Enabled &&
+        queuedPrompt &&
+        queuedPrompt.reason === "working" ? (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-slate-elevation2 px-2.5 py-1.5 text-xs text-muted-foreground">
             <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
             <span className="shrink-0 font-medium text-foreground">Queued</span>
