@@ -403,7 +403,11 @@ async def skyvern_block_schema(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Get the schema for a workflow block type, or list all available types if block_type is omitted."""
+    """Get the schema for a workflow block type, or list all available types if block_type is omitted.
+
+    Accepts ONLY a block_type string (e.g. 'navigation'); it does NOT accept a block definition or a
+    format argument. To check a full block definition you have authored, use skyvern_block_validate
+    (block_json=...) instead."""
 
     action = "skyvern_block_schema"
 
@@ -490,7 +494,9 @@ async def skyvern_block_validate(
         Field(description="When true, structurally reject non-code browser/page block types (code-only mode)"),
     ] = False,
 ) -> dict[str, Any]:
-    """Validate a workflow block definition before using it in skyvern_workflow_create. Returns field-level errors."""
+    """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
+    it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
+    block type first, use skyvern_block_schema(block_type=...)."""
     action = "skyvern_block_validate"
 
     try:

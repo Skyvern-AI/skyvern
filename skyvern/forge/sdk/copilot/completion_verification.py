@@ -159,6 +159,10 @@ class CompletionVerificationResult:
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
             if verdict is not None and _is_definition_plane_abstention(verdict):
                 continue
+            # An incomplete typed classification contract likewise abstains rather than refutes:
+            # it must not disown a delivered sibling output whose evidence is confirmed.
+            if verdict is not None and _is_incomplete_validation_classification_abstention(verdict):
+                continue
             if verdict is not None and verdict.self_emitted_judgment_not_independent:
                 if _has_independent_satisfied_requested_output_corroborator(verdict_by_id, criterion_id):
                     satisfied_run_plane_count += 1
@@ -350,6 +354,7 @@ class RunEvidenceSnapshot:
 _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
 _MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
 _INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT = "incomplete typed classification contract"
+_INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON = "validation_classification_incomplete_contract"
 _MISSING_REGISTERED_DOWNLOAD_EVIDENCE = "run output did not include a non-empty registered browser download"
 _DELIVERED_UNVERIFIED_OUTPUT_SOURCES = frozenset({"runtime_output", "registered_output_parameter"})
 
@@ -1015,11 +1020,16 @@ def grade_validation_classification_criteria(
         output_key = criterion.classification_output_key
         expected = criterion.expected_classification
         if output_key is None or expected is None:
+            # An incomplete typed contract cannot grade anything, so it fails safe to a non-sinking
+            # abstention like grade_definition_criteria rather than a sinking unsatisfied verdict —
+            # a value-less criterion minted without the fields this arm needs must not disown a
+            # delivered sibling output. It can never satisfy on its own: is_fully_satisfied still
+            # requires a genuinely satisfied run-plane criterion.
             verdicts.append(
-                _validation_classification_unsatisfied(
-                    criterion,
-                    reason_code="no_evidence",
-                    output_key=output_key or "",
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unknown",
+                    reason_code=_INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON,
                     missing_evidence=_INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT,
                 )
             )
@@ -2022,6 +2032,10 @@ def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
 
 
+def _is_incomplete_validation_classification_abstention(verdict: CriterionVerdict) -> bool:
+    return verdict.state == "unknown" and verdict.reason_code == _INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON
+
+
 def _is_structural_requested_output_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unsatisfied" and verdict.reason_code == _STRUCTURAL_ABSTENTION_REASON_CODE
 
@@ -2307,6 +2321,8 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
         if verdict is not None and verdict.satisfied:
             continue
         if verdict is not None and _is_definition_plane_abstention(verdict):
+            continue
+        if verdict is not None and _is_incomplete_validation_classification_abstention(verdict):
             continue
         if verdict is not None and result.is_structural_contingent_abstention(verdict):
             continue
