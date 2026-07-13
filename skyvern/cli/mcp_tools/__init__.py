@@ -295,6 +295,15 @@ Precision tools support intent (AI), selector (deterministic), or hybrid (both) 
 - console_messages and network_requests capture events from session start — call anytime.
 - Workflow, schedule, credential, script, folder, and block tools do NOT need a browser session.
 - schedule_create requires an existing workflow_permanent_id — call workflow_list or workflow_create first.
+- get_html reads an element by selector on the CURRENT page — navigate first; there is no fetch-HTML-by-URL.
+- workflow_get and workflow_run need a KNOWN workflow_permanent_id (wpid_); run starts a NEW run. To \
+search, browse, or paginate workflows use workflow_list — do NOT pass query/search/page/only_workflows \
+to workflow_get or workflow_create. To re-run an existing run, use workflow_retry with its workflow_run_id (wr_).
+- workflow_create/update take the ENTIRE workflow serialized into `definition` (title, blocks, and \
+parameters all inside); flat top-level fields are rejected.
+- browser_session_create MAKES a new session and takes no session_id/url/steps/selector — load a url with \
+navigate, run steps with execute, using the returned session_id. session_list returns ALL sessions (no pagination).
+- block_schema takes a block_type string only (no definition/format); validate a full block with block_validate(block_json=...).
 
 ## Session Lifecycle
 

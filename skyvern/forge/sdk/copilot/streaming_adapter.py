@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 
 from skyvern.config import settings
 
@@ -33,6 +34,16 @@ from skyvern.forge.sdk.copilot.narration import (
     tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
+from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
+    raise_if_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    CopilotUnrecoverableToolError,
+    _maybe_raise_unrecoverable_tool_error,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCodegenProgressUpdate,
     WorkflowCopilotDesignEndUpdate,
@@ -251,19 +262,6 @@ async def stream_to_sse(
     reasons unrelated to a dropped client) is re-raised unchanged so
     asyncio's cancellation machinery still runs normally.
     """
-    from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.enforcement import (
-        CopilotUnrecoverableToolError,
-        _maybe_raise_unrecoverable_tool_error,
-        outcome_fully_verified,
-    )
-    from skyvern.forge.sdk.copilot.turn_halt import (
-        CopilotTurnHalt,
-        raise_if_turn_halt,
-        stash_turn_halt_from_blocker_signal,
-    )
-
     call_id_to_name: dict[str, str] = {}
     # Counts completed tool round-trips (tool_called + tool_output pair), not
     # raw stream events. Both TOOL_CALL and TOOL_RESULT for the same round
