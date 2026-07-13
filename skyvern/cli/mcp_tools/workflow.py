@@ -1239,8 +1239,12 @@ async def skyvern_workflow_get(
     workflow_id: Annotated[str, "Workflow permanent ID (starts with wpid_)"],
     version: Annotated[int | None, "Specific version to retrieve (latest if omitted)"] = None,
 ) -> dict[str, Any]:
-    """Get the full definition of a specific workflow. Use when you need to inspect a workflow's
-    blocks, parameters, and configuration before running or updating it."""
+    """Get the full definition of ONE workflow by its known workflow_id (wpid_...). Use to inspect a
+    workflow's blocks, parameters, and configuration before running or updating it.
+
+    This fetches a single workflow by id only — it does NOT search, browse, or paginate, and rejects
+    arguments like query/search/page/page_size/only_workflows. To find a workflow by name or see what
+    exists, call skyvern_workflow_list first, then pass the returned workflow_id here."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_get"):
         return err
 
@@ -1368,6 +1372,14 @@ async def skyvern_workflow_create(
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
 
+    The ENTIRE workflow — its title, blocks, and parameters — must be serialized INTO the `definition`
+    string (YAML or JSON). Do NOT pass title, blocks, parameters, or other workflow fields as separate
+    top-level arguments; only definition/format/folder_id/code_only are accepted and any other top-level
+    field is rejected. Minimal JSON definition:
+    {"title": "My workflow", "workflow_definition": {"blocks": [...], "parameters": [...]}}.
+    This creates from a definition — it does not list or search; to browse existing workflows use
+    skyvern_workflow_list.
+
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
     Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
@@ -1459,7 +1471,11 @@ async def skyvern_workflow_update(
     ] = False,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
-    parameters, or configuration. Creates a new version of the workflow."""
+    parameters, or configuration. Creates a new version of the workflow.
+
+    The ENTIRE updated workflow — its title, blocks, and parameters — must be serialized INTO the
+    `definition` string; do NOT pass title/blocks/parameters as separate top-level arguments (only
+    workflow_id/definition/format/code_only are accepted, any other top-level field is rejected)."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
         return err
 
@@ -1690,6 +1706,9 @@ async def skyvern_workflow_run(
     ] = None,
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
+    Starts a NEW run and requires a workflow_id (wpid_...), NOT a workflow_run_id. To re-run an existing
+    terminal run with its original parameters, use skyvern_workflow_retry (which takes a workflow_run_id);
+    to inspect a past run, use skyvern_workflow_status or skyvern_workflow_run_list.
     Returns immediately by default (async) — set wait=true to block until completion.
     Default timeout is 300s (5 minutes). For longer workflows, increase timeout_seconds
     or use wait=false and poll with skyvern_workflow_status."""
@@ -1893,7 +1912,8 @@ async def skyvern_workflow_retry(
     workflow_run_id: Annotated[str, "Workflow run ID to retry (wr_...)"],
 ) -> dict[str, Any]:
     """Retry a terminal workflow run. Creates a new workflow run using the original run
-    parameters and run settings."""
+    parameters and run settings. Takes a workflow_run_id (wr_...), NOT a workflow_id — to start a
+    fresh run from a workflow definition instead, use skyvern_workflow_run."""
     if err := validate_workflow_run_id(workflow_run_id, "skyvern_workflow_retry"):
         return err
 

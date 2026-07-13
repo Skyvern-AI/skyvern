@@ -29,22 +29,33 @@ LOGGING_LEVEL_MAP: dict[str, int] = {
 _entrypoint: str = "unknown"
 
 _DRIVER_PIPE_CLOSED_ERROR = "Connection closed while reading from the driver"
+_TARGET_CLOSED_ERROR = "Target page, context or browser has been closed"
 _ORPHANED_FUTURE_MESSAGE = "Future exception was never retrieved"
+_TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
 
 
 class _DriverPipeNoiseFilter(logging.Filter):
-    """Drop asyncio's orphaned-future noise from a torn-down Playwright driver pipe"""
+    """Drop asyncio's orphaned-future noise from a torn-down Playwright driver/target.
+
+    Benign teardown race: a fire-and-forget driver op left a future behind, then the
+    target closed before it resolved, so asyncio logs the un-retrieved exception at
+    ERROR. Two variants are suppressed: the driver-pipe close (matched by its
+    distinctive message) and patchright's TargetClosedError. The latter is matched by
+    exception *type*, not text — the same "...has been closed" message can also come
+    from a crashed/killed browser, so a type check keeps real failures visible.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
         if _ORPHANED_FUTURE_MESSAGE not in message:
             return True
-        if _DRIVER_PIPE_CLOSED_ERROR in message:
-            return False
         exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
-        if exc is not None and _DRIVER_PIPE_CLOSED_ERROR in str(exc):
+        if _DRIVER_PIPE_CLOSED_ERROR in message or (exc is not None and _DRIVER_PIPE_CLOSED_ERROR in str(exc)):
             return False
-        return True
+        if exc is not None:
+            return type(exc).__name__ != _TARGET_CLOSED_ERROR_TYPE
+        # No exception object to type-check (message-only record) — fall back to the text.
+        return _TARGET_CLOSED_ERROR not in message
 
 
 def _get_entrypoint() -> str:
