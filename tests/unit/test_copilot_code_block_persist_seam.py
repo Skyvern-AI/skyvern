@@ -15328,6 +15328,149 @@ def test_producer_generated_code_raises_on_empty_scalar_text() -> None:
     assert empty_guards
 
 
+def _table_binding(output_path: str, column_index: int) -> LiveReadBinding:
+    return LiveReadBinding(
+        output_path=output_path,
+        kind=LiveReadKind.TABLE_COLUMN,
+        selector="#records",
+        selector_count=1,
+        selector_index=0,
+        row_selector="#records > tbody > tr",
+        row_count=2,
+        column_index=column_index,
+        relation_label=output_path.rsplit(".", 1)[-1],
+        headers=("Location", "Status"),
+        row_cell_counts=(2, 2),
+        row_identities=("Alpha Open", "Beta Closed"),
+    )
+
+
+def test_producer_table_column_emits_credited_list_literal_and_revalidates() -> None:
+    plan = _scalar_plan(
+        _table_binding("output.locations[].location", 0),
+        _table_binding("output.locations[].status", 1),
+    )
+    required = {"output.locations[].location", "output.locations[].status"}
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths=required,
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    assert "_envelope_records_0 = [{" in envelope.code
+    assert ".append(" not in envelope.code
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert required <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths=required
+    )
+    assert violations == []
+
+
+def test_producer_mixed_table_and_scalar_single_return_revalidates() -> None:
+    plan = _scalar_plan(
+        _scalar_binding("output.account_number", "Account Number", ".acct"),
+        _table_binding("output.locations[].location", 0),
+        _table_binding("output.locations[].status", 1),
+    )
+    required = {"output.account_number", "output.locations[].location", "output.locations[].status"}
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths=required,
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert required <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths=required
+    )
+    assert violations == []
+
+
+def test_producer_abstains_when_required_table_path_ungrounded() -> None:
+    plan = _scalar_plan(_table_binding("output.locations[].location", 0))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.locations[].location", "output.locations[].status"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_abstains_on_table_cell_variable_collision() -> None:
+    plan = _scalar_plan(_table_binding("output.locations[].location", 0))
+    envelope = produce_covered_static_return_envelope(
+        '_envelope_cell_0_0_0 = 1\nawait page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.locations[].location"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_table_with_sibling_declaration_emits_per_row_none_leaf() -> None:
+    plan = _scalar_plan(_table_binding("output.locations[].location", 0))
+    covered = {"output.locations[].location"}
+    declared = {"output.locations[].status"}
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths=covered,
+        declaration_paths=declared,
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    assert '"status": None' in envelope.code
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert (covered | declared) <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths=covered, declaration_paths=declared
+    )
+    assert violations == []
+
+
+def test_producer_abstains_on_array_declaration_without_matching_table_group() -> None:
+    plan = _scalar_plan(_scalar_binding("output.account_number", "Account Number", ".acct"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.account_number"},
+        declaration_paths={"output.locations[].status"},
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_abstains_on_nested_array_table_path() -> None:
+    plan = _scalar_plan(_table_binding("output.groups[].members[].name", 0))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.groups[].members[].name"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
 def test_produce_split_extraction_envelope_mixed_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = SimpleNamespace(
         reached_download_target=SimpleNamespace(selector="#download-invoice"),

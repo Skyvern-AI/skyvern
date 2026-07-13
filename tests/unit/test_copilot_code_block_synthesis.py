@@ -26,11 +26,13 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _READONLY_DEFERRED_VAR,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    ProducedStaticReturnEnvelope,
     _get_by_role_expr,
     _get_by_role_expr_strict,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
     is_optional_dismissal_only_trajectory,
+    produce_covered_static_return_envelope,
     render_synthesized_offer_text,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
@@ -231,6 +233,51 @@ async def test_generated_recipe_executes_and_fails_closed_on_runtime_drift() -> 
     page.visibility[("#records > tbody > tr|:scope > th, :scope > td", (1, 2))] = False
     with pytest.raises(ValueError, match="cell is no longer visible"):
         await _execute_recipe(page)
+
+
+def _produce_table_envelope() -> ProducedStaticReturnEnvelope | None:
+    return produce_covered_static_return_envelope(
+        "x = 1",
+        plan=_extraction_plan(),
+        scalar_required_paths=set(_extraction_plan().requested_output_paths),
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+
+
+async def _execute_envelope(page: _RecipePage, envelope: ProducedStaticReturnEnvelope | None) -> dict[str, object]:
+    assert envelope is not None
+    namespace: dict[str, object] = {}
+    exec("async def recipe(page):\n" + textwrap.indent(envelope.code, "    "), namespace)
+    recipe = namespace["recipe"]
+    assert callable(recipe)
+    return await recipe(page)
+
+
+@pytest.mark.asyncio
+async def test_produced_envelope_executes_table_and_scalar_reads() -> None:
+    result = await _execute_envelope(_RecipePage(), _produce_table_envelope())
+    assert result["output"]["record_id"] == "record-123"
+    assert result["output"]["overall_state"] == "Ready"
+    assert len(result["output"]["records"]) == 3
+    assert result["output"]["records"][0]["detail"] == "Detail 0"
+    assert result["output"]["records"][2]["state"] == "Ready"
+
+
+@pytest.mark.asyncio
+async def test_produced_envelope_guard_raises_on_empty_cell() -> None:
+    page = _RecipePage()
+    page.text[("#records > tbody > tr|:scope > th, :scope > td", (0, 1))] = ""
+    with pytest.raises(ValueError, match="table cell value is empty"):
+        await _execute_envelope(page, _produce_table_envelope())
+
+
+def test_suffix_omits_empty_cell_guard() -> None:
+    suffix = synthesize_extraction_suffix(_extraction_plan())
+    assert suffix is not None
+    assert "table cell value is empty" not in suffix.code
+    assert "scalar value is empty" not in suffix.code
 
 
 def test_plan_compiler_requires_exact_reveal_and_is_idempotent() -> None:
