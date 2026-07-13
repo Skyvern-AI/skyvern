@@ -359,6 +359,72 @@ def test_finalize_context_persists_fill_carry() -> None:
     ]
 
 
+def test_fill_carry_records_credential_field_inventory() -> None:
+    carry = _fill_carry_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ],
+        credential_field_inventory={"cred_123": frozenset({"username", "password"})},
+    )
+
+    assert [item.available_fields for item in carry] == [["password", "username"]]
+
+
+def test_fill_carry_without_inventory_serializes_like_legacy_payload() -> None:
+    carry = _fill_carry_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ]
+    )
+
+    assert [item.available_fields for item in carry] == [None]
+    serialized = StructuredContext(fill_carry=carry).to_json_str()
+    assert "available_fields" not in serialized
+    legacy_round_trip = StructuredContext.from_json_str(serialized)
+    assert legacy_round_trip.fill_carry[0].available_fields is None
+
+
+def test_finalize_context_persists_credential_inventory_on_fill_carry() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+        scout_trajectory=[
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ],
+        scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
+
+    assert raw is not None
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.fill_carry[0].available_fields == ["password", "username"]
+
+
 def test_finalize_context_clears_fill_carry_when_current_turn_has_no_fills() -> None:
     inbound = StructuredContext(
         fill_carry=[

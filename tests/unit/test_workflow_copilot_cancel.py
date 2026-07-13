@@ -65,7 +65,9 @@ class _FakeCache:
         self.set_calls.append((key, value, ex))
 
 
-def _make_chat_request(cancel_token: str | None = "tok_abc") -> WorkflowCopilotChatRequest:
+def _make_chat_request(
+    cancel_token: str | None = "tok_abc", keep_pending_proposal: bool = False
+) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
         workflow_id="wf-1",
@@ -74,6 +76,7 @@ def _make_chat_request(cancel_token: str | None = "tok_abc") -> WorkflowCopilotC
         message="please update",
         workflow_yaml="title: Example",
         cancel_token=cancel_token,
+        keep_pending_proposal=keep_pending_proposal,
     )
 
 
@@ -228,6 +231,7 @@ async def _drive_cancel_route(
     chat: SimpleNamespace,
     original_workflow: SimpleNamespace,
     agent_result: SimpleNamespace,
+    keep_pending_proposal: bool = False,
 ) -> tuple[AsyncMock, SimpleNamespace, list[Any]]:
     """Run a single chat-post + handler turn and return (restore_mock, workflow_params, sent_payloads)."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
@@ -238,7 +242,9 @@ async def _drive_cancel_route(
     request.headers = {"x-api-key": "sk-test"}
     organization = SimpleNamespace(organization_id="org-1")
 
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    response = await workflow_copilot_chat_post(
+        request, _make_chat_request(keep_pending_proposal=keep_pending_proposal), organization
+    )
     assert response is captured["sentinel"]
 
     sent_payloads: list[Any] = []
@@ -445,6 +451,115 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip(
 
 
 @pytest.mark.asyncio
+async def test_route_cancel_keeps_stale_proposed_workflow_when_no_wip_and_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """keep_pending_proposal=True survives a no-WIP cancel (chip/gate stays actionable)."""
+    chat = _make_chat(
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    original_workflow = _make_original_workflow()
+    agent_result = SimpleNamespace(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
+    )
+    _restore_mock, workflow_params, _sent = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result, keep_pending_proposal=True
+    )
+
+    workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_explicit_clear_overrides_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """keep_pending_proposal only neutralizes the restored-alone clear; an
+    agent-explicit clear_proposed_workflow must still win in the cancel path too."""
+    chat = _make_chat(
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    original_workflow = _make_original_workflow()
+    agent_result = SimpleNamespace(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=True,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        proposal_disposition="no_proposal",
+        turn_outcome=None,
+    )
+    _restore_mock, workflow_params, _sent = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result, keep_pending_proposal=True
+    )
+
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_clears_stale_proposal_when_rollback_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed rollback leaves canonical's state unverified — keep_pending_proposal
+    must not be honored against an assumption ("nothing changed") that didn't hold."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+    chat = _make_chat(
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    original_workflow = _make_original_workflow()
+    agent_result = SimpleNamespace(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=None,
+        response_type="REPLY",
+        proposal_disposition="no_proposal",
+        turn_outcome=None,
+    )
+    restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock.side_effect = RuntimeError("rollback boom")
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    organization = SimpleNamespace(organization_id="org-1")
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
 async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
     """Pre-agent cancel (agent_result=None) must clear any stale proposal.
 
@@ -478,6 +593,39 @@ async def test_pre_agent_cancel_clears_stale_proposed_workflow() -> None:
 
     workflow_params.update_workflow_copilot_chat.assert_awaited_once()
     assert workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_cancel_keeps_stale_proposed_workflow_when_keep_pending() -> None:
+    """keep_pending_proposal=True survives a pre-agent cancel too."""
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow={"workflow_id": "wf-canonical", "title": "Stale"},
+        auto_accept=False,
+    )
+    workflow_params = SimpleNamespace(
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 27, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await _persist_cancel_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=None,
+        user_message="please update",
+        agent_result=None,
+        keep_pending_proposal=True,
+    )
+
+    workflow_params.update_workflow_copilot_chat.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     summarize_tool_result,
     summarize_tool_result_detail,
     truncate_output,
+    user_facing_success,
 )
 
 
@@ -778,6 +779,59 @@ class TestFormatToolResultForUser:
         assert agent_summary == "Clicked 'xpath=//button[2]'"
 
 
+class TestUserFacingSuccess:
+    @staticmethod
+    def _blocker(blocker_kind: str, *, steering: str = "internal steering text"):
+        from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+
+        return CopilotToolBlockerSignal(
+            blocker_kind=blocker_kind,  # type: ignore[arg-type]
+            agent_steering_text=steering,
+            user_facing_reason="I need more information before I can continue.",
+            recovery_hint="ask_user_clarifying",
+            internal_reason_code="test_reason_code",
+            blocked_tool="evaluate",
+        )
+
+    def test_true_for_ok_result(self) -> None:
+        assert user_facing_success({"ok": True, "data": {}}) is True
+
+    def test_false_for_unclassified_failure(self) -> None:
+        assert user_facing_success({"ok": False, "error": "plain failure"}) is False
+
+    @pytest.mark.parametrize("blocker_kind", ["phase_gated", "missing_required_context", "authority_denied"])
+    def test_true_for_precondition_style_blockers(self, blocker_kind: str) -> None:
+        signal = self._blocker(blocker_kind)
+        result = {"ok": False, "error": signal.agent_steering_text}
+        assert user_facing_success(result, blocker_signal=signal) is True
+
+    @pytest.mark.parametrize("blocker_kind", ["tool_error", "loop_detected"])
+    def test_false_for_genuine_failure_blockers(self, blocker_kind: str) -> None:
+        """Regression guard: real tool errors and loop-detection halts keep failure affect."""
+        signal = self._blocker(blocker_kind)
+        result = {"ok": False, "error": signal.agent_steering_text}
+        assert user_facing_success(result, blocker_signal=signal) is False
+
+    def test_false_when_blocker_signal_does_not_match_result(self) -> None:
+        signal = self._blocker("phase_gated", steering="unrelated steering text")
+        result = {"ok": False, "error": "a totally different failure"}
+        assert user_facing_success(result, blocker_signal=signal) is False
+
+
+def test_format_tool_result_for_user_reframes_internal_validation_failure() -> None:
+    """Pins the SKY-11971 forensic leak: an unclassified internal validator reject must
+    never surface its raw agent-steering text (block labels, field names) to the user."""
+    raw_error = (
+        "Workflow validation failed: corrected block metadata still appears stale. "
+        "When changing a user's requested subject, URL, or action, rename affected block "
+        "labels and titles to match the revised goal. Stale metadata: extract_step: label mismatch"
+    )
+    summary = format_tool_result_for_user("update_workflow", {"ok": False, "error": raw_error})
+    assert summary == "Couldn't complete that step."
+    assert "stale" not in summary
+    assert "block" not in summary.lower()
+
+
 class TestParseFinalResponse:
     """parse_final_response is the last mile between model output and the frontend.
 
@@ -1025,8 +1079,32 @@ def test_summarize_tool_result_detail_returns_none_on_success() -> None:
     assert summarize_tool_result_detail({"ok": True, "data": {"block_count": 2}}) is None
 
 
+def test_summarize_tool_result_detail_omits_detail_for_reclassified_neutral_redirect() -> None:
+    """Regression guard (Codex, PR #13274): a phase/authority redirect reclassified to
+    success=True by user_facing_success must not still carry a non-None `detail` — the
+    schema documents `detail` as None on success, and this row renders without failure
+    affect. Without passing the reclassified `success` through, the raw `ok: false`
+    still drives a non-None structured detail here."""
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="phase_gated",
+        agent_steering_text="internal steering text",
+        user_facing_reason="I need to know what page to inspect first.",
+        recovery_hint="ask_user_clarifying",
+        internal_reason_code="test_reason_code",
+        blocked_tool="evaluate",
+    )
+    result = {"ok": False, "error": signal.agent_steering_text}
+    reclassified_success = user_facing_success(result, blocker_signal=signal)
+    assert reclassified_success is True
+
+    assert summarize_tool_result_detail(result, blocker_signal=signal) is not None
+    assert summarize_tool_result_detail(result, blocker_signal=signal, success=reclassified_success) is None
+
+
 def test_summarize_tool_result_detail_caps_at_max_chars() -> None:
-    long_error = "Workflow validation failed: " + ("missing field 'foo'; " * 200)
+    long_error = "Element lookup failed: " + ("missing field 'foo'; " * 200)
     detail = summarize_tool_result_detail({"ok": False, "error": long_error}, max_chars=400)
     assert detail is not None
     assert len(detail) <= 400
@@ -1035,9 +1113,17 @@ def test_summarize_tool_result_detail_caps_at_max_chars() -> None:
 
 def test_summarize_tool_result_detail_preserves_short_full_message() -> None:
     detail = summarize_tool_result_detail(
+        {"ok": False, "error": "Element lookup failed: title field required"},
+    )
+    assert detail == "Element lookup failed: title field required"
+
+
+def test_summarize_tool_result_detail_reframes_internal_validation_failure() -> None:
+    """Tooltip-grade detail must not leak raw internal validator text either."""
+    detail = summarize_tool_result_detail(
         {"ok": False, "error": "Workflow validation failed: title field required"},
     )
-    assert detail == "Workflow validation failed: title field required"
+    assert detail == "Couldn't complete that step."
 
 
 def test_summarize_tool_result_detail_strips_header_blobs() -> None:

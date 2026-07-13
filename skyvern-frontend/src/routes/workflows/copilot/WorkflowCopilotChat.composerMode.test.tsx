@@ -85,8 +85,11 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
+// This suite exercises the legacy (copilot_ux_v1 off) default-mode logic; no
+// test here touches copilot_ux_v1-gated behavior, so pin it off rather than
+// the stray `true` this file previously carried over from SKY-11973's mock.
 vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => true,
+  useFeatureFlagEnabled: () => false,
 }));
 
 const saveData = {

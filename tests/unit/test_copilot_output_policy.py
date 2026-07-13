@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
     _response_coverage_nudge,
 )
+from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.output_contracts import OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
     _contains_internal_tool_vocab_leak,
+    _contains_yaml_authoring_vocab_leak,
     derive_output_kind,
     evaluate_actuation_obligation,
     evaluate_output_policy,
@@ -2077,26 +2079,23 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     assert guarded_tools["update_and_run_blocks"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
 
     ctx = _ctx()
-    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
+    ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
     ctx.failed_tool_step_tracker = {"sentinel": 2}
 
-    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
-        ToolInputGuardrailData(
-            context=ToolContext(
-                context=ctx,
-                tool_name="update_and_run_blocks",
-                tool_call_id="call-1",
-                tool_arguments=json.dumps(
-                    {
-                        "workflow_yaml": """
+    rejected_yaml = """
 workflow_definition:
   blocks:
     - block_type: navigation
       label: login
       navigation_goal: Type password: hunter2 into the password field.
 """
-                    }
-                ),
+    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
+        ToolInputGuardrailData(
+            context=ToolContext(
+                context=ctx,
+                tool_name="update_and_run_blocks",
+                tool_call_id="call-1",
+                tool_arguments=json.dumps({"workflow_yaml": rejected_yaml}),
             ),
             agent=SimpleNamespace(),
         )
@@ -2104,7 +2103,9 @@ workflow_definition:
 
     assert result.behavior["type"] == "reject_content"
     assert "raw_secret_leak" in result.behavior["message"]
-    assert ctx.consecutive_tool_tracker == ["update_and_run_blocks"]
+    assert ctx.consecutive_tool_tracker == [
+        tool_step_identity("update_and_run_blocks", {"workflow_yaml": rejected_yaml})
+    ]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
 
@@ -2753,6 +2754,46 @@ def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None
 )
 def test_contains_internal_tool_vocab_leak_helper(user_response: str, expected: bool) -> None:
     assert _contains_internal_tool_vocab_leak(user_response) is expected
+
+
+@pytest.mark.parametrize(
+    "user_response,response_type,expected",
+    [
+        ("I changed the code block from folded code formatting to literal code formatting.", "REPLY", True),
+        ("Switched that step to use literal code formatting instead.", "REPLY", True),
+        ("Rewrote the block using a literal block scalar.", "REPLY", True),
+        ("Rewrote the block using a literal block scalar.", "REPLACE_WORKFLOW", True),
+        ("Switched that step to use literal code formatting instead.", "ASK_QUESTION", True),
+        ("Update the workflow to log in before extracting data.", "REPLY", False),
+        ("I formatted the code so it's easier to read.", "REPLY", False),
+        ("", "REPLY", False),
+    ],
+)
+def test_contains_yaml_authoring_vocab_leak_helper(user_response: str, response_type: str, expected: bool) -> None:
+    assert _contains_yaml_authoring_vocab_leak(user_response, response_type) is expected
+
+
+def test_yaml_authoring_vocab_leak_hard_blocks_ask_question() -> None:
+    """Regression guard: unlike the nudge/copilot-sentinel phrases, this leak class must
+    be caught in ASK_QUESTION turns too — a clarifying question is still user-visible."""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response="Should I switch this block to literal code formatting?",
+    )
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
+
+
+def test_yaml_block_scalar_standard_term_does_not_hard_block_ask_question() -> None:
+    """Regression guard for PR #13274 review feedback (LawyZheng): 'literal/folded block
+    scalar' is standard YAML terminology a legitimate clarifying question can use — unlike
+    the code-formatting jargon phrases, it must not hard-replace an ASK_QUESTION turn."""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response="Should this multi-line value use a literal block scalar or folded style?",
+    )
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
 
 
 def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:

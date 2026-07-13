@@ -5,7 +5,8 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, cast
+from dataclasses import replace
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -44,6 +45,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
     loaded_result_composition_evidence_from_page,
     loaded_result_composition_target_summary,
 )
@@ -306,6 +308,39 @@ async def _resolve_scout_role_name(
     return "", ""
 
 
+def _capped_with_eviction_accounting(
+    items: list[ScoutedInteraction],
+    *,
+    collection: Literal["scout_trajectory", "scouted_interactions"],
+) -> list[ScoutedInteraction]:
+    if len(items) <= _MAX_SCOUTED_INTERACTIONS:
+        return items
+    try:
+        for item in items[: len(items) - _MAX_SCOUTED_INTERACTIONS]:
+            event: dict[str, Any] = {
+                "collection": collection,
+                "tool_name": item.get("tool_name"),
+                "selector": item.get("selector"),
+                "source_url": item.get("source_url"),
+            }
+            if collection == "scout_trajectory":
+                event["trajectory_index"] = item.get("trajectory_index")
+            LOG.info("copilot_scout_interaction_evicted", **event)
+    except Exception:
+        pass
+    return items[-_MAX_SCOUTED_INTERACTIONS:]
+
+
+def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
+    # len() regresses once eviction trims the list, so the next index continues from the highest recorded one.
+    highest = -1
+    for item in trajectory:
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and index > highest:
+            highest = index
+    return highest + 1 if highest >= 0 else len(trajectory)
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -329,6 +364,12 @@ def _record_scouted_interaction(
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
     if tool_name != "press_key" and not selector:
+        LOG.info(
+            "copilot_scout_capture_loss",
+            tool_name=tool_name,
+            reason="unresolvable_selector",
+            url=(source_url or "").strip() or None,
+        )
         return
     _reset_evaluate_tracker(ctx)
     artifact: ScoutedInteraction = {"tool_name": tool_name}
@@ -374,13 +415,13 @@ def _record_scouted_interaction(
         )
     ]
     interactions.append(artifact)
-    ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
 
     trajectory = list(ctx.scout_trajectory)
     trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
-    trajectory_artifact["trajectory_index"] = len(trajectory)
+    trajectory_artifact["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(trajectory_artifact)
-    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
 
     LOG.info(
         "copilot_scout_interaction_captured",
@@ -499,6 +540,13 @@ async def _maybe_rebind_prior_fill_carry(
     if not prior:
         ctx.fill_carry_rebound_done = True
         return
+    # Inventory is credential metadata, not page state: rehydrate it even when page
+    # validation below drops the carried fills themselves.
+    for carry in prior:
+        if carry.tool_name == "fill_credential_field" and carry.credential_id and carry.available_fields:
+            ctx.scouted_credential_field_inventory_by_credential_id.setdefault(
+                carry.credential_id, frozenset(carry.available_fields)
+            )
     rebound: list[FillCarry] = []
     for carry in prior:
         failure = await _fill_carry_validation_failure(ctx, carry, page_evidence=page_evidence, url=url)
@@ -516,8 +564,8 @@ async def _maybe_rebind_prior_fill_carry(
     ctx.fill_carry_rebound_done = True
     trajectory = list(ctx.scout_trajectory)
     for carry in rebound:
-        trajectory.append(_fill_carry_to_interaction(carry, len(trajectory)))
-    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+        trajectory.append(_fill_carry_to_interaction(carry, _next_trajectory_index(trajectory)))
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
     LOG.info(
         "copilot_fill_carry_rebound",
         url=url,
@@ -565,6 +613,25 @@ def _scout_act_observe_capture_outcome(parsed: dict[str, Any] | None, *, started
 
 def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: float) -> str:
     return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
+
+
+def _mint_current_loaded_result_source(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any] | None,
+    *,
+    url: str,
+) -> LoadedResultCompositionEvidence | None:
+    if page_evidence is None:
+        return None
+    loaded_results = loaded_result_composition_evidence_from_page(
+        page_evidence,
+        source_tool="evaluate",
+        source_url=url,
+    )
+    if loaded_results is not None:
+        ctx.latest_evaluate_result_composition_steer = loaded_results
+        ctx.latest_evaluate_result_composition_signature = None
+    return loaded_results
 
 
 async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
@@ -832,6 +899,7 @@ def _reset_evaluate_tracker(ctx: AgentContext) -> None:
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
     ctx.latest_evaluate_result_composition_steer = None
+    ctx.latest_evaluate_result_composition_signature = None
 
 
 def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1163,6 +1231,34 @@ class _UnsetEvidence:
 _EVIDENCE_UNSET = _UnsetEvidence()
 
 
+def _page_evidence_has_password_control(page_evidence: dict[str, Any]) -> bool:
+    forms = page_evidence.get("forms")
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        fields = form.get("fields")
+        if not isinstance(fields, list):
+            continue
+        for form_field in fields:
+            if isinstance(form_field, dict) and str(form_field.get("type") or "").strip().lower() == "password":
+                return True
+    return False
+
+
+def _record_scout_page_observation(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
+    observed_index: int | None = None
+    for item in ctx.scout_trajectory:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and (observed_index is None or index > observed_index):
+            observed_index = index
+    ctx.last_scout_observation_trajectory_index = observed_index
+    ctx.last_scout_observation_has_password_control = _page_evidence_has_password_control(page_evidence)
+
+
 async def _maybe_steer_evaluate_to_action(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1183,7 +1279,8 @@ async def _maybe_steer_evaluate_to_action(
             _reset_evaluate_tracker(ctx)
             return False
         record_scouted_output_coverage(ctx, parsed)
-        loaded_results = loaded_result_composition_evidence_from_page(parsed)
+        _record_scout_page_observation(ctx, parsed)
+        loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
@@ -1203,6 +1300,7 @@ async def _maybe_steer_evaluate_to_action(
             # The result is patched in-place; returning False keeps the normal tool-loop guard active.
             return False
         ctx.latest_evaluate_result_composition_steer = None
+        ctx.latest_evaluate_result_composition_signature = None
         identities = _actionable_target_identities(parsed)
         if not identities:
             _reset_evaluate_tracker(ctx)
@@ -1272,6 +1370,18 @@ def _register_reached_download_scout_interaction(ctx: AgentContext, target: Reac
     )
 
 
+def _with_trajectory_anchor(ctx: AgentContext, target: ReachedDownloadTarget) -> ReachedDownloadTarget:
+    """Pin the target to the trajectory position where the affordance was observed, using the stored
+    ``trajectory_index`` rather than the list position so the anchor survives trajectory eviction."""
+    trajectory = list(ctx.scout_trajectory)
+    if not trajectory:
+        return target
+    anchor = trajectory[-1].get("trajectory_index")
+    if not isinstance(anchor, int):
+        return target
+    return replace(target, trajectory_anchor=anchor)
+
+
 async def _maybe_attach_reached_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1303,7 +1413,7 @@ async def _maybe_attach_reached_download_target(
         data["reached_download_guidance"] = _reached_download_guidance_for(target)
         if not target.already_registered:
             # The pure synthesizer compiles the terminal expect_download step from this typed object.
-            ctx.reached_download_target = target
+            ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
             if ctx.synthesized_block_offered and not ctx.update_workflow_called:
                 # The prompt-side offer latched before this download target resolved, so it rendered the
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.

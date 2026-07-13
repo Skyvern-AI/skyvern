@@ -444,6 +444,7 @@ class BlockType(StrEnum):
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
+    EMAIL_INBOX = "email_inbox"
 
 
 class AIFallbackMode(StrEnum):
@@ -506,6 +507,7 @@ class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
     GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
 
 
 class FileUploadDestination(BaseModel):
@@ -533,6 +535,14 @@ class FileUploadDestination(BaseModel):
 
     google_access_token: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -916,6 +926,18 @@ class FileUploadBlockYAML(BlockYAML):
     azure_folder_path: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
 
 
@@ -1244,6 +1266,20 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class EmailInboxBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
+    email_client: Literal["gmail", "outlook"]
+    credential_id: str | None = None
+    folder: str | None = None
+    prompt: str | None = None
+    sender: str | None = None
+    subject: str | None = None
+    newer_than_days: int | None = None
+    max_results: int = 25
+    include_body: bool = True
+    parameter_keys: list[str] | None = None
+
+
 class GoogleSheetsWriteBlockYAML(BlockYAML):
     block_type: Literal[BlockType.GOOGLE_SHEETS_WRITE] = BlockType.GOOGLE_SHEETS_WRITE  # type: ignore
     spreadsheet_url: str
@@ -1300,6 +1336,7 @@ BLOCK_YAML_SUBCLASSES = (
     | SplitPdfBlockYAML
     | WorkflowTriggerBlockYAML
     | GoogleSheetsReadBlockYAML
+    | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.experimentation.llm_prompt_config import LLMAPIHandler
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 import structlog
@@ -44,7 +44,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase, initial_build_phase
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _VALUE_EXCERPT_MAX,
     RecordedBuildTestOutcome,
@@ -54,9 +54,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    freeze_requested_output_extraction_candidate,
     is_optional_dismissal_only_trajectory,
     render_synthesized_offer_text,
     synthesize_code_block,
+    synthesize_code_block_with_extraction,
     trajectory_has_browser_fill_interaction,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
@@ -64,6 +66,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     apply_requested_output_producer_floor,
     build_turn_state,
     reconcile_completion_criteria,
+    requested_output_paths,
 )
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
 from skyvern.forge.sdk.copilot.config import (
@@ -92,9 +95,13 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.enforcement import (
     BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+    SCOUTED_SPINE_TURN_HALT_USER_REASON,
     artifact_health_blocked,
+    log_scouted_spine_unresolved_at_turn_halt,
     outcome_fully_verified,
     recycle_admits_present_completion_contract_ask,
+    requested_output_extraction_plan,
+    requested_output_extraction_plan_changed,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
     synthesized_trajectory_is_goal_complete,
@@ -152,6 +159,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_request_policy,
     credential_prompt_reason,
+    is_defer_authoring_durable_fill_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
@@ -169,6 +177,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHalt,
     TurnHaltKind,
+    expire_output_contract_ladder_at_turn_end,
     raise_if_turn_halt,
     turn_halt_to_trace_data,
 )
@@ -177,16 +186,19 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     RequiredContextKey,
     TurnIntent,
     TurnIntentClassifierResult,
+    TurnIntentExpectedOutput,
     TurnIntentMode,
     TurnIntentReasonCode,
     build_turn_intent,
     classify_turn_intent,
+    turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
     derive_response_kind,
     with_copilot_code_mode_diagnostics,
 )
+from skyvern.forge.sdk.copilot.turn_ownership import blocker_signal_render_allowed
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -459,12 +471,14 @@ def _reconcile_completion_criteria_on_context(
     policy_inputs: RequestPolicyGuardrailInputs,
 ) -> None:
     fresh_criteria = list(policy.completion_criteria)
+    durable_fill_carriers = [c for c in fresh_criteria if is_defer_authoring_durable_fill_criterion(c)]
     floored_fresh, fresh_floor_rekeyed_paths = apply_requested_output_producer_floor(fresh_criteria)
     if fresh_floor_rekeyed_paths:
         policy.completion_criteria = list(floored_fresh)
     snapshot = policy_inputs.stored_completion_criteria
     if snapshot is None:
         _log_requested_output_producer_floor(fresh_floor_rekeyed_paths)
+        _restore_durable_fill_carriers(policy, durable_fill_carriers)
         return
     requested_output_path_aliases = (
         ctx.copilot_config.requested_output_path_aliases if ctx.copilot_config is not None else None
@@ -482,6 +496,16 @@ def _reconcile_completion_criteria_on_context(
     if decision.action == "adopt_stored" or floor_rekeyed_paths:
         policy.completion_criteria = list(floored_criteria)
     _log_requested_output_producer_floor(floor_rekeyed_paths)
+    _restore_durable_fill_carriers(policy, durable_fill_carriers)
+
+
+def _restore_durable_fill_carriers(policy: RequestPolicy, carriers: list[CompletionCriterion]) -> None:
+    if not carriers:
+        return
+    present_ids = {criterion.id for criterion in policy.completion_criteria}
+    missing = [carrier for carrier in carriers if carrier.id not in present_ids]
+    if missing:
+        policy.completion_criteria = list(policy.completion_criteria) + missing
 
 
 def _store_request_policy_on_context(
@@ -1012,11 +1036,23 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     trajectory_len = len(ctx.scout_trajectory)
     previous_offer_len = ctx.synthesized_block_offered_trajectory_len
     trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    extraction_plan = requested_output_extraction_plan(ctx)
+    request_policy = getattr(ctx, "request_policy", None)
+    if (
+        request_policy is not None
+        and requested_output_paths(request_policy.completion_criteria)
+        and extraction_plan is None
+    ):
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="extraction_plan_unavailable")
+        return ""
+    plan_changed = requested_output_extraction_plan_changed(ctx, extraction_plan)
+    reopened = reopened or plan_changed
     if (
         ctx.synthesized_block_offered
         and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
         and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
         and not reopened
+        and not plan_changed
     ):
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
@@ -1038,7 +1074,19 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         trajectory_len=len(ctx.scout_trajectory),
         fill_step_count=fill_step_count,
     )
-    synthesized = synthesize_code_block(ctx.scout_trajectory, reached_download_target=ctx.reached_download_target)
+    synthesized = (
+        synthesize_code_block_with_extraction(
+            ctx.scout_trajectory,
+            extraction_plan,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if extraction_plan is not None
+        else synthesize_code_block(
+            ctx.scout_trajectory,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+    )
     if synthesized is None:
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
@@ -1046,6 +1094,15 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
             trajectory_len=len(ctx.scout_trajectory),
         )
         return ""
+    if extraction_plan is not None:
+        candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
+        if candidate is None:
+            return ""
+        existing_candidate = ctx.requested_output_extraction_candidate
+        if existing_candidate is not None and existing_candidate != candidate and not reopened:
+            LOG.warning("copilot_requested_output_extraction_candidate_mismatch")
+            return ""
+        ctx.requested_output_extraction_candidate = candidate
     ctx.synthesized_block_offered = True
     ctx.synthesized_block_offered_trajectory_len = trajectory_len
     ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete
@@ -1671,6 +1728,13 @@ def _make_agent_result(
             reason = credential_prompt_reason(policy, kwargs.get("user_response"))
             if reason:
                 payload_updates["credentialPrompt"] = {"reason": reason}
+        if ctx is not None and "credentialPause" not in narrative_payload:
+            pause_outcome = ctx.credential_pause_outcome
+            if pause_outcome:
+                pause_payload = {"outcome": pause_outcome}
+                if pause_outcome == "connected" and ctx.request_policy and ctx.request_policy.resolved_credentials:
+                    pause_payload["credentialId"] = ctx.request_policy.resolved_credentials[-1].credential_id
+                payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
             payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
         if ctx is not None and "outcomeAdjudication" not in narrative_payload:
@@ -2036,11 +2100,15 @@ async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_co
     )
 
 
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
+
+
 def _build_turn_halt_exit_result(
     ctx: CopilotContext,
     global_llm_context: str | None,
     halt: TurnHalt,
 ) -> AgentResult:
+    under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
     if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
         reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
         return _build_wip_exit_result(
@@ -2055,11 +2123,17 @@ def _build_turn_halt_exit_result(
     if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
         refresh_held_loop_blocker_evidence(ctx)
         signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
-    user_response = (
-        signal.user_facing_reason
-        if isinstance(signal, CopilotToolBlockerSignal)
-        else "I could not continue this turn safely. Tell me what to change and I'll try again."
-    )
+    if under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS:
+        user_response = SCOUTED_SPINE_TURN_HALT_USER_REASON
+        # The blocker-override finalizer re-renders from the held signal, so the
+        # reframed reason must live there, not just in the local reply.
+        if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
+            ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
+            ctx.blocker_signal_claimant = None
+    elif isinstance(signal, CopilotToolBlockerSignal):
+        user_response = signal.user_facing_reason
+    else:
+        user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
     return _build_exit_result(
         ctx,
         user_response,
@@ -2459,6 +2533,8 @@ def _finalize_result_with_blocker_override(
     if not isinstance(local_signal, CopilotToolBlockerSignal):
         return result
     if not local_signal.renders_final_reply:
+        return result
+    if not blocker_signal_render_allowed(ctx, local_signal):
         return result
     if local_signal.internal_reason_code in _INVOLUNTARY_BLOCKER_REASON_CODES and outcome_fully_verified(ctx):
         preserved = _verified_terminal_preserve_result(ctx, result, exit_site=exit_site)
@@ -3149,7 +3225,11 @@ async def _translate_to_agent_result(
     # Bind the signal to a local so the proposal-cascade gating below can't
     # desync from the inline override if ctx mutates mid-translate.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    render_blocker_reply = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    render_blocker_reply = (
+        local_blocker_signal is not None
+        and local_blocker_signal.renders_final_reply
+        and blocker_signal_render_allowed(ctx, local_blocker_signal)
+    )
     blocker_active = render_blocker_reply
     if local_blocker_signal is not None and render_blocker_reply:
         # Override only user-visible text + resp_type so REPLACE_WORKFLOW and ASK_QUESTION gating skip the model's side-effect path; the shim is the sole renderer.
@@ -3599,6 +3679,15 @@ def _structural_infeasibility_question(turn_intent: TurnIntent | None) -> str | 
     return question or None
 
 
+def _infeasibility_bail_question(turn_intent: TurnIntent | None) -> str | None:
+    """The pre-loop clarification question, or None when the turn must not bail. A
+    defer-authoring live-fill turn decides feasibility post-session at the actuation
+    hook, so it never takes the pre-loop bail even when judged structurally infeasible."""
+    if turn_intent_defers_authoring_live_fill(turn_intent):
+        return None
+    return _structural_infeasibility_question(turn_intent)
+
+
 def _build_infeasibility_clarification_result(
     question: str,
     user_message: str,
@@ -3646,6 +3735,86 @@ def _build_infeasibility_clarification_result(
             ),
         ),
         exit_site="feasibility_clarification",
+    )
+
+
+_DEFER_AUTHORING_NO_SESSION_MESSAGE = (
+    "You asked me to fill the page live now instead of authoring a workflow, but I don't have a live "
+    "browser session open on that page to act on. Open the page in a live browser session and I'll fill it directly."
+)
+
+
+def apply_defer_authoring_actuation_entry(
+    ctx: CopilotContext,
+    validated_browser_session_id: str | None,
+    *,
+    user_message: str,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult | None:
+    """With a validated live session, enters COMPOSING and enables live actuation while workflow
+    mutation stays blocked by the authority gate; without one, returns a deterministic honest terminal."""
+    turn_intent = ctx.turn_intent
+    if not isinstance(turn_intent, TurnIntent):
+        return None
+    if not turn_intent_defers_authoring_live_fill(turn_intent):
+        return None
+    if not validated_browser_session_id:
+        return _build_defer_authoring_no_session_result(
+            user_message=user_message,
+            prior_global_llm_context=prior_global_llm_context,
+            prior_workflow_yaml=prior_workflow_yaml,
+            ctx=ctx,
+        )
+    if turn_intent.mode in NO_MUTATION_TURN_INTENT_MODES:
+        turn_intent.mode = TurnIntentMode.BUILD
+        turn_intent.expected_output = TurnIntentExpectedOutput.RUN_RESULT
+    if RequiredContextKey.BROWSER_STATE not in turn_intent.required_context:
+        turn_intent.required_context.append(RequiredContextKey.BROWSER_STATE)
+    ctx.build_phase = BuildPhase.COMPOSING
+    return None
+
+
+def _build_defer_authoring_no_session_result(
+    *,
+    user_message: str,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+    ctx: CopilotContext,
+) -> AgentResult:
+    structured = StructuredContext.from_json_str(prior_global_llm_context)
+    if not structured.user_goal:
+        structured.user_goal = user_message[:300]
+    structured.decisions_made.append("defer-authoring live fill deferred: no live browser session")
+
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=_DEFER_AUTHORING_NO_SESSION_MESSAGE,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="defer_authoring_no_live_session",
+    )
+    return _finalize_result_with_blocker_override(
+        ctx,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=None,
+            global_llm_context=structured.to_json_str(),
+            response_type="ASK_QUESTION",
+            workflow_yaml=prior_workflow_yaml or None,
+            workflow_was_persisted=False,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
+            turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
+        ),
+        exit_site="defer_authoring_no_live_session",
     )
 
 
@@ -3998,7 +4167,11 @@ def _build_output_policy_blocked_result(
     # steering-only blockers should still flow through normal output-policy
     # salvage so internal tool text is scrubbed and saved drafts can surface.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    blocker_active = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    blocker_active = (
+        local_blocker_signal is not None
+        and local_blocker_signal.renders_final_reply
+        and blocker_signal_render_allowed(ctx, local_blocker_signal)
+    )
     preserved_workflow = (
         ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
     )
@@ -4168,6 +4341,31 @@ def _build_output_policy_blocked_result(
     )
 
 
+def _result_carries_terminal_outcome(result: AgentResult) -> bool:
+    if result.cancelled or result.response_type == "ASK_QUESTION":
+        return True
+    return result.turn_outcome is not None and bool(result.turn_outcome.terminal_reason)
+
+
+def _reconcile_turn_end_ownership(
+    ctx: CopilotContext | None, result: AgentResult, *, preserve_result: bool = False
+) -> AgentResult:
+    """Turn-end obligation: a GRANTED advisory signature always expires here, and only a silent
+    non-terminal reply is replaced by the stalled terminal; its own try keeps a reconcile failure
+    from masking the turn's real result."""
+    if ctx is None:
+        return result
+    try:
+        rewrite = not (preserve_result or _result_carries_terminal_outcome(result) or outcome_fully_verified(ctx))
+        halt = expire_output_contract_ladder_at_turn_end(ctx, emit_stalled_terminal=rewrite)
+        if halt is None:
+            return result
+        return _build_turn_halt_exit_result(ctx, result.global_llm_context, halt)
+    except Exception:
+        LOG.warning("copilot_turn_end_ownership_reconcile_failed", exc_info=True)
+        return result
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -4192,12 +4390,12 @@ async def run_copilot_agent(
     if turn_id is None:
         turn_id = uuid.uuid4().hex
     normalized_turn_index = turn_index if turn_index is not None else 0
+    ctx_sink: list[CopilotContext] = []
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
         # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
         ensure_tracing_initialized()
-        ctx_sink: list[CopilotContext] = []
         with _copilot_turn_span(
             chat_request=chat_request,
             chat_history=chat_history,
@@ -4205,7 +4403,7 @@ async def run_copilot_agent(
             turn_id=turn_id,
         ) as turn_span:
             try:
-                return await _run_copilot_turn_impl(
+                result = await _run_copilot_turn_impl(
                     stream=stream,
                     organization_id=organization_id,
                     chat_request=chat_request,
@@ -4224,6 +4422,7 @@ async def run_copilot_agent(
                     stored_completion_criteria=stored_completion_criteria,
                     prior_turn_outcome=prior_turn_outcome,
                 )
+                return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, result)
             except Exception as exc:
                 LOG.error(
                     "Copilot turn unhandled error",
@@ -4246,7 +4445,10 @@ async def run_copilot_agent(
                     turn_id=turn_id,
                     turn_index=normalized_turn_index,
                 )
-                return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+                error_result = _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+                return _reconcile_turn_end_ownership(
+                    ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True
+                )
             finally:
                 finalize_outcome_verification_trace(ctx_sink[0] if ctx_sink else None, turn_span)
     except Exception as exc:
@@ -4270,7 +4472,8 @@ async def run_copilot_agent(
             turn_id=turn_id,
             turn_index=normalized_turn_index,
         )
-        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
+        error_result = _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
+        return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True)
 
 
 async def _run_copilot_turn_impl(
@@ -4361,6 +4564,7 @@ async def _run_copilot_turn_impl(
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
         copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
+        client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
     )
     LOG.info(
         "copilot_block_authoring_policy_resolved",
@@ -4476,7 +4680,7 @@ async def _run_copilot_turn_impl(
     )
 
     # Infeasibility rides on turn_intent: a verdict carrying a question bails to a pre-loop clarification.
-    infeasibility_question = _structural_infeasibility_question(ctx.turn_intent)
+    infeasibility_question = _infeasibility_bail_question(ctx.turn_intent)
     if infeasibility_question is not None:
         return _build_infeasibility_clarification_result(
             question=infeasibility_question,
@@ -4508,6 +4712,15 @@ async def _run_copilot_turn_impl(
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
     ctx.browser_session_id = validated_browser_session_id
+    defer_authoring_terminal = apply_defer_authoring_actuation_entry(
+        ctx,
+        validated_browser_session_id,
+        user_message=agent_user_message,
+        prior_global_llm_context=global_llm_context,
+        prior_workflow_yaml=chat_request.workflow_yaml,
+    )
+    if defer_authoring_terminal is not None:
+        return defer_authoring_terminal
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
         llm_api_handler,

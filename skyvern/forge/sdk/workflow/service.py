@@ -76,6 +76,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
@@ -195,7 +196,10 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH = 120
 MANAGED_BROWSER_PROFILE_KEY_MAX_LENGTH = 40
 DETECTED_PLATFORM_RUN_TAG_KEY = "skyvern.platform"
-DETECTED_PLATFORM_RUN_TAG_CALLER_ID = "system:platform-detector"
+TRIGGER_RUN_TAG_KEY = "skyvern.trigger"
+TARGET_DOMAIN_RUN_TAG_KEY = "skyvern.target_domain"
+CREATION_RUN_TAG_CALLER_ID = "system:creation-tagging"
+COMPLETION_RUN_TAG_CALLER_ID = "system:completion-tagging"
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -448,6 +452,17 @@ class CachedScriptBlocks:
     blocks_to_clear: list[ScriptBlock]
 
 
+@dataclass(frozen=True)
+class ScriptBlockAttempt:
+    block_result: BlockResult | None
+    executed_with_code: bool
+    valid_to_run_code: bool
+    block_requires_agent: bool
+    fallback_episode_id: str | None
+    form_fields_for_episode: list | None
+    script_exception: Exception | None
+
+
 @dataclass
 class WorkflowBrowserCleanupResult:
     browser_state: BrowserState | None
@@ -651,28 +666,68 @@ class WorkflowService:
                 raise
 
     @staticmethod
-    async def _apply_detected_platform_run_tag_best_effort(
+    async def _apply_creation_run_tags_best_effort(
         *,
         workflow: Workflow,
         workflow_run_id: str,
         organization_id: str,
         parameters: dict[str, Any],
+        trigger_type: WorkflowRunTriggerType,
     ) -> None:
         try:
-            platform = workflow_script_service.detect_workflow_platform(workflow, parameters)
-            if not platform:
-                return
+            tags = {TRIGGER_RUN_TAG_KEY: trigger_type.value}
+            domain = workflow_script_service.resolve_target_domain_for_run_provenance(workflow, parameters)
+            if domain:
+                tags[TARGET_DOMAIN_RUN_TAG_KEY] = domain
+            try:
+                platform = workflow_script_service.detect_workflow_platform_for_tagging(
+                    workflow, parameters, domain_override=(domain or None)
+                )
+                if platform:
+                    tags[DETECTED_PLATFORM_RUN_TAG_KEY] = platform
+            except Exception:
+                LOG.warning(
+                    "Failed to detect platform for creation workflow run tags",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
             await app.DATABASE.tags.apply_system_run_tag_changes(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
-                sets={DETECTED_PLATFORM_RUN_TAG_KEY: platform},
-                caller_id=DETECTED_PLATFORM_RUN_TAG_CALLER_ID,
+                sets=tags,
+                caller_id=CREATION_RUN_TAG_CALLER_ID,
             )
         except Exception:
             LOG.warning(
-                "Failed to apply detected platform workflow run tag",
+                "Failed to apply creation workflow run tags",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    async def _apply_completion_run_tags_best_effort(workflow_run: WorkflowRun) -> None:
+        try:
+            tags = {"skyvern.status": str(workflow_run.status)}
+            if workflow_run.run_with:
+                tags["skyvern.execution_mode"] = workflow_run.run_with
+            if workflow_run.failure_category:
+                primary_category = workflow_run.failure_category[0].get("category")
+                if isinstance(primary_category, str):
+                    tags["skyvern.failure_category"] = primary_category
+
+            await app.DATABASE.tags.apply_system_run_tag_changes(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                sets=tags,
+                caller_id=COMPLETION_RUN_TAG_CALLER_ID,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to apply completion workflow run tags",
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
                 exc_info=True,
             )
 
@@ -1620,11 +1675,12 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             batch_error=str(batch_error),
                         )
-                await self._apply_detected_platform_run_tag_best_effort(
+                await self._apply_creation_run_tags_best_effort(
                     workflow=workflow,
                     workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization.organization_id,
                     parameters=parameter_values,
+                    trigger_type=resolved_trigger_type,
                 )
             except Exception as e:
                 LOG.exception(
@@ -3545,495 +3601,48 @@ class WorkflowService:
             )
 
             if block.block_type == BlockType.LOGIN:
-                await self._apply_login_block_credential_proxy_pin(
+                workflow_run = await self._prepare_login_block_browser_profile(
                     block=block,
                     workflow_run=workflow_run,
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
-                resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
-                    block=block,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_run.workflow_permanent_id,
-                )
-                # Save the original navigation goal before any mutation so
-                # retries don't stack the browser-session prefix repeatedly.
-                original_navigation_goal = block.navigation_goal
-                if resolved_browser_profile_id:
-                    decision = await self._evaluate_debug_session_profile_decision(
-                        workflow_run=workflow_run,
-                        browser_session_id=browser_session_id,
-                        resolved_browser_profile_id=resolved_browser_profile_id,
-                        organization_id=organization_id,
-                    )
 
-                    if decision.incompatible_reason is not None:
-                        # Debug session whose visible PBS is profile-incompatible.
-                        # Stream fidelity wins: attach the visible PBS so the user
-                        # can watch the action, but DO NOT write
-                        # workflow_run.browser_profile_id, DO NOT rewrite the
-                        # navigation_goal, and DO NOT emit "skipping login agent".
-                        # Fall through to ordinary LoginBlock execution below.
-                        LOG.warning(
-                            "Debug session profile incompatible with LoginBlock credential",
-                            code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
-                            reason=decision.incompatible_reason,
-                            workflow_run_id=workflow_run_id,
-                            block_label=block.label,
-                            debug_session_id=workflow_run.debug_session_id,
-                            browser_session_id=browser_session_id,
-                            credential_browser_profile_id=resolved_browser_profile_id,
-                        )
-                        if decision.attach_browser_session_id and block.url:
-                            try:
-                                await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                                    workflow_run=workflow_run,
-                                    url=block.url,
-                                    browser_session_id=decision.attach_browser_session_id,
-                                )
-                            except Exception:
-                                LOG.warning(
-                                    "PBS attach failed for debug incompatible profile; continuing",
-                                    workflow_run_id=workflow_run_id,
-                                    block_label=block.label,
-                                    browser_session_id=decision.attach_browser_session_id,
-                                    exc_info=True,
-                                )
-                    else:
-                        LOG.info(
-                            "LoginBlock has credential with browser profile — skipping login agent",
-                            workflow_run_id=workflow_run_id,
-                            block_label=block.label,
-                            browser_profile_id=resolved_browser_profile_id,
-                            url=block.url,
-                        )
-                        # Persist the browser_profile_id on the workflow_run so
-                        # subsequent blocks create / reuse a browser with the
-                        # saved profile (cookies, localStorage, etc.).
-                        await app.DATABASE.workflow_runs.update_workflow_run(
-                            workflow_run_id=workflow_run_id,
-                            browser_profile_id=resolved_browser_profile_id,
-                        )
-                        workflow_run = (
-                            await app.DATABASE.workflow_runs.get_workflow_run(
-                                workflow_run_id=workflow_run_id,
-                                organization_id=organization_id,
-                            )
-                            or workflow_run
-                        )
-
-                        # Create the browser with the saved profile and navigate
-                        # to the login block's URL.  When a saved-profile credential
-                        # is selected, the user is guided to enter the post-login
-                        # target URL (e.g. homepage/dashboard) rather than the
-                        # login page.  The saved cookies will authenticate the
-                        # session once the page loads.
-                        profile_loaded = bool(block.url)
-                        if block.url:
-                            try:
-                                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                                    workflow_run=workflow_run,
-                                    url=block.url,
-                                    browser_profile_id=resolved_browser_profile_id,
-                                    browser_session_id=decision.attach_browser_session_id,
-                                )
-                                working_page = await browser_state.get_working_page()
-                                if working_page and working_page.url == "about:blank":
-                                    await browser_state.navigate_to_url(page=working_page, url=block.url)
-                                # Wait for the page to settle so cookies/redirects complete
-                                if working_page:
-                                    try:
-                                        await working_page.wait_for_load_state("networkidle", timeout=10000)
-                                    except Exception:
-                                        LOG.debug(
-                                            "networkidle timeout after browser profile navigation (non-fatal)",
-                                            workflow_run_id=workflow_run_id,
-                                        )
-                            except Exception:
-                                LOG.warning(
-                                    "Saved browser profile failed to load, falling back to normal login",
-                                    workflow_run_id=workflow_run_id,
-                                    block_label=block.label,
-                                    browser_profile_id=resolved_browser_profile_id,
-                                    exc_info=True,
-                                )
-                                profile_loaded = False
-                                # Clear the profile so the normal login path doesn't reuse it
-                                await app.DATABASE.workflow_runs.update_workflow_run(
-                                    workflow_run_id=workflow_run_id,
-                                    browser_profile_id=None,
-                                )
-
-                        if not profile_loaded:
-                            # Fall through to normal block execution below
-                            pass
-                        else:
-                            # Browser profile loaded — the session may still be
-                            # valid or may have expired (common with bank sites).
-                            # Instead of skipping the login block, modify the
-                            # navigation goal so the AI checks whether the user is
-                            # already logged in and only performs login if needed.
-                            if original_navigation_goal:
-                                block.navigation_goal = (
-                                    "A saved browser session has been loaded. "
-                                    "Check if the user is already logged in. "
-                                    "If already logged in, complete this task immediately without taking any action. "
-                                    "If not logged in (e.g. the session expired), "
-                                    "proceed to log in with the provided credentials.\n\n"
-                                    f"Original goal: {original_navigation_goal}"
-                                )
-
-            valid_to_run_code = (
-                is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
+            attempt = await self._try_execute_block_with_script(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                block=block,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                script_blocks_by_label=script_blocks_by_label,
+                loaded_script_module=loaded_script_module,
+                is_script_run=is_script_run,
             )
-            # requires_agent blocks must execute via agent, not code — skip code path
-            block_requires_agent = False
-            if valid_to_run_code and script_blocks_by_label[block.label].requires_agent:
-                valid_to_run_code = False
-                block_requires_agent = True
-
-            # Log the execution mode decision for every block in a script run
-            if is_script_run and block.label:
-                LOG.info(
-                    "Block execution mode resolved",
-                    block_label=block.label,
-                    execution_mode="script" if valid_to_run_code else "ai",
-                    has_label=True,
-                    in_cache=block.label in script_blocks_by_label,
-                    disable_cache=block.disable_cache,
-                    requires_agent=block_requires_agent,
-                )
-
-            fallback_episode_id: str | None = None
-            form_fields_for_episode: list | None = None
-            script_exception: Exception | None = None
-            if valid_to_run_code:
-                script_block = script_blocks_by_label[block.label]
-                LOG.info(
-                    "Attempting to execute block with script code",
-                    block_label=block.label,
-                    run_signature=script_block.run_signature,
-                )
-                # Script path skips the block's own execute() (which is where
-                # format_potential_template_parameters runs in the agent path),
-                # so we apply the workflow_system_prompt here to thread the
-                # block-resolved value into the ``WorkflowRunContext`` cache.
-                # ``ai_extract`` reads from that cache so the script-generated
-                # extraction honors ``ignore_workflow_system_prompt`` the same
-                # way the agent path does — same string, same cache key.
-                try:
-                    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-                    block._apply_workflow_system_prompt(workflow_run_context)
-                except Exception:
-                    LOG.warning(
-                        "Failed to apply workflow_system_prompt for script-path block; continuing",
-                        block_label=block.label,
-                        exc_info=True,
-                    )
-
-                block_exec_start = time.monotonic()
-                try:
-                    vars_dict = vars(loaded_script_module) if loaded_script_module else {}
-                    exec_globals = {
-                        **vars_dict,
-                        "skyvern": skyvern,
-                        "__builtins__": __builtins__,
-                    }
-
-                    assert script_block.run_signature is not None
-                    normalized_signature = textwrap.dedent(script_block.run_signature).strip()
-
-                    # Compound statements (async for, for, if, while) can't be
-                    # wrapped in `return (...)` — they must be inlined directly
-                    # into the async wrapper function body.
-                    _COMPOUND_PREFIXES = ("async for ", "for ", "if ", "while ", "with ", "async with ")
-                    is_compound = normalized_signature.startswith(_COMPOUND_PREFIXES)
-
-                    if is_compound:
-                        indented_signature = textwrap.indent(normalized_signature, "    ")
-                        wrapper_code = f"async def __run_signature_wrapper():\n{indented_signature}\n"
-                    else:
-                        indented_signature = textwrap.indent(normalized_signature, "        ")
-                        wrapper_code = (
-                            f"async def __run_signature_wrapper():\n    return (\n{indented_signature}\n    )\n"
-                        )
-
-                    LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
-
-                    # Pre-init so the success log can reference output_value
-                    # when ScriptTerminationException was caught (terminated
-                    # is now in script_success_statuses).
-                    output_value: Any = None
-                    try:
-                        exec_code = compile(wrapper_code, "<run_signature>", "exec")
-                        exec(exec_code, exec_globals)
-                        output_value = await exec_globals["__run_signature_wrapper"]()
-                    except ScriptTerminationException as e:
-                        LOG.warning(
-                            "Script termination",
-                            block_label=block.label,
-                            error=str(e),
-                            exc_info=True,
-                        )
-
-                    workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                    )
-                    matching_blocks = [b for b in workflow_run_blocks if b.label == block.label]
-                    if matching_blocks:
-                        latest_block = max(matching_blocks, key=lambda b: b.created_at)
-                        workflow_run_block_result = BlockResult(
-                            success=latest_block.status == BlockStatus.completed,
-                            failure_reason=latest_block.failure_reason,
-                            output_parameter=block.output_parameter,
-                            output_parameter_value=latest_block.output,
-                            status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
-                            workflow_run_block_id=latest_block.workflow_run_block_id,
-                        )
-                        # Terminate() is an explicit signal to stop, not a
-                        # failure to retry. `generate_script_on_terminal` is
-                        # orthogonal — it gates script generation, not fallback.
-                        script_success_statuses = {BlockStatus.completed, BlockStatus.terminated}
-
-                        block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
-                        if workflow_run_block_result.status in script_success_statuses:
-                            block_executed_with_code = True
-                            LOG.info(
-                                "Successfully executed block with script code",
-                                block_label=block.label,
-                                block_status=workflow_run_block_result.status,
-                                has_output=output_value is not None,
-                                duration_ms=block_exec_duration_ms,
-                            )
-                        else:
-                            # Script ran but the task/block failed (e.g., wrong xpaths for a
-                            # different page layout). Treat this as a script failure: record a
-                            # fallback episode and let AI retry the block.
-                            block_executed_with_code = False
-                            LOG.warning(
-                                "Script executed but block failed, falling back to AI",
-                                block_label=block.label,
-                                block_status=workflow_run_block_result.status,
-                                failure_reason=workflow_run_block_result.failure_reason,
-                                duration_ms=block_exec_duration_ms,
-                            )
-                            # Reset the block result so AI fallback produces a fresh one
-                            workflow_run_block_result = None
-
-                            # Record fallback episode for adaptive caching
-                            if is_adaptive_caching(workflow, workflow_run) and block.label:
-                                context = skyvern_context.current()
-                                fallback_episode_id, form_fields_for_episode = await self._record_fallback_episode(
-                                    workflow_run=workflow_run,
-                                    workflow=workflow,
-                                    block=block,
-                                    organization_id=organization_id,
-                                    workflow_run_id=workflow_run_id,
-                                    error_message=f"Script completed but block failed: {latest_block.failure_reason}",
-                                    script_revision_id=context.script_revision_id if context else None,
-                                    classify_result=context.last_classify_result if context else None,
-                                )
-                    else:
-                        block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
-                        LOG.warning(
-                            "Block executed with code but no workflow run block found",
-                            block_label=block.label,
-                            duration_ms=block_exec_duration_ms,
-                        )
-                        block_executed_with_code = False
-                except Exception as e:
-                    block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
-                    script_exception = e
-                    LOG.warning(
-                        "Failed to execute block with script code, falling back to AI",
-                        block_label=block.label,
-                        error_type=type(e).__name__,
-                        error=str(e),
-                        duration_ms=block_exec_duration_ms,
-                        exc_info=True,
-                    )
-                    block_executed_with_code = False
-
-                    # Record fallback episode for the script reviewer (adaptive caching)
-                    if is_adaptive_caching(workflow, workflow_run) and block.label:
-                        context = skyvern_context.current()
-                        fallback_episode_id, form_fields_for_episode = await self._record_fallback_episode(
-                            workflow_run=workflow_run,
-                            workflow=workflow,
-                            block=block,
-                            organization_id=organization_id,
-                            workflow_run_id=workflow_run_id,
-                            error_message=str(e),
-                            script_revision_id=context.script_revision_id if context else None,
-                        )
+            workflow_run_block_result = attempt.block_result
+            block_executed_with_code = attempt.executed_with_code
+            block_requires_agent = attempt.block_requires_agent
 
             if not block_executed_with_code:
-                # Check if this block is designated as requires_agent by the script reviewer.
-                # These blocks must execute via agent even when ai_fallback=False.
-                block_requires_agent = bool(
-                    is_script_run
-                    and block.label
-                    and block.label in script_blocks_by_label
-                    and script_blocks_by_label[block.label].requires_agent
+                workflow_run_block_result, block_requires_agent = await self._execute_block_via_agent_if_allowed(
+                    block=block,
+                    workflow_run=workflow_run,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    parent_workflow_run_block_id=parent_workflow_run_block_id,
+                    is_script_run=is_script_run,
+                    script_blocks_by_label=script_blocks_by_label,
+                    attempt=attempt,
                 )
-                # Check if this block has never been cached (e.g. from an unexecuted
-                # conditional branch) or is a non-cacheable block type (goto_url,
-                # for_loop, conditional, code, wait, etc.). These blocks must run
-                # via agent even when ai_fallback=False.
-                block_is_uncached = bool(
-                    is_script_run
-                    and block.label
-                    and block.label not in script_blocks_by_label
-                    and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                )
-                block_is_non_cacheable = bool(
-                    is_script_run and block.block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                )
-                # If ai_fallback is explicitly disabled, skip the agent fallback entirely —
-                # UNLESS this block requires_agent, has never been cached, or is a
-                # non-cacheable block type that must always run via agent.
-                if (
-                    is_script_run
-                    and workflow_run.ai_fallback is False
-                    and not block_requires_agent
-                    and not block_is_uncached
-                    and not block_is_non_cacheable
-                ):
-                    LOG.info(
-                        "ai_fallback disabled: skipping agent fallback, keeping script failure",
-                        block_label=block.label,
-                        failure_reason=str(workflow_run_block_result.failure_reason)[:200]
-                        if workflow_run_block_result
-                        else "script exception",
-                    )
-                else:
-                    agent_reason = (
-                        "requires_agent"
-                        if block_requires_agent
-                        else "uncached_block"
-                        if block_is_uncached
-                        else "non_cacheable_block_type"
-                        if block_is_non_cacheable
-                        else "normal"
-                    )
-                    LOG.info(
-                        "Executing block via agent",
-                        sampling=True,
-                        block_label=block.label,
-                        block_type=block.block_type,
-                        agent_reason=agent_reason,
-                    )
-                    workflow_run_block_result = await block.execute_safe(
-                        workflow_run_id=workflow_run_id,
-                        parent_workflow_run_block_id=parent_workflow_run_block_id,
+                if attempt.fallback_episode_id and workflow_run_block_result:
+                    await self._enrich_fallback_episode_with_agent_actions(
+                        block=block,
+                        workflow_run_block_result=workflow_run_block_result,
+                        fallback_episode_id=attempt.fallback_episode_id,
+                        form_fields_for_episode=attempt.form_fields_for_episode,
                         organization_id=organization_id,
-                        browser_session_id=browser_session_id,
                     )
-                    # Record that this run experienced a script → AI fallback if
-                    # the agent execution we just ran was a consequence of a failed
-                    # script attempt. The gate correctly excludes:
-                    #   - ai_fallback=False kept-the-failure (execute_safe not reached)
-                    #   - requires_agent / uncached / disable_cache / non-cacheable
-                    #     routes (valid_to_run_code is False for these)
-                    #   - agent-only workflows (is_script_run=False → valid_to_run_code=False)
-                    # and correctly covers all three script-failure modes: script-
-                    # block failed, script threw, and script-ran-but-no-block-found.
-                    # Complements the task-block AI-fallback writers in `services/script_service.py`
-                    # writers which handle a separate task-block AI-fallback surface.
-                    # Perf: a fallback-heavy run issues N writes for N fallbacks.
-                    # Typical runs have 0-3. `_merge_script_run` is idempotent at the
-                    # DB layer. If observed latency regresses, add a context-scoped
-                    # already-flipped cache (tracked separately).
-                    await self._mark_script_fallback_triggered(
-                        workflow_run_id=workflow_run_id,
-                        # `valid_to_run_code` is computed as a chain of `and`s that
-                        # includes `block.label` (str | None), so its static type is
-                        # `Literal[''] | bool` when block.label is an empty string.
-                        # The helper treats it as a pure truthiness gate; `bool(...)`
-                        # narrows the type cleanly for mypy without changing runtime
-                        # semantics.
-                        valid_to_run_code=bool(valid_to_run_code),
-                        block_executed_with_code=block_executed_with_code,
-                        block_label=block.label,
-                    )
-
-                # Update fallback episode with agent actions for both success and failure.
-                # Failed fallbacks are kept for triage — the reviewer will determine
-                # if the failure is code-fixable.
-                if fallback_episode_id and workflow_run_block_result:
-                    try:
-                        # None = unknown count (taskless wrb / fetch error);
-                        # only a confirmed zero downgrades fallback_succeeded.
-                        fallback_wrb_id = workflow_run_block_result.workflow_run_block_id
-                        agent_action_count: int | None = None
-                        action_summaries: list[dict] | None = None
-                        if fallback_wrb_id:
-                            try:
-                                wrb = await app.DATABASE.observer.get_workflow_run_block(
-                                    workflow_run_block_id=fallback_wrb_id,
-                                    organization_id=organization_id,
-                                )
-                                if wrb and wrb.task_id:
-                                    actions = await app.DATABASE.tasks.get_task_actions(
-                                        task_id=wrb.task_id,
-                                        organization_id=organization_id,
-                                    )
-                                    agent_action_count = len(actions)
-                                    action_summaries = build_action_summaries_with_timing(actions)
-                            except Exception:
-                                LOG.debug(
-                                    "Could not fetch rich actions for fallback episode",
-                                    fallback_wrb_id=fallback_wrb_id,
-                                    exc_info=True,
-                                )
-
-                        # `completed` with confirmed 0 actions = the agent's
-                        # complete-verify accepting what the script's rejected.
-                        fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
-                        if fallback_succeeded and agent_action_count == 0:
-                            fallback_succeeded = False
-
-                        # Build agent actions summary for both success and failure
-                        agent_actions_summary: dict = {
-                            "block_status": str(workflow_run_block_result.status),
-                            "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
-                            if workflow_run_block_result.output_parameter_value
-                            else None,
-                        }
-                        if form_fields_for_episode:
-                            agent_actions_summary["form_fields"] = form_fields_for_episode
-                        if action_summaries is not None:
-                            agent_actions_summary["actions"] = action_summaries
-
-                        if not fallback_succeeded:
-                            if workflow_run_block_result.failure_reason:
-                                agent_actions_summary["failure_reason"] = str(workflow_run_block_result.failure_reason)[
-                                    :2000
-                                ]
-                            elif workflow_run_block_result.status == BlockStatus.completed and agent_action_count == 0:
-                                agent_actions_summary["failure_reason"] = script_service.VERIFIER_SWAP_FAILURE_REASON
-                            LOG.info(
-                                "AI fallback failed, keeping episode for triage",
-                                episode_id=fallback_episode_id,
-                                block_status=workflow_run_block_result.status,
-                                block_label=block.label,
-                                agent_action_count=agent_action_count,
-                            )
-
-                        await app.DATABASE.scripts.update_fallback_episode(
-                            episode_id=fallback_episode_id,
-                            organization_id=organization_id,
-                            agent_actions=agent_actions_summary,
-                            fallback_succeeded=fallback_succeeded,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to update fallback episode with agent actions",
-                            episode_id=fallback_episode_id,
-                            exc_info=True,
-                        )
 
             # Extract branch metadata for conditional blocks
             if isinstance(block, ConditionalBlock) and workflow_run_block_result:
@@ -4046,87 +3655,23 @@ class WorkflowService:
                 # (fallback_episode_id is set when the script path failed).
                 if (
                     is_script_run
-                    and (block_requires_agent or fallback_episode_id)
+                    and (block_requires_agent or attempt.fallback_episode_id)
                     and workflow_run_block_result.status == BlockStatus.completed
                     and branch_metadata
                     and is_adaptive_caching(workflow, workflow_run)
                 ):
-                    try:
-                        # Extract the branch expressions and results for the reviewer.
-                        # Evaluations from ConditionalBlock.execute() stop at the first
-                        # matched branch (break on match), so unevaluated branches
-                        # (including the default) may be missing. We merge runtime
-                        # evaluations with the full branch definitions so the script
-                        # reviewer always sees every branch — this is critical for the
-                        # branch-return validator which checks that generated code only
-                        # returns labels/indices from the defined branches.
-                        evaluations = branch_metadata.get("evaluations", [])
-                        eval_by_index: dict[int, dict] = {}
-                        for ev in evaluations:
-                            idx = ev.get("branch_index")
-                            if idx is not None:
-                                eval_by_index[idx] = ev
-
-                        expressions = []
-                        if hasattr(block, "ordered_branches"):
-                            for idx, b in enumerate(block.ordered_branches):
-                                ev = eval_by_index.get(idx)
-                                expr_info = {
-                                    "original_expression": (
-                                        ev.get("original_expression")
-                                        if ev
-                                        else (b.criteria.expression if b.criteria else None)
-                                    ),
-                                    "rendered_expression": ev.get("rendered_expression") if ev else None,
-                                    "result": ev.get("result") if ev else None,
-                                    "is_default": ev.get("is_default", b.is_default) if ev else b.is_default,
-                                    "next_block_label": b.next_block_label,
-                                }
-                                expressions.append(expr_info)
-                        else:
-                            # Fallback: no ordered_branches, use evaluations as-is
-                            for ev in evaluations:
-                                expressions.append(
-                                    {
-                                        "original_expression": ev.get("original_expression"),
-                                        "rendered_expression": ev.get("rendered_expression"),
-                                        "result": ev.get("result"),
-                                        "is_default": ev.get("is_default", False),
-                                        "next_block_label": ev.get("next_block_label"),
-                                    }
-                                )
-                        cond_context = skyvern_context.current()
-                        cond_episode = await app.DATABASE.scripts.create_fallback_episode(
-                            organization_id=organization_id,
-                            workflow_permanent_id=workflow.workflow_permanent_id,
-                            workflow_run_id=workflow_run_id,
-                            block_label=block.label,
-                            fallback_type="conditional_agent",
-                            error_message=None,
-                            script_revision_id=cond_context.script_revision_id if cond_context else None,
-                            agent_actions={
-                                "block_type": "conditional",
-                                "branch_taken": branch_metadata.get("branch_taken"),
-                                "branch_index": branch_metadata.get("branch_index"),
-                                "expressions": expressions,
-                            },
-                        )
-                        await app.DATABASE.scripts.update_fallback_episode(
-                            episode_id=cond_episode.episode_id,
-                            organization_id=organization_id,
-                            fallback_succeeded=True,
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to record conditional episode",
-                            block_label=block.label,
-                            exc_info=True,
-                        )
+                    await self._record_conditional_agent_episode(
+                        workflow=workflow,
+                        block=block,
+                        branch_metadata=branch_metadata,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
 
             if not workflow_run_block_result:
-                if script_exception is not None:
-                    exc_message = str(script_exception) or "<no message>"
-                    no_block_result_reason = f"Script error ({type(script_exception).__name__}): {exc_message}"
+                if attempt.script_exception is not None:
+                    exc_message = str(attempt.script_exception) or "<no message>"
+                    no_block_result_reason = f"Script error ({type(attempt.script_exception).__name__}): {exc_message}"
                 else:
                     no_block_result_reason = "Block result is None"
                 workflow_run = await self.mark_workflow_run_as_failed(
@@ -4134,54 +3679,17 @@ class WorkflowService:
                 )
                 return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
 
-            # Determine which block statuses are eligible for caching
-            cacheable_statuses = {BlockStatus.completed}
-            if workflow.generate_script_on_terminal:
-                cacheable_statuses.add(BlockStatus.terminated)
-
-            if (
-                not block_executed_with_code
-                and block.label
-                and block.label not in script_blocks_by_label
-                and workflow_run_block_result.status in cacheable_statuses
-                and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
-                # For traditional caching (code_version < 2), only track blocks
-                # for regeneration when actually running with code. Agent-mode runs
-                # should not trigger regeneration — doing so creates an infinite loop
-                # where every run deletes and regenerates the script because blocks
-                # always execute via agent and are never in script_blocks_by_label.
-                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
-            ):
-                blocks_to_update.add(block.label)
-
-            # NOTE: continue_on_failure block failures are handled by the Script
-            # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
-            # regenerating the entire script here. The fallback episode is already
-            # recorded and the reviewer will patch the specific block that failed.
-            # See _trigger_script_reviewer() for the capped reviewer flow.
-
-            # Track uncached loop block children for regeneration.
-            # Loop block children execute via block.py's execute_*_loop_helper(),
-            # bypassing _execute_single_block. Recursively walk all nesting levels
-            # so deeply nested blocks (e.g., file_download inside a double-nested
-            # loop) get cached functions generated.
-            if (
-                isinstance(block, (ForLoopBlock, WhileLoopBlock))
-                and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
-                and workflow_run_block_result.status in cacheable_statuses
-            ):
-                previous_labels = set(blocks_to_update)
-                _collect_uncached_loop_children(block, script_blocks_by_label, blocks_to_update)
-                new_labels = sorted(blocks_to_update - previous_labels)
-                if new_labels:
-                    LOG.info(
-                        "Loop block child blocks marked for caching",
-                        parent_label=block.label,
-                        child_labels=new_labels,
-                        child_count=len(new_labels),
-                        workflow_run_id=workflow_run_id,
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                    )
+            self._track_blocks_for_script_generation(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                workflow_run_id=workflow_run_id,
+                block=block,
+                workflow_run_block_result=workflow_run_block_result,
+                block_executed_with_code=block_executed_with_code,
+                is_script_run=is_script_run,
+                script_blocks_by_label=script_blocks_by_label,
+                blocks_to_update=blocks_to_update,
+            )
 
             workflow_run, should_stop = await self._handle_block_result_status(
                 block=block,
@@ -4213,6 +3721,677 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id, failure_reason=failure_reason
             )
             return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+    async def _record_conditional_agent_episode(
+        self,
+        *,
+        workflow: Workflow,
+        block: ConditionalBlock,
+        branch_metadata: dict[str, Any],
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            # Extract the branch expressions and results for the reviewer.
+            # Evaluations from ConditionalBlock.execute() stop at the first
+            # matched branch (break on match), so unevaluated branches
+            # (including the default) may be missing. We merge runtime
+            # evaluations with the full branch definitions so the script
+            # reviewer always sees every branch — this is critical for the
+            # branch-return validator which checks that generated code only
+            # returns labels/indices from the defined branches.
+            evaluations = branch_metadata.get("evaluations", [])
+            eval_by_index: dict[int, dict] = {}
+            for ev in evaluations:
+                idx = ev.get("branch_index")
+                if idx is not None:
+                    eval_by_index[idx] = ev
+
+            expressions = []
+            if hasattr(block, "ordered_branches"):
+                for idx, b in enumerate(block.ordered_branches):
+                    ev = eval_by_index.get(idx)
+                    expr_info = {
+                        "original_expression": (
+                            ev.get("original_expression") if ev else (b.criteria.expression if b.criteria else None)
+                        ),
+                        "rendered_expression": ev.get("rendered_expression") if ev else None,
+                        "result": ev.get("result") if ev else None,
+                        "is_default": ev.get("is_default", b.is_default) if ev else b.is_default,
+                        "next_block_label": b.next_block_label,
+                    }
+                    expressions.append(expr_info)
+            else:
+                # Fallback: no ordered_branches, use evaluations as-is
+                for ev in evaluations:
+                    expressions.append(
+                        {
+                            "original_expression": ev.get("original_expression"),
+                            "rendered_expression": ev.get("rendered_expression"),
+                            "result": ev.get("result"),
+                            "is_default": ev.get("is_default", False),
+                            "next_block_label": ev.get("next_block_label"),
+                        }
+                    )
+            cond_context = skyvern_context.current()
+            cond_episode = await app.DATABASE.scripts.create_fallback_episode(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                block_label=block.label,
+                fallback_type="conditional_agent",
+                error_message=None,
+                script_revision_id=cond_context.script_revision_id if cond_context else None,
+                agent_actions={
+                    "block_type": "conditional",
+                    "branch_taken": branch_metadata.get("branch_taken"),
+                    "branch_index": branch_metadata.get("branch_index"),
+                    "expressions": expressions,
+                },
+            )
+            await app.DATABASE.scripts.update_fallback_episode(
+                episode_id=cond_episode.episode_id,
+                organization_id=organization_id,
+                fallback_succeeded=True,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record conditional episode",
+                block_label=block.label,
+                exc_info=True,
+            )
+
+    def _track_blocks_for_script_generation(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        block: BlockTypeVar,
+        workflow_run_block_result: BlockResult,
+        block_executed_with_code: bool,
+        is_script_run: bool,
+        script_blocks_by_label: dict[str, Any],
+        blocks_to_update: set[str],
+    ) -> None:
+        # Determine which block statuses are eligible for caching
+        cacheable_statuses = {BlockStatus.completed}
+        if workflow.generate_script_on_terminal:
+            cacheable_statuses.add(BlockStatus.terminated)
+
+        if (
+            not block_executed_with_code
+            and block.label
+            and block.label not in script_blocks_by_label
+            and workflow_run_block_result.status in cacheable_statuses
+            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            # For traditional caching (code_version < 2), only track blocks
+            # for regeneration when actually running with code. Agent-mode runs
+            # should not trigger regeneration — doing so creates an infinite loop
+            # where every run deletes and regenerates the script because blocks
+            # always execute via agent and are never in script_blocks_by_label.
+            and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+        ):
+            blocks_to_update.add(block.label)
+
+        # NOTE: continue_on_failure block failures are handled by the Script
+        # Reviewer (triggered at end-of-run, capped at 5/day via Redis), NOT by
+        # regenerating the entire script here. The fallback episode is already
+        # recorded and the reviewer will patch the specific block that failed.
+        # See _trigger_script_reviewer() for the capped reviewer flow.
+
+        # Track uncached loop block children for regeneration.
+        # Loop block children execute via block.py's execute_*_loop_helper(),
+        # bypassing _execute_single_block. Recursively walk all nesting levels
+        # so deeply nested blocks (e.g., file_download inside a double-nested
+        # loop) get cached functions generated.
+        if (
+            isinstance(block, (ForLoopBlock, WhileLoopBlock))
+            and (is_adaptive_caching(workflow, workflow_run) or is_script_run)
+            and workflow_run_block_result.status in cacheable_statuses
+        ):
+            previous_labels = set(blocks_to_update)
+            _collect_uncached_loop_children(block, script_blocks_by_label, blocks_to_update)
+            new_labels = sorted(blocks_to_update - previous_labels)
+            if new_labels:
+                LOG.info(
+                    "Loop block child blocks marked for caching",
+                    parent_label=block.label,
+                    child_labels=new_labels,
+                    child_count=len(new_labels),
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                )
+
+    async def _try_execute_block_with_script(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        block: BlockTypeVar,
+        workflow_run_id: str,
+        organization_id: str,
+        script_blocks_by_label: dict[str, Any],
+        loaded_script_module: Any,
+        is_script_run: bool,
+    ) -> ScriptBlockAttempt:
+        workflow_run_block_result: BlockResult | None = None
+        block_executed_with_code = False
+        valid_to_run_code = (
+            is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
+        )
+        # requires_agent blocks must execute via agent, not code — skip code path
+        block_requires_agent = False
+        if valid_to_run_code and script_blocks_by_label[block.label].requires_agent:
+            valid_to_run_code = False
+            block_requires_agent = True
+
+        # Log the execution mode decision for every block in a script run
+        if is_script_run and block.label:
+            LOG.info(
+                "Block execution mode resolved",
+                block_label=block.label,
+                execution_mode="script" if valid_to_run_code else "ai",
+                has_label=True,
+                in_cache=block.label in script_blocks_by_label,
+                disable_cache=block.disable_cache,
+                requires_agent=block_requires_agent,
+            )
+
+        fallback_episode_id: str | None = None
+        form_fields_for_episode: list | None = None
+        script_exception: Exception | None = None
+        if valid_to_run_code:
+            script_block = script_blocks_by_label[block.label]
+            LOG.info(
+                "Attempting to execute block with script code",
+                block_label=block.label,
+                run_signature=script_block.run_signature,
+            )
+            # Script path skips the block's own execute() (which is where
+            # format_potential_template_parameters runs in the agent path),
+            # so we apply the workflow_system_prompt here to thread the
+            # block-resolved value into the ``WorkflowRunContext`` cache.
+            # ``ai_extract`` reads from that cache so the script-generated
+            # extraction honors ``ignore_workflow_system_prompt`` the same
+            # way the agent path does — same string, same cache key.
+            try:
+                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+                block._apply_workflow_system_prompt(workflow_run_context)
+            except Exception:
+                LOG.warning(
+                    "Failed to apply workflow_system_prompt for script-path block; continuing",
+                    block_label=block.label,
+                    exc_info=True,
+                )
+
+            block_exec_start = time.monotonic()
+            try:
+                vars_dict = vars(loaded_script_module) if loaded_script_module else {}
+                exec_globals = {
+                    **vars_dict,
+                    "skyvern": skyvern,
+                    "__builtins__": __builtins__,
+                }
+
+                assert script_block.run_signature is not None
+                normalized_signature = textwrap.dedent(script_block.run_signature).strip()
+
+                # Compound statements (async for, for, if, while) can't be
+                # wrapped in `return (...)` — they must be inlined directly
+                # into the async wrapper function body.
+                _COMPOUND_PREFIXES = ("async for ", "for ", "if ", "while ", "with ", "async with ")
+                is_compound = normalized_signature.startswith(_COMPOUND_PREFIXES)
+
+                if is_compound:
+                    indented_signature = textwrap.indent(normalized_signature, "    ")
+                    wrapper_code = f"async def __run_signature_wrapper():\n{indented_signature}\n"
+                else:
+                    indented_signature = textwrap.indent(normalized_signature, "        ")
+                    wrapper_code = f"async def __run_signature_wrapper():\n    return (\n{indented_signature}\n    )\n"
+
+                LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
+
+                # Pre-init so the success log can reference output_value
+                # when ScriptTerminationException was caught (terminated
+                # is now in script_success_statuses).
+                output_value: Any = None
+                try:
+                    exec_code = compile(wrapper_code, "<run_signature>", "exec")
+                    exec(exec_code, exec_globals)
+                    output_value = await exec_globals["__run_signature_wrapper"]()
+                except ScriptTerminationException as e:
+                    LOG.warning(
+                        "Script termination",
+                        block_label=block.label,
+                        error=str(e),
+                        exc_info=True,
+                    )
+
+                workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                matching_blocks = [b for b in workflow_run_blocks if b.label == block.label]
+                if matching_blocks:
+                    latest_block = max(matching_blocks, key=lambda b: b.created_at)
+                    workflow_run_block_result = BlockResult(
+                        success=latest_block.status == BlockStatus.completed,
+                        failure_reason=latest_block.failure_reason,
+                        output_parameter=block.output_parameter,
+                        output_parameter_value=latest_block.output,
+                        status=BlockStatus(latest_block.status) if latest_block.status else BlockStatus.failed,
+                        workflow_run_block_id=latest_block.workflow_run_block_id,
+                    )
+                    # Terminate() is an explicit signal to stop, not a
+                    # failure to retry. `generate_script_on_terminal` is
+                    # orthogonal — it gates script generation, not fallback.
+                    script_success_statuses = {BlockStatus.completed, BlockStatus.terminated}
+
+                    block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
+                    if workflow_run_block_result.status in script_success_statuses:
+                        block_executed_with_code = True
+                        LOG.info(
+                            "Successfully executed block with script code",
+                            block_label=block.label,
+                            block_status=workflow_run_block_result.status,
+                            has_output=output_value is not None,
+                            duration_ms=block_exec_duration_ms,
+                        )
+                    else:
+                        # Script ran but the task/block failed (e.g., wrong xpaths for a
+                        # different page layout). Treat this as a script failure: record a
+                        # fallback episode and let AI retry the block.
+                        block_executed_with_code = False
+                        LOG.warning(
+                            "Script executed but block failed, falling back to AI",
+                            block_label=block.label,
+                            block_status=workflow_run_block_result.status,
+                            failure_reason=workflow_run_block_result.failure_reason,
+                            duration_ms=block_exec_duration_ms,
+                        )
+                        # Reset the block result so AI fallback produces a fresh one
+                        workflow_run_block_result = None
+
+                        # Record fallback episode for adaptive caching
+                        if is_adaptive_caching(workflow, workflow_run) and block.label:
+                            context = skyvern_context.current()
+                            fallback_episode_id, form_fields_for_episode = await self._record_fallback_episode(
+                                workflow_run=workflow_run,
+                                workflow=workflow,
+                                block=block,
+                                organization_id=organization_id,
+                                workflow_run_id=workflow_run_id,
+                                error_message=f"Script completed but block failed: {latest_block.failure_reason}",
+                                script_revision_id=context.script_revision_id if context else None,
+                                classify_result=context.last_classify_result if context else None,
+                            )
+                else:
+                    block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
+                    LOG.warning(
+                        "Block executed with code but no workflow run block found",
+                        block_label=block.label,
+                        duration_ms=block_exec_duration_ms,
+                    )
+                    block_executed_with_code = False
+            except Exception as e:
+                block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
+                script_exception = e
+                LOG.warning(
+                    "Failed to execute block with script code, falling back to AI",
+                    block_label=block.label,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    duration_ms=block_exec_duration_ms,
+                    exc_info=True,
+                )
+                block_executed_with_code = False
+
+                # Record fallback episode for the script reviewer (adaptive caching)
+                if is_adaptive_caching(workflow, workflow_run) and block.label:
+                    context = skyvern_context.current()
+                    fallback_episode_id, form_fields_for_episode = await self._record_fallback_episode(
+                        workflow_run=workflow_run,
+                        workflow=workflow,
+                        block=block,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        error_message=str(e),
+                        script_revision_id=context.script_revision_id if context else None,
+                    )
+        return ScriptBlockAttempt(
+            block_result=workflow_run_block_result,
+            executed_with_code=block_executed_with_code,
+            valid_to_run_code=bool(valid_to_run_code),
+            block_requires_agent=block_requires_agent,
+            fallback_episode_id=fallback_episode_id,
+            form_fields_for_episode=form_fields_for_episode,
+            script_exception=script_exception,
+        )
+
+    async def _execute_block_via_agent_if_allowed(
+        self,
+        *,
+        block: BlockTypeVar,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str | None,
+        parent_workflow_run_block_id: str | None,
+        is_script_run: bool,
+        script_blocks_by_label: dict[str, Any],
+        attempt: ScriptBlockAttempt,
+    ) -> tuple[BlockResult | None, bool]:
+        workflow_run_block_result = attempt.block_result
+        # Check if this block is designated as requires_agent by the script reviewer.
+        # These blocks must execute via agent even when ai_fallback=False.
+        block_requires_agent = bool(
+            is_script_run
+            and block.label
+            and block.label in script_blocks_by_label
+            and script_blocks_by_label[block.label].requires_agent
+        )
+        # Check if this block has never been cached (e.g. from an unexecuted
+        # conditional branch) or is a non-cacheable block type (goto_url,
+        # for_loop, conditional, code, wait, etc.). These blocks must run
+        # via agent even when ai_fallback=False.
+        block_is_uncached = bool(
+            is_script_run
+            and block.label
+            and block.label not in script_blocks_by_label
+            and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+        )
+        block_is_non_cacheable = bool(is_script_run and block.block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED)
+        # If ai_fallback is explicitly disabled, skip the agent fallback entirely —
+        # UNLESS this block requires_agent, has never been cached, or is a
+        # non-cacheable block type that must always run via agent.
+        if (
+            is_script_run
+            and workflow_run.ai_fallback is False
+            and not block_requires_agent
+            and not block_is_uncached
+            and not block_is_non_cacheable
+        ):
+            LOG.info(
+                "ai_fallback disabled: skipping agent fallback, keeping script failure",
+                block_label=block.label,
+                failure_reason=str(workflow_run_block_result.failure_reason)[:200]
+                if workflow_run_block_result
+                else "script exception",
+            )
+        else:
+            agent_reason = (
+                "requires_agent"
+                if block_requires_agent
+                else "uncached_block"
+                if block_is_uncached
+                else "non_cacheable_block_type"
+                if block_is_non_cacheable
+                else "normal"
+            )
+            LOG.info(
+                "Executing block via agent",
+                sampling=True,
+                block_label=block.label,
+                block_type=block.block_type,
+                agent_reason=agent_reason,
+            )
+            workflow_run_block_result = await block.execute_safe(
+                workflow_run_id=workflow_run_id,
+                parent_workflow_run_block_id=parent_workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            # Record that this run experienced a script → AI fallback if
+            # the agent execution we just ran was a consequence of a failed
+            # script attempt. The gate correctly excludes:
+            #   - ai_fallback=False kept-the-failure (execute_safe not reached)
+            #   - requires_agent / uncached / disable_cache / non-cacheable
+            #     routes (valid_to_run_code is False for these)
+            #   - agent-only workflows (is_script_run=False → valid_to_run_code=False)
+            # and correctly covers all three script-failure modes: script-
+            # block failed, script threw, and script-ran-but-no-block-found.
+            # Complements the task-block AI-fallback writers in `services/script_service.py`
+            # writers which handle a separate task-block AI-fallback surface.
+            # Perf: a fallback-heavy run issues N writes for N fallbacks.
+            # Typical runs have 0-3. `_merge_script_run` is idempotent at the
+            # DB layer. If observed latency regresses, add a context-scoped
+            # already-flipped cache (tracked separately).
+            await self._mark_script_fallback_triggered(
+                workflow_run_id=workflow_run_id,
+                valid_to_run_code=attempt.valid_to_run_code,
+                block_executed_with_code=attempt.executed_with_code,
+                block_label=block.label,
+            )
+        return workflow_run_block_result, block_requires_agent
+
+    async def _enrich_fallback_episode_with_agent_actions(
+        self,
+        *,
+        block: BlockTypeVar,
+        workflow_run_block_result: BlockResult,
+        fallback_episode_id: str,
+        form_fields_for_episode: list | None,
+        organization_id: str,
+    ) -> None:
+        try:
+            # None = unknown count (taskless wrb / fetch error);
+            # only a confirmed zero downgrades fallback_succeeded.
+            fallback_wrb_id = workflow_run_block_result.workflow_run_block_id
+            agent_action_count: int | None = None
+            action_summaries: list[dict] | None = None
+            if fallback_wrb_id:
+                try:
+                    wrb = await app.DATABASE.observer.get_workflow_run_block(
+                        workflow_run_block_id=fallback_wrb_id,
+                        organization_id=organization_id,
+                    )
+                    if wrb and wrb.task_id:
+                        actions = await app.DATABASE.tasks.get_task_actions(
+                            task_id=wrb.task_id,
+                            organization_id=organization_id,
+                        )
+                        agent_action_count = len(actions)
+                        action_summaries = build_action_summaries_with_timing(actions)
+                except Exception:
+                    LOG.debug(
+                        "Could not fetch rich actions for fallback episode",
+                        fallback_wrb_id=fallback_wrb_id,
+                        exc_info=True,
+                    )
+
+            # `completed` with confirmed 0 actions = the agent's
+            # complete-verify accepting what the script's rejected.
+            fallback_succeeded = workflow_run_block_result.status == BlockStatus.completed
+            if fallback_succeeded and agent_action_count == 0:
+                fallback_succeeded = False
+
+            # Build agent actions summary for both success and failure
+            agent_actions_summary: dict = {
+                "block_status": str(workflow_run_block_result.status),
+                "output_value": str(workflow_run_block_result.output_parameter_value)[:500]
+                if workflow_run_block_result.output_parameter_value
+                else None,
+            }
+            if form_fields_for_episode:
+                agent_actions_summary["form_fields"] = form_fields_for_episode
+            if action_summaries is not None:
+                agent_actions_summary["actions"] = action_summaries
+
+            if not fallback_succeeded:
+                if workflow_run_block_result.failure_reason:
+                    agent_actions_summary["failure_reason"] = str(workflow_run_block_result.failure_reason)[:2000]
+                elif workflow_run_block_result.status == BlockStatus.completed and agent_action_count == 0:
+                    agent_actions_summary["failure_reason"] = script_service.VERIFIER_SWAP_FAILURE_REASON
+                LOG.info(
+                    "AI fallback failed, keeping episode for triage",
+                    episode_id=fallback_episode_id,
+                    block_status=workflow_run_block_result.status,
+                    block_label=block.label,
+                    agent_action_count=agent_action_count,
+                )
+
+            await app.DATABASE.scripts.update_fallback_episode(
+                episode_id=fallback_episode_id,
+                organization_id=organization_id,
+                agent_actions=agent_actions_summary,
+                fallback_succeeded=fallback_succeeded,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to update fallback episode with agent actions",
+                episode_id=fallback_episode_id,
+                exc_info=True,
+            )
+
+    async def _prepare_login_block_browser_profile(
+        self,
+        *,
+        block: BlockTypeVar,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str | None,
+    ) -> WorkflowRun:
+        await self._apply_login_block_credential_proxy_pin(
+            block=block,
+            workflow_run=workflow_run,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
+            block=block,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
+        )
+        # Save the original navigation goal before any mutation so
+        # retries don't stack the browser-session prefix repeatedly.
+        original_navigation_goal = block.navigation_goal
+        if resolved_browser_profile_id:
+            decision = await self._evaluate_debug_session_profile_decision(
+                workflow_run=workflow_run,
+                browser_session_id=browser_session_id,
+                resolved_browser_profile_id=resolved_browser_profile_id,
+                organization_id=organization_id,
+            )
+
+            if decision.incompatible_reason is not None:
+                # Debug session whose visible PBS is profile-incompatible.
+                # Stream fidelity wins: attach the visible PBS so the user
+                # can watch the action, but DO NOT write
+                # workflow_run.browser_profile_id, DO NOT rewrite the
+                # navigation_goal, and DO NOT emit "skipping login agent".
+                # Fall through to ordinary LoginBlock execution below.
+                LOG.warning(
+                    "Debug session profile incompatible with LoginBlock credential",
+                    code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
+                    reason=decision.incompatible_reason,
+                    workflow_run_id=workflow_run_id,
+                    block_label=block.label,
+                    debug_session_id=workflow_run.debug_session_id,
+                    browser_session_id=browser_session_id,
+                    credential_browser_profile_id=resolved_browser_profile_id,
+                )
+                if decision.attach_browser_session_id and block.url:
+                    try:
+                        await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                            workflow_run=workflow_run,
+                            url=block.url,
+                            browser_session_id=decision.attach_browser_session_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "PBS attach failed for debug incompatible profile; continuing",
+                            workflow_run_id=workflow_run_id,
+                            block_label=block.label,
+                            browser_session_id=decision.attach_browser_session_id,
+                            exc_info=True,
+                        )
+            else:
+                LOG.info(
+                    "LoginBlock has credential with browser profile — skipping login agent",
+                    workflow_run_id=workflow_run_id,
+                    block_label=block.label,
+                    browser_profile_id=resolved_browser_profile_id,
+                    url=block.url,
+                )
+                # Persist the browser_profile_id on the workflow_run so
+                # subsequent blocks create / reuse a browser with the
+                # saved profile (cookies, localStorage, etc.).
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run_id,
+                    browser_profile_id=resolved_browser_profile_id,
+                )
+                workflow_run = (
+                    await app.DATABASE.workflow_runs.get_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
+                    or workflow_run
+                )
+
+                # Create the browser with the saved profile and navigate
+                # to the login block's URL.  When a saved-profile credential
+                # is selected, the user is guided to enter the post-login
+                # target URL (e.g. homepage/dashboard) rather than the
+                # login page.  The saved cookies will authenticate the
+                # session once the page loads.
+                profile_loaded = bool(block.url)
+                if block.url:
+                    try:
+                        browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                            workflow_run=workflow_run,
+                            url=block.url,
+                            browser_profile_id=resolved_browser_profile_id,
+                            browser_session_id=decision.attach_browser_session_id,
+                        )
+                        working_page = await browser_state.get_working_page()
+                        if working_page and working_page.url == "about:blank":
+                            await browser_state.navigate_to_url(page=working_page, url=block.url)
+                        # Wait for the page to settle so cookies/redirects complete
+                        if working_page:
+                            try:
+                                await working_page.wait_for_load_state("networkidle", timeout=10000)
+                            except Exception:
+                                LOG.debug(
+                                    "networkidle timeout after browser profile navigation (non-fatal)",
+                                    workflow_run_id=workflow_run_id,
+                                )
+                    except Exception:
+                        LOG.warning(
+                            "Saved browser profile failed to load, falling back to normal login",
+                            workflow_run_id=workflow_run_id,
+                            block_label=block.label,
+                            browser_profile_id=resolved_browser_profile_id,
+                            exc_info=True,
+                        )
+                        profile_loaded = False
+                        # Clear the profile so the normal login path doesn't reuse it
+                        await app.DATABASE.workflow_runs.update_workflow_run(
+                            workflow_run_id=workflow_run_id,
+                            browser_profile_id=None,
+                        )
+
+                if not profile_loaded:
+                    # Fall through to normal block execution below
+                    pass
+                else:
+                    # Browser profile loaded — the session may still be
+                    # valid or may have expired (common with bank sites).
+                    # Instead of skipping the login block, modify the
+                    # navigation goal so the AI checks whether the user is
+                    # already logged in and only performs login if needed.
+                    if original_navigation_goal:
+                        block.navigation_goal = (
+                            "A saved browser session has been loaded. "
+                            "Check if the user is already logged in. "
+                            "If already logged in, complete this task immediately without taking any action. "
+                            "If not logged in (e.g. the session expired), "
+                            "proceed to log in with the provided credentials.\n\n"
+                            f"Original goal: {original_navigation_goal}"
+                        )
+        return workflow_run
 
     async def resolve_login_block_browser_profile_id_pre_run(
         self,
@@ -4974,6 +5153,8 @@ class WorkflowService:
         run_with: str | None = None,
         ai_fallback: bool = True,
         task_version: Literal["v1", "v2"] = "v1",
+        extracted_information_schema: dict[str, Any] | list | str | None = None,
+        generate_script: bool = False,
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -5038,6 +5219,7 @@ class WorkflowService:
                         label="extract_data",
                         title="Extract Data",
                         data_extraction_goal=data_extraction_goal,
+                        data_schema=extracted_information_schema,
                         output_parameter=OutputParameter(
                             output_parameter_id=str(uuid.uuid4()),
                             key="extract_data_output",
@@ -5112,6 +5294,7 @@ class WorkflowService:
             status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
+            generate_script_on_terminal=generate_script,
         )
 
         return new_workflow
@@ -5975,6 +6158,7 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            await self._apply_completion_run_tags_best_effort(workflow_run)
             run_completed_task = asyncio.create_task(
                 app.AGENT_FUNCTION.on_workflow_run_completed(
                     organization_id=workflow_run.organization_id,
@@ -6280,6 +6464,7 @@ class WorkflowService:
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
         )
+        await self._apply_completion_run_tags_best_effort(updated)
 
         bg = asyncio.create_task(
             self._sync_task_run_from_workflow_run(updated, workflow_run_id, WorkflowRunStatus.canceled),
@@ -7421,6 +7606,13 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+            submission_shadow.schedule_submission_signal_shadow(
+                har_data=har_data,
+                browser_state=browser_state,
+                last_step=last_step,
+                workflow_run=workflow_run,
+            )
         LOG.debug("Persisting har data", har_size=len(har_data))
         if har_data:
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -7503,6 +7695,13 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
+        if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+            submission_shadow.schedule_submission_signal_shadow(
+                har_data=har_data,
+                browser_state=browser_state,
+                last_step=last_step,
+                workflow_run=workflow_run,
+            )
         LOG.debug("Persisting har data (bundled)", har_size=len(har_data))
         if har_data:
             task_archive_entries["har.har"] = (ArtifactType.HAR, har_data)

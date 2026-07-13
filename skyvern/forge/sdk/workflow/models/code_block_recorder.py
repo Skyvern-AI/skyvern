@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 import time
 from os import PathLike, fspath
@@ -50,6 +51,7 @@ _LOCATOR_FACTORY_METHODS = frozenset(
         "filter",
     }
 )
+_RECORDABLE_HANDLE_TYPE_NAMES = frozenset({"ElementHandle", "FrameLocator", "Locator"})
 # SkyvernPage high-level API (page.extract / page.complete / ...). These are not raw
 # Playwright calls, so they fall through the maps above and used to execute unrecorded —
 # a navigate+extract block then rendered as only repeated "Goto URL" on the timeline.
@@ -308,11 +310,36 @@ class _Recorder:
         return result
 
 
+def _wrap_recording_result(value: Any, recorder: _Recorder, selector: str | None) -> Any:
+    if isinstance(value, list):
+        return [_wrap_recording_result(item, recorder, selector) for item in value]
+    if type(value).__module__.startswith("playwright.") and type(value).__name__ in _RECORDABLE_HANDLE_TYPE_NAMES:
+        return RecordingLocator(value, recorder, selector)
+    return value
+
+
+def _wrap_call_result(value: Any, recorder: _Recorder, selector: str | None) -> Any:
+    if inspect.isawaitable(value):
+
+        async def resolve() -> Any:
+            return _wrap_recording_result(await value, recorder, selector)
+
+        return resolve()
+    return _wrap_recording_result(value, recorder, selector)
+
+
 class RecordingLocator:
+    # Private worker-side hooks consumed by PlaywrightPageOperationBroker. The sandbox only
+    # receives opaque markers, never this proxy instance.
+    _skyvern_brokerable_handle = True
+
     def __init__(self, locator: Any, recorder: _Recorder, selector: str | None) -> None:
         self.__locator = locator
         self.__recorder = recorder
         self.__selector = selector
+
+    def _skyvern_page_operation_argument(self) -> Any:
+        return self.__locator
 
     def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
         return RecordingLocator(self.__locator.locator(selector, **kwargs), self.__recorder, selector)
@@ -333,8 +360,14 @@ class RecordingLocator:
 
             return factory
         action_type = _LOCATOR_ACTION_MAP.get(name)
-        if action_type is None or not callable(attr):
+        if not callable(attr):
             return attr
+        if action_type is None:
+
+            def forwarded(*args: Any, **kwargs: Any) -> Any:
+                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector)
+
+            return forwarded
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
             return await self.__recorder.record(
@@ -398,8 +431,14 @@ class RecordingPage:
         # Record direct page-level interactions (page.click/fill/press/...) and the high-level
         # SkyvernPage API (page.extract/complete/...) with the same redaction as the locator path.
         action_type = _LOCATOR_ACTION_MAP.get(name) or _PAGE_ACTION_MAP.get(name) or _HIGH_LEVEL_ACTION_MAP.get(name)
-        if action_type is None or not callable(attr):
+        if not callable(attr):
             return attr
+        if action_type is None:
+
+            def forwarded(*args: Any, **kwargs: Any) -> Any:
+                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, _factory_selector(name, args))
+
+            return forwarded
         record_prompt = name in _PROMPT_METHODS
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
@@ -419,3 +458,23 @@ class RecordingPage:
             )
 
         return recorded
+
+
+def json_safe_recorder_output(value: Any) -> Any:
+    """Recursively replace leaked recorder proxies with a JSON-safe marker before a code block's
+    output is registered. A raw RecordingLocator/RecordingKeyboard/RecordingPage reaching JSON
+    serialization raises TypeError at the output-registration boundary, which drops the whole
+    output payload and starves downstream evidence consumers.
+
+    A leaked proxy is a generated-code defect with no meaningful serializable value, so it collapses
+    to a type marker rather than its selector: a selector is only a lossy display fragment and can
+    embed a resolved credential, which mask_secrets_in_data does not scrub out of a dict key."""
+    if isinstance(value, (RecordingLocator, RecordingKeyboard, RecordingPage)):
+        return f"<{type(value).__name__}>"
+    if isinstance(value, dict):
+        # Normalize keys too: json.dumps rejects a non-primitive key outright (it never consults
+        # default=), so a proxy used as a mapping key would crash serialization all the same.
+        return {json_safe_recorder_output(key): json_safe_recorder_output(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_recorder_output(item) for item in value]
+    return value

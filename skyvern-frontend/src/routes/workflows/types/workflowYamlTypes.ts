@@ -161,6 +161,7 @@ export type BlockYAML =
   | HttpRequestBlockYAML
   | PrintPageBlockYAML
   | WorkflowTriggerBlockYAML
+  | EmailInboxBlockYAML
   | GoogleSheetsReadBlockYAML
   | GoogleSheetsWriteBlockYAML
   | PdfFillBlockYAML
@@ -347,6 +348,7 @@ export type UploadToS3BlockYAML = BlockYAMLBase & {
 export type FileUploadBlockYAML = BlockYAMLBase & {
   block_type: "file_upload";
   path?: string | null;
+  prompt?: string | null;
   storage_type: string;
   s3_bucket: string;
   region_name: string;
@@ -357,6 +359,14 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   azure_blob_container_name?: string | null;
   google_credential_id?: string | null;
   google_drive_folder_id?: string | null;
+  sftp_host?: string | null;
+  sftp_port?: number | null;
+  sftp_username?: string | null;
+  sftp_password?: string | null;
+  sftp_private_key?: string | null;
+  sftp_private_key_passphrase?: string | null;
+  sftp_remote_path?: string | null;
+  sftp_host_key?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {
@@ -458,6 +468,20 @@ export type WorkflowTriggerBlockYAML = BlockYAMLBase & {
   wait_for_completion: boolean;
   browser_session_id?: string | null;
   use_parent_browser_session?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type EmailInboxBlockYAML = BlockYAMLBase & {
+  block_type: "email_inbox";
+  email_client: "gmail" | "outlook";
+  credential_id: string | null;
+  folder: string;
+  prompt: string;
+  sender: string | null;
+  subject: string | null;
+  newer_than_days: number | null;
+  max_results: number;
+  include_body: boolean;
   parameter_keys?: Array<string> | null;
 };
 

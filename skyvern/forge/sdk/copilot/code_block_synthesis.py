@@ -8,19 +8,34 @@ that runs on the raw ``page`` object the copilot code block executes against.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import io
 import json
 import keyword
 import re
+import textwrap
 import tokenize
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import structlog
+
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    FrozenRequestedOutputExtractionCandidate,
+    LiveReadBinding,
+    LiveReadKind,
+    RequestedOutputExtractionPlan,
+    output_path_segments,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.utils.strings import escape_code_fences
+
+LOG = structlog.get_logger()
 
 _MAX_STEPS = 60
 _INDENT = "    "
@@ -56,6 +71,108 @@ _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
 # accessor ``.fill(await <param>.otp())`` — distinguishes a login fill from a plain
 # ``.fill(str(<key>))`` text input.
 CREDENTIAL_FILL_CODE_PATTERN = re.compile(r"\.fill\(\s*(?:[A-Za-z_]\w*\.\w+|await\s+[A-Za-z_]\w*\.otp\(\))\s*\)")
+# Credential fields the scout must fill live before a code block reading them may persist;
+# `.otp()` resolves at runtime only, so totp never requires (or credits) a live scout fill.
+LIVE_SCOUT_CREDENTIAL_FIELDS = frozenset({"username", "password"})
+_CREDENTIAL_FIELD_ACCESS_RE = re.compile(
+    r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
+)
+_CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
+_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
+
+
+class CredentialFieldAccess(NamedTuple):
+    parameter_key: str
+    field: str
+    requires_live_scout: bool
+
+
+def _credential_field_accesses(code: str) -> list[CredentialFieldAccess]:
+    accesses: list[CredentialFieldAccess] = []
+    for match in _CREDENTIAL_FIELD_ACCESS_RE.finditer(code):
+        field = match.group("field")
+        if field:
+            accesses.append(
+                CredentialFieldAccess(
+                    parameter_key=match.group("parameter"),
+                    field=field,
+                    requires_live_scout=True,
+                )
+            )
+            continue
+        if match.group("otp_method"):
+            accesses.append(
+                CredentialFieldAccess(
+                    parameter_key=match.group("parameter"),
+                    field="totp",
+                    requires_live_scout=False,
+                )
+            )
+    return accesses
+
+
+class ScoutGap(NamedTuple):
+    missing_fields: list[str]
+    missing_submit: bool
+
+
+def first_matched_post_fill_submit_index(
+    trajectory: Sequence[Mapping[str, Any]],
+    latest_fill_index: int,
+    matched_source_urls: AbstractSet[str],
+) -> int | None:
+    for index, interaction in enumerate(trajectory):
+        if index <= latest_fill_index:
+            continue
+        if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+            continue
+        source_url = str(interaction.get("source_url") or "").strip()
+        if matched_source_urls and source_url not in matched_source_urls:
+            continue
+        return index
+    return None
+
+
+def credential_scout_gap(
+    trajectory: Sequence[Mapping[str, Any]],
+    requirements: Sequence[tuple[AbstractSet[str], AbstractSet[str]]],
+    *,
+    requires_submit: bool,
+) -> ScoutGap:
+    """Match one block's credential requirements — (allowed_credential_ids, required_fields) tuples —
+    against the scout trajectory: fill indexes and source urls accumulate across requirement tuples, and
+    a single post-latest-fill submit on a matched source url satisfies ``requires_submit`` globally."""
+    matched_fill_indexes: list[int] = []
+    matched_source_urls: set[str] = set()
+    missing_fields: list[str] = []
+    for allowed_credential_ids, required_fields in requirements:
+        matched_fields: set[str] = set()
+        for index, interaction in enumerate(trajectory):
+            if str(interaction.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
+                continue
+            if str(interaction.get("credential_id") or "").strip() not in allowed_credential_ids:
+                continue
+            field = str(interaction.get("credential_field") or "").strip()
+            if field not in required_fields:
+                continue
+            matched_fields.add(field)
+            matched_fill_indexes.append(index)
+            source_url = str(interaction.get("source_url") or "").strip()
+            if source_url:
+                matched_source_urls.add(source_url)
+        for field in sorted(required_fields - matched_fields):
+            missing_fields.append(field)
+
+    missing_submit = False
+    if requires_submit:
+        latest_fill_index = max(matched_fill_indexes, default=-1)
+        missing_submit = (
+            latest_fill_index < 0
+            or first_matched_post_fill_submit_index(trajectory, latest_fill_index, matched_source_urls) is None
+        )
+    return ScoutGap(missing_fields=missing_fields, missing_submit=missing_submit)
+
+
 _ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
 _OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(
@@ -157,6 +274,12 @@ class SynthesisDiagnostics:
     emitted_interaction_count: int = 0
     truncated: bool = False
     dropped_interactions: list[dict[str, Any]] = field(default_factory=list)
+    # Emission ground truth recorded at each emission branch; with dropped/forgiven it partitions the
+    # retained trajectory indices. Diagnostics-only, never serialized.
+    emitted_interactions: list[dict[str, Any]] = field(default_factory=list)
+    forgiven_interactions: list[dict[str, Any]] = field(default_factory=list)
+    download_terminal_anchor: int | None = None
+    download_terminal_dropped_trailing: int = 0
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
@@ -170,6 +293,22 @@ class SynthesizedCodeBlock:
     notes: list[str] = field(default_factory=list)
     diagnostics: SynthesisDiagnostics = field(default_factory=SynthesisDiagnostics)
     steps: list[dict[str, Any]] = field(default_factory=list)
+    interaction_code: str = ""
+    extraction_code: str = ""
+    extraction_fingerprint: str = ""
+    extraction_plan_identity: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesizedExtractionSuffix:
+    code: str
+    fingerprint: str
+
+
+@dataclass
+class _ExtractionReturnNode:
+    children: dict[str, _ExtractionReturnNode] = field(default_factory=dict)
+    value_expression: str = ""
 
 
 # str.splitlines() and several parsers treat these codepoints as line boundaries, so a raw one in a
@@ -626,6 +765,23 @@ def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict
     return "", -1
 
 
+def _trajectory_prefix_at_anchor(
+    trajectory: Sequence[Mapping[str, Any]], anchor: int | None
+) -> tuple[Sequence[Mapping[str, Any]], int]:
+    """Cut the trajectory at the position where the download affordance was observed; interactions captured
+    after it navigate away, so replaying them would leave the terminal click on a page without the target."""
+    if anchor is None:
+        return trajectory, 0
+    prefix = [
+        interaction
+        for interaction in trajectory
+        if not isinstance(interaction.get("trajectory_index"), int) or int(interaction["trajectory_index"]) <= anchor
+    ]
+    if not prefix or len(prefix) == len(trajectory):
+        return trajectory, 0
+    return prefix, len(trajectory) - len(prefix)
+
+
 def synthesize_code_block(
     trajectory: Sequence[Mapping[str, Any]],
     *,
@@ -650,6 +806,18 @@ def synthesize_code_block(
         and not reached_download_target.already_registered
         and bool(reached_download_target.selector)
     )
+    if compile_download_target and reached_download_target is not None:
+        trajectory, dropped_trailing = _trajectory_prefix_at_anchor(
+            trajectory, reached_download_target.trajectory_anchor
+        )
+        if dropped_trailing:
+            diagnostics.download_terminal_anchor = reached_download_target.trajectory_anchor
+            diagnostics.download_terminal_dropped_trailing = dropped_trailing
+            LOG.info(
+                "copilot_spine_download_terminal_sequenced",
+                anchor=reached_download_target.trajectory_anchor,
+                dropped_trailing_count=dropped_trailing,
+            )
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
         steps.append(
@@ -661,6 +829,21 @@ def synthesize_code_block(
                 "line_end": len(lines),
             }
         )
+
+    def record_emission(
+        trajectory_index: int, tool_name: str, method: str, locator_expr: str, *, line_start: int, lane: str = ""
+    ) -> None:
+        record: dict[str, Any] = {
+            "trajectory_index": trajectory_index,
+            "tool_name": tool_name,
+            "method": method,
+            "selector": str(trajectory[trajectory_index].get("selector") or "").strip(),
+            "locator": locator_expr,
+            "call_source": textwrap.dedent("\n".join(lines[line_start - 1 :])),
+        }
+        if lane:
+            record["lane"] = lane
+        diagnostics.emitted_interactions.append(record)
 
     entry_url = ""
     entry_index = -1
@@ -717,7 +900,7 @@ def synthesize_code_block(
             notes.append("entry fallback can resume after authentication when login controls stay hidden")
         elif fallback_entry_index > entry_index:
             notes.append("entry replay starts at a later durable interaction")
-        entry_recovery_clicks: list[str] = []
+        entry_recovery_clicks: list[tuple[int, str]] = []
         if fallback_entry_index > entry_index:
             for recovery_index in range(entry_index, fallback_entry_index):
                 recovery_interaction = trajectory[recovery_index]
@@ -732,7 +915,7 @@ def synthesize_code_block(
                     strict_selectors=strict_selectors,
                 )
                 if recovery_locator:
-                    entry_recovery_clicks.append(recovery_locator)
+                    entry_recovery_clicks.append((recovery_index, recovery_locator))
             if entry_recovery_clicks:
                 notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
         line_start = len(lines) + 1
@@ -781,12 +964,21 @@ def synthesize_code_block(
                     recovery_indent = post_goto_indent + 2
                 else:
                     recovery_indent = post_goto_indent + 1
-                for recovery_locator in entry_recovery_clicks:
+                for recovery_index, recovery_locator in entry_recovery_clicks:
+                    recovery_line_start = len(lines) + 1
                     lines.append(f"{_INDENT * recovery_indent}{_ENTRY_OPENER_VAR} = {recovery_locator}")
                     lines.append(f"{_INDENT * recovery_indent}if await {_ENTRY_OPENER_VAR}.count() == 1:")
                     lines.append(f"{_INDENT * (recovery_indent + 1)}await {_ENTRY_OPENER_VAR}.click()")
                     lines.append(
                         f"{_INDENT * (recovery_indent + 1)}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})"
+                    )
+                    record_emission(
+                        recovery_index,
+                        "click",
+                        "click",
+                        recovery_locator,
+                        line_start=recovery_line_start,
+                        lane="entry_recovery",
                     )
                 lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
             else:
@@ -824,6 +1016,18 @@ def synthesize_code_block(
             notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
             break
         if entry_replay_start_index and trajectory_index < entry_replay_start_index:
+            already_recorded = any(
+                record.get("trajectory_index") == trajectory_index
+                for record in (*diagnostics.emitted_interactions, *diagnostics.dropped_interactions)
+            )
+            if not already_recorded:
+                diagnostics.forgiven_interactions.append(
+                    {
+                        "trajectory_index": trajectory_index,
+                        "tool_name": str(interaction.get("tool_name") or ""),
+                        "lane": "entry_replay_prefix",
+                    }
+                )
             continue
         action_indent = action_indent_for(trajectory_index)
         tool_name = str(interaction.get("tool_name") or "")
@@ -850,6 +1054,7 @@ def synthesize_code_block(
             line_start = len(lines) + 1
             if locator:
                 lines.append(f"{action_indent}await {locator}.press({_py_str(key)})")
+                record_emission(trajectory_index, tool_name, "press", locator, line_start=line_start)
             else:
                 if strict_selectors:
                     diagnostics.dropped_interactions.append(
@@ -861,6 +1066,7 @@ def synthesize_code_block(
                     )
                     continue
                 lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
+                record_emission(trajectory_index, tool_name, "press", "page.keyboard", line_start=line_start)
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             append_step(f"Press {key}", "keypress", line_start)
             emitted += 1
@@ -890,9 +1096,18 @@ def synthesize_code_block(
                 )
                 lines.append(f"{action_indent}{_INDENT}except Exception:")
                 lines.append(f"{action_indent}{_INDENT * 2}pass")
+                record_emission(
+                    trajectory_index,
+                    tool_name,
+                    "click",
+                    optional_locator,
+                    line_start=line_start,
+                    lane="optional_dismissal",
+                )
             else:
                 lines.append(f"{action_indent}await {locator}.click()")
                 lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+                record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
             typed_identity = _typed_value_identity(interaction)
@@ -933,11 +1148,15 @@ def synthesize_code_block(
                     f"{_py_str(f'{verify_target}: read-only value ')} + repr({_READONLY_DEFERRED_VAR})"
                     f" + {_py_str(' does not match expected ')} + repr(str({param_key})))"
                 )
+                record_emission(
+                    trajectory_index, tool_name, "input_value", locator, line_start=line_start, lane="readonly_skip"
+                )
                 append_step(f"Verify {verify_target}", "input_text", line_start)
             elif readonly_or_disabled:
                 deferred_readonly_assertions.append((trajectory_index, locator, param_key, _step_target(interaction)))
             else:
                 lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
+                record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
                 append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
@@ -961,6 +1180,7 @@ def synthesize_code_block(
                 lines.append(f"{action_indent}await {locator}.fill(await {credential_param_key}.otp())")
             else:
                 lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
+            record_emission(trajectory_index, tool_name, "fill", locator, line_start=line_start)
         elif tool_name == "select_option":
             value = str(interaction.get("value") or "").strip()
             if not value:
@@ -971,6 +1191,7 @@ def synthesize_code_block(
                 continue
             lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
+            record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
@@ -1017,7 +1238,16 @@ def synthesize_code_block(
         for deferred_index, deferred_locator, deferred_param_key, deferred_target in deferred_readonly_assertions:
             if entry_post_auth_resume_index and deferred_index < entry_post_auth_resume_index:
                 continue
+            deferred_line_start = len(lines) + 1
             emit_deferred_readonly_assertion(deferred_base, deferred_locator, deferred_param_key, deferred_target)
+            record_emission(
+                deferred_index,
+                "type_text",
+                "input_value",
+                deferred_locator,
+                line_start=deferred_line_start,
+                lane="readonly_skip",
+            )
 
         pre_resume_deferred = [
             entry
@@ -1026,9 +1256,18 @@ def synthesize_code_block(
         ]
         if pre_resume_deferred:
             lines.append(f"{deferred_base}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
-            for _, deferred_locator, deferred_param_key, deferred_target in pre_resume_deferred:
+            for deferred_index, deferred_locator, deferred_param_key, deferred_target in pre_resume_deferred:
+                deferred_line_start = len(lines) + 1
                 emit_deferred_readonly_assertion(
                     deferred_base + _INDENT, deferred_locator, deferred_param_key, deferred_target
+                )
+                record_emission(
+                    deferred_index,
+                    "type_text",
+                    "input_value",
+                    deferred_locator,
+                    line_start=deferred_line_start,
+                    lane="readonly_skip",
                 )
 
     if compile_download_target and reached_download_target is not None:
@@ -1067,6 +1306,524 @@ def synthesize_code_block(
     diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"
     return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics, steps=steps)
+
+
+SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = "scouted_spine_under_build"
+
+
+def normalized_locator_expr(text: str) -> str:
+    try:
+        return ast.unparse(ast.parse(text, mode="eval"))
+    except SyntaxError:
+        return text
+
+
+def locator_selector_literals(locator: str) -> set[str]:
+    try:
+        tree = ast.parse(locator, mode="eval")
+    except SyntaxError:
+        return set()
+    return {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+
+
+def _bare_locator_call_selector(receiver: str) -> str | None:
+    try:
+        node = ast.parse(receiver, mode="eval").body
+    except SyntaxError:
+        return None
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "locator"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value
+    return None
+
+
+def emitted_record_covered_by_call(record: Mapping[str, Any], method: str, receiver: str) -> bool:
+    if method != str(record.get("method") or ""):
+        return False
+    locator = str(record.get("locator") or "")
+    if locator and normalized_locator_expr(receiver) == normalized_locator_expr(locator):
+        return True
+    # Literal-membership matching would falsely cover a receiver that merely quotes the captured
+    # selector (a shared name= across different elements), so only a bare .locator(<selector>) counts.
+    selector = str(record.get("selector") or "")
+    return bool(selector) and selector == _bare_locator_call_selector(receiver)
+
+
+def uncovered_required_emitted_interactions(
+    emitted_interactions: Sequence[Mapping[str, Any]],
+    draft_calls: Sequence[tuple[str, str]],
+) -> list[Mapping[str, Any]]:
+    """Required (non-lane) emitted records the draft's ordered (method, receiver) calls do not
+    cover as an ordered subsequence, matched at method + selector/locator level."""
+    required = [record for record in emitted_interactions if not str(record.get("lane") or "")]
+    if not required:
+        return []
+    # Greedy ordered-subsequence scan: a miss consumes the remaining calls, so later rungs over-report (safe superset).
+    uncovered: list[Mapping[str, Any]] = []
+    next_call_index = 0
+    for record in required:
+        match_index = None
+        for call_index in range(next_call_index, len(draft_calls)):
+            method, receiver = draft_calls[call_index]
+            if emitted_record_covered_by_call(record, method, receiver):
+                match_index = call_index
+                break
+        if match_index is None:
+            uncovered.append(record)
+            next_call_index = len(draft_calls)
+        else:
+            next_call_index = match_index + 1
+    return uncovered
+
+
+def missing_rung_text(uncovered: Sequence[Mapping[str, Any]]) -> str:
+    return ", ".join(
+        f"`{str(record.get('method') or '')}` on {str(record.get('selector') or record.get('locator') or '')!r}"
+        for record in uncovered
+    )
+
+
+def render_missing_rung_call_sources(uncovered: Sequence[Mapping[str, Any]]) -> str:
+    sources = [source for record in uncovered if (source := str(record.get("call_source") or "").strip())]
+    if not sources:
+        return ""
+    return "Missing rung source to reuse verbatim:\n```python\n" + "\n".join(sources) + "\n```"
+
+
+def _return_node_expression(node: _ExtractionReturnNode) -> str:
+    if node.value_expression:
+        return node.value_expression
+    items = ", ".join(
+        f"{json.dumps(key)}: {_return_node_expression(child)}" for key, child in sorted(node.children.items())
+    )
+    return "{" + items + "}"
+
+
+def _set_return_expression(root: _ExtractionReturnNode, segments: Sequence[tuple[str, bool]], expression: str) -> None:
+    current = root
+    for name, _is_array in segments:
+        current = current.children.setdefault(name, _ExtractionReturnNode())
+    current.value_expression = expression
+
+
+def _array_prefix_of_segments(segments: Sequence[tuple[str, bool]]) -> tuple[tuple[str, bool], ...]:
+    for index, (_name, is_array) in enumerate(segments):
+        if is_array:
+            return tuple(segments[: index + 1])
+    return ()
+
+
+def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
+    return _array_prefix_of_segments(output_path_segments(binding.output_path))
+
+
+def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *, guard_empty: bool) -> list[str]:
+    container = f"page.locator({json.dumps(binding.selector)})"
+    target = f"{container}.nth({binding.selector_index})"
+    children = f'{target}.locator(":scope > *")'
+    statements = [
+        f"if await {container}.count() != {binding.selector_count}:",
+        f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
+        f"if not await {target}.is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
+        f"if await {children}.count() != {binding.child_count}:",
+        f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
+        f"if not await {children}.nth(0).is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
+        f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
+        f'{_INDENT}raise ValueError("Observed scalar label changed")',
+        f"if not await {children}.nth({binding.child_index}).is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
+        f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
+    ]
+    if guard_empty:
+        statements.extend(
+            [
+                f"if not {variable}:",
+                f'{_INDENT}raise ValueError("Observed scalar value is empty")',
+            ]
+        )
+    return statements
+
+
+def _table_group_read_lines(
+    bindings: list[LiveReadBinding],
+    *,
+    row_selector: str,
+    row_count: int,
+    prefix: tuple[tuple[str, bool], ...],
+    group_index: int,
+    records_variable: str,
+    cell_variable_base: str,
+    assemble_as_literal: bool,
+    guard_empty: bool = False,
+    none_leaf_segments: Sequence[tuple[tuple[str, bool], ...]] = (),
+) -> list[str]:
+    lines: list[str] = []
+    record_root = _ExtractionReturnNode()
+    for none_segments in none_leaf_segments:
+        _set_return_expression(record_root, none_segments, "None")
+    exemplar = bindings[0]
+    table = f"page.locator({json.dumps(exemplar.selector)})"
+    selected_table = f"{table}.nth({exemplar.selector_index})"
+    rows = f"page.locator({json.dumps(row_selector)})"
+    headers = f'{table}.nth({exemplar.selector_index}).locator(":scope > thead > tr > th")'
+    lines.append(f"if await {table}.count() != {exemplar.selector_count}:")
+    lines.append(f'{_INDENT}raise ValueError("Observed table identity changed")')
+    lines.append(f"if not await {table}.nth({exemplar.selector_index}).is_visible():")
+    lines.append(f'{_INDENT}raise ValueError("Observed table is no longer visible")')
+    lines.append(f'if await {selected_table}.locator(":scope table").count() != 0:')
+    lines.append(f'{_INDENT}raise ValueError("Observed table gained a nested table")')
+    lines.append(f'if await {table}.nth({exemplar.selector_index}).locator("[colspan], [rowspan]").count() != 0:')
+    lines.append(f'{_INDENT}raise ValueError("Observed table gained spanning cells")')
+    lines.append(f"if await {headers}.count() != {len(exemplar.headers)}:")
+    lines.append(f'{_INDENT}raise ValueError("Observed table header cardinality changed")')
+    for header_index, header_text in enumerate(exemplar.headers):
+        lines.append(f"if (await {headers}.nth({header_index}).inner_text()).strip() != {json.dumps(header_text)}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table header identity changed")')
+    lines.append(f"if await {rows}.count() != {row_count}:")
+    lines.append(f'{_INDENT}raise ValueError("Observed table row count changed")')
+    row_expressions: list[str] = []
+    if not assemble_as_literal:
+        lines.append(f"{records_variable} = []")
+    for row_index in range(row_count):
+        row = f"{rows}.nth({row_index})"
+        cells = f'{row}.locator(":scope > th, :scope > td")'
+        lines.append(f"if not await {row}.is_visible():")
+        lines.append(f'{_INDENT}raise ValueError("Observed table row is no longer visible")')
+        lines.append(f"if await {cells}.count() != {exemplar.row_cell_counts[row_index]}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table direct-cell cardinality changed")')
+        lines.append(f'if await {row}.locator(":scope > th").count() != 0:')
+        lines.append(f'{_INDENT}raise ValueError("Observed table row gained a row header")')
+        lines.append(
+            f'if " ".join((await {row}.inner_text()).split()) != {json.dumps(exemplar.row_identities[row_index])}:'
+        )
+        lines.append(f'{_INDENT}raise ValueError("Observed table row identity changed")')
+        for binding_index, binding in enumerate(sorted(bindings, key=lambda item: item.output_path)):
+            value_variable = f"{cell_variable_base}_{group_index}_{row_index}_{binding_index}"
+            lines.append(f"if not await {cells}.nth({binding.column_index}).is_visible():")
+            lines.append(f'{_INDENT}raise ValueError("Observed table cell is no longer visible")')
+            lines.append(f"{value_variable} = (await {cells}.nth({binding.column_index}).inner_text()).strip()")
+            if guard_empty:
+                lines.append(f"if not {value_variable}:")
+                lines.append(f'{_INDENT}raise ValueError("Observed table cell value is empty")')
+            _set_return_expression(
+                record_root, output_path_segments(binding.output_path)[len(prefix) :], value_variable
+            )
+        row_expression = _return_node_expression(record_root)
+        if assemble_as_literal:
+            row_expressions.append(row_expression)
+        else:
+            lines.append(f"{records_variable}.append({row_expression})")
+    if assemble_as_literal:
+        lines.append(f"{records_variable} = [{', '.join(row_expressions)}]")
+    return lines
+
+
+def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> SynthesizedExtractionSuffix | None:
+    if not plan.live_reads:
+        return None
+    lines: list[str] = []
+    return_root = _ExtractionReturnNode()
+    scalar_bindings = [binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE]
+    for index, binding in enumerate(scalar_bindings):
+        variable = f"_extraction_value_{index}"
+        lines.extend(_key_value_scalar_read_statements(binding, variable, guard_empty=False))
+        _set_return_expression(return_root, output_path_segments(binding.output_path), variable)
+
+    table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
+    for binding in plan.live_reads:
+        if binding.kind != LiveReadKind.TABLE_COLUMN:
+            continue
+        prefix = _array_prefix(binding)
+        if not prefix or not binding.row_selector or binding.row_count <= 0:
+            return None
+        table_groups.setdefault((binding.row_selector, binding.row_count, prefix), []).append(binding)
+    for group_index, ((row_selector, row_count, prefix), bindings) in enumerate(sorted(table_groups.items())):
+        records_variable = f"_extraction_records_{group_index}"
+        lines.extend(
+            _table_group_read_lines(
+                bindings,
+                row_selector=row_selector,
+                row_count=row_count,
+                prefix=prefix,
+                group_index=group_index,
+                records_variable=records_variable,
+                cell_variable_base="_extraction_cell",
+                assemble_as_literal=False,
+            )
+        )
+        _set_return_expression(return_root, prefix, records_variable)
+
+    lines.append(f"return {_return_node_expression(return_root)}")
+    code = "\n".join(lines) + "\n"
+    fingerprint_material = repr((plan.identity, plan.observation_identity, plan.reveal, code))
+    return SynthesizedExtractionSuffix(code=code, fingerprint=hashlib.sha256(fingerprint_material.encode()).hexdigest())
+
+
+_ENVELOPE_SCALAR_VAR_BASE = "_envelope_value"
+_ENVELOPE_CELL_VAR_BASE = "_envelope_cell"
+_ENVELOPE_RECORDS_VAR_BASE = "_envelope_records"
+
+
+@dataclass(frozen=True, slots=True)
+class ProducedStaticReturnEnvelope:
+    code: str
+    keyed_paths: tuple[str, ...]
+
+
+def _snippet_scope_returns(statements: Sequence[ast.stmt]) -> list[ast.Return]:
+    found: list[ast.Return] = []
+    for statement in statements:
+        if isinstance(statement, ast.Return):
+            found.append(statement)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for child in ast.iter_child_nodes(statement):
+            if isinstance(child, ast.stmt):
+                found.extend(_snippet_scope_returns([child]))
+            elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
+                found.extend(_snippet_scope_returns(child.body))
+    return found
+
+
+def _bound_or_referenced_identifiers(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                names.add(node.name)
+        elif isinstance(node, ast.alias):
+            if node.asname:
+                names.add(node.asname)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.MatchAs):
+            if node.name:
+                names.add(node.name)
+    return names
+
+
+def produce_covered_static_return_envelope(
+    code: str,
+    *,
+    plan: RequestedOutputExtractionPlan | None,
+    scalar_required_paths: set[str],
+    declaration_paths: set[str],
+    download_required_paths: set[str],
+    expects_download: bool,
+) -> ProducedStaticReturnEnvelope | None:
+    """Author the unique terminal keyed return covering every scout-bound scalar KEY_VALUE path and
+    every TABLE_COLUMN path as list-of-record reads via the shared ``_table_group_read_lines`` reader,
+    seeding per-row None leaves for sibling declaration columns alongside None-default top-level
+    declarations and the resolved download descriptor for the mixed shape.
+
+    Return None when it does not own the sole terminal return (zero returns, or the single
+    generator-owned download-idiom return), on any ungrounded or unbound required path, on nested-array
+    paths, on an array declaration with no unique matching table group, and on any minted-name collision."""
+    if download_required_paths and not expects_download:
+        return None
+    if not scalar_required_paths:
+        return None
+    if plan is None:
+        return None
+    stripped_code = textwrap.dedent(code).strip()
+    if not stripped_code:
+        return None
+    try:
+        tree = ast.parse(stripped_code)
+    except SyntaxError:
+        return None
+
+    bindings_by_path = {binding.output_path: binding for binding in plan.live_reads}
+    ordered_required_paths = sorted(scalar_required_paths)
+    if any(path not in bindings_by_path for path in ordered_required_paths):
+        return None
+
+    scalar_paths = [path for path in ordered_required_paths if bindings_by_path[path].kind == LiveReadKind.KEY_VALUE]
+    table_paths = [path for path in ordered_required_paths if bindings_by_path[path].kind == LiveReadKind.TABLE_COLUMN]
+    if len(scalar_paths) + len(table_paths) != len(ordered_required_paths):
+        return None
+
+    table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
+    for path in table_paths:
+        binding = bindings_by_path[path]
+        prefix = _array_prefix(binding)
+        if not prefix or not binding.row_selector or binding.row_count <= 0:
+            return None
+        if any(is_array for _name, is_array in output_path_segments(binding.output_path)[len(prefix) :]):
+            return None
+        table_groups.setdefault((binding.row_selector, binding.row_count, prefix), []).append(binding)
+
+    minted_vars = [f"{_ENVELOPE_SCALAR_VAR_BASE}_{index}" for index in range(len(scalar_paths))]
+    minted_names = set(minted_vars)
+    for group_index, ((_row_selector, row_count, _prefix), group_bindings) in enumerate(sorted(table_groups.items())):
+        minted_names.add(f"{_ENVELOPE_RECORDS_VAR_BASE}_{group_index}")
+        for row_index in range(row_count):
+            for binding_index in range(len(group_bindings)):
+                minted_names.add(f"{_ENVELOPE_CELL_VAR_BASE}_{group_index}_{row_index}_{binding_index}")
+    existing_names = _bound_or_referenced_identifiers(tree)
+    if minted_names & existing_names:
+        return None
+
+    returns = _snippet_scope_returns(tree.body)
+    download_descriptor_key = ""
+    download_descriptor_expr = ""
+    if download_required_paths:
+        if len(returns) != 1 or returns[0] not in tree.body:
+            return None
+        idiom_return = returns[0]
+        if idiom_return.col_offset != 0:
+            return None
+        if not isinstance(idiom_return.value, ast.Dict) or len(idiom_return.value.keys) != 1:
+            return None
+        descriptor_key_node = idiom_return.value.keys[0]
+        if not isinstance(descriptor_key_node, ast.Constant) or not isinstance(descriptor_key_node.value, str):
+            return None
+        descriptor_value = idiom_return.value.values[0]
+        if not isinstance(descriptor_value, (ast.Name, ast.Attribute)):
+            return None
+        download_descriptor_key = descriptor_key_node.value
+        download_descriptor_expr = ast.unparse(descriptor_value)
+        preserved_lines = stripped_code.splitlines()[: idiom_return.lineno - 1]
+    else:
+        if returns:
+            return None
+        preserved_lines = stripped_code.splitlines()
+
+    top_level_declarations: list[tuple[tuple[str, bool], ...]] = []
+    group_none_leaves: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[tuple[tuple[str, bool], ...]]] = {}
+    for path in sorted(declaration_paths):
+        segments = output_path_segments(path)
+        declaration_prefix = _array_prefix_of_segments(segments)
+        if not declaration_prefix:
+            top_level_declarations.append(segments)
+            continue
+        relative_segments = segments[len(declaration_prefix) :]
+        if any(is_array for _name, is_array in relative_segments):
+            return None
+        matching_groups = [key for key in table_groups if key[2] == declaration_prefix]
+        if len(matching_groups) != 1:
+            return None
+        group_none_leaves.setdefault(matching_groups[0], []).append(relative_segments)
+
+    return_root = _ExtractionReturnNode()
+    scalar_statements: list[str] = []
+    for path, variable in zip(scalar_paths, minted_vars):
+        scalar_statements.extend(_key_value_scalar_read_statements(bindings_by_path[path], variable, guard_empty=True))
+        _set_return_expression(return_root, output_path_segments(path), variable)
+    table_statements: list[str] = []
+    for group_index, (group_key, group_bindings) in enumerate(sorted(table_groups.items())):
+        row_selector, row_count, prefix = group_key
+        records_variable = f"{_ENVELOPE_RECORDS_VAR_BASE}_{group_index}"
+        table_statements.extend(
+            _table_group_read_lines(
+                group_bindings,
+                row_selector=row_selector,
+                row_count=row_count,
+                prefix=prefix,
+                group_index=group_index,
+                records_variable=records_variable,
+                cell_variable_base=_ENVELOPE_CELL_VAR_BASE,
+                assemble_as_literal=True,
+                guard_empty=True,
+                none_leaf_segments=group_none_leaves.get(group_key, ()),
+            )
+        )
+        _set_return_expression(return_root, prefix, records_variable)
+    for segments in top_level_declarations:
+        _set_return_expression(return_root, segments, "None")
+    if download_descriptor_key:
+        return_root.children.setdefault(
+            download_descriptor_key, _ExtractionReturnNode()
+        ).value_expression = download_descriptor_expr
+
+    body_lines = list(preserved_lines)
+    body_lines.extend(scalar_statements)
+    body_lines.extend(table_statements)
+    body_lines.append(f"return {_return_node_expression(return_root)}")
+    produced_code = "\n".join(body_lines).strip() + "\n"
+    keyed_paths = tuple(sorted(scalar_required_paths | declaration_paths))
+    return ProducedStaticReturnEnvelope(code=produced_code, keyed_paths=keyed_paths)
+
+
+def _trajectory_contains_reveal(trajectory: Sequence[Mapping[str, Any]], plan: RequestedOutputExtractionPlan) -> bool:
+    return any(
+        str(interaction.get("tool_name") or "") == "click"
+        and (
+            (bool(plan.reveal.selector) and str(interaction.get("selector") or "") == plan.reveal.selector)
+            or (
+                bool(plan.reveal.role and plan.reveal.name)
+                and str(interaction.get("role") or "") == plan.reveal.role
+                and str(interaction.get("accessible_name") or "") == plan.reveal.name
+            )
+        )
+        for interaction in trajectory
+    )
+
+
+def synthesize_code_block_with_extraction(
+    trajectory: Sequence[Mapping[str, Any]],
+    extraction_plan: RequestedOutputExtractionPlan,
+    *,
+    strict_selectors: bool = False,
+    reached_download_target: ReachedDownloadTarget | None = None,
+) -> SynthesizedCodeBlock | None:
+    if not _trajectory_contains_reveal(trajectory, extraction_plan):
+        return None
+    interaction = synthesize_code_block(
+        trajectory,
+        strict_selectors=strict_selectors,
+        reached_download_target=reached_download_target,
+    )
+    suffix = synthesize_extraction_suffix(extraction_plan)
+    if interaction is None or suffix is None:
+        return None
+    interaction_code = interaction.code.rstrip() + "\n"
+    interaction.code = interaction_code + suffix.code
+    interaction.interaction_code = interaction_code
+    interaction.extraction_code = suffix.code
+    interaction.extraction_fingerprint = suffix.fingerprint
+    interaction.extraction_plan_identity = extraction_plan.identity
+    return interaction
+
+
+def freeze_requested_output_extraction_candidate(
+    synthesized: SynthesizedCodeBlock,
+    plan: RequestedOutputExtractionPlan,
+    *,
+    source: str,
+) -> FrozenRequestedOutputExtractionCandidate | None:
+    if (
+        not synthesized.extraction_code
+        or not synthesized.extraction_fingerprint
+        or synthesized.extraction_plan_identity != plan.identity
+    ):
+        return None
+    return FrozenRequestedOutputExtractionCandidate(
+        plan_identity=plan.identity,
+        observation_identity=plan.observation_identity,
+        requested_output_paths=plan.requested_output_paths,
+        reveal=plan.reveal,
+        interaction_code=synthesized.interaction_code,
+        extraction_code=synthesized.extraction_code,
+        source=source,
+        admission_result="admitted",
+        fingerprint=synthesized.extraction_fingerprint,
+    )
 
 
 # Model-owned slots the synthesizer cannot prove; the model fills these.
@@ -1206,16 +1963,25 @@ def render_synthesized_offer_text(
     """Render the offer body the copilot sees for a synthesized block (pure)."""
     param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key") and not p.get("credential_id")]
     credential_parameters = [p for p in synthesized.parameters if p.get("key") and p.get("credential_id")]
+    extraction_instruction = (
+        "The same interaction-reached evidence compiled the requested keyed extraction suffix; preserve both "
+        "the reveal and extraction segments VERBATIM."
+        if synthesized.extraction_code
+        else (
+            "Hand-author a contract-shaped keyed structure for any requested outputs, never a flat "
+            "`page.inner_text(...)` / `text_content(...)` blob."
+        )
+    )
     parts = [
         "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
-        f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks; hand-author the "
-        "data-capture step it does not cover so the block `return`s a keyed structure (a dict, or an array "
-        "of objects for repeated records) — never a flat `page.inner_text(...)` / `text_content(...)` blob.",
+        f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks. {extraction_instruction}",
         "```python",
         synthesized.code.rstrip("\n"),
         "```",
     ]
+    if synthesized.extraction_plan_identity:
+        parts.append(f"Extraction plan identity: `{synthesized.extraction_plan_identity}`.")
     if param_keys:
         default_keys = [
             str(p.get("key") or "")

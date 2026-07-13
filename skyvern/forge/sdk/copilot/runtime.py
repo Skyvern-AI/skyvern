@@ -54,13 +54,15 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
@@ -347,7 +349,7 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
-    prior_fill_carry: list[dict[str, str | int | bool | None]] = field(default_factory=list)
+    prior_fill_carry: list[dict[str, str | int | bool | list[str] | None]] = field(default_factory=list)
     fill_carry_rebound_done: bool = False
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
@@ -360,6 +362,7 @@ class AgentContext:
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+    latest_evaluate_result_composition_signature: str | None = None
     last_auto_acted_signature: str | None = None
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.
@@ -372,6 +375,10 @@ class AgentContext:
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
+    # Ordered (method, receiver) browser mutations of the last successfully persisted draft's code
+    # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
+    persisted_draft_browser_calls: list[tuple[str, str]] | None = None
+    scouted_spine_checkpoint_fired: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
@@ -423,11 +430,31 @@ class AgentContext:
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
+    requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
+    # candidate only once the update it rode in on succeeds.
+    pending_requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # Set by the imposition seam when a goal-complete spine is on its way into a draft; the successful update
+    # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
+    pending_goal_complete_landing: bool = False
+    synthesized_goal_complete_landed: bool = False
+    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
+    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    spine_imposition_owned_attempt: bool = False
     synthesized_block_reopened_after_failed_run: bool = False
     synthesized_block_reopened_for_output_coverage: bool = False
+    synthesized_block_reopened_for_credential_scout: bool = False
     scouted_output_covered_paths: set[str] = field(default_factory=set)
     uncovered_output_rescout_context_key: str | None = None
     uncovered_output_rescout_steer_key: str | None = None
+    credential_scout_rescout_context_key: str | None = None
+    # Which requires-live-scout fields (username/password, non-empty) each scouted credential
+    # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
+    scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
+    # showed a password-type control; orders page evidence against post-fill submits across evictions.
+    last_scout_observation_trajectory_index: int | None = None
+    last_scout_observation_has_password_control: bool = False
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0
@@ -464,6 +491,13 @@ class AgentContext:
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
     author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
+    # Single-owner turn-precedence contract. One mechanism owns a turn's steering
+    # at a time; a contradicting weaker claim is recorded here and yields.
+    turn_ownership: TurnOwnership | None = None
+    gate_precedence_conflict_events: list[GatePrecedenceConflictEvent] = field(default_factory=list)
+    # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
+    # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
+    blocker_signal_claimant: TurnClaimant | None = None
 
 
 def copilot_author_time_gate_log_only_enabled() -> bool:

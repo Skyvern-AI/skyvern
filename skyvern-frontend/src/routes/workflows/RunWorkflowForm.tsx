@@ -21,7 +21,6 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { Badge } from "@/components/ui/badge";
 import {
   Form,
   FormControl,
@@ -37,7 +36,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { Input } from "@/components/ui/input";
@@ -69,16 +67,14 @@ import {
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
+import { RotatingCredentialField } from "./components/RotatingCredentialField";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
 import {
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
-import {
-  getLoginCredentialInputs,
-  getRotatingCredentialIds,
-} from "./runWorkflowCredentials";
+import { getLoginCredentialInputs } from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
 import { visitWorkflowBlocks } from "./workflowBlockUtils";
 
@@ -315,16 +311,6 @@ function deriveRunWith(
   if (workflow?.run_with === "agent") return "agent";
   if (workflow?.run_with === "code") return "code";
   return "agent";
-}
-
-function formatCredentialSelectionStrategy(
-  selectionStrategy: CredentialParameter["selection_strategy"],
-) {
-  if (selectionStrategy === "random") {
-    return "Random";
-  }
-
-  return "Round robin";
 }
 
 function formatLoginBlockList(labels: Array<string>) {
@@ -843,145 +829,24 @@ function RunWorkflowForm({
                 );
               }
 
-              const credentialIds = getRotatingCredentialIds(parameter);
               return (
                 <FormField
                   key={parameter.key}
                   control={form.control}
                   name={parameter.key}
-                  render={({ field }) => {
-                    const forcedCredentialId =
-                      typeof field.value === "string" ? field.value : "";
-                    const mode = forcedCredentialId ? "force" : "rotation";
-                    const forceSelectValue =
-                      forcedCredentialId || credentialIds[0] || "";
-
-                    return (
-                      <FormItem>
-                        <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
-                            <div className="w-72">
-                              <div className="flex items-center gap-2 text-lg">
-                                {title}
-                                <span className="text-sm text-slate-400">
-                                  credential rotation
-                                </span>
-                              </div>
-                              <h2 className="text-sm text-slate-400">
-                                {description}
-                              </h2>
-                            </div>
-                          </FormLabel>
-                          <div className="w-full space-y-3">
-                            <FormControl>
-                              <RadioGroup
-                                value={mode}
-                                onValueChange={(value) => {
-                                  if (value === "force") {
-                                    field.onChange(forceSelectValue);
-                                  } else {
-                                    field.onChange(undefined);
-                                  }
-                                  form.trigger(parameter.key);
-                                }}
-                                className="gap-3"
-                              >
-                                <label
-                                  className="flex cursor-pointer items-start gap-3 rounded-md border border-slate-700 bg-slate-900/40 p-3"
-                                  htmlFor={`${parameter.key}-rotation`}
-                                >
-                                  <RadioGroupItem
-                                    id={`${parameter.key}-rotation`}
-                                    value="rotation"
-                                    className="mt-1"
-                                  />
-                                  <div className="min-w-0 flex-1 space-y-2">
-                                    <div className="flex flex-wrap items-center gap-2">
-                                      <span className="text-sm font-medium text-slate-100">
-                                        Use configured rotation
-                                      </span>
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs font-normal"
-                                      >
-                                        {formatCredentialSelectionStrategy(
-                                          parameter.selection_strategy,
-                                        )}
-                                      </Badge>
-                                    </div>
-                                    <div className="grid gap-2 md:grid-cols-2">
-                                      {credentialIds.map((credentialId) => (
-                                        <div
-                                          key={credentialId}
-                                          className="min-w-0 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200"
-                                        >
-                                          <span className="block truncate">
-                                            {credentialNamesById.get(
-                                              credentialId,
-                                            ) ?? credentialId}
-                                          </span>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  </div>
-                                </label>
-
-                                <label
-                                  className="flex cursor-pointer items-start gap-3 rounded-md border border-slate-700 bg-slate-900/40 p-3"
-                                  htmlFor={`${parameter.key}-force`}
-                                >
-                                  <RadioGroupItem
-                                    id={`${parameter.key}-force`}
-                                    value="force"
-                                    className="mt-1"
-                                  />
-                                  <div className="min-w-0 flex-1 space-y-2">
-                                    <div className="flex flex-wrap items-center gap-2">
-                                      <span className="text-sm font-medium text-slate-100">
-                                        Force one credential for this run
-                                      </span>
-                                      {mode === "force" && (
-                                        <Badge
-                                          variant="outline"
-                                          className="text-xs font-normal"
-                                        >
-                                          Run only
-                                        </Badge>
-                                      )}
-                                    </div>
-                                    <Select
-                                      disabled={mode !== "force"}
-                                      value={forceSelectValue}
-                                      onValueChange={(value) => {
-                                        field.onChange(value);
-                                        form.trigger(parameter.key);
-                                      }}
-                                    >
-                                      <SelectTrigger className="w-full">
-                                        <SelectValue placeholder="Select a credential" />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        {credentialIds.map((credentialId) => (
-                                          <SelectItem
-                                            key={credentialId}
-                                            value={credentialId}
-                                          >
-                                            {credentialNamesById.get(
-                                              credentialId,
-                                            ) ?? credentialId}
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                </label>
-                              </RadioGroup>
-                            </FormControl>
-                          </div>
-                        </div>
-                      </FormItem>
-                    );
-                  }}
+                  render={({ field }) => (
+                    <RotatingCredentialField
+                      parameter={parameter as CredentialParameter}
+                      value={field.value}
+                      onChange={(value) => {
+                        field.onChange(value);
+                        form.trigger(parameter.key);
+                      }}
+                      credentialNamesById={credentialNamesById}
+                      title={title}
+                      description={description}
+                    />
+                  )}
                 />
               );
             })}

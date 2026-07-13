@@ -20,7 +20,11 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
+from skyvern.forge.sdk.copilot.run_outcome import (
+    RecordedRunOutcome,
+    run_outcome_display_reason,
+    trusted_terminal_challenge_category_name,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
@@ -107,6 +111,7 @@ def _challenge_failure_result() -> dict[str, Any]:
             "category": "ANTI_BOT_DETECTION",
             "confidence_float": 0.95,
             "reasoning": "Typed run analysis reported an anti-bot challenge.",
+            "evidence_source": "challenge_state",
         }
     ]
     result["data"]["blocks"] = [
@@ -633,3 +638,13 @@ class TestGenuineAttemptRunStamp:
         assert ctx.last_test_ok is None
         assert ctx.last_run_blocks_workflow_run_id == "wr_test"
         assert ctx.has_genuine_workflow_attempt() is True
+
+
+def test_trusted_terminal_challenge_category_requires_carrier() -> None:
+    carried = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "artifact"}
+    keyword = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "keyword_only"}
+    legacy = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9}
+
+    assert trusted_terminal_challenge_category_name(carried) == "ANTI_BOT_DETECTION"
+    assert trusted_terminal_challenge_category_name(keyword) is None
+    assert trusted_terminal_challenge_category_name(legacy) is None

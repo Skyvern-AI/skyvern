@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, extract_filename, is_download_response
+from skyvern.webeye.cdp_download_interceptor import (
+    CDPDownloadInterceptor,
+    _is_stale_interception_error,
+    extract_filename,
+    is_download_response,
+)
 
 
 class TestIsDownloadResponse:
@@ -705,6 +710,90 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
+
+
+class TestStaleInterceptionRace:
+    """Fetch.continueRequest/continueResponse can fail with 'Invalid InterceptionId' when the
+    interception is resolved/cancelled or its target detaches before our async handler responds.
+    That is a benign race (SKY-11964), not an error-level failure, and retrying it is futile."""
+
+    _MOD = "skyvern.webeye.cdp_download_interceptor"
+
+    def _make_interceptor(self) -> CDPDownloadInterceptor:
+        return CDPDownloadInterceptor(output_dir="/tmp/test_downloads")
+
+    def _make_cdp_session(self) -> MagicMock:
+        session = MagicMock()
+        session.send = AsyncMock()
+        return session
+
+    @staticmethod
+    def _response_event() -> dict:
+        return {
+            "requestId": "req-1",
+            "request": {"url": "https://example.com/analytics/collect"},
+            "resourceType": "XHR",
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "content-type", "value": "text/plain"}],
+        }
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            pytest.param("Protocol error (Fetch.continueResponse): Invalid InterceptionId", True, id="invalid_id"),
+            pytest.param("Protocol error (Fetch.continueRequest): Invalid InterceptionId", True, id="invalid_id_req"),
+            pytest.param("Target page, context or browser has been closed", True, id="target_closed"),
+            pytest.param("Session closed. Most likely the page has been closed.", True, id="session_closed"),
+            pytest.param("Protocol error (Fetch.continueResponse): Some other CDP failure", False, id="other_cdp"),
+            pytest.param("Connection reset by peer", False, id="generic"),
+        ],
+    )
+    def test_is_stale_interception_error(self, message: str, expected: bool) -> None:
+        assert _is_stale_interception_error(Exception(message)) is expected
+
+    @pytest.mark.asyncio
+    async def test_stale_continue_response_not_retried_or_error_logged(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): Invalid InterceptionId")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Only the original continueResponse — no futile recovery retry against a dead interception.
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_stale_response_error_still_retries_and_logs(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): boom")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Original continueResponse + one recovery attempt; real failures still surface as errors.
+        assert cdp_session.send.call_count == 2
+        mock_log.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_request_stage_error_not_logged_as_error(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueRequest): Invalid InterceptionId")
+        event = {
+            "requestId": "req-2",
+            "request": {"url": "https://example.com/page"},
+            "resourceType": "Document",
+            # No responseStatusCode — Request-stage event
+        }
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(event, cdp_session)
+
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
 
 
 class TestBlobDownloadCapture:

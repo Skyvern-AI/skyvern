@@ -1068,6 +1068,10 @@ class LLMAPIHandlerFactory:
         if not isinstance(llm_config, LLMRouterConfig):
             raise InvalidLLMConfigError(llm_key)
 
+        cache_kwargs: dict[str, int] = {}
+        if llm_config.redis_max_connections is not None:
+            cache_kwargs["max_connections"] = llm_config.redis_max_connections
+
         fallback_groups: list[str]
         if not llm_config.fallback_model_group:
             fallback_groups = []
@@ -1089,6 +1093,7 @@ class LLMAPIHandlerFactory:
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
+            cache_kwargs=cache_kwargs,
             routing_strategy=llm_config.routing_strategy,
             fallbacks=fallbacks_payload,
             # Router-level default timeout. Per litellm router precedence

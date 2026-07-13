@@ -378,6 +378,27 @@ export interface GoogleOAuthCredentialListResponse {
   credentials: GoogleOAuthCredential[];
 }
 
+export interface GoogleOAuthClientConfigSafe {
+  client_id: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+  client_secret_configured: boolean;
+  configured: boolean;
+  source: string;
+  encryption_enabled: boolean;
+}
+
+export interface GoogleOAuthClientConfigResponse {
+  config: GoogleOAuthClientConfigSafe;
+}
+
+export interface UpdateGoogleOAuthClientConfigRequest {
+  client_id: string;
+  client_secret?: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+}
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
@@ -391,6 +412,45 @@ export interface GoogleOAuthAuthorizeResponse {
 }
 
 export interface CreateGoogleOAuthCallbackRequest {
+  code: string;
+  state: string;
+}
+
+export interface MicrosoftOAuthCredential {
+  id: string;
+  organization_id: string;
+  credential_name: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface MicrosoftOAuthCredentialResponse {
+  credential: MicrosoftOAuthCredential;
+  app_origin?: string | null;
+}
+
+export interface MicrosoftOAuthCredentialListResponse {
+  credentials: MicrosoftOAuthCredential[];
+}
+
+export interface CreateMicrosoftOAuthAuthorizeRequest {
+  redirect_uri: string;
+  credential_name?: string;
+  scope_profile?: "outlook_mail";
+  app_origin?: string;
+}
+
+export interface MicrosoftOAuthAuthorizeResponse {
+  authorize_url: string;
+  state: string;
+}
+
+export interface CreateMicrosoftOAuthCallbackRequest {
   code: string;
   state: string;
 }

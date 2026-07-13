@@ -277,15 +277,18 @@ async def download_file(
                     # response.headers stays a CIMultiDictProxy: dict() would make header
                     # lookups case-sensitive and miss lowercase wire headers.
                     file_name = _determine_download_filename(filename, response.headers, url)
-                    final_path = (download_dir_resolved / file_name).resolve()
+                    allowed_dir = os.path.realpath(download_dir_resolved)
+                    resolved_final_path = os.path.realpath(os.path.join(allowed_dir, file_name))
                     # sanitize_filename strips separators but keeps dots, so a dots-only name can
                     # still resolve outside the download dir; require a direct child. Checked
                     # before streaming so a rejected name downloads zero bytes.
                     if (
-                        not final_path.is_relative_to(download_dir_resolved)
-                        or final_path.parent != download_dir_resolved
+                        resolved_final_path == allowed_dir
+                        or not resolved_final_path.startswith(allowed_dir + os.sep)
+                        or os.path.dirname(resolved_final_path) != allowed_dir
                     ):
                         raise ValueError(f"Unsafe filename derived from download: {file_name!r}")
+                    final_path = Path(resolved_final_path)
 
                     temp_file = tempfile.NamedTemporaryFile(mode="wb", dir=download_dir_resolved, delete=False)
                     file_path = Path(temp_file.name).resolve()

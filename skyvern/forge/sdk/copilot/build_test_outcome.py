@@ -12,6 +12,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -1040,7 +1041,7 @@ def recorded_outcome_from_run_blocks_result(
         )
     run_status = _safe_str(data.get("overall_status"))
     failure_type = _safe_str(data.get("failure_type"))
-    failure_categories = _failure_category_refs(data.get("failure_categories"))
+    failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
     runtime_failure_identity = _runtime_failure_identity(failed_block)
     if referenced_unbound_keys:
@@ -1709,6 +1710,17 @@ def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
     if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
         return ""
     return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
+
+
+def registered_output_payload_binds_output_path(
+    payloads: Sequence[Mapping[str, object]],
+    output_path: str,
+) -> bool:
+    for item in payloads:
+        value, present = _registered_output_value_for_path(item, output_path)
+        if present and not _is_empty_output_value(value):
+            return True
+    return False
 
 
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:

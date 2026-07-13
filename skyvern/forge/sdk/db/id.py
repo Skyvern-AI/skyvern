@@ -46,6 +46,7 @@ DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
 GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
+MICROSOFT_OAUTH_CREDENTIAL_PREFIX = "moac"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -284,6 +285,11 @@ def generate_tag_value_id() -> str:
 def generate_google_oauth_credential_id() -> str:
     int_id = generate_id()
     return f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
+
+
+def generate_microsoft_oauth_credential_id() -> str:
+    int_id = generate_id()
+    return f"{MICROSOFT_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:

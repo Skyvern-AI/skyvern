@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_built_unverified_exit_result,
     _build_goal_satisfied_exit_result,
     _resolve_wrapped_exception_exit_result,
+    _synthesized_block_offer_prompt,
     _verified_workflow_or_none,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
@@ -111,6 +112,61 @@ from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 
 _HISTORY_SENTINEL_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_prompt_offer_compiles_plan_and_refreshes_when_observation_changes() -> None:
+    criterion = CompletionCriterion(
+        id="record_id",
+        outcome="Record Identifier",
+        output_path="output.record_id",
+    )
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+    ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"record identifier": "output.record_id"})
+    ctx.scout_trajectory = [
+        {"tool_name": "click", "selector": "#show-details", "source_url": "https://example.com/provider"}
+    ]
+
+    def packet(step: int) -> dict[str, object]:
+        return {
+            "step": step,
+            "reached_via": "interaction",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "scout_interaction",
+                "interaction_tool": "click",
+                "interaction_selector": "#show-details",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "Record Identifier",
+                        "container_selector": ".record-kv",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 1,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+
+    ctx.flow_evidence = [packet(2)]
+    first = _synthesized_block_offer_prompt(ctx)
+    ctx.flow_evidence.append(packet(3))
+    second = _synthesized_block_offer_prompt(ctx)
+
+    assert 'page.locator(".record-kv").nth(0)' in first
+    assert 'return {"output": {"record_id": _extraction_value_0}}' in first
+    assert second == ""
+    assert "Extraction plan identity" in first
+    assert ctx.requested_output_extraction_candidate is not None
 
 
 def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]:
@@ -2098,6 +2154,7 @@ workflow_definition:
 
         async def fake_update_workflow(payload, _ctx, **_kwargs):
             captured_metadata.extend(payload["code_artifact_metadata"])
+            captured_metadata.append({"formation_prepared": _kwargs["formation_prepared"]})
             return {"ok": False, "error": "sentinel update reached", "data": {"from_update": True}}
 
         monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
@@ -2122,9 +2179,10 @@ workflow_definition:
             "output.flags",
             "output.record_id",
         ]
+        assert captured_metadata[-1]["formation_prepared"] is True
 
     @pytest.mark.asyncio
-    async def test_update_and_run_blocks_post_steering_static_return_gap_reaches_run(self, monkeypatch) -> None:
+    async def test_update_and_run_blocks_typed_advisory_static_return_gap_reaches_run(self, monkeypatch) -> None:
         workflow_yaml = """
 title: Test workflow
 workflow_definition:
@@ -2158,7 +2216,7 @@ workflow_definition:
             reason_code="requested_output_contract_missing_output_coverage",
             required_paths=required_paths,
         )
-        ctx.output_contract_reject_count_by_signature = {signature: 2}
+        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
         captured: dict[str, object] = {}
 
         async def fake_update_workflow(payload, update_ctx, **_kwargs):
@@ -2231,7 +2289,11 @@ workflow_definition:
         captured: dict[str, str | bool] = {}
 
         async def fake_update_workflow(
-            payload, ctx, allow_missing_credentials=False, allow_static_output_uncertainty=False
+            payload,
+            ctx,
+            allow_missing_credentials=False,
+            allow_static_output_uncertainty=False,
+            formation_prepared=False,
         ):
             captured["workflow_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]

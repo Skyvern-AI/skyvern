@@ -13,7 +13,7 @@ of tag objects rather than key-maps.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, AsyncGenerator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,10 +21,10 @@ import pytest_asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
-from skyvern.forge.sdk.db.models import Base, WorkflowModel, WorkflowRunModel
+from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -50,13 +50,10 @@ def _by_key(tags: list[dict[str, Any]], key: str | None) -> dict[str, Any]:
 
 
 @pytest_asyncio.fixture
-async def engine() -> AsyncGenerator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+async def engine(sqlite_engine: AsyncEngine) -> AsyncEngine:
     # The workflow the tag routes operate on must exist (non-deleted) so the
     # value-count filter can resolve it, mirroring the existence mock below.
-    session_maker = async_sessionmaker(eng, expire_on_commit=False)
+    session_maker = async_sessionmaker(sqlite_engine, expire_on_commit=False)
     async with session_maker() as session:
         session.add(
             WorkflowModel(organization_id=ORG_ID, workflow_permanent_id=WPID, title="t", workflow_definition={})
@@ -80,8 +77,7 @@ async def engine() -> AsyncGenerator[AsyncEngine]:
             )
         )
         await session.commit()
-    yield eng
-    await eng.dispose()
+    return sqlite_engine
 
 
 @pytest_asyncio.fixture
@@ -100,15 +96,16 @@ def _make_org(org_id: str = ORG_ID) -> Organization:
     )
 
 
-@pytest.fixture
-def app_with_routes(repo: TagsRepository, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
-    """Mount the real routers with patched ``app`` module + dependency overrides.
+@pytest.fixture(scope="module")
+def _route_app() -> tuple[FastAPI, MagicMock]:
+    """Mount the real routers once per module and return ``(app, app_mock)``.
 
-    The route handlers reach the DB via ``app.DATABASE.tags`` and
-    ``app.DATABASE.workflows``; we point both at fakes that delegate to the
-    in-memory ``TagsRepository`` and a mock workflow lookup respectively.
+    ``include_router`` over the full ``base_router`` (~285 routes) costs ~0.3s, so
+    the app, the static workflow/run fakes, and the dependency overrides are built
+    once and shared. The route handlers reach the DB via ``app.DATABASE.tags`` and
+    ``app.DATABASE.workflows``; only the per-test ``TagsRepository`` and the tagging
+    flag are re-pointed in ``app_with_routes``.
     """
-    from skyvern.forge.sdk.routes import agent_protocol as ap
     from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 
     workflows_mock = MagicMock()
@@ -166,15 +163,11 @@ def app_with_routes(repo: TagsRepository, monkeypatch: pytest.MonkeyPatch) -> Fa
     workflow_runs_mock.get_workflow_runs_by_ids = AsyncMock(side_effect=_get_workflow_runs_by_ids)
 
     database_mock = MagicMock()
-    database_mock.tags = repo
     database_mock.workflows = workflows_mock
     database_mock.workflow_runs = workflow_runs_mock
 
     app_mock = MagicMock()
     app_mock.DATABASE = database_mock
-    app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
-
-    monkeypatch.setattr(ap, "app", app_mock)
 
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
@@ -193,6 +186,20 @@ def app_with_routes(repo: TagsRepository, monkeypatch: pytest.MonkeyPatch) -> Fa
     test_app.dependency_overrides[org_auth_service.get_current_org] = _override_get_current_org
     test_app.dependency_overrides[org_auth_service.get_current_caller_context] = _override_get_current_caller_context
 
+    return test_app, app_mock
+
+
+@pytest.fixture
+def app_with_routes(
+    repo: TagsRepository, monkeypatch: pytest.MonkeyPatch, _route_app: tuple[FastAPI, MagicMock]
+) -> FastAPI:
+    """Re-point the module-scoped app at this test's repo and reset the tagging flag."""
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    test_app, app_mock = _route_app
+    app_mock.DATABASE.tags = repo
+    app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    monkeypatch.setattr(ap, "app", app_mock)
     return test_app
 
 

@@ -45,6 +45,13 @@ class NoopLock:
 
 
 class BaseCache(ABC):
+    #: True only for caches visible across separate worker processes (Redis).
+    #: A feature that writes in one request and reads in another (e.g. a
+    #: paused turn resumed by a POST that may land on a different worker)
+    #: must check this before relying on get/set alone -- a same-process-only
+    #: cache like LocalCache would silently hang, not error.
+    is_shared: bool = False
+
     @abstractmethod
     async def set(self, key: str, value: Any, ex: Union[int, timedelta, None] = CACHE_EXPIRE_TIME) -> None:
         pass

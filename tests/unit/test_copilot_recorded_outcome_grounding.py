@@ -767,6 +767,11 @@ def test_convergence_reject_uncrossable_frontier_commits_early_terminal() -> Non
         blocker_signal=None,
         turn_halt=None,
         consecutive_non_converging_repair_count=2,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
     )
 
     decision = _recorded_outcome_convergence_reject(
@@ -920,6 +925,11 @@ def test_early_terminal_renders_typed_final_reply_and_preserves_draft() -> None:
         blocker_signal=None,
         turn_halt=None,
         consecutive_non_converging_repair_count=3,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
     )
 
     _commit_recorded_outcome_early_terminal(ctx)

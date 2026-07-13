@@ -11,12 +11,15 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_CLICKABLE_CONTROLS,
     _MAX_FIELDS_PER_FORM,
     _MAX_FORMS,
+    _MAX_KEY_VALUE_RELATIONS,
     _MAX_MODAL_DISMISS_CONTROLS,
     _MAX_MODAL_OVERLAYS,
     _MAX_NAVIGATION_TARGETS,
     _MAX_PAGE_OBSTRUCTIONS,
     _MAX_RESULT_CONTAINERS,
+    _MAX_RESULT_SAMPLE_ROWS,
     _MAX_SELECT_OPTIONS,
+    _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
     _MODAL_DISMISS_HINTS,
     _MODAL_DISMISS_SYMBOLS,
@@ -198,6 +201,9 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
     f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
+    f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
+    f"const MAX_TABLE_HEADERS={int(_MAX_TABLE_HEADERS)};"
+    f"const MAX_RESULT_SAMPLE_ROWS={int(_MAX_RESULT_SAMPLE_ROWS)};"
     f"const MAX_SELECT_OPTIONS={int(_MAX_SELECT_OPTIONS)};"
     f"const MAX_CHALLENGE_CONTROLS={int(_MAX_CHALLENGE_CONTROLS)};"
     f"const MAX_CLICKABLE_CONTROLS={int(_MAX_CLICKABLE_CONTROLS)};"
@@ -405,17 +411,43 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
 }
 
 const resultContainers = [];
+let resultContainersTruncated = false;
+const selectorMatchCount = (selector) => { if (!selector) return 0; try { return document.querySelectorAll(selector).length; } catch (e) { return 0; } };
+const elementVisible = (node) => {
+  if (!node || !node.getBoundingClientRect) return false;
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
+};
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
   return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
 };
 const resultEntry = (node, tag) => {
-  const entry = { tag: tag, id: attr(node, 'id'), selector: selectorFor(node), is_table: tag === 'table' };
+  const selector = selectorFor(node);
+  const entry = { tag: tag, id: attr(node, 'id'), selector: selector, selector_match_count: selectorMatchCount(selector), visible: elementVisible(node), is_table: tag === 'table' };
 	  if (tag === 'table') {
-	    let rows = Array.from(node.querySelectorAll('tbody tr')).filter((r) => r.querySelector('td'));
-	    if (!rows.length) rows = Array.from(node.querySelectorAll('tr')).filter((r) => r.querySelector('td'));
-	    const sampleRows = rows.map((r) => Array.from(r.children || []).map((c) => nodeText(c)).filter(Boolean).join(' ') || nodeText(r)).filter(resultRowTextIsContent).slice(0, 5);
-	    if (sampleRows.length) { entry.row_count = sampleRows.length; entry.sample_rows = sampleRows; }
+	    let rows = Array.from(node.querySelectorAll(':scope > tbody > tr')).filter((r) => r.querySelector(':scope > td'));
+	    if (!rows.length) rows = Array.from(node.querySelectorAll(':scope > tr')).filter((r) => r.querySelector(':scope > td'));
+	    entry.row_count = rows.length;
+	    entry.rows_truncated = rows.length > MAX_RESULT_SAMPLE_ROWS;
+	    const headerNodes = Array.from(node.querySelectorAll(':scope > thead > tr > th'));
+	    const headers = headerNodes.slice(0, MAX_TABLE_HEADERS).map((h, i) => ({ text: nodeText(h), column_index: i })).filter((h) => !!h.text);
+	    if (headers.length) entry.headers = headers;
+	    entry.span_free = !node.querySelector('th[colspan],th[rowspan],td[colspan],td[rowspan]');
+	    entry.nested_table_free = !node.querySelector(':scope table');
+	    entry.row_selector = selector ? selector + ' > tbody > tr' : '';
+	    entry.rows = rows.slice(0, MAX_RESULT_SAMPLE_ROWS).map((row, rowIndex) => ({
+	      row_index: rowIndex,
+	      visible: elementVisible(row),
+	      has_row_header: !!row.querySelector(':scope > th'),
+	      cells: Array.from(row.querySelectorAll(':scope > th, :scope > td')).slice(0, MAX_TABLE_HEADERS).map((cell, columnIndex) => ({
+	        column_index: columnIndex,
+	        visible: elementVisible(cell),
+	      })),
+	    }));
+	    const sampleRows = rows.map((r) => Array.from(r.children || []).map((c) => nodeText(c)).filter(Boolean).join(' ') || nodeText(r)).filter(resultRowTextIsContent).slice(0, MAX_RESULT_SAMPLE_ROWS);
+	    if (sampleRows.length) entry.sample_rows = sampleRows;
 	  } else {
 	    const text = nodeText(node);
 	    if (text) entry.text_excerpt = text;
@@ -423,14 +455,36 @@ const resultEntry = (node, tag) => {
 	  return entry;
 	};
 	for (const node of all) {
-	  if (resultContainers.length >= MAX_RESULT_CONTAINERS) break;
 	  const tag = (node.tagName || '').toLowerCase();
 	  if (SKIP_TAGS.has(tag)) continue;
 	  const identity = (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase();
 	  if (tag === 'table' || RESULT_CONTAINER_HINTS.some((h) => identity.includes(h))) {
+	    if (resultContainers.length >= MAX_RESULT_CONTAINERS) { resultContainersTruncated = true; break; }
 	    resultContainers.push(resultEntry(node, tag));
 	  }
 	}
+
+const keyValueRelations = [];
+let keyValueRelationsTruncated = false;
+const keyValueSkipTags = new Set(['body', 'form', 'html', 'table', 'tbody', 'thead', 'tr']);
+for (const node of all) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  const children = Array.from(node.children || []);
+  if (children.length !== 2) continue;
+  if (children[0].children && children[0].children.length > 0) continue;
+  const keyText = nodeText(children[0]);
+  const valueText = nodeText(children[1]);
+  if (!keyText || keyText.length > 120 || !valueText || keyText === valueText) continue;
+  if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; break; }
+  const selector = selectorFor(node);
+  const matches = selectorMatchCount(selector);
+  if (!matches) continue;
+  let position = -1;
+  try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
+  if (position < 0) continue;
+  keyValueRelations.push({ key_text: keyText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
+}
 
 const challengeControls = [];
 const seenChallenge = new Set();
@@ -511,6 +565,9 @@ return JSON.stringify({
   forms: forms,
   navigation_targets: navTargets,
   result_containers: resultContainers,
+  result_containers_truncated: resultContainersTruncated,
+  key_value_relations: keyValueRelations,
+  key_value_relations_truncated: keyValueRelationsTruncated,
   clickable_controls: clickableControls,
   challenge_controls: challengeControls,
   modal_overlays: modalOverlays,

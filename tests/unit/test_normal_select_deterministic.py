@@ -94,7 +94,10 @@ async def _run_normal_select(
     selected_index: int | None = None,
     llm_response: dict | None = None,
 ) -> tuple[list, MagicMock, AsyncMock]:
-    provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=feature_enabled))
+    provider = SimpleNamespace(
+        is_feature_enabled_cached=AsyncMock(return_value=feature_enabled),
+        resolve_feature_enabled_unrecorded=AsyncMock(return_value=feature_enabled),
+    )
     normal_select_llm = AsyncMock(return_value=llm_response or {"value": "fallback", "index": None})
 
     monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)

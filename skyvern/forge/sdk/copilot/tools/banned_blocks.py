@@ -8,6 +8,7 @@ from typing import Any
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.enforcement import PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -490,7 +491,7 @@ def _challenge_http_request_reject_message(
         return None
     labels_text = ", ".join(sorted(set(labels)))
     return (
-        "Workflow validation failed: raw http_request blocks are not allowed for a page with observed "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}raw http_request blocks are not allowed for a page with observed "
         "anti-bot or human-verification challenge evidence. "
         f"Offending labels: [{labels_text}]. "
         "Use browser workflow blocks grounded in the observed page, include challenge handling only when visible, "
@@ -506,7 +507,7 @@ def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | N
         return None
     labels_text = ", ".join(sorted(set(labels)))
     return (
-        "Workflow validation failed: timing-only challenge wait blocks are not allowed after confirmed "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}timing-only challenge wait blocks are not allowed after confirmed "
         "anti-bot/WAF or repeated site-block evidence. "
         f"Offending labels: [{labels_text}]. "
         "Do not add wait/delay-only blocks for this blocker; use a conditional challenge check that takes a "

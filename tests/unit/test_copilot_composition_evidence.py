@@ -15,6 +15,14 @@ import yaml
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    ChallengeEvidenceSource,
+    artifact_challenge_flag_key,
+    carrier_backed_anti_bot_categories,
+    challenge_evidence_source_from_entry,
+    composition_challenge_carrier,
+    is_carrier_backed_category_entry,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
@@ -30,6 +38,8 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
     parse_composition_structured,
 )
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
@@ -615,6 +625,198 @@ def test_composition_parse_html_surfaces_human_verification_controls_after_long_
             "disabled": True,
         }
     ]
+
+
+def test_composition_parse_html_excludes_challenge_controls_inside_hidden_ancestors() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Search</title></head><body>
+          <div style="display: none;">
+            <div id="turnstile-solved" class="cf-turnstile" data-sitekey="key-1"></div>
+          </div>
+          <div aria-hidden="true">
+            <div id="challenge-stale" class="challenge-widget" data-callback="done"></div>
+          </div>
+          <div id="human-verification-widget" class="human-verification"></div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+
+    selectors = {control["selector"] for control in parsed["challenge_controls"]}
+    assert "#human-verification-widget" in selectors
+    assert "#turnstile-solved" not in selectors
+    assert "#challenge-stale" not in selectors
+    assert parsed["challenge_state"]["requires_human_verification"] is True
+    assert parsed["challenge_state"]["evidence_source"] == "challenge_state"
+    assert composition_challenge_carrier(parsed) == ChallengeEvidenceSource.CHALLENGE_STATE
+
+
+def test_composition_parse_html_passed_challenge_markup_escalates_without_assertion() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Search</title></head><body>
+          <div style="display:none">
+            <div id="turnstile-solved" class="cf-turnstile" data-sitekey="key-1"></div>
+          </div>
+          <main>Verification passed. Search below.</main>
+          <form><input name="q" /><input type="submit" value="Search" /></form>
+        </body></html>
+        """,
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+
+    assert parsed["challenge_state"]["detected"] is True
+    assert page_evidence_needs_visual_fallback(parsed) is True
+    assert parsed["challenge_controls"] == []
+    assert parsed["challenge_state"]["requires_human_verification"] is False
+    assert "evidence_source" not in parsed["challenge_state"]
+    assert composition_challenge_carrier(parsed) is None
+    assert run_execution_module._composition_anti_bot_reason(SimpleNamespace(composition_page_evidence=parsed)) is None
+
+
+def test_composition_consent_modal_after_passed_check_reports_no_challenge() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Order documents</title></head><body>
+          <main>Bot check passed. Success! Continue to your order documents.</main>
+          <div role="dialog" aria-modal="true" id="terms-modal">
+            <p>Please accept the terms of service and privacy policy to continue.</p>
+            <form id="continue-form">
+              <input type="checkbox" id="accept-terms" name="accept_terms" />
+              <input type="submit" id="btnContinue" value="Continue" disabled />
+            </form>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/order-documents",
+        current_url="https://example.com/order-documents",
+    )
+
+    assert parsed["anti_bot_indicators"] == []
+    assert parsed["challenge_controls"] == []
+    assert parsed["challenge_state"]["detected"] is False
+    assert parsed["challenge_state"]["requires_human_verification"] is False
+    assert composition_challenge_carrier(parsed) is None
+    assert run_execution_module._composition_anti_bot_reason(SimpleNamespace(composition_page_evidence=parsed)) is None
+
+
+def test_merge_visual_consent_summary_never_stamps_vision_carrier() -> None:
+    parsed = parse_composition_html(
+        "<html><head><title>Just a moment...</title></head><body>Human verification</body></html>",
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "A cookie consent dialog covers the page.",
+            "challenge_detected": True,
+            "obstruction_kind": "cookie_consent",
+        },
+    )
+
+    assert merged["challenge_state"]["requires_human_verification"] is False
+    assert "evidence_source" not in merged["challenge_state"]
+    assert composition_challenge_carrier(merged) is None
+
+
+def test_merge_visual_challenge_summary_stamps_vision_carrier() -> None:
+    parsed = parse_composition_html(
+        "<html><head><title>Just a moment...</title></head><body>Human verification</body></html>",
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "A verification card blocks the search form.",
+            "challenge_detected": True,
+            "obstruction_kind": "verification_panel",
+        },
+    )
+
+    assert merged["challenge_state"]["requires_human_verification"] is True
+    assert merged["challenge_state"]["evidence_source"] == "vision"
+    assert composition_challenge_carrier(merged) == ChallengeEvidenceSource.VISION
+
+
+def test_merge_visual_consent_summary_with_visible_control_keeps_dom_carrier() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Search</title></head><body>
+          <div id="human-verification-widget" class="human-verification"></div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "A consent-looking dialog sits over a live challenge widget.",
+            "challenge_detected": True,
+            "obstruction_kind": "cookie_consent",
+        },
+    )
+
+    assert merged["challenge_state"]["requires_human_verification"] is True
+    assert merged["challenge_state"]["evidence_source"] == "challenge_state"
+    assert composition_challenge_carrier(merged) == ChallengeEvidenceSource.CHALLENGE_STATE
+
+
+def test_challenge_evidence_carrier_wire_contract_fails_closed() -> None:
+    carried = {"category": "ANTI_BOT_DETECTION", "evidence_source": "vision"}
+    keyword = {"category": "CHALLENGE_DETECTION", "evidence_source": "keyword_only"}
+    legacy = {"category": "HUMAN_VERIFICATION_CHALLENGE"}
+    other = {"category": "PAGE_LOAD_TIMEOUT"}
+
+    assert challenge_evidence_source_from_entry(carried) == ChallengeEvidenceSource.VISION
+    assert is_carrier_backed_category_entry(carried) is True
+    assert is_carrier_backed_category_entry(keyword) is False
+    assert is_carrier_backed_category_entry(legacy) is False
+    assert is_carrier_backed_category_entry(other) is True
+    assert carrier_backed_anti_bot_categories([keyword, other, carried, legacy]) == [other, carried]
+
+
+def test_artifact_challenge_flag_requires_exact_typed_markers() -> None:
+    assert artifact_challenge_flag_key({"captcha_detected": True}) == "captcha_detected"
+    assert artifact_challenge_flag_key({"blocker": {"type": "browser_port_forbidden"}}) == "browser_port_forbidden"
+    assert artifact_challenge_flag_key({"blocked": True}) is None
+    assert artifact_challenge_flag_key({"status": "blocked"}) is None
+    assert artifact_challenge_flag_key({"summary": "the captcha challenge blocked the search"}) is None
+    assert (
+        artifact_challenge_flag_key({"captcha_detected": True}, declared_keys=frozenset({"captcha_detected"})) is None
+    )
+
+
+def test_artifact_challenge_flag_marker_values_off_ignores_string_markers() -> None:
+    assert artifact_challenge_flag_key({"failure_reason": "blocked_by_challenge"}, match_marker_values=False) is None
+    assert (
+        artifact_challenge_flag_key({"blocker": {"type": "browser_port_forbidden"}}, match_marker_values=False) is None
+    )
+    # Typed boolean flags still count when marker-value matching is off.
+    assert artifact_challenge_flag_key({"captcha_detected": True}, match_marker_values=False) == "captcha_detected"
+
+
+def test_artifact_carrier_ignores_run_envelope_prose_status_fields() -> None:
+    # A prose/status envelope value must not be promoted as an artifact carrier.
+    prose = {"data": {"failure_reason": "blocked_by_challenge", "overall_status": "challenge_detected"}}
+    assert _artifact_challenge_flag_from_result(prose) is None
+    # Typed block output still carries.
+    typed = {
+        "data": {
+            "blocks": [
+                {"status": "completed", "block_type": "extraction", "extracted_data": {"captcha_detected": True}}
+            ]
+        }
+    }
+    assert _artifact_challenge_flag_from_result(typed) == "captcha_detected"
 
 
 def test_composition_gate_requires_page_evidence_before_page_dependent_blocks() -> None:
@@ -2013,6 +2215,128 @@ def test_structured_preserves_populated_result_container_content() -> None:
     assert table["row_count"] == 1
     assert table["sample_rows"] == ["Jane Doe Active"]
     assert records["text_excerpt"] == "Record A ready"
+
+
+def test_structured_preserves_live_key_and_table_binding_shape() -> None:
+    payload = {
+        "page_title": "Records",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "#records",
+                "selector_match_count": 1,
+                "visible": True,
+                "span_free": True,
+                "nested_table_free": True,
+                "row_selector": "#records > tbody > tr",
+                "headers": [
+                    {"text": "Address", "column_index": 0},
+                    {"text": "Status", "column_index": 1},
+                ],
+                "row_count": 2,
+                "rows_truncated": False,
+                "rows": [
+                    {
+                        "row_index": row_index,
+                        "visible": True,
+                        "has_row_header": False,
+                        "cells": [
+                            {"column_index": 0, "visible": True},
+                            {"column_index": 1, "visible": True},
+                        ],
+                    }
+                    for row_index in range(2)
+                ],
+                "sample_rows": ["Record One Ready", "Record Two Pending"],
+            }
+        ],
+        "result_containers_truncated": False,
+        "key_value_relations": [
+            {
+                "key_text": "Record Identifier",
+                "container_selector": ".kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+        "key_value_relations_truncated": False,
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Record details",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/records", current_url="https://example.com/records"
+    )
+
+    assert parsed is not None
+    assert parsed["key_value_relations"] == payload["key_value_relations"]
+    assert parsed["key_value_relations_truncated"] is False
+    assert parsed["result_containers_truncated"] is False
+    assert parsed["result_containers"][0]["headers"] == payload["result_containers"][0]["headers"]
+    assert parsed["result_containers"][0]["selector_match_count"] == 1
+    assert parsed["result_containers"][0]["rows_truncated"] is False
+    assert parsed["result_containers"][0]["nested_table_free"] is True
+    assert parsed["result_containers"][0]["row_selector"] == "#records > tbody > tr"
+    assert parsed["result_containers"][0]["rows"][1]["has_row_header"] is False
+    assert parsed["result_containers"][0]["rows"][1]["cells"][1] == {
+        "column_index": 1,
+        "visible": True,
+    }
+
+
+def test_html_packet_excludes_hidden_bindings_and_preserves_revealed_structure() -> None:
+    details = """
+    <div id="details" STYLE>
+      <div class="kv"><div>Record Identifier</div><div>record-123</div></div>
+      <table id="records">
+        <thead><tr><th>Address</th><th>Status</th></tr></thead>
+        <tbody><tr><td>Record One</td><td>Ready</td></tr></tbody>
+      </table>
+    </div>
+    """
+    hidden = parse_composition_html(
+        details.replace("STYLE", 'style="display:none"'),
+        inspected_url="https://example.com/records",
+        current_url="https://example.com/records",
+    )
+    revealed = parse_composition_html(
+        details.replace("STYLE", ""),
+        inspected_url="https://example.com/records",
+        current_url="https://example.com/records",
+    )
+
+    assert hidden["key_value_relations"] == []
+    assert hidden["result_containers"] == []
+    assert revealed["key_value_relations"][0]["key_text"] == "Record Identifier"
+    table = revealed["result_containers"][0]
+    assert table["selector"] == "#records"
+    assert table["selector_match_count"] == 1
+    assert table["headers"] == [
+        {"text": "Address", "column_index": 0},
+        {"text": "Status", "column_index": 1},
+    ]
+    assert table["row_count"] == 1
+    assert table["rows_truncated"] is False
+    assert table["rows"] == [
+        {
+            "row_index": 0,
+            "visible": True,
+            "has_row_header": False,
+            "cells": [
+                {"column_index": 0, "visible": True},
+                {"column_index": 1, "visible": True},
+            ],
+        }
+    ]
 
 
 def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:

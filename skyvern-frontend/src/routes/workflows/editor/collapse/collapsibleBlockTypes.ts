@@ -27,6 +27,7 @@ const COLLAPSIBLE_NODE_TYPE_TO_BLOCK_TYPE: Record<string, WorkflowBlockType> = {
   http_request: "http_request",
   printPage: "print_page",
   workflowTrigger: "workflow_trigger",
+  emailInbox: "email_inbox",
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
   pdfFill: "pdf_fill",

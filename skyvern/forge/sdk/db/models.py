@@ -42,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
+    generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -747,6 +748,7 @@ class WorkflowRunModel(Base):
 
     credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     cached_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
+    topup_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -1857,6 +1859,44 @@ class GoogleOAuthCredentialModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     credential_name = Column(String, nullable=False, default="Default")
     provider = Column(String, nullable=False, default="google")
+    state = Column(String, nullable=False, default="pending_consent", index=True)
+    scopes_requested = Column(JSON, nullable=False, default=list)
+    scopes_granted = Column(JSON, nullable=False, default=list)
+    encrypted_refresh_token = Column(String, nullable=True)
+    encrypted_method = Column(String, nullable=True)
+    consent_nonce = Column(String, nullable=True)
+    consent_redirect_uri = Column(String, nullable=True)
+    consent_code_verifier = Column(String, nullable=True)
+    consent_app_origin = Column(String, nullable=True)
+    consent_expires_at = Column(DateTime, nullable=True)
+    client_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class MicrosoftOAuthCredentialModel(Base):
+    __tablename__ = "microsoft_oauth_credentials"
+    __table_args__ = (
+        Index(
+            "ux_microsoft_oauth_credentials_consent_nonce",
+            "consent_nonce",
+            unique=True,
+            postgresql_where=text("consent_nonce IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "state IN ('pending_consent', 'active', 'revoked', 'error')",
+            name="ck_microsoft_oauth_credentials_state",
+        ),
+    )
+
+    id = Column(String, primary_key=True, default=generate_microsoft_oauth_credential_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
+    credential_name = Column(String, nullable=False, default="Default")
     state = Column(String, nullable=False, default="pending_consent", index=True)
     scopes_requested = Column(JSON, nullable=False, default=list)
     scopes_granted = Column(JSON, nullable=False, default=list)

@@ -1,4 +1,5 @@
 from skyvern.forge import app
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES
 
@@ -11,11 +12,15 @@ async def is_cua_task(
 
     if task.workflow_run_id:
         # it's a task based block, should look up the block run to see if it's a CUA task
-        block = await app.DATABASE.observer.get_workflow_run_block_by_task_id(
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-        )
-        if block.engine is not None and block.engine in CUA_ENGINES:
+        try:
+            block = await app.DATABASE.observer.get_workflow_run_block_by_task_id(
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+            )
+        except NotFoundError:
+            # a missing block row means "unknown", not CUA — fall through to the run-type check
+            block = None
+        if block is not None and block.engine is not None and block.engine in CUA_ENGINES:
             return True
 
     run = await app.DATABASE.tasks.get_run(

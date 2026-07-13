@@ -36,6 +36,8 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 LOG = structlog.get_logger()
 PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
+_AUTHORING_INTENTS = {"author_now", "defer_authoring"}
+DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
 _RAW_SECRET_HANDLINGS = {"none", "block", "redacted_draft"}
 _CLASSIFIER_FAILURE_KINDS = {
@@ -48,6 +50,7 @@ _CLASSIFIER_FAILURE_KINDS = {
 }
 _CLASSIFICATION_RESPONSE_FIELDS = {
     "testing_intent",
+    "authoring_intent",
     "credential_input_kind",
     "credential_refs",
     "login_page_urls",
@@ -206,6 +209,8 @@ RequestedOutputEvidenceSource = Literal[
 ]
 JudgmentPredicate = Literal["login_gate_blocks_target"]
 _JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
+MintDegrade = Literal["turn_unsatisfiable_fallback", "contingent_missing_antecedent"]
+MINT_DEGRADE_VALUES: frozenset[str] = frozenset(get_args(MintDegrade))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
@@ -276,6 +281,9 @@ class CompletionCriterion:
     contingent_on: str | None = None
     contingent_antecedent_output_path: str | None = None
     deliverable_kind: Literal["registered_download"] | None = None
+    # Author-time seam signal only: unlike ``deliverable_kind`` it survives canonicalization onto
+    # non-canonical output paths, so it is never rendered to the completion verifier.
+    declared_deliverable_kind: Literal["registered_download"] | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -290,13 +298,16 @@ class CompletionCriterion:
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
-    mint_degrade: Literal["turn_unsatisfiable_fallback"] | None = None
+    mint_degrade: MintDegrade | None = None
     judgment_truth_condition: JudgmentTruthCondition | None = None
+    requested_output_floor_rekeyed: bool = False
+    floor_rekeyed_from_path: str | None = None
 
 
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
+    authoring_intent: str = "author_now"
     credential_input_kind: str = "none"
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
@@ -336,6 +347,7 @@ class RequestPolicy:
     def to_trace_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "testing_intent": self.testing_intent,
+            "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
@@ -384,11 +396,20 @@ class RequestPolicy:
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
+        mint_degraded_criteria = [
+            criterion for criterion in self.completion_criteria if criterion.mint_degrade is not None
+        ]
+        data["mint_degraded_criterion_count"] = len(mint_degraded_criteria)
+        for index, criterion in enumerate(mint_degraded_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"mint_degraded_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
         return data
 
     def prompt_summary(self) -> str:
         lines = [
             f"testing_intent: {self.testing_intent}",
+            f"authoring_intent: {self.authoring_intent}",
             f"credential_input_kind: {self.credential_input_kind}",
             f"clarification_reason: {self.clarification_reason}",
             f"allow_update_workflow: {self.allow_update_workflow}",
@@ -432,6 +453,21 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     if request_policy is None:
         return False
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
+
+
+def is_defer_authoring_durable_fill_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id == DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID
+
+
+def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id=DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID,
+        outcome="the live form is filled on the page this turn",
+        kind="terminal_action",
+        terminal_action_family="form",
+        method_mandated=True,
+        level="run",
+    )
 
 
 def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
@@ -751,6 +787,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     if raw is None:
         return RequestPolicy()
     testing_intent = raw.get("testing_intent")
+    authoring_intent = raw.get("authoring_intent")
     credential_input_kind = raw.get("credential_input_kind")
     completion_contract_raw = raw.get("completion_contract")
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
@@ -758,6 +795,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
+        authoring_intent=authoring_intent if authoring_intent in _AUTHORING_INTENTS else "author_now",
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
@@ -890,6 +928,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
                 deliverable_kind=deliverable_kind,
+                declared_deliverable_kind=deliverable_kind,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=cast(CriterionLevel, level_raw)
@@ -1378,6 +1417,15 @@ def _non_requested_output_run_corroborator(criterion: CompletionCriterion) -> bo
     )
 
 
+def is_presence_only_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.expected_output_value is None
+        and criterion.expected_output_shape is None
+        and criterion.deliverable_kind is None
+        and criterion.mint_degrade is None
+    )
+
+
 def _validation_classification_output_path(output_path: str | None) -> bool:
     return (
         output_path in _VALIDATION_CLASSIFICATION_BOOLEAN_OUTPUT_TARGETS
@@ -1516,6 +1564,7 @@ def _apply_requested_output_completion_criteria(
     )
 
     metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
+    declared_kind_by_output_path: dict[str, Literal["registered_download"]] = {}
     for criterion in policy.completion_criteria:
         if criterion.level == "definition" or criterion.method_mandated:
             continue
@@ -1523,6 +1572,7 @@ def _apply_requested_output_completion_criteria(
             not criterion.contingent_on
             and not criterion.contingent_antecedent_output_path
             and not criterion.deliverable_kind
+            and not criterion.declared_deliverable_kind
         ):
             continue
         for field_name, output_path, _field_label in requested_specs:
@@ -1530,6 +1580,8 @@ def _apply_requested_output_completion_criteria(
                 deliverable_kind = (
                     criterion.deliverable_kind if output_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
                 )
+                if criterion.output_path == output_path and criterion.declared_deliverable_kind:
+                    declared_kind_by_output_path.setdefault(output_path, criterion.declared_deliverable_kind)
                 metadata_by_output_path.setdefault(
                     output_path,
                     (
@@ -1562,6 +1614,7 @@ def _apply_requested_output_completion_criteria(
             contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
             contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
             deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+            declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
             judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
         )
         for _field_name, output_path, field_label in requested_specs
@@ -1614,6 +1667,7 @@ def _apply_validation_classification_completion_criteria(policy: RequestPolicy) 
                 expected_output_shape=None,
                 requested_output_evidence_source="runtime_output",
                 deliverable_kind=None,
+                declared_deliverable_kind=None,
                 terminal_action_family=None,
                 classification_output_key=output_key,
                 expected_classification=expected,
@@ -1680,6 +1734,22 @@ def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
 
 def is_turn_unsatisfiable_fallback_degraded(criterion: CompletionCriterion) -> bool:
     return criterion.mint_degrade == "turn_unsatisfiable_fallback"
+
+
+def is_contingent_missing_antecedent_degraded(criterion: CompletionCriterion) -> bool:
+    return criterion.mint_degrade == "contingent_missing_antecedent"
+
+
+def resolve_mint_degrade(
+    stored_value: object,
+    contingent_on: str | None,
+    contingent_antecedent_output_path: str | None,
+) -> MintDegrade | None:
+    if isinstance(stored_value, str) and stored_value in MINT_DEGRADE_VALUES:
+        return cast(MintDegrade, stored_value)
+    if contingent_on and contingent_antecedent_output_path is None:
+        return "contingent_missing_antecedent"
+    return None
 
 
 _FALLBACK_LITERAL_MIN_CHARS = 4
@@ -1760,6 +1830,26 @@ def _mark_turn_unsatisfiable_fallback_criteria(policy: RequestPolicy) -> None:
     policy.completion_criteria = marked
 
 
+def _degrade_pathless_contingent_criteria(policy: RequestPolicy) -> None:
+    swept: list[CompletionCriterion] = []
+    degraded_ids: list[str] = []
+    for criterion in policy.completion_criteria:
+        resolved = resolve_mint_degrade(
+            criterion.mint_degrade, criterion.contingent_on, criterion.contingent_antecedent_output_path
+        )
+        if resolved != criterion.mint_degrade:
+            criterion = replace(criterion, mint_degrade=resolved)
+            degraded_ids.append(criterion.id)
+        swept.append(criterion)
+    policy.completion_criteria = swept
+    if degraded_ids:
+        LOG.info(
+            "copilot_contingent_criterion_mint_degraded",
+            criterion_ids=degraded_ids,
+            mint_degrade="contingent_missing_antecedent",
+        )
+
+
 def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
     floor = [
         CompletionCriterion(
@@ -1827,6 +1917,7 @@ def _classifier_fallback_policy(
     )
     _apply_classifier_typed_requested_output_corroborators(policy)
     _mark_turn_unsatisfiable_fallback_criteria(policy)
+    _degrade_pathless_contingent_criteria(policy)
     if policy.graded_completion_criteria():
         policy.completion_contract_status = "present"
     return policy
@@ -2078,6 +2169,7 @@ async def _classify_request(
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
     _apply_validation_classification_completion_criteria(policy)
     _apply_classifier_typed_requested_output_corroborators(policy)
+    _degrade_pathless_contingent_criteria(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )
@@ -2694,6 +2786,12 @@ async def build_request_policy(
                 policy,
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
+
+    if policy.authoring_intent == "defer_authoring":
+        policy.allow_update_workflow = False
+        policy.allow_run_blocks = False
+        if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
+            policy.completion_criteria = list(policy.completion_criteria) + [_defer_authoring_durable_fill_criterion()]
 
     trace_data = policy.to_trace_data()
     if policy.classifier_status == "fallback":
