@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
     _contains_internal_tool_vocab_leak,
+    _contains_yaml_authoring_vocab_leak,
     derive_output_kind,
     evaluate_actuation_obligation,
     evaluate_output_policy,
@@ -2753,6 +2754,46 @@ def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None
 )
 def test_contains_internal_tool_vocab_leak_helper(user_response: str, expected: bool) -> None:
     assert _contains_internal_tool_vocab_leak(user_response) is expected
+
+
+@pytest.mark.parametrize(
+    "user_response,response_type,expected",
+    [
+        ("I changed the code block from folded code formatting to literal code formatting.", "REPLY", True),
+        ("Switched that step to use literal code formatting instead.", "REPLY", True),
+        ("Rewrote the block using a literal block scalar.", "REPLY", True),
+        ("Rewrote the block using a literal block scalar.", "REPLACE_WORKFLOW", True),
+        ("Switched that step to use literal code formatting instead.", "ASK_QUESTION", True),
+        ("Update the workflow to log in before extracting data.", "REPLY", False),
+        ("I formatted the code so it's easier to read.", "REPLY", False),
+        ("", "REPLY", False),
+    ],
+)
+def test_contains_yaml_authoring_vocab_leak_helper(user_response: str, response_type: str, expected: bool) -> None:
+    assert _contains_yaml_authoring_vocab_leak(user_response, response_type) is expected
+
+
+def test_yaml_authoring_vocab_leak_hard_blocks_ask_question() -> None:
+    """Regression guard: unlike the nudge/copilot-sentinel phrases, this leak class must
+    be caught in ASK_QUESTION turns too — a clarifying question is still user-visible."""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response="Should I switch this block to literal code formatting?",
+    )
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
+
+
+def test_yaml_block_scalar_standard_term_does_not_hard_block_ask_question() -> None:
+    """Regression guard for PR #13274 review feedback (LawyZheng): 'literal/folded block
+    scalar' is standard YAML terminology a legitimate clarifying question can use — unlike
+    the code-formatting jargon phrases, it must not hard-replace an ASK_QUESTION turn."""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response="Should this multi-line value use a literal block scalar or folded style?",
+    )
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
 
 
 def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:
