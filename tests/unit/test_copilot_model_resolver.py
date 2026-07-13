@@ -408,3 +408,30 @@ class TestModelResolver:
         assert model_name == "openai/gpt-4o"
         assert run_config.model_provider._base_url == "https://api.githubcopilot.com"
         assert run_config.model_provider._api_key == "gho_test"
+
+
+@pytest.mark.parametrize(
+    "alias", ["ACME_UNREGISTERED_PROVIDER_MODEL", "ZZUNREGISTEREDPROVIDER", "ZZ-UNREGISTERED-HYPHEN-KEY"]
+)
+def test_resolve_model_config_raises_for_unregistered_registry_alias(alias: str) -> None:
+    # Copilot pointed at a registry-style alias whose config isn't registered here must fail
+    # fast, not synthesize a provider-less model that 400s inside the Agents SDK. SKY-12322.
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+    from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
+
+    assert not LLMConfigRegistry.is_registered(alias)
+    handler = MagicMock()
+    handler.llm_key = alias
+    with pytest.raises(InvalidLLMConfigError):
+        resolve_model_config(handler)
+
+
+@pytest.mark.parametrize("model_name", ["gpt-4o", "azure/gpt-4.1"])
+def test_resolve_model_config_synthesizes_self_hosted_model(model_name: str) -> None:
+    # A raw self-hosted model string is not registry-style, so the guard leaves it alone and
+    # get_config's synth fallback resolves it — the self-hosted LLM_KEY path stays intact.
+    handler = MagicMock()
+    handler.llm_key = model_name
+    resolved_model_name, _run_config, resolved_llm_key, _ = resolve_model_config(handler)
+    assert resolved_model_name == model_name
+    assert resolved_llm_key == model_name
