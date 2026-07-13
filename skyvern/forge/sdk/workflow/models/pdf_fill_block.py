@@ -57,6 +57,26 @@ FLAT_PDF_OCR_MISSING_MESSAGE = (
 )
 FLAT_FILL_RENDER_RESOLUTION = 150
 FLAT_FILL_FONT_SIZE = 11
+FLAT_FILL_MIN_FONT_SIZE = 7.0
+FLAT_FILL_FONT_SIZE_GAP = 3.0
+FLAT_FILL_TEXT_END_GAP_PT = 3.0
+# Helvetica AFM: Ascender 718, Descender -207 (per 1000 em). The overlay value's
+# ink extends this far above/below its baseline; the OCR anchor box is the printed
+# label, not the value, so collision bands are modeled from the value's own ink.
+FLAT_FILL_GLYPH_ASCENT_RATIO = 0.718
+FLAT_FILL_GLYPH_DESCENT_RATIO = 0.207
+FLAT_FILL_LINE_EPS_PX = 2.0
+# Adobe AFM glyph widths (per 1000 units) for Helvetica, chars 32..126; fallback 600.
+# fmt: off
+_HELVETICA_WIDTHS_1000 = (
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+)
+# fmt: on
 FLAT_FILL_OCR_MIN_CONFIDENCE = 30.0
 FLAT_FILL_FONT_RESOURCE = "/SkyvernHelv"
 # Tesseract merges visually aligned table cells into one line; split anchors on column-sized gaps.
@@ -66,6 +86,25 @@ FLAT_FILL_OCR_TIMEOUT_SECONDS = 60
 FLAT_FILL_OCR_TOTAL_TIMEOUT_SECONDS = 300
 FLAT_FILL_MAX_PAGES = 25
 FLAT_FILL_OCR_LANGUAGES = os.getenv("FLAT_FILL_OCR_LANGUAGES", DEFAULT_FLAT_FILL_OCR_LANGUAGES).strip()
+
+
+def _flat_text_width_pt(value: str, font_size: float) -> float:
+    single_line = " ".join(value.split())
+    total = 0
+    for ch in single_line:
+        code = ord(ch)
+        total += _HELVETICA_WIDTHS_1000[code - 32] if 32 <= code <= 126 else 600
+    return total * font_size / 1000.0
+
+
+def _flat_value_band_px(position: str, anchor: FlatPdfAnchor, scale_y: float, font_size: float) -> tuple[float, float]:
+    if position == "below":
+        baseline_px = anchor.bottom + (FLAT_FILL_FONT_SIZE_GAP + font_size) / scale_y
+    else:
+        baseline_px = anchor.bottom + 1 / scale_y
+    ascent_px = FLAT_FILL_GLYPH_ASCENT_RATIO * font_size / scale_y
+    descent_px = FLAT_FILL_GLYPH_DESCENT_RATIO * font_size / scale_y
+    return baseline_px - ascent_px, baseline_px + descent_px
 
 
 @dataclass(frozen=True)
@@ -97,6 +136,15 @@ class FlatPlacement:
     anchor: FlatPdfAnchor
     value: str
     position: str
+
+
+@dataclass(frozen=True)
+class ResolvedFlatText:
+    value: str
+    x: float
+    y: float
+    font_size: float
+    overflowed: bool = False
 
 
 class PdfFillBlock(Block):
@@ -697,7 +745,138 @@ class PdfFillBlock(Block):
         single_line = " ".join(value.split())
         return single_line.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
 
-    async def _fill_flat_overlay(self, reader: PdfReader, placements: list[FlatPlacement], output_path: Path) -> bytes:
+    def _resolve_flat_page_layout(
+        self,
+        page_placements: list[FlatPlacement],
+        page_anchors: list[FlatPdfAnchor],
+        *,
+        page_width: float,
+        page_height: float,
+        origin_x: float,
+        origin_y: float,
+    ) -> list[ResolvedFlatText]:
+        resolved: list[ResolvedFlatText] = []
+        resolved_rects: list[tuple[float, float, float, float]] = []
+
+        for placement in sorted(page_placements, key=lambda item: (item.anchor.top, item.anchor.x0)):
+            anchor = placement.anchor
+            if not anchor.page_width_px or not anchor.page_height_px:
+                continue
+            scale_x = page_width / anchor.page_width_px
+            scale_y = page_height / anchor.page_height_px
+            chosen_position = "below" if placement.position == "below" else "right"
+            alternate_position = "right" if chosen_position == "below" else "below"
+            start_x_by_position = {
+                "right": anchor.x1 + 6 / scale_x,
+                "below": anchor.x0 + 8 / scale_x,
+            }
+
+            def available_span(position: str) -> float:
+                start_x_px = start_x_by_position[position]
+                band_top, band_bottom = _flat_value_band_px(position, anchor, scale_y, float(FLAT_FILL_FONT_SIZE))
+                obstacles: list[tuple[float, float]] = []
+                for other_anchor in page_anchors:
+                    if other_anchor.anchor_id == anchor.anchor_id:
+                        continue
+                    if position == "below" and other_anchor.bottom <= anchor.bottom + FLAT_FILL_LINE_EPS_PX:
+                        continue
+                    if min(band_bottom, other_anchor.bottom) > max(band_top, other_anchor.top):
+                        obstacles.append((float(other_anchor.x0), float(other_anchor.x1)))
+                for rect_x0, rect_x1, rect_top, rect_bottom in resolved_rects:
+                    if min(band_bottom, rect_bottom) > max(band_top, rect_top):
+                        obstacles.append((rect_x0, rect_x1))
+
+                if any(obstacle_x0 <= start_x_px < obstacle_x1 for obstacle_x0, obstacle_x1 in obstacles):
+                    return 0.0
+                page_right_px = anchor.page_width_px - 6 / scale_x
+                next_obstacle_x = min(
+                    (obstacle_x0 for obstacle_x0, _ in obstacles if obstacle_x0 > start_x_px),
+                    default=page_right_px,
+                )
+                return min(page_right_px, next_obstacle_x) - start_x_px
+
+            spans = {position: available_span(position) for position in ("right", "below")}
+
+            def fits(position: str, font_size: float) -> bool:
+                width_px = _flat_text_width_pt(placement.value, font_size) / scale_x
+                return width_px <= spans[position] - FLAT_FILL_TEXT_END_GAP_PT / scale_x
+
+            # Reject below ink past the page bottom, keeping bottom-row values visible to the right.
+            def on_page(position: str, font_size: float) -> bool:
+                if position != "below":
+                    return True
+                _, band_bottom_px = _flat_value_band_px("below", anchor, scale_y, font_size)
+                return band_bottom_px <= anchor.page_height_px
+
+            candidates: list[tuple[str, float]] = [
+                (chosen_position, float(FLAT_FILL_FONT_SIZE)),
+                (alternate_position, float(FLAT_FILL_FONT_SIZE)),
+            ]
+            font_size = FLAT_FILL_FONT_SIZE - 0.5
+            while font_size >= FLAT_FILL_MIN_FONT_SIZE:
+                candidates.append((chosen_position, font_size))
+                font_size -= 0.5
+            font_size = FLAT_FILL_FONT_SIZE - 0.5
+            while font_size >= FLAT_FILL_MIN_FONT_SIZE:
+                candidates.append((alternate_position, font_size))
+                font_size -= 0.5
+
+            selected = next((candidate for candidate in candidates if on_page(*candidate) and fits(*candidate)), None)
+            overflowed = selected is None
+            if selected is None:
+                fallback_positions = ["right"] + (["below"] if on_page("below", FLAT_FILL_MIN_FONT_SIZE) else [])
+                final_position = max(fallback_positions, key=lambda position: spans[position])
+                final_font_size = FLAT_FILL_MIN_FONT_SIZE
+                LOG.warning(
+                    "Flat PDF text placement overflow",
+                    value_length=len(placement.value),
+                    right_span_px=spans["right"],
+                    below_span_px=spans["below"],
+                )
+            else:
+                final_position, final_font_size = selected
+
+            if final_position != chosen_position or final_font_size != FLAT_FILL_FONT_SIZE:
+                LOG.info(
+                    "Adjusted flat PDF text placement",
+                    anchor_id=anchor.anchor_id,
+                    from_position=chosen_position,
+                    to_position=final_position,
+                    from_font_size=FLAT_FILL_FONT_SIZE,
+                    to_font_size=final_font_size,
+                )
+
+            if final_position == "below":
+                text_x = origin_x + anchor.x0 * scale_x + 8
+                text_y = origin_y + page_height - anchor.bottom * scale_y - final_font_size - FLAT_FILL_FONT_SIZE_GAP
+            else:
+                text_x = origin_x + anchor.x1 * scale_x + 6
+                text_y = origin_y + page_height - anchor.bottom * scale_y - 1
+            resolved.append(
+                ResolvedFlatText(
+                    value=placement.value,
+                    x=text_x,
+                    y=text_y,
+                    font_size=final_font_size,
+                    overflowed=overflowed,
+                )
+            )
+            start_x_px = start_x_by_position[final_position]
+            band_top, band_bottom = _flat_value_band_px(final_position, anchor, scale_y, final_font_size)
+            width_px = _flat_text_width_pt(placement.value, final_font_size) / scale_x
+            resolved_rects.append((start_x_px, start_x_px + width_px, band_top, band_bottom))
+
+        return resolved
+
+    async def _fill_flat_overlay(
+        self,
+        reader: PdfReader,
+        placements: list[FlatPlacement],
+        anchors: list[FlatPdfAnchor],
+        output_path: Path,
+        *,
+        overflow_records: list[dict[str, Any]] | None = None,
+    ) -> bytes:
         writer = PdfWriter()
         writer.clone_document_from_reader(reader)
 
@@ -716,23 +895,35 @@ class PdfFillBlock(Block):
             page_height = float(crop_box.height)
             origin_x = float(crop_box.left)
             origin_y = float(crop_box.bottom)
-            text_ops: list[str] = []
-            for placement in page_placements:
-                anchor = placement.anchor
-                if not anchor.page_width_px or not anchor.page_height_px:
-                    continue
-                scale_x = page_width / anchor.page_width_px
-                scale_y = page_height / anchor.page_height_px
-                if placement.position == "below":
-                    text_x = origin_x + anchor.x0 * scale_x + 8
-                    text_y = origin_y + page_height - anchor.bottom * scale_y - FLAT_FILL_FONT_SIZE - 3
-                else:
-                    text_x = origin_x + anchor.x1 * scale_x + 6
-                    text_y = origin_y + page_height - anchor.bottom * scale_y - 1
-                text_ops.append(
-                    f"BT {FLAT_FILL_FONT_RESOURCE} {FLAT_FILL_FONT_SIZE} Tf 0 0 0 rg "
-                    f"{text_x:.1f} {text_y:.1f} Td ({self._escape_pdf_text(placement.value)}) Tj ET"
-                )
+            page_anchors = [anchor for anchor in anchors if anchor.page_index == page_index]
+            resolvable_placements = [
+                placement
+                for placement in sorted(page_placements, key=lambda item: (item.anchor.top, item.anchor.x0))
+                if placement.anchor.page_width_px and placement.anchor.page_height_px
+            ]
+            resolved_texts = self._resolve_flat_page_layout(
+                resolvable_placements,
+                page_anchors,
+                page_width=page_width,
+                page_height=page_height,
+                origin_x=origin_x,
+                origin_y=origin_y,
+            )
+            if overflow_records is not None:
+                for placement, resolved in zip(resolvable_placements, resolved_texts, strict=True):
+                    if resolved.overflowed:
+                        overflow_records.append(
+                            {
+                                "anchor_id": placement.anchor.anchor_id,
+                                "value": resolved.value,
+                                "reason": "Placement overflowed the available space; value may overlap adjacent content",
+                            }
+                        )
+            text_ops = [
+                f"BT {FLAT_FILL_FONT_RESOURCE} {resolved.font_size:g} Tf 0 0 0 rg "
+                f"{resolved.x:.1f} {resolved.y:.1f} Td ({self._escape_pdf_text(resolved.value)}) Tj ET"
+                for resolved in resolved_texts
+            ]
             if not text_ops:
                 continue
 
@@ -752,6 +943,7 @@ class PdfFillBlock(Block):
                     NameObject("/Type"): NameObject("/Font"),
                     NameObject("/Subtype"): NameObject("/Type1"),
                     NameObject("/BaseFont"): NameObject("/Helvetica"),
+                    NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
                 }
             )
             overlay_page[NameObject("/Resources")] = DictionaryObject(
@@ -905,6 +1097,8 @@ class PdfFillBlock(Block):
                 )
 
             fill_mode = "acroform" if inventory else "flat_overlay"
+            skipped_fields: list[dict[str, Any]] = []
+            overflowed_placements: list[dict[str, Any]] = []
             try:
                 output_path = self._output_path(workflow_run_id, workflow_run_block_id)
                 if inventory:
@@ -969,7 +1163,13 @@ class PdfFillBlock(Block):
                             output_parameter_value={"fields": {}, "skipped_fields": skipped_fields},
                         )
                     fields = {placement.anchor.text: placement.value for placement in placements}
-                    pdf_bytes = await self._fill_flat_overlay(reader, placements, output_path)
+                    pdf_bytes = await self._fill_flat_overlay(
+                        reader,
+                        placements,
+                        anchors,
+                        output_path,
+                        overflow_records=overflowed_placements,
+                    )
             except Exception as e:
                 return await self._record_failure(
                     workflow_run_context,
@@ -1007,6 +1207,7 @@ class PdfFillBlock(Block):
                 "fill_mode": fill_mode,
                 "fields": fields,
                 "skipped_fields": skipped_fields,
+                "overflowed_placements": overflowed_placements,
                 "file_path": str(output_path),
                 "file_name": output_path.name,
                 "file_size": output_path.stat().st_size,
