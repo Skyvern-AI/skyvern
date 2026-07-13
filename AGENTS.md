@@ -22,7 +22,7 @@ This AGENTS.md file provides comprehensive guidance for AI agents working with t
 ### Python Standards
 
 - Use Python 3.11+ features and type hints
-- Follow PEP 8 with a line length of 100 characters
+- Follow PEP 8 with a line length of 120 characters to match formatter and import-sorting configuration
 - Use absolute imports for all modules
 - Document all public functions and classes with Google-style docstrings
 - Use `snake_case` for variables and functions, `PascalCase` for classes
