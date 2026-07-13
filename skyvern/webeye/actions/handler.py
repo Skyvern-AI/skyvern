@@ -62,6 +62,7 @@ from skyvern.exceptions import (
     NoIncrementalElementFoundForAutoCompletion,
     NoIncrementalElementFoundForCustomSelection,
     NoSuitableAutoCompleteOption,
+    NoTOTPSecretFound,
     OptionIndexOutOfBound,
     PhoneNumberInputMismatch,
     SkyvernException,
@@ -95,6 +96,8 @@ from skyvern.forge.sdk.services.credentials import (
     AzureVaultConstants,
     OnePasswordConstants,
     generate_totp_code,
+    is_unresolved_totp_placeholder,
+    is_unresolved_totp_value,
     parse_totp_config,
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -3009,8 +3012,53 @@ async def handle_input_text_action(
 ) -> list[ActionResult]:
     if not action.element_id:
         # This is a CUA type action
-        await EventStrategyFactory.type_text(page, None, action.text)
+        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+        if text_result is None:
+            return [ActionFailure(FailedToFetchSecret())]
+        if is_unresolved_totp_placeholder(text_result):
+            return [ActionFailure(NoTOTPSecretFound())]
+        cua_text = text_result
+        if cua_text in (BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP):
+            try:
+                cua_totp_secret = get_totp_secret_with_task(task=task, parameter=action.text)
+                cua_text = generate_totp_value_from_secret(cua_totp_secret)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
+        elif is_unresolved_totp_value(cua_text):
+            return [ActionFailure(NoTOTPSecretFound())]
+        await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
+
+    totp_secret: str | None = None
+    is_multi_field_totp = bool(action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
+    if is_multi_field_totp:
+        text = ""
+        current_text_target = action.text
+        is_totp_value = False
+        is_secret_value = True
+    else:
+        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
+        if text_result is None:
+            return [ActionFailure(FailedToFetchSecret())]
+        if is_unresolved_totp_placeholder(text_result):
+            return [ActionFailure(NoTOTPSecretFound())]
+        is_totp_value = text_result in (
+            BitwardenConstants.TOTP,
+            OnePasswordConstants.TOTP,
+            AzureVaultConstants.TOTP,
+        )
+        if not is_totp_value and is_unresolved_totp_value(text_result):
+            return [ActionFailure(NoTOTPSecretFound())]
+        if is_totp_value:
+            try:
+                totp_secret = get_totp_secret_with_task(task=task, parameter=action.text)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
+            text = ""
+        else:
+            text = text_result
+        current_text_target = text_result
+        is_secret_value = is_totp_value or text != action.text
 
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
@@ -3019,27 +3067,11 @@ async def handle_input_text_action(
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     current_text = await get_input_value(skyvern_element.get_tag_name(), skyvern_element.get_locator())
-    if current_text == action.text:
+    if not is_totp_value and current_text == current_text_target:
         return [ActionSuccess()]
 
     # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
-
-    # Check if this is multi-field TOTP first - if so, skip secret resolution
-    if action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"):
-        # For multi-field TOTP, we'll set text directly in the TOTP logic below
-        text: str = ""
-    else:
-        # For regular inputs, resolve secrets
-        text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
-        if text_result is None:
-            return [ActionFailure(FailedToFetchSecret())]
-        text = text_result
-
-    is_totp_value = (
-        text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP or text == AzureVaultConstants.TOTP
-    )
-    is_secret_value = text != action.text
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
@@ -3050,14 +3082,20 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
-    select_action = SelectOptionAction(
-        reasoning=action.reasoning,
-        element_id=skyvern_element.get_id(),
-        option=SelectOption(label=text),
-        intention=action.intention,
-        input_or_select_context=action.input_or_select_context,
-    )
     if await skyvern_element.get_selectable():
+        select_text = text
+        if is_totp_value:
+            try:
+                select_text = generate_totp_value_from_secret(totp_secret)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
+        select_action = SelectOptionAction(
+            reasoning=action.reasoning,
+            element_id=skyvern_element.get_id(),
+            option=SelectOption(label=select_text),
+            intention=action.intention,
+            input_or_select_context=action.input_or_select_context,
+        )
         LOG.info(
             "Input element is selectable, doing select actions",
             element_id=skyvern_element.get_id(),
@@ -3065,6 +3103,14 @@ async def handle_input_text_action(
         )
         action.set_has_mini_agent()
         return await handle_select_option_action(select_action, page, scraped_page, task, step)
+
+    select_action = SelectOptionAction(
+        reasoning=action.reasoning,
+        element_id=skyvern_element.get_id(),
+        option=SelectOption(label=text),
+        intention=action.intention,
+        input_or_select_context=action.input_or_select_context,
+    )
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
@@ -3285,7 +3331,10 @@ async def handle_input_text_action(
     class_name: str | None = await skyvern_element.get_attr("class")
     if class_name and "blinking-cursor" in class_name.lower():
         if is_totp_value:
-            text = generate_totp_value_with_task(task=task, parameter=action.text)
+            try:
+                text = generate_totp_value_from_secret(totp_secret)
+            except NoTOTPSecretFound as exc:
+                return [ActionFailure(exc)]
         await skyvern_element.press_fill(text=text)
         return [ActionSuccess()]
 
@@ -3340,7 +3389,10 @@ async def handle_input_text_action(
 
     if is_totp_value:
         LOG.info("Skipping the auto completion logic since it's a TOTP input")
-        text = generate_totp_value_with_task(task=task, parameter=action.text)
+        try:
+            text = generate_totp_value_from_secret(totp_secret)
+        except NoTOTPSecretFound as exc:
+            return [ActionFailure(exc)]
         await skyvern_element.input(text)
         return [ActionSuccess()]
 
@@ -4787,19 +4839,44 @@ def get_actual_value_of_parameter_if_secret_with_task(task: Task, parameter: str
     return get_actual_value_of_parameter_if_secret(task.workflow_run_id, parameter)
 
 
-def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
+def get_totp_secret(workflow_run_id: str, parameter: str) -> str:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if not workflow_run_context:
+        raise NoTOTPSecretFound()
     totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
     totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
     if not totp_secret:
-        LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
-        return parameter
-    return generate_totp_code(totp_secret)
+        LOG.warning("No TOTP secret found")
+        raise NoTOTPSecretFound()
+    if parse_totp_config(totp_secret) is None:
+        LOG.warning("Failed to parse TOTP credential secret")
+        raise NoTOTPSecretFound()
+    return totp_secret
+
+
+def get_totp_secret_with_task(task: Task, parameter: str) -> str:
+    if task.workflow_run_id is None:
+        raise NoTOTPSecretFound()
+    return get_totp_secret(task.workflow_run_id, parameter)
+
+
+def generate_totp_value_from_secret(totp_secret: str | None) -> str:
+    if not totp_secret:
+        raise NoTOTPSecretFound()
+    try:
+        return generate_totp_code(totp_secret)
+    except Exception as exc:
+        LOG.warning("Failed to generate TOTP from credential secret", exception_type=type(exc).__name__)
+        raise NoTOTPSecretFound() from exc
+
+
+def generate_totp_value(workflow_run_id: str, parameter: str) -> str:
+    return generate_totp_value_from_secret(get_totp_secret(workflow_run_id, parameter))
 
 
 def generate_totp_value_with_task(task: Task, parameter: str) -> str:
     if task.workflow_run_id is None:
-        return parameter
+        raise NoTOTPSecretFound()
     return generate_totp_value(task.workflow_run_id, parameter)
 
 
