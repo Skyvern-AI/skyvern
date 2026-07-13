@@ -1,5 +1,5 @@
 import * as React from "react";
-import { PlusIcon } from "@radix-ui/react-icons";
+import { CheckIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
   Command,
   CommandEmpty,
@@ -12,8 +12,11 @@ import {
   MAX_AUTOCOMPLETE_SUGGESTIONS,
   Tag,
   TagKey,
+  isUserWritableTagKey,
   parseTagInput,
   parseTypedTagQuery,
+  sortTags,
+  tagElementKey,
   validateTag,
 } from "../../types/tagTypes";
 
@@ -27,6 +30,10 @@ type Props = {
   // While a bulk apply is in flight, freeze the picker so a second pick can't
   // start a competing apply for the same selection.
   disabled?: boolean;
+  // Set for single-target pickers (workflow-row and run-tag menus) to enable
+  // removal; the bulk Actions surface omits them and stays add-only.
+  currentTags?: Array<Tag>;
+  onRemove?: (tag: Tag) => void;
 };
 
 // The cmdk body of the tag picker: suggestions plus an "Add label/group:label"
@@ -40,6 +47,8 @@ function TagPickerCommand({
   error,
   onErrorChange,
   disabled,
+  currentTags,
+  onRemove,
 }: Props) {
   const [query, setQuery] = React.useState("");
   const inputRef = React.useRef<HTMLInputElement>(null);
@@ -51,8 +60,30 @@ function TagPickerCommand({
     return () => cancelAnimationFrame(frame);
   }, []);
 
-  function applyTag(tag: Tag) {
+  const sortedCurrentTags = React.useMemo(
+    () =>
+      onRemove
+        ? sortTags(
+            (currentTags ?? []).filter((tag) => isUserWritableTagKey(tag.key)),
+          )
+        : [],
+    [currentTags, onRemove],
+  );
+  const currentTagByKey = React.useMemo(() => {
+    const byKey = new Map<string, Tag>();
+    for (const tag of sortedCurrentTags) {
+      byKey.set(tagElementKey(tag), tag);
+    }
+    return byKey;
+  }, [sortedCurrentTags]);
+
+  function selectTag(tag: Tag) {
     if (disabled) {
+      return;
+    }
+    const currentTag = currentTagByKey.get(tagElementKey(tag));
+    if (currentTag) {
+      onRemove?.(currentTag);
       return;
     }
     const validationError = validateTag(tag);
@@ -66,11 +97,18 @@ function TagPickerCommand({
   const trimmedQuery = query.trim();
   const normalizedQuery = trimmedQuery.toLowerCase();
   const candidate = parseTagInput(query);
+  const candidateAddable =
+    candidate !== null && isUserWritableTagKey(candidate.key);
+  const candidateIsCurrent =
+    candidate !== null &&
+    candidateAddable &&
+    currentTagByKey.has(tagElementKey(candidate));
   const { typedKey, typedValuePartial } = parseTypedTagQuery(trimmedQuery);
 
   const groupSuggestions =
     typedKey === null
       ? tagKeys
+          .filter((tk) => isUserWritableTagKey(tk.key))
           .filter((tk) => tk.key.toLowerCase().includes(normalizedQuery))
           .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
       : [];
@@ -81,13 +119,14 @@ function TagPickerCommand({
           .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
       : [];
   const groupedValueMatches =
-    typedKey !== null
+    typedKey !== null && isUserWritableTagKey(typedKey)
       ? (valueSuggestionsByKey?.get(typedKey) ?? [])
           .filter((value) => value.toLowerCase().includes(typedValuePartial))
           .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
       : [];
   const hasItems =
-    candidate !== null ||
+    sortedCurrentTags.length > 0 ||
+    candidateAddable ||
     groupSuggestions.length > 0 ||
     labelMatches.length > 0 ||
     groupedValueMatches.length > 0;
@@ -118,15 +157,36 @@ function TagPickerCommand({
         </div>
       ) : null}
       <CommandList>
-        {candidate !== null && (
+        {sortedCurrentTags.length > 0 && (
+          <CommandGroup heading="Current">
+            {sortedCurrentTags.map((tag) => (
+              <CommandItem
+                key={tagElementKey(tag)}
+                value={`current-${tagElementKey(tag)}`}
+                disabled={disabled}
+                onSelect={() => selectTag(tag)}
+              >
+                <span>
+                  {tag.key !== null ? `${tag.key}: ${tag.value}` : tag.value}
+                </span>
+                <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        )}
+        {candidateAddable && candidate !== null && (
           <CommandGroup>
             <CommandItem
-              value={`add-${trimmedQuery}`}
+              value={`${candidateIsCurrent ? "remove" : "add"}-${trimmedQuery}`}
               disabled={disabled}
-              onSelect={() => applyTag(candidate)}
+              onSelect={() => selectTag(candidate)}
             >
-              <PlusIcon className="mr-2 h-4 w-4" />
-              Add{" "}
+              {candidateIsCurrent ? (
+                <CheckIcon className="mr-2 h-4 w-4 text-blue-400" />
+              ) : (
+                <PlusIcon className="mr-2 h-4 w-4" />
+              )}
+              {candidateIsCurrent ? "Remove " : "Add "}
               {candidate.key !== null
                 ? `${candidate.key}: ${candidate.value}`
                 : candidate.value}
@@ -140,9 +200,14 @@ function TagPickerCommand({
                 key={value}
                 value={`${typedKey}:${value}`}
                 disabled={disabled}
-                onSelect={() => applyTag({ key: typedKey, value })}
+                onSelect={() => selectTag({ key: typedKey, value })}
               >
                 {value}
+                {currentTagByKey.has(
+                  tagElementKey({ key: typedKey, value }),
+                ) ? (
+                  <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+                ) : null}
               </CommandItem>
             ))}
           </CommandGroup>
@@ -168,9 +233,12 @@ function TagPickerCommand({
                 key={value}
                 value={`label-${value}`}
                 disabled={disabled}
-                onSelect={() => applyTag({ key: null, value })}
+                onSelect={() => selectTag({ key: null, value })}
               >
                 {value}
+                {currentTagByKey.has(tagElementKey({ key: null, value })) ? (
+                  <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+                ) : null}
               </CommandItem>
             ))}
           </CommandGroup>

@@ -53,9 +53,11 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
   PdfFillBlockYAML,
+  SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -150,6 +152,11 @@ import {
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
 import {
+  emailInboxNodeDefaultData,
+  isEmailInboxNode,
+} from "./nodes/EmailInboxNode/types";
+import { validateEmailInboxNode } from "./nodes/EmailInboxNode/validate";
+import {
   googleSheetsReadNodeDefaultData,
   isGoogleSheetsReadNode,
 } from "./nodes/GoogleSheetsReadNode/types";
@@ -164,6 +171,11 @@ import {
   pdfFillNodeDefaultData,
 } from "./nodes/PdfFillNode/types";
 import { validatePdfFillNode } from "./nodes/PdfFillNode/validate";
+import {
+  isSplitPdfNode,
+  splitPdfNodeDefaultData,
+} from "./nodes/SplitPdfNode/types";
+import { validateSplitPdfNode } from "./nodes/SplitPdfNode/validate";
 import {
   containsJinjaReference,
   getAffectedBlocks,
@@ -231,6 +243,9 @@ function serializeLoopNodeWhileBranchToYAML(
 }
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
+
+// Mirrors the backend settings.WORKFLOW_WAIT_BLOCK_MAX_SEC (30 minutes).
+const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
 
 function serializeSecretResponsePaths(
   secretResponsePaths: Array<string>,
@@ -914,7 +929,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
-          dataSchema: "null",
         },
       };
     }
@@ -1063,6 +1077,7 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+          prompt: block.prompt ?? null,
           storageType: block.storage_type,
           s3Bucket: block.s3_bucket ?? "",
           awsAccessKeyId: block.aws_access_key_id ?? "",
@@ -1073,6 +1088,14 @@ function convertToNode(
           azureBlobContainerName: block.azure_blob_container_name ?? "",
           googleCredentialId: block.google_credential_id ?? "",
           googleDriveFolderId: block.google_drive_folder_id ?? "",
+          sftpHost: block.sftp_host ?? "",
+          sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
+          sftpUsername: block.sftp_username ?? "",
+          sftpPassword: block.sftp_password ?? "",
+          sftpPrivateKey: block.sftp_private_key ?? "",
+          sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
+          sftpRemotePath: block.sftp_remote_path ?? "",
+          sftpHostKey: block.sftp_host_key ?? "",
         },
       };
     }
@@ -1143,6 +1166,20 @@ function convertToNode(
         },
       };
     }
+    case "split_pdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...commonData,
+          fileUrl: block.file_url ?? "",
+          prompt: block.prompt ?? "",
+          llmKey: block.llm_key ?? "",
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
     case "workflow_trigger": {
       return {
         ...identifiers,
@@ -1156,6 +1193,26 @@ function convertToNode(
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
           useParentBrowserSession: block.use_parent_browser_session ?? false,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "email_inbox": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "emailInbox",
+        data: {
+          ...commonData,
+          emailClient: block.email_client ?? "gmail",
+          credentialId: block.credential_id ?? "",
+          folder: block.folder ?? "INBOX",
+          prompt: block.prompt ?? "",
+          sender: block.sender ?? "",
+          subject: block.subject ?? "",
+          newerThanDays: block.newer_than_days ?? null,
+          maxResults: block.max_results ?? 25,
+          includeBody: block.include_body ?? true,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -2562,6 +2619,17 @@ function createNode(
         },
       };
     }
+    case "splitPdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...splitPdfNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "workflowTrigger": {
       return {
         ...identifiers,
@@ -2569,6 +2637,17 @@ function createNode(
         type: "workflowTrigger",
         data: {
           ...workflowTriggerNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "emailInbox": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "emailInbox",
+        data: {
+          ...emailInboxNodeDefaultData,
           label,
         },
       };
@@ -3042,6 +3121,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_upload",
         path: node.data.path,
+        prompt: node.data.prompt,
         storage_type: node.data.storageType,
         s3_bucket: node.data.s3Bucket ?? "",
         aws_access_key_id: node.data.awsAccessKeyId ?? "",
@@ -3052,6 +3132,17 @@ function getWorkflowBlock(
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
         google_credential_id: node.data.googleCredentialId ?? "",
         google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+        sftp_host: node.data.sftpHost ?? "",
+        sftp_port:
+          node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
+            ? Number(node.data.sftpPort)
+            : null,
+        sftp_username: node.data.sftpUsername ?? "",
+        sftp_password: node.data.sftpPassword ?? "",
+        sftp_private_key: node.data.sftpPrivateKey ?? "",
+        sftp_private_key_passphrase: node.data.sftpPrivateKeyPassphrase ?? "",
+        sftp_remote_path: node.data.sftpRemotePath ?? "",
+        sftp_host_key: node.data.sftpHostKey ?? "",
       };
     }
     case "fileParser": {
@@ -3143,6 +3234,16 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
       };
     }
+    case "splitPdf": {
+      return {
+        ...base,
+        block_type: "split_pdf",
+        file_url: node.data.fileUrl,
+        prompt: node.data.prompt,
+        llm_key: node.data.llmKey || null,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
     case "workflowTrigger": {
       const parsedPayload = JSONParseSafe(node.data.payload) as Record<
         string,
@@ -3159,6 +3260,22 @@ function getWorkflowBlock(
         wait_for_completion: node.data.waitForCompletion,
         browser_session_id: node.data.browserSessionId || null,
         use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "emailInbox": {
+      return {
+        ...base,
+        block_type: "email_inbox",
+        email_client: node.data.emailClient,
+        credential_id: node.data.credentialId || null,
+        folder: node.data.folder,
+        prompt: node.data.prompt,
+        sender: node.data.sender || null,
+        subject: node.data.subject || null,
+        newer_than_days: node.data.newerThanDays,
+        max_results: node.data.maxResults,
+        include_body: node.data.includeBody,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4388,6 +4505,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "file_upload",
           path: block.path,
+          prompt: block.prompt,
           storage_type: block.storage_type,
           s3_bucket: block.s3_bucket ?? "",
           aws_access_key_id: block.aws_access_key_id ?? "",
@@ -4398,6 +4516,14 @@ function convertBlocksToBlockYAML(
           azure_blob_container_name: block.azure_blob_container_name ?? "",
           google_credential_id: block.google_credential_id ?? "",
           google_drive_folder_id: block.google_drive_folder_id ?? "",
+          sftp_host: block.sftp_host ?? "",
+          sftp_port: block.sftp_port ?? null,
+          sftp_username: block.sftp_username ?? "",
+          sftp_password: block.sftp_password ?? "",
+          sftp_private_key: block.sftp_private_key ?? "",
+          sftp_private_key_passphrase: block.sftp_private_key_passphrase ?? "",
+          sftp_remote_path: block.sftp_remote_path ?? "",
+          sftp_host_key: block.sftp_host_key ?? "",
         };
         return blockYaml;
       }
@@ -4488,6 +4614,17 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "split_pdf": {
+        const blockYaml: SplitPdfBlockYAML = {
+          ...base,
+          block_type: "split_pdf",
+          file_url: block.file_url,
+          prompt: block.prompt,
+          llm_key: block.llm_key,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "workflow_trigger": {
         const blockYaml: WorkflowTriggerBlockYAML = {
           ...base,
@@ -4497,6 +4634,23 @@ function convertBlocksToBlockYAML(
           wait_for_completion: block.wait_for_completion,
           browser_session_id: block.browser_session_id,
           use_parent_browser_session: block.use_parent_browser_session,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "email_inbox": {
+        const blockYaml: EmailInboxBlockYAML = {
+          ...base,
+          block_type: "email_inbox",
+          email_client: block.email_client,
+          credential_id: block.credential_id,
+          folder: block.folder,
+          prompt: block.prompt,
+          sender: block.sender,
+          subject: block.subject,
+          newer_than_days: block.newer_than_days,
+          max_results: block.max_results,
+          include_body: block.include_body,
           parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
@@ -4782,6 +4936,17 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
     if (!isNumber) {
       errors.push(`${node.data.label}: Invalid input for wait time.`);
+      return;
+    }
+
+    // Mirror the backend bounds (InvalidWaitBlockTime rejects <= 0 or
+    // > WORKFLOW_WAIT_BLOCK_MAX_SEC) so a save fails fast instead of passing
+    // validation and then erroring at run time.
+    const waitSeconds = Number(waitTimeString);
+    if (waitSeconds < 1 || waitSeconds > WORKFLOW_WAIT_BLOCK_MAX_SEC) {
+      errors.push(
+        `${node.data.label}: Wait time must be between 1 and ${WORKFLOW_WAIT_BLOCK_MAX_SEC} seconds.`,
+      );
     }
   });
 
@@ -4823,12 +4988,20 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
 
   nodes
+    .filter(isEmailInboxNode)
+    .forEach((node) => errors.push(...validateEmailInboxNode(node)));
+
+  nodes
     .filter(isGoogleSheetsWriteNode)
     .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
 
   nodes
     .filter(isPdfFillNode)
     .forEach((node) => errors.push(...validatePdfFillNode(node)));
+
+  nodes
+    .filter(isSplitPdfNode)
+    .forEach((node) => errors.push(...validateSplitPdfNode(node)));
 
   return errors;
 }

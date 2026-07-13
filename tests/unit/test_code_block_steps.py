@@ -292,41 +292,6 @@ def test_get_by_role_without_name_falls_back_to_the_element():
     assert steps[0]["description"] == "Click the element"
 
 
-def test_extract_call_surfaces_as_a_distinct_step_with_prompt_copy():
-    # page.extract() is the code-first extraction surface and must surface as its own step.
-    code = (
-        "async def run(page):\n"
-        "    await page.goto('https://example.com/')\n"
-        "    data = await page.extract(prompt='Extract the URLs of the top 20 posts', schema={'type': 'object'})\n"
-    )
-    steps = derive_code_block_steps(code)
-    assert [s["action_type"] for s in steps] == ["goto_url", "extract"]
-    assert steps[1]["description"] == "Extract the URLs of the top 20 posts"
-
-
-def test_multiline_prompt_literal_renders_without_backslash_escapes():
-    # A YAML block-scalar / multiline prompt must collapse to readable copy, not leak
-    # the source-level "\n" escape that ast.unparse would re-introduce.
-    code = "async def run(page):\n    await page.extract(prompt='Extract the URLs\\nof the top 20 posts')\n"
-    steps = derive_code_block_steps(code)
-    assert steps[0]["action_type"] == "extract"
-    assert steps[0]["description"] == "Extract the URLs of the top 20 posts"
-
-
-def test_extract_without_prompt_literal_falls_back_to_a_generic_extract_label():
-    code = "async def run(page):\n    data = await page.extract(prompt=goal)\n"
-    steps = derive_code_block_steps(code)
-    assert steps[0]["action_type"] == "extract"
-    assert steps[0]["description"] == "Extract information from the page"
-
-
-def test_whitespace_only_prompt_falls_back_instead_of_rendering_blank_copy():
-    code = "async def run(page):\n    data = await page.extract(prompt='   \\n  ')\n"
-    steps = derive_code_block_steps(code)
-    assert steps[0]["action_type"] == "extract"
-    assert steps[0]["description"] == "Extract information from the page"
-
-
 def test_check_and_uncheck_map_to_checkbox_matching_the_recorder():
     code = (
         "async def run(page):\n"
@@ -339,28 +304,30 @@ def test_check_and_uncheck_map_to_checkbox_matching_the_recorder():
 
 
 def test_extraction_then_looped_navigation_are_distinguishable():
-    # The canonical failing case: open a site, extract a list of links, then for
-    # each link open it and extract its contents. Every step must read as the
-    # action it performs, and the two navigations must not be the same generic copy.
+    # The canonical failing case: open a site, read a list of links, then for each
+    # link open it and read its contents. The two navigations must not share copy.
     code = (
         "async def run(page, limit):\n"
         "    await page.goto('https://example.com/')\n"
-        "    posts = await page.extract(prompt='Extract the URLs of the top posts')\n"
-        "    for post in posts['posts'][:limit]:\n"
-        "        await page.goto(post['url'])\n"
-        "        await page.extract(prompt='Extract the top comment on the post')\n"
+        "    posts = await page.locator('.post a').all_text_contents()\n"
+        "    for post in posts[:limit]:\n"
+        "        await page.goto(post)\n"
+        "        await page.locator('.comment').inner_text()\n"
     )
     steps = derive_code_block_steps(code)
     assert [s["action_type"] for s in steps] == ["goto_url", "extract", "goto_url", "extract"]
     descriptions = [s["description"] for s in steps]
-    assert descriptions == [
-        "Open https://example.com/",
-        "Extract the URLs of the top posts",
-        "Open each post",
-        "Extract the top comment on the post",
-    ]
+    assert descriptions[0] == "Open https://example.com/"
+    assert descriptions[2] == "Open each post"
     # The follow-up navigation must be distinguishable from the first, not a repeated label.
     assert descriptions[0] != descriptions[2]
+
+
+def test_page_extract_is_not_a_code_block_step():
+    # Code blocks run raw Playwright; page.extract is not part of the surface and
+    # must not render a step in the editor preview.
+    code = "async def run(page):\n    data = await page.extract(prompt='Extract the product names')\n"
+    assert derive_code_block_steps(code) == []
 
 
 def test_goto_with_non_literal_url_outside_a_loop_describes_a_linked_page():
@@ -437,20 +404,6 @@ def test_dom_reads_separated_by_an_action_are_distinct_steps():
     )
     steps = derive_code_block_steps(code)
     assert [s["action_type"] for s in steps] == ["extract", "click", "extract"]
-
-
-def test_explicit_extract_prompt_is_preserved_alongside_raw_reads():
-    # page.extract() carries the author's reader-facing prompt; consolidating raw
-    # reads must never merge into it and clobber that copy.
-    code = (
-        "async def run(page):\n"
-        "    data = await page.extract(prompt='Extract the product names')\n"
-        "    extra = await page.locator('#x').text_content()\n"
-    )
-    steps = derive_code_block_steps(code)
-    assert [s["action_type"] for s in steps] == ["extract", "extract"]
-    assert steps[0]["description"] == "Extract the product names"
-    assert steps[1]["description"] == "Extract information from the page"
 
 
 def test_control_flow_reads_do_not_fabricate_an_extraction_step():

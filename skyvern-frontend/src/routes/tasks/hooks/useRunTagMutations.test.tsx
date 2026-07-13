@@ -5,8 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { mockDelete, mockPost } = vi.hoisted(() => ({
-  mockDelete: vi.fn(),
+const { mockPost } = vi.hoisted(() => ({
   mockPost: vi.fn(),
 }));
 
@@ -15,15 +14,12 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
-  getClient: () => Promise.resolve({ delete: mockDelete, post: mockPost }),
+  getClient: () => Promise.resolve({ post: mockPost }),
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
-import {
-  useApplyRunTagsMutation,
-  useDeleteRunTagMutation,
-} from "./useRunTagMutations";
+import { useApplyRunTagsMutation } from "./useRunTagMutations";
 
 function createWrapper() {
   const queryClient = new QueryClient({
@@ -74,29 +70,6 @@ describe("useRunTagMutations", () => {
       tags_to_delete: [{ value: "old" }],
       colors: { env: "green" },
     });
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["run-tags"],
-    });
-    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["runs"] });
-    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
-  });
-
-  it("deletes a grouped tag by key from the run tag endpoint", async () => {
-    mockDelete.mockResolvedValue({ data: {} });
-    const { invalidateQueries, wrapper } = createWrapper();
-    const { result } = renderHook(() => useDeleteRunTagMutation(), {
-      wrapper,
-    });
-
-    act(() => {
-      result.current.mutate({
-        workflowRunId: "wr_1",
-        key: "customer/tier",
-      });
-    });
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(mockDelete).toHaveBeenCalledWith("/runs/wr_1/tags/customer%2Ftier");
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: ["run-tags"],
     });

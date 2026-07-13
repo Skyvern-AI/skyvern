@@ -48,6 +48,7 @@ import {
 } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
+import { ResizableTimelineSplit } from "./workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "./workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
@@ -97,43 +98,48 @@ function WorkflowRunRightColumn({
   onSetActiveIteration: (loopBlockId: string, iterationIndex: number) => void;
 }) {
   return (
-    <div className="grid min-h-0 w-[clamp(28rem,34vw,36rem)] shrink-0 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
-      <div className="min-h-0 w-full overflow-hidden">
-        <WorkflowRunTimeline
-          activeItem={activeItem}
-          activeIteration={activeIteration}
-          onActionItemSelected={(item) => {
-            onSetActiveItem(item.action.action_id);
-          }}
-          onBlockItemSelected={(item) => {
-            onSetActiveItem(item.workflow_run_block_id);
-          }}
-          onThoughtItemSelected={(item) => {
-            onSetActiveItem(item.thought_id);
-          }}
-          onLiveStreamSelected={() => {
-            onSetActiveItem("stream");
-          }}
-          onIterationSelected={(loopBlock, iterationIndex) => {
-            onSetActiveIteration(
-              loopBlock.workflow_run_block_id,
-              iterationIndex,
-            );
-          }}
-        />
-      </div>
-      <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
-        <WorkflowRunBlockDetail
-          activeItem={activeItem}
-          activeIteration={activeIteration}
-          timeline={timeline}
-          timelineReady={timelineReady}
-          onThoughtSelect={(thought) => {
-            onSetActiveItem(thought.thought_id);
-          }}
-        />
-      </div>
-    </div>
+    <ResizableTimelineSplit
+      className="w-[clamp(28rem,34vw,36rem)] shrink-0"
+      top={
+        <div className="min-h-0 w-full overflow-hidden">
+          <WorkflowRunTimeline
+            activeItem={activeItem}
+            activeIteration={activeIteration}
+            onActionItemSelected={(item) => {
+              onSetActiveItem(item.action.action_id);
+            }}
+            onBlockItemSelected={(item) => {
+              onSetActiveItem(item.workflow_run_block_id);
+            }}
+            onThoughtItemSelected={(item) => {
+              onSetActiveItem(item.thought_id);
+            }}
+            onLiveStreamSelected={() => {
+              onSetActiveItem("stream");
+            }}
+            onIterationSelected={(loopBlock, iterationIndex) => {
+              onSetActiveIteration(
+                loopBlock.workflow_run_block_id,
+                iterationIndex,
+              );
+            }}
+          />
+        </div>
+      }
+      bottom={
+        <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
+          <WorkflowRunBlockDetail
+            activeItem={activeItem}
+            activeIteration={activeIteration}
+            timeline={timeline}
+            timelineReady={timelineReady}
+            onThoughtSelect={(thought) => {
+              onSetActiveItem(thought.thought_id);
+            }}
+          />
+        </div>
+      }
+    />
   );
 }
 

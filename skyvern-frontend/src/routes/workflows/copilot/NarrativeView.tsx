@@ -1,8 +1,17 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 
+import { buildRevealOffsets, revealedCountAt } from "./actionReveal";
+import { humanizeBlockLabel } from "./blockLabel";
+import {
+  CopilotPhaseId,
+  PhaseStatus,
+  derivePhases,
+  showPhaseChecklist,
+} from "./copilotPhases";
 import {
   ActivityEntry,
   BlockState,
+  RecordedActionSummary,
   TurnNarrativeState,
   TurnSummary,
   computeTurnSummary,
@@ -13,6 +22,11 @@ import {
   parseUtcIsoMs,
   toolActivityDisplayLabel,
 } from "./narrativeState";
+import { useShimmerText } from "../workflowRun/useShimmerText";
+
+// Row flashes green/red for 600ms once revealed — must match the tailwind
+// copilot-row-flash-* animation duration.
+const FLASH_WINDOW_MS = 600;
 
 interface BlockPalette {
   fg: string;
@@ -188,22 +202,68 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
   );
 }
 
-function useSecondTick(active: boolean): void {
+function useTick(active: boolean, intervalMs = 1000): void {
   const [, setTick] = useState(0);
   useEffect(() => {
     if (!active) return;
-    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    const id = setInterval(() => setTick((t) => t + 1), intervalMs);
     return () => clearInterval(id);
-  }, [active]);
+  }, [active, intervalMs]);
+}
+
+function FRecordedActionRow({
+  action,
+  revealing,
+  flash,
+}: {
+  action: RecordedActionSummary;
+  revealing: boolean;
+  flash: boolean;
+}) {
+  const shimmerRef = useShimmerText<HTMLSpanElement>(revealing);
+  if (revealing) {
+    return (
+      <FSubRow glyph={<Spinner small />} glyphClass="text-blue-300">
+        <span ref={shimmerRef} className="text-slate-200">
+          {action.label}
+        </span>
+        {action.summary ? (
+          <span className="text-slate-500"> · {action.summary}</span>
+        ) : null}
+      </FSubRow>
+    );
+  }
+  const flashClass = flash
+    ? action.failed
+      ? "animate-copilot-row-flash-error"
+      : "animate-copilot-row-flash-success"
+    : "";
+  return (
+    <FSubRow
+      glyph={action.failed ? "✕" : "✓"}
+      glyphClass={action.failed ? "text-rose-300" : "text-emerald-300"}
+    >
+      <span
+        className={`${action.failed ? "text-rose-200" : "text-slate-200"} ${flashClass}`}
+      >
+        {action.label}
+      </span>
+      {action.summary ? (
+        <span className="text-slate-500"> · {action.summary}</span>
+      ) : null}
+    </FSubRow>
+  );
 }
 
 interface FBlockRunProps {
   block: BlockState;
   turnEnded: boolean;
   onSelect?: (label: string) => void;
+  uxV1?: boolean;
 }
 
-function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
+function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
+  const displayLabel = uxV1 ? humanizeBlockLabel(block.label) : block.label;
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
@@ -247,11 +307,41 @@ function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
           ? "bg-rose-500/15"
           : "bg-slate-elevation3";
 
+  const recordedActions = block.recordedActions;
+  const hasActions =
+    recordedActions !== undefined && recordedActions.length > 0;
+  const durations = useMemo(
+    () => (recordedActions ?? []).map((a) => a.durationMs),
+    [recordedActions],
+  );
+  const offsets = useMemo(() => buildRevealOffsets(durations), [durations]);
+  const totalMs = offsets.length > 0 ? offsets[offsets.length - 1]! : 0;
+  // Time-derived, not timer-chained: recomputed from wall-clock time on
+  // every render/tick so collapse, remount, and StrictMode double-invoke
+  // can never restart or duplicate the reveal.
+  const elapsedReveal = hasActions
+    ? Date.now() - (block.recordedActionsAt ?? 0)
+    : 0;
+  const revealedCount = hasActions
+    ? revealedCountAt(offsets, elapsedReveal)
+    : 0;
+  const replayingAction =
+    hasActions && elapsedReveal >= 0 && revealedCount < recordedActions!.length;
+  const visibleActionCount = !hasActions
+    ? 0
+    : elapsedReveal < 0
+      ? 0
+      : Math.min(
+          revealedCount + (replayingAction ? 1 : 0),
+          recordedActions!.length,
+        );
+
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const defaultOpen = isRunning || isFail;
+  const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
   const open = userOpen === null ? defaultOpen : userOpen;
   const toggleable = isOk || isOutcomeNotShown || isVerifying || isRanNeutral;
-  useSecondTick(isRunning);
+  useTick(isRunning);
+  useTick(hasActions && (replayingAction || elapsedReveal < totalMs), 150);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
   const statusText = isOk
@@ -303,8 +393,15 @@ function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
         </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-            <span className="font-mono text-[12.5px] font-semibold text-slate-100">
-              {block.label}
+            <span
+              className={
+                uxV1
+                  ? "text-[12.5px] font-semibold text-slate-100"
+                  : "font-mono text-[12.5px] font-semibold text-slate-100"
+              }
+              title={uxV1 ? block.label : undefined}
+            >
+              {displayLabel}
             </span>
             <span className="text-[11px] text-slate-500">·</span>
             <span className={`font-mono text-[11px] font-medium ${accentText}`}>
@@ -354,6 +451,21 @@ function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
           {block.activity.map((entry) => (
             <ActivityRow key={entry.id} entry={entry} />
           ))}
+          {hasActions
+            ? recordedActions!
+                .slice(0, visibleActionCount)
+                .map((action, i) => (
+                  <FRecordedActionRow
+                    key={action.actionId}
+                    action={action}
+                    revealing={replayingAction && i === revealedCount}
+                    flash={
+                      i < revealedCount &&
+                      elapsedReveal - offsets[i]! < FLASH_WINDOW_MS
+                    }
+                  />
+                ))
+            : null}
           {isFail ? (
             <div className="mt-1 flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
               <span className="text-[11px] font-bold text-rose-300">✕</span>
@@ -382,9 +494,10 @@ interface FDesignRowProps {
   done: boolean;
   blockLabels: string[];
   activity: ActivityEntry[];
+  uxV1?: boolean;
 }
 
-function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
+function FDesignRow({ done, blockLabels, activity, uxV1 }: FDesignRowProps) {
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen === null ? !done : userOpen;
   const drafts = blockLabels.length;
@@ -445,11 +558,269 @@ function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
           {blockLabels.map((label) => (
             <FSubRow key={label} glyph="✦" glyphClass="text-emerald-300">
               <span className="text-slate-400">Drafted </span>
-              <span className="font-mono text-slate-100">{label}</span>
+              <span
+                className={uxV1 ? "text-slate-100" : "font-mono text-slate-100"}
+                title={uxV1 ? label : undefined}
+              >
+                {uxV1 ? humanizeBlockLabel(label) : label}
+              </span>
             </FSubRow>
           ))}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function FWorkingHeader() {
+  return (
+    <div className="flex items-center gap-2 px-1 py-1">
+      <Spinner />
+      <span className="text-[12.5px] font-semibold text-slate-100">
+        Working…
+      </span>
+      <span className="text-[11px] text-slate-400">
+        · building your workflow
+      </span>
+    </div>
+  );
+}
+
+function phaseGlyph(status: PhaseStatus): ReactNode {
+  switch (status) {
+    case "done":
+      return "✓";
+    case "fail":
+      return "✕";
+    case "active":
+      return <Spinner />;
+    default:
+      return "○";
+  }
+}
+
+function phasePuckClasses(status: PhaseStatus): string {
+  switch (status) {
+    case "done":
+      return "border-emerald-400/60 bg-emerald-500/15 text-emerald-300";
+    case "fail":
+      return "border-rose-400/60 bg-rose-500/15 text-rose-300";
+    case "active":
+      return "border-blue-400/60 bg-blue-500/15 text-blue-300";
+    default:
+      return "border-slate-500/60 bg-slate-elevation3 text-slate-600";
+  }
+}
+
+function phaseLabelClasses(status: PhaseStatus): string {
+  switch (status) {
+    case "active":
+      return "font-semibold text-slate-100";
+    case "fail":
+      return "text-rose-300";
+    case "pending":
+    case "notrun":
+      return "text-slate-500";
+    default:
+      return "text-slate-400";
+  }
+}
+
+// Status is otherwise conveyed only via an aria-hidden glyph/color — this
+// gives screen-reader users the same information as sighted users.
+function phaseStatusWord(status: PhaseStatus): string {
+  switch (status) {
+    case "active":
+      return "Active";
+    case "done":
+      return "Done";
+    case "fail":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+    case "notrun":
+      return "Not run";
+    default:
+      return "Pending";
+  }
+}
+
+// While Draft is active its stream is necessarily empty (the LLM is writing
+// code, no frames arrive) — one shimmered placeholder row fills that gap,
+// naming the redraft iteration once a prior verify failed.
+function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
+  const shimmerRef = useShimmerText<HTMLSpanElement>(true);
+  const priorFailedVerdict =
+    turn.lastRunOutcome?.verdict === "not_demonstrated" ||
+    turn.lastRunOutcome?.verdict === "not_evaluated";
+  const text = priorFailedVerdict
+    ? `Draft v${turn.authoringCount + 1} — revising after failed verify: ${
+        turn.lastRunOutcome?.displayReason ?? "outcome not confirmed"
+      }`
+    : "Writing the workflow code…";
+  return (
+    <FSubRow glyph="▸" glyphClass="text-slate-400">
+      <span
+        ref={shimmerRef}
+        title={text}
+        className="block truncate text-slate-400"
+      >
+        {text}
+      </span>
+    </FSubRow>
+  );
+}
+
+interface FPhaseChecklistProps {
+  turn: TurnNarrativeState;
+  turnEnded: boolean;
+  onBlockSelect?: (label: string) => void;
+  uxV1?: boolean;
+}
+
+function FPhaseChecklist({
+  turn,
+  turnEnded,
+  onBlockSelect,
+  uxV1,
+}: FPhaseChecklistProps) {
+  const rows = useMemo(() => derivePhases(turn), [turn]);
+  const [openPhases, setOpenPhases] = useState<Set<CopilotPhaseId>>(
+    () => new Set(),
+  );
+
+  return (
+    <div className="flex flex-col">
+      {rows.map((row) => {
+        const isActive = row.status === "active";
+        const hasNest =
+          row.id === "draft"
+            ? row.entries.length > 0 ||
+              (turn.draft?.blockLabels.length ?? 0) > 0 ||
+              isActive
+            : row.id === "test"
+              ? row.entries.length > 0 || turn.blocks.length > 0
+              : row.entries.length > 0;
+        const open = isActive || openPhases.has(row.id);
+        const toggleable = hasNest && !isActive;
+        const rowContent = (
+          <>
+            <span
+              className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-bold ${phasePuckClasses(
+                row.status,
+              )}`}
+              aria-hidden="true"
+            >
+              {phaseGlyph(row.status)}
+            </span>
+            <span
+              className={`flex-1 text-[12.5px] ${phaseLabelClasses(row.status)}`}
+            >
+              {row.label}
+              <span className="sr-only"> · {phaseStatusWord(row.status)}</span>
+            </span>
+            {row.stub ? (
+              <span
+                className={`text-[11px] tabular-nums ${
+                  row.status === "fail" ? "text-rose-400" : "text-slate-500"
+                }`}
+              >
+                {row.stub}
+              </span>
+            ) : null}
+            {hasNest ? (
+              <span
+                className={`shrink-0 text-[12px] text-slate-500 transition-transform ${
+                  open ? "rotate-90" : ""
+                }`}
+                aria-hidden="true"
+              >
+                ›
+              </span>
+            ) : null}
+          </>
+        );
+        const toggle = () =>
+          setOpenPhases((prev) => {
+            const next = new Set(prev);
+            if (next.has(row.id)) {
+              next.delete(row.id);
+            } else {
+              next.add(row.id);
+            }
+            return next;
+          });
+
+        return (
+          <div key={row.id} className="flex flex-col">
+            {toggleable ? (
+              <button
+                type="button"
+                aria-expanded={open}
+                onClick={toggle}
+                className="flex w-full cursor-pointer items-center gap-3 px-1 py-1 text-left"
+              >
+                {rowContent}
+              </button>
+            ) : (
+              // Active rows render inert (a button whose click is a no-op
+              // would be a keyboard/screen-reader trap) — status is
+              // conveyed via the sr-only word in rowContent instead.
+              <div className="flex w-full items-center gap-3 px-1 py-1 text-left">
+                {rowContent}
+              </div>
+            )}
+            {open ? (
+              <div className="ml-[25px] flex flex-col gap-1.5 rounded-lg border border-slate-700/60 bg-slate-elevation1 px-3 py-2">
+                {row.id === "draft" ? (
+                  <>
+                    {row.entries.map((entry) => (
+                      <ActivityRow key={entry.id} entry={entry} />
+                    ))}
+                    {(turn.draft?.blockLabels ?? []).map((label) => (
+                      <FSubRow
+                        key={label}
+                        glyph="✦"
+                        glyphClass="text-emerald-300"
+                      >
+                        <span className="text-slate-400">Drafted </span>
+                        <span
+                          className={
+                            uxV1 ? "text-slate-100" : "font-mono text-slate-100"
+                          }
+                          title={uxV1 ? label : undefined}
+                        >
+                          {uxV1 ? humanizeBlockLabel(label) : label}
+                        </span>
+                      </FSubRow>
+                    ))}
+                    {isActive ? <DraftPlaceholderNote turn={turn} /> : null}
+                  </>
+                ) : row.id === "test" ? (
+                  <>
+                    {row.entries.map((entry) => (
+                      <ActivityRow key={entry.id} entry={entry} />
+                    ))}
+                    {turn.blocks.map((b) => (
+                      <FBlockRun
+                        key={b.workflowRunBlockId || b.label}
+                        block={b}
+                        turnEnded={turnEnded}
+                        onSelect={onBlockSelect}
+                        uxV1={uxV1}
+                      />
+                    ))}
+                  </>
+                ) : (
+                  row.entries.map((entry) => (
+                    <ActivityRow key={entry.id} entry={entry} />
+                  ))
+                )}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -516,15 +887,24 @@ interface RollupCardProps {
   turn: TurnNarrativeState;
   summary: TurnSummary;
   onExpand: () => void;
+  onBlockSelect?: (label: string) => void;
+  uxV1?: boolean;
 }
 
-function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
+function RollupCard({
+  turn,
+  summary,
+  onExpand,
+  onBlockSelect,
+  uxV1,
+}: RollupCardProps) {
   const closing =
     turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const completed = rollupBlocks.filter((b) => isBlockOk(b));
   const failed = rollupBlocks.filter((b) => b.state === "failed");
   const showCommit = !summary.isQA && completed.length > 0;
+  const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
 
   return (
     <div className="overflow-hidden rounded-xl border border-slate-700/60 bg-slate-elevation2">
@@ -547,6 +927,17 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
         }
       />
 
+      {showChecklist ? (
+        <div className="border-t border-white/5 px-3.5 py-2">
+          <FPhaseChecklist
+            turn={turn}
+            turnEnded
+            onBlockSelect={onBlockSelect}
+            uxV1={uxV1}
+          />
+        </div>
+      ) : null}
+
       {showCommit ? (
         <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
           <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-slate-500">
@@ -566,8 +957,15 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
                   >
                     {palette.glyph}
                   </span>
-                  <span className="font-mono text-[11px] text-slate-400">
-                    {b.label}
+                  <span
+                    className={
+                      uxV1
+                        ? "text-[11px] text-slate-400"
+                        : "font-mono text-[11px] text-slate-400"
+                    }
+                    title={uxV1 ? b.label : undefined}
+                  >
+                    {uxV1 ? humanizeBlockLabel(b.label) : b.label}
                   </span>
                   <span className="text-slate-600">·</span>
                   <span className="text-[11.5px] text-slate-200">
@@ -597,8 +995,15 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
                 >
                   ✕
                 </span>
-                <span className="font-mono text-[11px] text-rose-300/80">
-                  {b.label}
+                <span
+                  className={
+                    uxV1
+                      ? "text-[11px] text-rose-300/80"
+                      : "font-mono text-[11px] text-rose-300/80"
+                  }
+                  title={uxV1 ? b.label : undefined}
+                >
+                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
                 </span>
               </li>
             ))}
@@ -613,9 +1018,15 @@ interface DetailViewProps {
   turn: TurnNarrativeState;
   onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
+  uxV1?: boolean;
 }
 
-function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
+function DetailView({
+  turn,
+  onCollapse,
+  onBlockSelect,
+  uxV1,
+}: DetailViewProps) {
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -625,6 +1036,7 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
   // long design phase isn't silently invisible.
   const hasDraft = (turn.draft?.blockCount ?? 0) > 0;
   const showDesign = designStarted && (hasDraft || hasBlocks || !turn.terminal);
+  const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
   const preBlockNarration = turn.designActivity.filter(
     (e) => e.kind === "narration",
   );
@@ -645,11 +1057,22 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
         </button>
       ) : null}
 
-      {showDesign ? (
+      {showChecklist ? (
+        <>
+          {turn.terminal === null ? <FWorkingHeader /> : null}
+          <FPhaseChecklist
+            turn={turn}
+            turnEnded={turn.terminal !== null}
+            onBlockSelect={onBlockSelect}
+            uxV1={uxV1}
+          />
+        </>
+      ) : showDesign ? (
         <FDesignRow
           done={!designOpen}
           blockLabels={turn.draft?.blockLabels ?? []}
           activity={turn.designActivity}
+          uxV1={uxV1}
         />
       ) : preBlockNarration.length > 0 ? (
         preBlockNarration.map((e) => (
@@ -657,7 +1080,7 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
         ))
       ) : null}
 
-      {hasBlocks ? (
+      {!showChecklist && hasBlocks ? (
         <div className="flex flex-col gap-1">
           {turn.blocks.map((b) => (
             <FBlockRun
@@ -665,6 +1088,7 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
               block={b}
               turnEnded={turn.terminal !== null}
               onSelect={onBlockSelect}
+              uxV1={uxV1}
             />
           ))}
         </div>
@@ -691,10 +1115,18 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
 interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
+  uxV1?: boolean;
 }
 
-export function NarrativeView({ turn, onBlockSelect }: NarrativeViewProps) {
-  const summary = useMemo(() => computeTurnSummary(turn), [turn]);
+export function NarrativeView({
+  turn,
+  onBlockSelect,
+  uxV1,
+}: NarrativeViewProps) {
+  const summary = useMemo(
+    () => computeTurnSummary(turn, { uxV1 }),
+    [turn, uxV1],
+  );
   const isInFlight = turn.terminal === null;
   const isComplete = !isInFlight;
   const [userRolled, setUserRolled] = useState<boolean | null>(null);
@@ -706,6 +1138,8 @@ export function NarrativeView({ turn, onBlockSelect }: NarrativeViewProps) {
         turn={turn}
         summary={summary}
         onExpand={() => setUserRolled(false)}
+        onBlockSelect={onBlockSelect}
+        uxV1={uxV1}
       />
     );
   }
@@ -715,6 +1149,7 @@ export function NarrativeView({ turn, onBlockSelect }: NarrativeViewProps) {
       turn={turn}
       onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
+      uxV1={uxV1}
     />
   );
 }

@@ -8,7 +8,7 @@ function useShimmerText<T extends HTMLElement = HTMLElement>(active: boolean) {
   }, []);
 
   useEffect(() => {
-    if (!active || !element) return;
+    if (!active || !element || typeof element.animate !== "function") return;
 
     // Apply static styles for background-clip: text
     element.style.background =

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 import structlog
 from sqlalchemy import Exists, and_, exists, func, select, text, update
@@ -20,14 +21,23 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunTagEventModel,
     WorkflowTagEventModel,
 )
-from skyvern.forge.sdk.workflow.models.tags import TagEventType, TagWriteContext
-from skyvern.forge.sdk.workflow.models.validators import RUN_METADATA_MAX_KEYS, random_tag_color
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagEventType, TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.validators import (
+    RUN_METADATA_MAX_KEYS,
+    is_reserved_tag_key,
+    normalize_optional_system_tag_key,
+    normalize_tag_value,
+    random_tag_color,
+)
 
 LOG = structlog.get_logger()
 
 # Aliased to RUN_METADATA_MAX_KEYS so tag and run_metadata caps stay coupled.
 MAX_TAGS_PER_WORKFLOW = RUN_METADATA_MAX_KEYS
 MAX_TAGS_PER_RUN = RUN_METADATA_MAX_KEYS
+MAX_SYSTEM_TAGS_PER_WORKFLOW = RUN_METADATA_MAX_KEYS
+MAX_SYSTEM_TAGS_PER_RUN = RUN_METADATA_MAX_KEYS
+SYSTEM_TAG_CALLER_ID = "system"
 
 
 class TagCountLimitExceeded(ValueError):
@@ -62,6 +72,18 @@ class TagValueRenameResult:
 
 
 @dataclass(frozen=True)
+class TagDeleteCascadeResult:
+    """Exact rows superseded by a registry delete cascade."""
+
+    removed_from_workflow_count: int
+    removed_from_run_count: int
+
+    @property
+    def removed_count(self) -> int:
+        return self.removed_from_workflow_count + self.removed_from_run_count
+
+
+@dataclass(frozen=True)
 class TagChange:
     """One concrete state change derived from a caller's set/delete request.
     ``key`` is None for a standalone label (identified by its value)."""
@@ -70,6 +92,28 @@ class TagChange:
     new_value: str | None
     event_type: TagEventType
     superseded_event_id: str | None
+
+
+def _normalize_required_system_tag_key(key: object) -> str:
+    normalized = normalize_optional_system_tag_key(key)
+    if normalized is None:
+        raise ValueError("system tag keys must be non-empty")
+    return normalized
+
+
+def _normalize_system_tag_sets(sets: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, value in sets.items():
+        normalized_key = _normalize_required_system_tag_key(key)
+        normalized_value = normalize_tag_value(value)
+        if normalized_value == "*":
+            raise ValueError("system tag values must not be exactly '*'")
+        normalized[normalized_key] = normalized_value
+    return normalized
+
+
+def _normalize_system_tag_deletes(deletes: set[str]) -> set[str]:
+    return {_normalize_required_system_tag_key(key) for key in deletes}
 
 
 class TagsRepository(BaseRepository):
@@ -104,6 +148,7 @@ class TagsRepository(BaseRepository):
             label_deletes=label_deletes,
             colors=colors,
             max_tags=MAX_TAGS_PER_WORKFLOW,
+            max_system_tags=MAX_SYSTEM_TAGS_PER_WORKFLOW,
         )
 
     @db_operation("apply_run_tag_changes")
@@ -132,6 +177,47 @@ class TagsRepository(BaseRepository):
             label_deletes=label_deletes,
             colors=colors,
             max_tags=MAX_TAGS_PER_RUN,
+            max_system_tags=MAX_SYSTEM_TAGS_PER_RUN,
+        )
+
+    @db_operation("apply_system_run_tag_changes")
+    async def apply_system_run_tag_changes(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        sets: dict[str, str],
+        caller_id: str = SYSTEM_TAG_CALLER_ID,
+        deletes: set[str] | None = None,
+        set_at: datetime | None = None,
+    ) -> list[TagChange]:
+        """Write Skyvern-owned run tags in the reserved namespace.
+
+        Public API schemas reject ``skyvern.*`` keys. Internal writers should use
+        this helper so provenance is always ``source=system`` and
+        ``caller_type=system``.
+        """
+        normalized_sets = _normalize_system_tag_sets(sets)
+        normalized_deletes = _normalize_system_tag_deletes(deletes or set())
+        context = TagWriteContext(
+            caller_id=caller_id,
+            source=TagSource.SYSTEM,
+            caller_type=CallerType.SYSTEM,
+            set_at=set_at,
+        )
+        return await self._apply_tag_changes(
+            event_model=WorkflowRunTagEventModel,
+            entity_id_name="workflow_run_id",
+            entity_id=workflow_run_id,
+            entity_label="workflow run",
+            organization_id=organization_id,
+            sets=normalized_sets,
+            deletes=normalized_deletes,
+            context=context,
+            label_sets=None,
+            label_deletes=None,
+            colors=None,
+            max_tags=MAX_TAGS_PER_RUN,
+            max_system_tags=MAX_SYSTEM_TAGS_PER_RUN,
         )
 
     async def _apply_tag_changes(
@@ -149,6 +235,7 @@ class TagsRepository(BaseRepository):
         label_deletes: list[str] | None,
         colors: dict[str, str] | None,
         max_tags: int,
+        max_system_tags: int,
     ) -> list[TagChange]:
         label_sets = label_sets or []
         label_deletes = label_deletes or []
@@ -156,10 +243,12 @@ class TagsRepository(BaseRepository):
         label_set_values = set(label_sets)
         effective_deletes = {k for k in deletes if k not in sets}
         effective_label_deletes = {v for v in label_deletes if v not in label_set_values}
-        if not sets and not effective_deletes and not label_set_values and not effective_label_deletes:
+        has_changes = bool(sets or effective_deletes or label_set_values or effective_label_deletes)
+        reserved_keys = {key for key in set(sets.keys()) | effective_deletes if is_reserved_tag_key(key)}
+        if reserved_keys and context.source != TagSource.SYSTEM:
+            raise ValueError("reserved skyvern.* tag keys can only be written with system provenance")
+        if event_model is not WorkflowRunTagEventModel and not has_changes:
             return []
-
-        now = datetime.now(timezone.utc)
 
         async with self.Session() as session:
             if event_model is WorkflowRunTagEventModel:
@@ -168,6 +257,10 @@ class TagsRepository(BaseRepository):
                     workflow_run_id=entity_id,
                     organization_id=organization_id,
                 )
+            if not has_changes:
+                return []
+
+            now = context.set_at or datetime.now(timezone.utc)
 
             active_rows = await self._get_active_set_rows_for_entity(
                 session,
@@ -184,10 +277,18 @@ class TagsRepository(BaseRepository):
             # partial UNIQUEs catch only same-identity races. Cap is a UX rule.
             projected_grouped = (set(grouped_current.keys()) | set(sets.keys())) - effective_deletes
             projected_labels = (set(label_current.keys()) | label_set_values) - effective_label_deletes
-            projected_total = len(projected_grouped) + len(projected_labels)
-            if projected_total > max_tags:
+            projected_system_grouped = {key for key in projected_grouped if is_reserved_tag_key(key)}
+            projected_user_grouped = projected_grouped - projected_system_grouped
+            projected_user_total = len(projected_user_grouped) + len(projected_labels)
+            if projected_user_total > max_tags:
                 raise TagCountLimitExceeded(
-                    f"{entity_label} {entity_id} would have {projected_total} tags; max is {max_tags}"
+                    f"{entity_label} {entity_id} would have {projected_user_total} user-writable tags; "
+                    f"max is {max_tags}"
+                )
+            if len(projected_system_grouped) > max_system_tags:
+                raise TagCountLimitExceeded(
+                    f"{entity_label} {entity_id} would have {len(projected_system_grouped)} system tags; "
+                    f"max is {max_system_tags}"
                 )
 
             changes: list[TagChange] = []
@@ -675,7 +776,7 @@ class TagsRepository(BaseRepository):
             return list(result.scalars().all())
 
     @db_operation("list_tag_values")
-    async def list_tag_values(self, organization_id: str) -> list[TagValueModel]:
+    async def list_tag_values(self, organization_id: str, key: str | None = None) -> list[TagValueModel]:
         """Active (key, value, color) registry entries for the org, ordered by key
         then value. The frontend joins these onto tags by (key, value) the same way
         it joins descriptions onto keys."""
@@ -684,8 +785,10 @@ class TagsRepository(BaseRepository):
                 select(TagValueModel)
                 .where(TagValueModel.organization_id == organization_id)
                 .where(TagValueModel.deleted_at.is_(None))
-                .order_by(TagValueModel.key.asc(), TagValueModel.value.asc())
             )
+            if key is not None:
+                stmt = stmt.where(TagValueModel.key == key)
+            stmt = stmt.order_by(TagValueModel.key.asc(), TagValueModel.value.asc())
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
@@ -873,6 +976,51 @@ class TagsRepository(BaseRepository):
             )
             return (await session.execute(stmt)).scalar_one()
 
+    @db_operation("count_active_workflows_for_key")
+    async def count_active_workflows_for_key(self, organization_id: str, key: str) -> int:
+        """Number of non-deleted workflows with an active SET on grouped ``key``."""
+        async with self.Session() as session:
+            stmt = select(func.count(func.distinct(WorkflowTagEventModel.workflow_permanent_id))).where(
+                and_(
+                    WorkflowTagEventModel.organization_id == organization_id,
+                    WorkflowTagEventModel.key == key,
+                    WorkflowTagEventModel.superseded_at.is_(None),
+                    WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                    WorkflowTagEventModel.deleted_at.is_(None),
+                    self._non_deleted_workflow_exists(organization_id),
+                )
+            )
+            return (await session.execute(stmt)).scalar_one()
+
+    @db_operation("count_active_runs_for_key")
+    async def count_active_runs_for_key(self, organization_id: str, key: str) -> int:
+        """Number of workflow runs with an active SET on grouped ``key``."""
+        async with self.Session() as session:
+            stmt = select(func.count(func.distinct(WorkflowRunTagEventModel.workflow_run_id))).where(
+                and_(
+                    WorkflowRunTagEventModel.organization_id == organization_id,
+                    WorkflowRunTagEventModel.key == key,
+                    WorkflowRunTagEventModel.superseded_at.is_(None),
+                    WorkflowRunTagEventModel.event_type == TagEventType.SET.value,
+                )
+            )
+            return (await session.execute(stmt)).scalar_one()
+
+    @db_operation("count_active_runs_for_value")
+    async def count_active_runs_for_value(self, organization_id: str, key: str, value: str) -> int:
+        """Number of workflow runs with an active SET on grouped ``(key, value)``."""
+        async with self.Session() as session:
+            stmt = select(func.count(func.distinct(WorkflowRunTagEventModel.workflow_run_id))).where(
+                and_(
+                    WorkflowRunTagEventModel.organization_id == organization_id,
+                    WorkflowRunTagEventModel.key == key,
+                    WorkflowRunTagEventModel.value == value,
+                    WorkflowRunTagEventModel.superseded_at.is_(None),
+                    WorkflowRunTagEventModel.event_type == TagEventType.SET.value,
+                )
+            )
+            return (await session.execute(stmt)).scalar_one()
+
     async def _soft_delete_tag_value_rows(
         self,
         session: AsyncSession,
@@ -904,6 +1052,7 @@ class TagsRepository(BaseRepository):
         organization_id: str,
         key: str,
         value: str | None = None,
+        soft_delete_column: Any | None = None,
     ) -> list[WorkflowTagEventModel] | list[WorkflowRunTagEventModel]:
         filters = [
             event_model.organization_id == organization_id,
@@ -913,9 +1062,8 @@ class TagsRepository(BaseRepository):
         ]
         if value is not None:
             filters.append(event_model.value == value)
-        deleted_at = getattr(event_model, "deleted_at", None)
-        if deleted_at is not None:
-            filters.append(deleted_at.is_(None))
+        if soft_delete_column is not None:
+            filters.append(soft_delete_column.is_(None))
 
         result = await session.execute(select(event_model).where(and_(*filters)))
         return list(result.scalars().all())
@@ -956,11 +1104,11 @@ class TagsRepository(BaseRepository):
         organization_id: str,
         key: str,
         context: TagWriteContext,
-    ) -> int | None:
+    ) -> TagDeleteCascadeResult | None:
         """Cascade-delete a tag key: write a DELETE event for every workflow that
         currently has it, then soft-delete the key registry row and its value color
-        rows (so GET /tag-values stops returning colors for the removed key). Returns the number
-        of workflows the tag was removed from, or None when the key is not
+        rows (so GET /tag-values stops returning colors for the removed key). Returns exact workflow/run
+        counts removed by the transaction, or None when the key is not
         registered (caller should 404). Idempotent: a second call returns None.
 
         DELETE events don't match the SET-only partial UNIQUE, so superseding the
@@ -1002,6 +1150,7 @@ class TagsRepository(BaseRepository):
                 event_model=WorkflowTagEventModel,
                 organization_id=organization_id,
                 key=key,
+                soft_delete_column=WorkflowTagEventModel.deleted_at,
             )
             active_run_sets = await self._get_active_grouped_set_rows(
                 session,
@@ -1038,7 +1187,10 @@ class TagsRepository(BaseRepository):
             key_row.deleted_at = now
             await self._soft_delete_tag_value_rows(session, organization_id=organization_id, key=key, now=now)
             await session.commit()
-            return len(active_sets)
+            return TagDeleteCascadeResult(
+                removed_from_workflow_count=len(active_sets),
+                removed_from_run_count=len(active_run_sets),
+            )
 
     @db_operation("delete_tag_value")
     async def delete_tag_value(
@@ -1047,12 +1199,12 @@ class TagsRepository(BaseRepository):
         key: str,
         value: str,
         context: TagWriteContext,
-    ) -> int | None:
+    ) -> TagDeleteCascadeResult | None:
         """Cascade-delete a single grouped label ``(key, value)``, mirroring
         ``delete_tag_key`` at value granularity: write a DELETE event (carrying the
         value, so history records which label was removed) for every workflow with
-        an active SET on it, then soft-delete the ``(key, value)`` color row. Returns
-        the number of workflows the label was removed from, or None when neither a
+        an active SET on it, then soft-delete the ``(key, value)`` color row. Returns exact
+        workflow/run counts removed by the transaction, or None when neither a
         registered color row nor an active SET exists (caller should 404). Idempotent:
         a second call returns None; re-applying via a SET re-registers the label.
 
@@ -1080,6 +1232,7 @@ class TagsRepository(BaseRepository):
                 organization_id=organization_id,
                 key=key,
                 value=value,
+                soft_delete_column=WorkflowTagEventModel.deleted_at,
             )
             active_run_sets = await self._get_active_grouped_set_rows(
                 session,
@@ -1121,7 +1274,10 @@ class TagsRepository(BaseRepository):
                 session, organization_id=organization_id, key=key, now=now, value=value
             )
             await session.commit()
-            return len(active_sets)
+            return TagDeleteCascadeResult(
+                removed_from_workflow_count=len(active_sets),
+                removed_from_run_count=len(active_run_sets),
+            )
 
     @db_operation("rename_tag_value")
     async def rename_tag_value(

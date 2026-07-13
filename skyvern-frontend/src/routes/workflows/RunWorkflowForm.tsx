@@ -59,19 +59,24 @@ import { parseHeaderJson } from "@/util/secretHeaders";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import {
+  CredentialParameter,
   WorkflowApiResponse,
   WorkflowBlock,
   WorkflowParameter,
-  isNestedLoopWorkflowBlock,
+  WorkflowParameterTypes,
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
+import { RotatingCredentialField } from "./components/RotatingCredentialField";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
 import {
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
+import { getLoginCredentialInputs } from "./runWorkflowCredentials";
+import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
+import { visitWorkflowBlocks } from "./workflowBlockUtils";
 
 /**
  * Recursively finds all login blocks that don't have any credential parameters selected.
@@ -82,18 +87,14 @@ function getLoginBlocksWithoutCredentials(
 ): Array<{ label: string }> {
   const result: Array<{ label: string }> = [];
 
-  for (const block of blocks) {
+  visitWorkflowBlocks(blocks, (block) => {
     if (block.block_type === "login") {
       // Login block requires at least one parameter (credential) to be selected
       if (!block.parameters || block.parameters.length === 0) {
         result.push({ label: block.label });
       }
     }
-
-    if (isNestedLoopWorkflowBlock(block) && block.loop_blocks) {
-      result.push(...getLoginBlocksWithoutCredentials(block.loop_blocks));
-    }
-  }
+  });
 
   return result;
 }
@@ -191,6 +192,14 @@ function parseValuesForWorkflowRun(
   );
 }
 
+function omitUndefinedValues(
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== undefined),
+  );
+}
+
 type RunWorkflowRequestBody = {
   data: Record<string, unknown>; // workflow parameters and values
   proxy_location: ProxyLocation | null;
@@ -227,12 +236,13 @@ function getRunWorkflowRequestBody(
     parameters,
     workflowParameters,
   );
+  const data = omitUndefinedValues(parsedParameters);
 
   const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
   const bpi = browserProfileId?.trim() === "" ? null : browserProfileId;
 
   const body: RunWorkflowRequestBody = {
-    data: parsedParameters,
+    data,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
     browser_profile_id: bpi,
@@ -303,6 +313,47 @@ function deriveRunWith(
   return "agent";
 }
 
+function formatLoginBlockList(labels: Array<string>) {
+  if (labels.length <= 1) {
+    return labels[0] ?? "";
+  }
+
+  if (labels.length === 2) {
+    return `${labels[0]} and ${labels[1]}`;
+  }
+
+  const lastLabel = labels[labels.length - 1];
+  return `${labels.slice(0, -1).join(", ")}, and ${lastLabel}`;
+}
+
+function getLoginCredentialDisplayText(
+  parameter: WorkflowParameter | CredentialParameter,
+  loginBlockLabels: Array<string>,
+) {
+  const parameterLabel = parameter.description || parameter.key;
+
+  // Prefer the login block label for single-use credentials, but use the
+  // parameter label plus "Used by ..." copy when one credential is shared.
+  if (loginBlockLabels.length === 1) {
+    return {
+      title: loginBlockLabels[0] ?? parameterLabel,
+      description: parameterLabel,
+    };
+  }
+
+  if (loginBlockLabels.length === 0) {
+    return {
+      title: parameterLabel,
+      description: parameter.key,
+    };
+  }
+
+  return {
+    title: parameterLabel,
+    description: `Used by ${formatLoginBlockList(loginBlockLabels)}`,
+  };
+}
+
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
@@ -328,6 +379,34 @@ function RunWorkflowForm({
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  const loginCredentialInputs = useMemo(
+    () => getLoginCredentialInputs({ workflow, workflowParameters }),
+    [workflow, workflowParameters],
+  );
+  const { data: credentials = [] } = useCredentialsQuery({ page_size: 100 });
+  const credentialNamesById = useMemo(
+    () =>
+      new Map(
+        credentials.map((credential) => [
+          credential.credential_id,
+          credential.name,
+        ]),
+      ),
+    [credentials],
+  );
+  const loginCredentialParameterKeys = useMemo(
+    () => new Set(loginCredentialInputs.map((input) => input.parameter.key)),
+    [loginCredentialInputs],
+  );
+  const visibleWorkflowParameters = useMemo(
+    () =>
+      workflowParameters.filter(
+        (parameter) => !loginCredentialParameterKeys.has(parameter.key),
+      ),
+    [loginCredentialParameterKeys, workflowParameters],
+  );
+  const showGenericInputs =
+    visibleWorkflowParameters.length > 0 || loginCredentialInputs.length === 0;
 
   // Validate login blocks have credentials selected
   const loginBlocksWithoutCredentials = useMemo(
@@ -680,134 +759,233 @@ function RunWorkflowForm({
           </Alert>
         )}
 
-        <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
-          <header>
-            <h1 className="text-lg">Inputs</h1>
-          </header>
-          {workflowParameters?.map((parameter) => {
-            return (
-              <FormField
-                key={parameter.key}
-                control={form.control}
-                name={parameter.key}
-                rules={{
-                  validate: (value) => {
-                    if (parameter.workflow_parameter_type === "json") {
-                      return validateJsonWorkflowParameterValue(value);
-                    }
+        {loginCredentialInputs.length > 0 && (
+          <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
+            <header>
+              <h1 className="text-lg">Login credentials</h1>
+            </header>
+            {loginCredentialInputs.map(({ parameter, loginBlockLabels }) => {
+              const { title, description } = getLoginCredentialDisplayText(
+                parameter,
+                loginBlockLabels,
+              );
 
-                    // Boolean parameters are required - show error and block submission
-                    if (parameter.workflow_parameter_type === "boolean") {
-                      if (value === null || value === undefined) {
-                        return "This field is required";
-                      }
-                      return;
-                    }
-
-                    // Numeric parameters are required - show error and block submission
-                    if (
-                      parameter.workflow_parameter_type === "integer" ||
-                      parameter.workflow_parameter_type === "float"
-                    ) {
-                      if (
-                        value === null ||
-                        value === undefined ||
-                        Number.isNaN(value)
-                      ) {
-                        return "This field is required";
-                      }
-                      return;
-                    }
-
-                    if (parameter.workflow_parameter_type === "file_url") {
-                      if (
-                        value === null ||
-                        value === undefined ||
-                        (typeof value === "string" && value.trim() === "") ||
-                        (typeof value === "object" &&
-                          value !== null &&
-                          "s3uri" in value &&
-                          !value.s3uri)
-                      ) {
-                        return "This field is required";
-                      }
-                      return;
-                    }
-
-                    // For string parameters, show warning but don't block
-                    if (
-                      parameter.workflow_parameter_type === "string" &&
-                      (value === null || value === "")
-                    ) {
-                      return "Warning: you left this field empty";
-                    }
-
-                    // For all other non-boolean types, show warning but don't block
-                    if (value === null || value === undefined) {
-                      return "Warning: you left this field empty";
-                    }
-                  },
-                }}
-                render={({ field }) => {
-                  return (
-                    <FormItem>
-                      <div className="flex gap-16">
-                        <FormLabel className="!text-slate-50">
-                          <div className="w-72">
-                            <div className="flex items-center gap-2 text-lg">
-                              {parameter.key}
-                              <span className="text-sm text-slate-400">
-                                {getLabelForWorkflowParameterType(
-                                  parameter.workflow_parameter_type,
-                                )}
-                              </span>
+              if (
+                parameter.parameter_type === WorkflowParameterTypes.Workflow
+              ) {
+                return (
+                  <FormField
+                    key={parameter.key}
+                    control={form.control}
+                    name={parameter.key}
+                    rules={{
+                      validate: (value) => {
+                        if (
+                          value === null ||
+                          value === undefined ||
+                          value === ""
+                        ) {
+                          return "Warning: you left this field empty";
+                        }
+                      },
+                    }}
+                    render={({ field }) => (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel className="!text-slate-50">
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                {title}
+                                <span className="text-sm text-slate-400">
+                                  credential
+                                </span>
+                              </div>
+                              <h2 className="text-sm text-slate-400">
+                                {description}
+                              </h2>
                             </div>
-                            <h2 className="text-sm text-slate-400">
-                              {parameter.description}
-                            </h2>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <WorkflowParameterInput
+                                type={parameter.workflow_parameter_type}
+                                value={field.value}
+                                onChange={(value) => {
+                                  field.onChange(value);
+                                  form.trigger(parameter.key);
+                                }}
+                              />
+                            </FormControl>
+                            {form.formState.errors[parameter.key] && (
+                              <div className="text-xs text-warning">
+                                {form.formState.errors[parameter.key]?.message}
+                              </div>
+                            )}
                           </div>
-                        </FormLabel>
-                        <div className="w-full space-y-2">
-                          <FormControl>
-                            <WorkflowParameterInput
-                              type={parameter.workflow_parameter_type}
-                              value={field.value}
-                              onChange={(value) => {
-                                field.onChange(value);
-                                form.trigger(parameter.key);
-                              }}
-                            />
-                          </FormControl>
-                          {form.formState.errors[parameter.key] && (
-                            <div
-                              className={`text-xs ${
-                                parameter.workflow_parameter_type ===
-                                  "boolean" ||
-                                parameter.workflow_parameter_type ===
-                                  "integer" ||
-                                parameter.workflow_parameter_type === "float" ||
-                                parameter.workflow_parameter_type ===
-                                  "file_url" ||
-                                parameter.workflow_parameter_type === "json"
-                                  ? "text-destructive"
-                                  : "text-warning"
-                              }`}
-                            >
-                              {form.formState.errors[parameter.key]?.message}
-                            </div>
-                          )}
                         </div>
-                      </div>
-                    </FormItem>
-                  );
-                }}
-              />
-            );
-          })}
-          {workflowParameters.length === 0 && (
-            <div>This agent doesn't have any inputs</div>
-          )}
-        </div>
+                      </FormItem>
+                    )}
+                  />
+                );
+              }
+
+              return (
+                <FormField
+                  key={parameter.key}
+                  control={form.control}
+                  name={parameter.key}
+                  render={({ field }) => (
+                    <RotatingCredentialField
+                      parameter={parameter as CredentialParameter}
+                      value={field.value}
+                      onChange={(value) => {
+                        field.onChange(value);
+                        form.trigger(parameter.key);
+                      }}
+                      credentialNamesById={credentialNamesById}
+                      title={title}
+                      description={description}
+                    />
+                  )}
+                />
+              );
+            })}
+          </div>
+        )}
+
+        {showGenericInputs && (
+          <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
+            <header>
+              <h1 className="text-lg">
+                {loginCredentialInputs.length > 0 ? "Other inputs" : "Inputs"}
+              </h1>
+            </header>
+            {visibleWorkflowParameters?.map((parameter) => {
+              return (
+                <FormField
+                  key={parameter.key}
+                  control={form.control}
+                  name={parameter.key}
+                  rules={{
+                    validate: (value) => {
+                      if (parameter.workflow_parameter_type === "json") {
+                        return validateJsonWorkflowParameterValue(value);
+                      }
+
+                      // Boolean parameters are required - show error and block submission
+                      if (parameter.workflow_parameter_type === "boolean") {
+                        if (value === null || value === undefined) {
+                          return "This field is required";
+                        }
+                        return;
+                      }
+
+                      // Numeric parameters are required - show error and block submission
+                      if (
+                        parameter.workflow_parameter_type === "integer" ||
+                        parameter.workflow_parameter_type === "float"
+                      ) {
+                        if (
+                          value === null ||
+                          value === undefined ||
+                          Number.isNaN(value)
+                        ) {
+                          return "This field is required";
+                        }
+                        return;
+                      }
+
+                      if (parameter.workflow_parameter_type === "file_url") {
+                        if (
+                          value === null ||
+                          value === undefined ||
+                          (typeof value === "string" && value.trim() === "") ||
+                          (typeof value === "object" &&
+                            value !== null &&
+                            "s3uri" in value &&
+                            !value.s3uri)
+                        ) {
+                          return "This field is required";
+                        }
+                        return;
+                      }
+
+                      // For string parameters, show warning but don't block
+                      if (
+                        parameter.workflow_parameter_type === "string" &&
+                        (value === null || value === "")
+                      ) {
+                        return "Warning: you left this field empty";
+                      }
+
+                      // For all other non-boolean types, show warning but don't block
+                      if (value === null || value === undefined) {
+                        return "Warning: you left this field empty";
+                      }
+                    },
+                  }}
+                  render={({ field }) => {
+                    return (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel className="!text-slate-50">
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                {parameter.key}
+                                <span className="text-sm text-slate-400">
+                                  {getLabelForWorkflowParameterType(
+                                    parameter.workflow_parameter_type,
+                                  )}
+                                </span>
+                              </div>
+                              <h2 className="text-sm text-slate-400">
+                                {parameter.description}
+                              </h2>
+                            </div>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <WorkflowParameterInput
+                                type={parameter.workflow_parameter_type}
+                                value={field.value}
+                                onChange={(value) => {
+                                  field.onChange(value);
+                                  form.trigger(parameter.key);
+                                }}
+                              />
+                            </FormControl>
+                            {form.formState.errors[parameter.key] && (
+                              <div
+                                className={`text-xs ${
+                                  parameter.workflow_parameter_type ===
+                                    "boolean" ||
+                                  parameter.workflow_parameter_type ===
+                                    "integer" ||
+                                  parameter.workflow_parameter_type ===
+                                    "float" ||
+                                  parameter.workflow_parameter_type ===
+                                    "file_url" ||
+                                  parameter.workflow_parameter_type === "json"
+                                    ? "text-destructive"
+                                    : "text-warning"
+                                }`}
+                              >
+                                {form.formState.errors[parameter.key]?.message}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </FormItem>
+                    );
+                  }}
+                />
+              );
+            })}
+            {visibleWorkflowParameters.length === 0 && (
+              <div>This agent doesn't have any inputs</div>
+            )}
+          </div>
+        )}
 
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>

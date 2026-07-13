@@ -108,6 +108,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
@@ -375,6 +376,24 @@ async def _cancel_pending_prefetch_task(task: asyncio.Task | None) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+class _BackgroundArtifactTaskTracker:
+    # Instantiated fresh per agent_step call so the in-flight artifact task is isolated
+    # to that call. A shared (module-global or instance) tracker would let concurrent
+    # agent_step invocations await each other's background writes.
+    def __init__(self) -> None:
+        self.task: asyncio.Task | None = None
+
+    async def drain(self) -> None:
+        if self.task is None:
+            return
+        task = self.task
+        self.task = None
+        try:
+            await task
+        except Exception:
+            LOG.warning("Background artifact task failed, continuing", exc_info=True)
 
 
 def _build_totp_timeout_reasoning(task: Task) -> str:
@@ -764,6 +783,7 @@ class ForgeAgent:
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
+        pre_resolved_browser_state: BrowserState | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
@@ -887,7 +907,13 @@ class ForgeAgent:
                 step,
                 browser_state,
                 detailed_output,
-            ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id)
+            ) = await self.initialize_execution_state(
+                task,
+                step,
+                workflow_run,
+                browser_session_id,
+                pre_resolved_browser_state=pre_resolved_browser_state,
+            )
 
             # mark step as completed and mark task as completed
             if (
@@ -1472,20 +1498,7 @@ class ForgeAgent:
             cua_response=None,
         )
         prefetched_summary_task: asyncio.Task[dict[str, Any]] | None = None
-        current_artifact_task: asyncio.Task | None = None
-        pdf_auto_download_src: str | None = None
-        pdf_auto_download_used_bytes: bool = False
-
-        async def await_background_artifact_task() -> None:
-            nonlocal current_artifact_task
-            if current_artifact_task is None:
-                return
-            task = current_artifact_task
-            current_artifact_task = None
-            try:
-                await task
-            except Exception:
-                LOG.warning("Background artifact task failed, continuing", exc_info=True)
+        artifact_tracker = _BackgroundArtifactTaskTracker()
 
         try:
             LOG.info(
@@ -1559,231 +1572,27 @@ class ForgeAgent:
 
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
-            actions: list[Action]
-
-            # If prepare_step_execution injected actions (e.g. proactive captcha solving),
-            # skip LLM entirely and use the injected actions directly.
-            if injected_actions is not None:
-                LOG.info(
-                    "Using injected actions from prepare_step_execution, skipping LLM",
-                    step_id=step.step_id,
-                    num_actions=len(injected_actions),
-                    action_types=[a.action_type for a in injected_actions],
-                )
-                actions = injected_actions
-            elif engine == RunEngine.openai_cua:
-                actions, new_cua_response = await self._generate_cua_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    previous_response=cua_response,
-                    engine=engine,
-                )
-                detailed_agent_step_output.cua_response = new_cua_response
-            elif engine == RunEngine.anthropic_cua:
-                assert llm_caller is not None
-                actions = await self._generate_anthropic_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    llm_caller=llm_caller,
-                )
-            elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "DISABLE_UI_TARS_CUA",
-                task.workflow_run_id or task.task_id,
-                properties={"organization_id": task.organization_id},
-            ):
-                assert llm_caller is not None
-                actions = await self._generate_ui_tars_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    llm_caller=llm_caller,
-                )
-            elif engine == RunEngine.yutori_navigator:
-                assert llm_caller is not None
-                actions = await self._generate_yutori_navigator_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    llm_caller=llm_caller,
-                )
-
-            else:
-                if is_extraction_task:
-                    actions = [
-                        await self.create_extract_action(
-                            task,
-                            step,
-                            scraped_page,
-                            prefetched_summary_task=prefetched_summary_task,
-                        )
-                    ]
-                else:
-                    llm_key_override = task.llm_key
-                    # FIXME: Redundant engine check?
-                    if engine in CUA_ENGINES:
-                        self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
-                        llm_key_override = None
-
-                    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                        llm_key_override, default=app.LLM_API_HANDLER
-                    )
-                    # Add caching flag to context for monitoring
-                    if use_caching:
-                        context = skyvern_context.current()
-                        if context:
-                            context.use_prompt_caching = True
-
-                    if not reuse_speculative_llm_response:
-                        json_response = await llm_api_handler(
-                            prompt=extract_action_prompt,
-                            prompt_name=prompt_name,
-                            step=step,
-                            screenshots=[] if without_page_information else scraped_page.screenshots,
-                            system_prompt=task.workflow_system_prompt,
-                        )
-                    else:
-                        LOG.debug(
-                            "Using speculative extract-actions response",
-                            step_id=step.step_id,
-                        )
-                    if json_response is None:
-                        raise MissingExtractActionsResponse()
-                    try:
-                        # Check for PDF viewer: either <embed type="application/pdf"> or
-                        # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
-                        pdf_src = scraped_page.check_pdf_viewer_embed()
-                        if not pdf_src:
-                            pdf_src = await scraped_page.check_pdf_iframe()
-                        if pdf_src and not should_auto_download_pdf(pdf_src):
-                            LOG.info(
-                                "PDF source already downloaded, skipping auto-download",
-                                step_id=step.step_id,
-                            )
-                            pdf_src = None
-                        if pdf_src:
-                            LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
-                            pdf_bytes: bytes | None = None
-                            download_url: str | None = None
-
-                            # Check if the src is a data URI with base64 encoded PDF
-                            # Format: data:application/pdf[;charset=...];base64,<base64_data>
-                            if pdf_src.startswith("data:application/pdf"):
-                                # Use more precise regex to extract base64 data after the base64, prefix
-                                # This pattern matches: data:application/pdf[;optional_params];base64,<data>
-                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
-                                if not m:
-                                    raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_src,
-                                        reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
-                                    )
-
-                                base64_data = m.group(1)
-                                LOG.info(
-                                    "Found base64 data in PDF src",
-                                    step_id=step.step_id,
-                                    base64_data_length=len(base64_data),
-                                )
-
-                                # Decode base64 data with error handling
-                                try:
-                                    pdf_bytes = base64.b64decode(base64_data, validate=True)
-                                except Exception as e:
-                                    raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_src,
-                                        reason=f"Failed to decode base64 data: {str(e)}",
-                                    ) from e
-                            else:
-                                # If not a data URI, treat it as a URL
-                                LOG.info(
-                                    "Found PDF src as URL (not base64 data)",
-                                    step_id=step.step_id,
-                                    download_url=pdf_src,
-                                )
-                                download_url = pdf_src
-
-                            actions = [
-                                DownloadFileAction(
-                                    reasoning="Downloading the file from the PDF viewer.",
-                                    organization_id=task.organization_id,
-                                    workflow_run_id=task.workflow_run_id,
-                                    task_id=task.task_id,
-                                    step_id=step.step_id,
-                                    step_order=step.order,
-                                    action_order=0,
-                                    file_name=f"{uuid.uuid4()}.pdf",
-                                    byte=pdf_bytes,
-                                    download_url=download_url,
-                                    download=True,
-                                )
-                            ]
-                            pdf_auto_download_src = pdf_src
-                            pdf_auto_download_used_bytes = pdf_bytes is not None
-                        else:
-                            otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
-                                task, step, scraped_page, browser_state, json_response
-                            )
-                            if otp_actions:
-                                detailed_agent_step_output.llm_response = otp_json_response
-                                actions = otp_actions
-                            else:
-                                actions = parse_actions(
-                                    task, step.step_id, step.order, scraped_page, json_response["actions"]
-                                )
-
-                        if context:
-                            context.pop_totp_code(task.task_id)
-                    except NoTOTPVerificationCodeFound:
-                        # Surface only the source poll_otp_value actually queried so
-                        # the failure_reason tells the customer which delivery endpoint
-                        # went silent.
-                        timeout_reasoning = _build_totp_timeout_reasoning(task)
-                        LOG.warning(
-                            "TOTP polling timed out — terminating task",
-                            task_id=task.task_id,
-                            workflow_run_id=task.workflow_run_id,
-                            totp_verification_url=strip_query_params(task.totp_verification_url)
-                            if task.totp_verification_url
-                            else None,
-                            totp_identifier=task.totp_identifier,
-                            organization_id=task.organization_id,
-                        )
-                        actions = [
-                            TerminateAction(
-                                organization_id=task.organization_id,
-                                workflow_run_id=task.workflow_run_id,
-                                task_id=task.task_id,
-                                step_id=step.step_id,
-                                step_order=step.order,
-                                action_order=0,
-                                reasoning=timeout_reasoning,
-                                intention=timeout_reasoning,
-                                errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
-                            )
-                        ]
-                    except FailedToGetTOTPVerificationCode as e:
-                        actions = [
-                            TerminateAction(
-                                reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
-                                intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
-                                organization_id=task.organization_id,
-                                workflow_run_id=task.workflow_run_id,
-                                task_id=task.task_id,
-                                step_id=step.step_id,
-                                step_order=step.order,
-                                action_order=0,
-                                errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
-                            )
-                        ]
-
-                    if reuse_speculative_llm_response and speculative_llm_metadata:
-                        await self._persist_speculative_llm_metadata(
-                            step,
-                            speculative_llm_metadata,
-                            screenshots=scraped_page.screenshots,
-                        )
-                        speculative_llm_metadata = None
+            actions, pdf_auto_download_src, pdf_auto_download_used_bytes = await self._generate_step_actions(
+                task=task,
+                step=step,
+                browser_state=browser_state,
+                engine=engine,
+                scraped_page=scraped_page,
+                detailed_agent_step_output=detailed_agent_step_output,
+                injected_actions=injected_actions,
+                is_extraction_task=is_extraction_task,
+                prefetched_summary_task=prefetched_summary_task,
+                cua_response=cua_response,
+                llm_caller=llm_caller,
+                extract_action_prompt=extract_action_prompt,
+                prompt_name=prompt_name,
+                use_caching=use_caching,
+                without_page_information=without_page_information,
+                json_response=json_response,
+                reuse_speculative_llm_response=reuse_speculative_llm_response,
+                speculative_llm_metadata=speculative_llm_metadata,
+                context=context,
+            )
 
             detailed_agent_step_output.actions = actions
             record_validation_span_attrs(_step_span, task, actions)
@@ -1800,412 +1609,33 @@ class ForgeAgent:
                 )
                 return step, detailed_agent_step_output
 
-            # Execute the actions
-            LOG.info(
-                "Executing actions",
-                sampling=True,
-                step_order=step.order,
-                step_retry=step.retry_index,
-                actions=actions,
-            )
-            action_results: list[ActionResult] = []
-            detailed_agent_step_output.action_results = action_results
-            # filter out wait action if there are other actions in the list
-            # we do this because WAIT action is considered as a failure
-            # which will block following actions if we don't remove it from the list
-            # if the list only contains WAIT action, we will execute WAIT action(s)
-            if len(actions) > 1:
-                wait_actions_to_skip = [action for action in actions if action.action_type == ActionType.WAIT]
-                wait_actions_len = len(wait_actions_to_skip)
-                # if there are wait actions and there are other actions in the list, skip wait actions
-                # if we are using cached action plan, we don't skip wait actions
-                if wait_actions_len > 0 and wait_actions_len < len(actions):
-                    actions = [action for action in actions if action.action_type != ActionType.WAIT]
-                    LOG.info(
-                        "Skipping wait actions",
-                        wait_actions_to_skip=wait_actions_to_skip,
-                        actions=actions,
-                    )
-
-            # initialize list of tuples and set actions as the first element of each tuple so that in the case
-            # of an exception, we can still see all the actions
-            detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
-
-            # build a linked action chain by the action_idx
-            action_linked_list: list[ActionLinkedNode] = []
-            element_id_to_action_index: dict[str, int] = dict()
-            for action_idx, action in enumerate(actions):
-                node = ActionLinkedNode(action=action)
-                action_linked_list.append(node)
-
-                if not isinstance(action, WebAction):
-                    continue
-
-                previous_action_idx = element_id_to_action_index.get(action.element_id)
-                if previous_action_idx is not None:
-                    previous_node = action_linked_list[previous_action_idx]
-                    previous_node.next = node
-
-                element_id_to_action_index[action.element_id] = action_idx
-
-            element_id_to_last_action: dict[str, int] = dict()
-            try:
-                wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
-                base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
-            except Exception:
-                base_delay = 0.5
-            for action_idx, action_node in enumerate(action_linked_list):
-                await await_background_artifact_task()
-
-                context = skyvern_context.ensure_context()
-                if context.refresh_working_page:
-                    LOG.warning(
-                        "Detected the signal to reload the page, going to reload and skip the rest of the actions",
-                        step_order=step.order,
-                    )
-                    await browser_state.reload_page()
-                    context.refresh_working_page = False
-                    action_result = ActionSuccess()
-                    action_result.step_order = step.order
-                    action_result.step_retry_number = step.retry_index
-                    action = ReloadPageAction(
-                        reasoning="Something wrong with the current page, reload to continue",
-                        status=ActionStatus.completed,
-                        organization_id=task.organization_id,
-                        workflow_run_id=task.workflow_run_id,
-                        task_id=task.task_id,
-                        step_id=step.step_id,
-                        step_order=step.order,
-                        action_order=action_idx,
-                    )
-                    detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
-                    action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
-                    current_artifact_task = asyncio.create_task(
-                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
-                    )
-                    break
-
-                action = action_node.action
-                if isinstance(action, WebAction):
-                    previous_action_idx = element_id_to_last_action.get(action.element_id)
-                    if previous_action_idx is not None:
-                        LOG.warning(
-                            "Duplicate action element id.",
-                            step_order=step.order,
-                            action=action,
-                        )
-
-                        previous_action, previous_result = detailed_agent_step_output.actions_and_results[
-                            previous_action_idx
-                        ]
-                        if len(previous_result) > 0 and previous_result[-1].success:
-                            LOG.info(
-                                "Previous action succeeded, but we'll still continue.",
-                                step_order=step.order,
-                                previous_action=previous_action,
-                                previous_result=previous_result,
-                            )
-                        else:
-                            LOG.warning(
-                                "Previous action failed, so handle the next action.",
-                                step_order=step.order,
-                                previous_action=previous_action,
-                                previous_result=previous_result,
-                            )
-
-                    element_id_to_last_action[action.element_id] = action_idx
-
-                if engine != RunEngine.openai_cua:
-                    self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
-                current_page = await browser_state.must_get_working_page()
-                if isinstance(action, CompleteAction) and not complete_verification:
-                    # Do not verify the complete action when complete_verification is False
-                    # set verified to True will skip the completion verification
-                    action.verified = True
-
-                # Pass TOTP secret to handler for multi-field TOTP sequences
-                # Handler will generate TOTP at execution time
-                if (
-                    action.action_type == ActionType.INPUT_TEXT
-                    and self._is_multi_field_totp_sequence(actions)
-                    and (totp_secret := skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_secret"))
-                ):
-                    # Pass TOTP secret to handler for execution-time generation
-                    action.totp_timing_info = {
-                        "is_totp_sequence": True,
-                        "action_index": action_idx,
-                        "totp_secret": totp_secret,
-                        "is_retry": step.retry_index > 0,
-                    }
-
-                # Tell the handler to skip the auto-completion Tab hack when the
-                # next batched action would be broken by a focus change — e.g. a
-                # KEYPRESS Enter or another action on the same element.
-                if action.action_type == ActionType.INPUT_TEXT:
-                    next_action = (
-                        action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
-                    )
-                    if isinstance(next_action, KeypressAction) or (
-                        isinstance(next_action, WebAction) and next_action.element_id == action.element_id
-                    ):
-                        action.skip_auto_complete_tab = True
-                    action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
-
-                results = await ActionHandler.handle_action(
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
-                    page=current_page,
-                    action=action,
-                )
-                await app.AGENT_FUNCTION.post_action_execution(action)
-                detailed_agent_step_output.actions_and_results[action_idx] = (
-                    action,
-                    results,
-                )
-
-                # Determine wait time between actions
-                wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
-
-                # For multi-field TOTP sequences, use zero delay between all digits for fast execution
-                if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
-                    current_text = action.text if hasattr(action, "text") else None
-
-                    if current_text and len(current_text) == 1 and current_text.isdigit():
-                        # Zero delay between all TOTP digits for fast execution
-                        wait_time = 0.0
-                        LOG.debug(
-                            "TOTP: zero delay for digit",
-                            task_id=task.task_id,
-                            action_idx=action_idx,
-                            digit=current_text,
-                        )
-
-                # Skip sleep and post-action artifacts for page-level SCROLL to preserve
-                # scroll-driven JS state. Many pages enable buttons only while scrolled to
-                # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
-                # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
-                # page position, so they keep normal sleep and artifact recording.
-                is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
-                    r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
-                )
-                if is_page_level_scroll:
-                    wait_time = 0.0
-
-                _step_span.add_event(
-                    "action.post_wait",
-                    attributes={"wait_time_ms": int(wait_time * 1000), "action_idx": action_idx},
-                )
-                await asyncio.sleep(wait_time)
-                if not is_page_level_scroll:
-                    current_artifact_task = asyncio.create_task(
-                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
-                    )
-                else:
-                    LOG.info(
-                        "Skipping post-action artifacts for page-level scroll",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                    )
-                for result in results:
-                    result.step_retry_number = step.retry_index
-                    result.step_order = step.order
-                step.output = detailed_agent_step_output.to_agent_step_output()
-                action_results.extend(results)
-                # Check the last result for this action. If that succeeded, assume the entire action is successful
-                if results and results[-1].success:
-                    if pdf_auto_download_src and isinstance(action, DownloadFileAction):
-                        actually_downloaded = pdf_auto_download_used_bytes or results[-1].download_triggered
-                        if actually_downloaded:
-                            mark_pdf_source_downloaded(pdf_auto_download_src)
-                        pdf_auto_download_src = None
-                    LOG.info(
-                        "Action succeeded",
-                        sampling=True,
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                    )
-                    if results[-1].skip_remaining_actions:
-                        LOG.warning(
-                            "Going to stop executing the remaining actions",
-                            step_order=step.order,
-                            step_retry=step.retry_index,
-                            action_idx=action_idx,
-                            action=action,
-                            action_result=results,
-                        )
-                        break
-
-                elif results and isinstance(action, DecisiveAction):
-                    LOG.warning(
-                        "DecisiveAction failed, but not stopping execution and not retrying the step",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                    )
-                elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
-                    LOG.warning(
-                        "Action failed, but not stopping execution",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                    )
-                else:
-                    if action_node.next is not None:
-                        LOG.warning(
-                            "Action failed, but have duplicated element id in the action list. Continue excuting.",
-                            step_order=step.order,
-                            step_retry=step.retry_index,
-                            action_idx=action_idx,
-                            action=action,
-                            next_action=action_node.next.action,
-                            action_result=results,
-                        )
-                        continue
-
-                    LOG.warning(
-                        "Action failed, marking step as failed",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        action_idx=action_idx,
-                        action=action,
-                        action_result=results,
-                        actions_and_results=detailed_agent_step_output.actions_and_results,
-                    )
-                    # if the action failed, don't execute the rest of the actions, mark the step as failed, and retry
-                    failed_step = await self.update_step(
-                        step=step,
-                        status=StepStatus.failed,
-                        output=detailed_agent_step_output.to_agent_step_output(),
-                    )
-                    return failed_step, detailed_agent_step_output.get_clean_detailed_output()
-
-            await await_background_artifact_task()
-
-            LOG.info(
-                "Actions executed successfully, marking step as completed",
-                sampling=True,
-                step_order=step.order,
-                step_retry=step.retry_index,
-                action_results=action_results,
-            )
-
-            # Clean up TOTP cache after multi-field TOTP sequence completion
-            if self._is_multi_field_totp_sequence(actions):
-                context = skyvern_context.ensure_context()
-                cache_key = f"{task.task_id}_totp_cache"
-                removed_totp_cache = False
-                for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
-                    if key in context.totp_codes:
-                        context.totp_codes.pop(key)
-                        removed_totp_cache = True
-
-                if removed_totp_cache:
-                    LOG.debug(
-                        "Cleaned up TOTP cache after multi-field sequence completion",
-                        task_id=task.task_id,
-                    )
-
-                secret_key = f"{task.task_id}_secret"
-                if secret_key in context.totp_codes:
-                    context.totp_codes.pop(secret_key)
-
-            # Update Navigator caller with actual action results so the next
-            # step's tool responses include real execution data.
-            if (
-                engine == RunEngine.yutori_navigator
-                and detailed_agent_step_output
-                and detailed_agent_step_output.actions_and_results
-            ):
-                nav_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if isinstance(nav_caller, YutoriNavigatorLLMCaller):
-                    for action, results in detailed_agent_step_output.actions_and_results:
-                        if not results or not action.tool_call_id:
-                            continue
-                        r = results[-1]
-                        result_str: str | None
-                        if isinstance(action, WaitAction):
-                            # Skyvern's handle_wait_action always returns ActionFailure by
-                            # design (to discourage v1/v2 engines from leaning on wait), but
-                            # Navigator emits wait as a deliberate cooperative pause —
-                            # surface a positive tool result so the model sees WaitAction success.
-                            result_str = f"Waited {action.seconds}s"
-                        elif r.success:
-                            # Use actual data when available (JS output, etc.)
-                            result_str = str(r.data) if r.data is not None else None
-                        else:
-                            # Provide error details so the model can recover
-                            result_str = f"ERROR: {r.exception_message or 'Action failed'}"
-                        nav_caller.update_pending_result(action.tool_call_id, result_str)
-
-            # Check if Skyvern already returned a complete action, if so, don't run user goal check
-            has_decisive_action = False
-            if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
-                for action, results in detailed_agent_step_output.actions_and_results:
-                    if isinstance(action, DecisiveAction):
-                        has_decisive_action = True
-                        break
-
-            task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
-            enable_parallel_verification = False
-            if (
-                not has_decisive_action
-                and not task_completes_on_download
-                and not isinstance(task_block, ActionBlock)
-                and complete_verification
-                and (task.navigation_goal or task.complete_criterion)
-            ):
-                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "DISABLE_USER_GOAL_CHECK",
-                    task.task_id,
-                    properties={"task_url": task.url, "organization_id": task.organization_id},
-                )
-
-                # Parallel verification is always enabled (user goal check deferred to handle_completed_step)
-                enable_parallel_verification = not disable_user_goal_check
-
-            # if the last action is complete and is successful, check if there's a data extraction goal
-            # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
-            # skip when the step already ran a successful planner-emitted EXTRACT action — re-extracting would be a duplicate
-            step_has_successful_extract = any(
-                executed_action.action_type == ActionType.EXTRACT and any(result.success for result in results)
-                for executed_action, results in detailed_agent_step_output.actions_and_results
-            )
-            if (
-                task.navigation_goal
-                and task.data_extraction_goal
-                and not step_has_successful_extract
-                and self.step_has_completed_goal(detailed_agent_step_output)
-            ):
-                working_page = await browser_state.must_get_working_page()
-                # refresh task in case the extracted information is updated previously
-                refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
-                assert refreshed_task is not None
-                task = refreshed_task
-                extract_action = await self.create_extract_action(task, step, scraped_page)
-                extract_results = await ActionHandler.handle_action(
-                    scraped_page, task, step, working_page, extract_action
-                )
-                await app.AGENT_FUNCTION.post_action_execution(extract_action)
-                detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
-
-            # If no action errors return the agent state and output
-            completed_step = await self.update_step(
+            actions, early_return = await self._execute_step_actions(
+                task=task,
                 step=step,
-                status=StepStatus.completed,
-                output=detailed_agent_step_output.to_agent_step_output(),
+                browser_state=browser_state,
+                engine=engine,
+                scraped_page=scraped_page,
+                complete_verification=complete_verification,
+                actions=actions,
+                detailed_agent_step_output=detailed_agent_step_output,
+                pdf_auto_download_src=pdf_auto_download_src,
+                pdf_auto_download_used_bytes=pdf_auto_download_used_bytes,
+                _step_span=_step_span,
+                artifact_tracker=artifact_tracker,
             )
-            if enable_parallel_verification:
-                completed_step.speculative_original_status = StepStatus.completed
-            return completed_step, detailed_agent_step_output.get_clean_detailed_output()
+            if early_return is not None:
+                return early_return
+            return await self._finalize_step_execution(
+                task=task,
+                step=step,
+                browser_state=browser_state,
+                engine=engine,
+                scraped_page=scraped_page,
+                complete_verification=complete_verification,
+                task_block=task_block,
+                actions=actions,
+                detailed_agent_step_output=detailed_agent_step_output,
+            )
         except CancelledError:
             # A cancellation here is a deliberate stop (elapsed-time timeout / user cancel). Persist
             # the step as failed (shielded, so the write survives the cancel) for observability, then
@@ -2250,7 +1680,695 @@ class ForgeAgent:
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
         finally:
             await _cancel_pending_prefetch_task(prefetched_summary_task)
-            await await_background_artifact_task()
+            await artifact_tracker.drain()
+
+    async def _execute_step_actions(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+        scraped_page: ScrapedPage,
+        complete_verification: bool,
+        actions: list[Action],
+        detailed_agent_step_output: DetailedAgentStepOutput,
+        pdf_auto_download_src: str | None,
+        pdf_auto_download_used_bytes: bool,
+        _step_span: otel_trace.Span,
+        artifact_tracker: _BackgroundArtifactTaskTracker,
+    ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
+        # Execute the actions
+        LOG.info(
+            "Executing actions",
+            sampling=True,
+            step_order=step.order,
+            step_retry=step.retry_index,
+            actions=actions,
+        )
+        action_results: list[ActionResult] = []
+        detailed_agent_step_output.action_results = action_results
+        # filter out wait action if there are other actions in the list
+        # we do this because WAIT action is considered as a failure
+        # which will block following actions if we don't remove it from the list
+        # if the list only contains WAIT action, we will execute WAIT action(s)
+        if len(actions) > 1:
+            wait_actions_to_skip = [action for action in actions if action.action_type == ActionType.WAIT]
+            wait_actions_len = len(wait_actions_to_skip)
+            # if there are wait actions and there are other actions in the list, skip wait actions
+            # if we are using cached action plan, we don't skip wait actions
+            if wait_actions_len > 0 and wait_actions_len < len(actions):
+                actions = [action for action in actions if action.action_type != ActionType.WAIT]
+                LOG.info(
+                    "Skipping wait actions",
+                    wait_actions_to_skip=wait_actions_to_skip,
+                    actions=actions,
+                )
+
+        # initialize list of tuples and set actions as the first element of each tuple so that in the case
+        # of an exception, we can still see all the actions
+        detailed_agent_step_output.actions_and_results = [(action, []) for action in actions]
+
+        # build a linked action chain by the action_idx
+        action_linked_list: list[ActionLinkedNode] = []
+        element_id_to_action_index: dict[str, int] = dict()
+        for action_idx, action in enumerate(actions):
+            node = ActionLinkedNode(action=action)
+            action_linked_list.append(node)
+
+            if not isinstance(action, WebAction):
+                continue
+
+            previous_action_idx = element_id_to_action_index.get(action.element_id)
+            if previous_action_idx is not None:
+                previous_node = action_linked_list[previous_action_idx]
+                previous_node.next = node
+
+            element_id_to_action_index[action.element_id] = action_idx
+
+        element_id_to_last_action: dict[str, int] = dict()
+        try:
+            wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
+            base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
+        except Exception:
+            base_delay = 0.5
+        for action_idx, action_node in enumerate(action_linked_list):
+            await artifact_tracker.drain()
+
+            context = skyvern_context.ensure_context()
+            if context.refresh_working_page:
+                LOG.warning(
+                    "Detected the signal to reload the page, going to reload and skip the rest of the actions",
+                    step_order=step.order,
+                )
+                await browser_state.reload_page()
+                context.refresh_working_page = False
+                action_result = ActionSuccess()
+                action_result.step_order = step.order
+                action_result.step_retry_number = step.retry_index
+                action = ReloadPageAction(
+                    reasoning="Something wrong with the current page, reload to continue",
+                    status=ActionStatus.completed,
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=action_idx,
+                )
+                detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
+                action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
+                artifact_tracker.task = asyncio.create_task(
+                    self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                )
+                break
+
+            action = action_node.action
+            if isinstance(action, WebAction):
+                previous_action_idx = element_id_to_last_action.get(action.element_id)
+                if previous_action_idx is not None:
+                    LOG.warning(
+                        "Duplicate action element id.",
+                        step_order=step.order,
+                        action=action,
+                    )
+
+                    previous_action, previous_result = detailed_agent_step_output.actions_and_results[
+                        previous_action_idx
+                    ]
+                    if len(previous_result) > 0 and previous_result[-1].success:
+                        LOG.info(
+                            "Previous action succeeded, but we'll still continue.",
+                            step_order=step.order,
+                            previous_action=previous_action,
+                            previous_result=previous_result,
+                        )
+                    else:
+                        LOG.warning(
+                            "Previous action failed, so handle the next action.",
+                            step_order=step.order,
+                            previous_action=previous_action,
+                            previous_result=previous_result,
+                        )
+
+                element_id_to_last_action[action.element_id] = action_idx
+
+            if engine != RunEngine.openai_cua:
+                self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
+            current_page = await browser_state.must_get_working_page()
+            if isinstance(action, CompleteAction) and not complete_verification:
+                # Do not verify the complete action when complete_verification is False
+                # set verified to True will skip the completion verification
+                action.verified = True
+
+            # Pass TOTP secret to handler for multi-field TOTP sequences
+            # Handler will generate TOTP at execution time
+            if (
+                action.action_type == ActionType.INPUT_TEXT
+                and self._is_multi_field_totp_sequence(actions)
+                and (totp_secret := skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_secret"))
+            ):
+                # Pass TOTP secret to handler for execution-time generation
+                action.totp_timing_info = {
+                    "is_totp_sequence": True,
+                    "action_index": action_idx,
+                    "totp_secret": totp_secret,
+                    "is_retry": step.retry_index > 0,
+                }
+
+            # Tell the handler to skip the auto-completion Tab hack when the
+            # next batched action would be broken by a focus change — e.g. a
+            # KEYPRESS Enter or another action on the same element.
+            if action.action_type == ActionType.INPUT_TEXT:
+                next_action = (
+                    action_linked_list[action_idx + 1].action if action_idx + 1 < len(action_linked_list) else None
+                )
+                if isinstance(next_action, KeypressAction) or (
+                    isinstance(next_action, WebAction) and next_action.element_id == action.element_id
+                ):
+                    action.skip_auto_complete_tab = True
+                action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
+
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=current_page,
+                action=action,
+            )
+            await app.AGENT_FUNCTION.post_action_execution(action)
+            detailed_agent_step_output.actions_and_results[action_idx] = (
+                action,
+                results,
+            )
+
+            # Determine wait time between actions
+            wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
+
+            # For multi-field TOTP sequences, use zero delay between all digits for fast execution
+            if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
+                current_text = action.text if hasattr(action, "text") else None
+
+                if current_text and len(current_text) == 1 and current_text.isdigit():
+                    # Zero delay between all TOTP digits for fast execution
+                    wait_time = 0.0
+                    LOG.debug(
+                        "TOTP: zero delay for digit",
+                        task_id=task.task_id,
+                        action_idx=action_idx,
+                        digit=current_text,
+                    )
+
+            # Skip sleep and post-action artifacts for page-level SCROLL to preserve
+            # scroll-driven JS state. Many pages enable buttons only while scrolled to
+            # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
+            # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
+            # page position, so they keep normal sleep and artifact recording.
+            is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
+                r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
+            )
+            if is_page_level_scroll:
+                wait_time = 0.0
+
+            _step_span.add_event(
+                "action.post_wait",
+                attributes={"wait_time_ms": int(wait_time * 1000), "action_idx": action_idx},
+            )
+            await asyncio.sleep(wait_time)
+            if not is_page_level_scroll:
+                artifact_tracker.task = asyncio.create_task(
+                    self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                )
+            else:
+                LOG.info(
+                    "Skipping post-action artifacts for page-level scroll",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                )
+            for result in results:
+                result.step_retry_number = step.retry_index
+                result.step_order = step.order
+            step.output = detailed_agent_step_output.to_agent_step_output()
+            action_results.extend(results)
+            # Check the last result for this action. If that succeeded, assume the entire action is successful
+            if results and results[-1].success:
+                if pdf_auto_download_src and isinstance(action, DownloadFileAction):
+                    actually_downloaded = pdf_auto_download_used_bytes or results[-1].download_triggered
+                    if actually_downloaded:
+                        mark_pdf_source_downloaded(pdf_auto_download_src)
+                    pdf_auto_download_src = None
+                LOG.info(
+                    "Action succeeded",
+                    sampling=True,
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                )
+                if results[-1].skip_remaining_actions:
+                    LOG.warning(
+                        "Going to stop executing the remaining actions",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                        action=action,
+                        action_result=results,
+                    )
+                    break
+
+            elif results and isinstance(action, DecisiveAction):
+                LOG.warning(
+                    "DecisiveAction failed, but not stopping execution and not retrying the step",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                )
+            elif results and not results[-1].success and not results[-1].stop_execution_on_failure:
+                LOG.warning(
+                    "Action failed, but not stopping execution",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                )
+            else:
+                if action_node.next is not None:
+                    LOG.warning(
+                        "Action failed, but have duplicated element id in the action list. Continue excuting.",
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        action_idx=action_idx,
+                        action=action,
+                        next_action=action_node.next.action,
+                        action_result=results,
+                    )
+                    continue
+
+                LOG.warning(
+                    "Action failed, marking step as failed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    action_idx=action_idx,
+                    action=action,
+                    action_result=results,
+                    actions_and_results=detailed_agent_step_output.actions_and_results,
+                )
+                # if the action failed, don't execute the rest of the actions, mark the step as failed, and retry
+                failed_step = await self.update_step(
+                    step=step,
+                    status=StepStatus.failed,
+                    output=detailed_agent_step_output.to_agent_step_output(),
+                )
+                return actions, (failed_step, detailed_agent_step_output.get_clean_detailed_output())
+
+        await artifact_tracker.drain()
+        return actions, None
+
+    async def _finalize_step_execution(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+        scraped_page: ScrapedPage,
+        complete_verification: bool,
+        task_block: BaseTaskBlock | None,
+        actions: list[Action],
+        detailed_agent_step_output: DetailedAgentStepOutput,
+    ) -> tuple[Step, DetailedAgentStepOutput]:
+        assert detailed_agent_step_output.actions_and_results is not None
+
+        LOG.info(
+            "Actions executed successfully, marking step as completed",
+            sampling=True,
+            step_order=step.order,
+            step_retry=step.retry_index,
+            action_results=detailed_agent_step_output.action_results,
+        )
+
+        # Clean up TOTP cache after multi-field TOTP sequence completion
+        if self._is_multi_field_totp_sequence(actions):
+            context = skyvern_context.ensure_context()
+            cache_key = f"{task.task_id}_totp_cache"
+            removed_totp_cache = False
+            for key in (cache_key, f"{cache_key}_valid_from", f"{cache_key}_valid_until"):
+                if key in context.totp_codes:
+                    context.totp_codes.pop(key)
+                    removed_totp_cache = True
+
+            if removed_totp_cache:
+                LOG.debug(
+                    "Cleaned up TOTP cache after multi-field sequence completion",
+                    task_id=task.task_id,
+                )
+
+            secret_key = f"{task.task_id}_secret"
+            if secret_key in context.totp_codes:
+                context.totp_codes.pop(secret_key)
+
+        # Update Navigator caller with actual action results so the next
+        # step's tool responses include real execution data.
+        if (
+            engine == RunEngine.yutori_navigator
+            and detailed_agent_step_output
+            and detailed_agent_step_output.actions_and_results
+        ):
+            nav_caller = LLMCallerManager.get_llm_caller(task.task_id)
+            if isinstance(nav_caller, YutoriNavigatorLLMCaller):
+                for action, results in detailed_agent_step_output.actions_and_results:
+                    if not results or not action.tool_call_id:
+                        continue
+                    r = results[-1]
+                    result_str: str | None
+                    if isinstance(action, WaitAction):
+                        # Skyvern's handle_wait_action always returns ActionFailure by
+                        # design (to discourage v1/v2 engines from leaning on wait), but
+                        # Navigator emits wait as a deliberate cooperative pause —
+                        # surface a positive tool result so the model sees WaitAction success.
+                        result_str = f"Waited {action.seconds}s"
+                    elif r.success:
+                        # Use actual data when available (JS output, etc.)
+                        result_str = str(r.data) if r.data is not None else None
+                    else:
+                        # Provide error details so the model can recover
+                        result_str = f"ERROR: {r.exception_message or 'Action failed'}"
+                    nav_caller.update_pending_result(action.tool_call_id, result_str)
+
+        # Check if Skyvern already returned a complete action, if so, don't run user goal check
+        has_decisive_action = False
+        if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
+            for action, results in detailed_agent_step_output.actions_and_results:
+                if isinstance(action, DecisiveAction):
+                    has_decisive_action = True
+                    break
+
+        task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
+        enable_parallel_verification = False
+        if (
+            not has_decisive_action
+            and not task_completes_on_download
+            and not isinstance(task_block, ActionBlock)
+            and complete_verification
+            and (task.navigation_goal or task.complete_criterion)
+        ):
+            disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_USER_GOAL_CHECK",
+                task.task_id,
+                properties={"task_url": task.url, "organization_id": task.organization_id},
+            )
+
+            # Parallel verification is always enabled (user goal check deferred to handle_completed_step)
+            enable_parallel_verification = not disable_user_goal_check
+
+        # if the last action is complete and is successful, check if there's a data extraction goal
+        # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
+        # skip when the step already ran a successful planner-emitted EXTRACT action — re-extracting would be a duplicate
+        step_has_successful_extract = any(
+            executed_action.action_type == ActionType.EXTRACT and any(result.success for result in results)
+            for executed_action, results in detailed_agent_step_output.actions_and_results
+        )
+        if (
+            task.navigation_goal
+            and task.data_extraction_goal
+            and not step_has_successful_extract
+            and self.step_has_completed_goal(detailed_agent_step_output)
+        ):
+            working_page = await browser_state.must_get_working_page()
+            # refresh task in case the extracted information is updated previously
+            refreshed_task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id)
+            assert refreshed_task is not None
+            task = refreshed_task
+            extract_action = await self.create_extract_action(task, step, scraped_page)
+            extract_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, extract_action)
+            await app.AGENT_FUNCTION.post_action_execution(extract_action)
+            detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
+
+        # If no action errors return the agent state and output
+        completed_step = await self.update_step(
+            step=step,
+            status=StepStatus.completed,
+            output=detailed_agent_step_output.to_agent_step_output(),
+        )
+        if enable_parallel_verification:
+            completed_step.speculative_original_status = StepStatus.completed
+        return completed_step, detailed_agent_step_output.get_clean_detailed_output()
+
+    async def _generate_step_actions(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+        scraped_page: ScrapedPage,
+        detailed_agent_step_output: DetailedAgentStepOutput,
+        injected_actions: list[Action] | None,
+        is_extraction_task: bool,
+        prefetched_summary_task: asyncio.Task[dict[str, Any]] | None,
+        cua_response: OpenAIResponse | None,
+        llm_caller: LLMCaller | None,
+        extract_action_prompt: str,
+        prompt_name: str,
+        use_caching: bool,
+        without_page_information: bool,
+        json_response: dict[str, Any] | None,
+        reuse_speculative_llm_response: bool,
+        speculative_llm_metadata: SpeculativeLLMMetadata | None,
+        context: SkyvernContext | None,
+    ) -> tuple[list[Action], str | None, bool]:
+        pdf_auto_download_src: str | None = None
+        pdf_auto_download_used_bytes = False
+        actions: list[Action]
+        # If prepare_step_execution injected actions (e.g. proactive captcha solving),
+        # skip LLM entirely and use the injected actions directly.
+        if injected_actions is not None:
+            LOG.info(
+                "Using injected actions from prepare_step_execution, skipping LLM",
+                step_id=step.step_id,
+                num_actions=len(injected_actions),
+                action_types=[a.action_type for a in injected_actions],
+            )
+            actions = injected_actions
+        elif engine == RunEngine.openai_cua:
+            actions, new_cua_response = await self._generate_cua_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                previous_response=cua_response,
+                engine=engine,
+            )
+            detailed_agent_step_output.cua_response = new_cua_response
+        elif engine == RunEngine.anthropic_cua:
+            assert llm_caller is not None
+            actions = await self._generate_anthropic_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                llm_caller=llm_caller,
+            )
+        elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "DISABLE_UI_TARS_CUA",
+            task.workflow_run_id or task.task_id,
+            properties={"organization_id": task.organization_id},
+        ):
+            assert llm_caller is not None
+            actions = await self._generate_ui_tars_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                llm_caller=llm_caller,
+            )
+        elif engine == RunEngine.yutori_navigator:
+            assert llm_caller is not None
+            actions = await self._generate_yutori_navigator_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                llm_caller=llm_caller,
+            )
+
+        else:
+            if is_extraction_task:
+                actions = [
+                    await self.create_extract_action(
+                        task,
+                        step,
+                        scraped_page,
+                        prefetched_summary_task=prefetched_summary_task,
+                    )
+                ]
+            else:
+                llm_key_override = task.llm_key
+                # FIXME: Redundant engine check?
+                if engine in CUA_ENGINES:
+                    self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
+                    llm_key_override = None
+
+                llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                    llm_key_override, default=app.LLM_API_HANDLER
+                )
+                # Add caching flag to context for monitoring
+                if use_caching:
+                    context = skyvern_context.current()
+                    if context:
+                        context.use_prompt_caching = True
+
+                if not reuse_speculative_llm_response:
+                    json_response = await llm_api_handler(
+                        prompt=extract_action_prompt,
+                        prompt_name=prompt_name,
+                        step=step,
+                        screenshots=[] if without_page_information else scraped_page.screenshots,
+                        system_prompt=task.workflow_system_prompt,
+                    )
+                else:
+                    LOG.debug(
+                        "Using speculative extract-actions response",
+                        step_id=step.step_id,
+                    )
+                if json_response is None:
+                    raise MissingExtractActionsResponse()
+                try:
+                    # Check for PDF viewer: either <embed type="application/pdf"> or
+                    # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
+                    pdf_src = scraped_page.check_pdf_viewer_embed()
+                    if not pdf_src:
+                        pdf_src = await scraped_page.check_pdf_iframe()
+                    if pdf_src and not should_auto_download_pdf(pdf_src):
+                        LOG.info(
+                            "PDF source already downloaded, skipping auto-download",
+                            step_id=step.step_id,
+                        )
+                        pdf_src = None
+                    if pdf_src:
+                        LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
+                        pdf_bytes: bytes | None = None
+                        download_url: str | None = None
+
+                        # Check if the src is a data URI with base64 encoded PDF
+                        # Format: data:application/pdf[;charset=...];base64,<base64_data>
+                        if pdf_src.startswith("data:application/pdf"):
+                            # Use more precise regex to extract base64 data after the base64, prefix
+                            # This pattern matches: data:application/pdf[;optional_params];base64,<data>
+                            m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
+                            if not m:
+                                raise PDFEmbedBase64DecodeError(
+                                    pdf_embed_src=pdf_src,
+                                    reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
+                                )
+
+                            base64_data = m.group(1)
+                            LOG.info(
+                                "Found base64 data in PDF src",
+                                step_id=step.step_id,
+                                base64_data_length=len(base64_data),
+                            )
+
+                            # Decode base64 data with error handling
+                            try:
+                                pdf_bytes = base64.b64decode(base64_data, validate=True)
+                            except Exception as e:
+                                raise PDFEmbedBase64DecodeError(
+                                    pdf_embed_src=pdf_src,
+                                    reason=f"Failed to decode base64 data: {str(e)}",
+                                ) from e
+                        else:
+                            # If not a data URI, treat it as a URL
+                            LOG.info(
+                                "Found PDF src as URL (not base64 data)",
+                                step_id=step.step_id,
+                                download_url=pdf_src,
+                            )
+                            download_url = pdf_src
+
+                        actions = [
+                            DownloadFileAction(
+                                reasoning="Downloading the file from the PDF viewer.",
+                                organization_id=task.organization_id,
+                                workflow_run_id=task.workflow_run_id,
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                action_order=0,
+                                file_name=f"{uuid.uuid4()}.pdf",
+                                byte=pdf_bytes,
+                                download_url=download_url,
+                                download=True,
+                            )
+                        ]
+                        pdf_auto_download_src = pdf_src
+                        pdf_auto_download_used_bytes = pdf_bytes is not None
+                    else:
+                        otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
+                            task, step, scraped_page, browser_state, json_response
+                        )
+                        if otp_actions:
+                            detailed_agent_step_output.llm_response = otp_json_response
+                            actions = otp_actions
+                        else:
+                            actions = parse_actions(
+                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                            )
+
+                    if context:
+                        context.pop_totp_code(task.task_id)
+                except NoTOTPVerificationCodeFound:
+                    # Surface only the source poll_otp_value actually queried so
+                    # the failure_reason tells the customer which delivery endpoint
+                    # went silent.
+                    timeout_reasoning = _build_totp_timeout_reasoning(task)
+                    LOG.warning(
+                        "TOTP polling timed out — terminating task",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        totp_verification_url=strip_query_params(task.totp_verification_url)
+                        if task.totp_verification_url
+                        else None,
+                        totp_identifier=task.totp_identifier,
+                        organization_id=task.organization_id,
+                    )
+                    actions = [
+                        TerminateAction(
+                            organization_id=task.organization_id,
+                            workflow_run_id=task.workflow_run_id,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=0,
+                            reasoning=timeout_reasoning,
+                            intention=timeout_reasoning,
+                            errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
+                        )
+                    ]
+                except FailedToGetTOTPVerificationCode as e:
+                    actions = [
+                        TerminateAction(
+                            reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                            intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                            organization_id=task.organization_id,
+                            workflow_run_id=task.workflow_run_id,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=0,
+                            errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
+                        )
+                    ]
+
+                if reuse_speculative_llm_response and speculative_llm_metadata:
+                    await self._persist_speculative_llm_metadata(
+                        step,
+                        speculative_llm_metadata,
+                        screenshots=scraped_page.screenshots,
+                    )
+                    speculative_llm_metadata = None
+        return actions, pdf_auto_download_src, pdf_auto_download_used_bytes
 
     async def _generate_cua_actions(
         self,
@@ -3346,8 +3464,11 @@ class ForgeAgent:
         step: Step,
         workflow_run: WorkflowRun | None = None,
         browser_session_id: str | None = None,
+        pre_resolved_browser_state: BrowserState | None = None,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
-        if workflow_run:
+        if pre_resolved_browser_state is not None:
+            browser_state = pre_resolved_browser_state
+        elif workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
                 url=task.url,
@@ -4996,6 +5117,14 @@ class ForgeAgent:
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+                submission_shadow.schedule_submission_signal_shadow(
+                    har_data=har_data,
+                    browser_state=browser_state,
+                    last_step=last_step,
+                    task=task,
+                    browser_session_id=browser_session_id,
+                )
             LOG.debug("Uploading har data", har_size=len(har_data))
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(

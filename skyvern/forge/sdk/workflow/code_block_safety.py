@@ -80,7 +80,7 @@ def is_safe_code(
     """Reject imports, private members, and known escape hatches."""
     tree = ast.parse(textwrap.dedent(code))
     for node in ast.walk(tree):
-        if hasattr(node, "attr") and str(node.attr).startswith("__"):
+        if hasattr(node, "attr") and str(node.attr).startswith("_"):
             raise error_factory("Not allowed to access private methods or attributes")
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise error_factory("Not allowed to access private methods or attributes")

@@ -13,18 +13,29 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
+    has_witnessed_value_content,
 )
-from skyvern.forge.sdk.copilot.context import FillCarry
+from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import (
+    FillCarry,
+    StructuredContext,
+    finalize_discovery_counter_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
+    record_scouted_output_coverage,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.result_evidence import scout_observation_bound_paths
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
@@ -78,6 +89,28 @@ def _bounded_extractor_payload() -> dict[str, Any]:
     }
 
 
+def _kv_only_extractor_payload() -> dict[str, Any]:
+    return {
+        "page_title": "Provider Record",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "key_value_relations": [
+            {
+                "key_text": "Ref Code",
+                "value_text": "AB-2931",
+                "container_selector": ".record .kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+    }
+
+
 def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleNamespace:
     return SimpleNamespace(
         pending_browser_interaction_observation=None,
@@ -91,6 +124,11 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         fill_carry_rebound_done=False,
         pending_scout_source_url=source_url,
         flow_evidence=[],
+        completion_criteria_turn_state=None,
+        last_code_authoring_repair_context=None,
+        copilot_config=None,
+        scout_observation_contract=None,
+        scouted_output_covered_paths=set(),
     )
 
 
@@ -485,6 +523,150 @@ class TestActObserveSuccess:
         assert page["modal_dismiss_controls"] == ["Accept"]
         assert len(json.dumps(result)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
 
+    @pytest.mark.asyncio
+    async def test_content_witnessed_kv_reveal_admitted_without_bounded_schema(self) -> None:
+        ctx = _ctx(server=_server_returning(_kv_only_extractor_payload()))
+
+        result = await _run_click(ctx)
+
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+        assert ctx.pending_browser_interaction_observation is None
+        assert len(ctx.flow_evidence) == 1
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "interaction"
+        assert entry["had_bounded_schema"] is False
+        evidence = entry["evidence"]
+        assert evidence["source_tool"] == "scout_interaction"
+        assert has_bounded_page_schema(evidence) is False
+        assert has_witnessed_value_content(evidence) is True
+
+
+def _zero_overlap_kv_relation(key_text: str, value_text: str, selector: str) -> dict[str, Any]:
+    return {
+        "key_text": key_text,
+        "value_text": value_text,
+        "container_selector": selector,
+        "container_match_count": 1,
+        "container_position": 0,
+        "value_child_index": 1,
+        "direct_child_count": 2,
+        "visible": True,
+        "value_visible": True,
+    }
+
+
+def _zero_overlap_kv_packet() -> dict[str, Any]:
+    return {
+        "current_url": _LANDING_URL,
+        "source_tool": "scout_interaction",
+        "interaction_selector": "#reveal",
+        "inspection_warnings": [],
+        "result_containers_truncated": False,
+        "key_value_relations_truncated": False,
+        "key_value_relations": [
+            _zero_overlap_kv_relation("Ref Code", "12345678", ".kv-ref"),
+            _zero_overlap_kv_relation("Site", "12 Peak Way Reno NV 89501", ".kv-site"),
+        ],
+        "result_containers": [],
+    }
+
+
+_ZERO_OVERLAP_BOUND_PATHS = {"output.widget_id", "output.address"}
+
+
+def _zero_overlap_requested_output_ctx() -> SimpleNamespace:
+    ctx = _ctx()
+    ctx.completion_criteria_turn_state = SimpleNamespace(
+        decision=SimpleNamespace(
+            criteria=(
+                CompletionCriterion(
+                    id="output.widget_id",
+                    outcome="the eight digit widget reference",
+                    output_path="output.widget_id",
+                ),
+                CompletionCriterion(
+                    id="output.address",
+                    outcome="the mailing address of the site",
+                    output_path="output.address",
+                ),
+            )
+        )
+    )
+    ctx.copilot_config = CopilotConfig(
+        requested_output_shape_expectations={
+            "widget_id": ShapeExpectation(ValueShape.NUMERIC_ID, ValueCardinality.SCALAR, id_digit_length=8),
+            "address": ShapeExpectation(ValueShape.POSTAL_ADDRESS, ValueCardinality.SCALAR),
+        }
+    )
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#reveal", "trajectory_index": 0}]
+    return ctx
+
+
+class TestActObserveCoverageCredit:
+    @pytest.mark.asyncio
+    async def test_click_admit_branch_credits_value_grounded_on_witnessed_reveal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            scouting_module, "_scout_act_observe_page_evidence", AsyncMock(return_value=_zero_overlap_kv_packet())
+        )
+        ctx = _zero_overlap_requested_output_ctx()
+
+        with capture_logs() as logs:
+            step, page_evidence = await _register_scout_interaction_observation(
+                ctx, tool_name="click", selector="#reveal", source_url=_SOURCE_URL, url=_LANDING_URL
+            )
+
+        assert page_evidence is not None
+        assert has_witnessed_value_content(page_evidence) is True
+        assert ctx.scout_observation_contract is not None
+        assert scout_observation_bound_paths(ctx.scout_observation_contract) == _ZERO_OVERLAP_BOUND_PATHS
+        assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert sorted(credited["value_grounded_paths"]) == sorted(_ZERO_OVERLAP_BOUND_PATHS)
+
+    @pytest.mark.asyncio
+    async def test_second_record_for_same_paths_emits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            scouting_module, "_scout_act_observe_page_evidence", AsyncMock(return_value=_zero_overlap_kv_packet())
+        )
+        ctx = _zero_overlap_requested_output_ctx()
+
+        await _register_scout_interaction_observation(
+            ctx, tool_name="click", selector="#reveal", source_url=_SOURCE_URL, url=_LANDING_URL
+        )
+        assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(
+                ctx, _zero_overlap_kv_packet(), contract=ctx.scout_observation_contract, include_lexical=False
+            )
+        assert not any(entry["event"] == "copilot_scouted_output_coverage_credited" for entry in logs)
+        assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
+
+    @pytest.mark.asyncio
+    async def test_unwitnessed_reveal_mints_and_credits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            scouting_module,
+            "_scout_act_observe_page_evidence",
+            AsyncMock(return_value={"current_url": _LANDING_URL, "forms": [], "key_value_relations": []}),
+        )
+        ctx = _zero_overlap_requested_output_ctx()
+        ctx.last_scout_act_observe_outcome = None
+
+        with capture_logs() as logs:
+            step, page_evidence = await _register_scout_interaction_observation(
+                ctx, tool_name="click", selector="#reveal", source_url=_SOURCE_URL, url=_LANDING_URL
+            )
+
+        assert page_evidence is None
+        assert ctx.scout_observation_contract is None
+        assert ctx.scouted_output_covered_paths == set()
+        assert not any(entry["event"] == "copilot_scouted_output_coverage_credited" for entry in logs)
+
 
 class TestActObserveDegrade:
     @pytest.mark.asyncio
@@ -672,6 +854,72 @@ class TestActObserveDegrade:
         assert not hasattr(ctx, "latest_recorded_build_test_outcome")
 
 
+class TestActObserveRecaptureSettle:
+    @pytest.mark.asyncio
+    async def test_bounded_settle_paid_before_single_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.6)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
+        )
+
+        parsed = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == [0.6]
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert parsed is not None and has_bounded_page_schema(parsed)
+
+    @pytest.mark.asyncio
+    async def test_zero_settle_pays_no_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
+        )
+
+        await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == []
+        assert ctx.last_scout_act_observe_outcome == "attached"
+
+    @pytest.mark.asyncio
+    async def test_attached_first_capture_pays_no_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.6)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
+
+        await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == []
+        assert ctx.last_scout_act_observe_outcome == "attached"
+
+    @pytest.mark.asyncio
+    async def test_capture_log_carries_container_and_relation_counts(self) -> None:
+        ctx = _ctx(server=_server_returning(_kv_only_extractor_payload()))
+
+        with capture_logs() as logs:
+            await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        probe = next(entry for entry in logs if entry["event"] == "copilot_scout_act_observe")
+        assert probe["result_container_count"] == 0
+        assert probe["key_value_relation_count"] == 1
+
+
 class TestActObserveNoRace:
     @pytest.mark.asyncio
     async def test_appended_entry_never_mutates_after_hook_returns(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -815,10 +1063,35 @@ class TestActObserveToolGate:
             ctx,
         )
 
-        server.call_internal_tool.assert_not_awaited()
+        awaited_tools = [call.args[0] for call in server.call_internal_tool.await_args_list]
+        assert awaited_tools == ["skyvern_get_value"]
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+
+    @pytest.mark.asyncio
+    async def test_bare_css_selector_probes_control_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def passes(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        server = _server_returning(_bounded_extractor_payload())
+        ctx = _ctx(server=server, source_url=_SOURCE_URL)
+
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#electricDate", "text_length": 10}},
+            {"browser_context": {"url": _LANDING_URL, "title": "Results"}},
+            ctx,
+        )
+
+        probed = [
+            call
+            for call in server.call_internal_tool.await_args_list
+            if call.args and call.args[0] == "skyvern_evaluate" and "readonly" in call.args[1]["expression"]
+        ]
+        assert len(probed) == 1
 
 
 def _np_ctx(*, server: Any = None, counter: int = 0) -> SimpleNamespace:
@@ -1199,3 +1472,142 @@ class TestClickReperceptionHardening:
 
         assert ctx.last_scout_act_observe_outcome == "attached"
         assert ctx.consecutive_no_progress_interaction_count == 0
+
+
+class TestCredentialInventoryCarry:
+    @staticmethod
+    def _credential_carry(available_fields: list[str] | None) -> dict[str, Any]:
+        return FillCarry(
+            source_url=_LANDING_URL,
+            selector="#password",
+            tool_name="fill_credential_field",
+            credential_id="cred_123",
+            credential_field="username",
+            available_fields=available_fields,
+        ).model_dump()
+
+    @pytest.mark.asyncio
+    async def test_rebind_rehydrates_inventory_alongside_carried_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_fill_carry = [self._credential_carry(["password", "username"])]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#password", "label": "Password"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
+
+    @pytest.mark.asyncio
+    async def test_page_mismatch_drops_carry_but_keeps_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_fill_carry = [self._credential_carry(["password", "username"])]
+        mismatched = {"current_url": "https://example.com/elsewhere", "forms": [{"fields": []}]}
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=mismatched, url="https://example.com/elsewhere")
+
+        assert ctx.scout_trajectory == []
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+
+    @pytest.mark.asyncio
+    async def test_legacy_carry_without_available_fields_rehydrates_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_fill_carry = [self._credential_carry(None)]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#password", "label": "Password"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {}
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
+
+    @pytest.mark.asyncio
+    async def test_inventory_round_trips_through_structured_context_and_agent_hydration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first_turn = SimpleNamespace(
+            prior_discovery_calls_made=0,
+            discovery_calls_this_turn=0,
+            prior_page_inspection_calls_made=0,
+            page_inspection_calls_this_turn=0,
+            flow_evidence=[],
+            latest_evaluate_result_composition_steer=None,
+            scout_trajectory=[
+                {
+                    "tool_name": "fill_credential_field",
+                    "selector": "#password",
+                    "source_url": _LANDING_URL,
+                    "typed_length": 10,
+                    "credential_id": "cred_123",
+                    "credential_field": "username",
+                }
+            ],
+            scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
+        )
+        raw = finalize_discovery_counter_in_global_llm_context(first_turn, None)
+        assert raw is not None
+
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        next_turn = _ctx()
+        next_turn.scouted_credential_field_inventory_by_credential_id = {}
+        next_turn.prior_fill_carry = [carry.model_dump() for carry in StructuredContext.from_json_str(raw).fill_carry]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#password", "label": "Password"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(next_turn, page_evidence=evidence, url=_LANDING_URL)
+
+        assert next_turn.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+        assert next_turn.scout_trajectory[-1]["credential_field"] == "username"
+
+
+class TestScoutPageObservationSignal:
+    def test_password_control_detected_in_forms(self) -> None:
+        evidence = {
+            "forms": [{"fields": [{"selector": "#user", "type": "text"}, {"selector": "#pass", "type": "password"}]}]
+        }
+        assert scouting_module._page_evidence_has_password_control(evidence) is True
+
+    def test_no_password_control_in_forms(self) -> None:
+        evidence = {"forms": [{"fields": [{"selector": "#user", "type": "text"}]}]}
+        assert scouting_module._page_evidence_has_password_control(evidence) is False
+        assert scouting_module._page_evidence_has_password_control({}) is False
+
+    def test_record_scout_page_observation_captures_stable_index_and_signal(self) -> None:
+        ctx = _ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#go", "source_url": _LANDING_URL, "trajectory_index": 4},
+            "scout-note",
+        ]
+        ctx.last_scout_observation_trajectory_index = None
+        ctx.last_scout_observation_has_password_control = False
+
+        scouting_module._record_scout_page_observation(
+            ctx, {"forms": [{"fields": [{"selector": "#pass", "type": "password"}]}]}
+        )
+
+        assert ctx.last_scout_observation_trajectory_index == 4
+        assert ctx.last_scout_observation_has_password_control is True
+
+        scouting_module._record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#name"}]}]})
+
+        assert ctx.last_scout_observation_has_password_control is False

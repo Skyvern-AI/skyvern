@@ -22,8 +22,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _apply_requested_output_completion_criteria,
     _apply_validation_classification_completion_criteria,
+    _classifier_fallback_policy,
     _classify_request,
     _criterion_grounding_mode,
+    _degrade_pathless_contingent_criteria,
     _parse_completion_criteria,
     _render_active_criteria_for_prompt,
     build_classifier_fallback_floor,
@@ -1540,6 +1542,7 @@ def test_active_criteria_rendering_includes_optional_fields(
             {
                 "outcome": "A provider blocker is reported to the user.",
                 "contingent_on": "the provider site blocks online submission",
+                "mint_degrade": "contingent_missing_antecedent",
             },
             id="contingent_on",
         ),
@@ -2079,3 +2082,110 @@ def test_scope_boundary_boolean_on_non_enumerated_path_keeps_judgment_invariant(
     assert kept.kind == "outcome"
     assert kept.expected_output_value is True
     assert kept.requested_output_evidence_source == "independent_run_evidence"
+
+
+@pytest.mark.asyncio
+async def test_classifier_success_path_degrades_pathless_contingent_criterion() -> None:
+    policy = await _policy_for_message(
+        "Submit the request and report any blocker.",
+        [
+            {"outcome": "A blocker is reported to the user.", "contingent_on": "the site blocks submission"},
+            {
+                "outcome": "A blocker is reported with evidence.",
+                "contingent_on": "the site blocks submission with evidence",
+                "contingent_antecedent_output_path": "output.blocker",
+            },
+        ],
+    )
+
+    by_contingent = {c.contingent_on: c for c in policy.completion_criteria if c.contingent_on}
+    assert by_contingent["the site blocks submission"].mint_degrade == "contingent_missing_antecedent"
+    assert by_contingent["the site blocks submission with evidence"].mint_degrade is None
+
+
+@pytest.mark.asyncio
+async def test_canonicalization_carry_of_pathless_contingent_is_mint_degraded() -> None:
+    policy = await _policy_for_message(
+        "Return a final record with NPI.",
+        [
+            {
+                "outcome": "The returned record includes NPI.",
+                "output_path": "output.npi",
+                "contingent_on": "the provider site allows online lookup",
+            }
+        ],
+    )
+
+    (canonical,) = (c for c in policy.completion_criteria if c.output_path == "output.npi")
+    assert canonical.contingent_on == "the provider site allows online lookup"
+    assert canonical.contingent_antecedent_output_path is None
+    assert canonical.mint_degrade == "contingent_missing_antecedent"
+
+
+def test_fallback_policy_upholds_contingent_mint_invariant() -> None:
+    policy = _classifier_fallback_policy(
+        [],
+        raw_secret_present=False,
+        failure_kind="provider_error",
+        user_message="return the status for the record",
+    )
+
+    assert policy.completion_criteria
+    assert all(
+        criterion.contingent_antecedent_output_path is not None or criterion.mint_degrade is not None
+        for criterion in policy.completion_criteria
+        if criterion.contingent_on
+    )
+
+
+def test_degrade_sweep_targets_only_pathless_contingent_criteria() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            _criterion("c0", "A blocker is reported to the user.", contingent_on="the site blocks submission"),
+            _criterion(
+                "c1",
+                "A blocker is reported with evidence.",
+                contingent_on="the site blocks submission with evidence",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+            _criterion("c2", "The request is submitted."),
+        ]
+    )
+
+    _degrade_pathless_contingent_criteria(policy)
+
+    degrades = {criterion.id: criterion.mint_degrade for criterion in policy.completion_criteria}
+    assert degrades == {"c0": "contingent_missing_antecedent", "c1": None, "c2": None}
+
+
+def test_degrade_sweep_preserves_existing_mint_degrade() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            replace(
+                _criterion("c0", "return the status", contingent_on="the site blocks submission"),
+                mint_degrade="turn_unsatisfiable_fallback",
+            )
+        ]
+    )
+
+    _degrade_pathless_contingent_criteria(policy)
+
+    assert policy.completion_criteria[0].mint_degrade == "turn_unsatisfiable_fallback"
+
+
+def test_to_trace_data_reports_mint_degraded_criteria_without_output_path() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            replace(
+                _criterion("c0", "A blocker is reported to the user.", contingent_on="the site blocks submission"),
+                mint_degrade="contingent_missing_antecedent",
+            ),
+            _criterion("c1", "The request is submitted."),
+        ]
+    )
+
+    data = policy.to_trace_data()
+
+    assert data["mint_degraded_criterion_count"] == 1
+    assert data["mint_degraded_criterion_0_id"] == "c0"
+    assert data["mint_degraded_criterion_0_mint_degrade"] == "contingent_missing_antecedent"

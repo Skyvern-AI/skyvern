@@ -180,6 +180,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         totp_identifier: totpIdentifier,
         max_screenshot_scrolls: maxScreenshotScrolls,
         publish_workflow: publishWorkflow,
+        generate_script: generateScript,
         run_with: "agent",
         ai_fallback: true,
         extracted_information_schema: dataSchema
@@ -204,6 +205,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
 
       request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
 
+      const trimmedMaxStepsOverride = maxStepsOverride?.trim();
       const result = await client.post<
         Createv2TaskRequest,
         { data: WorkflowApiResponse }
@@ -213,11 +215,9 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
           task_version: "v1",
           request,
         },
-        {
-          headers: {
-            "x-max-steps-override": maxStepsOverride,
-          },
-        },
+        trimmedMaxStepsOverride
+          ? { headers: { "x-max-steps-override": trimmedMaxStepsOverride } }
+          : undefined,
       );
 
       return result;
@@ -627,6 +627,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
               key={example.key}
               icon={example.icon}
               label={example.label}
+              disabled={isSubmitting}
               onClick={() => {
                 submitPrompt({ prompt: example.prompt });
               }}

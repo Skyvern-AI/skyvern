@@ -79,11 +79,16 @@ def _stub_evaluate(
     """
     matched_states = list(matched_state) if isinstance(matched_state, list) else None
 
+    def _matched_state_with_defaults(state: dict | None) -> dict | None:
+        if state is None:
+            return None
+        return {"role": "", "nestedChoice": False, "inMultiselectable": False, **state}
+
     async def _evaluate(*, frame: object, expression: str, arg: object = None) -> object:
-        if "return { label," in expression:
+        if "const nestedChoice =" in expression:
             if matched_states is not None:
-                return matched_states.pop(0) if matched_states else None
-            return matched_state
+                return _matched_state_with_defaults(matched_states.pop(0)) if matched_states else None
+            return _matched_state_with_defaults(matched_state)
         if "anchorIsComboboxInput" in expression:
             return committed
         return None
@@ -389,6 +394,97 @@ class TestCustomSelectCandidates:
             {"label": "Choice", "element_id": "opt-choice", "value": None, "is_choice_input": True}
         ]
 
+    @pytest.mark.parametrize(
+        ("role", "aria_multiselectable", "expected"),
+        [
+            ("option", "true", True),
+            ("treeitem", "TRUE", True),
+            ("option", None, False),
+            ("treeitem", "false", False),
+            ("option", True, False),
+        ],
+    )
+    def test_multiselectable_container_marks_option_shapes_as_choice_inputs(
+        self,
+        role: str,
+        aria_multiselectable: str | bool | None,
+        expected: bool,
+    ) -> None:
+        container_attributes: dict[str, object] = {"role": "tree" if role == "treeitem" else "listbox"}
+        if aria_multiselectable is not None:
+            container_attributes["aria-multiselectable"] = aria_multiselectable
+        tree = [
+            {
+                "id": "choice-panel",
+                "tagName": "div",
+                "attributes": container_attributes,
+                "children": [
+                    {
+                        "id": "choice-alpha",
+                        "tagName": "div",
+                        "attributes": {"role": role, "aria-selected": "false"},
+                        "text": "Alpha",
+                        "interactable": True,
+                    }
+                ],
+            }
+        ]
+
+        assert _custom_select_candidates_from_elements(tree) == [
+            {"label": "Alpha", "element_id": "choice-alpha", "value": None, "is_choice_input": expected}
+        ]
+
+    def test_label_wrapping_idless_checkbox_is_choice_input_shaped(self) -> None:
+        tree = [
+            {
+                "id": "choice-label",
+                "tagName": "label",
+                "text": "Alpha",
+                "interactable": True,
+                "children": [
+                    {
+                        "tagName": "input",
+                        "attributes": {"type": "checkbox"},
+                        "interactable": True,
+                    }
+                ],
+            }
+        ]
+
+        assert _custom_select_candidates_from_elements(tree) == [
+            {"label": "Alpha", "element_id": "choice-label", "value": None, "is_choice_input": True}
+        ]
+
+    def test_every_candidate_includes_is_choice_input(self) -> None:
+        candidates = _custom_select_candidates_from_elements(
+            [
+                {
+                    "id": "choice-panel",
+                    "tagName": "div",
+                    "attributes": {"role": "listbox"},
+                    "children": [
+                        {
+                            "id": "choice-alpha",
+                            "tagName": "div",
+                            "attributes": {"role": "option"},
+                            "text": "Alpha",
+                            "interactable": True,
+                        }
+                    ],
+                },
+                {
+                    "id": "choice-radio",
+                    "tagName": "div",
+                    "attributes": {"role": "radio"},
+                    "text": "Beta",
+                    "interactable": True,
+                },
+            ]
+        )
+
+        assert candidates
+        assert all(isinstance(candidate["is_choice_input"], bool) for candidate in candidates)
+
 
 class TestDeterministicCustomSelect:
     @pytest.mark.asyncio
@@ -396,7 +492,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         get_skyvern_element = AsyncMock()
@@ -405,8 +504,8 @@ class TestDeterministicCustomSelect:
         result = await _select_deterministic_custom_option(
             target_value="United States",
             get_option_candidates=lambda: [
-                {"label": "United States", "element_id": "us-1", "value": "US"},
-                {"label": "United States", "element_id": "us-2", "value": "USA"},
+                {"label": "United States", "element_id": "us-1", "value": "US", "is_choice_input": False},
+                {"label": "United States", "element_id": "us-2", "value": "USA", "is_choice_input": False},
             ],
             field_context={},
             page=MagicMock(),
@@ -424,14 +523,19 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=False),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=False),
+            ),
         )
         get_skyvern_element = AsyncMock()
         get_readback_scope_element = AsyncMock()
 
         result = await _select_deterministic_custom_option(
             target_value="Job Board",
-            get_option_candidates=lambda: [{"label": "Job Board", "element_id": "source-job-board", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": False}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=get_skyvern_element,
@@ -449,7 +553,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="15",
-            get_option_candidates=lambda: [{"label": "15", "element_id": "day-15", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "15", "element_id": "day-15", "value": None, "is_choice_input": False}
+            ],
             field_context={"is_date_related": True},
             page=MagicMock(),
             get_skyvern_element=get_skyvern_element,
@@ -466,14 +572,19 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         selected_element = _FakeCustomElement(role="listbox")
 
         result = await _select_deterministic_custom_option(
             target_value="Job Board",
-            get_option_candidates=lambda: [{"label": "Job Board", "element_id": "source-panel", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "Job Board", "element_id": "source-panel", "value": None, "is_choice_input": False}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -491,7 +602,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -513,7 +627,58 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="Choice",
-            get_option_candidates=lambda: [{"label": "Choice", "element_id": "choice-radio", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "Choice", "element_id": "choice-radio", "value": None, "is_choice_input": True}
+            ],
+            field_context={},
+            page=MagicMock(),
+            get_skyvern_element=AsyncMock(return_value=selected_element),
+            task=_task(),  # type: ignore[arg-type]
+        )
+
+        assert result is not None
+        action_result, matched_label = result
+        assert action_result.success
+        assert matched_label == "Choice"
+        selected_element.click.assert_not_awaited()
+        selected_element.scroll_into_view.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_already_selected_multiselectable_option_returns_success_without_clicking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler.app,
+            "EXPERIMENTATION_PROVIDER",
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
+        )
+        monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+        monkeypatch.setattr(
+            handler.SkyvernFrame,
+            "evaluate",
+            _stub_evaluate(
+                matched_state={
+                    "label": "Choice",
+                    "role": "option",
+                    "inMultiselectable": True,
+                    "ariaSelected": True,
+                    "ariaChecked": False,
+                    "selectedAttr": False,
+                    "checked": False,
+                }
+            ),
+        )
+        selected_element = _FakeCustomElement(role="option")
+        selected_element.get_locator().count = AsyncMock(return_value=1)
+
+        result = await _select_deterministic_custom_option(
+            target_value="Choice",
+            get_option_candidates=lambda: [
+                {"label": "Choice", "element_id": "choice-option", "value": None, "is_choice_input": True}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -534,7 +699,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -549,7 +717,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="WAKE",
-            get_option_candidates=lambda: [{"label": "WAKE", "element_id": "county-wake", "value": "WAKE"}],
+            get_option_candidates=lambda: [
+                {"label": "WAKE", "element_id": "county-wake", "value": "WAKE", "is_choice_input": True}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -570,13 +740,18 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         matched_states = [
             {
                 "label": "Job Board",
                 "role": "option",
+                "nestedChoice": False,
+                "inMultiselectable": False,
                 "ariaSelected": True,
                 "ariaChecked": False,
                 "selectedAttr": False,
@@ -585,6 +760,8 @@ class TestDeterministicCustomSelect:
             {
                 "label": "Job Board",
                 "role": "option",
+                "nestedChoice": False,
+                "inMultiselectable": False,
                 "ariaSelected": True,
                 "ariaChecked": False,
                 "selectedAttr": False,
@@ -594,7 +771,7 @@ class TestDeterministicCustomSelect:
         scope_args: list[dict[str, object]] = []
 
         async def evaluate(*, frame: object, expression: str, arg: object = None) -> object:
-            if "return { label," in expression:
+            if "const nestedChoice =" in expression:
                 return matched_states.pop(0)
             if "anchorIsComboboxInput" in expression:
                 assert isinstance(arg, list)
@@ -610,7 +787,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="Job Board",
-            get_option_candidates=lambda: [{"label": "Job Board", "element_id": "source-job-board", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": False}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -630,7 +809,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -648,7 +830,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="WAKE",
-            get_option_candidates=lambda: [{"label": "WAKE", "element_id": "county-wake", "value": "WAKE"}],
+            get_option_candidates=lambda: [
+                {"label": "WAKE", "element_id": "county-wake", "value": "WAKE", "is_choice_input": True}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -668,7 +852,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -686,7 +873,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="Job Board",
-            get_option_candidates=lambda: [{"label": "Job Board", "element_id": "source-job-board", "value": None}],
+            get_option_candidates=lambda: [
+                {"label": "Job Board", "element_id": "source-job-board", "value": None, "is_choice_input": False}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -707,7 +896,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -745,13 +937,134 @@ class TestDeterministicCustomSelect:
         selected_element.click.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_live_multiselectable_option_hard_fails_when_trimmed_tree_loses_ancestor_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler.app,
+            "EXPERIMENTATION_PROVIDER",
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
+        )
+        monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+        monkeypatch.setattr(
+            handler.SkyvernFrame,
+            "evaluate",
+            _stub_evaluate(
+                matched_state={
+                    "label": "Alpha",
+                    "role": "option",
+                    "inMultiselectable": True,
+                    "ariaSelected": False,
+                    "selectedAttr": False,
+                    "checked": False,
+                },
+                committed=False,
+            ),
+        )
+        selected_element = _FakeCustomElement(role="option")
+        selected_element.get_locator().count = AsyncMock(return_value=1)
+        readback_scope_element = _FakeAnchorElement(tag_name="button")
+        candidates = _custom_select_candidates_from_elements(
+            [
+                {
+                    "id": "choice-panel",
+                    "tagName": "div",
+                    "children": [
+                        {
+                            "id": "choice-alpha",
+                            "tagName": "div",
+                            "attributes": {"role": "option", "aria-selected": "false"},
+                            "text": "Alpha",
+                            "interactable": True,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        result = await _select_deterministic_custom_option(
+            target_value="Alpha",
+            get_option_candidates=lambda: candidates,
+            field_context={},
+            page=MagicMock(),
+            get_skyvern_element=AsyncMock(return_value=selected_element),
+            get_readback_scope_element=AsyncMock(return_value=readback_scope_element),
+            task=_task(),  # type: ignore[arg-type]
+        )
+
+        assert candidates[0]["is_choice_input"] is False
+        assert result is not None
+        action_result, matched_label = result
+        assert not action_result.success
+        assert action_result.skip_remaining_actions is True
+        assert matched_label == "Alpha"
+        selected_element.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("walk_is_choice_input", [True, False])
+    async def test_missing_live_matched_state_falls_back_to_walk_classification(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        walk_is_choice_input: bool,
+    ) -> None:
+        monkeypatch.setattr(
+            handler.app,
+            "EXPERIMENTATION_PROVIDER",
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
+        )
+        monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+        monkeypatch.setattr(
+            handler.SkyvernFrame,
+            "evaluate",
+            _stub_evaluate(matched_state=None, committed=False),
+        )
+        selected_element = _FakeCustomElement()
+        selected_element.get_locator().count = AsyncMock(return_value=1)
+
+        result = await _select_deterministic_custom_option(
+            target_value="Alpha",
+            get_option_candidates=lambda: [
+                {
+                    "label": "Alpha",
+                    "element_id": "choice-alpha",
+                    "value": None,
+                    "is_choice_input": walk_is_choice_input,
+                }
+            ],
+            field_context={},
+            page=MagicMock(),
+            get_skyvern_element=AsyncMock(return_value=selected_element),
+            get_readback_scope_element=AsyncMock(return_value=_FakeAnchorElement()),
+            task=_task(),  # type: ignore[arg-type]
+        )
+
+        if walk_is_choice_input:
+            assert result is not None
+            action_result, matched_label = result
+            assert not action_result.success
+            assert action_result.skip_remaining_actions is True
+            assert matched_label == "Alpha"
+        else:
+            assert result is None
+        selected_element.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_clicked_but_unverified_non_choice_option_soft_fails_to_llm(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -790,7 +1103,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -808,7 +1124,9 @@ class TestDeterministicCustomSelect:
 
         result = await _select_deterministic_custom_option(
             target_value="WAKE",
-            get_option_candidates=lambda: [{"label": "WAKE", "element_id": "source-wake", "value": "WAKE"}],
+            get_option_candidates=lambda: [
+                {"label": "WAKE", "element_id": "source-wake", "value": "WAKE", "is_choice_input": False}
+            ],
             field_context={},
             page=MagicMock(),
             get_skyvern_element=AsyncMock(return_value=selected_element),
@@ -861,7 +1179,7 @@ class TestDeterministicCustomSelect:
         async def evaluate(*, frame: object, expression: str, arg: object = None) -> object:
             captured["expression"] = expression
             captured["arg"] = arg
-            if "return { label," in expression:
+            if "const nestedChoice =" in expression:
                 return None
             return True
 
@@ -919,7 +1237,10 @@ class TestDeterministicCustomSelect:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -992,13 +1313,105 @@ class TestDeterministicCustomSelect:
         select_from_dropdown_by_value.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_handle_select_option_action_multiselectable_option_hard_fails_via_live_dom(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            handler.app,
+            "EXPERIMENTATION_PROVIDER",
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
+        )
+        monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
+        monkeypatch.setattr(
+            handler.SkyvernFrame,
+            "evaluate",
+            _stub_evaluate(
+                matched_state={
+                    "label": "Choice",
+                    "role": "option",
+                    "inMultiselectable": True,
+                    "ariaSelected": False,
+                    "selectedAttr": False,
+                    "checked": False,
+                },
+                committed=False,
+            ),
+        )
+
+        anchor_element = _FakeAnchorElement()
+        selected_element = _FakeCustomElement(role="option")
+        selected_element.get_locator().count = AsyncMock(return_value=1)
+        fake_frame = MagicMock()
+        fake_frame.safe_wait_for_animation_end = AsyncMock()
+        # Trimmed-shape option node: role=option survives trimming, but the container's
+        # aria-multiselectable does not — the walk classifies False and only the live-DOM
+        # pre-click read (stubbed above) can catch the toggle hazard.
+        fake_incremental = _FakeIncrementalScrapePage(
+            [
+                [{"id": "opened-option"}],
+                [
+                    {
+                        "id": "choice-option",
+                        "tagName": "div",
+                        "attributes": {"role": "option"},
+                        "text": "Choice",
+                        "interactable": True,
+                    }
+                ],
+            ]
+        )
+
+        class FakeDomUtil:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            async def get_skyvern_element_by_id(self, _element_id: str) -> _FakeAnchorElement:
+                return anchor_element
+
+        select_from_dropdown_by_value = AsyncMock(return_value=handler.ActionSuccess())
+        monkeypatch.setattr(handler, "DomUtil", FakeDomUtil)
+        monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame))
+        monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock(return_value=fake_incremental))
+        monkeypatch.setattr(
+            handler,
+            "_get_input_or_select_context",
+            AsyncMock(return_value=InputOrSelectContext(field="Field", is_required=True)),
+        )
+        monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=None))
+        monkeypatch.setattr(handler.SkyvernElement, "create_from_incremental", AsyncMock(return_value=selected_element))
+        monkeypatch.setattr(handler, "select_from_dropdown_by_value", select_from_dropdown_by_value)
+
+        results = await handler.handle_select_option_action(
+            action=_select_action(),
+            page=MagicMock(),
+            scraped_page=SimpleNamespace(
+                id_to_element_dict={"field-control": {"id": "field-control"}},
+                id_to_css_dict={},
+            ),
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert len(results) == 1
+        assert not results[0].success
+        assert results[0].skip_remaining_actions is True
+        selected_element.click.assert_awaited_once()
+        select_from_dropdown_by_value.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_select_from_dropdown_deterministic_success_skips_custom_select_prompt_and_llm(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(
             handler.app,
             "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True)),
+            SimpleNamespace(
+                is_feature_enabled_cached=AsyncMock(return_value=True),
+                resolve_feature_enabled_unrecorded=AsyncMock(return_value=True),
+            ),
         )
         monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
         monkeypatch.setattr(
@@ -1063,7 +1476,7 @@ class TestDeterministicCustomSelect:
         async def evaluate(*, frame: object, expression: str, arg: object = None) -> object:
             if "anchorIsComboboxInput" in expression:
                 captured["expression"] = expression
-            if "return { label," in expression:
+            if "const nestedChoice =" in expression:
                 return None
             return False
 

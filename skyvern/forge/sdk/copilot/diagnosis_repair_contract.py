@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     only_structural_requested_output_abstentions,
@@ -162,8 +163,9 @@ def build_diagnosis_repair_contract(
     run_ok = bool(result.get("ok", False))
     suspicious = run_ok and bool(getattr(ctx, "last_test_suspicious_success", False))
     failed_blocks = _failed_block_labels(blocks)
-    categories = _failure_categories(data)
-    terminal_challenge_categories = _trusted_terminal_challenge_categories(data)
+    carrier_categories = carrier_backed_anti_bot_categories(data.get("failure_categories"))
+    categories = _failure_categories(carrier_categories)
+    terminal_challenge_categories = _trusted_terminal_challenge_categories(carrier_categories)
     run_status = _safe_str(data.get("overall_status"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     summary = _failure_summary(result, data, blocks)
@@ -436,10 +438,7 @@ def _turn_intent_summary(ctx: Any) -> dict[str, Any]:
         return {}
 
 
-def _failure_categories(data: dict[str, Any]) -> list[str]:
-    raw = data.get("failure_categories")
-    if not isinstance(raw, list):
-        return []
+def _failure_categories(raw: list[Any]) -> list[str]:
     return list(
         dict.fromkeys(
             category
@@ -451,10 +450,7 @@ def _failure_categories(data: dict[str, Any]) -> list[str]:
     )
 
 
-def _trusted_terminal_challenge_categories(data: dict[str, Any]) -> list[str]:
-    raw = data.get("failure_categories")
-    if not isinstance(raw, list):
-        return []
+def _trusted_terminal_challenge_categories(raw: list[Any]) -> list[str]:
     return list(
         dict.fromkeys(
             category

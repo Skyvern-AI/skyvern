@@ -967,6 +967,7 @@ function WorkflowsFlat() {
                           tagKeys={tagKeys}
                           labelSuggestions={labelSuggestions}
                           valueSuggestionsByKey={valueSuggestionsByKey}
+                          currentTags={workflowTags ?? []}
                           taggingEnabled={taggingEnabled}
                           selectedCount={selected.size}
                           onNavigate={(path) => navigate(path)}

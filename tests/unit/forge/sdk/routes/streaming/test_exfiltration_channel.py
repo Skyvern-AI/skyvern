@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import json
 import typing as t
 import weakref
@@ -99,7 +98,15 @@ class TestExfiltrationChannelEvents:
 
     def test_page_tracking_releases_collected_pages(self) -> None:
         channel, _ = _make_channel()
-        page = _make_page()
+
+        # A real MagicMock page carries internal reference cycles, forcing a
+        # full-heap gc.collect() to reclaim it (seconds late in the suite). A
+        # cycle-free stand-in is reclaimed by refcounting the moment the last
+        # strong reference drops, so the weak trackers clear without a collect.
+        class _Page:
+            pass
+
+        page = _Page()
         page_ref = weakref.ref(page)
 
         ExfiltrationChannel._active_binding_channels[page] = channel
@@ -107,7 +114,6 @@ class TestExfiltrationChannelEvents:
         channel._page_console_captures[page] = PageConsoleCapture(console_listener=MagicMock())
 
         del page
-        gc.collect()
 
         assert page_ref() is None
         assert not ExfiltrationChannel._active_binding_channels

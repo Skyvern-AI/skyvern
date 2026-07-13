@@ -767,7 +767,10 @@ async def skyvern_get_html(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
 ) -> dict[str, Any]:
-    """Get HTML content of a DOM element. Returns innerHTML by default; set outer=true for outerHTML."""
+    """Get HTML content of a DOM element identified by `selector` on the CURRENT page. Returns innerHTML
+    by default; set outer=true for outerHTML. This does NOT accept a url and cannot fetch HTML by URL —
+    to read a page you have not opened yet, navigate there first with skyvern_navigate(url=...), then
+    call this with a selector."""
     from skyvern.cli.core.browser_ops import do_get_html
 
     try:

@@ -12,6 +12,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -21,7 +22,11 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
+from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
+    ScoutObservationContract,
+    scout_observation_contract_valid,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeReasonCode
 
 LOG = structlog.get_logger()
@@ -228,6 +233,7 @@ class RecordedOutcomeBindingConstraint(BaseModel):
 class _RecordedBuildTestOutcomeContext(Protocol):
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
     recorded_build_test_outcome_history: list[dict[str, object]]
+    recorded_persisted_block_run_workflow_run_id: str | None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None
 
@@ -253,6 +259,8 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     )
     del history[:-_HISTORY_LIMIT]
     ctx.recorded_build_test_outcome_history = history
+    if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
+        ctx.recorded_persisted_block_run_workflow_run_id = outcome.workflow_run_id
     LOG.info(
         "copilot recorded build-test outcome stored",
         phase=outcome.phase,
@@ -398,14 +406,10 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
 
 
 def run_backed_repair_evidence_exists(ctx: object) -> bool:
-    fallback_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    latest = getattr(ctx, "latest_recorded_build_test_outcome", None)
-    if isinstance(latest, RecordedBuildTestOutcome):
-        # An author-time reject is never run-backed even if a stale run id lingers on ctx; only a persisted run counts.
-        if latest.phase != "persisted_block_run":
-            return False
-        return bool(latest.workflow_run_id or fallback_run_id)
-    return bool(fallback_run_id)
+    # Reached from the enforcement belt with an untyped ctx; a ctx without the latch must read as
+    # "no run-backed evidence" so the guardrail fails safe instead of raising.
+    run_id = getattr(ctx, "recorded_persisted_block_run_workflow_run_id", None)
+    return isinstance(run_id, str) and bool(run_id)
 
 
 def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGroundingRequirement | None:
@@ -438,6 +442,7 @@ def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGr
     )
     if workflow_run_id is None:
         ctx.composition_page_evidence = None  # type: ignore[attr-defined]
+        ctx.scout_observation_contract = None  # type: ignore[attr-defined]
     ctx.recorded_outcome_grounding_requirement = requirement  # type: ignore[attr-defined]
     LOG.info(
         "copilot recorded outcome grounding armed",
@@ -465,6 +470,9 @@ def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
     evidence = getattr(ctx, "composition_page_evidence", None)
     if isinstance(evidence, dict) and _evidence_current_url(evidence):
         return True
+    contract = getattr(ctx, "scout_observation_contract", None)
+    if scout_observation_contract_valid(contract):
+        return True
     observed_urls = getattr(ctx, "observed_browser_urls", None)
     return isinstance(observed_urls, list) and any(isinstance(url, str) and url.strip() for url in observed_urls)
 
@@ -474,9 +482,12 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     if not isinstance(requirement, RecordedOutcomeGroundingRequirement):
         return False
     evidence = getattr(ctx, "composition_page_evidence", None)
+    contract = getattr(ctx, "scout_observation_contract", None)
     payload = _grounding_payload_from_evidence(requirement, evidence)
     if payload is None:
-        _log_grounding_rejection(requirement, evidence)
+        payload = _grounding_payload_from_scout_contract(requirement, contract)
+    if payload is None:
+        _log_grounding_rejection(requirement, evidence, contract)
         return False
     satisfied_requirement = requirement.model_copy(update={"satisfied": True, "payload": payload})
     ctx.recorded_outcome_grounding_requirement = satisfied_requirement  # type: ignore[attr-defined]
@@ -492,11 +503,15 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     return True
 
 
-def _log_grounding_rejection(requirement: RecordedOutcomeGroundingRequirement, evidence: object) -> None:
+def _log_grounding_rejection(
+    requirement: RecordedOutcomeGroundingRequirement,
+    evidence: object,
+    contract: object = None,
+) -> None:
     evidence_dict = evidence if isinstance(evidence, dict) else {}
     LOG.info(
         "copilot recorded outcome grounding rejected",
-        reject_reason=_grounding_reject_reason(requirement, evidence),
+        reject_reason=_grounding_reject_reason(requirement, evidence, contract),
         structural_key=requirement.structural_key,
         requirement_workflow_run_id=requirement.workflow_run_id,
         evidence_workflow_run_id=evidence_dict.get("workflow_run_id"),
@@ -509,16 +524,64 @@ def _log_grounding_rejection(requirement: RecordedOutcomeGroundingRequirement, e
 def _grounding_reject_reason(
     requirement: RecordedOutcomeGroundingRequirement,
     evidence: object,
+    contract: object = None,
 ) -> Literal["not_inspect_source", "degraded_page", "run_id_mismatch", "no_url"]:
-    if not isinstance(evidence, dict) or evidence.get("source_tool") != _INSPECT_PAGE_SOURCE_TOOL:
+    if isinstance(evidence, dict) and evidence.get("source_tool") == _INSPECT_PAGE_SOURCE_TOOL:
+        if _evidence_current_url(evidence) is None:
+            return "no_url"
+        run_id = requirement.workflow_run_id
+        if isinstance(run_id, str) and run_id:
+            if evidence.get("observed_after_workflow_run") is not True or evidence.get("workflow_run_id") != run_id:
+                return "run_id_mismatch"
+        return "degraded_page"
+    if isinstance(contract, ScoutObservationContract):
+        return _scout_contract_reject_reason(requirement, contract)
+    return "not_inspect_source"
+
+
+def _scout_contract_reject_reason(
+    requirement: RecordedOutcomeGroundingRequirement,
+    contract: ScoutObservationContract,
+) -> Literal["not_inspect_source", "degraded_page", "run_id_mismatch", "no_url"]:
+    if not scout_observation_contract_valid(contract):
         return "not_inspect_source"
-    if _evidence_current_url(evidence) is None:
+    if not contract.source_url.strip():
         return "no_url"
     run_id = requirement.workflow_run_id
     if isinstance(run_id, str) and run_id:
-        if evidence.get("observed_after_workflow_run") is not True or evidence.get("workflow_run_id") != run_id:
+        if not contract.observed_after_workflow_run or contract.workflow_run_id != run_id:
             return "run_id_mismatch"
     return "degraded_page"
+
+
+def _grounding_payload_from_scout_contract(
+    requirement: RecordedOutcomeGroundingRequirement,
+    contract: object,
+) -> RecordedOutcomeGroundingPayload | None:
+    if not isinstance(contract, ScoutObservationContract) or not scout_observation_contract_valid(contract):
+        return None
+    run_id = requirement.workflow_run_id
+    if isinstance(run_id, str) and run_id:
+        if not contract.observed_after_workflow_run or contract.workflow_run_id != run_id:
+            return None
+    capture_degraded = not contract.has_bounded_page_schema
+    diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = (
+        "capture_degraded" if capture_degraded else "none"
+    )
+    return RecordedOutcomeGroundingPayload(
+        repeated_structural_key=requirement.structural_key,
+        source_tool=contract.source_tool,
+        observed_after_workflow_run=contract.observed_after_workflow_run,
+        workflow_run_id=contract.workflow_run_id,
+        capture_degraded=capture_degraded,
+        target_url=requirement.required_target_url,
+        source_url=contract.source_url,
+        requirement_workflow_run_id=requirement.workflow_run_id,
+        payload_workflow_run_id=contract.workflow_run_id,
+        diagnostic_reason=diagnostic_reason,
+        current_origin=_origin(contract.source_url),
+        current_url_present=True,
+    )
 
 
 def _grounding_payload_from_evidence(
@@ -1041,7 +1104,7 @@ def recorded_outcome_from_run_blocks_result(
         )
     run_status = _safe_str(data.get("overall_status"))
     failure_type = _safe_str(data.get("failure_type"))
-    failure_categories = _failure_category_refs(data.get("failure_categories"))
+    failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
     runtime_failure_identity = _runtime_failure_identity(failed_block)
     if referenced_unbound_keys:
@@ -1710,6 +1773,17 @@ def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
     if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
         return ""
     return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
+
+
+def registered_output_payload_binds_output_path(
+    payloads: Sequence[Mapping[str, object]],
+    output_path: str,
+) -> bool:
+    for item in payloads:
+        value, present = _registered_output_value_for_path(item, output_path)
+        if present and not _is_empty_output_value(value):
+            return True
+    return False
 
 
 def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:

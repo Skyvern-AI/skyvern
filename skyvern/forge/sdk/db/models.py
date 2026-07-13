@@ -40,6 +40,9 @@ from skyvern.forge.sdk.db.id import (
     generate_debug_session_id,
     generate_folder_id,
     generate_google_oauth_credential_id,
+    generate_heal_episode_id,
+    generate_heal_proposal_id,
+    generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -194,6 +197,10 @@ class OrganizationModel(Base):
     bw_organization_id = Column(String, nullable=True, default=None)
     bw_collection_ids = Column(JSON, nullable=True, default=None)
     artifact_url_expiry_seconds = Column(Integer, nullable=True)
+    selfheal_screenshot_capture_enabled = Column(
+        Boolean, default=False, nullable=False, server_default=sqlalchemy.false()
+    )
+    selfheal_artifact_retention_days = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -383,7 +390,7 @@ class WorkflowTagEventModel(Base):
         ),
         CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
         CheckConstraint(
-            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import')",
+            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import', 'system')",
             name="ck_workflow_tag_events_source",
         ),
         CheckConstraint(
@@ -741,6 +748,7 @@ class WorkflowRunModel(Base):
 
     credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     cached_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
+    topup_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -1744,6 +1752,76 @@ class ScriptFallbackEpisodeModel(Base):
     )
 
 
+class HealEpisodeModel(Base):
+    __tablename__ = "heal_episodes"
+    __table_args__ = (
+        Index("he_org_wpid_index", "organization_id", "workflow_permanent_id", "created_at"),
+        Index("he_org_created_at_index", "organization_id", "created_at"),
+        Index("he_org_wrid_index", "organization_id", "workflow_run_id"),
+    )
+
+    heal_episode_id = Column(String, primary_key=True, default=generate_heal_episode_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    workflow_run_block_id = Column(String, nullable=False)
+    block_label = Column(String, nullable=False)
+    engine = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    skip_reason = Column(String, nullable=True)
+    block_prompt = Column(UnicodeText, nullable=True)
+    block_code = Column(UnicodeText, nullable=True)
+    block_steps = Column(JSON, nullable=True)
+    snapshot_available = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    convergence_eligible = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    parameter_binding_keys = Column(JSON, nullable=True)
+    exception_class = Column(String, nullable=True)
+    failing_line = Column(Integer, nullable=True)
+    matched_step_index = Column(Integer, nullable=True)
+    failure_message = Column(UnicodeText, nullable=True)
+    escalation_task_id = Column(String, nullable=True)
+    wall_clock_ms = Column(Integer, nullable=True)
+    action_count = Column(Integer, nullable=True)
+    output_obligation = Column(String, nullable=True)
+    dom_snapshot_artifact_id = Column(String, nullable=True)
+    scout_transcript_artifact_id = Column(String, nullable=True)
+    screenshot_artifact_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class WorkflowHealProposalModel(Base):
+    __tablename__ = "workflow_heal_proposals"
+    __table_args__ = (Index("hp_org_wpid_index", "organization_id", "workflow_permanent_id"),)
+
+    heal_proposal_id = Column(String, primary_key=True, default=generate_heal_proposal_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    block_label = Column(String, nullable=False)
+    candidate_definition = Column(JSON, nullable=False)
+    provenance = Column(JSON, nullable=True)
+    episode_ids = Column(JSON, nullable=False)
+    rendered_diff = Column(UnicodeText, nullable=True)
+    base_version = Column(Integer, nullable=False)
+    base_definition_hash = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="proposed", server_default=sqlalchemy.text("'proposed'"))
+    adopted_workflow_id = Column(String, nullable=True)
+    episode_window = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
 class ScriptBranchHitModel(Base):
     """Tracks which classify branches are accessed during cached script execution.
 
@@ -1781,6 +1859,44 @@ class GoogleOAuthCredentialModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     credential_name = Column(String, nullable=False, default="Default")
     provider = Column(String, nullable=False, default="google")
+    state = Column(String, nullable=False, default="pending_consent", index=True)
+    scopes_requested = Column(JSON, nullable=False, default=list)
+    scopes_granted = Column(JSON, nullable=False, default=list)
+    encrypted_refresh_token = Column(String, nullable=True)
+    encrypted_method = Column(String, nullable=True)
+    consent_nonce = Column(String, nullable=True)
+    consent_redirect_uri = Column(String, nullable=True)
+    consent_code_verifier = Column(String, nullable=True)
+    consent_app_origin = Column(String, nullable=True)
+    consent_expires_at = Column(DateTime, nullable=True)
+    client_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class MicrosoftOAuthCredentialModel(Base):
+    __tablename__ = "microsoft_oauth_credentials"
+    __table_args__ = (
+        Index(
+            "ux_microsoft_oauth_credentials_consent_nonce",
+            "consent_nonce",
+            unique=True,
+            postgresql_where=text("consent_nonce IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "state IN ('pending_consent', 'active', 'revoked', 'error')",
+            name="ck_microsoft_oauth_credentials_state",
+        ),
+    )
+
+    id = Column(String, primary_key=True, default=generate_microsoft_oauth_credential_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
+    credential_name = Column(String, nullable=False, default="Default")
     state = Column(String, nullable=False, default="pending_consent", index=True)
     scopes_requested = Column(JSON, nullable=False, default=list)
     scopes_granted = Column(JSON, nullable=False, default=list)

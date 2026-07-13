@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
@@ -17,7 +17,10 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant
 
 BlockerKind = Literal[
     "authority_denied",
@@ -240,6 +243,9 @@ class _LoopEvidenceCtx(Protocol):
 
 class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
     blocker_signal: CopilotToolBlockerSignal | None
+    # Owned here at the stash choke-point: cleared whenever the held signal changes identity,
+    # re-assigned only by an owned precedence claim in turn_ownership.
+    blocker_signal_claimant: TurnClaimant | None
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None
     tool_blocker_signals: list[CopilotToolBlockerSignal]
 
@@ -247,6 +253,7 @@ class _BlockerSignalCtx(_LoopEvidenceCtx, Protocol):
 class _TerminalEvidenceResetCtx(Protocol):
     last_run_blocks_workflow_run_id: str | None
     last_successful_run_blocks_workflow_run_id: str | None
+    recorded_persisted_block_run_workflow_run_id: str | None
     last_run_blocks_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
     last_run_outcome: RecordedRunOutcome | None
@@ -282,6 +289,7 @@ def terminal_evidence_from_ctx(ctx: _LoopEvidenceCtx) -> TerminalEvidence:
 def clear_terminal_evidence_on_workflow_edit(ctx: _TerminalEvidenceResetCtx) -> None:
     ctx.last_run_blocks_workflow_run_id = None
     ctx.last_successful_run_blocks_workflow_run_id = None
+    ctx.recorded_persisted_block_run_workflow_run_id = None
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None
@@ -335,10 +343,33 @@ _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budg
 _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
 UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
-_RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
+RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
+SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
     {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
 )
+
+# A held blocker whose reason code is in this set must win both the rendered reply and the typed
+# halt kind over a later non-terminal trip (e.g. the code-authoring churn backstop).
+GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
+    {
+        ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        "tool_error_run_output_terminal_blocker",
+        "tool_error_post_budget_challenge_blocker",
+        "tool_error_challenge_gated_submit_disabled",
+        "probable_site_block_stop",
+        SCHEMA_INCOMPATIBILITY_REASON_CODE,
+        OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+        "advisory_dispatch_stalled",
+        "repair_ceiling_reached",
+    }
+)
+
+
+def blocker_signal_is_genuinely_terminal(signal: CopilotToolBlockerSignal | None) -> bool:
+    return signal is not None and signal.internal_reason_code in GENUINELY_TERMINAL_BLOCKER_REASON_CODES
 
 
 def _should_stash_over_existing(
@@ -363,13 +394,13 @@ def _should_stash_over_existing(
     ):
         return True
     if (
-        incoming.internal_reason_code == _RECORDED_OUTCOME_GROUNDING_REASON_CODE
+        incoming.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
         and existing.blocker_kind == "tool_error"
         and not existing.renders_final_reply
     ):
         return True
     if (
-        existing.internal_reason_code == _RECORDED_OUTCOME_GROUNDING_REASON_CODE
+        existing.internal_reason_code == RECORDED_OUTCOME_GROUNDING_REASON_CODE
         and not existing.renders_final_reply
         and incoming.renders_final_reply
     ):
@@ -397,12 +428,14 @@ def maybe_clear_blocker_signal_on_tool_success(ctx: _BlockerSignalCtx, succeeded
     signal = getattr(ctx, "blocker_signal", None)
     if isinstance(signal, CopilotToolBlockerSignal) and _tool_success_clears_signal(signal, succeeded_tool_name):
         ctx.blocker_signal = None
+        ctx.blocker_signal_claimant = None
 
 
 def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
     signal = getattr(ctx, "blocker_signal", None)
     if isinstance(signal, CopilotToolBlockerSignal) and signal.internal_reason_code in internal_reason_codes:
         ctx.blocker_signal = None
+        ctx.blocker_signal_claimant = None
 
 
 def clear_tool_blocker_signals_for_reason_codes(ctx: _BlockerSignalCtx, internal_reason_codes: frozenset[str]) -> None:
@@ -437,6 +470,7 @@ def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSigna
     stashed = _should_stash_over_existing(existing, signal)
     if stashed:
         ctx.blocker_signal = signal
+        ctx.blocker_signal_claimant = None
     extra: dict[str, Any] = {"stashed": stashed}
     if not stashed and isinstance(existing, CopilotToolBlockerSignal):
         extra["existing_reason_code"] = existing.internal_reason_code
@@ -695,4 +729,5 @@ def refresh_held_loop_blocker_evidence(ctx: _BlockerSignalCtx) -> None:
     except ValueError:
         return
     ctx.blocker_signal = refreshed
+    ctx.blocker_signal_claimant = None
     LOG.info("copilot loop blocker signal evidence refreshed", **to_trace_data(refreshed))

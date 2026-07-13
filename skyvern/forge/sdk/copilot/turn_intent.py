@@ -100,6 +100,7 @@ class TurnIntentReasonCode(StrEnum):
     DEFAULT_UNKNOWN = "default_unknown"
     REQUEST_POLICY_DERIVED = "request_policy_derived"
     REQUEST_POLICY_CLARIFICATION = "request_policy_clarification"
+    AUTHORING_INTENT_DEFER_AUTHORING = "authoring_intent_defer_authoring"
     TESTING_INTENT_SKIP_TEST = "testing_intent_skip_test"
     TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE = "testing_intent_run_overrides_diagnose"
     WORKFLOW_CONTEXT_PRESENT = "workflow_context_present"
@@ -128,8 +129,14 @@ class TurnIntentClassifierFailureKind(StrEnum):
     MALFORMED_OUTPUT = "malformed_output"
 
 
+_DETERMINISTIC_ONLY_REASON_CODES = frozenset(
+    {
+        TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK,
+        TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING,
+    }
+)
 _CLASSIFIER_REASON_CODES = tuple(
-    reason for reason in TurnIntentReasonCode if reason != TurnIntentReasonCode.TRANSIENT_CLASSIFIER_FALLBACK
+    reason for reason in TurnIntentReasonCode if reason not in _DETERMINISTIC_ONLY_REASON_CODES
 )
 
 
@@ -785,6 +792,8 @@ def build_turn_intent(
         reason_codes.append(TurnIntentReasonCode.BROWSER_CONTEXT_PRESENT)
     if request_policy.credential_input_kind != "none" or request_policy.resolved_credentials:
         required_context.append(RequiredContextKey.CREDENTIAL_METADATA)
+    if request_policy.authoring_intent == "defer_authoring" and not request_policy.raw_secret_detected:
+        reason_codes.append(TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING)
 
     authority = TurnIntentAuthority(
         may_update_workflow=request_policy.allow_update_workflow,
@@ -961,4 +970,11 @@ def build_turn_intent(
         confidence=confidence,
         reason_codes=reason_codes,
         missing_context_question=missing_context_question,
+    )
+
+
+def turn_intent_defers_authoring_live_fill(turn_intent: TurnIntent | None) -> bool:
+    return (
+        isinstance(turn_intent, TurnIntent)
+        and TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING in turn_intent.reason_codes
     )

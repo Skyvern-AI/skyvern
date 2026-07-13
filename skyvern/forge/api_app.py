@@ -42,6 +42,7 @@ from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
+from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
@@ -399,6 +400,8 @@ def create_api_app() -> FastAPI:
     # the frontend, not by SDK users.
     fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
     fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
+    fastapi_app.include_router(microsoft_oauth_router, prefix="/v1/microsoft", include_in_schema=False)
+    fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
 

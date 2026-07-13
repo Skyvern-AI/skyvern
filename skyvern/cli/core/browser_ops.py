@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -560,16 +560,11 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
-_PASSWORD_NAME_RE = re.compile(
-    r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\btoken\b|\bcredential\b|\bpwd\b|\bpasswd\b|\bpin\b",
-    re.IGNORECASE,
-)
-
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
 _OBSERVE_INTERACTABLES_JS = r"""
-(scopeSelector) => {
+({ scopeSelector, includeValues }) => {
   const root = scopeSelector ? document.querySelector(scopeSelector) : document.body;
   if (!root) return [];
 
@@ -604,6 +599,8 @@ _OBSERVE_INTERACTABLES_JS = r"""
         .trim();
       if (labelsText) return labelsText;
     }
+    // Deliberate: unlabeled non-password inputs may surface their value as the accessible
+    // name (identification fallback), independent of includeValues; passwords never do.
     return (element.innerText || element.textContent || element.getAttribute("placeholder") || (isPassword(element) ? "" : element.value) || "")
       .replace(/\s+/g, " ")
       .trim();
@@ -681,15 +678,13 @@ _OBSERVE_INTERACTABLES_JS = r"""
     return Boolean(nativeRole(element) || widgetRoles.has(explicitRole(element)) || staticClick(element) || frameworkClick(element) || knownClass(element) || pointer(element) || (tag === "div" && element.getAttribute("tabindex") === "0") || optionLike(element));
   };
 
-  return Array.from(root.querySelectorAll("*"))
+  // querySelectorAll excludes the root itself — a scoped observe must still surface the scoped element.
+  return (scopeSelector ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*")))
     .filter(candidate)
     .map((element) => {
       const tag = element.tagName.toLowerCase();
       const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
-      if (isPassword(element)) {
-        item.value = "";
-        item.is_password = true;
-      } else if (["input", "textarea", "select", "option"].includes(tag)) {
+      if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
         item.value = element.value || element.getAttribute("value") || "";
       }
       if (tag === "select") item.options = Array.from(element.options).map((option) => text(option));
@@ -859,17 +854,13 @@ def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
         return []
     result: list[dict[str, Any]] = []
     if node.get("role") and node["role"] != "WebArea":
+        # a11y snapshots carry current input values; drop them at capture so the guarded
+        # DOM scan (includeValues gate in _OBSERVE_INTERACTABLES_JS) is the only value source.
+        node.pop("value", None)
         result.append(node)
     for child in node.get("children", []):
         result.extend(_flatten_a11y_tree(child))
     return result
-
-
-def _is_password_field(role: str, name: str) -> bool:
-    """DESIGN-2: Detect password-type fields for value redaction."""
-    if _PASSWORD_NAME_RE.search(name):
-        return True
-    return role == "textbox" and "password" in name.lower()
 
 
 def _extract_options(node: dict[str, Any]) -> list[str] | None:
@@ -881,12 +872,19 @@ def _extract_options(node: dict[str, Any]) -> list[str] | None:
     return opts if opts else None
 
 
-async def _get_dom_observe_elements(page: Any, selector: str | None = None) -> list[dict[str, Any]]:
+async def _get_dom_observe_elements(
+    page: Any,
+    selector: str | None = None,
+    include_values: bool = False,
+) -> list[dict[str, Any]]:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
         return []
     try:
-        result = await evaluate(_OBSERVE_INTERACTABLES_JS, selector)
+        result = await evaluate(
+            _OBSERVE_INTERACTABLES_JS,
+            {"scopeSelector": selector, "includeValues": include_values},
+        )
     except Exception:
         return []
     if not isinstance(result, list):
@@ -935,10 +933,8 @@ def _merge_dom_observe_elements(
                     and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
                 ):
                     existing["selector"] = dom_selector
-                    if dom_element.get("value") is not None and existing.get("value") is None:
-                        existing["value"] = dom_element.get("value")
-                    if dom_element.get("is_password"):
-                        existing["is_password"] = True
+                    if dom_element.get("value") is not None:
+                        existing["value"] = dom_element["value"]
                     if dom_element.get("options") and not existing.get("children"):
                         existing["options"] = dom_element.get("options")
                     matched_existing = True
@@ -950,31 +946,6 @@ def _merge_dom_observe_elements(
             if dom_selector:
                 selector_seen.add(dom_selector)
 
-    # Any accessible name the DOM identifies as a password field redacts EVERY element
-    # sharing that (role, name, tag) key — a duplicate accessible name must not let an
-    # unflagged a11y value slip through.
-    password_keys = {
-        _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
-        for dom_element in dom_elements
-        if dom_element.get("is_password")
-    }
-    if password_keys:
-        # Keys present among the ORIGINAL a11y elements (NOT the appended DOM elements — an
-        # appended DOM password would otherwise "match" itself and defeat the fail-closed check).
-        a11y_password_keys = {
-            _key(e.get("role", ""), e.get("name", ""), _ROLE_TO_TAG.get(e.get("role", ""), "")) for e in a11y_elements
-        }
-        for element in merged:
-            role = element.get("role", "")
-            if _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, "")) in password_keys:
-                element["is_password"] = True
-        if password_keys - a11y_password_keys:
-            # Fail closed: a DOM password field could not be mapped to any original a11y element
-            # (unlabeled or divergent accessible name). Redact every a11y textbox value so a
-            # password can never leak through an unmatched pairing.
-            for element in merged:
-                if element.get("role") == "textbox" and element.get("value"):
-                    element["is_password"] = True
     return merged
 
 
@@ -983,8 +954,12 @@ async def do_observe(
     selector: str | None = None,
     interactive_only: bool = True,
     max_elements: int = 50,
+    include_values: bool = False,
 ) -> ObserveResult:
     """Capture interactive elements with stable refs for batch operations."""
+    # Execute-step params arrive as untyped JSON; a string like "false" must not
+    # enable value capture — the opt-in counts only as a literal boolean True.
+    include_values = include_values is True
     accessibility = getattr(page, "accessibility", None)
     if selector and accessibility is not None:
         element_handle = await page.locator(selector).first.element_handle()
@@ -995,7 +970,7 @@ async def do_observe(
         snapshot = None
 
     all_elements = _flatten_a11y_tree(snapshot)
-    dom_elements = await _get_dom_observe_elements(page, selector)
+    dom_elements = await _get_dom_observe_elements(page, selector, include_values)
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
@@ -1030,11 +1005,6 @@ async def do_observe(
     for i, elem in enumerate(capped):
         role = elem.get("role", "")
         name = elem.get("name", "")
-        value = elem.get("value")
-
-        # DESIGN-2: Redact password field values — by DOM input type (is_password) or name.
-        if elem.get("is_password") or (value and _is_password_field(role, name)):
-            value = "***"
 
         key = (role, name)
         match_index = elem.get("_match_index", 0)
@@ -1046,7 +1016,7 @@ async def do_observe(
                 name=name,
                 tag=elem.get("tag") or _ROLE_TO_TAG.get(role, ""),
                 selector=elem.get("selector"),
-                value=value,
+                value=elem.get("value"),
                 options=elem.get("options") or _extract_options(elem),
                 match_index=match_index,
                 needs_disambiguation=full_group_size[key] > 1,
@@ -1079,6 +1049,11 @@ def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
             fields["match_index"] = e.match_index
         result.append({k: v for k, v in fields.items() if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")})
     return result
+
+
+def ref_map_from_elements(elements: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Ref-map/registry entries persist across calls — they hold ref-resolution fields, never input values."""
+    return {element["ref"]: {k: v for k, v in element.items() if k != "value"} for element in elements}
 
 
 def ref_to_selector(elem: dict[str, Any]) -> str:
@@ -1129,6 +1104,14 @@ class ExecuteStep:
     params: dict[str, Any] = field(default_factory=dict)
 
 
+class ToolStepError(RuntimeError):
+    """Step failure that preserves the failing tool's structured error payload."""
+
+    def __init__(self, error: dict[str, Any]) -> None:
+        super().__init__(error.get("message", "Tool execution failed"))
+        self.error = error
+
+
 @dataclass
 class StepResult:
     step: int
@@ -1136,7 +1119,7 @@ class StepResult:
     ok: bool
     wall_ms: int = 0
     data: dict[str, Any] | None = None
-    error: str | None = None
+    error: str | dict[str, Any] | None = None
 
 
 @dataclass
@@ -1151,6 +1134,7 @@ async def do_execute(
     dispatch_fn: Any,
     steps: list[ExecuteStep],
     stop_on_error: bool = True,
+    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool] | None = None,
 ) -> ExecuteResult:
     """Execute a sequence of deterministic browser operations in one batch.
 
@@ -1161,6 +1145,9 @@ async def do_execute(
     nav_failed = False
 
     for i, step in enumerate(steps):
+        if step.tool == "navigate":
+            ref_map = {}
+
         # DESIGN-3: Block sensitive ops after failed navigate
         if nav_failed and not stop_on_error and step.tool in _SENSITIVE_TOOLS:
             results.append(
@@ -1177,16 +1164,23 @@ async def do_execute(
         t0 = time.monotonic()
         try:
             result = await dispatch_fn(step, ref_map)
+            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges).
+            # If session publication rejects the snapshot (a concurrent navigation
+            # invalidated it), the batch must not act on it either.
+            if step.tool == "observe" and result and "elements" in result:
+                new_map = ref_map_from_elements(result["elements"])
+                if on_ref_map_update is None or on_ref_map_update(new_map):
+                    ref_map = new_map
+                else:
+                    ref_map = {}
+
             wall_ms = int((time.monotonic() - t0) * 1000)
             results.append(StepResult(step=i, tool=step.tool, ok=True, wall_ms=wall_ms, data=result))
 
-            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges)
-            if step.tool == "observe" and result and "elements" in result:
-                ref_map = {elem["ref"]: elem for elem in result["elements"]}
-
         except Exception as e:
             wall_ms = int((time.monotonic() - t0) * 1000)
-            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=str(e)))
+            error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
+            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:
