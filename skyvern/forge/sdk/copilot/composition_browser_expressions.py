@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_PAGE_OBSTRUCTIONS,
     _MAX_RESULT_CONTAINERS,
     _MAX_RESULT_SAMPLE_ROWS,
+    _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
     _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
@@ -202,6 +203,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
     f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
     f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
+    f"const MAX_REVEAL_KEY_VALUE_RELATIONS={int(_MAX_REVEAL_KEY_VALUE_RELATIONS)};"
     f"const MAX_TABLE_HEADERS={int(_MAX_TABLE_HEADERS)};"
     f"const MAX_RESULT_SAMPLE_ROWS={int(_MAX_RESULT_SAMPLE_ROWS)};"
     f"const MAX_SELECT_OPTIONS={int(_MAX_SELECT_OPTIONS)};"
@@ -488,6 +490,46 @@ for (const node of all) {
   keyValueRelations.push({ key_text: keyText, value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
 }
 
+const revealHintTokens = (node) => (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const matchesResultHintToken = (node) => revealHintTokens(node).some((t) => RESULT_CONTAINER_HINTS.includes(t));
+const revealHeadingTags = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+let revealRelationCount = 0;
+let revealRelationsTruncated = false;
+for (const node of all) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  if (!matchesResultHintToken(node)) continue;
+  const children = Array.from(node.children || []);
+  if (children.length < 3 || children.length > 6) continue;
+  if (children.some((c) => c.children && c.children.length > 0)) continue;
+  const heading = children[0];
+  if (!revealHeadingTags.has((heading.tagName || '').toLowerCase()) || !elementVisible(heading)) continue;
+  const keyText = nodeText(heading);
+  if (!keyText || keyText.length > 120) continue;
+  const selector = selectorFor(node);
+  const matches = selectorMatchCount(selector);
+  if (!matches) continue;
+  let position = -1;
+  try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
+  if (position < 0) continue;
+  const valueLeaves = [];
+  for (let i = 1; i < children.length; i++) {
+    const leaf = children[i];
+    if (!elementVisible(leaf)) continue;
+    const valueText = nodeText(leaf);
+    if (!valueText || keyText === valueText) continue;
+    valueLeaves.push({ index: i, valueText: valueText });
+  }
+  const revealKeyText = valueLeaves.length === 1 ? keyText : '';
+  let capped = false;
+  for (const leaf of valueLeaves) {
+    if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
+    keyValueRelations.push({ key_text: revealKeyText, value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    revealRelationCount++;
+  }
+  if (capped) break;
+}
+
 const challengeControls = [];
 const seenChallenge = new Set();
 for (const node of all) {
@@ -570,6 +612,7 @@ return JSON.stringify({
   result_containers_truncated: resultContainersTruncated,
   key_value_relations: keyValueRelations,
   key_value_relations_truncated: keyValueRelationsTruncated,
+  reveal_relations_truncated: revealRelationsTruncated,
   clickable_controls: clickableControls,
   challenge_controls: challengeControls,
   modal_overlays: modalOverlays,

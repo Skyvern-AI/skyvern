@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
@@ -55,6 +56,7 @@ _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
 _MAX_RESULT_CONTAINERS = 8
 _MAX_KEY_VALUE_RELATIONS = 24
+_MAX_REVEAL_KEY_VALUE_RELATIONS = 8
 _MAX_TABLE_HEADERS = 12
 _MAX_RESULT_SAMPLE_ROWS = 5
 _MAX_NAVIGATION_TARGETS = 20
@@ -201,14 +203,16 @@ def _evidence_metadata(
     *,
     forms: list[dict[str, Any]] | None = None,
     challenge_controls: list[dict[str, Any]] | None = None,
+    reveal_relations_truncated: bool = False,
 ) -> dict[str, Any]:
     gated_controls = _gated_submit_controls(forms or [])
+    inspection_warnings = ["reveal_relations_truncated"] if reveal_relations_truncated else []
     return {
         "evidence_sources": [DOM_EVIDENCE_SOURCE],
         "screenshot_used": False,
         "visual_evidence_summary": "",
         "visual_evidence_omissions": [],
-        "inspection_warnings": [],
+        "inspection_warnings": inspection_warnings,
         "challenge_state": _challenge_state(
             indicators or [],
             gated_submit_controls=gated_controls,
@@ -1515,7 +1519,7 @@ def _selector_match_count(soup: Any, selector: str) -> int:
         return 0
 
 
-def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool]:
+def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool, bool]:
     relations: list[dict[str, Any]] = []
     truncated = False
     for node in soup.find_all(True):
@@ -1556,7 +1560,74 @@ def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool]:
                 "value_visible": True,
             }
         )
-    return relations, truncated
+    reveal_truncated = _append_reveal_shape_relations(soup, relations)
+    return relations, truncated, reveal_truncated
+
+
+def _matches_result_hint_token(node: Any) -> bool:
+    node_id = str(node.get("id") or "") if hasattr(node, "get") else ""
+    raw = f"{node_id} {' '.join(_classes_for(node))}".lower()
+    return any(token in _RESULT_CONTAINER_HINTS for token in re.split(r"[^a-z0-9]+", raw) if token)
+
+
+def _append_reveal_shape_relations(soup: Any, relations: list[dict[str, Any]]) -> bool:
+    reveal_count = 0
+    reveal_truncated = False
+    for node in soup.find_all(True):
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if tag_name in {"body", "form", "html", "table", "tbody", "thead", "tr"}:
+            continue
+        if not _matches_result_hint_token(node):
+            continue
+        children = [child for child in node.find_all(recursive=False) if child.name]
+        if len(children) < 3 or len(children) > 6:
+            continue
+        if any(child.find(True) is not None for child in children):
+            continue
+        heading = children[0]
+        if str(getattr(heading, "name", "") or "").lower() not in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            continue
+        key_text = _schema_text(_node_text(heading), 240)
+        if not key_text or len(key_text) > 120:
+            continue
+        selector = _selector_for(node)[:160]
+        match_count = _selector_match_count(soup, selector)
+        if match_count <= 0:
+            continue
+        try:
+            position = soup.select(selector).index(node)
+        except ValueError:
+            continue
+        value_leaves: list[tuple[int, str]] = []
+        for index in range(1, len(children)):
+            value_text = _schema_text(_node_text(children[index]), 240)
+            if not value_text or key_text == value_text:
+                continue
+            value_leaves.append((index, value_text))
+        reveal_key_text = key_text if len(value_leaves) == 1 else ""
+        capped = False
+        for index, value_text in value_leaves:
+            if len(relations) >= _MAX_KEY_VALUE_RELATIONS or reveal_count >= _MAX_REVEAL_KEY_VALUE_RELATIONS:
+                reveal_truncated = True
+                capped = True
+                break
+            relations.append(
+                {
+                    "key_text": reveal_key_text,
+                    "value_text": value_text,
+                    "container_selector": selector,
+                    "container_match_count": match_count,
+                    "container_position": position,
+                    "value_child_index": index,
+                    "direct_child_count": len(children),
+                    "visible": True,
+                    "value_visible": True,
+                }
+            )
+            reveal_count += 1
+        if capped:
+            break
+    return reveal_truncated
 
 
 def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
@@ -1948,7 +2019,8 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
                 break
             result_containers.append(_result_container_entry(node, soup=soup))
 
-    key_value_relations, key_value_relations_truncated = _key_value_relations(soup)
+    key_value_relations, key_value_relations_truncated, reveal_relations_truncated = _key_value_relations(soup)
+    reveal_relations_truncated = reveal_relations_truncated and not key_value_relations_truncated
 
     used_selectors: set[str] = set()
     for form in forms:
@@ -1998,7 +2070,12 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
+        **_evidence_metadata(
+            anti_bot_indicators,
+            forms=forms,
+            challenge_controls=challenge_controls,
+            reveal_relations_truncated=reveal_relations_truncated,
+        ),
     }
 
 
@@ -2226,7 +2303,8 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
         position = item.get("container_position")
         child_index = item.get("value_child_index")
         child_count = item.get("direct_child_count")
-        if not key_text or not selector:
+        value_text = _schema_text(_structured_str(item.get("value_text")), 240)
+        if not selector or (not key_text and not value_text):
             continue
         if (
             not isinstance(match_count, int)
@@ -2248,7 +2326,7 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
         relations.append(
             {
                 "key_text": key_text,
-                "value_text": _schema_text(_structured_str(item.get("value_text")), 240),
+                "value_text": value_text,
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -2383,6 +2461,9 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
     navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
     result_containers = _structured_result_containers(data.get("result_containers"))
     key_value_relations = _structured_key_value_relations(data.get("key_value_relations"))
+    reveal_relations_truncated = (
+        data.get("reveal_relations_truncated") is True and data.get("key_value_relations_truncated") is not True
+    )
     clickable_controls = _structured_clickable_controls(data.get("clickable_controls"))
     challenge_controls = _structured_challenge_controls(data.get("challenge_controls"))
     modal_overlays = _structured_modal_overlays(data.get("modal_overlays"))
@@ -2430,5 +2511,10 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
+        **_evidence_metadata(
+            anti_bot_indicators,
+            forms=forms,
+            challenge_controls=challenge_controls,
+            reveal_relations_truncated=reveal_relations_truncated,
+        ),
     }
