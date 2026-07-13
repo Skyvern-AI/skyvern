@@ -366,6 +366,20 @@ class SkyvernElement:
             )
             return False
 
+    async def supports_text_input(self) -> bool:
+        if self.get_tag_name().lower() in COMMON_INPUT_TAGS:
+            return True
+        if await self.is_editable():
+            return True
+
+        class_name = await self.get_attr("class")
+        if class_name and "blinking-cursor" in class_name.lower():
+            return True
+
+        # Fallback for browser editable checks that fail closed on contenteditable elements.
+        contenteditable = await self.get_attr("contenteditable")
+        return contenteditable is not None and str(contenteditable).lower() != "false"
+
     async def is_child_of_pdf_object(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         parent_locator = self.get_locator().locator("..")
         tag_name: str | None = await parent_locator.evaluate("el => el.tagName", timeout=timeout)

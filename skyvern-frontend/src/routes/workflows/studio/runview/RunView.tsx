@@ -16,6 +16,7 @@ import { isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
+import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
@@ -26,6 +27,7 @@ import { getOrderedRunParameters } from "../../utils";
 import {
   buildFilmstrip,
   formatElapsed,
+  runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
 import { toReadableSearch } from "../panes";
@@ -318,13 +320,7 @@ export function RunView({
 
   const hasInputs =
     runInputs.parameters.length > 0 || runInputs.meta.length > 0;
-  const hasOutputs =
-    runErrors.length > 0 ||
-    (extractedInformation != null &&
-      Object.values(extractedInformation).some((value) => value !== null)) ||
-    downloadedFiles.length > 0 ||
-    observerOutput != null ||
-    webhookFailureReason != null;
+  const hasOutputs = runHasOutputs(workflowRun);
 
   if (!workflowRun) {
     return <RunPlaceholder loading={isLoading || runIdPending} />;
@@ -396,42 +392,47 @@ export function RunView({
         {view === "timeline" ? (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
             <RunSummaryStrip workflowRun={workflowRun} elapsed={elapsed} />
-            <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
-              <div className="min-h-0 overflow-hidden">
-                <WorkflowRunTimeline
-                  workflowRunId={workflowRunId}
-                  hideLiveBadge
-                  activeItem={activeItem}
-                  activeIteration={activeIteration}
-                  onActionItemSelected={(item) => {
-                    pinFrame(item.action.action_id);
-                  }}
-                  onBlockItemSelected={(block) => {
-                    pinFrame(block.workflow_run_block_id);
-                  }}
-                  onThoughtItemSelected={(thought) => {
-                    pinFrame(thought.thought_id);
-                  }}
-                  onLiveStreamSelected={() => {
-                    pinFrame("stream");
-                  }}
-                  onIterationSelected={(loopBlock, iterationIndex) => {
-                    pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
-                  }}
-                />
-              </div>
-              <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
-                <WorkflowRunBlockDetail
-                  activeItem={activeItem}
-                  activeIteration={activeIteration}
-                  timeline={timeline ?? []}
-                  timelineReady={Boolean(timeline)}
-                  showDownloadedFiles
-                  workflowRunId={workflowRunId}
-                  onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
-                />
-              </div>
-            </div>
+            <ResizableTimelineSplit
+              className="flex-1"
+              top={
+                <div className="min-h-0 overflow-hidden">
+                  <WorkflowRunTimeline
+                    workflowRunId={workflowRunId}
+                    hideLiveBadge
+                    activeItem={activeItem}
+                    activeIteration={activeIteration}
+                    onActionItemSelected={(item) => {
+                      pinFrame(item.action.action_id);
+                    }}
+                    onBlockItemSelected={(block) => {
+                      pinFrame(block.workflow_run_block_id);
+                    }}
+                    onThoughtItemSelected={(thought) => {
+                      pinFrame(thought.thought_id);
+                    }}
+                    onLiveStreamSelected={() => {
+                      pinFrame("stream");
+                    }}
+                    onIterationSelected={(loopBlock, iterationIndex) => {
+                      pinFrame(loopBlock.workflow_run_block_id, iterationIndex);
+                    }}
+                  />
+                </div>
+              }
+              bottom={
+                <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1">
+                  <WorkflowRunBlockDetail
+                    activeItem={activeItem}
+                    activeIteration={activeIteration}
+                    timeline={timeline ?? []}
+                    timelineReady={Boolean(timeline)}
+                    showDownloadedFiles
+                    workflowRunId={workflowRunId}
+                    onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
+                  />
+                </div>
+              }
+            />
           </div>
         ) : view === "inputs" ? (
           <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-slate-elevation1 p-4">

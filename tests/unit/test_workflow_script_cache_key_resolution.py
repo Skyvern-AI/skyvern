@@ -4,9 +4,15 @@ from types import SimpleNamespace
 import pytest
 from jinja2 import UndefinedError
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching_from_effective_state
 from skyvern.services import workflow_script_service
-from skyvern.services.workflow_script_service import CacheKeyResolutionError, resolve_cache_key_value
+from skyvern.services.workflow_script_service import (
+    CacheKeyResolutionError,
+    detect_workflow_platform,
+    detect_workflow_platform_for_tagging,
+    resolve_cache_key_value,
+)
 
 
 def _workflow(cache_key: str | None = "default", url: str | None = "https://example.com/login") -> Workflow:
@@ -50,7 +56,10 @@ def _stub_platform_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         workflow_script_service.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(detect_ats_platform=lambda domain: "known_platform" if domain == "ats.example.com" else None),
+        SimpleNamespace(
+            detect_ats_platform=lambda domain: "known_platform" if domain == "ats.example.com" else None,
+            detect_platform_for_tagging=lambda domain: "tagging_platform" if domain == "tagging.example.com" else None,
+        ),
     )
 
 
@@ -64,6 +73,34 @@ def test_resolve_empty_cache_key_uses_platform_when_detected() -> None:
     workflow = _workflow(cache_key="", url="https://ats.example.com/login")
 
     assert resolve_cache_key_value(workflow, {}, adaptive_caching=False) == "known_platform"
+
+
+def test_detect_workflow_platform_uses_first_resolved_block_domain() -> None:
+    workflow = _workflow(cache_key="custom", url="https://ats.example.com/login")
+
+    assert detect_workflow_platform(workflow, {}) == "known_platform"
+
+
+def test_detect_workflow_platform_returns_none_when_detector_has_no_verdict() -> None:
+    workflow = _workflow(cache_key="custom", url="https://essentials.example.com/login")
+
+    assert detect_workflow_platform(workflow, {}) is None
+
+
+def test_cache_key_ignores_tagging_only_platforms() -> None:
+    workflow = _workflow(cache_key="default", url="https://tagging.example.com/jobs/1")
+
+    assert resolve_cache_key_value(workflow, {}, adaptive_caching=False) == "default:tagging.example.com"
+
+
+def test_tagging_detector_uses_tagging_only_platforms() -> None:
+    workflow = _workflow(cache_key="default", url="https://tagging.example.com/jobs/1")
+
+    assert detect_workflow_platform_for_tagging(workflow, {}) == "tagging_platform"
+
+
+def test_oss_platform_tagging_is_noop() -> None:
+    assert AgentFunction().detect_platform_for_tagging("https://tagging.example.com/jobs/1") is None
 
 
 def test_resolve_appends_v2_when_adaptive_caching_enabled() -> None:

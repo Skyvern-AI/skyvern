@@ -441,3 +441,243 @@ async def test_request_policy_resolver_still_blocks_raw_secret_with_author_time_
     assert policy.user_response_policy == "ask_clarification"
     assert policy.allow_update_workflow is False
     assert policy.allow_run_blocks is False
+
+
+def _cred(name: str, credential_id: str, tested_url: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(name=name, credential_id=credential_id, tested_url=tested_url)
+
+
+async def _build_with_forced_classifier(
+    *,
+    user_message: str,
+    classifier_policy: RequestPolicy,
+    org_credentials: list[SimpleNamespace],
+    get_credentials: AsyncMock | None = None,
+    get_credentials_by_ids: AsyncMock | None = None,
+) -> RequestPolicy:
+    load_mock = get_credentials or AsyncMock(return_value=org_credentials)
+    by_ids_mock = get_credentials_by_ids or AsyncMock(return_value=[])
+    with (
+        patch(
+            "skyvern.forge.sdk.copilot.request_policy._classify_request",
+            new=AsyncMock(return_value=classifier_policy),
+        ),
+        patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=load_mock),
+        patch("skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids", new=by_ids_mock),
+    ):
+        return await build_request_policy(
+            user_message=user_message,
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="o_test",
+            handler=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["credential_name", "none"])
+async def test_success_empty_refs_resolves_named_credential(kind: str) -> None:
+    credential = _cred("mock-portal-login", "cred_login")
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in with the saved credential named mock-portal-login.",
+        classifier_policy=RequestPolicy(credential_input_kind=kind, classifier_status="success"),
+        org_credentials=[credential, _cred("other", "cred_other")],
+    )
+
+    assert policy.classifier_status == "success"
+    assert policy.credential_input_kind == "credential_name"
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_login"]
+    assert policy.clarification_reason != "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_success_website_kind_with_nonmatching_url_resolves_named_credential() -> None:
+    credential = _cred("mock-portal-login", "cred_login", tested_url="https://saved.example.net/signin")
+    policy = await _build_with_forced_classifier(
+        user_message="Log in with the saved credential named mock-portal-login here.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://unrelated.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[credential],
+    )
+
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_login"]
+    assert policy.clarification_reason != "credential_name_unresolved"
+    assert policy.clarification_question is None
+
+
+@pytest.mark.asyncio
+async def test_success_website_kind_with_matching_url_keeps_url_credential() -> None:
+    url_credential = _cred("portal-cred", "cred_url", tested_url="https://portal.example.com/login")
+    named_credential = _cred("other-login", "cred_named", tested_url="https://elsewhere.example.net/login")
+    policy = await _build_with_forced_classifier(
+        user_message="Log in with the saved credential named other-login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="website_stored_credential",
+            login_page_urls=["https://portal.example.com/login"],
+            classifier_status="success",
+        ),
+        org_credentials=[url_credential, named_credential],
+    )
+
+    assert policy.credential_input_kind == "website_stored_credential"
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_url"]
+
+
+@pytest.mark.asyncio
+async def test_success_credential_id_intent_is_not_overridden_by_name_scan() -> None:
+    by_ids = AsyncMock(return_value=[_cred("real", "cred_real")])
+    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
+    policy = await _build_with_forced_classifier(
+        user_message="Use cred_real, the saved credential named mock-portal-login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="credential_id",
+            credential_refs=["cred_real"],
+            classifier_status="success",
+        ),
+        org_credentials=[],
+        get_credentials=load_mock,
+        get_credentials_by_ids=by_ids,
+    )
+
+    assert policy.credential_input_kind == "credential_id"
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_real"]
+    load_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_success_populated_name_refs_are_not_narrowed_by_scan() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Use the saved credential named alpha.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="credential_name",
+            credential_refs=["alpha", "beta"],
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("alpha", "cred_alpha")],
+    )
+
+    assert policy.credential_refs == ["alpha", "beta"]
+    assert policy.clarification_reason == "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_success_pre_resolution_clarification_is_preserved() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in with the saved credential named mock-portal-login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="none",
+            requires_user_clarification=True,
+            clarification_reason="invalid_conditional_container",
+            classifier_status="success",
+        ),
+        org_credentials=[_cred("mock-portal-login", "cred_login")],
+    )
+
+    assert policy.clarification_reason == "invalid_conditional_container"
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+async def test_success_ambiguous_named_credentials_clarify_for_normal_request() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Use the credential named alpha or the credential named beta to sign in.",
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[_cred("alpha", "cred_alpha"), _cred("beta", "cred_beta")],
+    )
+
+    assert policy.requires_user_clarification is True
+    assert policy.clarification_reason == "credential_name_unresolved"
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+async def test_success_ambiguous_named_credentials_draft_unbound_for_explicit_draft() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message=(
+            "Build this as a code block using the saved credential named alpha "
+            "or the saved credential named beta. Do not create a login block."
+        ),
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[_cred("alpha", "cred_alpha"), _cred("beta", "cred_beta")],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.allow_missing_credentials_in_draft is True
+    assert policy.requires_user_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_success_incidental_quote_out_of_credential_context_is_not_rewritten() -> None:
+    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
+    policy = await _build_with_forced_classifier(
+        user_message='Set the page title to "mock-portal-login" before saving.',
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[],
+        get_credentials=load_mock,
+    )
+
+    assert policy.credential_input_kind == "none"
+    assert policy.resolved_credentials == []
+    load_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_success_quote_after_word_containing_login_substring_is_not_context() -> None:
+    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
+    policy = await _build_with_forced_classifier(
+        user_message='Publish the blog in the section titled "mock-portal-login".',
+        classifier_policy=RequestPolicy(credential_input_kind="none", classifier_status="success"),
+        org_credentials=[],
+        get_credentials=load_mock,
+    )
+
+    assert policy.credential_input_kind == "none"
+    assert policy.resolved_credentials == []
+    load_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_success_quoted_name_in_credential_context_resolves() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message='Sign in using the saved credential "mock-portal-login".',
+        classifier_policy=RequestPolicy(credential_input_kind="credential_name", classifier_status="success"),
+        org_credentials=[_cred("mock-portal-login", "cred_login")],
+    )
+
+    assert policy.credential_input_kind == "credential_name"
+    assert [c.credential_id for c in policy.resolved_credentials] == ["cred_login"]
+
+
+@pytest.mark.asyncio
+async def test_success_zero_name_match_falls_through_to_clarification() -> None:
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in with the saved credential named ghost-cred.",
+        classifier_policy=RequestPolicy(credential_input_kind="credential_name", classifier_status="success"),
+        org_credentials=[_cred("mock-portal-login", "cred_login")],
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.clarification_reason == "credential_name_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_success_raw_secret_blocks_name_scan_before_loading_credentials() -> None:
+    load_mock = AsyncMock(return_value=[_cred("mock-portal-login", "cred_login")])
+    policy = await _build_with_forced_classifier(
+        user_message="Sign in with the saved credential named mock-portal-login.",
+        classifier_policy=RequestPolicy(
+            credential_input_kind="none",
+            raw_secret_detected=True,
+            raw_secret_handling="block",
+            classifier_status="success",
+        ),
+        org_credentials=[],
+        get_credentials=load_mock,
+    )
+
+    assert policy.resolved_credentials == []
+    load_mock.assert_not_awaited()

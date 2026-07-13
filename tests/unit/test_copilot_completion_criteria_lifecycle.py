@@ -285,10 +285,73 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
             ),
             id="deliverable-kind",
         ),
+        pytest.param(
+            (
+                _criterion(
+                    "c0",
+                    "A blocker is reported to the user.",
+                    contingent_on="the site blocks submission",
+                    mint_degrade="contingent_missing_antecedent",
+                ),
+            ),
+            id="contingent-mint-degrade",
+        ),
     ],
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_criteria_from_json_degrades_stored_pathless_contingent() -> None:
+    (criterion,) = criteria_from_json(
+        [
+            {
+                "id": "c0",
+                "outcome": "A blocker is reported to the user.",
+                "contingent_on": "the site blocks submission",
+            }
+        ]
+    )
+    assert criterion.mint_degrade == "contingent_missing_antecedent"
+
+
+def test_criteria_from_json_keeps_wellformed_contingent_undegraded() -> None:
+    (criterion,) = criteria_from_json(
+        [
+            {
+                "id": "c0",
+                "outcome": "A blocker is reported to the user.",
+                "contingent_on": "the site blocks submission",
+                "contingent_antecedent_output_path": "output.blocker",
+            }
+        ]
+    )
+    assert criterion.mint_degrade is None
+
+
+def test_criteria_from_json_coerces_unknown_mint_degrade_to_none() -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", "mint_degrade": "bogus"}])
+    assert criterion.mint_degrade is None
+
+
+def test_adopt_stored_rehydrates_pathless_contingent_as_degraded() -> None:
+    stored_criteria = criteria_from_json(
+        [
+            {"id": "c0", "outcome": "The request is submitted."},
+            {
+                "id": "c1",
+                "outcome": "A blocker is reported to the user.",
+                "contingent_on": "the site blocks submission",
+            },
+        ]
+    )
+    stored = StoredCriteriaSet(set_id="set_1", goal_epoch=1, criteria=stored_criteria)
+
+    decision = reconcile_completion_criteria(StoredCriteriaSnapshot(active=stored, next_epoch=2), [], actionable=True)
+
+    assert decision.action == "adopt_stored"
+    degrades = {criterion.id: criterion.mint_degrade for criterion in decision.criteria}
+    assert degrades == {"c0": None, "c1": "contingent_missing_antecedent"}
 
 
 def test_criteria_from_json_normalizes_unknown_deliverable_kind() -> None:

@@ -252,12 +252,14 @@ class TestPayloadJsonSerialization:
         block: WorkflowTriggerBlock,
         payload: dict[str, Any],
         values: dict[str, Any],
+        credential_ids: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         ctx = MagicMock()
         ctx.values = values
         ctx.secrets = {}
         ctx.include_secrets_in_templates = False
         ctx.get_block_metadata = MagicMock(return_value={})
+        ctx.get_resolved_credential_parameter_id.side_effect = lambda key: (credential_ids or {}).get(key)
         return block._render_templates_in_payload(payload, ctx)
 
     def test_list_value_renders_as_json(self) -> None:
@@ -295,6 +297,32 @@ class TestPayloadJsonSerialization:
             {"file_number": "ABC-123"},
         )
         assert result == {"file_number": "ABC-123"}
+
+    def test_credential_id_value_renders_as_raw_id(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"credentialId": "{{ credentialId }}"},
+            {
+                "credentialId": {
+                    "context": "placeholder",
+                    "username": "secret_username",
+                    "password": "secret_password",
+                }
+            },
+            credential_ids={"credentialId": "cred_selected"},
+        )
+        assert result == {"credentialId": "cred_selected"}
+
+    def test_credential_id_json_filter_renders_as_raw_id(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"credentialId": "{{ credentialId | json }}"},
+            {"credentialId": {"context": "placeholder"}},
+            credential_ids={"credentialId": "cred_selected"},
+        )
+        assert result == {"credentialId": "cred_selected"}
 
     def test_int_value_renders_as_decimal_string(self) -> None:
         block = _make_block()

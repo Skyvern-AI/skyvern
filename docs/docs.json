@@ -212,6 +212,7 @@
               "developers/self-hosted/proxy",
               "developers/self-hosted/kubernetes",
               "developers/self-hosted/storage",
+              "developers/self-hosted/google-integrations",
               "integrations/local-llms"
             ]
           }

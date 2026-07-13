@@ -1,0 +1,118 @@
+---
+title: Google Integrations
+subtitle: Connect Google accounts to Google Sheets, Gmail, and Google Drive on a self-hosted deployment
+description: Configure Google OAuth on self-hosted Skyvern so users can connect Google accounts for Sheets, Gmail, and Drive from the Settings or Integrations page. Covers creating the OAuth client, required scopes, settings-page configuration, and the GOOGLE_OAUTH_* environment variables.
+slug: developers/self-hosted/google-integrations
+keywords:
+  - Google Sheets
+  - Gmail
+  - Google Drive
+  - Google OAuth
+  - integrations
+  - Settings
+  - GOOGLE_OAUTH_CLIENT_ID
+  - GOOGLE_OAUTH_CLIENT_SECRET
+  - GOOGLE_OAUTH_REDIRECT_HOSTS
+  - GOOGLE_OAUTH_APP_ORIGINS
+  - scopes
+---
+
+The Google Sheets, Gmail, and Google Drive integrations connect to a Google account through OAuth. On self-hosted Skyvern this is off by default. Once you configure a Google OAuth client, users can connect their accounts from the **Integrations** page and the OAuth callback completes in your own UI.
+
+## 1. Create a Google OAuth client
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), select or create a project.
+2. Enable the **Google Sheets API**, **Google Drive API**, and **Gmail API** for the project (APIs & Services → Library).
+3. Configure the **OAuth consent screen**. External apps must add each user as a test user (or publish the app) before they can connect.
+4. Create an **OAuth client ID** of type **Web application** (APIs & Services → Credentials → Create credentials).
+5. Add your Skyvern UI's callback URL to **Authorized redirect URIs**. The path is always `/integrations/google/callback`:
+   - Local: `http://localhost:8080/integrations/google/callback`
+   - Production: `https://skyvern.your-company.com/integrations/google/callback`
+6. Copy the generated **Client ID** and **Client secret**.
+
+## 2. Required scopes
+
+Skyvern requests a scope profile for the integration the user connects.
+
+### Google Sheets
+
+| Scope | Purpose |
+|-------|---------|
+| `https://www.googleapis.com/auth/spreadsheets` | Read and write spreadsheet contents |
+| `https://www.googleapis.com/auth/drive.file` | Access files the app creates or the user opens |
+| `https://www.googleapis.com/auth/drive.metadata.readonly` | List and look up spreadsheets by name |
+
+### Gmail
+
+| Scope | Purpose |
+|-------|---------|
+| `https://www.googleapis.com/auth/gmail.readonly` | Read messages for verification codes and magic links |
+
+### Google Drive
+
+| Scope | Purpose |
+|-------|---------|
+| `https://www.googleapis.com/auth/drive` | Upload files to Drive, including existing folders selected by ID or URL |
+
+You don't set these manually — Skyvern requests the appropriate profile automatically. If your consent screen restricts scopes, add the scopes above so users can grant them.
+
+## 3. Configure the OAuth client in Skyvern (recommended)
+
+First, enable encryption on the **backend** (`.env` or your deployment's environment), then restart Skyvern:
+
+```bash .env
+ENABLE_ENCRYPTION=true
+ENCRYPTOR_AES_SECRET_KEY=<32-byte base64 key>
+```
+
+Then configure the client for your organization:
+
+1. Open **Settings → Google OAuth**, or use the **Google OAuth** form at the top of **Integrations**.
+2. Confirm that the read-only **Callback URL** matches the redirect URI you registered with Google.
+3. Paste the **Client ID** and **Client Secret** from step 1.
+4. Set **Redirect Hosts** to the hostname allowed for the OAuth redirect (hostname only, without a scheme or path).
+5. Set **App Origins** to the origin allowed to finish the flow (scheme, host, and port when applicable).
+6. Click **Save Configuration**.
+
+Skyvern stores the OAuth client configuration AES-encrypted per organization. The client secret is never displayed again after you save it; leave the field blank when updating the other values to keep the existing secret.
+
+## 4. Environment variables (alternative)
+
+Operators who prefer environment configuration can set these values on the **backend** (`.env` or your deployment's environment), then restart Skyvern. An organization-level configuration saved in **Settings** takes precedence over these environment values.
+
+```bash .env
+# Enable encryption — OAuth refresh tokens are never stored in plaintext.
+ENABLE_ENCRYPTION=true
+ENCRYPTOR_AES_SECRET_KEY=<32-byte base64 key>
+
+# Google OAuth client from step 1.
+GOOGLE_OAUTH_CLIENT_ID=<your-client-id>.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=<your-client-secret>
+
+# Hostname(s) allowed as the OAuth redirect_uri (host only, no scheme or path).
+# Must match the host of the redirect URI you registered with Google.
+GOOGLE_OAUTH_REDIRECT_HOSTS=skyvern.your-company.com
+
+# App origin(s) allowed to receive the connected credential after callback
+# (scheme + host + port). This is the origin your UI is served from.
+GOOGLE_OAUTH_APP_ORIGINS=https://skyvern.your-company.com
+```
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GOOGLE_OAUTH_CLIENT_ID` | Yes | Web-application client ID from Google Cloud. |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | Yes | Client secret paired with the client ID. |
+| `GOOGLE_OAUTH_REDIRECT_HOSTS` | Yes | Comma-separated hostnames permitted as the `redirect_uri`. Non-loopback hosts must use HTTPS. |
+| `GOOGLE_OAUTH_APP_ORIGINS` | Yes | Comma-separated origins (`scheme://host[:port]`) permitted to finish the flow. Empty rejects every connect attempt. |
+| `ENABLE_ENCRYPTION` | Yes | Must be `true`; credentials are refused if encryption is off. |
+
+For local development, `localhost` is treated as a loopback host, so `http://localhost:8080` works for both `GOOGLE_OAUTH_REDIRECT_HOSTS` (`localhost`) and `GOOGLE_OAUTH_APP_ORIGINS` (`http://localhost:8080`).
+
+## 5. Verify
+
+1. Restart the backend so the encryption or environment settings load.
+2. Open the Skyvern UI and go to **Integrations**. Confirm that the **Google Sheets**, **Gmail**, and **Google Drive** cards each show a **Connect** button.
+3. Click **Connect** on one of the cards and complete the Google consent screen. You land back on the Integrations page with the account listed under **Connected Google Accounts**.
+4. Use the connected account in the corresponding Google Sheets, Gmail, or Google Drive workflow feature.
+
+If **Connect** returns an error, double-check that the redirect URI registered with Google matches **Redirect Hosts** (or `GOOGLE_OAUTH_REDIRECT_HOSTS`), and that **App Origins** (or `GOOGLE_OAUTH_APP_ORIGINS`) contains the exact origin your UI runs on.

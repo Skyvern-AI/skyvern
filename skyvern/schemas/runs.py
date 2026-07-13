@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
@@ -514,6 +515,7 @@ class TaskRunListItem(BaseModel):
     workflow_permanent_id: str | None = None
     workflow_deleted: bool = False
     script_run: bool = False
+    trigger_type: WorkflowRunTriggerType | None = None
     searchable_text: str | None = Field(default=None, exclude=True)
 
     @field_validator("script_run", mode="before")

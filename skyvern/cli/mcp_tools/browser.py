@@ -5,7 +5,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -15,6 +15,7 @@ from skyvern.cli.core.browser_ops import (
     _ALLOWED_EXECUTE_TOOLS,
     MAX_EXECUTE_STEPS,
     ExecuteStep,
+    ToolStepError,
     do_act,
     do_execute,
     do_extract,
@@ -26,6 +27,7 @@ from skyvern.cli.core.browser_ops import (
     do_observe,
     do_screenshot,
     parse_extract_schema,
+    ref_map_from_elements,
     ref_to_selector,
     select_native_option_if_targeted,
     serialize_elements,
@@ -52,8 +54,29 @@ from ._common import (
     make_result,
     save_artifact,
 )
+from ._element_state import (
+    ACTION_TIMEOUT_DESCRIPTION,
+    MAX_ACTION_TIMEOUT_MS,
+    MIN_ACTION_TIMEOUT_MS,
+    classify_element_state,
+    element_state_error,
+    is_direct_action,
+    is_pointer_interception_error,
+    make_direct_action_error,
+    resolve_action_timeout_ms,
+)
 from ._localhost import is_localhost_url
-from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
+from ._session import (
+    BrowserNotAvailableError,
+    clear_session_ref_map,
+    get_current_session,
+    get_page,
+    get_session_ref,
+    no_browser_error,
+    page_ref_key,
+    replace_session_ref_map,
+    session_ref_generation,
+)
 
 LOG = structlog.get_logger(__name__)
 
@@ -124,6 +147,46 @@ def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
     return bool(url and is_localhost_url(url) and getattr(ctx, "can_access_localhost", None) is False)
 
 
+async def _direct_failure_result(
+    action: str,
+    ctx: Any,
+    timer: Timer,
+    page: Any,
+    selector: str,
+    exc: Exception,
+    timeout_ms: int,
+) -> dict[str, Any]:
+    return make_result(
+        action,
+        ok=False,
+        browser_context=ctx,
+        timing_ms=timer.timing_ms,
+        error=await make_direct_action_error(page, selector, exc, timeout_ms=timeout_ms),
+    )
+
+
+async def _drag_failure_error(
+    page: Any,
+    source_selector: str,
+    target_selector: str | None,
+    exc: Exception,
+    timeout_ms: int,
+) -> dict[str, Any]:
+    # Probe both ends without the pointer-interception hint: interception during a drag usually
+    # happens at the drop point, so an actionable source must not absorb the occluded label.
+    failed_selector = source_selector
+    state = await classify_element_state(page, source_selector)
+    if state == "unknown" and target_selector is not None:
+        failed_selector = target_selector
+        state = await classify_element_state(page, target_selector)
+    if state == "unknown" and is_pointer_interception_error(exc):
+        state = "occluded"
+    error = element_state_error(state, exc, selector=failed_selector, timeout_ms=timeout_ms)
+    if failed_selector != source_selector:
+        error["details"]["source_selector"] = source_selector
+    return error
+
+
 _SelectorMode = Annotated[
     Literal["resilient", "direct"],
     Field(
@@ -188,6 +251,7 @@ async def skyvern_navigate(
     # (even failed navigations can partially load and destroy existing frames)
     state = get_current_session()
     state._working_frame = None
+    clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     with Timer() as timer:
         try:
@@ -209,6 +273,12 @@ async def skyvern_navigate(
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the URL is valid and accessible"),
             )
+        finally:
+            # Clear again after the attempt (success OR failure — a failed goto can
+            # still partially replace the document): an observe that started while
+            # navigation was in flight captured a post-clear generation, so only a
+            # second bump can invalidate its snapshot of the old document.
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     return make_result(
         "skyvern_navigate",
@@ -231,13 +301,9 @@ async def skyvern_click(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
-        int,
-        Field(
-            description="Max time to wait for the element in ms. Increase for slow-loading pages. Default 30000 (30s)",
-            ge=1000,
-            le=60000,
-        ),
-    ] = 30000,
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     button: Annotated[str | None, Field(description="Mouse button: left, right, middle")] = None,
     click_count: Annotated[int | None, Field(description="Number of clicks (2 for double-click)")] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
@@ -272,19 +338,22 @@ async def skyvern_click(
         return make_result("skyvern_click", ok=False, error=no_browser_error())
 
     deterministic = selector is not None and selector_mode == "direct"
+    direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+    skip_element_prep = selector is not None and ai_mode is None and not deterministic
     used_ai_path = False
     native_option_selection = None
     resolved: str | None = None
     with Timer() as timer:
         try:
-            kwargs: dict[str, Any] = {"timeout": timeout}
+            kwargs: dict[str, Any] = {"timeout": action_timeout}
             if button:
                 kwargs["button"] = button
             if click_count is not None:
                 kwargs["click_count"] = click_count
 
             if selector is not None and (deterministic or ai_mode is None or ai_mode == "fallback"):
-                native_option_selection = await select_native_option_if_targeted(page, selector, timeout=timeout)
+                native_option_selection = await select_native_option_if_targeted(page, selector, timeout=action_timeout)
 
             if native_option_selection is not None:
                 resolved = native_option_selection.select_selector
@@ -297,9 +366,11 @@ async def skyvern_click(
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
-                resolved = await page.click(selector=selector, **kwargs)
+                resolved = await page.click(selector=selector, _skip_element_prep=skip_element_prep, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
+            if direct_action and selector is not None:
+                return await _direct_failure_result("skyvern_click", ctx, timer, page, selector, e, action_timeout)
             return make_result(
                 "skyvern_click",
                 ok=False,
@@ -313,6 +384,8 @@ async def skyvern_click(
             )
         except Exception as e:
             code = ErrorCode.AI_FALLBACK_FAILED if used_ai_path else ErrorCode.ACTION_FAILED
+            if direct_action and selector is not None and is_pointer_interception_error(e):
+                return await _direct_failure_result("skyvern_click", ctx, timer, page, selector, e, action_timeout)
             return make_result(
                 "skyvern_click",
                 ok=False,
@@ -387,13 +460,9 @@ async def skyvern_drag(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
-        int,
-        Field(
-            description="Max time to wait for elements in ms. Default 30000 (30s)",
-            ge=1000,
-            le=60000,
-        ),
-    ] = 30000,
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     source_intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
     target_intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
@@ -425,6 +494,7 @@ async def skyvern_drag(
         return make_result("skyvern_drag", ok=False, error=no_browser_error())
 
     use_selectors = source_selector and target_selector and not source_intent and not target_intent
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=bool(use_selectors))
 
     with Timer() as timer:
         try:
@@ -432,7 +502,7 @@ async def skyvern_drag(
                 await page.page.drag_and_drop(
                     source_selector,
                     target_selector,
-                    timeout=timeout,  # type: ignore[arg-type]
+                    timeout=action_timeout,  # type: ignore[arg-type]
                 )
             else:
                 src = source_intent or source_selector
@@ -440,6 +510,15 @@ async def skyvern_drag(
                 await do_act(page, f"Drag {src} and drop it onto {tgt}")
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
+            if use_selectors:
+                assert source_selector is not None
+                return make_result(
+                    "skyvern_drag",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=await _drag_failure_error(page, source_selector, target_selector, e, action_timeout),
+                )
             return make_result(
                 "skyvern_drag",
                 ok=False,
@@ -452,6 +531,15 @@ async def skyvern_drag(
                 ),
             )
         except Exception as e:
+            if use_selectors and is_pointer_interception_error(e):
+                assert source_selector is not None
+                return make_result(
+                    "skyvern_drag",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=await _drag_failure_error(page, source_selector, target_selector, e, action_timeout),
+                )
             return make_result(
                 "skyvern_drag",
                 ok=False,
@@ -488,13 +576,9 @@ async def skyvern_file_upload(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
-        int,
-        Field(
-            description="Max time to wait for the element in ms. Default 30000 (30s)",
-            ge=1000,
-            le=60000,
-        ),
-    ] = 30000,
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Upload files to a file input element. Accepts local paths or URLs (auto-downloaded).
@@ -522,6 +606,8 @@ async def skyvern_file_upload(
                 "Use intent='the file upload button' or selector='input[type=file]'",
             ),
         )
+    direct_action = is_direct_action(selector, ai_mode)
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
 
     has_urls = any(fp.startswith(("http://", "https://", "s3://", "gs://", "azure://")) for fp in file_paths)
     has_local = any(not fp.startswith(("http://", "https://", "s3://", "gs://", "azure://")) for fp in file_paths)
@@ -575,11 +661,11 @@ async def skyvern_file_upload(
                         files=fp,
                         prompt=intent,
                         ai=ai_mode,
-                        timeout=timeout,
+                        timeout=action_timeout,
                     )
                 else:
                     assert selector is not None
-                    await page.upload_file(selector=selector, files=fp, timeout=timeout)
+                    await page.upload_file(selector=selector, files=fp, timeout=action_timeout)
             elif ai_mode is not None and len(file_paths) == 1:
                 # Single local file + intent: use SDK for AI element resolution
                 await page.upload_file(
@@ -587,16 +673,20 @@ async def skyvern_file_upload(
                     files=file_paths[0],
                     prompt=intent,
                     ai=ai_mode,
-                    timeout=timeout,
+                    timeout=action_timeout,
                 )
             else:
                 # Local files + selector: set directly via Playwright
                 assert selector is not None
                 locator = page.page.locator(selector).first
-                await locator.set_input_files(file_paths, timeout=timeout)
+                await locator.set_input_files(file_paths, timeout=action_timeout)
 
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
+            if direct_action and selector is not None:
+                return await _direct_failure_result(
+                    "skyvern_file_upload", ctx, timer, page, selector, e, action_timeout
+                )
             return make_result(
                 "skyvern_file_upload",
                 ok=False,
@@ -610,6 +700,10 @@ async def skyvern_file_upload(
             )
         except Exception as e:
             code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            if direct_action and selector is not None and is_pointer_interception_error(e):
+                return await _direct_failure_result(
+                    "skyvern_file_upload", ctx, timer, page, selector, e, action_timeout
+                )
             return make_result(
                 "skyvern_file_upload",
                 ok=False,
@@ -633,13 +727,9 @@ async def skyvern_hover(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
-        int,
-        Field(
-            description="Max time to wait for the element in ms. Default 30000 (30s)",
-            ge=1000,
-            le=60000,
-        ),
-    ] = 30000,
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Hover over an element to reveal tooltips, menus, or hidden content. Uses AI intent, CSS/XPath selector, or both."""
@@ -654,6 +744,8 @@ async def skyvern_hover(
                 "Use intent='describe what to hover' for AI-powered hovering, or selector='#css-selector' for precise targeting",
             ),
         )
+    direct_action = is_direct_action(selector, ai_mode)
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -667,9 +759,11 @@ async def skyvern_hover(
             else:
                 assert selector is not None
                 loc = page.locator(selector)
-            await loc.hover(timeout=timeout)
+            await loc.hover(timeout=action_timeout)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
+            if direct_action and selector is not None:
+                return await _direct_failure_result("skyvern_hover", ctx, timer, page, selector, e, action_timeout)
             return make_result(
                 "skyvern_hover",
                 ok=False,
@@ -683,6 +777,8 @@ async def skyvern_hover(
             )
         except Exception as e:
             code = ErrorCode.AI_FALLBACK_FAILED if ai_mode else ErrorCode.ACTION_FAILED
+            if direct_action and selector is not None and is_pointer_interception_error(e):
+                return await _direct_failure_result("skyvern_hover", ctx, timer, page, selector, e, action_timeout)
             return make_result(
                 "skyvern_hover",
                 ok=False,
@@ -721,13 +817,9 @@ async def skyvern_type(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
-        int,
-        Field(
-            description="Max time to wait for the element in ms. Increase for slow-loading pages. Default 30000 (30s)",
-            ge=1000,
-            le=60000,
-        ),
-    ] = 30000,
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     clear: Annotated[bool, Field(description="Clear existing content before typing")] = True,
     delay: Annotated[int | None, Field(description="Delay between keystrokes in ms")] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
@@ -791,6 +883,10 @@ async def skyvern_type(
             )
 
     deterministic = selector is not None and selector_mode == "direct"
+    direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+    skip_element_prep = selector is not None and ai_mode is None and not deterministic
+
     with Timer() as timer:
         try:
             # selector_mode="direct" pins the selector with no AI fall-back. Resilient (default) and
@@ -799,14 +895,14 @@ async def skyvern_type(
             if clear:
                 if deterministic:
                     assert selector is not None
-                    await page.fill(selector, text, mode="direct", timeout=timeout)
+                    await page.fill(selector, text, mode="direct", timeout=action_timeout)
                 elif ai_mode is not None:
-                    await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
+                    await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=action_timeout)  # type: ignore[arg-type]
                 else:
                     assert selector is not None
-                    await page.fill(selector, text, timeout=timeout)
+                    await page.fill(selector, text, timeout=action_timeout, _skip_element_prep=skip_element_prep)
             else:
-                kwargs: dict[str, Any] = {"timeout": timeout}
+                kwargs: dict[str, Any] = {"timeout": action_timeout}
                 if delay is not None:
                     kwargs["delay"] = delay
                 if deterministic:
@@ -816,9 +912,11 @@ async def skyvern_type(
                     await loc.type(text, **kwargs)
                 else:
                     assert selector is not None
-                    await page.type(selector, text, **kwargs)
+                    await page.type(selector, text, _skip_element_prep=skip_element_prep, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
+            if direct_action and selector is not None:
+                return await _direct_failure_result("skyvern_type", ctx, timer, page, selector, e, action_timeout)
             return make_result(
                 "skyvern_type",
                 ok=False,
@@ -832,6 +930,8 @@ async def skyvern_type(
             )
         except Exception as e:
             code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
+            if direct_action and selector is not None and is_pointer_interception_error(e):
+                return await _direct_failure_result("skyvern_type", ctx, timer, page, selector, e, action_timeout)
             return make_result(
                 "skyvern_type",
                 ok=False,
@@ -1040,8 +1140,9 @@ async def skyvern_select_option(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
     timeout: Annotated[
-        int, Field(description="Max time to wait for the dropdown in ms. Default 30000 (30s)", ge=1000, le=60000)
-    ] = 30000,
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     by_label: Annotated[bool, Field(description="Select by visible label instead of value")] = False,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
@@ -1069,24 +1170,55 @@ async def skyvern_select_option(
         return make_result("skyvern_select_option", ok=False, error=no_browser_error())
 
     deterministic = selector is not None and selector_mode == "direct"
+    direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+
     with Timer() as timer:
         try:
             # selector_mode="direct" pins the selector with no AI fall-back. Only an intent-only call
             # (no selector) uses AI to interpret the option text.
             if ai_mode is not None and not deterministic:
-                await page.select_option(selector=selector, value=value, prompt=intent, ai=ai_mode, timeout=timeout)  # type: ignore[arg-type]
+                await page.select_option(
+                    selector=selector,  # type: ignore[arg-type]
+                    value=value,
+                    prompt=intent,
+                    ai=ai_mode,
+                    timeout=action_timeout,
+                )
             else:
                 assert selector is not None
                 if by_label:
                     # Bypass SkyvernPage to avoid value="" coercion conflicting with label kwarg.
-                    await page.page.locator(selector).select_option(label=value, timeout=timeout)
+                    await page.page.locator(selector).select_option(label=value, timeout=action_timeout)
                 elif deterministic:
-                    await page.select_option(selector, value=value, ai=None, timeout=timeout)
+                    await page.select_option(selector, value=value, ai=None, timeout=action_timeout)
                 else:
-                    await page.select_option(selector, value=value, timeout=timeout)
+                    await page.select_option(selector, value=value, timeout=action_timeout)
             timer.mark("sdk")
+        except PlaywrightTimeoutError as e:
+            if direct_action and selector is not None:
+                return await _direct_failure_result(
+                    "skyvern_select_option", ctx, timer, page, selector, e, action_timeout
+                )
+            code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
+            return make_result(
+                "skyvern_select_option",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    code,
+                    _exception_message(e),
+                    "Check selector and available options",
+                    details=_exception_details(e),
+                ),
+            )
         except Exception as e:
             code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
+            if direct_action and selector is not None and is_pointer_interception_error(e):
+                return await _direct_failure_result(
+                    "skyvern_select_option", ctx, timer, page, selector, e, action_timeout
+                )
             return make_result(
                 "skyvern_select_option",
                 ok=False,
@@ -1126,6 +1258,10 @@ async def skyvern_press_key(
     ] = None,
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    timeout: Annotated[
+        int | None,
+        Field(description=ACTION_TIMEOUT_DESCRIPTION, ge=MIN_ACTION_TIMEOUT_MS, le=MAX_ACTION_TIMEOUT_MS),
+    ] = None,
     intent: Annotated[str | None, Field(description=AI_FALLBACK_DESCRIPTION)] = None,
 ) -> dict[str, Any]:
     """Press a keyboard key -- Enter, Tab, Escape, arrow keys, shortcuts, etc.
@@ -1138,20 +1274,28 @@ async def skyvern_press_key(
     except BrowserNotAvailableError:
         return make_result("skyvern_press_key", ok=False, error=no_browser_error())
 
+    ai_mode = _resolve_ai_mode(selector, intent)[0] if (intent or selector) else None
+    direct_action = is_direct_action(selector, ai_mode)
+    action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+
     with Timer() as timer:
         try:
             if intent or selector:
-                ai_mode, _ = _resolve_ai_mode(selector, intent)
                 if ai_mode is not None:
                     loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)  # type: ignore[arg-type]
+                    await loc.press(key, timeout=action_timeout)
                 else:
                     assert selector is not None
-                    loc = page.locator(selector)
-                await loc.press(key)
+                    await page.locator(selector).press(key, timeout=action_timeout)
             else:
                 await page.keyboard.press(key)
             timer.mark("sdk")
         except Exception as e:
+            if direct_action and selector is not None:
+                if isinstance(e, PlaywrightTimeoutError) or is_pointer_interception_error(e):
+                    return await _direct_failure_result(
+                        "skyvern_press_key", ctx, timer, page, selector, e, action_timeout
+                    )
             return make_result(
                 "skyvern_press_key",
                 ok=False,
@@ -1842,6 +1986,7 @@ async def skyvern_frame_switch(
             # Persist frame on session state for subsequent MCP calls
             state = get_current_session()
             state._working_frame = page._working_frame
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
         except ValueError as e:
             return make_result(
                 "skyvern_frame_switch",
@@ -1897,6 +2042,7 @@ async def skyvern_frame_main(
     # Clear frame on session state
     state = get_current_session()
     state._working_frame = None
+    clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     return make_result(
         "skyvern_frame_main",
@@ -2111,12 +2257,22 @@ async def skyvern_observe(
         int,
         Field(description="Max elements to return. Default 50.", ge=1, le=200),
     ] = 50,
+    include_values: Annotated[
+        bool,
+        Field(
+            description="Include current values for non-password inputs. "
+            "Password values are never returned. Default false."
+        ),
+    ] = False,
 ) -> dict[str, Any]:
-    """Snapshot interactive page elements with stable refs (e0, e1, ...) for use in skyvern_execute batches."""
+    """Snapshot interactive elements with refs reusable in this browser session until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe). Input values are omitted by default; set include_values=True to return non-password values. Password values are never returned."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_observe", ok=False, error=no_browser_error())
+
+    observe_page_key = page_ref_key(page)
+    generation = session_ref_generation(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
     with Timer() as timer:
         try:
@@ -2125,6 +2281,7 @@ async def skyvern_observe(
                 selector=selector,
                 interactive_only=interactive_only,
                 max_elements=max_elements,
+                include_values=include_values,
             )
             timer.mark("sdk")
         except Exception as e:
@@ -2137,11 +2294,22 @@ async def skyvern_observe(
             )
 
     elements = serialize_elements(result.elements)
+    replace_session_ref_map(
+        ref_map_from_elements(elements),
+        session_id=ctx.session_id,
+        cdp_url=ctx.cdp_url,
+        generation=generation,
+        page_key=observe_page_key,
+    )
     hint = (
         f"Found {result.element_count} interactive elements"
         f"{f' (of {result.total_on_page} total on page)' if result.total_on_page > result.element_count else ''}. "
         "Use these refs in skyvern_execute steps, e.g.: "
-        '{tool: "click", params: {ref: "e0"}}'
+        '{tool: "click", params: {ref: "e0"}}. '
+        "Refs remain valid across calls in this browser session until the next skyvern_observe, "
+        "skyvern_navigate, same-tab navigation, or tab/frame switch. Same-document DOM changes can also "
+        "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures. "
+        "Input values are omitted unless include_values=true; password values are never returned."
     )
     return make_result(
         "skyvern_observe",
@@ -2182,7 +2350,7 @@ _TOOL_ACCEPTED_PARAMS: dict[str, frozenset[str]] = {
     "navigate": frozenset({"url", "timeout", "wait_until"}),
     "click": frozenset({"intent", "selector", "timeout", "click_count", "button"}),
     "type": frozenset({"text", "intent", "selector", "clear_first", "press_enter", "timeout"}),
-    "press_key": frozenset({"key", "intent", "selector"}),
+    "press_key": frozenset({"key", "intent", "selector", "timeout"}),
     "select_option": frozenset({"value", "intent", "selector", "timeout", "by_label"}),
     "hover": frozenset({"intent", "selector", "timeout"}),
     "scroll": frozenset({"direction", "amount", "intent", "selector"}),
@@ -2197,14 +2365,22 @@ async def _dispatch_step(
     ref_map: dict[str, dict[str, Any]],
     session_id: str | None,
     cdp_url: str | None,
+    page_key: tuple[int, int | None, str] | None = None,
+    on_observe_page: Callable[[tuple[int, int | None, str]], None] | None = None,
 ) -> dict[str, Any] | None:
     """Route a step to the appropriate handler, resolving refs to selectors."""
     params = dict(step.params)
 
-    # Resolve ref to selector if present
+    # Resolve ref to selector if present. Refs bind to the page/frame they were
+    # observed on, so re-check identity against the page this step will actually
+    # run on — a popup or external tab change may have moved it mid-batch.
     if ref := params.pop("ref", None):
-        elem = ref_map.get(ref)
-        if not elem:
+        current_page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
+        current_key = page_ref_key(current_page)
+        elem = ref_map.get(ref) if page_key is None or current_key == page_key else None
+        if elem is None:
+            elem = get_session_ref(ref, session_id=session_id, cdp_url=cdp_url, page_key=current_key)
+        if elem is None:
             raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
         params["selector"] = ref_to_selector(elem)
 
@@ -2213,7 +2389,9 @@ async def _dispatch_step(
         from skyvern.cli.core.browser_ops import do_observe as _do_observe
 
         page, _ = await get_page(session_id=session_id, cdp_url=cdp_url)
-        accepted = {"selector", "interactive_only", "max_elements"}
+        if on_observe_page is not None:
+            on_observe_page(page_ref_key(page))
+        accepted = {"selector", "interactive_only", "max_elements", "include_values"}
         filtered = {k: v for k, v in params.items() if k in accepted}
         result = await _do_observe(page, **filtered)
         return {
@@ -2241,8 +2419,7 @@ async def _dispatch_step(
     tool_result = await tool_fn(**filtered_params)
 
     if not tool_result.get("ok", False):
-        error = tool_result.get("error", {})
-        raise RuntimeError(error.get("message", "Tool execution failed"))
+        raise ToolStepError(tool_result.get("error") or {})
 
     return tool_result.get("data")
 
@@ -2253,7 +2430,11 @@ async def skyvern_execute(
         Field(
             description=(
                 "Array of {tool, params} step objects to execute sequentially. "
-                f"Within params, refs from skyvern_observe are direct targets. {DIRECT_TARGET_DESCRIPTION}"
+                "Within params, refs from skyvern_observe are direct targets across calls in the same browser session. "
+                "The next skyvern_observe or page/document context change invalidates them; they can occasionally "
+                "expire early. Same-document DOM changes can also invalidate ordinal refs; on 'Unknown ref' or "
+                "unexpected failures, re-observe. "
+                f"{DIRECT_TARGET_DESCRIPTION}"
             )
         ),
     ],
@@ -2264,7 +2445,7 @@ async def skyvern_execute(
         Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
     ] = True,
 ) -> dict[str, Any]:
-    """Execute multiple browser operations in a single batch. Each step is {tool, params} using refs from skyvern_observe.
+    """Execute browser operations using current-session refs until the next observe or page/document context change.
     Allowed tools: navigate, click, type, press_key, select_option, hover, scroll, wait, observe, screenshot, evaluate."""
     if not steps:
         return make_result(
@@ -2316,15 +2497,55 @@ async def skyvern_execute(
 
     # Verify we can reach the browser before executing anything
     try:
-        await get_page(session_id=session_id, cdp_url=cdp_url)
+        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_execute", ok=False, error=no_browser_error())
 
+    batch_page_key = page_ref_key(page)
+
+    # Generation captured before each observe dispatch so a snapshot that raced
+    # a concurrent navigation/context switch is discarded, not committed.
+    observe_generation: dict[str, int] = {}
+    observe_page_key: tuple[int, int | None, str] | None = None
+
+    def capture_observe_page_key(page_key: tuple[int, int | None, str]) -> None:
+        nonlocal observe_page_key
+        observe_page_key = page_key
+
     async def dispatch(step: ExecuteStep, ref_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-        return await _dispatch_step(step, ref_map, session_id=session_id, cdp_url=cdp_url)
+        if step.tool == "observe":
+            observe_generation["value"] = session_ref_generation(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+        return await _dispatch_step(
+            step,
+            ref_map,
+            session_id=session_id,
+            cdp_url=cdp_url,
+            page_key=batch_page_key,
+            on_observe_page=capture_observe_page_key if step.tool == "observe" else None,
+        )
+
+    def publish_observe_refs(ref_map: dict[str, dict[str, Any]]) -> bool:
+        nonlocal batch_page_key
+        if observe_page_key is None:
+            return False
+        accepted = replace_session_ref_map(
+            ref_map,
+            session_id=ctx.session_id,
+            cdp_url=ctx.cdp_url,
+            generation=observe_generation.get("value"),
+            page_key=observe_page_key,
+        )
+        if accepted:
+            batch_page_key = observe_page_key
+        return accepted
 
     with Timer() as timer:
-        result = await do_execute(dispatch, parsed_steps, stop_on_error=stop_on_error)
+        result = await do_execute(
+            dispatch,
+            parsed_steps,
+            stop_on_error=stop_on_error,
+            on_ref_map_update=publish_observe_refs,
+        )
         timer.mark("sdk")
 
     step_results = []

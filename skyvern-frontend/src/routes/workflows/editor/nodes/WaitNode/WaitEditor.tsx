@@ -5,7 +5,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
 import { helpTooltips } from "../../helpContent";
-import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { WaitNode, WaitNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
 
@@ -30,23 +29,15 @@ function WaitEditorBody({
 }) {
   const { editable } = data;
   const update = useUpdate<WaitNodeData>({ id: blockId, editable });
-  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
 
   return (
     <div data-testid="wait-block-form" className="space-y-4">
       <div className="space-y-2">
-        <div className="flex justify-between">
-          <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">
-              Wait Time (in seconds)
-            </Label>
-            <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
-          </div>
-          {isFirstWorkflowBlock ? (
-            <div className="flex justify-end text-xs text-slate-400">
-              Tip: Use the {"+"} button to add inputs!
-            </div>
-          ) : null}
+        <div className="flex gap-2">
+          <Label className="text-xs text-slate-300">
+            Wait Time (in seconds)
+          </Label>
+          <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
         </div>
         <Input
           value={data.waitInSeconds}

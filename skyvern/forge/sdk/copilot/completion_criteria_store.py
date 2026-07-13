@@ -32,10 +32,13 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_requested_output_evidence_source,
     _normalize_contingent_antecedent_output_path,
     _normalize_deliverable_kind,
+    is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
+    is_presence_only_requested_output_criterion,
     judgment_truth_condition_key,
     normalized_criterion_outcome_key,
     requested_output_path_for_field,
+    resolve_mint_degrade,
     typed_expected_output_value_key,
 )
 
@@ -133,6 +136,7 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "contingent_on": criterion.contingent_on,
             "contingent_antecedent_output_path": criterion.contingent_antecedent_output_path,
             "deliverable_kind": criterion.deliverable_kind,
+            "declared_deliverable_kind": criterion.declared_deliverable_kind,
             "implicit": criterion.implicit,
             "method_mandated": criterion.method_mandated,
             "level": criterion.level,
@@ -176,7 +180,10 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         )
         classification_output_key = _coerce_classification_output_key(item.get("classification_output_key"))
         expected_classification = _coerce_expected_classification(item.get("expected_classification"))
-        contingent_on = item.get("contingent_on")
+        contingent_on_raw = item.get("contingent_on")
+        contingent_on = (
+            contingent_on_raw.strip() if isinstance(contingent_on_raw, str) and contingent_on_raw.strip() else None
+        )
         contingent_antecedent_output_path = _normalize_contingent_antecedent_output_path(
             item.get("contingent_antecedent_output_path")
         )
@@ -207,11 +214,10 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             CompletionCriterion(
                 id=criterion_id,
                 outcome=outcome,
-                contingent_on=contingent_on.strip()
-                if isinstance(contingent_on, str) and contingent_on.strip()
-                else None,
+                contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
                 deliverable_kind=_normalize_deliverable_kind(item.get("deliverable_kind")),
+                declared_deliverable_kind=_normalize_deliverable_kind(item.get("declared_deliverable_kind")),
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
@@ -224,9 +230,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
                 requested_output_corroborator=bool(item.get("requested_output_corroborator")),
-                mint_degrade="turn_unsatisfiable_fallback"
-                if item.get("mint_degrade") == "turn_unsatisfiable_fallback"
-                else None,
+                mint_degrade=resolve_mint_degrade(
+                    item.get("mint_degrade"), contingent_on, contingent_antecedent_output_path
+                ),
                 judgment_truth_condition=_coerce_judgment_truth_condition(
                     item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
                 ),
@@ -239,7 +245,8 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_key = criterion.contingent_on or ""
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     deliverable_kind_key = (
-        f"{criterion.deliverable_kind or ''}\x1fmint_degrade:{criterion.mint_degrade or ''}"
+        f"{criterion.deliverable_kind or ''}\x1fdeclared:{criterion.declared_deliverable_kind or ''}"
+        f"\x1fmint_degrade:{criterion.mint_degrade or ''}"
         f"\x1fjudgment:{judgment_truth_condition_key(criterion.judgment_truth_condition)}"
     )
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
@@ -390,12 +397,7 @@ def apply_requested_output_producer_floor(
     criteria = tuple(criteria)
     requested, _remaining = split_requested_output_criteria(list(criteria))
     presence_only_ids = {
-        criterion.id
-        for criterion in requested
-        if criterion.expected_output_value is None
-        and criterion.expected_output_shape is None
-        and criterion.deliverable_kind is None
-        and criterion.mint_degrade is None
+        criterion.id for criterion in requested if is_presence_only_requested_output_criterion(criterion)
     }
     if not presence_only_ids:
         return criteria, ()
@@ -404,7 +406,16 @@ def apply_requested_output_producer_floor(
     for criterion in criteria:
         if criterion.id in presence_only_ids:
             rekeyed_paths.append(criterion.output_path or "")
-            floored.append(replace(criterion, output_path=None, level="run", kind="outcome"))
+            floored.append(
+                replace(
+                    criterion,
+                    output_path=None,
+                    level="run",
+                    kind="outcome",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=criterion.floor_rekeyed_from_path or criterion.output_path,
+                )
+            )
         else:
             floored.append(criterion)
     return tuple(floored), tuple(rekeyed_paths)
@@ -426,6 +437,7 @@ def reconcile_completion_criteria(
     """
     stored = snapshot.active if snapshot is not None else None
     next_epoch = snapshot.next_epoch if snapshot is not None else 1
+    fresh = [criterion for criterion in fresh if not is_defer_authoring_durable_fill_criterion(criterion)]
     if fresh and all(is_fallback_floor_criterion(criterion) for criterion in fresh):
         fresh = []
     if stored is None:

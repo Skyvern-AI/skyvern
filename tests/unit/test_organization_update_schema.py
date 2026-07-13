@@ -68,6 +68,12 @@ class TestOrganizationUpdateSchema:
         with pytest.raises(ValueError):
             OrganizationUpdate(max_steps_per_run=-1)
 
+    def test_accepts_max_steps_per_run_above_150(self) -> None:
+        # This schema is shared with the self-hosted CLI/MCP tool, so it must
+        # not carry Skyvern Cloud's frontend-only cap.
+        update = OrganizationUpdate(max_steps_per_run=500)
+        assert update.model_dump(exclude_unset=True) == {"max_steps_per_run": 500}
+
     def test_rejects_negative_max_retries_per_step(self) -> None:
         with pytest.raises(ValueError):
             OrganizationUpdate(max_retries_per_step=-1)

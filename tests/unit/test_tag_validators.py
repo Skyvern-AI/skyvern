@@ -7,6 +7,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     TAG_DESCRIPTION_MAX_LENGTH,
     TAG_KEY_MAX_LENGTH,
     TAG_VALUE_MAX_LENGTH,
+    normalize_optional_system_tag_key,
     normalize_optional_tag_key,
     normalize_optional_tag_value,
     normalize_run_metadata,
@@ -29,6 +30,12 @@ class TestNormalizeRunMetadataUnchanged:
 
     def test_all_empty_returns_none(self) -> None:
         assert normalize_run_metadata({"": "", "  ": "  "}) is None
+
+    def test_reserved_namespace_keys_are_filtered(self) -> None:
+        assert normalize_run_metadata({"env": "prod", " skyvern.platform ": "shop"}) == {"env": "prod"}
+
+    def test_all_reserved_namespace_keys_return_none(self) -> None:
+        assert normalize_run_metadata({"skyvern.platform": "shop"}) is None
 
     def test_over_max_keys_raises(self) -> None:
         too_many = {f"k{i}": "v" for i in range(RUN_METADATA_MAX_KEYS + 1)}
@@ -102,6 +109,19 @@ class TestNormalizeOptionalTagKey:
     def test_bare_skyvern_key_allowed(self) -> None:
         # 'skyvern' without the dot separator is not the reserved prefix.
         assert normalize_optional_tag_key("skyvern") == "skyvern"
+
+
+class TestNormalizeOptionalSystemTagKey:
+    def test_reserved_key_shape_is_valid_for_system_writers(self) -> None:
+        assert normalize_optional_system_tag_key(" skyvern.platform ") == "skyvern.platform"
+
+    def test_non_reserved_key_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            normalize_optional_system_tag_key("env")
+
+    def test_bad_shape_still_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must match"):
+            normalize_optional_system_tag_key("skyvern bad")
 
 
 class TestNormalizeTagValue:

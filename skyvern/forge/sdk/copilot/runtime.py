@@ -31,11 +31,20 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_origin import (
+    HealAdoptionFailed,
+    TurnOrigin,
+    is_self_heal_session_id,
+    make_self_heal_session_id,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
+from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
+    from playwright.async_api import Page
+
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
@@ -45,13 +54,15 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+    from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
@@ -178,6 +189,10 @@ class ScoutedInteraction(TypedDict):
     raw_typed_value: NotRequired[str]
     role: NotRequired[str]
     accessible_name: NotRequired[str]
+    # Captured for the type_text lane only; absent on credential fills (secret-leak boundary).
+    control_readonly: NotRequired[bool]
+    control_disabled: NotRequired[bool]
+    control_value_satisfied: NotRequired[bool]
     trajectory_index: NotRequired[int]
     carried: NotRequired[bool]
     # Credential fills carry references and metadata only — never secret values.
@@ -195,6 +210,9 @@ class AgentContext:
     browser_session_id: str | None
     stream: EventSourceStream
     api_key: str | None = None
+    turn_origin: TurnOrigin = TurnOrigin.interactive
+    injected_browser_state: BrowserState | None = None
+    heal_workflow_run_id: str | None = None
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -297,6 +315,7 @@ class AgentContext:
     last_run_outcome_block_labels: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
     consecutive_non_converging_repair_count: int = 0
@@ -330,7 +349,7 @@ class AgentContext:
     # flow_evidence does not cover it (closes the spent-inspection-budget
     # deadlock). Each item: {url, had_bounded_schema, reached_via}.
     prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
-    prior_fill_carry: list[dict[str, str | int]] = field(default_factory=list)
+    prior_fill_carry: list[dict[str, str | int | bool | list[str] | None]] = field(default_factory=list)
     fill_carry_rebound_done: bool = False
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
@@ -343,6 +362,7 @@ class AgentContext:
     last_evaluate_actionable_signature: str | None = None
     last_evaluate_actionable_url: str | None = None
     latest_evaluate_result_composition_steer: LoadedResultCompositionEvidence | None = None
+    latest_evaluate_result_composition_signature: str | None = None
     last_auto_acted_signature: str | None = None
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.
@@ -355,6 +375,10 @@ class AgentContext:
     # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
     # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
     reached_download_target: ReachedDownloadTarget | None = None
+    # Ordered (method, receiver) browser mutations of the last successfully persisted draft's code
+    # blocks; None until a persist succeeds this turn. Gates the scouted-spine under-build reject and turn-end nudge.
+    persisted_draft_browser_calls: list[tuple[str, str]] | None = None
+    scouted_spine_checkpoint_fired: bool = False
     # Author-time output-contract cross-turn state, keyed by the contract signature; set lazily by workflow_update.
     output_contract_pinned_block_label_by_signature: dict[str, str] = field(default_factory=dict)
     output_contract_reject_count_by_signature: dict[str, int] = field(default_factory=dict)
@@ -386,11 +410,10 @@ class AgentContext:
     # flaky scout pass. Cleared when the spine gains a source, on imposition, or on run dispatch.
     output_contract_declick_attempted_by_signature: dict[str, bool] = field(default_factory=dict)
     # One-shot per signature: a consumed advisory run whose observed output bound no required path may
-    # re-enter the ladder once so the stronger page-source extraction can be imposed before any terminal.
+    # re-enter the ladder once before any terminal.
     output_contract_dispatch_reopened_by_signature: dict[str, bool] = field(default_factory=dict)
-    # Set once a page-source extraction (page.extract keyed to the required paths) has been imposed on a
-    # signature; the exhaustion terminal requires this so a code static-return never terminals a producible shape.
-    output_contract_page_source_required_by_signature: dict[str, bool] = field(default_factory=dict)
+    # The exhaustion terminal requires this, and no rung sets it while code blocks stay on raw
+    # Playwright, so that terminal is unreachable until output grounding returns.
     output_contract_page_extraction_imposed_by_signature: dict[str, bool] = field(default_factory=dict)
     # Run-output evidence recorded at the run-result seam: a dispatched run's output-contract signatures
     # mapped to their required paths (armed at seam-admit and page-source imposition), then the observed
@@ -407,11 +430,31 @@ class AgentContext:
     synthesized_block_offered: bool = False
     synthesized_block_offered_trajectory_len: int = 0
     synthesized_block_offered_goal_complete: bool = False
+    requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # Candidate frozen by an imposition that has not been persisted yet; promoted to the committed
+    # candidate only once the update it rode in on succeeds.
+    pending_requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+    # Set by the imposition seam when a goal-complete spine is on its way into a draft; the successful update
+    # promotes it to the landed latch only when the persisted draft covers the freshly scouted spine.
+    pending_goal_complete_landing: bool = False
+    synthesized_goal_complete_landed: bool = False
+    # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
+    # guard (the fallback for a non-rewriting imposition) must not also answer for it.
+    spine_imposition_owned_attempt: bool = False
     synthesized_block_reopened_after_failed_run: bool = False
     synthesized_block_reopened_for_output_coverage: bool = False
+    synthesized_block_reopened_for_credential_scout: bool = False
     scouted_output_covered_paths: set[str] = field(default_factory=set)
     uncovered_output_rescout_context_key: str | None = None
     uncovered_output_rescout_steer_key: str | None = None
+    credential_scout_rescout_context_key: str | None = None
+    # Which requires-live-scout fields (username/password, non-empty) each scouted credential
+    # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
+    scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
+    # showed a password-type control; orders page evidence against post-fill submits across evictions.
+    last_scout_observation_trajectory_index: int | None = None
+    last_scout_observation_has_password_control: bool = False
     # Count of times the scout-act download gate rejected a download-intent block this turn. Bounds
     # the author->scout->re-author cycle so a genuinely un-scoutable affordance halts honestly.
     download_scout_required_rejections: int = 0
@@ -448,6 +491,13 @@ class AgentContext:
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
     author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
+    # Single-owner turn-precedence contract. One mechanism owns a turn's steering
+    # at a time; a contradicting weaker claim is recorded here and yields.
+    turn_ownership: TurnOwnership | None = None
+    gate_precedence_conflict_events: list[GatePrecedenceConflictEvent] = field(default_factory=list)
+    # Claimant whose owned claim stashed the current blocker_signal; the stash choke-point clears
+    # it whenever the held signal changes identity, so a plain stash can never alias a stale owner.
+    blocker_signal_claimant: TurnClaimant | None = None
 
 
 def copilot_author_time_gate_log_only_enabled() -> bool:
@@ -530,12 +580,42 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, BrowserState, Page]:
+    browser_state = ctx.injected_browser_state
+    if browser_state is None:
+        raise HealAdoptionFailed("injected_browser_state_missing")
+    if not _browser_context_is_attachable(browser_state.browser_context):
+        raise HealAdoptionFailed("injected_browser_context_unusable")
+    try:
+        page = await browser_state.get_working_page()
+    except Exception as exc:
+        LOG.warning(
+            "Self-heal browser adoption failed while probing working page",
+            organization_id=ctx.organization_id,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        raise HealAdoptionFailed("injected_working_page_unavailable") from exc
+    if page is None:
+        raise HealAdoptionFailed("injected_working_page_unavailable")
+    workflow_run_id = ctx.heal_workflow_run_id
+    if not workflow_run_id:
+        raise HealAdoptionFailed("self_heal_workflow_run_id_missing")
+    session_id = make_self_heal_session_id(workflow_run_id)
+    return session_id, browser_state, page
+
+
 @asynccontextmanager
 async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
-    if not ctx.browser_session_id:
-        raise RuntimeError("No browser_session_id set on agent context")
     browser_session_id = ctx.browser_session_id
+    # Equality, not identity: a plain-string origin must still route to the fail-closed heal branch.
+    if ctx.turn_origin != TurnOrigin.runtime_self_heal and not browser_session_id:
+        raise RuntimeError("No browser_session_id set on agent context")
+    if browser_session_id is None:
+        # Self-heal only; always overwritten below before use. Just satisfies the
+        # str-tuple typing of sdk_action_workflow_run_cache_key.
+        browser_session_id = ""
     sdk_action_workflow_run_cache_key: SdkActionWorkflowRunCacheKey = (ctx.organization_id, browser_session_id)
     # Validate api_key at the boundary, before touching any backend.
     #
@@ -554,19 +634,26 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         )
         raise RuntimeError("Copilot agent context missing api_key")
 
-    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-        session_id=browser_session_id,
-        organization_id=ctx.organization_id,
-    )
-    if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
-        # Keep the session id out of the raised message -- it can propagate
-        # to LLM- or user-visible output -- but log it for operators.
-        LOG.warning(
-            "No browser context for copilot session",
+    browser_state: BrowserState | None
+    working_page: Page | None = None
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        browser_session_id, browser_state, working_page = await _resolve_self_heal_browser_state(ctx)
+        ctx.browser_session_id = browser_session_id
+        sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
+    else:
+        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
             session_id=browser_session_id,
             organization_id=ctx.organization_id,
         )
-        raise RuntimeError("No browser context for copilot session")
+        if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
+            # Keep the session id out of the raised message -- it can propagate
+            # to LLM- or user-visible output -- but log it for operators.
+            LOG.warning(
+                "No browser context for copilot session",
+                session_id=browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+            raise RuntimeError("No browser context for copilot session")
 
     override_token = set_api_key_override(ctx.api_key)
     try:
@@ -590,6 +677,11 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
         )
+        if working_page is not None:
+            # Seed the tab pin from the already-probed page (mirrors what skyvern_tab_switch
+            # sets interactively) so self-heal tools land on the adopted tab instead of the
+            # new SkyvernBrowser's pages[-1] fallback.
+            state._active_page = working_page
         register_copilot_session(browser_session_id, state)
         try:
             async with scoped_session(state):
@@ -607,7 +699,25 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
 
 
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    """Create a browser session if needed. Returns None on success, error dict on failure."""
+    """Create a browser session if needed. Returns None on success, error dict on failure.
+
+    Exception: the self-heal path raises HealAdoptionFailed instead of returning an
+    error dict, so a failed adoption aborts the turn rather than degrading to a normal
+    tool-level error. Callers must let it propagate.
+    """
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
+        ctx.browser_session_id = browser_session_id
+        return None
+
+    if is_self_heal_session_id(ctx.browser_session_id):
+        LOG.warning(
+            "Supplied self-heal browser_session_id on interactive path; auto-creating",
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        ctx.browser_session_id = None
+
     if ctx.browser_session_id:
         persistent = await _get_persistent_browser_session(ctx.browser_session_id, ctx.organization_id)
         if persistent is not None and _browser_session_status_is_final(persistent.status):

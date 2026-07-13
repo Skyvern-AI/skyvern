@@ -40,6 +40,9 @@ class CodeBlockSandboxNameDiagnostic:
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")
 _MYPY_ERROR_RE = re.compile(r"^(?P<path>.*?):(?P<line>\d+): (?P<severity>error): (?P<message>.*)$")
 _LOCATOR_NOT_CALLABLE_RE = re.compile(r'"Locator" not callable\s+\[operator\]')
+# Locator properties that return a Locator; calling one (``.first()`` / ``.last()``)
+# is the ``"Locator" not callable`` misuse the mypy pass exists to surface.
+_LOCATOR_NONCALLABLE_PROPERTIES = frozenset({"first", "last"})
 _BROAD_BODY_TEXT_WAIT_NEEDLES = (
     "document.body.innertext",
     "document.body.textcontent",
@@ -232,6 +235,13 @@ def preflight_code_block(
     if diagnostics:
         return diagnostics
 
+    # Booting mypy costs ~1s per call, and the only diagnostic it can surface is
+    # ``"Locator" not callable`` (a Locator invoked as a function). Skip the boot
+    # entirely when a cheap AST scan proves the snippet contains no such call.
+    tree, _ = _parse_static_ast(code)
+    if tree is None or not _may_invoke_locator_object(tree):
+        return []
+
     try:
         from mypy import api as mypy_api
     except ImportError:
@@ -262,6 +272,26 @@ def preflight_code_block(
         return []
 
     return _parse_mypy_output(stdout)
+
+
+def _may_invoke_locator_object(tree: ast.AST) -> bool:
+    """True when the snippet could call a Locator object as a function.
+
+    ``"Locator" not callable`` is the only diagnostic the mypy pass surfaces, and
+    it arises from calling a Locator-returning property (``.first()`` / ``.last()``)
+    or the result of another call (``page.locator(...)()``). Conservative: any such
+    shape returns True so the mypy pass still runs; only snippets provably free of
+    them skip it.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in _LOCATOR_NONCALLABLE_PROPERTIES:
+            return True
+        if isinstance(func, ast.Call):
+            return True
+    return False
 
 
 def sandbox_unresolved_name_diagnostics(

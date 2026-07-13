@@ -23,6 +23,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
+    clear_terminal_evidence_on_workflow_edit,
     maybe_clear_blocker_signal_on_tool_success,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -53,14 +54,21 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _maybe_raise_non_retriable_nav,
     _needs_inspect_before_repair_nudge,
     _prune_input_list,
+    _record_code_authoring_guardrail_reject,
     _recover_from_context_overflow,
     _strip_input_images,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
 )
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
-from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_halt import (
+    ADVISORY_DISPATCH_STALLED_REASON_CODE,
+    CopilotTurnHalt,
+    TurnHaltKind,
+    expire_output_contract_ladder_at_turn_end,
+)
 from tests.unit.conftest import make_copilot_context as _fresh_context
 
 # ---------------------------------------------------------------------------
@@ -454,6 +462,10 @@ def _ceiling_reached_contract() -> DiagnosisRepairContract:
     )
 
 
+def _mark_recorded_run_backed(ctx: CopilotContext) -> None:
+    ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
+
+
 def test_zero_run_ceiling_yields_to_code_authoring_churn_backstop() -> None:
     ctx = _fresh_context()
     ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
@@ -473,6 +485,7 @@ def test_run_backed_ceiling_precedes_code_authoring_churn_backstop() -> None:
     ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
+    _mark_recorded_run_backed(ctx)
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -481,6 +494,32 @@ def test_run_backed_ceiling_precedes_code_authoring_churn_backstop() -> None:
     signal = ctx.blocker_signal
     assert isinstance(signal, CopilotToolBlockerSignal)
     assert signal.internal_reason_code == "repair_ceiling_reached"
+
+
+def test_stale_fallback_run_id_does_not_make_ceiling_run_backed() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+    ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
+    ctx.last_run_blocks_workflow_run_id = "wr_stale"
+
+    with pytest.raises(CopilotTurnHalt) as excinfo:
+        _check_enforcement(ctx)
+
+    assert excinfo.value.halt.kind is TurnHaltKind.LOOP_DETECTED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
+
+
+def test_workflow_edit_clears_recorded_persisted_run_latch() -> None:
+    ctx = _fresh_context()
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
+    ctx.recorded_persisted_block_run_workflow_run_id = "wr_1"
+
+    clear_terminal_evidence_on_workflow_edit(ctx)
+
+    assert ctx.last_run_blocks_workflow_run_id is None
+    assert ctx.recorded_persisted_block_run_workflow_run_id is None
 
 
 def test_credential_priority_churn_raises_at_higher_bound() -> None:
@@ -528,6 +567,7 @@ def test_run_backed_ceiling_precedes_credential_priority_churn() -> None:
     ctx.last_code_authoring_reject_was_credential_priority = True
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
+    _mark_recorded_run_backed(ctx)
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -580,6 +620,7 @@ def test_run_backed_ceiling_precedes_no_progress_interaction_floor() -> None:
     ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
     ctx.latest_diagnosis_repair_contract = _ceiling_reached_contract()
     ctx.last_run_blocks_workflow_run_id = "wr_1"
+    _mark_recorded_run_backed(ctx)
 
     with pytest.raises(CopilotTurnHalt) as excinfo:
         _check_enforcement(ctx)
@@ -694,3 +735,97 @@ def test_no_progress_held_blocker_survives_progress_tool_success(recovery_tool: 
     maybe_clear_blocker_signal_on_tool_success(ctx, recovery_tool)
 
     assert ctx.blocker_signal is held
+
+
+def _grant_output_contract_ladder(ctx: CopilotContext) -> None:
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+
+def test_inline_churn_reject_yields_to_live_ladder_and_keeps_count() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    _grant_output_contract_ladder(ctx)
+
+    _record_code_authoring_guardrail_reject(ctx)
+
+    assert ctx.code_authoring_guardrail_reject_count == MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert any(
+        event.fingerprint == "output_contract_actuation>code_authoring_guardrail_churn"
+        for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_inline_churn_reject_stashes_when_no_owner_is_live() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+
+    _record_code_authoring_guardrail_reject(ctx)
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
+    assert signal.renders_final_reply is True
+
+
+def test_churn_backstop_yields_to_live_ladder_without_halt_or_stash() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS
+    _grant_output_contract_ladder(ctx)
+
+    assert _check_enforcement(ctx) is None
+
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+    assert any(
+        event.fingerprint == "output_contract_actuation>code_authoring_guardrail_churn"
+        for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_no_progress_backstop_yields_to_live_ladder() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+    _grant_output_contract_ladder(ctx)
+
+    assert _check_enforcement(ctx) is None
+
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert any(
+        event.fingerprint == "output_contract_actuation>loop_detected" for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_register_no_progress_click_yields_to_live_ladder() -> None:
+    ctx = _fresh_context()
+    ctx.consecutive_no_progress_interaction_count = MAX_NO_PROGRESS_INTERACTION_ATTEMPTS - 1
+    _grant_output_contract_ladder(ctx)
+
+    register_no_progress_interaction_click(ctx, outcome="failed")
+
+    assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
+    assert ctx.blocker_signal is None
+
+
+def test_grant_plus_ceiling_reject_in_one_call_reaches_stalled_terminal_not_churn_reply() -> None:
+    ctx = _fresh_context()
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    _grant_output_contract_ladder(ctx)
+    ctx.output_contract_pending_run_evidence["sig_a"] = ["output.confirmation_number"]
+
+    _record_code_authoring_guardrail_reject(ctx)
+    assert _check_enforcement(ctx) is None
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+
+    halt = expire_output_contract_ladder_at_turn_end(ctx)
+
+    assert halt is not None
+    assert ctx.turn_halt is halt
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == ADVISORY_DISPATCH_STALLED_REASON_CODE

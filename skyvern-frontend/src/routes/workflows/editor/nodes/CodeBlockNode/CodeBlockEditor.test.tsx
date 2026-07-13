@@ -17,7 +17,6 @@ const baseData: CodeBlockNodeData = {
   parameterKeys: [],
   prompt: null,
   steps: null,
-  dataSchema: "null",
   model: null,
 };
 

@@ -145,6 +145,9 @@ class Settings(BaseSettings):
     # Static kill-switch for fail-fast shadow observability. Per-org rollout is the
     # PostHog flag FAIL_FAST_SHADOW; this only force-enables it everywhere (local/testing).
     FAIL_FAST_SHADOW: bool = False
+    # Default-off telemetry for deterministic submission signals; enabling it only schedules
+    # fire-and-forget shadow evaluation and does not change run behavior.
+    SKYVERN_SUBMISSION_SIGNAL_SHADOW: bool = False
     # Global kill-switch for select/autocomplete shadow-match observability (LLM-vs-deterministic
     # agreement logging). Not per-org; set false to silence the logs everywhere.
     SKYVERN_SELECT_SHADOW_MATCH: bool = True
@@ -206,6 +209,16 @@ class Settings(BaseSettings):
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
+    # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
+    # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
+    # coordinate the poller with a /credential-response POST that may land on another worker,
+    # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
+    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = False
+    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
+    # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
+    WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
@@ -215,6 +228,9 @@ class Settings(BaseSettings):
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
+    # SFTP uploads connect directly from the worker, so private/internal hosts are
+    # blocked by default; self-hosted deployments with internal SFTP targets can enable.
+    ALLOW_SFTP_INTERNAL_HOSTS: bool = False
 
     # Format: "http://<username>:<password>@host:port, http://<username>:<password>@host:port, ...."
     HOSTED_PROXY_POOL: str = ""
@@ -509,6 +525,27 @@ class Settings(BaseSettings):
     AZURE_GPT5_4_API_BASE: str | None = None
     AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
 
+    # AZURE gpt-5.6 sol
+    ENABLE_AZURE_GPT5_6_SOL: bool = False
+    AZURE_GPT5_6_SOL_DEPLOYMENT: str = "gpt-5.6-sol"
+    AZURE_GPT5_6_SOL_API_KEY: str | None = None
+    AZURE_GPT5_6_SOL_API_BASE: str | None = None
+    AZURE_GPT5_6_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5.6 terra
+    ENABLE_AZURE_GPT5_6_TERRA: bool = False
+    AZURE_GPT5_6_TERRA_DEPLOYMENT: str = "gpt-5.6-terra"
+    AZURE_GPT5_6_TERRA_API_KEY: str | None = None
+    AZURE_GPT5_6_TERRA_API_BASE: str | None = None
+    AZURE_GPT5_6_TERRA_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5.6 luna
+    ENABLE_AZURE_GPT5_6_LUNA: bool = False
+    AZURE_GPT5_6_LUNA_DEPLOYMENT: str = "gpt-5.6-luna"
+    AZURE_GPT5_6_LUNA_API_KEY: str | None = None
+    AZURE_GPT5_6_LUNA_API_BASE: str | None = None
+    AZURE_GPT5_6_LUNA_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
@@ -694,6 +731,15 @@ class Settings(BaseSettings):
     # Fails closed: an empty list rejects every app_origin, so self-hosted operators
     # who want to use the bounce-back flow must populate this with at least one entry.
     GOOGLE_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
+    # OSS/self-hosted instances can store the Google OAuth client config per org
+    # through Settings. Skyvern Cloud keeps the centrally managed OAuth client.
+    ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG: bool = True
+
+    MICROSOFT_OAUTH_CLIENT_ID: str | None = None
+    MICROSOFT_OAUTH_CLIENT_SECRET: str | None = None
+    MICROSOFT_OAUTH_TENANT: str = "common"
+    MICROSOFT_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    MICROSOFT_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
 
     # Google Sheets API runtime tuning
     GOOGLE_SHEETS_API_TIMEOUT_SECONDS: float = 30.0
@@ -777,6 +823,27 @@ class Settings(BaseSettings):
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
             ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
+            (
+                "azure/gpt-5.6-sol",
+                self.ENABLE_AZURE_GPT5_6_SOL,
+                "AZURE_OPENAI_GPT5_6_SOL",
+                "OPENAI_GPT5_6_SOL",
+                "GPT 5.6 Sol",
+            ),
+            (
+                "azure/gpt-5.6-terra",
+                self.ENABLE_AZURE_GPT5_6_TERRA,
+                "AZURE_OPENAI_GPT5_6_TERRA",
+                "OPENAI_GPT5_6_TERRA",
+                "GPT 5.6 Terra",
+            ),
+            (
+                "azure/gpt-5.6-luna",
+                self.ENABLE_AZURE_GPT5_6_LUNA,
+                "AZURE_OPENAI_GPT5_6_LUNA",
+                "OPENAI_GPT5_6_LUNA",
+                "GPT 5.6 Luna",
+            ),
             ("azure/o3", self.ENABLE_AZURE_O3, "AZURE_OPENAI_O3", "OPENAI_O3", "GPT O3"),
         ]
         for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:

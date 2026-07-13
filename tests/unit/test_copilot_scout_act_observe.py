@@ -20,7 +20,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
 )
-from skyvern.forge.sdk.copilot.context import FillCarry
+from skyvern.forge.sdk.copilot.context import (
+    FillCarry,
+    StructuredContext,
+    finalize_discovery_counter_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
@@ -815,10 +819,35 @@ class TestActObserveToolGate:
             ctx,
         )
 
-        server.call_internal_tool.assert_not_awaited()
+        awaited_tools = [call.args[0] for call in server.call_internal_tool.await_args_list]
+        assert awaited_tools == ["skyvern_get_value"]
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
+
+    @pytest.mark.asyncio
+    async def test_bare_css_selector_probes_control_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def passes(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        server = _server_returning(_bounded_extractor_payload())
+        ctx = _ctx(server=server, source_url=_SOURCE_URL)
+
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#electricDate", "text_length": 10}},
+            {"browser_context": {"url": _LANDING_URL, "title": "Results"}},
+            ctx,
+        )
+
+        probed = [
+            call
+            for call in server.call_internal_tool.await_args_list
+            if call.args and call.args[0] == "skyvern_evaluate" and "readonly" in call.args[1]["expression"]
+        ]
+        assert len(probed) == 1
 
 
 def _np_ctx(*, server: Any = None, counter: int = 0) -> SimpleNamespace:
@@ -1199,3 +1228,142 @@ class TestClickReperceptionHardening:
 
         assert ctx.last_scout_act_observe_outcome == "attached"
         assert ctx.consecutive_no_progress_interaction_count == 0
+
+
+class TestCredentialInventoryCarry:
+    @staticmethod
+    def _credential_carry(available_fields: list[str] | None) -> dict[str, Any]:
+        return FillCarry(
+            source_url=_LANDING_URL,
+            selector="#password",
+            tool_name="fill_credential_field",
+            credential_id="cred_123",
+            credential_field="username",
+            available_fields=available_fields,
+        ).model_dump()
+
+    @pytest.mark.asyncio
+    async def test_rebind_rehydrates_inventory_alongside_carried_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_fill_carry = [self._credential_carry(["password", "username"])]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#password", "label": "Password"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
+
+    @pytest.mark.asyncio
+    async def test_page_mismatch_drops_carry_but_keeps_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_fill_carry = [self._credential_carry(["password", "username"])]
+        mismatched = {"current_url": "https://example.com/elsewhere", "forms": [{"fields": []}]}
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=mismatched, url="https://example.com/elsewhere")
+
+        assert ctx.scout_trajectory == []
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+
+    @pytest.mark.asyncio
+    async def test_legacy_carry_without_available_fields_rehydrates_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_fill_carry = [self._credential_carry(None)]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#password", "label": "Password"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=evidence, url=_LANDING_URL)
+
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {}
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
+
+    @pytest.mark.asyncio
+    async def test_inventory_round_trips_through_structured_context_and_agent_hydration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first_turn = SimpleNamespace(
+            prior_discovery_calls_made=0,
+            discovery_calls_this_turn=0,
+            prior_page_inspection_calls_made=0,
+            page_inspection_calls_this_turn=0,
+            flow_evidence=[],
+            latest_evaluate_result_composition_steer=None,
+            scout_trajectory=[
+                {
+                    "tool_name": "fill_credential_field",
+                    "selector": "#password",
+                    "source_url": _LANDING_URL,
+                    "typed_length": 10,
+                    "credential_id": "cred_123",
+                    "credential_field": "username",
+                }
+            ],
+            scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
+        )
+        raw = finalize_discovery_counter_in_global_llm_context(first_turn, None)
+        assert raw is not None
+
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        next_turn = _ctx()
+        next_turn.scouted_credential_field_inventory_by_credential_id = {}
+        next_turn.prior_fill_carry = [carry.model_dump() for carry in StructuredContext.from_json_str(raw).fill_carry]
+        evidence = {
+            "current_url": _LANDING_URL,
+            "forms": [{"fields": [{"selector": "#password", "label": "Password"}]}],
+        }
+
+        await _maybe_rebind_prior_fill_carry(next_turn, page_evidence=evidence, url=_LANDING_URL)
+
+        assert next_turn.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+        assert next_turn.scout_trajectory[-1]["credential_field"] == "username"
+
+
+class TestScoutPageObservationSignal:
+    def test_password_control_detected_in_forms(self) -> None:
+        evidence = {
+            "forms": [{"fields": [{"selector": "#user", "type": "text"}, {"selector": "#pass", "type": "password"}]}]
+        }
+        assert scouting_module._page_evidence_has_password_control(evidence) is True
+
+    def test_no_password_control_in_forms(self) -> None:
+        evidence = {"forms": [{"fields": [{"selector": "#user", "type": "text"}]}]}
+        assert scouting_module._page_evidence_has_password_control(evidence) is False
+        assert scouting_module._page_evidence_has_password_control({}) is False
+
+    def test_record_scout_page_observation_captures_stable_index_and_signal(self) -> None:
+        ctx = _ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#go", "source_url": _LANDING_URL, "trajectory_index": 4},
+            "scout-note",
+        ]
+        ctx.last_scout_observation_trajectory_index = None
+        ctx.last_scout_observation_has_password_control = False
+
+        scouting_module._record_scout_page_observation(
+            ctx, {"forms": [{"fields": [{"selector": "#pass", "type": "password"}]}]}
+        )
+
+        assert ctx.last_scout_observation_trajectory_index == 4
+        assert ctx.last_scout_observation_has_password_control is True
+
+        scouting_module._record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#name"}]}]})
+
+        assert ctx.last_scout_observation_has_password_control is False

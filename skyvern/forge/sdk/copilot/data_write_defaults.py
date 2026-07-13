@@ -15,6 +15,7 @@ DATA_WRITE_BLOCK_TYPES: frozenset[str] = frozenset(
         BlockType.FILE_UPLOAD.value,
         BlockType.UPLOAD_TO_S3.value,
         BlockType.DOWNLOAD_TO_S3.value,
+        BlockType.SPLIT_PDF.value,
     }
 )
 

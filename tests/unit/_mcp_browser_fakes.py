@@ -49,6 +49,21 @@ def make_mock_page(
     return page
 
 
+def make_probe_locator(
+    *,
+    count: int = 1,
+    visible: bool = True,
+    enabled: bool = True,
+    side_effect: Exception | None = None,
+) -> MagicMock:
+    locator = MagicMock()
+    locator.first = locator
+    locator.count = AsyncMock(side_effect=side_effect, return_value=count)
+    locator.is_visible = AsyncMock(side_effect=side_effect, return_value=visible)
+    locator.is_enabled = AsyncMock(side_effect=side_effect, return_value=enabled)
+    return locator
+
+
 def make_skyvern_page(page: MagicMock) -> MagicMock:
     wrapper = MagicMock()
     wrapper.page = page

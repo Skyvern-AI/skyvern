@@ -25,15 +25,18 @@ function renderControl(props: {
   exactValuesOnly?: boolean;
   value?: Array<TagFilterTerm>;
   onChange?: (terms: Array<TagFilterTerm>) => void;
+  tagKeys?: Array<TagKey>;
+  onDeleteKey?: (tagKey: TagKey) => void;
 }) {
   return render(
     <MemoryRouter>
       <TagFilterControl
-        tagKeys={tagKeys}
+        tagKeys={props.tagKeys ?? tagKeys}
         value={props.value ?? []}
         onChange={props.onChange ?? (() => {})}
         labelSuggestions={["adhoc"]}
         exactValuesOnly={props.exactValuesOnly}
+        onDeleteKey={props.onDeleteKey}
       />
     </MemoryRouter>,
   );
@@ -72,5 +75,33 @@ describe("TagFilterControl default mode", () => {
     renderControl({ exactValuesOnly: false });
     openAndType("prod");
     expect(screen.getByText(/Filter by label/)).toBeTruthy();
+  });
+
+  it("keeps reserved system groups filterable but hides their delete action", () => {
+    const onChange = vi.fn();
+    const onDeleteKey = vi.fn();
+    renderControl({
+      onChange,
+      onDeleteKey,
+      tagKeys: [
+        ...tagKeys,
+        {
+          key: "skyvern.platform",
+          description: null,
+          workflow_count: 1,
+        },
+      ],
+    });
+
+    openAndType("skyvern");
+
+    expect(screen.getByText("skyvern.platform")).toBeTruthy();
+    expect(screen.queryByLabelText("Delete group skyvern.platform")).toBeNull();
+
+    fireEvent.click(screen.getByText("skyvern.platform"));
+    expect(onChange).toHaveBeenCalledWith([
+      { key: "skyvern.platform", value: null },
+    ]);
+    expect(onDeleteKey).not.toHaveBeenCalled();
   });
 });

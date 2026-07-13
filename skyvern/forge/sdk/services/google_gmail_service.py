@@ -1,5 +1,3 @@
-import base64
-import binascii
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,11 +8,17 @@ from urllib.parse import quote
 import httpx
 import structlog
 
-GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
+from skyvern.services.email import gmail_client
+
+GMAIL_API_BASE = gmail_client.GMAIL_API_BASE
+GmailAPIError = gmail_client.GmailAPIError
 LOG = structlog.get_logger()
 
 _OTP_QUERY_TERMS = "(verification OR verify OR code OR passcode OR otp OR 2fa OR one-time OR password)"
 _SAFE_EMAIL_QUERY_IDENTIFIER = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$")
+_decode = gmail_client.decode
+_get_json = gmail_client.get_json
+_payload_text = gmail_client.payload_text
 
 
 @dataclass(frozen=True)
@@ -22,44 +26,6 @@ class GmailMessageCandidate:
     message_id: str
     content: str
     internal_date: datetime | None = None
-
-
-class GmailAPIError(RuntimeError):
-    def __init__(self, *, status: int, code: str | None, message: str) -> None:
-        super().__init__(message)
-        self.status = status
-        self.code = code
-
-
-async def _get_json(
-    client: httpx.AsyncClient,
-    url: str,
-    *,
-    access_token: str,
-    params: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    response = await client.get(
-        url,
-        params=params,
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-    )
-    if response.is_success:
-        return response.json() or {}
-
-    code = None
-    message = response.text[:500] or "Gmail API error"
-    try:
-        err = (response.json() or {}).get("error")
-        if isinstance(err, dict):
-            message = err.get("message") or message
-            details = err.get("errors")
-            if isinstance(details, list) and details and isinstance(details[0], dict):
-                code = details[0].get("reason")
-    except ValueError:
-        pass
-    if response.status_code == 403 and code in {"insufficientPermissions", "insufficientScopes"}:
-        code = "reconnect_required"
-    raise GmailAPIError(status=response.status_code, code=code, message=message)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -80,28 +46,6 @@ def _build_query(totp_identifier: str, *, created_after: datetime | None = None)
         return None
     quoted = '"' + identifier.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return f"{_newer_than_query(created_after)} {_OTP_QUERY_TERMS} (to:{quoted} OR deliveredto:{quoted})"
-
-
-def _decode(data: str | None) -> str:
-    if not data:
-        return ""
-    try:
-        return base64.urlsafe_b64decode(f"{data}{'=' * (-len(data) % 4)}").decode("utf-8", errors="replace")
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        return ""
-
-
-def _payload_text(payload: dict[str, Any]) -> list[str]:
-    texts: list[str] = []
-    body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
-    decoded = _decode(body.get("data") if isinstance(body, dict) else None)
-    mime_type = str(payload.get("mimeType") or "").lower()
-    if decoded and mime_type in {"text/plain", "text/html"}:
-        texts.append(decoded)
-    for part in payload.get("parts") or []:
-        if isinstance(part, dict):
-            texts.extend(_payload_text(part))
-    return texts
 
 
 def _internal_date(message: dict[str, Any]) -> datetime | None:

@@ -24,6 +24,7 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
@@ -45,7 +46,7 @@ from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import is_manual_like_workflow_run_trigger_type
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -99,6 +100,98 @@ GEMINI_SAFETY_SETTINGS: list[dict[str, str]] = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
+
+CONTENT_FILTER_RESCUE_LLM_NAME_FLAG = "CONTENT_FILTER_RESCUE_LLM_NAME"
+# PostHog encodes a disabled multivariate flag as `False`; JS-style booleans
+# can also surface as strings.
+_CONTENT_FILTER_RESCUE_CONTROL_VARIANTS = {None, False, "False", "false", "", "control"}
+_content_filter_rescue_handler_cache: dict[str, LLMAPIHandler] = {}
+_content_filter_rescue_logged: set[str] = set()
+
+
+def _content_filter_rescue_log_once(dedup_key: str) -> bool:
+    """True only the first time `dedup_key` is seen; dedups per-misconfiguration warnings."""
+    if dedup_key in _content_filter_rescue_logged:
+        return False
+    _content_filter_rescue_logged.add(dedup_key)
+    return True
+
+
+async def _get_content_filter_rescue_handler(
+    current_llm_key: str, organization_id: str | None
+) -> tuple[str, LLMAPIHandler] | None:
+    """Resolve the CONTENT_FILTER_RESCUE_LLM_NAME multivariate flag to (llm_key, handler).
+
+    Returns None when the flag is unset/control or resolution fails, so the caller
+    keeps the default content-filter fallback behavior (SKY-11766).
+    """
+    ctx = skyvern_context.current()
+    distinct_id = ((ctx.workflow_run_id or ctx.task_id) if ctx else None) or organization_id
+    if not distinct_id:
+        return None
+    try:
+        variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+            CONTENT_FILTER_RESCUE_LLM_NAME_FLAG,
+            distinct_id,
+            properties={
+                "organization_id": organization_id or (ctx.organization_id if ctx else None),
+                "workflow_permanent_id": ctx.workflow_permanent_id if ctx else None,
+            },
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read CONTENT_FILTER_RESCUE_LLM_NAME; keeping default content-filter fallback",
+            llm_key=current_llm_key,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return None
+
+    if variant in _CONTENT_FILTER_RESCUE_CONTROL_VARIANTS or not isinstance(variant, str):
+        return None
+    # The rescue call resolves this flag again; skipping the blocked key here is
+    # what terminates that recursion.
+    if variant == current_llm_key:
+        if _content_filter_rescue_log_once(f"self:{variant}"):
+            LOG.warning(
+                "CONTENT_FILTER_RESCUE_LLM_NAME matches the blocked llm_key; ignoring",
+                variant=variant,
+            )
+        return None
+
+    # Custom LLMs are org-owned BYO endpoints: this path never validates ownership and
+    # the handler cache outlives registry updates, so they are not valid rescue targets.
+    if is_custom_llm_key(variant):
+        if _content_filter_rescue_log_once(f"custom:{variant}"):
+            LOG.warning(
+                "CONTENT_FILTER_RESCUE_LLM_NAME variant points at a custom LLM; ignoring",
+                variant=variant,
+            )
+        return None
+
+    handler = _content_filter_rescue_handler_cache.get(variant)
+    if handler is None:
+        # get_config synthesizes a config for unknown keys (a typo'd variant would reach
+        # litellm as a model name), so require an explicitly registered llm_key.
+        if not LLMConfigRegistry.is_registered(variant):
+            if _content_filter_rescue_log_once(f"unregistered:{variant}"):
+                LOG.warning(
+                    "CONTENT_FILTER_RESCUE_LLM_NAME variant is not a registered llm_key; ignoring",
+                    variant=variant,
+                )
+            return None
+        try:
+            handler = LLMAPIHandlerFactory.get_llm_api_handler(variant)
+        except Exception:
+            if _content_filter_rescue_log_once(f"init_failed:{variant}"):
+                LOG.warning(
+                    "Failed to initialize handler for CONTENT_FILTER_RESCUE_LLM_NAME variant",
+                    variant=variant,
+                    exc_info=True,
+                )
+            return None
+        _content_filter_rescue_handler_cache[variant] = handler
+    return variant, handler
 
 
 def _set_llm_context_attrs(
@@ -883,9 +976,9 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
         """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
-        default for its non-flex twin when `trigger_type == manual` (UI/MCP)."""
+        default for its non-flex twin when `trigger_type` is manual-like."""
         ctx = skyvern_context.current()
-        if ctx is None or ctx.trigger_type != WorkflowRunTriggerType.manual:
+        if ctx is None or not is_manual_like_workflow_run_trigger_type(ctx.trigger_type):
             return None
         effective_key = (
             getattr(default, "llm_key", None)
@@ -975,6 +1068,10 @@ class LLMAPIHandlerFactory:
         if not isinstance(llm_config, LLMRouterConfig):
             raise InvalidLLMConfigError(llm_key)
 
+        cache_kwargs: dict[str, int] = {}
+        if llm_config.redis_max_connections is not None:
+            cache_kwargs["max_connections"] = llm_config.redis_max_connections
+
         fallback_groups: list[str]
         if not llm_config.fallback_model_group:
             fallback_groups = []
@@ -996,6 +1093,7 @@ class LLMAPIHandlerFactory:
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
+            cache_kwargs=cache_kwargs,
             routing_strategy=llm_config.routing_strategy,
             fallbacks=fallbacks_payload,
             # Router-level default timeout. Per litellm router precedence
@@ -1384,37 +1482,98 @@ class LLMAPIHandlerFactory:
                     # recovers it. Gemini's non-configurable safety filters block PII-heavy
                     # prompts that safety_settings=BLOCK_NONE cannot recover, so retrying on
                     # another Gemini tier hits the same block — jump straight to the first
-                    # non-Gemini fallback group. Fires for any Gemini model that produced the
+                    # non-Gemini fallback group, unless CONTENT_FILTER_RESCUE_LLM_NAME names
+                    # a specific rescue llm_key. Fires for any Gemini model that produced the
                     # block, including a standard tier litellm already fell back to (SKY-11766).
-                    non_gemini_fallback = next(
-                        (group for group in fallback_groups if "gemini" not in group.lower()), None
-                    )
-                    if (
-                        is_content_filtered_response(response)
-                        and non_gemini_fallback is not None
-                        and "gemini" in (model_used or "").lower()
-                    ):
-                        fallback_model = non_gemini_fallback
-                        LOG.warning(
-                            "LLM response blocked by content filter on Gemini, retrying with non-Gemini fallback",
-                            llm_key=llm_key,
-                            prompt_name=prompt_name,
-                            filtered_model=model_used,
-                            fallback_model=fallback_model,
+                    if is_content_filtered_response(response) and "gemini" in (model_used or "").lower():
+                        rescue_organization_id = organization_id or (
+                            step.organization_id if step else (thought.organization_id if thought else None)
                         )
-                        _llm_call_start = time.perf_counter()
-                        try:
-                            # No timeout= kwarg here either; see SKY-10200 note on
-                            # the primary call site above.
-                            response = await router.acompletion(
-                                model=fallback_model,
-                                messages=messages,
-                                drop_params=True,
-                                **parameters,
+                        rescue = await _get_content_filter_rescue_handler(llm_key, rescue_organization_id)
+                        if rescue is not None:
+                            rescue_llm_key, rescue_handler = rescue
+                            LOG.warning(
+                                "LLM response blocked by content filter on Gemini, retrying with configured rescue LLM",
+                                llm_key=llm_key,
+                                prompt_name=prompt_name,
+                                filtered_model=model_used,
+                                rescue_llm_key=rescue_llm_key,
                             )
-                        finally:
-                            llm_duration_seconds += time.perf_counter() - _llm_call_start
-                        model_used = response.model or fallback_model
+                            try:
+                                # No parameters= forwarded: the rescue handler derives them from
+                                # its own llm_config (token limits and temperature rules differ).
+                                rescue_result = await rescue_handler(
+                                    prompt=prompt,
+                                    prompt_name=prompt_name,
+                                    step=step,
+                                    task_v2=task_v2,
+                                    thought=thought,
+                                    ai_suggestion=ai_suggestion,
+                                    workflow_run_block_id=workflow_run_block_id,
+                                    screenshots=screenshots,
+                                    organization_id=rescue_organization_id,
+                                    tools=tools,
+                                    use_message_history=use_message_history,
+                                    raw_response=raw_response,
+                                    window_dimension=window_dimension,
+                                    force_dict=force_dict,
+                                    system_prompt=system_prompt,
+                                )
+                            except CancelledError:
+                                raise
+                            except Exception:
+                                # Warn per event so failure rate stays visible, but only
+                                # attach the traceback once per rescue key to avoid spam.
+                                LOG.warning(
+                                    "Content-filter rescue LLM failed; retrying with non-Gemini fallback",
+                                    llm_key=llm_key,
+                                    prompt_name=prompt_name,
+                                    rescue_llm_key=rescue_llm_key,
+                                    exc_info=_content_filter_rescue_log_once(f"rescue_failed:{rescue_llm_key}"),
+                                )
+                            else:
+                                # Pair the blocked response with the already-recorded request so the
+                                # early return doesn't orphan it; the rescue handler persists its own set.
+                                if should_persist_llm_artifacts:
+                                    blocked_response_bytes = _safe_model_dump_json(response).encode("utf-8")
+                                    if _should_bundle:
+                                        _bundle_request = llm_request_json.encode("utf-8")
+                                        _bundle_response = blocked_response_bytes
+                                    else:
+                                        artifacts.append(
+                                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                                data=blocked_response_bytes,
+                                                artifact_type=ArtifactType.LLM_RESPONSE,
+                                                **artifact_targets,
+                                            )
+                                        )
+                                _llm_span.set_attribute("status", "content_filter_rescued")
+                                return rescue_result
+                        non_gemini_fallback = next(
+                            (group for group in fallback_groups if "gemini" not in group.lower()), None
+                        )
+                        if non_gemini_fallback is not None:
+                            fallback_model = non_gemini_fallback
+                            LOG.warning(
+                                "LLM response blocked by content filter on Gemini, retrying with non-Gemini fallback",
+                                llm_key=llm_key,
+                                prompt_name=prompt_name,
+                                filtered_model=model_used,
+                                fallback_model=fallback_model,
+                            )
+                            _llm_call_start = time.perf_counter()
+                            try:
+                                # No timeout= kwarg here either; see SKY-10200 note on
+                                # the primary call site above.
+                                response = await router.acompletion(
+                                    model=fallback_model,
+                                    messages=messages,
+                                    drop_params=True,
+                                    **parameters,
+                                )
+                            finally:
+                                llm_duration_seconds += time.perf_counter() - _llm_call_start
+                            model_used = response.model or fallback_model
 
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.

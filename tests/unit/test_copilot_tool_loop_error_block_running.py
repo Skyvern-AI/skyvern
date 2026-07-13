@@ -15,6 +15,7 @@ from typing import Any
 
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import compute_action_sequence_fingerprint
+from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.tools import (
     BLOCK_RUNNING_TOOLS,
@@ -49,6 +50,9 @@ def _ctx(**overrides: Any) -> Any:
         "output_contract_actuation_count_by_signature": {},
         "output_contract_armed_directive_fingerprint_by_signature": {},
         "output_contract_dispatch_reopened_by_signature": {},
+        "turn_ownership": None,
+        "blocker_signal_claimant": None,
+        "gate_precedence_conflict_events": [],
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -131,6 +135,22 @@ def test_planning_tool_still_trips_name_only_streak() -> None:
     msg = _tool_loop_error(ctx, "update_workflow")
     assert msg is not None
     assert "LOOP DETECTED" in msg
+
+
+def test_native_site_distinct_arguments_do_not_trip_streak() -> None:
+    ctx = _ctx()
+    for value in ("a", "b", "c", "d"):
+        assert _tool_loop_error(ctx, "update_workflow", {"workflow_yaml": value}) is None
+
+
+def test_exempt_tool_completion_breaks_non_exempt_streak() -> None:
+    ctx = _ctx()
+    assert _tool_loop_error(ctx, "update_workflow") is None
+    assert _tool_loop_error(ctx, "update_workflow") is None
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx, "fill_credential_field", {"ok": True, "data": {}}, {"field": "username"}
+    )
+    assert _tool_loop_error(ctx, "update_workflow") is None
 
 
 def test_unresolved_output_contract_ladder_skips_name_only_streak_for_authoring_tool() -> None:

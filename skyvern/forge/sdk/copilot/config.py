@@ -356,6 +356,14 @@ def _default_fallback_llm_key() -> str | None:
     return settings.SECONDARY_LLM_KEY
 
 
+def _default_credential_pause_enabled() -> bool:
+    return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED
+
+
+def _default_credential_pause_timeout_seconds() -> int:
+    return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
+
+
 @dataclass(slots=True)
 class CopilotConfig:
     prompt_template: str = DEFAULT_PROMPT_TEMPLATE
@@ -367,6 +375,8 @@ class CopilotConfig:
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     impose_synthesized_code_block: bool = False
     requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
+    credential_pause_enabled: bool = field(default_factory=_default_credential_pause_enabled)
+    credential_pause_timeout_seconds: int = field(default_factory=_default_credential_pause_timeout_seconds)
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

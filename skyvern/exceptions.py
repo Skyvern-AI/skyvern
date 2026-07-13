@@ -171,6 +171,16 @@ class PhoneNumberInputMismatch(SkyvernException):
         )
 
 
+class CardNumberInputMismatch(SkyvernException):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        self.expected_digit_count = expected_digit_count
+        self.actual_digit_count = actual_digit_count
+        super().__init__(
+            "Card number input read-back mismatch: "
+            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 
@@ -278,7 +288,16 @@ class MissingWorkflowRunBrowserState(SkyvernException):
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
 
 
-class CaptchaNotSolvedInTime(SkyvernException):
+class CaptchaSolveError(SkyvernException):
+    """Base for captcha-solve failures.
+
+    Shared marker so the action handler can catch captcha-solve failures with a
+    dedicated typed arm (logged as a handled failure) instead of the generic
+    "Unhandled exception" arm. Cloud captcha-solve exceptions subclass this too.
+    """
+
+
+class CaptchaNotSolvedInTime(CaptchaSolveError):
     def __init__(self, task_id: str, final_state: str) -> None:
         super().__init__(f"Captcha not solved in time for task {task_id}. Final state: {final_state}")
 
