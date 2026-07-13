@@ -128,6 +128,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     output_policy_verdict_to_trace_data,
     url_origin,
 )
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     ReachedDownloadTarget,
@@ -10215,7 +10216,7 @@ async def _update_workflow(
                 code_rejected=True,
             )
         return reject(
-            error=f"Workflow validation failed: {e}",
+            error=f"{INTERNAL_VALIDATION_FAILURE_PREFIX}{e}",
             user_facing_summary=user_facing_summary,
             data=repair_data,
         )
