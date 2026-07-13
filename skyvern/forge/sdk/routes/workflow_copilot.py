@@ -42,6 +42,11 @@ from skyvern.forge.sdk.copilot.context import (
     render_loaded_result_context_for_prompt,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.credential_pause import (
+    CredentialPauseRejection,
+    check_credential_pause_resumable,
+    resolve_credential_pause,
+)
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
@@ -77,6 +82,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotChatSummary,
     WorkflowCopilotClearProposedWorkflowRequest,
+    WorkflowCopilotCredentialResponseRequest,
     WorkflowCopilotProcessingUpdate,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamMessageType,
@@ -2350,6 +2356,72 @@ async def workflow_copilot_cancel(
         "1",
         ex=COPILOT_CANCEL_TTL,
     )
+
+
+@base_router.post(
+    "/workflow/copilot/credential-response", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
+)
+async def workflow_copilot_credential_response(
+    response_request: WorkflowCopilotCredentialResponseRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    """Resume a turn paused on ``credential_required`` with the user's card response.
+
+    The resume path is not authorized by org auth + ``turn_id`` alone: the caller
+    must echo back the one-time ``resume_token`` and ``workflow_copilot_chat_id``
+    from the frame, which ``resolve_credential_pause`` checks against a still-pending
+    active-pause record before it writes the flag the paused loop polls. Returns
+    503 when ``app.CACHE`` is absent, 422 when ``action="connected"`` omits a
+    ``credential_id``, 404 when that ID doesn't resolve in this organization or no
+    active pause matches, 403 on a bad token, and 409 once the pause is consumed.
+    """
+    cache = getattr(app, "CACHE", None)
+    if cache is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Credential response not supported in this environment",
+        )
+
+    # Validate the resume token BEFORE the credential-id lookup below: org auth
+    # alone doesn't authorize this turn, and checking token validity first avoids
+    # using an unauthorized-for-this-turn caller's credential_id as a small
+    # authenticated existence oracle (a bogus token still gets a real 404/not-found).
+    try:
+        await check_credential_pause_resumable(
+            cache,
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=response_request.workflow_copilot_chat_id,
+            turn_id=response_request.turn_id,
+            resume_token=response_request.resume_token,
+        )
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+
+    credential_id = response_request.credential_id
+    if response_request.action == "connected":
+        if not credential_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="credential_id is required when action is 'connected'",
+            )
+        existing = await app.DATABASE.credentials.get_credentials_by_ids(
+            [credential_id], organization_id=organization.organization_id
+        )
+        if not existing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Credential {credential_id} not found")
+
+    try:
+        await resolve_credential_pause(
+            cache,
+            organization_id=organization.organization_id,
+            workflow_copilot_chat_id=response_request.workflow_copilot_chat_id,
+            turn_id=response_request.turn_id,
+            resume_token=response_request.resume_token,
+            action=response_request.action,
+            credential_id=credential_id,
+        )
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
 
 
 @base_router.post(

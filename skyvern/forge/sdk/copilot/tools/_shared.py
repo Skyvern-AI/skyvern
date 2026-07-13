@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -26,7 +25,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_structured
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS, _elapsed_run_seconds
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.task_output_envelope import (
     _TASK_ENVELOPE_BLOCK_TYPES,
@@ -270,7 +269,7 @@ def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
     started_at = getattr(ctx, "copilot_run_start_monotonic", None)
     if not isinstance(started_at, int | float):
         return None
-    return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
+    return TOTAL_TIMEOUT_SECONDS - _elapsed_run_seconds(ctx, float(started_at))
 
 
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:

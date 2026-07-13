@@ -1728,6 +1728,13 @@ def _make_agent_result(
             reason = credential_prompt_reason(policy, kwargs.get("user_response"))
             if reason:
                 payload_updates["credentialPrompt"] = {"reason": reason}
+        if ctx is not None and "credentialPause" not in narrative_payload:
+            pause_outcome = ctx.credential_pause_outcome
+            if pause_outcome:
+                pause_payload = {"outcome": pause_outcome}
+                if pause_outcome == "connected" and ctx.request_policy and ctx.request_policy.resolved_credentials:
+                    pause_payload["credentialId"] = ctx.request_policy.resolved_credentials[-1].credential_id
+                payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
             payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
         if ctx is not None and "outcomeAdjudication" not in narrative_payload:
@@ -4557,6 +4564,7 @@ async def _run_copilot_turn_impl(
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
         copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
+        client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
     )
     LOG.info(
         "copilot_block_authoring_policy_resolved",

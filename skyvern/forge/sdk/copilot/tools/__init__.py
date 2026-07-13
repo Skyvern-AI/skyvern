@@ -615,6 +615,12 @@ async def update_and_run_blocks_tool(
         "parameters": parameters or {},
     }
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
+    # Cleared unconditionally up front and only set True at the actual skip
+    # branch below — reflects "we skipped a run", not "the policy would have
+    # allowed a skip if we got that far". A stale True from an earlier call, or
+    # a premature True from a policy check ahead of an unrelated update_workflow
+    # failure, would misreport an authoring error as a credential ask.
+    copilot_ctx.last_run_skipped_unbound_credentials = False
     authority_error = _authority_tool_error(
         copilot_ctx,
         "update_and_run_blocks",
@@ -721,6 +727,7 @@ async def update_and_run_blocks_tool(
         return json.dumps(sanitized)
 
     if skip_run_after_update:
+        copilot_ctx.last_run_skipped_unbound_credentials = True
         skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
             "ok": True,

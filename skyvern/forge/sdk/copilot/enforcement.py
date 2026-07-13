@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.config import (
     normalize_block_authoring_policy,
 )
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     RepairLoopState,
@@ -946,8 +947,24 @@ def _mark_copilot_total_timeout(ctx: Any) -> None:
     ctx.copilot_total_timeout_exceeded = True
 
 
+def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
+    """Wall-clock elapsed since ``start_time``, minus time spent in a credential pause.
+
+    Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
+    time, so a paused-and-resumed turn isn't penalized for pause time.
+
+    ``pause_seconds`` is coerced defensively: tests commonly pass a bare
+    ``MagicMock()`` as ``ctx``, whose ``getattr(..., default)`` returns a
+    fresh Mock instead of the default (Mock never raises AttributeError).
+    """
+    pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
+    if not isinstance(pause_seconds, (int, float)):
+        pause_seconds = 0.0
+    return time.monotonic() - start_time - pause_seconds
+
+
 def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float) -> None:
-    if time.monotonic() - start_time >= TOTAL_TIMEOUT_SECONDS:
+    if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
         _mark_copilot_total_timeout(ctx)
 
 
@@ -1515,6 +1532,14 @@ def _check_enforcement(
             consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
         )
         raise_if_turn_halt(ctx, verified=verified)
+
+    # A pending credential pause pre-empts every hygiene nudge below, not just
+    # the failed-test one: a credential-blocked update_and_run_blocks call
+    # satisfies post_update (test not run) and, when the diagnosis contract
+    # is the source, the generic failed-test nudge too. None of those nudges
+    # can be acted on without the credential the pause is about to ask for.
+    if credential_pause_would_fire(ctx, config):
+        return None
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
@@ -2095,7 +2120,7 @@ async def _run_streamed_with_deadline(
     ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so
     ``wait_for(timeout=0)`` never panics on an already-spent budget.
     """
-    elapsed = time.monotonic() - start_time
+    elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
     result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
     try:
@@ -2919,7 +2944,7 @@ async def run_with_enforcement(
         # SSE stream silently drops events once the browser is gone, but
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
-        elapsed = time.monotonic() - start_time
+        elapsed = _elapsed_run_seconds(ctx, start_time)
         if elapsed > TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx)
             raise CopilotTotalTimeoutError()
@@ -3073,14 +3098,41 @@ async def run_with_enforcement(
         synthesized_msg = _maybe_synthesized_block_offer_msg(ctx)
 
         spine_checkpoint_nudge = False
-        if nudge is None and synthesized_msg is None:
-            spine_nudge = _scouted_spine_turn_end_nudge(ctx)
-            if spine_nudge is None:
-                _consume_pending_screenshots(ctx)
-                _maybe_raise_non_retriable_nav(ctx)
-                return result
-            nudge = spine_nudge
-            spine_checkpoint_nudge = True
+        if nudge is None:
+            # Checked whenever there's no regular nudge, even if a synthesized
+            # offer is also pending: a credential-blocked run's diagnosis can
+            # coincide with a reopened synthesized-block offer, and the pause
+            # must win so the loop doesn't send the offer instead of the card.
+            pause_used_before_this_call = getattr(ctx, "credential_pause_used", False)
+            resume_msgs = await maybe_credential_pause(ctx, result, stream, copilot_config)
+            if resume_msgs is not None:
+                current_input = (
+                    resume_msgs if session is not None else _prune_input_list(result.to_input_list()) + resume_msgs
+                )
+                iteration += 1
+                continue
+            if (
+                not pause_used_before_this_call
+                and getattr(ctx, "credential_pause_used", False)
+                and getattr(ctx, "credential_pause_outcome", None) == "declined"
+            ):
+                # The latch just flipped on THIS call with no frame ever sent
+                # (disconnect, cache gone, or the reason vanished under the
+                # async-only checks credential_pause_would_fire's docstring notes
+                # it excludes) -- fall back to whatever nudge this iteration would
+                # have gotten without the pre-empt, instead of silently finalizing
+                # an uncorrected reply. Gated on the latch's own transition (not
+                # just the outcome value) so a later iteration's unrelated
+                # nudge=None doesn't re-trigger this off a stale "declined".
+                nudge = _check_enforcement(ctx, result, copilot_config)
+            if nudge is None and synthesized_msg is None:
+                spine_nudge = _scouted_spine_turn_end_nudge(ctx)
+                if spine_nudge is None:
+                    _consume_pending_screenshots(ctx)
+                    _maybe_raise_non_retriable_nav(ctx)
+                    return result
+                nudge = spine_nudge
+                spine_checkpoint_nudge = True
 
         if nudge is not None and not spine_checkpoint_nudge and nudge == _nudge(copilot_config, "post_update"):
             if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:
