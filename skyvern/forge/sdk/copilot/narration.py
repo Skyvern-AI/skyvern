@@ -36,7 +36,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
 

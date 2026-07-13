@@ -61,7 +61,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
+from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization

@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()

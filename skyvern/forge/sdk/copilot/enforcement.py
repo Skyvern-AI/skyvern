@@ -166,7 +166,7 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.copilot.runtime import AgentContext
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
 
