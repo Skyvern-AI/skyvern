@@ -499,6 +499,9 @@ async def _clear_proposed_workflow(chat: Any) -> None:
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
         proposed_workflow=None,
     )
+    # Keep the in-memory chat in sync — a same-turn recovery retry reads
+    # chat.proposed_workflow again and must not see the pre-write value.
+    chat.proposed_workflow = None
 
 
 async def _load_completion_criteria_snapshot(chat: Any) -> StoredCriteriaSnapshot | None:
@@ -598,18 +601,25 @@ def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
     return isinstance(diagnostics, dict) and diagnostics.get("final_output_policy_allowed") is False
 
 
-async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult, restored: bool) -> None:
+async def _persist_proposed_workflow_state(
+    chat: Any, agent_result: AgentResult, restored: bool, keep_pending_proposal: bool = False
+) -> None:
     updated_workflow = agent_result.updated_workflow
     auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
     if not auto_accept_effective and updated_workflow:
+        proposed_workflow_data = _build_proposed_workflow_data(updated_workflow, agent_result)
         await app.DATABASE.workflow_params.update_workflow_copilot_chat(
             organization_id=chat.organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            proposed_workflow=_build_proposed_workflow_data(updated_workflow, agent_result),
+            proposed_workflow=proposed_workflow_data,
         )
+        # Keep the in-memory chat in sync — a same-turn recovery retry reads
+        # chat.proposed_workflow again and must not see the pre-write value.
+        chat.proposed_workflow = proposed_workflow_data
     elif chat.proposed_workflow is not None and (
-        restored
+        (restored and not keep_pending_proposal)
         or agent_result.clear_proposed_workflow
+        or _should_commit_staged_workflow(chat.auto_accept, agent_result)
         or (
             getattr(agent_result, "apply_without_review", False) is True
             and auto_accept_effective
@@ -619,14 +629,21 @@ async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult,
         # Null any persisted proposed_workflow the assistant just invalidated
         # so a reload does not resurrect a stale Accept/Reject card. Runs
         # under both auto_accept values — a stale proposal can survive an
-        # auto-accept toggle.
+        # auto-accept toggle. The staged-commit clause always wins over
+        # keep_pending_proposal: this turn's own auto-commit already
+        # overwrote canonical, so an earlier bypassed proposal is now stale
+        # regardless of the client's preservation request.
         await _clear_proposed_workflow(chat)
     elif (
         # This intentionally checks the raw setting, not
         # ``auto_accept_effective``: no-proposal OutputPolicy blocks are not
         # auto-applicable, but ordinary auto-accept turns still need to clear a
-        # stale unvalidated card because the UI has no review panel for it.
+        # stale unvalidated card once no UI renders a review panel for it.
+        # keep_pending_proposal still wins: auto_accept doesn't cover
+        # review_untested/review_tested, so a gate-worthy card can coexist
+        # with auto_accept=True and must survive the same as any other bypass.
         chat.auto_accept is True
+        and not keep_pending_proposal
         and chat.proposed_workflow is not None
         and chat.proposed_workflow.get("_copilot_unvalidated") is True
         and not _output_policy_blocked_final_response(agent_result)
@@ -645,6 +662,7 @@ async def _persist_cancel_turn(
     agent_result: AgentResult | None,
     audio_artifact_id: str | None = None,
     turn_id: str | None = None,
+    keep_pending_proposal: bool = False,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -664,10 +682,11 @@ async def _persist_cancel_turn(
         response_turn_id = turn_id
         narrative_summary = None
         narrative_payload = None
-        if chat.proposed_workflow is not None:
+        if chat.proposed_workflow is not None and not keep_pending_proposal:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
         restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+        restore_failed = False
         if restored:
             try:
                 await asyncio.shield(_restore_workflow_definition(original_workflow, organization_id))
@@ -677,10 +696,24 @@ async def _persist_cancel_turn(
                     organization_id=organization_id,
                     exc_info=True,
                 )
-        if agent_result.updated_workflow is None and chat.proposed_workflow is not None:
+                restore_failed = True
+        # A failed rollback means canonical may still hold the mid-turn write — don't
+        # honor keep_pending_proposal against an unverified "nothing changed" state.
+        effective_keep_pending_proposal = keep_pending_proposal and not restore_failed
+        # Broader than "restored-alone" (any no-new-proposal cancel); an agent-explicit
+        # clear_proposed_workflow still wins below when this branch is skipped instead.
+        if (
+            agent_result.updated_workflow is None
+            and chat.proposed_workflow is not None
+            and not effective_keep_pending_proposal
+        ):
             await asyncio.shield(_clear_proposed_workflow(chat))
         else:
-            await asyncio.shield(_persist_proposed_workflow_state(chat, agent_result, restored))
+            await asyncio.shield(
+                _persist_proposed_workflow_state(
+                    chat, agent_result, restored, keep_pending_proposal=effective_keep_pending_proposal
+                )
+            )
         user_response = agent_result.user_response
         updated_workflow = agent_result.updated_workflow
         updated_global_llm_context = agent_result.global_llm_context
@@ -778,11 +811,13 @@ async def _finalise_normal_turn(
     # applies proposals via applyWorkflowUpdate when auto-accept is
     # on.
     restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+    restore_failed = False
     if restored:
         try:
             await _restore_workflow_definition(original_workflow, organization_id)
         except Exception:
             LOG.warning("copilot restore failed in _finalise_normal_turn", exc_info=True)
+            restore_failed = True
 
     if _should_commit_staged_workflow(chat.auto_accept, agent_result):
         try:
@@ -799,7 +834,14 @@ async def _finalise_normal_turn(
                 await _restore_workflow_definition(original_workflow, organization_id)
             raise
 
-    await _persist_proposed_workflow_state(chat, agent_result, restored)
+    await _persist_proposed_workflow_state(
+        chat,
+        agent_result,
+        restored,
+        # A failed rollback means canonical may still hold the mid-turn write —
+        # don't honor keep_pending_proposal against an unverified "nothing changed" state.
+        keep_pending_proposal=chat_request.keep_pending_proposal and not restore_failed,
+    )
     await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
     workflow_applied = _effective_auto_accept(chat.auto_accept, agent_result)
@@ -1435,6 +1477,10 @@ async def _new_copilot_chat_post(
 
         original_workflow: Workflow | None = None
         chat = None
+        # Snapshot before any write this turn — lets a recovery handler tell
+        # "this turn's own write already superseded it" from "the write itself
+        # is what failed", which agent_result.updated_workflow alone can't.
+        proposed_workflow_at_turn_start: Any = None
         agent_result: AgentResult | None = None
         global_llm_context: str | None = None
         terminal_frame_emitted = False
@@ -1455,6 +1501,101 @@ async def _new_copilot_chat_post(
                 organization_id=organization.organization_id,
                 turn_id=turn_id,
             )
+
+        async def _recover_from_route_exception(
+            exc: BaseException,
+            *,
+            restore_log_context: str,
+            translated_log_message: str,
+            none_chat_log_message: str,
+            none_chat_user_message: str,
+        ) -> None:
+            """Shared by the LLMProviderError and generic Exception handlers below —
+            only their four log/user-facing strings differ."""
+            nonlocal terminal_frame_emitted
+            restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+            restore_failed = False
+            if restored:
+                try:
+                    await _restore_workflow_definition(original_workflow, organization.organization_id)
+                except Exception:
+                    LOG.warning(
+                        f"Workflow restore failed inside {restore_log_context}",
+                        organization_id=organization.organization_id,
+                        exc_info=True,
+                    )
+                    restore_failed = True
+            if chat is not None:
+                workflow_modified = bool(getattr(agent_result, "workflow_was_persisted", False)) and not restored
+                # Pre-bake restored here: the recovered AgentResult has workflow_was_persisted=False,
+                # so _persist_proposed_workflow_state's own restored check would always read False.
+                recovered_result, failure = _build_recoverable_route_agent_result(
+                    exc,
+                    workflow_modified=workflow_modified,
+                    # agent_result is the real completed result when the exception hit AFTER
+                    # run_copilot_agent returned (e.g. mid-finalisation) — honor its own
+                    # explicit clear decision the same way the non-recovery path does.
+                    clear_proposed_workflow=(restored and not chat_request.keep_pending_proposal)
+                    or workflow_modified
+                    or getattr(agent_result, "clear_proposed_workflow", False)
+                    # A staged commit that already succeeded before this exception fired
+                    # still invalidates a stale kept proposal, same as the non-recovery path.
+                    or _should_commit_staged_workflow(chat.auto_accept, agent_result)
+                    # A failed rollback leaves canonical's true state unverified — don't
+                    # honor keep_pending_proposal against an assumption that didn't hold.
+                    or restore_failed
+                    # Compares against the turn-start snapshot, not agent_result.updated_workflow:
+                    # that field only means a write was ATTEMPTED, not that it SUCCEEDED — if the
+                    # write itself is what raised, chat.proposed_workflow never changed and an
+                    # older, legitimately keep_pending_proposal-protected proposal must survive.
+                    or chat.proposed_workflow is not proposed_workflow_at_turn_start,
+                    global_llm_context=global_llm_context,
+                    turn_id=turn_id,
+                    turn_index=turn_index,
+                )
+                recovered_result.turn_outcome = _with_current_copilot_code_mode_metadata(
+                    recovered_result.turn_outcome,
+                    effective_mode=effective_mode,
+                    code_available=current_code_available,
+                    turn_id=turn_id,
+                )
+                LOG.error(
+                    translated_log_message,
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    failure_kind=failure.failure_kind,
+                    internal_error_id=failure.internal_error_id,
+                    exception_type=failure.exception_type,
+                    exc_info=True,
+                )
+                await asyncio.shield(
+                    _finalise_normal_turn(
+                        stream=stream,
+                        chat=chat,
+                        organization_id=organization.organization_id,
+                        original_workflow=original_workflow,
+                        chat_request=chat_request,
+                        agent_result=recovered_result,
+                    )
+                )
+                terminal_frame_emitted = True
+                capture_code_mode_opt_out_after_persist()
+            else:
+                LOG.error(
+                    none_chat_log_message,
+                    organization_id=organization.organization_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                terminal_frame_emitted = True
+                await stream.send(
+                    WorkflowCopilotStreamErrorUpdate(
+                        type=WorkflowCopilotStreamMessageType.ERROR,
+                        error=none_chat_user_message,
+                        turn_id=turn_id,
+                        narrative_summary=None,
+                    )
+                )
 
         # Single-element list used as a closure flag (mutable bool by reference).
         # The watcher sets [0] = True before issuing handler_task.cancel() so the
@@ -1477,6 +1618,7 @@ async def _new_copilot_chat_post(
                 workflow_permanent_id=chat_request.workflow_permanent_id,
                 workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
             )
+            proposed_workflow_at_turn_start = chat.proposed_workflow
             chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
             chat_request.audio_artifact_id = await _validate_copilot_audio_artifact_id(
                 audio_artifact_id=chat_request.audio_artifact_id,
@@ -1670,6 +1812,7 @@ async def _new_copilot_chat_post(
                     agent_result=agent_result,
                     audio_artifact_id=chat_request.audio_artifact_id,
                     turn_id=turn_id,
+                    keep_pending_proposal=chat_request.keep_pending_proposal,
                 )
                 terminal_frame_emitted = True
                 capture_code_mode_opt_out_after_persist()
@@ -1714,69 +1857,13 @@ async def _new_copilot_chat_post(
                 )
             )
         except LLMProviderError as exc:
-            restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
-            if restored:
-                try:
-                    await _restore_workflow_definition(original_workflow, organization.organization_id)
-                except Exception:
-                    LOG.warning(
-                        "Workflow restore failed inside LLMProviderError handler",
-                        organization_id=organization.organization_id,
-                        exc_info=True,
-                    )
-            if chat is not None:
-                workflow_modified = bool(getattr(agent_result, "workflow_was_persisted", False)) and not restored
-                recovered_result, failure = _build_recoverable_route_agent_result(
-                    exc,
-                    workflow_modified=workflow_modified,
-                    clear_proposed_workflow=restored or workflow_modified,
-                    global_llm_context=global_llm_context,
-                    turn_id=turn_id,
-                    turn_index=turn_index,
-                )
-                recovered_result.turn_outcome = _with_current_copilot_code_mode_metadata(
-                    recovered_result.turn_outcome,
-                    effective_mode=effective_mode,
-                    code_available=current_code_available,
-                    turn_id=turn_id,
-                )
-                LOG.error(
-                    "LLM provider error translated to recoverable workflow copilot v2 reply",
-                    organization_id=organization.organization_id,
-                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    failure_kind=failure.failure_kind,
-                    internal_error_id=failure.internal_error_id,
-                    exception_type=failure.exception_type,
-                    exc_info=True,
-                )
-                await asyncio.shield(
-                    _finalise_normal_turn(
-                        stream=stream,
-                        chat=chat,
-                        organization_id=organization.organization_id,
-                        original_workflow=original_workflow,
-                        chat_request=chat_request,
-                        agent_result=recovered_result,
-                    )
-                )
-                terminal_frame_emitted = True
-                capture_code_mode_opt_out_after_persist()
-            else:
-                LOG.error(
-                    "LLM provider error (copilot v2)",
-                    organization_id=organization.organization_id,
-                    error=str(exc),
-                    exc_info=True,
-                )
-                terminal_frame_emitted = True
-                await stream.send(
-                    WorkflowCopilotStreamErrorUpdate(
-                        type=WorkflowCopilotStreamMessageType.ERROR,
-                        error="Failed to process your request. Please try again.",
-                        turn_id=turn_id,
-                        narrative_summary=None,
-                    )
-                )
+            await _recover_from_route_exception(
+                exc,
+                restore_log_context="LLMProviderError handler",
+                translated_log_message="LLM provider error translated to recoverable workflow copilot v2 reply",
+                none_chat_log_message="LLM provider error (copilot v2)",
+                none_chat_user_message="Failed to process your request. Please try again.",
+            )
         except asyncio.CancelledError:
             if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
                 try:
@@ -1801,6 +1888,7 @@ async def _new_copilot_chat_post(
                         agent_result=None,
                         audio_artifact_id=chat_request.audio_artifact_id,
                         turn_id=turn_id,
+                        keep_pending_proposal=chat_request.keep_pending_proposal,
                     )
                 )
                 terminal_frame_emitted = True
@@ -1822,69 +1910,13 @@ async def _new_copilot_chat_post(
                 )
                 raise
         except Exception as exc:
-            restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
-            if restored:
-                try:
-                    await _restore_workflow_definition(original_workflow, organization.organization_id)
-                except Exception:
-                    LOG.warning(
-                        "Workflow restore failed inside generic-error handler",
-                        organization_id=organization.organization_id,
-                        exc_info=True,
-                    )
-            if chat is not None:
-                workflow_modified = bool(getattr(agent_result, "workflow_was_persisted", False)) and not restored
-                recovered_result, failure = _build_recoverable_route_agent_result(
-                    exc,
-                    workflow_modified=workflow_modified,
-                    clear_proposed_workflow=restored or workflow_modified,
-                    global_llm_context=global_llm_context,
-                    turn_id=turn_id,
-                    turn_index=turn_index,
-                )
-                recovered_result.turn_outcome = _with_current_copilot_code_mode_metadata(
-                    recovered_result.turn_outcome,
-                    effective_mode=effective_mode,
-                    code_available=current_code_available,
-                    turn_id=turn_id,
-                )
-                LOG.error(
-                    "Unexpected workflow copilot v2 error translated to recoverable reply",
-                    organization_id=organization.organization_id,
-                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    failure_kind=failure.failure_kind,
-                    internal_error_id=failure.internal_error_id,
-                    exception_type=failure.exception_type,
-                    exc_info=True,
-                )
-                await asyncio.shield(
-                    _finalise_normal_turn(
-                        stream=stream,
-                        chat=chat,
-                        organization_id=organization.organization_id,
-                        original_workflow=original_workflow,
-                        chat_request=chat_request,
-                        agent_result=recovered_result,
-                    )
-                )
-                terminal_frame_emitted = True
-                capture_code_mode_opt_out_after_persist()
-            else:
-                LOG.error(
-                    "Unexpected error in workflow copilot v2",
-                    organization_id=organization.organization_id,
-                    error=str(exc),
-                    exc_info=True,
-                )
-                terminal_frame_emitted = True
-                await stream.send(
-                    WorkflowCopilotStreamErrorUpdate(
-                        type=WorkflowCopilotStreamMessageType.ERROR,
-                        error="An error occurred. Please try again.",
-                        turn_id=turn_id,
-                        narrative_summary=None,
-                    )
-                )
+            await _recover_from_route_exception(
+                exc,
+                restore_log_context="generic-error handler",
+                translated_log_message="Unexpected workflow copilot v2 error translated to recoverable reply",
+                none_chat_log_message="Unexpected error in workflow copilot v2",
+                none_chat_user_message="An error occurred. Please try again.",
+            )
         finally:
             if cancel_watcher is not None and not cancel_watcher.done():
                 cancel_watcher.cancel()
