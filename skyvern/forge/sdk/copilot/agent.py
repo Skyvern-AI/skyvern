@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.experimentation.llm_prompt_config import LLMAPIHandler
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 import structlog
