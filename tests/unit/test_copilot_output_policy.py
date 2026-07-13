@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
     _response_coverage_nudge,
 )
+from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.output_contracts import OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_policy import (
     ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
@@ -2077,26 +2078,23 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     assert guarded_tools["update_and_run_blocks"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
 
     ctx = _ctx()
-    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
+    ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
     ctx.failed_tool_step_tracker = {"sentinel": 2}
 
-    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
-        ToolInputGuardrailData(
-            context=ToolContext(
-                context=ctx,
-                tool_name="update_and_run_blocks",
-                tool_call_id="call-1",
-                tool_arguments=json.dumps(
-                    {
-                        "workflow_yaml": """
+    rejected_yaml = """
 workflow_definition:
   blocks:
     - block_type: navigation
       label: login
       navigation_goal: Type password: hunter2 into the password field.
 """
-                    }
-                ),
+    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
+        ToolInputGuardrailData(
+            context=ToolContext(
+                context=ctx,
+                tool_name="update_and_run_blocks",
+                tool_call_id="call-1",
+                tool_arguments=json.dumps({"workflow_yaml": rejected_yaml}),
             ),
             agent=SimpleNamespace(),
         )
@@ -2104,7 +2102,9 @@ workflow_definition:
 
     assert result.behavior["type"] == "reject_content"
     assert "raw_secret_leak" in result.behavior["message"]
-    assert ctx.consecutive_tool_tracker == ["update_and_run_blocks"]
+    assert ctx.consecutive_tool_tracker == [
+        tool_step_identity("update_and_run_blocks", {"workflow_yaml": rejected_yaml})
+    ]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
 
