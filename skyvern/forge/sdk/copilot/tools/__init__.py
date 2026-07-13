@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml as _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
@@ -615,6 +615,12 @@ async def update_and_run_blocks_tool(
         "parameters": parameters or {},
     }
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
+    # Cleared unconditionally up front and only set True at the actual skip
+    # branch below — reflects "we skipped a run", not "the policy would have
+    # allowed a skip if we got that far". A stale True from an earlier call, or
+    # a premature True from a policy check ahead of an unrelated update_workflow
+    # failure, would misreport an authoring error as a credential ask.
+    copilot_ctx.last_run_skipped_unbound_credentials = False
     authority_error = _authority_tool_error(
         copilot_ctx,
         "update_and_run_blocks",
@@ -721,6 +727,7 @@ async def update_and_run_blocks_tool(
         return json.dumps(sanitized)
 
     if skip_run_after_update:
+        copilot_ctx.last_run_skipped_unbound_credentials = True
         skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
             "ok": True,

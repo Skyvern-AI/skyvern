@@ -17,6 +17,7 @@ from agents import ModelSettings, RunConfig
 from agents.run import Runner
 
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
+from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.blocker_signal import (
     SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE,
@@ -85,6 +86,7 @@ from skyvern.forge.sdk.copilot.config import (
     normalize_block_authoring_policy,
 )
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.credential_pause import credential_pause_would_fire, maybe_credential_pause
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     RepairLoopState,
@@ -151,6 +153,12 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
     claim_turn,
     emit_blocker_signal_payload,
 )
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    CopilotUnrecoverableToolError as CopilotUnrecoverableToolError,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    _maybe_raise_unrecoverable_tool_error as _maybe_raise_unrecoverable_tool_error,
+)
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -159,7 +167,7 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.copilot.runtime import AgentContext
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
 
@@ -185,7 +193,6 @@ REPEATED_FRONTIER_STREAK_STOP_AT = 3
 # scraper could not read the page. Aligned with MAX_FAILED_TEST_NUDGES so the
 # copilot gets one generic retry nudge, then stops on the second occurrence.
 PROBABLE_SITE_BLOCK_STREAK_STOP_AT = 2
-UNRECOVERABLE_TOOL_ERROR_STOP_AT = 2
 # Caps how many times the stop nudge can re-fire — without this, the streak
 # stays latched while no new test runs reset it and every subsequent turn
 # re-injects the same nudge until MAX_ITERATIONS. Independent of
@@ -940,8 +947,24 @@ def _mark_copilot_total_timeout(ctx: Any) -> None:
     ctx.copilot_total_timeout_exceeded = True
 
 
+def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
+    """Wall-clock elapsed since ``start_time``, minus time spent in a credential pause.
+
+    Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
+    time, so a paused-and-resumed turn isn't penalized for pause time.
+
+    ``pause_seconds`` is coerced defensively: tests commonly pass a bare
+    ``MagicMock()`` as ``ctx``, whose ``getattr(..., default)`` returns a
+    fresh Mock instead of the default (Mock never raises AttributeError).
+    """
+    pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
+    if not isinstance(pause_seconds, (int, float)):
+        pause_seconds = 0.0
+    return time.monotonic() - start_time - pause_seconds
+
+
 def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float) -> None:
-    if time.monotonic() - start_time >= TOTAL_TIMEOUT_SECONDS:
+    if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
         _mark_copilot_total_timeout(ctx)
 
 
@@ -980,127 +1003,7 @@ def _maybe_raise_non_retriable_nav(ctx: Any) -> None:
     raise CopilotNonRetriableNavError(url=_extract_url_from_nav_error(err), error_message=err)
 
 
-class CopilotUnrecoverableToolError(Exception):
-    """Raised when browser-session tool failures prove the current loop cannot recover."""
-
-    def __init__(self, tool_name: str, error_message: str) -> None:
-        self.tool_name = tool_name
-        self.error_message = error_message
-        super().__init__(f"Unrecoverable tool error in {tool_name}: {error_message}")
-
-
-_BROWSER_SESSION_TOOL_NAMES = frozenset(
-    {
-        "navigate_browser",
-        "get_browser_screenshot",
-        "evaluate",
-        "click",
-        "type_text",
-        "scroll",
-        "console_messages",
-        "select_option",
-        "press_key",
-    }
-)
 _POST_RUN_PAGE_OBSERVATION_TOOLS = frozenset({"evaluate", "get_browser_screenshot", "inspect_page_for_composition"})
-_UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
-_BROWSER_SESSION_ID_RE = re.compile(r"\bpbs_[A-Za-z0-9_-]+\b")
-_BROWSER_SESSION_WITH_ID_RE = re.compile(r"\bbrowser session\s+pbs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
-
-
-def redact_browser_session_references(value: str) -> str:
-    value = _BROWSER_SESSION_WITH_ID_RE.sub("Browser session", value)
-    return _BROWSER_SESSION_ID_RE.sub("the browser session", value)
-
-
-def _result_text_values(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        result: list[str] = []
-        for item in value.values():
-            result.extend(_result_text_values(item))
-        return result
-    if isinstance(value, list):
-        result = []
-        for item in value:
-            result.extend(_result_text_values(item))
-        return result
-    return []
-
-
-def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
-    raw_reason = output.get("error")
-    if not isinstance(raw_reason, str) or not raw_reason.strip():
-        data = output.get("data")
-        raw_reason = data.get("failure_reason") if isinstance(data, dict) else None
-    if not isinstance(raw_reason, str) or not raw_reason.strip():
-        raw_reason = " ".join(_result_text_values(output))
-    reason = " ".join(str(raw_reason or "Browser session was no longer reachable.").split())
-    reason = redact_browser_session_references(reason)
-    return reason[:240].rstrip()
-
-
-def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, Any]) -> bool:
-    if tool_name not in _BROWSER_SESSION_TOOL_NAMES or output.get("ok", True):
-        return False
-    lowered = " ".join(_result_text_values(output)).lower()
-    if "no browser context" in lowered:
-        return True
-    has_session_signal = "browser session" in lowered or "browser context" in lowered
-    has_lost_signal = "not found" in lowered or "404" in lowered
-    return has_session_signal and has_lost_signal
-
-
-def _record_unrecoverable_tool_error_contract(ctx: Any, tool_name: str, reason: str) -> None:
-    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
-
-    result = {
-        "ok": False,
-        "error": reason,
-        "data": {
-            "overall_status": "aborted",
-            "failure_reason": reason,
-            "failure_categories": [{"category": _UNRECOVERABLE_TOOL_ERROR_CATEGORY, "reasoning": reason}],
-        },
-    }
-    contract = build_diagnosis_repair_contract(source_tool=tool_name, result=result, ctx=ctx)
-    ctx.latest_diagnosis_repair_contract = contract
-    ctx.unrecoverable_tool_error_reason = reason
-    ctx.unrecoverable_tool_error_tool_name = tool_name
-    ctx.last_test_failure_reason = reason
-    trace_data = contract.to_trace_data()
-    LOG.warning(
-        "Copilot unrecoverable tool error stop",
-        tool_name=tool_name,
-        error_reason=reason,
-        **{f"diagnosis_repair_{key}": value for key, value in trace_data.items()},
-    )
-    with copilot_span("copilot_unrecoverable_tool_error", data={"tool_name": tool_name, **trace_data}):
-        pass
-
-
-def _maybe_raise_unrecoverable_tool_error(ctx: Any, tool_name: str, output: dict[str, Any]) -> None:
-    if not _is_unrecoverable_browser_session_error(tool_name, output):
-        if tool_name in _BROWSER_SESSION_TOOL_NAMES and output.get("ok", False):
-            ctx.unrecoverable_tool_error_streak_count = 0
-            ctx.unrecoverable_tool_error_signature = None
-        return
-
-    reason = _unrecoverable_tool_error_reason(output)
-    signature = "browser_session_unreachable"
-    prior_signature = getattr(ctx, "unrecoverable_tool_error_signature", None)
-    prior_count = getattr(ctx, "unrecoverable_tool_error_streak_count", 0)
-    prior_count = prior_count if isinstance(prior_count, int) else 0
-    count = prior_count + 1 if prior_signature == signature else 1
-    ctx.unrecoverable_tool_error_signature = signature
-    ctx.unrecoverable_tool_error_streak_count = count
-    ctx.unrecoverable_tool_error_reason = reason
-    ctx.unrecoverable_tool_error_tool_name = tool_name
-
-    if count >= UNRECOVERABLE_TOOL_ERROR_STOP_AT:
-        _record_unrecoverable_tool_error_contract(ctx, tool_name, reason)
-        raise CopilotUnrecoverableToolError(tool_name, reason)
 
 
 def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
@@ -1629,6 +1532,14 @@ def _check_enforcement(
             consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
         )
         raise_if_turn_halt(ctx, verified=verified)
+
+    # A pending credential pause pre-empts every hygiene nudge below, not just
+    # the failed-test one: a credential-blocked update_and_run_blocks call
+    # satisfies post_update (test not run) and, when the diagnosis contract
+    # is the source, the generic failed-test nudge too. None of those nudges
+    # can be acted on without the credential the pause is about to ask for.
+    if credential_pause_would_fire(ctx, config):
+        return None
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
@@ -2209,14 +2120,12 @@ async def _run_streamed_with_deadline(
     ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so
     ``wait_for(timeout=0)`` never panics on an already-spent budget.
     """
-    from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
-
-    elapsed = time.monotonic() - start_time
+    elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
     result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
     try:
         try:
-            await asyncio.wait_for(stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+            await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
         finally:
             _accumulate_usage(result, ctx)
     except asyncio.TimeoutError:
@@ -2425,6 +2334,30 @@ def _requested_output_coverage_tokens(ctx: AgentContext) -> dict[str, frozenset[
     }
 
 
+def _registered_download_deliverable_paths(ctx: AgentContext) -> set[str]:
+    return {
+        criterion.output_path
+        for criterion in _pre_run_gated_completion_criteria(ctx)
+        if criterion.declared_deliverable_kind == "registered_download" and criterion.output_path
+    }
+
+
+def download_satisfied_requested_output_paths(ctx: AgentContext) -> set[str]:
+    """Requested-output paths a reached download registration satisfies at runtime rather than a
+    page-scalar read: the registered-download alias paths plus the paths the classifier declared as
+    ``registered_download`` deliverables. Empty unless a download target with a captured selector
+    was reached. Author-time seam classification only — it never credits scout coverage."""
+    download = ctx.reached_download_target
+    if download is None or not download.selector:
+        return set()
+    requested = _requested_output_paths_for_ctx(ctx)
+    # The scout reads page scalars; it can never read a file that exists only once a download fires.
+    # So a declared download kind on a path the scout DID cover is a classifier false positive, and the
+    # path stays a live-read scalar. The canonical alias paths are download-registered by definition.
+    declared = _registered_download_deliverable_paths(ctx) - set(ctx.scouted_output_covered_paths)
+    return requested & (REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS | declared)
+
+
 def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     """Requested-output paths not yet credited by scouted evidence. A path whose identifying
     tokens are all generic (e.g. ``output.data``) is uncoverable by token match and is exempted,
@@ -2433,15 +2366,32 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     if not requested:
         return set()
     tokens_by_path = _requested_output_coverage_tokens(ctx)
-    covered: set[str] = set(ctx.scouted_output_covered_paths)
-    download = ctx.reached_download_target
-    if download is not None and download.selector:
-        covered |= REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+    covered: set[str] = set(ctx.scouted_output_covered_paths) | download_satisfied_requested_output_paths(ctx)
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
 def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
     requested_paths = _requested_output_paths_for_ctx(ctx)
+    if not requested_paths:
+        return None
+    labels_by_path: dict[str, tuple[str, ...]] = {}
+    for criterion in _pre_run_gated_completion_criteria(ctx):
+        if criterion.output_path in requested_paths and criterion.outcome.strip():
+            labels_by_path.setdefault(criterion.output_path, ())
+            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+    if set(labels_by_path) != requested_paths:
+        return None
+    return derive_requested_output_extraction_plan(
+        flow_evidence=ctx.flow_evidence,
+        labels_by_path=labels_by_path,
+    )
+
+
+def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+    """Extraction plan over the page-scalar subset of requested outputs (requested minus the
+    download-registered paths), for the mixed download+scalar shape whose download half is
+    satisfied by execution registration rather than a static keyed read."""
+    requested_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
     if not requested_paths:
         return None
     labels_by_path: dict[str, tuple[str, ...]] = {}
@@ -2598,10 +2548,11 @@ def synthesized_trajectory_is_goal_complete(ctx: AgentContext) -> bool:
         return False
     if _request_expects_unreached_download(ctx):
         return False
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    plan = requested_output_extraction_plan(ctx)
-    if requested_paths and (plan is None or not requested_paths.issubset(set(plan.requested_output_paths))):
-        return False
+    scalar_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
+    if scalar_paths:
+        plan = requested_scalar_output_extraction_plan(ctx)
+        if plan is None or not scalar_paths.issubset(set(plan.requested_output_paths)):
+            return False
     if _credential_flow_scout_gap_incomplete(ctx, ctx.scout_trajectory):
         return False
     return synthesized_trajectory_reaches_goal(ctx)
@@ -2993,7 +2944,7 @@ async def run_with_enforcement(
         # SSE stream silently drops events once the browser is gone, but
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
-        elapsed = time.monotonic() - start_time
+        elapsed = _elapsed_run_seconds(ctx, start_time)
         if elapsed > TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx)
             raise CopilotTotalTimeoutError()
@@ -3147,14 +3098,41 @@ async def run_with_enforcement(
         synthesized_msg = _maybe_synthesized_block_offer_msg(ctx)
 
         spine_checkpoint_nudge = False
-        if nudge is None and synthesized_msg is None:
-            spine_nudge = _scouted_spine_turn_end_nudge(ctx)
-            if spine_nudge is None:
-                _consume_pending_screenshots(ctx)
-                _maybe_raise_non_retriable_nav(ctx)
-                return result
-            nudge = spine_nudge
-            spine_checkpoint_nudge = True
+        if nudge is None:
+            # Checked whenever there's no regular nudge, even if a synthesized
+            # offer is also pending: a credential-blocked run's diagnosis can
+            # coincide with a reopened synthesized-block offer, and the pause
+            # must win so the loop doesn't send the offer instead of the card.
+            pause_used_before_this_call = getattr(ctx, "credential_pause_used", False)
+            resume_msgs = await maybe_credential_pause(ctx, result, stream, copilot_config)
+            if resume_msgs is not None:
+                current_input = (
+                    resume_msgs if session is not None else _prune_input_list(result.to_input_list()) + resume_msgs
+                )
+                iteration += 1
+                continue
+            if (
+                not pause_used_before_this_call
+                and getattr(ctx, "credential_pause_used", False)
+                and getattr(ctx, "credential_pause_outcome", None) == "declined"
+            ):
+                # The latch just flipped on THIS call with no frame ever sent
+                # (disconnect, cache gone, or the reason vanished under the
+                # async-only checks credential_pause_would_fire's docstring notes
+                # it excludes) -- fall back to whatever nudge this iteration would
+                # have gotten without the pre-empt, instead of silently finalizing
+                # an uncorrected reply. Gated on the latch's own transition (not
+                # just the outcome value) so a later iteration's unrelated
+                # nudge=None doesn't re-trigger this off a stale "declined".
+                nudge = _check_enforcement(ctx, result, copilot_config)
+            if nudge is None and synthesized_msg is None:
+                spine_nudge = _scouted_spine_turn_end_nudge(ctx)
+                if spine_nudge is None:
+                    _consume_pending_screenshots(ctx)
+                    _maybe_raise_non_retriable_nav(ctx)
+                    return result
+                nudge = spine_nudge
+                spine_checkpoint_nudge = True
 
         if nudge is not None and not spine_checkpoint_nudge and nudge == _nudge(copilot_config, "post_update"):
             if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:

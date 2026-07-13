@@ -75,6 +75,7 @@ async def test_send_totp_code_parse_failure_log_redacts_identifier_and_content(
 
     error_log = next((r for r in logs if r.get("event") == "Failed to parse otp login"), None)
     assert error_log is not None
+    assert error_log["organization_id"] == "o_test"
     assert error_log["totp_identifier"] == "[REDACTED_OTP_IDENTIFIER]"
     assert error_log["content_length"] == len(raw_content)
     assert "content" not in error_log
@@ -102,8 +103,10 @@ async def test_send_totp_code_parser_exception_log_redacts_raw_exception_context
                 curr_org=SimpleNamespace(organization_id="o_test"),
             )
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Failed to parse otp login"
+    # A raised parser is a backend/dependency failure, not bad caller input, so the
+    # endpoint returns a retryable 502 with a static detail that never echoes the payload.
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "OTP extraction is temporarily unavailable. Please retry in a few minutes."
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
     assert raw_identifier not in str(exc_info.value)
@@ -113,6 +116,7 @@ async def test_send_totp_code_parser_exception_log_redacts_raw_exception_context
 
     error_log = next((r for r in logs if r.get("event") == "Failed to parse otp login"), None)
     assert error_log is not None
+    assert error_log["organization_id"] == "o_test"
     assert error_log["totp_identifier"] == "[REDACTED_OTP_IDENTIFIER]"
     assert error_log["content_length"] == len(raw_content)
     assert error_log["exception_type"] == "RuntimeError"

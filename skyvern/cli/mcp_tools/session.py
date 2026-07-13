@@ -102,6 +102,11 @@ async def skyvern_browser_session_create(
 ) -> dict[str, Any]:
     """Create a new browser session to start interacting with websites. Cloud session results include app_url to watch the run live. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
 
+    This tool CREATES a new session and returns its id; it takes no session_id, url, steps, or selector.
+    To load a URL, run a sequence of steps, or act on an EXISTING session, first create the session, then
+    call skyvern_navigate(url=..., session_id=...), skyvern_execute(steps=[...], session_id=...), or the
+    click/type tools with that session_id.
+
     Use local=true for a local Chromium instance.
     The session persists across tool calls until explicitly closed.
     """
@@ -381,7 +386,8 @@ async def skyvern_browser_session_close(
 
 
 async def skyvern_browser_session_list() -> dict[str, Any]:
-    """List all active browser sessions. Use to find available sessions to connect to."""
+    """List all active browser sessions. Use to find available sessions to connect to. Returns every
+    active session in one call — it takes no arguments and does not paginate (no page/page_size)."""
     with Timer() as timer:
         try:
             skyvern = get_skyvern()

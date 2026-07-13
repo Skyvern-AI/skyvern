@@ -1413,12 +1413,118 @@ def _set_return_expression(root: _ExtractionReturnNode, segments: Sequence[tuple
     current.value_expression = expression
 
 
-def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
-    segments = output_path_segments(binding.output_path)
+def _array_prefix_of_segments(segments: Sequence[tuple[str, bool]]) -> tuple[tuple[str, bool], ...]:
     for index, (_name, is_array) in enumerate(segments):
         if is_array:
-            return segments[: index + 1]
+            return tuple(segments[: index + 1])
     return ()
+
+
+def _array_prefix(binding: LiveReadBinding) -> tuple[tuple[str, bool], ...]:
+    return _array_prefix_of_segments(output_path_segments(binding.output_path))
+
+
+def _key_value_scalar_read_statements(binding: LiveReadBinding, variable: str, *, guard_empty: bool) -> list[str]:
+    container = f"page.locator({json.dumps(binding.selector)})"
+    target = f"{container}.nth({binding.selector_index})"
+    children = f'{target}.locator(":scope > *")'
+    statements = [
+        f"if await {container}.count() != {binding.selector_count}:",
+        f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
+        f"if not await {target}.is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
+        f"if await {children}.count() != {binding.child_count}:",
+        f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
+        f"if not await {children}.nth(0).is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
+        f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
+        f'{_INDENT}raise ValueError("Observed scalar label changed")',
+        f"if not await {children}.nth({binding.child_index}).is_visible():",
+        f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
+        f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
+    ]
+    if guard_empty:
+        statements.extend(
+            [
+                f"if not {variable}:",
+                f'{_INDENT}raise ValueError("Observed scalar value is empty")',
+            ]
+        )
+    return statements
+
+
+def _table_group_read_lines(
+    bindings: list[LiveReadBinding],
+    *,
+    row_selector: str,
+    row_count: int,
+    prefix: tuple[tuple[str, bool], ...],
+    group_index: int,
+    records_variable: str,
+    cell_variable_base: str,
+    assemble_as_literal: bool,
+    guard_empty: bool = False,
+    none_leaf_segments: Sequence[tuple[tuple[str, bool], ...]] = (),
+) -> list[str]:
+    lines: list[str] = []
+    record_root = _ExtractionReturnNode()
+    for none_segments in none_leaf_segments:
+        _set_return_expression(record_root, none_segments, "None")
+    exemplar = bindings[0]
+    table = f"page.locator({json.dumps(exemplar.selector)})"
+    selected_table = f"{table}.nth({exemplar.selector_index})"
+    rows = f"page.locator({json.dumps(row_selector)})"
+    headers = f'{table}.nth({exemplar.selector_index}).locator(":scope > thead > tr > th")'
+    lines.append(f"if await {table}.count() != {exemplar.selector_count}:")
+    lines.append(f'{_INDENT}raise ValueError("Observed table identity changed")')
+    lines.append(f"if not await {table}.nth({exemplar.selector_index}).is_visible():")
+    lines.append(f'{_INDENT}raise ValueError("Observed table is no longer visible")')
+    lines.append(f'if await {selected_table}.locator(":scope table").count() != 0:')
+    lines.append(f'{_INDENT}raise ValueError("Observed table gained a nested table")')
+    lines.append(f'if await {table}.nth({exemplar.selector_index}).locator("[colspan], [rowspan]").count() != 0:')
+    lines.append(f'{_INDENT}raise ValueError("Observed table gained spanning cells")')
+    lines.append(f"if await {headers}.count() != {len(exemplar.headers)}:")
+    lines.append(f'{_INDENT}raise ValueError("Observed table header cardinality changed")')
+    for header_index, header_text in enumerate(exemplar.headers):
+        lines.append(f"if (await {headers}.nth({header_index}).inner_text()).strip() != {json.dumps(header_text)}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table header identity changed")')
+    lines.append(f"if await {rows}.count() != {row_count}:")
+    lines.append(f'{_INDENT}raise ValueError("Observed table row count changed")')
+    row_expressions: list[str] = []
+    if not assemble_as_literal:
+        lines.append(f"{records_variable} = []")
+    for row_index in range(row_count):
+        row = f"{rows}.nth({row_index})"
+        cells = f'{row}.locator(":scope > th, :scope > td")'
+        lines.append(f"if not await {row}.is_visible():")
+        lines.append(f'{_INDENT}raise ValueError("Observed table row is no longer visible")')
+        lines.append(f"if await {cells}.count() != {exemplar.row_cell_counts[row_index]}:")
+        lines.append(f'{_INDENT}raise ValueError("Observed table direct-cell cardinality changed")')
+        lines.append(f'if await {row}.locator(":scope > th").count() != 0:')
+        lines.append(f'{_INDENT}raise ValueError("Observed table row gained a row header")')
+        lines.append(
+            f'if " ".join((await {row}.inner_text()).split()) != {json.dumps(exemplar.row_identities[row_index])}:'
+        )
+        lines.append(f'{_INDENT}raise ValueError("Observed table row identity changed")')
+        for binding_index, binding in enumerate(sorted(bindings, key=lambda item: item.output_path)):
+            value_variable = f"{cell_variable_base}_{group_index}_{row_index}_{binding_index}"
+            lines.append(f"if not await {cells}.nth({binding.column_index}).is_visible():")
+            lines.append(f'{_INDENT}raise ValueError("Observed table cell is no longer visible")')
+            lines.append(f"{value_variable} = (await {cells}.nth({binding.column_index}).inner_text()).strip()")
+            if guard_empty:
+                lines.append(f"if not {value_variable}:")
+                lines.append(f'{_INDENT}raise ValueError("Observed table cell value is empty")')
+            _set_return_expression(
+                record_root, output_path_segments(binding.output_path)[len(prefix) :], value_variable
+            )
+        row_expression = _return_node_expression(record_root)
+        if assemble_as_literal:
+            row_expressions.append(row_expression)
+        else:
+            lines.append(f"{records_variable}.append({row_expression})")
+    if assemble_as_literal:
+        lines.append(f"{records_variable} = [{', '.join(row_expressions)}]")
+    return lines
 
 
 def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> SynthesizedExtractionSuffix | None:
@@ -1429,26 +1535,7 @@ def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> Synthes
     scalar_bindings = [binding for binding in plan.live_reads if binding.kind == LiveReadKind.KEY_VALUE]
     for index, binding in enumerate(scalar_bindings):
         variable = f"_extraction_value_{index}"
-        container = f"page.locator({json.dumps(binding.selector)})"
-        target = f"{container}.nth({binding.selector_index})"
-        children = f'{target}.locator(":scope > *")'
-        lines.extend(
-            [
-                f"if await {container}.count() != {binding.selector_count}:",
-                f'{_INDENT}raise ValueError("Observed scalar selector cardinality changed")',
-                f"if not await {target}.is_visible():",
-                f'{_INDENT}raise ValueError("Observed scalar relation is no longer visible")',
-                f"if await {children}.count() != {binding.child_count}:",
-                f'{_INDENT}raise ValueError("Observed scalar direct-child shape changed")',
-                f"if not await {children}.nth(0).is_visible():",
-                f'{_INDENT}raise ValueError("Observed scalar label is no longer visible")',
-                f"if (await {children}.nth(0).inner_text()).strip() != {json.dumps(binding.relation_label)}:",
-                f'{_INDENT}raise ValueError("Observed scalar label changed")',
-                f"if not await {children}.nth({binding.child_index}).is_visible():",
-                f'{_INDENT}raise ValueError("Observed scalar value is no longer visible")',
-                f"{variable} = (await {children}.nth({binding.child_index}).inner_text()).strip()",
-            ]
-        )
+        lines.extend(_key_value_scalar_read_statements(binding, variable, guard_empty=False))
         _set_return_expression(return_root, output_path_segments(binding.output_path), variable)
 
     table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
@@ -1461,56 +1548,216 @@ def synthesize_extraction_suffix(plan: RequestedOutputExtractionPlan) -> Synthes
         table_groups.setdefault((binding.row_selector, binding.row_count, prefix), []).append(binding)
     for group_index, ((row_selector, row_count, prefix), bindings) in enumerate(sorted(table_groups.items())):
         records_variable = f"_extraction_records_{group_index}"
-        record_root = _ExtractionReturnNode()
-        exemplar = bindings[0]
-        table = f"page.locator({json.dumps(exemplar.selector)})"
-        selected_table = f"{table}.nth({exemplar.selector_index})"
-        rows = f"page.locator({json.dumps(row_selector)})"
-        headers = f'{table}.nth({exemplar.selector_index}).locator(":scope > thead > tr > th")'
-        lines.append(f"if await {table}.count() != {exemplar.selector_count}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table identity changed")')
-        lines.append(f"if not await {table}.nth({exemplar.selector_index}).is_visible():")
-        lines.append(f'{_INDENT}raise ValueError("Observed table is no longer visible")')
-        lines.append(f'if await {selected_table}.locator(":scope table").count() != 0:')
-        lines.append(f'{_INDENT}raise ValueError("Observed table gained a nested table")')
-        lines.append(f'if await {table}.nth({exemplar.selector_index}).locator("[colspan], [rowspan]").count() != 0:')
-        lines.append(f'{_INDENT}raise ValueError("Observed table gained spanning cells")')
-        lines.append(f"if await {headers}.count() != {len(exemplar.headers)}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table header cardinality changed")')
-        for header_index, header_text in enumerate(exemplar.headers):
-            lines.append(f"if (await {headers}.nth({header_index}).inner_text()).strip() != {json.dumps(header_text)}:")
-            lines.append(f'{_INDENT}raise ValueError("Observed table header identity changed")')
-        lines.append(f"if await {rows}.count() != {row_count}:")
-        lines.append(f'{_INDENT}raise ValueError("Observed table row count changed")')
-        lines.append(f"{records_variable} = []")
-        for row_index in range(row_count):
-            row = f"{rows}.nth({row_index})"
-            cells = f'{row}.locator(":scope > th, :scope > td")'
-            lines.append(f"if not await {row}.is_visible():")
-            lines.append(f'{_INDENT}raise ValueError("Observed table row is no longer visible")')
-            lines.append(f"if await {cells}.count() != {exemplar.row_cell_counts[row_index]}:")
-            lines.append(f'{_INDENT}raise ValueError("Observed table direct-cell cardinality changed")')
-            lines.append(f'if await {row}.locator(":scope > th").count() != 0:')
-            lines.append(f'{_INDENT}raise ValueError("Observed table row gained a row header")')
-            lines.append(
-                f'if " ".join((await {row}.inner_text()).split()) != {json.dumps(exemplar.row_identities[row_index])}:'
+        lines.extend(
+            _table_group_read_lines(
+                bindings,
+                row_selector=row_selector,
+                row_count=row_count,
+                prefix=prefix,
+                group_index=group_index,
+                records_variable=records_variable,
+                cell_variable_base="_extraction_cell",
+                assemble_as_literal=False,
             )
-            lines.append(f'{_INDENT}raise ValueError("Observed table row identity changed")')
-            for binding_index, binding in enumerate(sorted(bindings, key=lambda item: item.output_path)):
-                value_variable = f"_extraction_cell_{group_index}_{row_index}_{binding_index}"
-                lines.append(f"if not await {cells}.nth({binding.column_index}).is_visible():")
-                lines.append(f'{_INDENT}raise ValueError("Observed table cell is no longer visible")')
-                lines.append(f"{value_variable} = (await {cells}.nth({binding.column_index}).inner_text()).strip()")
-                _set_return_expression(
-                    record_root, output_path_segments(binding.output_path)[len(prefix) :], value_variable
-                )
-            lines.append(f"{records_variable}.append({_return_node_expression(record_root)})")
+        )
         _set_return_expression(return_root, prefix, records_variable)
 
     lines.append(f"return {_return_node_expression(return_root)}")
     code = "\n".join(lines) + "\n"
     fingerprint_material = repr((plan.identity, plan.observation_identity, plan.reveal, code))
     return SynthesizedExtractionSuffix(code=code, fingerprint=hashlib.sha256(fingerprint_material.encode()).hexdigest())
+
+
+_ENVELOPE_SCALAR_VAR_BASE = "_envelope_value"
+_ENVELOPE_CELL_VAR_BASE = "_envelope_cell"
+_ENVELOPE_RECORDS_VAR_BASE = "_envelope_records"
+
+
+@dataclass(frozen=True, slots=True)
+class ProducedStaticReturnEnvelope:
+    code: str
+    keyed_paths: tuple[str, ...]
+
+
+def _snippet_scope_returns(statements: Sequence[ast.stmt]) -> list[ast.Return]:
+    found: list[ast.Return] = []
+    for statement in statements:
+        if isinstance(statement, ast.Return):
+            found.append(statement)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for child in ast.iter_child_nodes(statement):
+            if isinstance(child, ast.stmt):
+                found.extend(_snippet_scope_returns([child]))
+            elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
+                found.extend(_snippet_scope_returns(child.body))
+    return found
+
+
+def _bound_or_referenced_identifiers(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                names.add(node.name)
+        elif isinstance(node, ast.alias):
+            if node.asname:
+                names.add(node.asname)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.MatchAs):
+            if node.name:
+                names.add(node.name)
+    return names
+
+
+def produce_covered_static_return_envelope(
+    code: str,
+    *,
+    plan: RequestedOutputExtractionPlan | None,
+    scalar_required_paths: set[str],
+    declaration_paths: set[str],
+    download_required_paths: set[str],
+    expects_download: bool,
+) -> ProducedStaticReturnEnvelope | None:
+    """Author the unique terminal keyed return covering every scout-bound scalar KEY_VALUE path and
+    every TABLE_COLUMN path as list-of-record reads via the shared ``_table_group_read_lines`` reader,
+    seeding per-row None leaves for sibling declaration columns alongside None-default top-level
+    declarations and the resolved download descriptor for the mixed shape.
+
+    Return None when it does not own the sole terminal return (zero returns, or the single
+    generator-owned download-idiom return), on any ungrounded or unbound required path, on nested-array
+    paths, on an array declaration with no unique matching table group, and on any minted-name collision."""
+    if download_required_paths and not expects_download:
+        return None
+    if not scalar_required_paths:
+        return None
+    if plan is None:
+        return None
+    stripped_code = textwrap.dedent(code).strip()
+    if not stripped_code:
+        return None
+    try:
+        tree = ast.parse(stripped_code)
+    except SyntaxError:
+        return None
+
+    bindings_by_path = {binding.output_path: binding for binding in plan.live_reads}
+    ordered_required_paths = sorted(scalar_required_paths)
+    if any(path not in bindings_by_path for path in ordered_required_paths):
+        return None
+
+    scalar_paths = [path for path in ordered_required_paths if bindings_by_path[path].kind == LiveReadKind.KEY_VALUE]
+    table_paths = [path for path in ordered_required_paths if bindings_by_path[path].kind == LiveReadKind.TABLE_COLUMN]
+    if len(scalar_paths) + len(table_paths) != len(ordered_required_paths):
+        return None
+
+    table_groups: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[LiveReadBinding]] = {}
+    for path in table_paths:
+        binding = bindings_by_path[path]
+        prefix = _array_prefix(binding)
+        if not prefix or not binding.row_selector or binding.row_count <= 0:
+            return None
+        if any(is_array for _name, is_array in output_path_segments(binding.output_path)[len(prefix) :]):
+            return None
+        table_groups.setdefault((binding.row_selector, binding.row_count, prefix), []).append(binding)
+
+    minted_vars = [f"{_ENVELOPE_SCALAR_VAR_BASE}_{index}" for index in range(len(scalar_paths))]
+    minted_names = set(minted_vars)
+    for group_index, ((_row_selector, row_count, _prefix), group_bindings) in enumerate(sorted(table_groups.items())):
+        minted_names.add(f"{_ENVELOPE_RECORDS_VAR_BASE}_{group_index}")
+        for row_index in range(row_count):
+            for binding_index in range(len(group_bindings)):
+                minted_names.add(f"{_ENVELOPE_CELL_VAR_BASE}_{group_index}_{row_index}_{binding_index}")
+    existing_names = _bound_or_referenced_identifiers(tree)
+    if minted_names & existing_names:
+        return None
+
+    returns = _snippet_scope_returns(tree.body)
+    download_descriptor_key = ""
+    download_descriptor_expr = ""
+    if download_required_paths:
+        if len(returns) != 1 or returns[0] not in tree.body:
+            return None
+        idiom_return = returns[0]
+        if idiom_return.col_offset != 0:
+            return None
+        if not isinstance(idiom_return.value, ast.Dict) or len(idiom_return.value.keys) != 1:
+            return None
+        descriptor_key_node = idiom_return.value.keys[0]
+        if not isinstance(descriptor_key_node, ast.Constant) or not isinstance(descriptor_key_node.value, str):
+            return None
+        descriptor_value = idiom_return.value.values[0]
+        if not isinstance(descriptor_value, (ast.Name, ast.Attribute)):
+            return None
+        download_descriptor_key = descriptor_key_node.value
+        download_descriptor_expr = ast.unparse(descriptor_value)
+        preserved_lines = stripped_code.splitlines()[: idiom_return.lineno - 1]
+    else:
+        if returns:
+            return None
+        preserved_lines = stripped_code.splitlines()
+
+    top_level_declarations: list[tuple[tuple[str, bool], ...]] = []
+    group_none_leaves: dict[tuple[str, int, tuple[tuple[str, bool], ...]], list[tuple[tuple[str, bool], ...]]] = {}
+    for path in sorted(declaration_paths):
+        segments = output_path_segments(path)
+        declaration_prefix = _array_prefix_of_segments(segments)
+        if not declaration_prefix:
+            top_level_declarations.append(segments)
+            continue
+        relative_segments = segments[len(declaration_prefix) :]
+        if any(is_array for _name, is_array in relative_segments):
+            return None
+        matching_groups = [key for key in table_groups if key[2] == declaration_prefix]
+        if len(matching_groups) != 1:
+            return None
+        group_none_leaves.setdefault(matching_groups[0], []).append(relative_segments)
+
+    return_root = _ExtractionReturnNode()
+    scalar_statements: list[str] = []
+    for path, variable in zip(scalar_paths, minted_vars):
+        scalar_statements.extend(_key_value_scalar_read_statements(bindings_by_path[path], variable, guard_empty=True))
+        _set_return_expression(return_root, output_path_segments(path), variable)
+    table_statements: list[str] = []
+    for group_index, (group_key, group_bindings) in enumerate(sorted(table_groups.items())):
+        row_selector, row_count, prefix = group_key
+        records_variable = f"{_ENVELOPE_RECORDS_VAR_BASE}_{group_index}"
+        table_statements.extend(
+            _table_group_read_lines(
+                group_bindings,
+                row_selector=row_selector,
+                row_count=row_count,
+                prefix=prefix,
+                group_index=group_index,
+                records_variable=records_variable,
+                cell_variable_base=_ENVELOPE_CELL_VAR_BASE,
+                assemble_as_literal=True,
+                guard_empty=True,
+                none_leaf_segments=group_none_leaves.get(group_key, ()),
+            )
+        )
+        _set_return_expression(return_root, prefix, records_variable)
+    for segments in top_level_declarations:
+        _set_return_expression(return_root, segments, "None")
+    if download_descriptor_key:
+        return_root.children.setdefault(
+            download_descriptor_key, _ExtractionReturnNode()
+        ).value_expression = download_descriptor_expr
+
+    body_lines = list(preserved_lines)
+    body_lines.extend(scalar_statements)
+    body_lines.extend(table_statements)
+    body_lines.append(f"return {_return_node_expression(return_root)}")
+    produced_code = "\n".join(body_lines).strip() + "\n"
+    keyed_paths = tuple(sorted(scalar_required_paths | declaration_paths))
+    return ProducedStaticReturnEnvelope(code=produced_code, keyed_paths=keyed_paths)
 
 
 def _trajectory_contains_reveal(trajectory: Sequence[Mapping[str, Any]], plan: RequestedOutputExtractionPlan) -> bool:

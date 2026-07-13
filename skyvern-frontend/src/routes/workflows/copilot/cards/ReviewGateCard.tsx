@@ -2,6 +2,7 @@ import { MagicWandIcon } from "@radix-ui/react-icons";
 
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
+import { humanizeBlockLabel } from "../blockLabel";
 import { TurnNarrativeState } from "../narrativeState";
 import { getDiffCardTitle } from "./diffCardTitle";
 
@@ -118,8 +119,8 @@ export function ReviewGateCard({
                 Added
               </div>
               {draft.blockLabels.map((label) => (
-                <div key={label} className={itemClassName}>
-                  + {label}
+                <div key={label} className={itemClassName} title={label}>
+                  + {humanizeBlockLabel(label)}
                 </div>
               ))}
             </div>
@@ -130,8 +131,8 @@ export function ReviewGateCard({
                 Removed
               </div>
               {removed.map((label) => (
-                <div key={label} className={itemClassName}>
-                  - {label}
+                <div key={label} className={itemClassName} title={label}>
+                  - {humanizeBlockLabel(label)}
                 </div>
               ))}
             </div>

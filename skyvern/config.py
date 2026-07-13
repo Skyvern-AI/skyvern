@@ -209,6 +209,13 @@ class Settings(BaseSettings):
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
+    # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
+    # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
+    # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
+    # coordinate the poller with a /credential-response POST that may land on another worker,
+    # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
+    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = False
+    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True

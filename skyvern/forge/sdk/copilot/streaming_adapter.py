@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 
 from skyvern.config import settings
 
@@ -32,7 +33,21 @@ from skyvern.forge.sdk.copilot.narration import (
     snapshot_ctx,
     tool_activity_display_label,
 )
-from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
+from skyvern.forge.sdk.copilot.output_utils import (
+    format_tool_result_for_user,
+    summarize_tool_result_detail,
+    user_facing_success,
+)
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
+from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
+    raise_if_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    CopilotUnrecoverableToolError,
+    _maybe_raise_unrecoverable_tool_error,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCodegenProgressUpdate,
     WorkflowCopilotDesignEndUpdate,
@@ -50,7 +65,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
@@ -251,19 +266,6 @@ async def stream_to_sse(
     reasons unrelated to a dropped client) is re-raised unchanged so
     asyncio's cancellation machinery still runs normally.
     """
-    from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.enforcement import (
-        CopilotUnrecoverableToolError,
-        _maybe_raise_unrecoverable_tool_error,
-        outcome_fully_verified,
-    )
-    from skyvern.forge.sdk.copilot.turn_halt import (
-        CopilotTurnHalt,
-        raise_if_turn_halt,
-        stash_turn_halt_from_blocker_signal,
-    )
-
     call_id_to_name: dict[str, str] = {}
     # Counts completed tool round-trips (tool_called + tool_output pair), not
     # raw stream events. Both TOOL_CALL and TOOL_RESULT for the same round
@@ -378,8 +380,10 @@ async def stream_to_sse(
                 else:
                     blocker_signals = _tool_blocker_signal_candidates(ctx)
                     summary = format_tool_result_for_user(tool_name, parsed, blocker_signal=blocker_signals)
-                    success = parsed.get("ok", True)
-                    detail = summarize_tool_result_detail(parsed, tool_name=tool_name, blocker_signal=blocker_signals)
+                    success = user_facing_success(parsed, blocker_signal=blocker_signals)
+                    detail = summarize_tool_result_detail(
+                        parsed, tool_name=tool_name, blocker_signal=blocker_signals, success=success
+                    )
                     narrator_state.record_activity(
                         build_tool_result_activity(tool_name, summary, success, iteration, call_id)
                     )
@@ -411,7 +415,7 @@ async def stream_to_sse(
                             summary=summary,
                             success=success,
                             iteration=iteration,
-                            details=extract_tool_details(tool_name, parsed),
+                            details=extract_tool_details(tool_name, parsed, success=success),
                         )
                         for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
                             narrator_state.record_transition(transition)
@@ -517,7 +521,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
         return
     blocker_signals = _tool_blocker_signal_candidates(ctx)
     summary = format_tool_result_for_user(pending.tool_name, parsed, blocker_signal=blocker_signals)
-    success = parsed.get("ok", True)
+    success = user_facing_success(parsed, blocker_signal=blocker_signals)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
@@ -533,7 +537,9 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             summary=summary,
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
-            detail=summarize_tool_result_detail(parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals),
+            detail=summarize_tool_result_detail(
+                parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
+            ),
             workflow_run_id=_tool_result_workflow_run_id(pending.tool_name, parsed),
         )
     )

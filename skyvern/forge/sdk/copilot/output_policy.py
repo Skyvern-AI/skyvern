@@ -134,6 +134,31 @@ _INTERNAL_TOOL_PARAPHRASE_PHRASES = ("nudge turn", "nudge-turn")
 _INTERNAL_COPILOT_SENTINEL_PREFIX = "[copilot:"
 _LOOP_DETECTED_MARKER = "loop detected"
 
+# Copilot's own paraphrase for a formatting change it made — not standard YAML
+# vocabulary, so a legitimate clarification is not going to phrase itself this way.
+# Runs for every response type, including ASK_QUESTION.
+_YAML_AUTHORING_JARGON_PHRASES = (
+    "folded code formatting",
+    "literal code formatting",
+)
+# Standard YAML block-scalar terminology (folded `>` vs literal `|`). A legitimate
+# ASK_QUESTION can ask the user which style they want for a multi-line value, so these
+# only count as a leak once the reply is final and user-visible.
+_YAML_BLOCK_SCALAR_TERM_PHRASES = (
+    "folded block scalar",
+    "literal block scalar",
+)
+
+
+def _contains_yaml_authoring_vocab_leak(user_response: str, response_type: str) -> bool:
+    lower = user_response.lower()
+    if any(phrase in lower for phrase in _YAML_AUTHORING_JARGON_PHRASES):
+        return True
+    return response_type in _USER_VISIBLE_REPLY_TYPES and any(
+        phrase in lower for phrase in _YAML_BLOCK_SCALAR_TERM_PHRASES
+    )
+
+
 _SELF_PRESCRIPTIVE_FIXED_PHRASE = "send me a normal instruction like"
 _SELF_PRESCRIPTIVE_IMPERATIVE_VERBS = frozenset({"send", "reply", "type", "respond"})
 _SELF_PRESCRIPTIVE_POLITE_PREFIXES = frozenset({"please", "kindly", "just", "now"})
@@ -668,6 +693,8 @@ def _contains_internal_block_taxonomy_leak(
     if not user_response:
         return False
     if _contains_deprecated_block_identifier(user_response):
+        return True
+    if _contains_yaml_authoring_vocab_leak(user_response, response_type):
         return True
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response):
         return True

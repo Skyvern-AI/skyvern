@@ -48,6 +48,13 @@ class SkyvernException(Exception):
         self.message = message
         super().__init__(message)
 
+    @property
+    def user_facing_type_name(self) -> str:
+        # Class name safe to render in a user-facing message. Subclasses whose real class
+        # name carries sensitive info (e.g. a remote-browser vendor identity) override this
+        # so the concrete name stays in logs/monitoring but never reaches end users.
+        return type(self).__name__
+
 
 class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
@@ -126,6 +133,16 @@ _BROWSER_CONNECTION_PATTERNS = (
 
 def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
+
+
+# A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
+# ws/wss endpoint URL, which can carry the remote-browser vendor host, a session-bearing
+# path/query, or credentials embedded as user:pass@host. Redact it before it reaches a user.
+_CDP_WS_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+
+
+def _redact_cdp_endpoint_urls(message: str) -> str:
+    return _CDP_WS_URL_RE.sub("[remote browser endpoint]", message)
 
 
 def get_user_facing_exception_message(exception: Exception) -> str:
@@ -288,7 +305,16 @@ class MissingWorkflowRunBrowserState(SkyvernException):
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
 
 
-class CaptchaNotSolvedInTime(SkyvernException):
+class CaptchaSolveError(SkyvernException):
+    """Base for captcha-solve failures.
+
+    Shared marker so the action handler can catch captcha-solve failures with a
+    dedicated typed arm (logged as a handled failure) instead of the generic
+    "Unhandled exception" arm. Cloud captcha-solve exceptions subclass this too.
+    """
+
+
+class CaptchaNotSolvedInTime(CaptchaSolveError):
     def __init__(self, task_id: str, final_state: str) -> None:
         super().__init__(f"Captcha not solved in time for task {task_id}. Final state: {final_state}")
 
@@ -464,16 +490,23 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
     SUPPORT_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
     def __init__(self, browser_type: str, exception: Exception) -> None:
-        exception_type = type(exception).__name__
+        # browser_type can be a concrete remote-browser vendor identity (settings.BROWSER_TYPE);
+        # keep it on the exception for structured logs but never surface it in the user message.
+        self.browser_type = browser_type
+        # A SkyvernException may redact its own class name (e.g. a vendor-named rate-limit
+        # error whose real name is kept for logs/monitoring but must not reach end users).
+        exception_type = (
+            exception.user_facing_type_name if isinstance(exception, SkyvernException) else type(exception).__name__
+        )
         detail = self._get_detail(exception)
-        super().__init__(f"Failed to create browser context for {browser_type} ({exception_type}). {detail}")
+        super().__init__(f"Failed to create browser context ({exception_type}). {detail}")
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
-        raw_message = str(exception).strip()
+        raw_message = _redact_cdp_endpoint_urls(str(exception).strip())
         raw_lower = raw_message.lower()
 
         # Browser launch environment errors: worker cannot initialize the

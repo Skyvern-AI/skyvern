@@ -72,6 +72,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
+    produce_covered_static_return_envelope,
     render_missing_rung_call_sources,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
@@ -95,8 +96,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _record_code_authoring_guardrail_reject,
     _scouted_spine_open_obligation,
     arm_credential_scout_reopen,
+    download_satisfied_requested_output_paths,
     requested_output_extraction_plan,
     requested_output_extraction_plan_changed,
+    requested_scalar_output_extraction_plan,
     synthesized_goal_completion_landing_pending,
     synthesized_persistence_reopened,
     synthesized_persistence_reopened_after_failed_run,
@@ -125,6 +128,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     output_policy_verdict_to_trace_data,
     url_origin,
 )
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     ReachedDownloadTarget,
@@ -164,7 +168,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     parse_workflow_yaml,
     workflow_blocks,
 )
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS, is_sensitive_workflow_parameter
@@ -1639,7 +1643,7 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
         return set()
     paths: set[str] = set()
     for criterion in _active_completion_criteria(ctx):
-        if isinstance(criterion, CompletionCriterion) and _independent_judgment_output_criterion(criterion):
+        if isinstance(criterion, CompletionCriterion) and _is_judgment_boolean_criterion(criterion):
             continue
         if getattr(criterion, "level", None) == "definition":
             continue
@@ -1681,18 +1685,16 @@ def _active_completion_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     return request_policy.graded_completion_criteria()
 
 
-def _independent_judgment_output_criterion(criterion: CompletionCriterion) -> bool:
-    return criterion.requested_output_evidence_source == "independent_run_evidence" and _is_judgment_boolean_criterion(
-        criterion
-    )
-
-
-def _independent_judgment_output_paths(ctx: AgentContext) -> set[str]:
+def _judgment_output_paths(ctx: AgentContext) -> set[str]:
+    # Judgment-boolean paths are dropped from the producer's static-bind set, not moved to the
+    # declaration lane; declaring one would fabricate a None where the run's own judgment belongs. The
+    # requested-output gate reads the completion criteria directly rather than this bind set, so dropping
+    # cannot pin it open.
     paths: set[str] = set()
     for criterion in _active_completion_criteria(ctx):
         if not isinstance(criterion, CompletionCriterion):
             continue
-        if not _independent_judgment_output_criterion(criterion):
+        if not _is_judgment_boolean_criterion(criterion):
             continue
         path = _canonical_requested_output_path(criterion.output_path)
         if path and _output_path_has_child(path):
@@ -2389,7 +2391,7 @@ def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContract
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     antecedent_paths = _contingent_antecedent_child_paths(ctx)
     if runtime_contract is not None:
-        runtime_observation_paths = runtime_contract.required_paths - _independent_judgment_output_paths(ctx)
+        runtime_observation_paths = runtime_contract.required_paths - _judgment_output_paths(ctx)
         return _OutputContractRequiredPaths(
             observation_paths=runtime_observation_paths,
             declaration_paths=antecedent_paths - runtime_observation_paths,
@@ -2397,6 +2399,7 @@ def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContract
             reason_code=runtime_contract.reason_code,
         )
     observation_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
+    observation_paths = observation_paths - _judgment_output_paths(ctx)
     repair_context = getattr(ctx, "last_code_authoring_repair_context", None)
     if (
         not observation_paths
@@ -2411,7 +2414,7 @@ def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContract
                 *repair_context.required_code_return_paths,
             ]
         )
-        rehydrated -= _independent_judgment_output_paths(ctx)
+        rehydrated -= _judgment_output_paths(ctx)
         # An antecedent the repair contract carried only in schema/return roles stays in the
         # declaration lane on rehydration; the goal role is the observation-lane record.
         observation_paths = rehydrated - (antecedent_paths - goal_paths)
@@ -3190,6 +3193,46 @@ class _SpineSplitOutcome(NamedTuple):
     stage_count: int | None
 
 
+def _produce_split_extraction_envelope(
+    ctx: AgentContext,
+    extraction_suffix: str,
+    *,
+    required_paths: set[str],
+    declaration_paths: set[str] | None,
+    label: str,
+    signature: str,
+) -> str | None:
+    """Scalar-only producer for the spine-split seam: the extraction suffix carries no browser
+    actions, so the mixed download shape abstains here and the split bail stays byte-identical."""
+    declarations = declaration_paths or set()
+    if required_paths & download_satisfied_requested_output_paths(ctx):
+        return None
+    scalar_paths = required_paths - declarations
+    envelope = produce_covered_static_return_envelope(
+        extraction_suffix,
+        plan=requested_scalar_output_extraction_plan(ctx),
+        scalar_required_paths=scalar_paths,
+        declaration_paths=declarations,
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    if envelope is None:
+        return None
+    _, revalidation = _extraction_code_with_required_static_return(
+        envelope.code, required_paths=scalar_paths, declaration_paths=declarations
+    )
+    if revalidation:
+        return None
+    LOG.info(
+        "copilot_output_contract_keyed_static_return_produced",
+        block_label=label,
+        keyed_paths=list(envelope.keyed_paths),
+        download_registration_paths=[],
+        canonical_output_contract_signature=signature,
+    )
+    return envelope.code
+
+
 def _attempt_separated_spine_split(
     *,
     ctx: AgentContext,
@@ -3198,6 +3241,7 @@ def _attempt_separated_spine_split(
     target_code: str,
     synthesized: SynthesizedCodeBlock,
     required_paths: set[str],
+    signature: str,
     declaration_paths: set[str] | None = None,
 ) -> _SpineSplitOutcome:
     code_block = next(
@@ -3230,7 +3274,17 @@ def _attempt_separated_spine_split(
         extraction_suffix, required_paths=required_paths, declaration_paths=declaration_paths
     )
     if static_violations:
-        return _SpineSplitOutcome(None, ["static_return_envelope_unavailable"], None)
+        produced_extraction = _produce_split_extraction_envelope(
+            ctx,
+            extraction_suffix,
+            required_paths=required_paths,
+            declaration_paths=declaration_paths,
+            label=label,
+            signature=signature,
+        )
+        if produced_extraction is None:
+            return _SpineSplitOutcome(None, ["static_return_envelope_unavailable"], None)
+        keyed_extraction = produced_extraction
     if _browser_surface_contains_full_action_spine(keyed_extraction, reconciled_synthesized):
         return _SpineSplitOutcome(None, ["extraction_retains_full_spine"], None)
 
@@ -3880,6 +3934,110 @@ def _stamp_declaration_contract_defaults(
     return yaml.safe_dump(parsed, sort_keys=False), True
 
 
+def _impose_covered_static_return_envelope(
+    ctx: AgentContext,
+    *,
+    parsed: dict[str, Any],
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+    label: str,
+    target_code: str,
+    observation_paths: set[str],
+    declaration_paths: set[str],
+    source: str,
+    reason_code: str,
+    signature: str,
+    runtime_attempt_key: str,
+) -> tuple[str, object, bool] | None:
+    """Deterministic evidence-derived envelope on the whole-block scaffold route: author the scalar
+    live-reads (mixed shape merges the resolved download descriptor into one return), or admit a
+    download-only block, so ``static_return_envelope_unavailable`` never fires for scout-covered goals.
+    Returns None to leave today's bail ladder byte-identical."""
+    download_registered = download_satisfied_requested_output_paths(ctx)
+    scalar_paths = observation_paths - download_registered
+    download_paths = observation_paths & download_registered
+    download = ctx.reached_download_target
+    expects_download = download is not None and bool(download.selector) and _code_uses_expect_download(target_code)
+    block_metadata = _metadata_item_for_block_label(raw_code_artifact_metadata, label) or {}
+
+    if not scalar_paths:
+        if not (download_paths and expects_download):
+            return None
+        if _download_return_shape_error(label, block_metadata, target_code) is not None:
+            return None
+        scaffolded_metadata = _apply_metadata_contract_scaffold(
+            ctx,
+            workflow_yaml,
+            raw_code_artifact_metadata,
+            required_paths=observation_paths,
+            source=source,
+            reason_code=reason_code,
+            declaration_paths=declaration_paths,
+            allow_missing_static_return=True,
+        )
+        _mark_output_contract_imposed(ctx, signature)
+        _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
+        LOG.info(
+            "copilot_output_contract_download_registration_admitted",
+            block_label=label,
+            download_registration_paths=sorted(download_paths),
+            canonical_output_contract_signature=signature,
+        )
+        return workflow_yaml, scaffolded_metadata, scaffolded_metadata is not raw_code_artifact_metadata
+
+    envelope = produce_covered_static_return_envelope(
+        target_code,
+        plan=requested_scalar_output_extraction_plan(ctx),
+        scalar_required_paths=scalar_paths,
+        declaration_paths=declaration_paths,
+        download_required_paths=download_paths,
+        expects_download=expects_download,
+    )
+    if envelope is None:
+        return None
+    _, revalidation = _extraction_code_with_required_static_return(
+        envelope.code, required_paths=scalar_paths, declaration_paths=declaration_paths
+    )
+    if revalidation:
+        return None
+    if download_paths and _download_return_shape_error(label, block_metadata, envelope.code) is not None:
+        return None
+
+    for block in _workflow_code_blocks(parsed):
+        if str(block.get("label") or "").strip() == label:
+            block["code"] = envelope.code.rstrip() + "\n"
+            break
+    imposed_yaml = yaml.safe_dump(parsed, sort_keys=False)
+    scaffolded_metadata = _apply_metadata_contract_scaffold(
+        ctx,
+        imposed_yaml,
+        raw_code_artifact_metadata,
+        required_paths=observation_paths,
+        source=source,
+        reason_code=reason_code,
+        declaration_paths=declaration_paths,
+        allow_missing_static_return=bool(download_paths),
+    )
+    _mark_output_contract_imposed(ctx, signature)
+    _record_runtime_output_repair_attempt(ctx, runtime_attempt_key)
+    LOG.info(
+        "copilot_output_contract_keyed_static_return_produced",
+        block_label=label,
+        keyed_paths=list(envelope.keyed_paths),
+        download_registration_paths=sorted(download_paths),
+        canonical_output_contract_signature=signature,
+    )
+    LOG.info(
+        "copilot_output_contract_envelope_imposed_after_steering",
+        block_label=label,
+        canonical_output_contract_signature=signature,
+        steering_reject_count=_output_contract_reject_count(ctx, signature),
+        return_envelope_applied=True,
+        metadata_scaffold_applied=scaffolded_metadata is not raw_code_artifact_metadata,
+    )
+    return imposed_yaml, scaffolded_metadata, True
+
+
 def _impose_output_contract_envelope_after_steering(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -3944,6 +4102,7 @@ def _impose_output_contract_envelope_after_steering(
                 target_code=target_code,
                 synthesized=synthesized,
                 required_paths=required_paths,
+                signature=signature,
                 declaration_paths=declaration_paths,
             )
             if split.imposed_yaml is not None:
@@ -4008,6 +4167,23 @@ def _impose_output_contract_envelope_after_steering(
         declaration_paths=declaration_paths,
     )
     if violations:
+        produced = _impose_covered_static_return_envelope(
+            ctx,
+            parsed=parsed,
+            workflow_yaml=workflow_yaml,
+            raw_code_artifact_metadata=raw_code_artifact_metadata,
+            label=label,
+            target_code=target_code,
+            observation_paths=observation_paths,
+            declaration_paths=declaration_paths,
+            source=source,
+            reason_code=reason_code,
+            signature=signature,
+            runtime_attempt_key=runtime_attempt_key,
+        )
+        if produced is not None:
+            produced_yaml, produced_metadata, produced_changed = produced
+            return produced_yaml, produced_metadata, produced_changed or declaration_stamped
         scaffolded_metadata = _apply_metadata_contract_scaffold(
             ctx,
             workflow_yaml,
@@ -10040,7 +10216,7 @@ async def _update_workflow(
                 code_rejected=True,
             )
         return reject(
-            error=f"Workflow validation failed: {e}",
+            error=f"{INTERNAL_VALIDATION_FAILURE_PREFIX}{e}",
             user_facing_summary=user_facing_summary,
             data=repair_data,
         )

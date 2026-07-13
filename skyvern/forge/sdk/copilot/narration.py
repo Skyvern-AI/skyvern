@@ -36,7 +36,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
 
@@ -563,16 +563,21 @@ _TRANSITION_LABELS: dict[TransitionKind, str] = {
 _MAX_DETAILS_CHARS = 240
 
 
-def extract_tool_details(tool_name: str, parsed: dict[str, Any]) -> str:
+def extract_tool_details(tool_name: str, parsed: dict[str, Any], *, success: bool | None = None) -> str:
     """Compact narrator-friendly excerpt from a tool's parsed payload.
 
     Intentionally narrow: counts, domains, and high-level statuses only.
     Raw labels (block names, field names, URL paths, page content) are excluded
     so they can't reach the narrator prompt and be echoed at the user.
+
+    ``success`` lets a caller override the raw ``ok`` field (e.g. a precondition
+    redirect that streaming_adapter has already reclassified as non-failure) so this
+    detail line doesn't contradict the entry's own success status in the narrator prompt.
     """
     if not isinstance(parsed, dict):
         return ""
-    if not parsed.get("ok", True):
+    ok = parsed.get("ok", True) if success is None else success
+    if not ok:
         return "last action failed"
 
     data = parsed.get("data")

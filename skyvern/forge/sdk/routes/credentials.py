@@ -466,8 +466,13 @@ async def send_totp_code(
             parse_exception_type_name = type(e).__name__
 
     if parse_exception_type_name:
+        # parse_otp_login raised, meaning the OTP-extraction dependency (LLM backend)
+        # failed rather than the caller supplying unparseable input. Surface a retryable
+        # 502 so relays retry once the backend recovers, instead of a 400 that reads as
+        # "bad input" and masks a backend outage.
         LOG.error(
             "Failed to parse otp login",
+            organization_id=curr_org.organization_id,
             totp_identifier=redacted_totp_identifier,
             task_id=data.task_id,
             workflow_id=data.workflow_id,
@@ -475,11 +480,15 @@ async def send_totp_code(
             content_length=len(data.content),
             exception_type=parse_exception_type_name,
         )
-        raise HTTPException(status_code=400, detail="Failed to parse otp login")
+        raise HTTPException(
+            status_code=502,
+            detail="OTP extraction is temporarily unavailable. Please retry in a few minutes.",
+        )
 
     if not otp_value:
         LOG.error(
             "Failed to parse otp login",
+            organization_id=curr_org.organization_id,
             totp_identifier=redacted_totp_identifier,
             task_id=data.task_id,
             workflow_id=data.workflow_id,

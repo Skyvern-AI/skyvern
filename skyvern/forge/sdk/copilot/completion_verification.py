@@ -116,6 +116,7 @@ class CompletionVerificationResult:
     degraded_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_criterion_ids: list[str] = field(default_factory=list)
     floor_rekeyed_output_path_by_criterion_id: dict[str, str] = field(default_factory=dict)
+    floor_rekeyed_backed_by_criterion_id: dict[str, bool] = field(default_factory=dict)
     contingent_degraded_criterion_ids: list[str] = field(default_factory=list)
     requested_output_criteria_count: int = 0
 
@@ -157,6 +158,10 @@ class CompletionVerificationResult:
             # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
             if verdict is not None and _is_definition_plane_abstention(verdict):
+                continue
+            # An incomplete typed classification contract likewise abstains rather than refutes:
+            # it must not disown a delivered sibling output whose evidence is confirmed.
+            if verdict is not None and _is_incomplete_validation_classification_abstention(verdict):
                 continue
             if verdict is not None and verdict.self_emitted_judgment_not_independent:
                 if _has_independent_satisfied_requested_output_corroborator(verdict_by_id, criterion_id):
@@ -349,6 +354,7 @@ class RunEvidenceSnapshot:
 _UNAVAILABLE = CompletionVerificationResult(status="unavailable")
 _MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
 _INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT = "incomplete typed classification contract"
+_INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON = "validation_classification_incomplete_contract"
 _MISSING_REGISTERED_DOWNLOAD_EVIDENCE = "run output did not include a non-empty registered browser download"
 _DELIVERED_UNVERIFIED_OUTPUT_SOURCES = frozenset({"runtime_output", "registered_output_parameter"})
 
@@ -1014,11 +1020,16 @@ def grade_validation_classification_criteria(
         output_key = criterion.classification_output_key
         expected = criterion.expected_classification
         if output_key is None or expected is None:
+            # An incomplete typed contract cannot grade anything, so it fails safe to a non-sinking
+            # abstention like grade_definition_criteria rather than a sinking unsatisfied verdict —
+            # a value-less criterion minted without the fields this arm needs must not disown a
+            # delivered sibling output. It can never satisfy on its own: is_fully_satisfied still
+            # requires a genuinely satisfied run-plane criterion.
             verdicts.append(
-                _validation_classification_unsatisfied(
-                    criterion,
-                    reason_code="no_evidence",
-                    output_key=output_key or "",
+                CriterionVerdict(
+                    criterion_id=criterion.id,
+                    state="unknown",
+                    reason_code=_INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON,
                     missing_evidence=_INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT,
                 )
             )
@@ -2021,6 +2032,10 @@ def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
 
 
+def _is_incomplete_validation_classification_abstention(verdict: CriterionVerdict) -> bool:
+    return verdict.state == "unknown" and verdict.reason_code == _INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON
+
+
 def _is_structural_requested_output_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unsatisfied" and verdict.reason_code == _STRUCTURAL_ABSTENTION_REASON_CODE
 
@@ -2218,6 +2233,7 @@ def combine_verification_results(
     degraded_ids: list[str] = []
     floor_rekeyed_ids: list[str] = []
     floor_rekeyed_path_by_id: dict[str, str] = {}
+    floor_rekeyed_backed_by_id: dict[str, bool] = {}
     contingent_degraded_ids: list[str] = []
     if run_result is not None:
         contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
@@ -2229,6 +2245,7 @@ def combine_verification_results(
         degraded_ids = list(dict.fromkeys([*degraded_ids, *run_result.degraded_criterion_ids]))
         floor_rekeyed_ids = list(dict.fromkeys([*floor_rekeyed_ids, *run_result.floor_rekeyed_criterion_ids]))
         floor_rekeyed_path_by_id.update(run_result.floor_rekeyed_output_path_by_criterion_id)
+        floor_rekeyed_backed_by_id.update(run_result.floor_rekeyed_backed_by_criterion_id)
         contingent_degraded_ids = list(
             dict.fromkeys([*contingent_degraded_ids, *run_result.contingent_degraded_criterion_ids])
         )
@@ -2244,6 +2261,7 @@ def combine_verification_results(
             degraded_criterion_ids=degraded_ids,
             floor_rekeyed_criterion_ids=floor_rekeyed_ids,
             floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
+            floor_rekeyed_backed_by_criterion_id=floor_rekeyed_backed_by_id,
             contingent_degraded_criterion_ids=contingent_degraded_ids,
             requested_output_criteria_count=requested_output_criteria_count,
         )
@@ -2303,6 +2321,8 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
         if verdict is not None and verdict.satisfied:
             continue
         if verdict is not None and _is_definition_plane_abstention(verdict):
+            continue
+        if verdict is not None and _is_incomplete_validation_classification_abstention(verdict):
             continue
         if verdict is not None and result.is_structural_contingent_abstention(verdict):
             continue
@@ -2478,6 +2498,86 @@ def carry_floor_rekeyed_criterion_ids(
         floor_rekeyed_criterion_ids=merged,
         floor_rekeyed_output_path_by_criterion_id=output_path_by_id,
     )
+
+
+def carry_floor_rekeyed_path_backing(
+    result: CompletionVerificationResult,
+    backing_by_criterion_id: Mapping[str, bool],
+) -> CompletionVerificationResult:
+    if not backing_by_criterion_id and not result.floor_rekeyed_backed_by_criterion_id:
+        return result
+    merged = dict(result.floor_rekeyed_backed_by_criterion_id)
+    merged.update(backing_by_criterion_id)
+    return replace(result, floor_rekeyed_backed_by_criterion_id=merged)
+
+
+@dataclass(frozen=True)
+class FloorRekeyedEmissionWithhold:
+    criterion_ids: tuple[str, ...]
+    unbacked_output_paths: tuple[str, ...]
+    backed_output_paths: tuple[str, ...]
+
+
+def floor_rekeyed_effective_marked_ids(result: CompletionVerificationResult) -> list[str]:
+    """Floor-rekeyed markers that required an emission this run: the marked set minus the
+    structurally-unfired contingent (abstained) markers, which needed no emission to fire."""
+    abstained = result.abstained_criterion_ids()
+    return [criterion_id for criterion_id in result.floor_rekeyed_criterion_ids if criterion_id not in abstained]
+
+
+def floor_rekeyed_emission_withhold(
+    result: CompletionVerificationResult | None,
+) -> FloorRekeyedEmissionWithhold | None:
+    """A fully satisfied run whose floor-rekeyed emission markers lack a meaningful runtime value at
+    their original path delivered no emission that corroboration can substitute for. Keyed on the typed
+    marker id-set (never payload emptiness) so never-minted reach-state and structurally-unfired
+    contingent markers are untouched, and a missing backing entry reads as unbacked to fail closed."""
+    if result is None or result.status != "evaluated" or not result.is_fully_satisfied():
+        return None
+    effective_ids = floor_rekeyed_effective_marked_ids(result)
+    if not effective_ids:
+        return None
+    unbacked_ids: list[str] = []
+    unbacked_paths: list[str] = []
+    backed_paths: list[str] = []
+    for criterion_id in effective_ids:
+        path = result.floor_rekeyed_output_path_by_criterion_id.get(criterion_id, "")
+        if result.floor_rekeyed_backed_by_criterion_id.get(criterion_id, False):
+            backed_paths.append(path)
+        else:
+            unbacked_ids.append(criterion_id)
+            unbacked_paths.append(path)
+    if not unbacked_ids:
+        return None
+    return FloorRekeyedEmissionWithhold(
+        criterion_ids=tuple(unbacked_ids),
+        unbacked_output_paths=tuple(unbacked_paths),
+        backed_output_paths=tuple(backed_paths),
+    )
+
+
+def floor_rekeyed_emission_lane_fields(result: CompletionVerificationResult | None) -> dict[str, Any] | None:
+    """Structured fingerprint fields for the floor-rekeyed emission lane, emitted whenever an
+    evaluated result carries markers — on satisfied and unsatisfied results alike, independent of
+    outcome."""
+    if result is None or result.status != "evaluated" or not result.floor_rekeyed_criterion_ids:
+        return None
+    effective_ids = floor_rekeyed_effective_marked_ids(result)
+    backed_ids = [cid for cid in effective_ids if result.floor_rekeyed_backed_by_criterion_id.get(cid, False)]
+    unbacked_ids = [cid for cid in effective_ids if cid not in backed_ids]
+    withhold = floor_rekeyed_emission_withhold(result)
+    return {
+        "criterion_ids": list(result.floor_rekeyed_criterion_ids),
+        "effective_criterion_ids": list(effective_ids),
+        "abstained_excluded_criterion_ids": sorted(set(result.floor_rekeyed_criterion_ids) - set(effective_ids)),
+        "backed_criterion_ids": backed_ids,
+        "unbacked_criterion_ids": unbacked_ids,
+        "backed_output_paths": [result.floor_rekeyed_output_path_by_criterion_id.get(cid, "") for cid in backed_ids],
+        "unbacked_output_paths": [
+            result.floor_rekeyed_output_path_by_criterion_id.get(cid, "") for cid in unbacked_ids
+        ],
+        "engaged": withhold is not None,
+    }
 
 
 async def evaluate_completion_criteria(

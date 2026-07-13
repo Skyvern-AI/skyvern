@@ -124,10 +124,33 @@ class WorkflowCopilotChatRequest(BaseModel):
             "otherwise it is a no-op."
         ),
     )
+    supports_credential_pause: bool = Field(
+        False,
+        description=(
+            "True when the client can render the credential_required frame. Older clients default to False "
+            "and silently drop unknown frame types, so the backend must not pause for them even if the "
+            "server-side flag is on."
+        ),
+    )
+    keep_pending_proposal: bool = Field(
+        False,
+        description=(
+            "When true, a pending proposed_workflow from an earlier turn survives turns that end without "
+            "a new proposal, so the client can keep rendering an actionable review gate."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
     cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
+
+
+class WorkflowCopilotCredentialResponseRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+    action: Literal["connected", "skip"] = Field(..., description="The user's response to the credential card")
+    credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
@@ -192,6 +215,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     DESIGN_START = "design_start"
     DESIGN_END = "design_end"
     WORKFLOW_DRAFT = "workflow_draft"
+    CREDENTIAL_REQUIRED = "credential_required"
     CODEGEN_PROGRESS = "codegen_progress"
 
 
@@ -397,6 +421,26 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
+
+
+class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
+    )
+    turn_id: str = Field(..., description="UUID for the paused turn; correlates with credential-response POSTs")
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+    resume_token: str = Field(..., description="One-time token the credential-response POST must echo back to resume")
+    reason: Literal[
+        "workflow_credential_inputs_unbound",
+        "missing_credential_run_failure",
+        "credential_deferred_draft",
+    ] = Field(..., description="Typed signal that triggered the pause")
+    message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
+    login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
+    credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
+    timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
+    expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowCopilotCodegenProgressUpdate(BaseModel):

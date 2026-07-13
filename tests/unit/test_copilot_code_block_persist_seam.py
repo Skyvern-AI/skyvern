@@ -17,6 +17,7 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
@@ -41,12 +42,14 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    ProducedStaticReturnEnvelope,
     ScoutGap,
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
     _get_by_role_expr,
     _get_by_role_expr_strict,
     credential_scout_gap,
+    produce_covered_static_return_envelope,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
@@ -59,6 +62,12 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.output_contracts import (
     OutputContractAdvisoryState,
     code_block_available_binding_keys_by_label,
+)
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    LiveReadBinding,
+    LiveReadKind,
+    RequestedOutputExtractionPlan,
+    RevealAnchor,
 )
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -4372,6 +4381,94 @@ class TestCodeRepairProgressClassification:
         assert required_paths == {"output.record_id"}
         assert source == "requested_output_contract"
         assert reason_code == "requested_output_contract_missing_output_coverage"
+
+    def test_runtime_output_judgment_is_excluded_from_scalar_bind_set(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="runtime_output",
+                ),
+                CompletionCriterion(
+                    id="record_id",
+                    outcome="the record id is returned",
+                    output_path="output.record_id",
+                ),
+            ]
+        )
+
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        assert contract.observation_paths == {"output.record_id"}
+        assert contract.union == {"output.record_id"}
+        assert "output.login_gate_blocks_target" not in contract.declaration_paths
+
+    def test_runtime_output_judgment_alone_yields_empty_bind_set(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="login_gate",
+                    outcome="the target path is blocked by a login gate",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="runtime_output",
+                )
+            ]
+        )
+
+        assert workflow_update_module._output_contract_required_paths_source(ctx).union == set()
+
+    def test_non_judgment_scalar_bind_set_is_unchanged(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="record_id",
+                    outcome="the record id is returned",
+                    output_path="output.record_id",
+                )
+            ]
+        )
+
+        assert workflow_update_module._output_contract_required_paths_source(ctx).observation_paths == {
+            "output.record_id"
+        }
+
+    def test_judgment_output_paths_widens_independent_predicate(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(
+                    id="independent_gate",
+                    outcome="the independent path is blocked by a login gate",
+                    output_path="output.independent_gate_blocks_target",
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                ),
+                CompletionCriterion(
+                    id="runtime_gate",
+                    outcome="the runtime path is blocked by a login gate",
+                    output_path="output.runtime_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="runtime_output",
+                ),
+            ]
+        )
+
+        all_judgment = workflow_update_module._judgment_output_paths(ctx)
+
+        assert all_judgment == {
+            "output.independent_gate_blocks_target",
+            "output.runtime_gate_blocks_target",
+        }
 
     def test_independent_judgment_runtime_repair_fact_is_not_rehydrated_as_code_return_path(self) -> None:
         ctx = _code_only_ctx()
@@ -15006,3 +15103,574 @@ class TestSequencedDownloadTerminalCoverage:
 
         assert guarded is not None
         assert any("scouted_spine_under_build" in violation for violation in guarded.violations)
+
+
+def _scalar_binding(output_path: str, label: str, selector: str) -> LiveReadBinding:
+    return LiveReadBinding(
+        output_path=output_path,
+        kind=LiveReadKind.KEY_VALUE,
+        selector=selector,
+        selector_count=1,
+        selector_index=0,
+        child_index=1,
+        child_count=2,
+        relation_label=label,
+    )
+
+
+def _scalar_plan(*bindings: LiveReadBinding) -> RequestedOutputExtractionPlan:
+    return RequestedOutputExtractionPlan(
+        requested_output_paths=tuple(binding.output_path for binding in bindings),
+        observation_step=1,
+        observation_identity="obs-identity",
+        reveal=RevealAnchor(selector="#reveal"),
+        live_reads=tuple(bindings),
+        identity="plan-identity",
+    )
+
+
+_MIXED_DOWNLOAD_CODE = (
+    "async with page.expect_download() as dl_info:\n"
+    '    await page.locator("#download-invoice").click()\n'
+    "dl_info_file = await dl_info.value\n"
+    "downloaded_file_name = dl_info_file.suggested_filename\n"
+    "await dl_info_file.path()\n"
+    "return {\n"
+    '    "downloaded_file_name": downloaded_file_name,\n'
+    "}\n"
+)
+
+
+def test_producer_scalar_coverage_single_return_over_all_paths() -> None:
+    plan = _scalar_plan(
+        _scalar_binding("output.account_number", "Account Number", ".acct"),
+        _scalar_binding("output.confirmation_number", "Confirmation Number", ".conf"),
+    )
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.account_number", "output.confirmation_number"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.keyed_paths == ("output.account_number", "output.confirmation_number")
+    assert envelope.code.count("return {") == 1
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert {"output.account_number", "output.confirmation_number"} <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths={"output.account_number", "output.confirmation_number"}
+    )
+    assert violations == []
+
+
+def test_producer_mixed_merged_single_return_passes_download_gate() -> None:
+    plan = _scalar_plan(
+        _scalar_binding("output.statement_amount", "Amount Due", ".amt"),
+        _scalar_binding("output.statement_date", "Statement Date", ".dt"),
+    )
+    envelope = produce_covered_static_return_envelope(
+        _MIXED_DOWNLOAD_CODE,
+        plan=plan,
+        scalar_required_paths={"output.statement_amount", "output.statement_date"},
+        declaration_paths=set(),
+        download_required_paths={"output.downloaded_invoice_pdf"},
+        expects_download=True,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    assert '"downloaded_file_name": downloaded_file_name' in envelope.code
+    assert workflow_update_module._code_uses_expect_download(envelope.code)
+    artifact = {"claimed_outcomes": [{"id": "claim", "goal_value_paths": ["output.downloaded_invoice_pdf"]}]}
+    assert workflow_update_module._download_return_shape_error("block", artifact, envelope.code) is None
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths={"output.statement_amount", "output.statement_date"}
+    )
+    assert violations == []
+
+
+def test_producer_no_coverage_abstains() -> None:
+    plan = _scalar_plan(_scalar_binding("output.account_number", "Account Number", ".acct"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.account_number", "output.confirmation_number"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_output_passes_keyer_on_reduced_set() -> None:
+    plan = _scalar_plan(_scalar_binding("output.amount", "Amount", ".amt"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.amount"},
+        declaration_paths={"output.optional_note"},
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is not None
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths={"output.amount"}, declaration_paths={"output.optional_note"}
+    )
+    assert violations == []
+
+
+def test_producer_abstains_when_unbindable_judgment_path_kept_in_scalar_set() -> None:
+    plan = _scalar_plan(_scalar_binding("output.record_id", "Record Identifier", ".record-kv"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.record_id", "output.login_gate_blocks_target"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_emits_keyed_scalar_when_judgment_path_excluded() -> None:
+    plan = _scalar_plan(_scalar_binding("output.record_id", "Record Identifier", ".record-kv"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.record_id"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.keyed_paths == ("output.record_id",)
+    assert "login_gate_blocks_target" not in envelope.code
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert "output.record_id" in produced
+    assert "output.login_gate_blocks_target" not in produced
+
+
+def test_producer_branchy_return_abstains() -> None:
+    plan = _scalar_plan(_scalar_binding("output.amount", "Amount", ".amt"))
+    envelope = produce_covered_static_return_envelope(
+        'if await page.locator("#done").is_visible():\n    return {"output": {}}\n',
+        plan=plan,
+        scalar_required_paths={"output.amount"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_download_without_idiom_abstains() -> None:
+    plan = _scalar_plan(_scalar_binding("output.statement_amount", "Amount Due", ".amt"))
+    envelope = produce_covered_static_return_envelope(
+        _MIXED_DOWNLOAD_CODE,
+        plan=plan,
+        scalar_required_paths={"output.statement_amount"},
+        declaration_paths=set(),
+        download_required_paths={"output.downloaded_invoice_pdf"},
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_identifier_collision_abstains() -> None:
+    plan = _scalar_plan(_scalar_binding("output.amount", "Amount", ".amt"))
+    envelope = produce_covered_static_return_envelope(
+        '_envelope_value_0 = 1\nawait page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.amount"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_declaration_paths_are_none_defaults() -> None:
+    plan = _scalar_plan(_scalar_binding("output.amount", "Amount", ".amt"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.amount"},
+        declaration_paths={"output.optional_note"},
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is not None
+    assert '"optional_note": None' in envelope.code
+    assert "optional_note" not in envelope.code.split('"optional_note": None')[0]
+
+
+def test_producer_generated_code_raises_on_empty_scalar_text() -> None:
+    plan = _scalar_plan(_scalar_binding("output.amount", "Amount", ".amt"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.amount"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is not None
+    tree = ast.parse(envelope.code)
+    empty_guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and any(isinstance(child, ast.Raise) for child in node.body)
+    ]
+    assert empty_guards
+
+
+def _table_binding(output_path: str, column_index: int) -> LiveReadBinding:
+    return LiveReadBinding(
+        output_path=output_path,
+        kind=LiveReadKind.TABLE_COLUMN,
+        selector="#records",
+        selector_count=1,
+        selector_index=0,
+        row_selector="#records > tbody > tr",
+        row_count=2,
+        column_index=column_index,
+        relation_label=output_path.rsplit(".", 1)[-1],
+        headers=("Location", "Status"),
+        row_cell_counts=(2, 2),
+        row_identities=("Alpha Open", "Beta Closed"),
+    )
+
+
+def test_producer_table_column_emits_credited_list_literal_and_revalidates() -> None:
+    plan = _scalar_plan(
+        _table_binding("output.locations[].location", 0),
+        _table_binding("output.locations[].status", 1),
+    )
+    required = {"output.locations[].location", "output.locations[].status"}
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths=required,
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    assert "_envelope_records_0 = [{" in envelope.code
+    assert ".append(" not in envelope.code
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert required <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths=required
+    )
+    assert violations == []
+
+
+def test_producer_mixed_table_and_scalar_single_return_revalidates() -> None:
+    plan = _scalar_plan(
+        _scalar_binding("output.account_number", "Account Number", ".acct"),
+        _table_binding("output.locations[].location", 0),
+        _table_binding("output.locations[].status", 1),
+    )
+    required = {"output.account_number", "output.locations[].location", "output.locations[].status"}
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths=required,
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert required <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths=required
+    )
+    assert violations == []
+
+
+def test_producer_abstains_when_required_table_path_ungrounded() -> None:
+    plan = _scalar_plan(_table_binding("output.locations[].location", 0))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.locations[].location", "output.locations[].status"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_abstains_on_table_cell_variable_collision() -> None:
+    plan = _scalar_plan(_table_binding("output.locations[].location", 0))
+    envelope = produce_covered_static_return_envelope(
+        '_envelope_cell_0_0_0 = 1\nawait page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.locations[].location"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_table_with_sibling_declaration_emits_per_row_none_leaf() -> None:
+    plan = _scalar_plan(_table_binding("output.locations[].location", 0))
+    covered = {"output.locations[].location"}
+    declared = {"output.locations[].status"}
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths=covered,
+        declaration_paths=declared,
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert isinstance(envelope, ProducedStaticReturnEnvelope)
+    assert envelope.code.count("return {") == 1
+    assert '"status": None' in envelope.code
+    produced = workflow_update_module._code_block_produced_output_paths(envelope.code)
+    assert (covered | declared) <= produced
+    _, violations = workflow_update_module._extraction_code_with_required_static_return(
+        envelope.code, required_paths=covered, declaration_paths=declared
+    )
+    assert violations == []
+
+
+def test_producer_abstains_on_array_declaration_without_matching_table_group() -> None:
+    plan = _scalar_plan(_scalar_binding("output.account_number", "Account Number", ".acct"))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.account_number"},
+        declaration_paths={"output.locations[].status"},
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_producer_abstains_on_nested_array_table_path() -> None:
+    plan = _scalar_plan(_table_binding("output.groups[].members[].name", 0))
+    envelope = produce_covered_static_return_envelope(
+        'await page.locator("#lookup").click()\n',
+        plan=plan,
+        scalar_required_paths={"output.groups[].members[].name"},
+        declaration_paths=set(),
+        download_required_paths=set(),
+        expects_download=False,
+    )
+    assert envelope is None
+
+
+def test_produce_split_extraction_envelope_mixed_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = SimpleNamespace(
+        reached_download_target=SimpleNamespace(selector="#download-invoice"),
+        scouted_output_covered_paths={"output.statement_amount"},
+    )
+    monkeypatch.setattr(
+        workflow_update_module,
+        "download_satisfied_requested_output_paths",
+        lambda _ctx: {"output.downloaded_invoice_pdf"},
+    )
+    result = workflow_update_module._produce_split_extraction_envelope(
+        ctx,
+        'value = "x"\n',
+        required_paths={"output.statement_amount", "output.downloaded_invoice_pdf"},
+        declaration_paths=set(),
+        label="extract_block",
+        signature="sig",
+    )
+    assert result is None
+
+
+def _download_classification_ctx(
+    *criteria: CompletionCriterion,
+    covered_paths: set[str] | None = None,
+    download_selector: str | None = "#download-invoice",
+) -> SimpleNamespace:
+    download = (
+        ReachedDownloadTarget(
+            selector=download_selector,
+            affordance_text="Download Invoice",
+            download_kind="attribute",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        if download_selector
+        else None
+    )
+    return SimpleNamespace(
+        completion_criteria_turn_state=SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria))),
+        last_code_authoring_repair_context=None,
+        scouted_output_covered_paths=set(covered_paths or set()),
+        reached_download_target=download,
+        flow_evidence=[],
+    )
+
+
+def test_uncovered_scalar_path_is_not_classified_as_a_download_path() -> None:
+    ctx = _download_classification_ctx(
+        CompletionCriterion(
+            id="statement_amount",
+            outcome="The returned record includes the statement amount.",
+            output_path="output.statement_amount",
+        ),
+        covered_paths=set(),
+    )
+
+    assert enforcement_module.download_satisfied_requested_output_paths(ctx) == set()
+    assert enforcement_module.uncovered_requested_output_paths(ctx) == {"output.statement_amount"}
+    assert (
+        workflow_update_module._impose_covered_static_return_envelope(
+            ctx,
+            parsed={},
+            workflow_yaml="",
+            raw_code_artifact_metadata=[],
+            label="download_block",
+            target_code=_MIXED_DOWNLOAD_CODE,
+            observation_paths={"output.statement_amount"},
+            declaration_paths=set(),
+            source="scout",
+            reason_code="reason",
+            signature="sig",
+            runtime_attempt_key="key",
+        )
+        is None
+    )
+
+
+def test_declared_registered_download_kind_on_uncovered_custom_path_is_a_download_path() -> None:
+    ctx = _download_classification_ctx(
+        CompletionCriterion(
+            id="downloaded_invoice_pdf",
+            outcome="The returned record includes the downloaded invoice pdf.",
+            output_path="output.downloaded_invoice_pdf",
+            declared_deliverable_kind="registered_download",
+        ),
+        covered_paths=set(),
+    )
+
+    assert enforcement_module.download_satisfied_requested_output_paths(ctx) == {"output.downloaded_invoice_pdf"}
+    assert enforcement_module.uncovered_requested_output_paths(ctx) == set()
+
+
+def test_declared_registered_download_kind_on_scout_covered_path_is_not_a_download_path() -> None:
+    ctx = _download_classification_ctx(
+        CompletionCriterion(
+            id="npi",
+            outcome="The returned record includes NPI.",
+            output_path="output.npi",
+            declared_deliverable_kind="registered_download",
+        ),
+        CompletionCriterion(
+            id="downloaded_invoice_pdf",
+            outcome="The returned record includes the downloaded invoice pdf.",
+            output_path="output.downloaded_invoice_pdf",
+            declared_deliverable_kind="registered_download",
+        ),
+        covered_paths={"output.npi"},
+    )
+
+    assert enforcement_module.download_satisfied_requested_output_paths(ctx) == {"output.downloaded_invoice_pdf"}
+
+
+def test_declared_registered_download_kind_survives_requested_output_canonicalization() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="download",
+                outcome="The workflow downloads the invoice file.",
+                output_path="output.downloaded_invoice_pdf",
+                deliverable_kind="registered_download",
+                declared_deliverable_kind="registered_download",
+            )
+        ]
+    )
+
+    request_policy_module._apply_requested_output_completion_criteria(
+        policy, "return the downloaded_invoice_pdf when you are done"
+    )
+
+    canonical = {criterion.output_path: criterion for criterion in policy.completion_criteria if criterion.output_path}
+    criterion = canonical["output.downloaded_invoice_pdf"]
+    assert criterion.declared_deliverable_kind == "registered_download"
+    assert criterion.deliverable_kind is None
+
+
+def test_split_seam_declaration_path_is_none_defaulted_not_live_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = _scalar_plan(
+        _scalar_binding("output.amount", "Amount", ".amt"),
+        _scalar_binding("output.optional_note", "Optional Note", ".note"),
+    )
+    monkeypatch.setattr(workflow_update_module, "download_satisfied_requested_output_paths", lambda _ctx: set())
+    monkeypatch.setattr(workflow_update_module, "requested_scalar_output_extraction_plan", lambda _ctx: plan)
+
+    produced = workflow_update_module._produce_split_extraction_envelope(
+        SimpleNamespace(),
+        'await page.locator("#lookup").click()\n',
+        required_paths={"output.amount", "output.optional_note"},
+        declaration_paths={"output.optional_note"},
+        label="extract_block",
+        signature="sig",
+    )
+
+    assert produced is not None
+    assert '"optional_note": None' in produced
+    assert ".note" not in produced
+    assert "Optional Note" not in produced
+
+
+def test_producer_abstains_when_terminal_return_shares_a_line() -> None:
+    plan = _scalar_plan(_scalar_binding("output.statement_amount", "Amount Due", ".amt"))
+    code = (
+        "async with page.expect_download() as dl_info:\n"
+        '    await page.locator("#download-invoice").click()\n'
+        "dl_info_file = await dl_info.value\n"
+        'name = dl_info_file.suggested_filename; return {"downloaded_file_name": name}\n'
+    )
+
+    envelope = produce_covered_static_return_envelope(
+        code,
+        plan=plan,
+        scalar_required_paths={"output.statement_amount"},
+        declaration_paths=set(),
+        download_required_paths={"output.downloaded_invoice_pdf"},
+        expects_download=True,
+    )
+
+    assert envelope is None
+
+
+def test_producer_preserves_the_models_download_descriptor_key() -> None:
+    plan = _scalar_plan(_scalar_binding("output.statement_amount", "Amount Due", ".amt"))
+    code = (
+        "async with page.expect_download() as dl_info:\n"
+        '    await page.locator("#download-invoice").click()\n'
+        'return {"saved_as": dl_info.value.suggested_filename}\n'
+    )
+
+    envelope = produce_covered_static_return_envelope(
+        code,
+        plan=plan,
+        scalar_required_paths={"output.statement_amount"},
+        declaration_paths=set(),
+        download_required_paths={"output.downloaded_invoice_pdf"},
+        expects_download=True,
+    )
+
+    assert envelope is not None
+    assert envelope.code.count("return {") == 1
+    assert '"saved_as": dl_info.value.suggested_filename' in envelope.code
+    assert "downloaded_file_name" not in envelope.code
+    artifact = {"claimed_outcomes": [{"id": "claim", "goal_value_paths": ["output.downloaded_invoice_pdf"]}]}
+    assert workflow_update_module._download_return_shape_error("block", artifact, envelope.code) is None
+    assert {"output.statement_amount"} <= workflow_update_module._code_block_produced_output_paths(envelope.code)

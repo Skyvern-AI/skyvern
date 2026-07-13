@@ -215,6 +215,7 @@ class TaskV2Request(BaseModel):
     totp_identifier: str | None = None
     proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
+    generate_script: bool | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None

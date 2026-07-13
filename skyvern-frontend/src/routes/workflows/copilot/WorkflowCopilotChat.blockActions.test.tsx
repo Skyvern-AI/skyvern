@@ -426,7 +426,9 @@ describe("WorkflowCopilotChat — recorded-action fetch wiring", () => {
     fireEvent.click(
       within(statusRegion).getByRole("button", { expanded: false }),
     );
-    fireEvent.click(within(statusRegion).getByText("block_1"));
+    // uxV1 is on by default in this file, so the row's primary text is the
+    // humanized label ("block_1" -> "Block 1"), not the raw block label.
+    fireEvent.click(within(statusRegion).getByText("Block 1"));
 
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
   });

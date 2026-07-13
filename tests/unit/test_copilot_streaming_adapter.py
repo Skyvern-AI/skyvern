@@ -523,12 +523,80 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
     assert tool_results[0].summary == signal.user_facing_reason
     assert tool_results[0].detail == signal.user_facing_reason
     assert "Do NOT" not in tool_results[0].summary
+    # tool_error blocker signals are genuine failures (something ran out of budget/broke,
+    # not a precondition redirect) and must keep their failure affect.
+    assert tool_results[0].success is False
 
     activity = ctx.narrator_state.design_activity
     assert len(activity) == 2
     assert activity[-1]["kind"] == "tool_result"
     assert activity[-1]["text"] == signal.user_facing_reason
     assert "Do NOT" not in activity[-1]["text"]
+    assert activity[-1]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_tool_result_sse_success_true_for_phase_gated_precondition() -> None:
+    """A precondition redirect (agent tried a tool before its build phase allowed it)
+    was never a real failure — it must not render with error affect."""
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="phase_gated",
+        agent_steering_text=(
+            "Direct browser tools are not callable before composition. "
+            "Call discover_workflow_entrypoint to resolve the entrypoint URL."
+        ),
+        user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
+        recovery_hint="ask_user_clarifying",
+        cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
+        internal_reason_code="build_phase_browser_blocked_pre_compose",
+        blocked_tool="evaluate",
+    )
+
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": "evaluate", "arguments": "{}"}
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": "evaluate"}
+    out_item.output = [{"type": "text", "text": json.dumps({"ok": False, "error": signal.agent_steering_text})}]
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace(
+        latest_tool_blocker_signal=signal,
+        tool_blocker_signals=[signal],
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    assert tool_results[0].summary == signal.user_facing_reason
+    assert tool_results[0].success is True
+
+    activity = ctx.narrator_state.design_activity
+    assert activity[-1]["kind"] == "tool_result"
+    assert activity[-1]["success"] is True
 
 
 @pytest.mark.asyncio
@@ -1234,9 +1302,7 @@ async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) ->
 
 @pytest.mark.asyncio
 async def test_stream_emits_detail_for_failure() -> None:
-    long_error = "Workflow validation failed: " + (
-        "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
-    )
+    long_error = "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
     payload = await _capture_tool_result(
         "update_workflow",
         {"ok": False, "error": long_error},
@@ -1247,6 +1313,21 @@ async def test_stream_emits_detail_for_failure() -> None:
     # `summary` is the visible bullet, capped tighter than `detail` (the
     # tooltip-grade text) — strictly longer detail is the contract.
     assert len(payload.detail) > len(payload.summary)
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_generic_detail_for_internal_validation_failure() -> None:
+    """The tooltip-grade detail must not leak raw internal validator text either —
+    only the visible summary was sanitized before this regression test was added."""
+    long_error = "Workflow validation failed: " + (
+        "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
+    )
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": False, "error": long_error},
+    )
+    assert payload.detail == "Couldn't complete that step."
+    assert "navigation_goal" not in payload.detail
 
 
 @pytest.mark.asyncio
