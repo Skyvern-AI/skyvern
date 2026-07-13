@@ -26,7 +26,11 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
+    RecordingKeyboard,
+    RecordingLocator,
     RecordingPage,
+    _Recorder,
+    json_safe_recorder_output,
     user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
@@ -858,3 +862,73 @@ async def test_persisted_actions_never_contain_secret_values(monkeypatch: pytest
     assert actions
     dumped = json.dumps([a.model_dump(mode="json") for a in actions])
     assert secret not in dumped
+
+
+def test_json_safe_recorder_output_normalizes_leaked_locator_wrappers() -> None:
+    """SKY-12272: a leaked recorder proxy in a code block's output must collapse to a JSON-safe
+    marker, never a raw proxy that raises TypeError at the registration boundary."""
+    recorder = _Recorder(None)
+    locator = RecordingLocator(FakeLocator(), recorder, "#invoice-link")
+    keyboard = RecordingKeyboard(SimpleNamespace(), recorder)
+
+    result = {
+        "link": locator,
+        "name": "Invoice_2026.pdf",
+        "rows": [locator, {"nested": locator}],
+        "kb": keyboard,
+    }
+
+    safe = json_safe_recorder_output(result)
+
+    # The whole point: serializes with NO default= fallback. A raw wrapper raises TypeError here.
+    json.dumps(safe)
+    assert safe["name"] == "Invoice_2026.pdf"  # sibling field never starved
+    assert safe["link"] == "<RecordingLocator>"  # leaked locator -> type marker, not its selector
+    assert safe["rows"][0] == "<RecordingLocator>"  # nested inside a list
+    assert safe["rows"][1]["nested"] == "<RecordingLocator>"  # nested inside a dict
+    assert safe["kb"] == "<RecordingKeyboard>"  # non-locator proxy -> its own marker
+
+
+def test_json_safe_recorder_output_normalizes_leaked_locator_used_as_key() -> None:
+    """json.dumps rejects a non-primitive mapping key outright (default= is never consulted for
+    keys), so a leaked proxy key must be normalized too, not just values."""
+    locator = RecordingLocator(FakeLocator(), _Recorder(None), "#doc")
+    safe = json_safe_recorder_output({locator: "delivered"})
+    json.dumps(safe)  # a raw locator key raises TypeError: keys must be str/int/float/bool/None
+    assert safe == {"<RecordingLocator>": "delivered"}
+
+
+def test_json_safe_recorder_output_never_leaks_a_secret_bearing_selector() -> None:
+    """A resolved credential can end up in a locator selector; mask_secrets_in_data scrubs dict
+    values, not keys, so the marker must not carry the selector at all — as a value or a key."""
+    secret = "s3cr3t-token"
+    recorder = _Recorder(None)
+    as_value = RecordingLocator(FakeLocator(), recorder, f"text={secret}")
+    as_key = RecordingLocator(FakeLocator(), recorder, f"#{secret}")
+
+    safe = json_safe_recorder_output({"field": as_value, as_key: "delivered"})
+
+    assert secret not in json.dumps(safe)
+
+
+def test_json_safe_recorder_output_passes_through_plain_data() -> None:
+    payload = {"a": 1, "b": ["x", {"c": True, "d": None}], "e": 3.5}
+    assert json_safe_recorder_output(payload) == payload
+
+
+@pytest.mark.asyncio
+async def test_code_block_output_registers_leaked_locator_as_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-12272 end-to-end: a code block that leaves a locator in a local variable registers a
+    JSON-safe output (selector string), and sibling fields survive rather than dropping the payload."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("link = page.locator('#invoice-link')\nname = 'Invoice_2026.pdf'", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    assert result.output_parameter_value is not None
+    json.dumps(result.output_parameter_value)  # registration payload is JSON-safe
+    assert result.output_parameter_value["name"] == "Invoice_2026.pdf"  # sibling preserved
+    assert result.output_parameter_value["link"] == "<RecordingLocator>"  # locator normalized, not a raw proxy
