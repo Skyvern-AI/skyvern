@@ -444,6 +444,8 @@ const resultEntry = (node, tag) => {
 	      cells: Array.from(row.querySelectorAll(':scope > th, :scope > td')).slice(0, MAX_TABLE_HEADERS).map((cell, columnIndex) => ({
 	        column_index: columnIndex,
 	        visible: elementVisible(cell),
+	        has_text: !!nodeText(cell),
+	        text: nodeText(cell),
 	      })),
 	    }));
 	    const sampleRows = rows.map((r) => Array.from(r.children || []).map((c) => nodeText(c)).filter(Boolean).join(' ') || nodeText(r)).filter(resultRowTextIsContent).slice(0, MAX_RESULT_SAMPLE_ROWS);
@@ -483,7 +485,7 @@ for (const node of all) {
   let position = -1;
   try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
   if (position < 0) continue;
-  keyValueRelations.push({ key_text: keyText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
+  keyValueRelations.push({ key_text: keyText, value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
 }
 
 const challengeControls = [];

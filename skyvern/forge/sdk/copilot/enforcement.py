@@ -57,7 +57,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
-from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, interactive_challenge_controls
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -98,6 +98,7 @@ from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisorySta
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RequestedOutputExtractionPlan,
     derive_requested_output_extraction_plan,
+    resolve_shape_expectations_by_path,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
     completion_criterion_requires_browser_fill_delivery,
@@ -118,7 +119,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.result_evidence import (
     COVERAGE_TOKEN_RE,
+    ScoutObservationContract,
     covered_output_paths_in_result_containers,
+    mint_scout_observation_contract,
+    scout_observation_bound_paths,
 )
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
@@ -2262,6 +2266,9 @@ def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
     return synthesized_persistence_reopened_after_failed_run(ctx)
 
 
+# Intentionally distinct from request_policy._OUTPUT_GENERIC_WORDS: this list filters output-path leaf
+# tokens for coverage token matching, so it keeps phrase words the other list drops. Not unified — the
+# consumers differ.
 _COVERAGE_GENERIC_TOKENS = frozenset(
     {
         "output",
@@ -2370,15 +2377,21 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
-def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, ...]]:
     requested_paths = _requested_output_paths_for_ctx(ctx)
-    if not requested_paths:
-        return None
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
         if criterion.output_path in requested_paths and criterion.outcome.strip():
             labels_by_path.setdefault(criterion.output_path, ())
             labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+    return labels_by_path
+
+
+def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    if not requested_paths:
+        return None
+    labels_by_path = _requested_output_labels_by_path(ctx)
     if set(labels_by_path) != requested_paths:
         return None
     return derive_requested_output_extraction_plan(
@@ -2410,31 +2423,73 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
 def requested_output_extraction_plan_changed(ctx: AgentContext, current: RequestedOutputExtractionPlan | None) -> bool:
     if current is None or len(ctx.flow_evidence) < 2:
         return False
-    labels_by_path: dict[str, tuple[str, ...]] = {}
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    for criterion in _pre_run_gated_completion_criteria(ctx):
-        if criterion.output_path in requested_paths and criterion.outcome.strip():
-            labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
     previous = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence[:-1],
-        labels_by_path=labels_by_path,
+        labels_by_path=_requested_output_labels_by_path(ctx),
     )
     return previous is not None and previous.identity != current.identity
 
 
-def record_scouted_output_coverage(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
-    coverage_tokens = _requested_output_coverage_tokens(ctx)
-    if not coverage_tokens:
+def mint_scout_observation_contract_for_ctx(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any],
+    *,
+    url: str,
+) -> ScoutObservationContract | None:
+    labels_by_path = _requested_output_labels_by_path(ctx)
+    if not labels_by_path:
+        return None
+    copilot_config = getattr(ctx, "copilot_config", None)
+    shape_registry = copilot_config.requested_output_shape_expectations if copilot_config is not None else None
+    shape_expectations_by_path = resolve_shape_expectations_by_path(set(labels_by_path), shape_registry)
+    return mint_scout_observation_contract(
+        page_evidence,
+        labels_by_path=labels_by_path,
+        url=url,
+        has_bounded_page_schema=has_bounded_page_schema(page_evidence),
+        shape_expectations_by_path=shape_expectations_by_path or None,
+    )
+
+
+def record_scouted_output_coverage(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any],
+    *,
+    contract: ScoutObservationContract | None = None,
+    include_lexical: bool = True,
+) -> None:
+    lexical_covered: set[str] = set()
+    if include_lexical:
+        coverage_tokens = _requested_output_coverage_tokens(ctx)
+        if coverage_tokens:
+            lexical_covered = covered_output_paths_in_result_containers(
+                page_evidence.get("result_containers"), coverage_tokens
+            )
+    contract_covered: set[str] = set()
+    bound_paths = scout_observation_bound_paths(contract)
+    if bound_paths:
+        contract_covered = bound_paths & _requested_output_paths_for_ctx(ctx)
+    candidate = lexical_covered | contract_covered
+    if not candidate:
         return
-    newly_covered = covered_output_paths_in_result_containers(page_evidence.get("result_containers"), coverage_tokens)
+    newly_covered = candidate - ctx.scouted_output_covered_paths
     if not newly_covered:
         return
     ctx.scouted_output_covered_paths.update(newly_covered)
+    value_grounded = newly_covered & contract_covered
+    lexical_new = newly_covered & lexical_covered
+    if value_grounded and lexical_new:
+        provenance = "both"
+    elif value_grounded:
+        provenance = "value_grounded"
+    else:
+        provenance = "lexical"
     LOG.info(
         "copilot_scouted_output_coverage_credited",
         newly_covered_paths=sorted(newly_covered),
-        source_url=page_evidence.get("current_url") or "",
+        provenance=provenance,
+        value_grounded_paths=sorted(value_grounded),
+        source_url=page_evidence.get("current_url") or (contract.source_url if contract is not None else "") or "",
     )
 
 

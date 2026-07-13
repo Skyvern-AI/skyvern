@@ -788,6 +788,7 @@ async def _evaluate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    ctx.scout_observation_contract = None
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
         _reset_evaluate_tracker(ctx)
