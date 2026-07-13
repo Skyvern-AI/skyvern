@@ -72,7 +72,9 @@ async def test_jinja_rendered_prompt_condition_keeps_browser_session() -> None:
     evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"Single_or_Joint__c": "Joint"})  # type: ignore[method-assign]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal") as mock_prompt,
+        patch(
+            "skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"
+        ) as mock_prompt,
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -115,7 +117,9 @@ async def test_pure_natlang_prompt_condition_uses_browser_session_and_context() 
     evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"plan": "premium"})  # type: ignore[method-assign]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal") as mock_prompt,
+        patch(
+            "skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"
+        ) as mock_prompt,
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -378,7 +382,9 @@ async def test_empty_param_produces_explicit_marker_in_prompt_evaluation() -> No
     evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={"test_parameter": ""})  # type: ignore[method-assign]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal") as mock_prompt,
+        patch(
+            "skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"
+        ) as mock_prompt,
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -433,7 +439,7 @@ async def test_extraction_failure_with_none_reason_produces_informative_error() 
     evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -466,7 +472,7 @@ async def test_extraction_failure_with_reason_preserves_original_message() -> No
     evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -515,7 +521,7 @@ async def test_extra_placeholder_evals_recovered_when_well_formed_subset_matches
     ]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -554,7 +560,7 @@ async def test_extra_evals_not_recovered_when_well_formed_count_does_not_match()
     ]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -597,7 +603,7 @@ async def test_extra_placeholder_evals_multi_branch_preserves_order() -> None:
     ]
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -669,7 +675,7 @@ async def test_condition_index_alignment_is_order_independent() -> None:
         {"condition_index": 1, "reasoning": "A", "result": False},
     ]
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -701,7 +707,7 @@ async def test_hallucinated_unindexed_entry_does_not_misroute() -> None:
         {"condition_index": 2, "reasoning": "B", "result": True},
     ]
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -736,7 +742,7 @@ async def test_under_return_retries_then_succeeds() -> None:
         ],
     )
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -764,7 +770,7 @@ async def test_under_return_fails_loudly_after_retries_exhausted() -> None:
 
     bad = _extraction_result(block.output_parameter, [{"condition_index": 1, "reasoning": "A", "result": False}])
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -799,7 +805,7 @@ async def test_retry_varies_extraction_goal_for_true_reroll() -> None:
         ],
     )
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -835,7 +841,7 @@ async def test_branch_eval_schema_is_strict_and_indexed() -> None:
         ],
     )
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -890,7 +896,7 @@ async def test_string_condition_index_out_of_order_aligns_by_index() -> None:
         {"condition_index": "1", "reasoning": "A", "result": False},
     ]
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
@@ -920,7 +926,7 @@ async def test_float_condition_index_out_of_order_aligns_by_index() -> None:
         {"condition_index": 1.0, "reasoning": "A", "result": False},
     ]
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.branching.prompt_engine.load_prompt", return_value="goal"),
         patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
     ):
         mock_extraction = MagicMock()
