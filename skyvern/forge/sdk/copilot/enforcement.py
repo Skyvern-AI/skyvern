@@ -40,7 +40,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_c
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     LIVE_SCOUT_CREDENTIAL_FIELDS,
-    SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+    ObligationFinding,
     credential_scout_gap,
     first_matched_post_fill_submit_index,
     freeze_requested_output_extraction_candidate,
@@ -48,16 +48,20 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
     missing_rung_text,
+    obligation_finding_reason_code,
+    obligation_finding_selector,
     render_missing_rung_call_sources,
+    render_obligation_findings,
     render_synthesized_offer_text,
+    spine_partition_findings,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
     trajectory_has_browser_fill_interaction,
-    uncovered_required_emitted_interactions,
+    uncovered_rung_records,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
-from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, interactive_challenge_controls
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -98,6 +102,7 @@ from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisorySta
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RequestedOutputExtractionPlan,
     derive_requested_output_extraction_plan,
+    resolve_shape_expectations_by_path,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
     completion_criterion_requires_browser_fill_delivery,
@@ -118,7 +123,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.result_evidence import (
     COVERAGE_TOKEN_RE,
+    ScoutObservationContract,
     covered_output_paths_in_result_containers,
+    mint_scout_observation_contract,
+    scout_observation_bound_paths,
 )
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
@@ -470,9 +478,10 @@ _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_p
 _SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL = "persisted_draft"
 
 
-def _scouted_spine_open_obligation(ctx: AgentContext) -> list[Mapping[str, Any]]:
-    """Required scouted rungs the latest persisted draft leaves uncovered; empty when no in-turn
-    persist exists or coverage holds."""
+def _scouted_spine_open_obligation(ctx: AgentContext) -> list[ObligationFinding]:
+    """Partition-exhaustiveness findings the latest persisted draft leaves open — uncovered required
+    rungs, dropped interactions the allowlist does not forgive, retained indices in no lane, and
+    truncation; empty when no in-turn persist exists or the full manifest is accounted for."""
     persisted_calls = ctx.persisted_draft_browser_calls
     if persisted_calls is None:
         return []
@@ -492,15 +501,20 @@ def _scouted_spine_open_obligation(ctx: AgentContext) -> list[Mapping[str, Any]]
     )
     if synthesized is None:
         return []
-    return uncovered_required_emitted_interactions(synthesized.diagnostics.emitted_interactions, persisted_calls)
+    return spine_partition_findings(synthesized.diagnostics, persisted_calls, trajectory)
 
 
-def _log_scouted_spine_unresolved(uncovered: list[Mapping[str, Any]], *, site: str) -> None:
+def _scouted_spine_missing_text(findings: list[ObligationFinding]) -> str:
+    uncovered = uncovered_rung_records(findings)
+    return missing_rung_text(uncovered) if uncovered else render_obligation_findings(findings)
+
+
+def _log_scouted_spine_unresolved(findings: list[ObligationFinding], *, site: str) -> None:
     LOG.info(
         "copilot_scouted_spine_under_build_unresolved",
         site=site,
-        missing_rung_count=len(uncovered),
-        missing_rungs=missing_rung_text(uncovered),
+        missing_rung_count=len(uncovered_rung_records(findings)),
+        missing_rungs=_scouted_spine_missing_text(findings),
     )
 
 
@@ -514,46 +528,50 @@ SCOUTED_SPINE_TURN_HALT_USER_REASON = (
 def log_scouted_spine_unresolved_at_turn_halt(ctx: AgentContext) -> bool:
     """Log-only and never raises: a failed obligation read must not block rendering the halt reply."""
     try:
-        uncovered = _scouted_spine_open_obligation(ctx)
+        findings = _scouted_spine_open_obligation(ctx)
     except Exception:
         LOG.warning("copilot_scouted_spine_turn_halt_check_failed", exc_info=True)
         return False
-    if not uncovered:
+    if not findings:
         return False
-    _log_scouted_spine_unresolved(uncovered, site="turn_halt")
+    _log_scouted_spine_unresolved(findings, site="turn_halt")
     return True
 
 
 def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
     try:
-        uncovered = _scouted_spine_open_obligation(ctx)
+        findings = _scouted_spine_open_obligation(ctx)
     except Exception:
         LOG.warning("copilot_scouted_spine_turn_end_check_failed", exc_info=True)
         return None
-    if not uncovered:
+    if not findings:
         return None
     if ctx.scouted_spine_checkpoint_fired:
-        _log_scouted_spine_unresolved(uncovered, site="turn_end")
+        _log_scouted_spine_unresolved(findings, site="turn_end")
         return None
     ctx.scouted_spine_checkpoint_fired = True
+    first = findings[0]
+    reason_code = obligation_finding_reason_code(first)
     repair_context = CodeAuthoringRepairContext(
         block_label=_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL,
-        reason_code=SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
-        selector=str(uncovered[0].get("selector") or "") or None,
+        reason_code=reason_code,
+        selector=obligation_finding_selector(first),
     )
     ctx.last_code_authoring_repair_context = repair_context
     record_build_test_outcome(ctx, recorded_outcome_from_authoring_repair_context(repair_context))
     _record_code_authoring_guardrail_reject(ctx)
-    missing_text = missing_rung_text(uncovered)
+    uncovered = uncovered_rung_records(findings)
+    missing_text = _scouted_spine_missing_text(findings)
     LOG.info(
         "copilot_scouted_spine_under_build",
         block_label=_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL,
         site="turn_end",
+        reason_code=reason_code,
         missing_rung_count=len(uncovered),
         missing_rungs=missing_text,
     )
     nudge = (
-        f"The persisted draft under-builds the scouted spine ({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): "
+        f"The persisted draft under-builds the scouted spine ({reason_code}): "
         f"missing rung(s): {missing_text}. Resubmit the code block through update_workflow so every scouted "
         "rung is replayed — reuse the synthesized code block verbatim."
     )
@@ -2262,6 +2280,9 @@ def synthesized_persistence_reopened(ctx: AgentContext) -> bool:
     return synthesized_persistence_reopened_after_failed_run(ctx)
 
 
+# Intentionally distinct from request_policy._OUTPUT_GENERIC_WORDS: this list filters output-path leaf
+# tokens for coverage token matching, so it keeps phrase words the other list drops. Not unified — the
+# consumers differ.
 _COVERAGE_GENERIC_TOKENS = frozenset(
     {
         "output",
@@ -2370,15 +2391,21 @@ def uncovered_requested_output_paths(ctx: AgentContext) -> set[str]:
     return {path for path in requested if path not in covered and tokens_by_path.get(path)}
 
 
-def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, ...]]:
     requested_paths = _requested_output_paths_for_ctx(ctx)
-    if not requested_paths:
-        return None
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
         if criterion.output_path in requested_paths and criterion.outcome.strip():
             labels_by_path.setdefault(criterion.output_path, ())
             labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+    return labels_by_path
+
+
+def requested_output_extraction_plan(ctx: AgentContext) -> RequestedOutputExtractionPlan | None:
+    requested_paths = _requested_output_paths_for_ctx(ctx)
+    if not requested_paths:
+        return None
+    labels_by_path = _requested_output_labels_by_path(ctx)
     if set(labels_by_path) != requested_paths:
         return None
     return derive_requested_output_extraction_plan(
@@ -2410,31 +2437,73 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
 def requested_output_extraction_plan_changed(ctx: AgentContext, current: RequestedOutputExtractionPlan | None) -> bool:
     if current is None or len(ctx.flow_evidence) < 2:
         return False
-    labels_by_path: dict[str, tuple[str, ...]] = {}
-    requested_paths = _requested_output_paths_for_ctx(ctx)
-    for criterion in _pre_run_gated_completion_criteria(ctx):
-        if criterion.output_path in requested_paths and criterion.outcome.strip():
-            labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
     previous = derive_requested_output_extraction_plan(
         flow_evidence=ctx.flow_evidence[:-1],
-        labels_by_path=labels_by_path,
+        labels_by_path=_requested_output_labels_by_path(ctx),
     )
     return previous is not None and previous.identity != current.identity
 
 
-def record_scouted_output_coverage(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
-    coverage_tokens = _requested_output_coverage_tokens(ctx)
-    if not coverage_tokens:
+def mint_scout_observation_contract_for_ctx(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any],
+    *,
+    url: str,
+) -> ScoutObservationContract | None:
+    labels_by_path = _requested_output_labels_by_path(ctx)
+    if not labels_by_path:
+        return None
+    copilot_config = getattr(ctx, "copilot_config", None)
+    shape_registry = copilot_config.requested_output_shape_expectations if copilot_config is not None else None
+    shape_expectations_by_path = resolve_shape_expectations_by_path(set(labels_by_path), shape_registry)
+    return mint_scout_observation_contract(
+        page_evidence,
+        labels_by_path=labels_by_path,
+        url=url,
+        has_bounded_page_schema=has_bounded_page_schema(page_evidence),
+        shape_expectations_by_path=shape_expectations_by_path or None,
+    )
+
+
+def record_scouted_output_coverage(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any],
+    *,
+    contract: ScoutObservationContract | None = None,
+    include_lexical: bool = True,
+) -> None:
+    lexical_covered: set[str] = set()
+    if include_lexical:
+        coverage_tokens = _requested_output_coverage_tokens(ctx)
+        if coverage_tokens:
+            lexical_covered = covered_output_paths_in_result_containers(
+                page_evidence.get("result_containers"), coverage_tokens
+            )
+    contract_covered: set[str] = set()
+    bound_paths = scout_observation_bound_paths(contract)
+    if bound_paths:
+        contract_covered = bound_paths & _requested_output_paths_for_ctx(ctx)
+    candidate = lexical_covered | contract_covered
+    if not candidate:
         return
-    newly_covered = covered_output_paths_in_result_containers(page_evidence.get("result_containers"), coverage_tokens)
+    newly_covered = candidate - ctx.scouted_output_covered_paths
     if not newly_covered:
         return
     ctx.scouted_output_covered_paths.update(newly_covered)
+    value_grounded = newly_covered & contract_covered
+    lexical_new = newly_covered & lexical_covered
+    if value_grounded and lexical_new:
+        provenance = "both"
+    elif value_grounded:
+        provenance = "value_grounded"
+    else:
+        provenance = "lexical"
     LOG.info(
         "copilot_scouted_output_coverage_credited",
         newly_covered_paths=sorted(newly_covered),
-        source_url=page_evidence.get("current_url") or "",
+        provenance=provenance,
+        value_grounded_paths=sorted(value_grounded),
+        source_url=page_evidence.get("current_url") or (contract.source_url if contract is not None else "") or "",
     )
 
 

@@ -53,18 +53,24 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    _BARE_TAG_RE,
     _CODE_SUBMIT_ACTION_RE,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
+    SCOUTED_SPINE_TRUNCATED_REASON_CODE,
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+    SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE,
+    UNCOVERED_RUNG_FINDING,
+    ObligationFinding,
     SynthesisDiagnostics,
     SynthesizedCodeBlock,
+    _bare_drop_superseded_on_screen,
     _credential_field_accesses,
     _get_by_role_expr_strict,
+    _is_ignorable_entry_opener_drop,
     _is_positional_selector,
-    _parse_role_name,
+    _selector_refines,
     artifact_dependency_id,
     artifact_observation_ref_id,
     credential_scout_gap,
@@ -72,11 +78,16 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
+    obligation_finding_reason_code,
+    obligation_finding_selector,
     produce_covered_static_return_envelope,
     render_missing_rung_call_sources,
+    render_obligation_findings,
+    spine_partition_findings,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
     uncovered_required_emitted_interactions,
+    uncovered_rung_records,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
@@ -5434,6 +5445,7 @@ class _SynthesizedCodeImpositionResult:
     repair_context: CodeAuthoringRepairContext | None = None
     scrubbed_selected_metadata_label: str | None = None
     selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
+    minted_parameter_keys: list[str] = dataclass_field(default_factory=list)
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -5849,15 +5861,18 @@ def _stale_spine_rung_provenance(
     return provenance
 
 
-def _draft_leaves_scouted_rungs_uncovered(
-    code_blocks: list[dict[str, Any]], *, synthesized: SynthesizedCodeBlock
+def _draft_leaves_scouted_partition_open(
+    code_blocks: list[dict[str, Any]],
+    *,
+    synthesized: SynthesizedCodeBlock,
+    scout_trajectory: list[ScoutedInteraction],
 ) -> bool:
     draft_calls = [
         (mutation.method, mutation.receiver)
         for block in code_blocks
         for mutation in _browser_surface_for_code(str(block.get("code") or ""))[0]
     ]
-    return bool(uncovered_required_emitted_interactions(synthesized.diagnostics.emitted_interactions, draft_calls))
+    return bool(spine_partition_findings(synthesized.diagnostics, draft_calls, scout_trajectory))
 
 
 def _code_block_browser_actions(block: Mapping[str, Any]) -> list[str]:
@@ -5906,7 +5921,24 @@ def _drop_stale_spine_rung_blocks(
     carrier_label: str,
     provenance: list[_BrowserSurfaceRejectionProvenance],
 ) -> _StaleSpineRungReplacement:
-    undroppable = [block for block in stale_rungs if _code_block_output_is_referenced(parsed, block)]
+    definition = parsed.get("workflow_definition")
+    all_blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    surviving_blocks = [
+        block
+        for block in (all_blocks if isinstance(all_blocks, list) else [])
+        if all(block is not stale for stale in stale_rungs)
+    ]
+    # A stale rung that a surviving block still points at via next_block_label/branch cannot be dropped:
+    # removing it would manufacture the dangling reference that _dangling_next_block_label_violation rejects.
+    # References from the stale set itself do not count (those pointers leave with the dropped blocks).
+    _, surviving_references = _workflow_block_graph({"workflow_definition": {"blocks": surviving_blocks}})
+    graph_referenced_labels = set(surviving_references)
+    undroppable = [
+        block
+        for block in stale_rungs
+        if _code_block_output_is_referenced(parsed, block)
+        or str(block.get("label") or "").strip() in graph_referenced_labels
+    ]
     if not undroppable and _remove_top_level_code_blocks(parsed, stale_rungs):
         replaced_labels = [_code_block_label(block) for block in stale_rungs]
         LOG.info(
@@ -5925,16 +5957,6 @@ def _drop_stale_spine_rung_blocks(
         f"{_provenance_suffix_text(provenance)}"
     )
     return _StaleSpineRungReplacement(violation=violation, replaced_labels=[])
-
-
-def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: SynthesisDiagnostics) -> bool:
-    return (
-        dropped.get("reason_code") == "ambiguous_bare_selector"
-        and dropped.get("tool_name") == "click"
-        and dropped.get("trajectory_index") == 0
-        and str(dropped.get("selector") or "").strip() in {"button", "role=button"}
-        and bool(diagnostics.locator_provenance)
-    )
 
 
 def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> bool:
@@ -6642,6 +6664,14 @@ def _browser_surface_contains_full_action_spine(submitted_code: str, synthesized
 
 
 _SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = SCOUTED_SPINE_UNDER_BUILD_REASON_CODE
+_SCOUTED_SPINE_REASON_CODES = frozenset(
+    {
+        SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+        SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
+        SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE,
+        SCOUTED_SPINE_TRUNCATED_REASON_CODE,
+    }
+)
 
 
 def _synthesized_resubmission_credential_scout_requirements(
@@ -6686,55 +6716,98 @@ def _scouted_spine_under_build_result(
     # Lane-flagged emissions (optional dismissals, readonly verifies, entry recovery) are conditional
     # or read-only replays, not load-bearing rungs.
     required = [record for record in diagnostics.emitted_interactions if not str(record.get("lane") or "")]
-    if not required:
-        return None
     draft_calls = [
         (mutation.method, mutation.receiver) for code in draft_codes for mutation in _browser_surface_for_code(code)[0]
     ]
-    uncovered = uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls)
-    if not uncovered:
-        return None
-    credential_scout_requirements = _synthesized_resubmission_credential_scout_requirements(
-        ctx, synthesized, block_label=block_label
+    uncovered = (
+        uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls) if required else []
     )
-    missing_text = missing_rung_text(uncovered)
+    if uncovered:
+        credential_scout_requirements = _synthesized_resubmission_credential_scout_requirements(
+            ctx, synthesized, block_label=block_label
+        )
+        missing_text = missing_rung_text(uncovered)
+        LOG.info(
+            "copilot_scouted_spine_under_build",
+            block_label=block_label,
+            site=site,
+            required_rung_count=len(required),
+            covered_rung_count=len(required) - len(uncovered),
+            missing_rungs=missing_text,
+            credential_scout_precondition_pending=bool(credential_scout_requirements),
+        )
+        first_uncovered = uncovered[0]
+        pass_route = render_missing_rung_call_sources(uncovered)
+        violation = (
+            f"Unable to impose synthesized code block: `{block_label}` under-builds the scouted spine "
+            f"({_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): the draft covers "
+            f"{len(required) - len(uncovered)} of {len(required)} scouted rung(s); missing: {missing_text}. "
+        )
+        if credential_scout_requirements:
+            violation += (
+                "Two steps are required, in order. Step 1 — satisfy the credential-scout precondition: "
+                + " ".join(credential_scout_requirements)
+                + " Step 2 — resubmit the code block, reusing the synthesized rung source verbatim so every "
+                "scouted rung is replayed."
+            )
+        else:
+            violation += (
+                "Author the remaining synthesized rungs — reuse the synthesized code block verbatim so every "
+                "scouted rung is replayed."
+            )
+        if pass_route:
+            violation += "\n" + pass_route
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=[violation],
+            repair_context=CodeAuthoringRepairContext(
+                block_label=block_label,
+                reason_code=_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+                selector=str(first_uncovered.get("selector") or "") or None,
+            ),
+        )
+    partition_findings = [
+        finding
+        for finding in spine_partition_findings(diagnostics, draft_calls, ctx.scout_trajectory or [])
+        if finding.kind != UNCOVERED_RUNG_FINDING
+    ]
+    if not partition_findings:
+        return None
+    return _scouted_spine_partition_under_build_result(
+        workflow_yaml, findings=partition_findings, block_label=block_label, site=site
+    )
+
+
+def _scouted_spine_partition_under_build_result(
+    workflow_yaml: str,
+    *,
+    findings: list[ObligationFinding],
+    block_label: str,
+    site: str,
+) -> _SynthesizedCodeImpositionResult:
+    first = findings[0]
+    reason_code = obligation_finding_reason_code(first)
+    summary = render_obligation_findings(findings)
     LOG.info(
         "copilot_scouted_spine_under_build",
         block_label=block_label,
         site=site,
-        required_rung_count=len(required),
-        covered_rung_count=len(required) - len(uncovered),
-        missing_rungs=missing_text,
-        credential_scout_precondition_pending=bool(credential_scout_requirements),
+        reason_code=reason_code,
+        finding_count=len(findings),
+        finding_summary=summary,
     )
-    first_uncovered = uncovered[0]
-    pass_route = render_missing_rung_call_sources(uncovered)
     violation = (
         f"Unable to impose synthesized code block: `{block_label}` under-builds the scouted spine "
-        f"({_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): the draft covers "
-        f"{len(required) - len(uncovered)} of {len(required)} scouted rung(s); missing: {missing_text}. "
+        f"({reason_code}): {summary}. Resubmit the code block reusing the synthesized rung source verbatim so "
+        "every captured interaction is replayed or carries a forgiven-drop reason."
     )
-    if credential_scout_requirements:
-        violation += (
-            "Two steps are required, in order. Step 1 — satisfy the credential-scout precondition: "
-            + " ".join(credential_scout_requirements)
-            + " Step 2 — resubmit the code block, reusing the synthesized rung source verbatim so every "
-            "scouted rung is replayed."
-        )
-    else:
-        violation += (
-            "Author the remaining synthesized rungs — reuse the synthesized code block verbatim so every "
-            "scouted rung is replayed."
-        )
-    if pass_route:
-        violation += "\n" + pass_route
     return _SynthesizedCodeImpositionResult(
         workflow_yaml=workflow_yaml,
         violations=[violation],
         repair_context=CodeAuthoringRepairContext(
             block_label=block_label,
-            reason_code=_SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
-            selector=str(first_uncovered.get("selector") or "") or None,
+            reason_code=reason_code,
+            selector=obligation_finding_selector(first),
         ),
     )
 
@@ -6789,132 +6862,6 @@ def _workflow_yaml_browser_call_pairs(workflow_yaml: str) -> list[tuple[str, str
         for block in _workflow_code_blocks(parsed)
         for mutation in _browser_surface_for_code(str(block.get("code") or ""))[0]
     ]
-
-
-_IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
-_FILTERING_PSEUDO_CLASSES = (
-    ":visible",
-    ":enabled",
-    ":disabled",
-    ":checked",
-    ":not(",
-    ":has(",
-    ":has-text(",
-    ":text(",
-    ":is(",
-)
-_EXACT_TEXT_XPATH_TAG_RE = re.compile(
-    r"""^(?:xpath=)?//(?P<tag>[a-zA-Z][a-zA-Z0-9-]*)\s*\[\s*normalize-space\(\s*(?:\.|text\(\))?\s*\)\s*=\s*(?P<quote>['"])[^'"]+(?P=quote)\s*\]\s*$"""
-)
-
-
-def _qualifier_narrows_to_identity(qualifier: str) -> bool:
-    if not qualifier or qualifier[0] not in _IDENTITY_QUALIFIER_BOUNDARY:
-        return False
-    if any(pseudo in qualifier for pseudo in _FILTERING_PSEUDO_CLASSES):
-        return False
-    bracket_depth = 0
-    quote: str | None = None
-    for char in qualifier:
-        if quote is not None:
-            if char == quote:
-                quote = None
-        elif char in ("'", '"'):
-            quote = char
-        elif char == "[":
-            bracket_depth += 1
-        elif char == "]":
-            bracket_depth = max(0, bracket_depth - 1)
-        elif bracket_depth == 0 and (char.isspace() or char in ">+~"):
-            return False
-    return True
-
-
-def _selector_refines(bare: str, candidate: str) -> bool:
-    bare = bare.strip()
-    candidate = candidate.strip()
-    if not bare or not candidate or bare == candidate:
-        return False
-
-    bare_role = _parse_role_name(bare)
-    candidate_role = _parse_role_name(candidate)
-    if bare_role is not None or candidate_role is not None:
-        if bare_role is None or candidate_role is None:
-            return False
-        bare_role_name, bare_name, bare_suffix = bare_role
-        candidate_role_name, candidate_name, candidate_suffix = candidate_role
-        return (
-            bare_role_name == candidate_role_name
-            and not bare_name
-            and not bare_suffix
-            and bool(candidate_name)
-            and not candidate_suffix
-        )
-    if not _BARE_TAG_RE.match(bare):
-        return False
-    if not candidate.startswith(bare) or _is_positional_selector(candidate):
-        return False
-    return _qualifier_narrows_to_identity(candidate[len(bare) :])
-
-
-def _stable_same_kind_bare_click_refiner(bare: str, candidate: str) -> bool:
-    bare = bare.strip()
-    candidate = candidate.strip()
-    if not bare or not candidate or bare == candidate or _is_positional_selector(candidate):
-        return False
-    if _selector_refines(bare, candidate):
-        return True
-    if bare != "button":
-        return False
-
-    candidate_role = _parse_role_name(candidate)
-    if candidate_role is not None:
-        role_name, accessible_name, suffix = candidate_role
-        return role_name == "button" and bool(accessible_name) and not suffix
-
-    xpath_match = _EXACT_TEXT_XPATH_TAG_RE.match(candidate)
-    return xpath_match is not None and xpath_match.group("tag").casefold() == "button"
-
-
-def _bare_drop_superseded_on_screen(
-    dropped: Mapping[str, Any],
-    scout_trajectory: list[ScoutedInteraction],
-    *,
-    claimed_refiner_indices: set[int],
-) -> tuple[bool, dict[str, Any] | None]:
-    if dropped.get("reason_code") != "ambiguous_bare_selector" or dropped.get("tool_name") != "click":
-        return False, None
-    dropped_selector = str(dropped.get("selector") or "").strip()
-    if not dropped_selector:
-        return False, None
-
-    dropped_index = dropped.get("trajectory_index")
-    if not isinstance(dropped_index, int) or dropped_index < 0 or dropped_index >= len(scout_trajectory):
-        return False, None
-    source_url = str(scout_trajectory[dropped_index].get("source_url") or "").strip()
-    if not source_url:
-        return False, None
-
-    for refiner_index in range(dropped_index + 1, len(scout_trajectory)):
-        if refiner_index in claimed_refiner_indices:
-            continue
-        later = scout_trajectory[refiner_index]
-        if later.get("tool_name") != "click":
-            continue
-        if str(later.get("source_url") or "").strip() != source_url:
-            continue
-        later_selector = str(later.get("selector") or "").strip()
-        if not _stable_same_kind_bare_click_refiner(dropped_selector, later_selector):
-            continue
-        claimed_refiner_indices.add(refiner_index)
-        return True, {
-            "dropped_index": dropped_index,
-            "dropped_selector": dropped_selector,
-            "refiner_index": refiner_index,
-            "refiner_selector": later_selector,
-            "source_url": source_url,
-        }
-    return False, None
 
 
 def _submitted_suffix_after_synthesized_code(submitted_code: str, synthesized_code: str) -> str:
@@ -7356,20 +7303,166 @@ def _strip_redundant_sandbox_imports_in_yaml(workflow_yaml: str) -> tuple[str, l
     return yaml.safe_dump(parsed, sort_keys=False), stripped_modules
 
 
-def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContext) -> tuple[str, list[str]]:
-    if not getattr(ctx, "impose_synthesized_code_block", False):
-        return workflow_yaml, []
+def _code_block_has_load_bearing_mutation(code: str) -> bool:
+    mutations, _reads, _ambiguous = _browser_surface_for_code(code)
+    return any(mutation.method in _LOCATOR_MUTATION_METHODS for mutation in mutations)
+
+
+def _iter_workflow_blocks(blocks: object) -> Iterator[dict[str, Any]]:
+    if not isinstance(blocks, list):
+        return
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        yield block
+        yield from _iter_workflow_blocks(block.get("loop_blocks"))
+
+
+def _workflow_block_graph(parsed: Mapping[str, Any]) -> tuple[set[str], list[str]]:
+    definition = parsed.get("workflow_definition")
+    blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    labels: set[str] = set()
+    references: list[str] = []
+    for block in _iter_workflow_blocks(blocks):
+        label = str(block.get("label") or "").strip()
+        if label:
+            labels.add(label)
+    for block in _iter_workflow_blocks(blocks):
+        next_label = str(block.get("next_block_label") or "").strip()
+        if next_label:
+            references.append(next_label)
+        branch_conditions = block.get("branch_conditions")
+        if isinstance(branch_conditions, list):
+            for branch in branch_conditions:
+                if not isinstance(branch, dict):
+                    continue
+                branch_target = str(branch.get("next_block_label") or "").strip()
+                if branch_target:
+                    references.append(branch_target)
+    return labels, references
+
+
+def _dangling_next_block_label_violation(parsed: Mapping[str, Any]) -> str | None:
+    labels, references = _workflow_block_graph(parsed)
+    dangling = sorted({reference for reference in references if reference not in labels})
+    if not dangling:
+        return None
+    return (
+        "Unable to persist workflow: next_block_label reference(s) point to no existing block: "
+        + ", ".join(f"`{label}`" for label in dangling)
+        + "."
+    )
+
+
+def _scaffolding_only_body_violation(ctx: AgentContext, parsed: Mapping[str, Any]) -> str | None:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return workflow_yaml, []
+        return None
     scout_trajectory = ctx.scout_trajectory
     if not isinstance(scout_trajectory, list) or not scout_trajectory:
-        return workflow_yaml, []
+        return None
+    synthesized = synthesize_code_block(
+        scout_trajectory, reached_download_target=getattr(ctx, "reached_download_target", None)
+    )
+    if synthesized is None:
+        return None
+    required = [record for record in synthesized.diagnostics.emitted_interactions if not str(record.get("lane") or "")]
+    if not required:
+        return None
+    code_blocks = _workflow_code_blocks(parsed) if isinstance(parsed, dict) else []
+    if not code_blocks:
+        return None
+    if any(_code_block_has_load_bearing_mutation(str(block.get("code") or "")) for block in code_blocks):
+        return None
+    return (
+        "Unable to persist workflow: the persisted code block(s) commit no load-bearing browser interaction "
+        f"({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}), though the scout demonstrated {len(required)} rung(s). "
+        "Reuse the synthesized code block verbatim so the captured interactions are replayed."
+    )
+
+
+def _normalize_prompt_text(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _stub_with_raw_prompt_violation(ctx: AgentContext, parsed: Mapping[str, Any]) -> str | None:
+    packet = getattr(ctx, "turn_context_packet", None)
+    if packet is None:
+        return None
+    anchor = _normalize_prompt_text(str(packet.transcript_context.earliest_user_turn or ""))
+    if not anchor:
+        return None
+    if _scaffolding_only_body_violation(ctx, parsed) is None:
+        return None
+    for block in _iter_workflow_blocks(parsed.get("workflow_definition", {}).get("blocks")):
+        for field_name in ("prompt", "description", "title"):
+            if _normalize_prompt_text(str(block.get(field_name) or "")) == anchor:
+                return (
+                    "Unable to persist workflow: a block reproduces the raw user request as its "
+                    f"{field_name} while committing no load-bearing browser interaction "
+                    f"({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE})."
+                )
+    return None
+
+
+def _code_references_parameter(code: str, key: str) -> bool:
+    return re.search(rf"\b{re.escape(key)}\b", code) is not None
+
+
+def _orphan_minted_parameter_violation(parsed: Mapping[str, Any], minted_keys: list[str]) -> str | None:
+    if not minted_keys or not isinstance(parsed, dict):
+        return None
+    codes = [str(block.get("code") or "") for block in _workflow_code_blocks(parsed)]
+    orphans = sorted(
+        {key for key in minted_keys if key and not any(_code_references_parameter(code, key) for code in codes)}
+    )
+    if not orphans:
+        return None
+    return (
+        "Unable to persist workflow: minted workflow parameter(s) are not referenced by any generated code: "
+        + ", ".join(f"`{key}`" for key in orphans)
+        + "."
+    )
+
+
+def _final_yaml_structural_violations(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    *,
+    minted_parameter_keys: list[str],
+    promoted_parameter_keys: list[str],
+    carried_by_imposition: bool,
+) -> list[str]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return []
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return []
+    candidates: list[str | None] = [
+        _dangling_next_block_label_violation(parsed),
+        _orphan_minted_parameter_violation(parsed, [*minted_parameter_keys, *promoted_parameter_keys]),
+    ]
+    # The spine-coverage seam runs only when imposition made no substitution; a successful imposition
+    # skips it, so the body-shape predicates re-validate exactly that bypassed window.
+    if carried_by_imposition:
+        candidates.insert(0, _scaffolding_only_body_violation(ctx, parsed))
+        candidates.insert(1, _stub_with_raw_prompt_violation(ctx, parsed))
+    return [violation for violation in candidates if violation is not None]
+
+
+def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContext) -> tuple[str, list[str], list[str]]:
+    if not getattr(ctx, "impose_synthesized_code_block", False):
+        return workflow_yaml, [], []
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return workflow_yaml, [], []
+    scout_trajectory = ctx.scout_trajectory
+    if not isinstance(scout_trajectory, list) or not scout_trajectory:
+        return workflow_yaml, [], []
     synthesized = synthesize_code_block(
         scout_trajectory,
         reached_download_target=getattr(ctx, "reached_download_target", None),
     )
     if synthesized is None:
-        return workflow_yaml, []
+        return workflow_yaml, [], []
 
     defaults_by_value: dict[str, list[str]] = {}
     for parameter in synthesized.parameters:
@@ -7388,20 +7481,24 @@ def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContex
         )
     value_to_key = {value: keys[0] for value, keys in defaults_by_value.items() if len(set(keys)) == 1}
     if not value_to_key:
-        return workflow_yaml, []
+        return workflow_yaml, [], []
 
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
-        return workflow_yaml, []
+        return workflow_yaml, [], []
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
-        return workflow_yaml, []
+        return workflow_yaml, [], []
     parameters = workflow_definition.get("parameters")
     if parameters is None:
         parameters = []
         workflow_definition["parameters"] = parameters
     if not isinstance(parameters, list):
-        return workflow_yaml, ["Unable to bind typed workflow inputs: workflow_definition.parameters must be a list."]
+        return (
+            workflow_yaml,
+            ["Unable to bind typed workflow inputs: workflow_definition.parameters must be a list."],
+            [],
+        )
 
     reserved_keys = set(RESERVED_PARAMETER_KEYS) | _workflow_output_parameter_keys(parsed)
     allocated_value_to_key: dict[str, str] = {}
@@ -7439,7 +7536,7 @@ def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContex
         any_rewrite = True
 
     if not any_rewrite:
-        return workflow_yaml, []
+        return workflow_yaml, [], []
 
     existing_by_key = {
         str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
@@ -7452,7 +7549,7 @@ def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContex
         existing = existing_by_key.get(key)
         if isinstance(existing, dict):
             _normalize_plain_parameter_row(existing, default_value)
-    return yaml.safe_dump(parsed, sort_keys=False), []
+    return yaml.safe_dump(parsed, sort_keys=False), [], sorted(used_promoted_keys)
 
 
 def _is_credential_parameter(parameter: Mapping[str, Any]) -> bool:
@@ -8044,7 +8141,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         imposed_candidate = candidate
 
     synthesized_spine_code = synthesized.interaction_code or synthesized.code
-    if not carrier_changed and not _draft_leaves_scouted_rungs_uncovered(code_blocks, synthesized=synthesized):
+    if not carrier_changed and not _draft_leaves_scouted_partition_open(
+        code_blocks, synthesized=synthesized, scout_trajectory=scout_trajectory
+    ):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     replaced_rung_labels: list[str] = []
     if owns_spine:
@@ -8073,9 +8172,19 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         violations.append("Unable to impose synthesized code block: scout trajectory was truncated.")
     claimed_refiner_indices: set[int] = set()
     forgiven_superseded_bare_drops: list[dict[str, Any]] = []
+    forgiven_entry_opener_drops: list[dict[str, Any]] = []
     repair_context: CodeAuthoringRepairContext | None = None
     for dropped in diagnostics.dropped_interactions:
         if _is_ignorable_entry_opener_drop(dropped, diagnostics):
+            entry_opener_record = {
+                "trajectory_index": dropped.get("trajectory_index"),
+                "tool_name": str(dropped.get("tool_name") or ""),
+                "reason_code": str(dropped.get("reason_code") or ""),
+                "selector": str(dropped.get("selector") or "").strip(),
+                "forgiveness": "entry_opener_superseded_by_locator_provenance",
+            }
+            forgiven_entry_opener_drops.append(entry_opener_record)
+            LOG.info("copilot_imposition_forgave_entry_opener_drop", **entry_opener_record)
             continue
         forgiven, refiner_record = _bare_drop_superseded_on_screen(
             dropped, scout_trajectory, claimed_refiner_indices=claimed_refiner_indices
@@ -8361,6 +8470,8 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         substitutions["scrubbed_stale_selected_goal_value_paths"] = True
     if forgiven_superseded_bare_drops:
         substitutions["forgiven_superseded_bare_drops"] = forgiven_superseded_bare_drops
+    if forgiven_entry_opener_drops:
+        substitutions["forgiven_entry_opener_drops"] = forgiven_entry_opener_drops
     selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
     if scrubbed_selected_metadata_label:
         selected_extraction_metadata_disposition = "browser_spine_replaced_metadata_stale"
@@ -8385,6 +8496,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         substitutions=substitutions,
         scrubbed_selected_metadata_label=scrubbed_selected_metadata_label,
         selected_extraction_metadata_disposition=selected_extraction_metadata_disposition,
+        minted_parameter_keys=list(parameter_reconciliation.parameter_keys),
     )
 
 
@@ -9357,11 +9469,11 @@ def _missing_scouted_rung_violation_text(artifact: str) -> str:
 
 def _open_scouted_spine_obligation_artifact(ctx: AgentContext) -> str:
     try:
-        uncovered = _scouted_spine_open_obligation(ctx)
+        findings = _scouted_spine_open_obligation(ctx)
     except Exception:
         LOG.warning("copilot_scouted_spine_obligation_read_failed", exc_info=True)
         return ""
-    artifact = render_missing_rung_call_sources(uncovered)
+    artifact = render_missing_rung_call_sources(uncovered_rung_records(findings))
     if not artifact:
         return ""
     return _missing_scouted_rung_violation_text(artifact)
@@ -9468,7 +9580,7 @@ async def _update_workflow(
             )
         if (
             imposition.repair_context is not None
-            and imposition.repair_context.reason_code == _SCOUTED_SPINE_UNDER_BUILD_REASON_CODE
+            and imposition.repair_context.reason_code in _SCOUTED_SPINE_REASON_CODES
         ):
             _set_code_authoring_repair_context(ctx, imposition.repair_context)
             _record_code_authoring_guardrail_reject(ctx)
@@ -9501,7 +9613,9 @@ async def _update_workflow(
     stripped_sandbox_imports: list[str] = []
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml, stripped_sandbox_imports = _strip_redundant_sandbox_imports_in_yaml(workflow_yaml)
-    workflow_yaml, typed_default_violations = _apply_scouted_typed_default_promotions(workflow_yaml, ctx)
+    workflow_yaml, typed_default_violations, promoted_parameter_keys = _apply_scouted_typed_default_promotions(
+        workflow_yaml, ctx
+    )
     if typed_default_violations:
         return reject(
             error="\n".join(typed_default_violations),
@@ -9510,6 +9624,20 @@ async def _update_workflow(
         )
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         workflow_yaml = _adopt_exact_declared_parameter_keys_for_unresolved_names(workflow_yaml)
+    final_structural_violations = _final_yaml_structural_violations(
+        ctx,
+        workflow_yaml,
+        minted_parameter_keys=imposition.minted_parameter_keys,
+        promoted_parameter_keys=promoted_parameter_keys,
+        carried_by_imposition=imposition.substitutions is not None,
+    )
+    if final_structural_violations:
+        _record_code_authoring_guardrail_reject(ctx)
+        return reject(
+            error="\n".join(final_structural_violations),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data=_code_repair_progress_data(),
+        )
     params["workflow_yaml"] = workflow_yaml
     metadata_scrubbed_by_imposition = False
     if (

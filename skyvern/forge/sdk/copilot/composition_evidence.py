@@ -645,6 +645,43 @@ def has_actionable_steer_content(evidence: dict[str, Any]) -> bool:
     return isinstance(clickable_controls, list) and bool(clickable_controls)
 
 
+def has_witnessed_value_content(evidence: dict[str, Any]) -> bool:
+    """True when the capture carries binder-consumable rendered value content under the mint's own
+    witnesses: a key_value_relations entry with non-empty value_text, or a result_containers sample-row
+    cell with text. Truncated or warned captures void the matching channel, mirroring the mint."""
+    warnings = evidence.get("inspection_warnings")
+    if isinstance(warnings, list) and warnings:
+        return False
+    if evidence.get("key_value_relations_truncated") is not True:
+        relations = evidence.get("key_value_relations")
+        if isinstance(relations, list):
+            for relation in relations:
+                if not isinstance(relation, dict):
+                    continue
+                value_text = relation.get("value_text")
+                if isinstance(value_text, str) and value_text.strip():
+                    return True
+    if evidence.get("result_containers_truncated") is not True:
+        containers = evidence.get("result_containers")
+        if isinstance(containers, list):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                rows = container.get("rows")
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    cells = row.get("cells")
+                    if not isinstance(cells, list):
+                        continue
+                    for cell in cells:
+                        if isinstance(cell, dict) and cell.get("has_text") is True:
+                            return True
+    return False
+
+
 def _is_scout_interaction_evidence(evidence: dict[str, Any]) -> bool:
     # A scout interaction that resolved a concrete selector proves the page rendered
     # and the element was actionable, so it is non-hollow evidence of the reached
@@ -1509,6 +1546,7 @@ def _key_value_relations(soup: Any) -> tuple[list[dict[str, Any]], bool]:
         relations.append(
             {
                 "key_text": key_text,
+                "value_text": value_text,
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
@@ -1561,7 +1599,12 @@ def _result_container_entry(node: Any, *, soup: Any) -> dict[str, Any]:
                 "visible": True,
                 "has_row_header": row.select_one(":scope > th") is not None,
                 "cells": [
-                    {"column_index": column_index, "visible": True}
+                    {
+                        "column_index": column_index,
+                        "visible": True,
+                        "has_text": bool(_node_text(_cell)),
+                        "text": _schema_text(_node_text(_cell), 120),
+                    }
                     for column_index, _cell in enumerate(row.select(":scope > td")[:_MAX_TABLE_HEADERS])
                 ],
             }
@@ -2123,7 +2166,14 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
                         column_index = raw_cell.get("column_index")
                         if not isinstance(column_index, int) or isinstance(column_index, bool) or column_index < 0:
                             continue
-                        cells.append({"column_index": column_index, "visible": raw_cell.get("visible") is True})
+                        cells.append(
+                            {
+                                "column_index": column_index,
+                                "visible": raw_cell.get("visible") is True,
+                                "has_text": raw_cell.get("has_text") is True,
+                                "text": _schema_text(_structured_str(raw_cell.get("text")), 120),
+                            }
+                        )
                 rows.append(
                     {
                         "row_index": row_index,
@@ -2198,6 +2248,7 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
         relations.append(
             {
                 "key_text": key_text,
+                "value_text": _schema_text(_structured_str(item.get("value_text")), 240),
                 "container_selector": selector,
                 "container_match_count": match_count,
                 "container_position": position,
