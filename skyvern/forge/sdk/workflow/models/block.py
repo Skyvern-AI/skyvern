@@ -147,6 +147,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
     RecordingPage,
+    json_safe_recorder_output,
     user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
@@ -4785,6 +4786,10 @@ async def wrapper({default_args}):
             # Safety net for paths the except arms miss (CancelledError, link_block failure).
             await recorder.finalize(success=False)
 
+        # A leaked recorder proxy (RecordingLocator/Page/Keyboard) is not JSON serializable and
+        # would either crash registration or, via the default= fallback, replace the value with a
+        # useless placeholder — normalize the wrapper family to its selector/marker first.
+        result = json_safe_recorder_output(result)
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
         )
