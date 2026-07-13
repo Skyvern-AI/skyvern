@@ -352,6 +352,23 @@ def test_extract_tool_details_failure_is_generic() -> None:
     assert "failed" in details.lower()
 
 
+def test_extract_tool_details_success_override_suppresses_failed_line() -> None:
+    """A caller-supplied success (e.g. a reclassified precondition redirect) must
+    win over the raw ok:False, so the detail line doesn't contradict the entry's
+    own success status in the narrator prompt."""
+    details = narration.extract_tool_details(
+        "evaluate",
+        {"ok": False, "error": "internal steering text"},
+        success=True,
+    )
+    assert details != "last action failed"
+
+
+def test_extract_tool_details_no_override_keeps_raw_ok() -> None:
+    details = narration.extract_tool_details("evaluate", {"ok": False, "error": "boom"})
+    assert details == "last action failed"
+
+
 # ---------------------------------------------------------------------------
 # _build_narrator_prompt — redacts raw tool identifiers
 # ---------------------------------------------------------------------------
