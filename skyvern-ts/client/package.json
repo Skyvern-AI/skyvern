@@ -52,7 +52,7 @@
     "devDependencies": {
         "webpack": "^5.97.1",
         "ts-loader": "^9.5.1",
-        "vitest": "^3.2.6",
+        "vitest": "^4.1.10",
         "msw": "2.11.2",
         "@types/node": "^18.19.70",
         "typescript": "~5.7.2",
@@ -76,7 +76,7 @@
     },
     "pnpm": {
         "overrides": {
-            "vitest": "^3.2.6",
+            "vitest": "^4.1.10",
             "vite": "^7.3.5",
             "rollup": "^4.59.0",
             "serialize-javascript": "^7.0.3",
