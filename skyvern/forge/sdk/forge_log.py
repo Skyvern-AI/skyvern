@@ -6,10 +6,11 @@ from pathlib import Path
 from types import TracebackType
 
 import structlog
+from structlog.typing import EventDict
+
 from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
-from structlog.typing import EventDict
 
 # Bearer JWTs occasionally leak into log messages via WebSocket connection
 # URLs that pass `?token=Bearer%20<jwt>` as a query string. Redact before

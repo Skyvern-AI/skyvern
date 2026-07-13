@@ -7,6 +7,7 @@ from collections.abc import Iterator
 
 import pytest
 import structlog
+
 from skyvern.config import settings
 from skyvern.forge.sdk.forge_log import setup_logger
 
