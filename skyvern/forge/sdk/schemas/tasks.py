@@ -209,6 +209,11 @@ class PromptedTaskRequest(TaskRequest):
         description="Whether to publish the workflow created from the prompt.",
         examples=[True, False],
     )
+    generate_script: bool | None = Field(
+        default=None,
+        description="Whether to generate scripts for runs of the workflow created from the prompt.",
+        examples=[True, False],
+    )
     run_with: str | None = Field(
         default=None,
         description="The executor to run the task with.",
