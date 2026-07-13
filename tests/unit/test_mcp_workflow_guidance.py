@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
+from skyvern.cli.mcp_tools.inspection import skyvern_get_html
 from skyvern.cli.mcp_tools.prompts import BUILD_WORKFLOW_CONTENT
+from skyvern.cli.mcp_tools.session import skyvern_browser_session_create, skyvern_browser_session_list
+from skyvern.cli.mcp_tools.workflow import (
+    skyvern_workflow_create,
+    skyvern_workflow_get,
+    skyvern_workflow_retry,
+    skyvern_workflow_run,
+    skyvern_workflow_update,
+)
 
 
 def test_build_workflow_prompt_guides_text_prompt_defaults() -> None:
@@ -44,3 +55,71 @@ async def test_text_prompt_block_schema_example_omits_raw_llm_key() -> None:
     assert result["ok"] is True
     assert "llm_key" not in result["data"]["example"]
     assert "model" not in result["data"]["example"]
+
+
+# --- Tool-routing hints in tool descriptions (mechanism (c): wrong-tool / missing-arg calls) ---
+# These guard the cross-references that steer an MCP client to the right tool. Tool names are stable
+# API identifiers, so asserting they appear in the routing docstrings is a contract check, not prose.
+
+
+def test_workflow_get_routes_search_and_browse_to_workflow_list() -> None:
+    """get fetches ONE workflow by known id; search/browse/paginate belong on workflow_list (SKY-12087/89/90/91)."""
+    doc = skyvern_workflow_get.__doc__ or ""
+    assert "skyvern_workflow_list" in doc
+    params = inspect.signature(skyvern_workflow_get).parameters
+    assert params["workflow_id"].default is inspect.Parameter.empty
+
+
+def test_workflow_create_routes_list_intent_and_keeps_definition() -> None:
+    """create builds from a serialized `definition`; list intent (only_workflows) belongs on workflow_list
+    (SKY-12088), and the whole workflow (incl. title) serializes INTO `definition` (SKY-12072/12107/12108/12109)."""
+    doc = skyvern_workflow_create.__doc__ or ""
+    assert "skyvern_workflow_list" in doc
+    assert "definition" in doc
+
+
+def test_workflow_update_keeps_serialized_definition() -> None:
+    """update takes the whole workflow serialized into `definition`; flat fields are rejected (SKY-12072)."""
+    doc = skyvern_workflow_update.__doc__ or ""
+    assert "definition" in doc
+    params = inspect.signature(skyvern_workflow_update).parameters
+    assert params["definition"].default is inspect.Parameter.empty
+
+
+def test_workflow_run_routes_retry_intent_to_workflow_retry() -> None:
+    """run starts a NEW run (needs workflow_id); a workflow_run_id means retry an existing run (SKY-12051)."""
+    doc = skyvern_workflow_run.__doc__ or ""
+    assert "skyvern_workflow_retry" in doc
+    params = inspect.signature(skyvern_workflow_run).parameters
+    assert params["workflow_id"].default is inspect.Parameter.empty
+    assert "workflow_run_id" not in params
+
+
+def test_workflow_retry_cross_refs_workflow_run() -> None:
+    doc = skyvern_workflow_retry.__doc__ or ""
+    assert "skyvern_workflow_run" in doc
+
+
+def test_browser_session_create_makes_session_and_routes_url_and_steps() -> None:
+    """create MAKES a session; a session_id/url/steps/selector means act on an EXISTING session via
+    navigate/execute instead (SKY-12092/12093/12095/12103)."""
+    doc = skyvern_browser_session_create.__doc__ or ""
+    assert "skyvern_navigate" in doc
+    assert "skyvern_execute" in doc
+    params = set(inspect.signature(skyvern_browser_session_create).parameters)
+    assert not ({"session_id", "url", "steps", "selector"} & params)
+
+
+def test_browser_session_list_takes_no_pagination() -> None:
+    """session_list returns ALL sessions in one call; it has no page/page_size (SKY-12110)."""
+    params = set(inspect.signature(skyvern_browser_session_list).parameters)
+    assert not ({"page", "page_size"} & params)
+
+
+def test_get_html_reads_current_page_by_selector_not_by_url() -> None:
+    """get_html reads an element by selector on the CURRENT page; no HTML-by-URL — navigate first (SKY-12104)."""
+    doc = skyvern_get_html.__doc__ or ""
+    assert "skyvern_navigate" in doc
+    params = set(inspect.signature(skyvern_get_html).parameters)
+    assert "selector" in params
+    assert "url" not in params
