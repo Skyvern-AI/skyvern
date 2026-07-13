@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { buildRevealOffsets, revealedCountAt } from "./actionReveal";
+import { humanizeBlockLabel } from "./blockLabel";
 import {
   CopilotPhaseId,
   PhaseStatus,
@@ -258,9 +259,11 @@ interface FBlockRunProps {
   block: BlockState;
   turnEnded: boolean;
   onSelect?: (label: string) => void;
+  uxV1?: boolean;
 }
 
-function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
+function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
+  const displayLabel = uxV1 ? humanizeBlockLabel(block.label) : block.label;
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
@@ -390,8 +393,15 @@ function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
         </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-            <span className="font-mono text-[12.5px] font-semibold text-slate-100">
-              {block.label}
+            <span
+              className={
+                uxV1
+                  ? "text-[12.5px] font-semibold text-slate-100"
+                  : "font-mono text-[12.5px] font-semibold text-slate-100"
+              }
+              title={uxV1 ? block.label : undefined}
+            >
+              {displayLabel}
             </span>
             <span className="text-[11px] text-slate-500">·</span>
             <span className={`font-mono text-[11px] font-medium ${accentText}`}>
@@ -484,9 +494,10 @@ interface FDesignRowProps {
   done: boolean;
   blockLabels: string[];
   activity: ActivityEntry[];
+  uxV1?: boolean;
 }
 
-function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
+function FDesignRow({ done, blockLabels, activity, uxV1 }: FDesignRowProps) {
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen === null ? !done : userOpen;
   const drafts = blockLabels.length;
@@ -547,7 +558,12 @@ function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
           {blockLabels.map((label) => (
             <FSubRow key={label} glyph="✦" glyphClass="text-emerald-300">
               <span className="text-slate-400">Drafted </span>
-              <span className="font-mono text-slate-100">{label}</span>
+              <span
+                className={uxV1 ? "text-slate-100" : "font-mono text-slate-100"}
+                title={uxV1 ? label : undefined}
+              >
+                {uxV1 ? humanizeBlockLabel(label) : label}
+              </span>
             </FSubRow>
           ))}
         </div>
@@ -659,12 +675,14 @@ interface FPhaseChecklistProps {
   turn: TurnNarrativeState;
   turnEnded: boolean;
   onBlockSelect?: (label: string) => void;
+  uxV1?: boolean;
 }
 
 function FPhaseChecklist({
   turn,
   turnEnded,
   onBlockSelect,
+  uxV1,
 }: FPhaseChecklistProps) {
   const rows = useMemo(() => derivePhases(turn), [turn]);
   const [openPhases, setOpenPhases] = useState<Set<CopilotPhaseId>>(
@@ -766,8 +784,13 @@ function FPhaseChecklist({
                         glyphClass="text-emerald-300"
                       >
                         <span className="text-slate-400">Drafted </span>
-                        <span className="font-mono text-slate-100">
-                          {label}
+                        <span
+                          className={
+                            uxV1 ? "text-slate-100" : "font-mono text-slate-100"
+                          }
+                          title={uxV1 ? label : undefined}
+                        >
+                          {uxV1 ? humanizeBlockLabel(label) : label}
                         </span>
                       </FSubRow>
                     ))}
@@ -784,6 +807,7 @@ function FPhaseChecklist({
                         block={b}
                         turnEnded={turnEnded}
                         onSelect={onBlockSelect}
+                        uxV1={uxV1}
                       />
                     ))}
                   </>
@@ -909,6 +933,7 @@ function RollupCard({
             turn={turn}
             turnEnded
             onBlockSelect={onBlockSelect}
+            uxV1={uxV1}
           />
         </div>
       ) : null}
@@ -932,8 +957,15 @@ function RollupCard({
                   >
                     {palette.glyph}
                   </span>
-                  <span className="font-mono text-[11px] text-slate-400">
-                    {b.label}
+                  <span
+                    className={
+                      uxV1
+                        ? "text-[11px] text-slate-400"
+                        : "font-mono text-[11px] text-slate-400"
+                    }
+                    title={uxV1 ? b.label : undefined}
+                  >
+                    {uxV1 ? humanizeBlockLabel(b.label) : b.label}
                   </span>
                   <span className="text-slate-600">·</span>
                   <span className="text-[11.5px] text-slate-200">
@@ -963,8 +995,15 @@ function RollupCard({
                 >
                   ✕
                 </span>
-                <span className="font-mono text-[11px] text-rose-300/80">
-                  {b.label}
+                <span
+                  className={
+                    uxV1
+                      ? "text-[11px] text-rose-300/80"
+                      : "font-mono text-[11px] text-rose-300/80"
+                  }
+                  title={uxV1 ? b.label : undefined}
+                >
+                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
                 </span>
               </li>
             ))}
@@ -1025,6 +1064,7 @@ function DetailView({
             turn={turn}
             turnEnded={turn.terminal !== null}
             onBlockSelect={onBlockSelect}
+            uxV1={uxV1}
           />
         </>
       ) : showDesign ? (
@@ -1032,6 +1072,7 @@ function DetailView({
           done={!designOpen}
           blockLabels={turn.draft?.blockLabels ?? []}
           activity={turn.designActivity}
+          uxV1={uxV1}
         />
       ) : preBlockNarration.length > 0 ? (
         preBlockNarration.map((e) => (
@@ -1047,6 +1088,7 @@ function DetailView({
               block={b}
               turnEnded={turn.terminal !== null}
               onSelect={onBlockSelect}
+              uxV1={uxV1}
             />
           ))}
         </div>
