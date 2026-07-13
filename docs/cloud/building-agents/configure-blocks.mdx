@@ -31,7 +31,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 | Category | Blocks |
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
-| [Data and Extraction](#data-and-extraction) | Text Prompt, File Parser |
+| [Data and Extraction](#data-and-extraction) | Text Prompt, File Parser, Split PDF |
 | [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
 | [Files](#files) | File Download, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction |
@@ -229,6 +229,16 @@ Parse PDFs, CSVs, Excel files, and images to extract structured data.
 <Frame>
 <img width="400" src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
 </Frame>
+
+### Split PDF
+
+Split a PDF into smaller sections using a natural-language prompt. Useful for isolating specific pages or ranges (for example, invoices, receipts, or a single chapter) before parsing them.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **File URL** | text | URL or parameter reference to the source PDF |
+| **Prompt** | text | Natural-language instructions describing which pages or sections to keep |
+| **Model** | selector | Which LLM model to use |
 
 ---
 
