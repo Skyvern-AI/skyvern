@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml as _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
