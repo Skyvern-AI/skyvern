@@ -9,6 +9,7 @@ fallback for the ``blocking_element is None and blocked is True`` branch only.
 
 from __future__ import annotations
 
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +17,14 @@ import pytest
 from skyvern.config import settings
 from skyvern.webeye.utils import dom as dom_module
 from skyvern.webeye.utils.dom import InteractiveElement, SkyvernElement
+
+
+class _ChainClickRun(NamedTuple):
+    results: list
+    coordinate_click: AsyncMock
+    try_navigate: AsyncMock
+    click_in_javascript: AsyncMock
+    blocking_click: AsyncMock | None
 
 
 def _make_anchor_element(
@@ -303,10 +312,26 @@ class TestChainClickBlockedAnchorNavigation:
         action_y: int | None = None,
         action_download: bool = False,
         navigate_result: str | None = "https://portal.example.com/billpay",
-    ) -> tuple[list, AsyncMock, AsyncMock]:
-        """Invoke chain_click through the ``blocking_element is None`` path
-        with tightly-scoped stubs.  Returns (results, coordinate_click_mock,
-        try_navigate_mock)."""
+        with_incremental: bool = False,
+        page_responded: bool | None = True,
+        input_type: str | None = None,
+        js_click_url: str | None = None,
+        blocking_is_parent: bool | None = None,
+        blocking_is_sibling: bool | None = None,
+        blocking_rect: dict[str, float] | None = None,
+        blocking_viewport: tuple[float, float] = (1920, 1080),
+        blocking_inside_modal: bool = False,
+    ) -> _ChainClickRun:
+        """Invoke chain_click through the ``find_blocking_element`` fallback with
+        tightly-scoped stubs.
+
+        ``with_incremental`` supplies an ``incremental_scraped`` observer (as the
+        real ClickAction path does) and monkeypatches ``_did_page_respond`` to
+        return ``page_responded`` so the intended-element JS-dispatch fallback can
+        be verified.  When ``blocking_is_parent``/``blocking_is_sibling`` are set,
+        ``find_blocking_element`` returns a tracked blocking element with those
+        relationships (Path 2); otherwise it returns ``(None, blocked)`` (Path 1).
+        """
         from skyvern.webeye.actions import handler as handler_module
         from skyvern.webeye.actions.actions import ClickAction
 
@@ -352,6 +377,8 @@ class TestChainClickBlockedAnchorNavigation:
                 return href
             if name == "onclick":
                 return None
+            if name == "type":
+                return input_type
             return None
 
         elem.get_attr = AsyncMock(side_effect=_get_attr)  # type: ignore[method-assign]
@@ -359,9 +386,36 @@ class TestChainClickBlockedAnchorNavigation:
         elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        elem.find_blocking_element = AsyncMock(return_value=(None, blocked))  # type: ignore[method-assign]
+        elem.get_element_handler = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
         elem.coordinate_click = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.click_in_javascript = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        blocking_click: AsyncMock | None = None
+        if blocking_is_parent is not None or blocking_is_sibling is not None:
+            blocking_element = MagicMock()
+            blocking_element.get_id = MagicMock(return_value="BLK1")
+            blocking_element.is_parent_of = AsyncMock(return_value=bool(blocking_is_parent))
+            blocking_element.is_sibling_of = AsyncMock(return_value=bool(blocking_is_sibling))
+            blocking_click = AsyncMock(return_value=None)
+            blocking_locator = MagicMock()
+            blocking_locator.click = blocking_click
+            blocking_locator.evaluate = AsyncMock(
+                return_value=(
+                    {
+                        "width": blocking_rect["width"],
+                        "height": blocking_rect["height"],
+                        "viewport_width": blocking_viewport[0],
+                        "viewport_height": blocking_viewport[1],
+                        "inside_modal": blocking_inside_modal,
+                    }
+                    if blocking_rect is not None
+                    else None
+                )
+            )
+            blocking_element.get_locator = MagicMock(return_value=blocking_locator)
+            elem.find_blocking_element = AsyncMock(return_value=(blocking_element, blocked))  # type: ignore[method-assign]
+        else:
+            elem.find_blocking_element = AsyncMock(return_value=(None, blocked))  # type: ignore[method-assign]
 
         try_navigate = AsyncMock(return_value=navigate_result)
         elem.try_navigate_via_href = try_navigate  # type: ignore[method-assign]
@@ -370,6 +424,12 @@ class TestChainClickBlockedAnchorNavigation:
         page.url = "https://portal.example.com/dashboard"
         page.goto = AsyncMock(return_value=None)
         page.on = MagicMock()
+        if js_click_url is not None:
+
+            async def _navigate_on_js_click() -> None:
+                page.url = js_click_url
+
+            elem.click_in_javascript = AsyncMock(side_effect=_navigate_on_js_click)  # type: ignore[method-assign]
 
         task = MagicMock()
         task.organization_id = "org_test"
@@ -382,14 +442,32 @@ class TestChainClickBlockedAnchorNavigation:
             y=action_y,
         )
 
+        incremental = None
+        skyvern_frame = None
+        if with_incremental:
+            incremental = MagicMock()
+            skyvern_frame = MagicMock()
+            skyvern_frame.get_frame.return_value = page
+            if page_responded is None:
+                incremental.get_incremental_elements_num = AsyncMock(return_value=0)
+                skyvern_frame.safe_wait_for_animation_end = AsyncMock(return_value=None)
+            else:
+                monkeypatch.setattr(
+                    handler_module,
+                    "_did_page_respond",
+                    AsyncMock(return_value=page_responded),
+                )
+
         results = await handler_module.chain_click(
             task=task,
             scraped_page=scraped_page,
             page=page,
             action=action,
             skyvern_element=elem,
+            incremental_scraped=incremental,
+            skyvern_frame=skyvern_frame,
         )
-        return results, elem.coordinate_click, try_navigate
+        return _ChainClickRun(results, elem.coordinate_click, try_navigate, elem.click_in_javascript, blocking_click)
 
     @pytest.mark.asyncio
     async def test_blocked_anchor_navigates_via_href_and_skips_coordinate_click(
@@ -397,7 +475,7 @@ class TestChainClickBlockedAnchorNavigation:
     ) -> None:
         from skyvern.webeye.actions.responses import ActionSuccess
 
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.A,
@@ -410,7 +488,7 @@ class TestChainClickBlockedAnchorNavigation:
 
     @pytest.mark.asyncio
     async def test_blocked_non_anchor_still_uses_coordinate_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.BUTTON,
@@ -424,7 +502,7 @@ class TestChainClickBlockedAnchorNavigation:
     async def test_unblocked_anchor_still_uses_coordinate_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # blocked=False = the transient-instability React re-render case; the
         # coordinate fallback is safe there.  We must not divert to href nav.
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=False,
             tag=InteractiveElement.A,
@@ -438,7 +516,7 @@ class TestChainClickBlockedAnchorNavigation:
     async def test_blocked_anchor_with_upload_action_skips_href_navigation(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.A,
@@ -456,7 +534,7 @@ class TestChainClickBlockedAnchorNavigation:
         # JS-driven downloads (onclick builds a blob/POST) would fetch the
         # wrong static resource if we diverted to ``frame.goto(href)``.
         # Downloads must keep going through the normal click path.
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.A,
@@ -471,7 +549,7 @@ class TestChainClickBlockedAnchorNavigation:
     async def test_blocked_anchor_with_explicit_coordinates_skips_href_navigation(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.A,
@@ -489,7 +567,7 @@ class TestChainClickBlockedAnchorNavigation:
     ) -> None:
         # If the helper cannot resolve a safe URL (e.g. javascript:) it returns
         # None; the existing coordinate fallback must still run.
-        results, coord_click, navigate = await self._run_chain_click(
+        results, coord_click, navigate, *_ = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.A,
@@ -499,6 +577,279 @@ class TestChainClickBlockedAnchorNavigation:
 
         navigate.assert_awaited_once()
         coord_click.assert_awaited_once()
+
+
+class TestChainClickOverlayBlockedSubmit:
+    """A primary-submit click intercepted by a consent / opt-out / FCRA overlay
+    must not be silently redirected onto the overlay.  On the observer-backed
+    ClickAction path (``incremental_scraped`` present), chain_click dispatches on
+    the *intended* element (bypassing hit-testing) instead of coordinate-clicking
+    into whatever pixel is on top, and never retargets onto a mere sibling
+    overlay.  Callers without an observer (custom checkbox/radio retarget) keep
+    their existing coordinate-click / sibling-retarget behavior.
+    """
+
+    _run_chain_click = staticmethod(TestChainClickBlockedAnchorNavigation._run_chain_click)
+
+    @staticmethod
+    def _has_success(results: list) -> bool:
+        from skyvern.webeye.actions.responses import ActionSuccess
+
+        return any(isinstance(r, ActionSuccess) for r in results)
+
+    @staticmethod
+    def _has_failure(results: list) -> bool:
+        from skyvern.webeye.actions.responses import ActionFailure
+
+        return any(isinstance(r, ActionFailure) for r in results)
+
+    @pytest.mark.asyncio
+    async def test_untracked_overlay_dispatches_on_intended_element_not_overlay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=True,
+            page_responded=True,
+        )
+
+        run.click_in_javascript.assert_awaited_once()
+        run.coordinate_click.assert_not_called()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_untracked_overlay_no_page_response_fails_clean(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=True,
+            page_responded=False,
+        )
+
+        run.click_in_javascript.assert_awaited_once()
+        run.coordinate_click.assert_not_called()
+        assert self._has_failure(run.results)
+        assert not self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_untracked_overlay_input_submit_dispatches_on_intended_element(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            href=None,
+            with_incremental=True,
+            page_responded=True,
+        )
+
+        run.click_in_javascript.assert_awaited_once()
+        run.coordinate_click.assert_not_called()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_untracked_overlay_navigation_after_dispatch_counts_as_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=True,
+            page_responded=None,
+            js_click_url="https://portal.example.com/submitted",
+        )
+
+        run.click_in_javascript.assert_awaited_once()
+        run.coordinate_click.assert_not_called()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_explicit_coordinate_click_still_coordinate_clicks_under_overlay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An action with explicit x/y is a deliberate coordinate click; keep it.
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=True,
+            action_x=100,
+            action_y=200,
+        )
+
+        run.coordinate_click.assert_awaited_once()
+        run.click_in_javascript.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parent_container_blocker_still_retargets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=True,
+            blocking_is_parent=True,
+            blocking_is_sibling=False,
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_awaited_once()
+        run.click_in_javascript.assert_not_called()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_sibling_overlay_with_observer_not_retargeted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=True,
+            page_responded=True,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_not_called()
+        run.click_in_javascript.assert_awaited_once()
+        assert self._has_success(run.results)
+
+    @pytest.mark.parametrize("input_type", ["checkbox", "radio"])
+    @pytest.mark.asyncio
+    async def test_sibling_form_control_with_observer_still_retargets(
+        self, monkeypatch: pytest.MonkeyPatch, input_type: str
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            input_type=input_type,
+            href=None,
+            with_incremental=True,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+            blocking_rect={"x": 0, "y": 0, "width": 24, "height": 24},
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_awaited_once()
+        run.click_in_javascript.assert_not_called()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_small_custom_sibling_with_observer_still_retargets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag="div",
+            href=None,
+            with_incremental=True,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+            blocking_rect={"x": 0, "y": 0, "width": 24, "height": 24},
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_awaited_once()
+        run.click_in_javascript.assert_not_called()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_full_cover_sibling_overlay_over_checkbox_is_not_retargeted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            input_type="checkbox",
+            href=None,
+            with_incremental=True,
+            page_responded=True,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+            blocking_rect={"x": 0, "y": 0, "width": 1920, "height": 1080},
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_not_called()
+        run.click_in_javascript.assert_awaited_once()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_small_semantic_modal_sibling_over_checkbox_is_not_retargeted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            input_type="checkbox",
+            href=None,
+            with_incremental=True,
+            page_responded=True,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+            blocking_rect={"x": 0, "y": 0, "width": 600, "height": 400},
+            blocking_inside_modal=True,
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_not_called()
+        run.click_in_javascript.assert_awaited_once()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_iframe_covering_sibling_overlay_over_checkbox_is_not_retargeted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.INPUT,
+            input_type="checkbox",
+            href=None,
+            with_incremental=True,
+            page_responded=True,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+            blocking_rect={"x": 0, "y": 0, "width": 800, "height": 500},
+            blocking_viewport=(800, 500),
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_not_called()
+        run.click_in_javascript.assert_awaited_once()
+        assert self._has_success(run.results)
+
+    @pytest.mark.asyncio
+    async def test_sibling_blocker_without_observer_still_retargets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No observer = the custom checkbox/radio retarget callers; a sibling
+        # decoration (e.g. a styled span over the real control) must still be
+        # clicked to activate the intended control.
+        run = await self._run_chain_click(
+            monkeypatch,
+            blocked=True,
+            tag=InteractiveElement.BUTTON,
+            href=None,
+            with_incremental=False,
+            blocking_is_parent=False,
+            blocking_is_sibling=True,
+        )
+
+        assert run.blocking_click is not None
+        run.blocking_click.assert_awaited_once()
+        assert self._has_success(run.results)
 
 
 def test_dom_module_exports_try_navigate_via_href() -> None:
