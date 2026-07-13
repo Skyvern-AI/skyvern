@@ -280,6 +280,9 @@ class SynthesisDiagnostics:
     forgiven_interactions: list[dict[str, Any]] = field(default_factory=list)
     download_terminal_anchor: int | None = None
     download_terminal_dropped_trailing: int = 0
+    # Post-download-cut trajectory indices recorded before the emission loop, so the partition obligation
+    # can detect a truncation-break index that lands in no record lane instead of silently losing it.
+    retained_trajectory_indices: list[int] = field(default_factory=list)
     locator_provenance: list[dict[str, Any]] = field(default_factory=list)
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
@@ -678,6 +681,25 @@ def is_optional_dismissal_only_trajectory(trajectory: Sequence[Mapping[str, Any]
     )
 
 
+def _is_anonymous_structural_dismissal_click(interaction: Mapping[str, Any]) -> bool:
+    return _is_structural_dismissal_click(interaction) and not _is_optional_dismissal_click(interaction)
+
+
+def _last_action_interaction_index(trajectory: Sequence[Mapping[str, Any]]) -> int:
+    last = -1
+    for index, interaction in enumerate(trajectory):
+        tool_name = str(interaction.get("tool_name") or "")
+        if tool_name not in _ENTRY_TARGET_TOOLS:
+            continue
+        # An empty-key press_key is dropped as missing_key and emits nothing, so it must not claim the
+        # terminal index — otherwise a trailing empty keypress steals it from a real terminal dismissal
+        # click and defeats the reclassify-to-required guard.
+        if tool_name == "press_key" and not str(interaction.get("key") or "").strip():
+            continue
+        last = index
+    return last
+
+
 def _optional_dismissal_locator_expr(interaction: Mapping[str, Any], fallback_locator: str) -> str:
     selector = str(interaction.get("selector") or "").strip()
     if _NOT_DECLINE_BUTTON_SELECTOR_PATTERN.match(selector) or _is_cookie_accept_xpath_selector(selector):
@@ -818,6 +840,7 @@ def synthesize_code_block(
                 anchor=reached_download_target.trajectory_anchor,
                 dropped_trailing_count=dropped_trailing,
             )
+    diagnostics.retained_trajectory_indices = list(range(len(trajectory)))
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
         steps.append(
@@ -999,6 +1022,7 @@ def synthesize_code_block(
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
+    terminal_action_index = _last_action_interaction_index(trajectory)
     deferred_readonly_assertions: list[tuple[int, str, str, str]] = []
 
     def action_indent_for(trajectory_index: int) -> str:
@@ -1085,7 +1109,12 @@ def synthesize_code_block(
 
         line_start = len(lines) + 1
         if tool_name == "click":
-            if _is_optional_or_structural_dismissal_click(interaction):
+            reclassify_terminal_required = (
+                trajectory_index == terminal_action_index
+                and _is_anonymous_structural_dismissal_click(interaction)
+                and any(not str(record.get("lane") or "") for record in diagnostics.emitted_interactions)
+            )
+            if _is_optional_or_structural_dismissal_click(interaction) and not reclassify_terminal_required:
                 optional_locator = _optional_dismissal_locator_expr(interaction, locator)
                 lines.append(f"{action_indent}{_OPTIONAL_DISMISSAL_VAR} = {optional_locator}")
                 lines.append(f"{action_indent}if await {_OPTIONAL_DISMISSAL_VAR}.count() > 0:")
@@ -1309,6 +1338,9 @@ def synthesize_code_block(
 
 
 SCOUTED_SPINE_UNDER_BUILD_REASON_CODE = "scouted_spine_under_build"
+SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE = "scouted_spine_dropped_unforgiven"
+SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE = "scouted_spine_unrecorded_index"
+SCOUTED_SPINE_TRUNCATED_REASON_CODE = "scouted_spine_truncated"
 
 
 def normalized_locator_expr(text: str) -> str:
@@ -1381,6 +1413,267 @@ def uncovered_required_emitted_interactions(
         else:
             next_call_index = match_index + 1
     return uncovered
+
+
+_IDENTITY_QUALIFIER_BOUNDARY = ("[", "#", ".")
+_FILTERING_PSEUDO_CLASSES = (
+    ":visible",
+    ":enabled",
+    ":disabled",
+    ":checked",
+    ":not(",
+    ":has(",
+    ":has-text(",
+    ":text(",
+    ":is(",
+)
+_EXACT_TEXT_XPATH_TAG_RE = re.compile(
+    r"""^(?:xpath=)?//(?P<tag>[a-zA-Z][a-zA-Z0-9-]*)\s*\[\s*normalize-space\(\s*(?:\.|text\(\))?\s*\)\s*=\s*(?P<quote>['"])[^'"]+(?P=quote)\s*\]\s*$"""
+)
+
+
+def _qualifier_narrows_to_identity(qualifier: str) -> bool:
+    if not qualifier or qualifier[0] not in _IDENTITY_QUALIFIER_BOUNDARY:
+        return False
+    if any(pseudo in qualifier for pseudo in _FILTERING_PSEUDO_CLASSES):
+        return False
+    bracket_depth = 0
+    quote: str | None = None
+    for char in qualifier:
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif bracket_depth == 0 and (char.isspace() or char in ">+~"):
+            return False
+    return True
+
+
+def _selector_refines(bare: str, candidate: str) -> bool:
+    bare = bare.strip()
+    candidate = candidate.strip()
+    if not bare or not candidate or bare == candidate:
+        return False
+
+    bare_role = _parse_role_name(bare)
+    candidate_role = _parse_role_name(candidate)
+    if bare_role is not None or candidate_role is not None:
+        if bare_role is None or candidate_role is None:
+            return False
+        bare_role_name, bare_name, bare_suffix = bare_role
+        candidate_role_name, candidate_name, candidate_suffix = candidate_role
+        return (
+            bare_role_name == candidate_role_name
+            and not bare_name
+            and not bare_suffix
+            and bool(candidate_name)
+            and not candidate_suffix
+        )
+    if not _BARE_TAG_RE.match(bare):
+        return False
+    if not candidate.startswith(bare) or _is_positional_selector(candidate):
+        return False
+    return _qualifier_narrows_to_identity(candidate[len(bare) :])
+
+
+def _stable_same_kind_bare_click_refiner(bare: str, candidate: str) -> bool:
+    bare = bare.strip()
+    candidate = candidate.strip()
+    if not bare or not candidate or bare == candidate or _is_positional_selector(candidate):
+        return False
+    if _selector_refines(bare, candidate):
+        return True
+    if bare != "button":
+        return False
+
+    candidate_role = _parse_role_name(candidate)
+    if candidate_role is not None:
+        role_name, accessible_name, suffix = candidate_role
+        return role_name == "button" and bool(accessible_name) and not suffix
+
+    xpath_match = _EXACT_TEXT_XPATH_TAG_RE.match(candidate)
+    return xpath_match is not None and xpath_match.group("tag").casefold() == "button"
+
+
+def _is_ignorable_entry_opener_drop(dropped: Mapping[str, Any], diagnostics: SynthesisDiagnostics) -> bool:
+    return (
+        dropped.get("reason_code") == "ambiguous_bare_selector"
+        and dropped.get("tool_name") == "click"
+        and dropped.get("trajectory_index") == 0
+        and str(dropped.get("selector") or "").strip() in {"button", "role=button"}
+        and bool(diagnostics.locator_provenance)
+    )
+
+
+def _bare_drop_superseded_on_screen(
+    dropped: Mapping[str, Any],
+    scout_trajectory: Sequence[Mapping[str, Any]],
+    *,
+    claimed_refiner_indices: set[int],
+) -> tuple[bool, dict[str, Any] | None]:
+    if dropped.get("reason_code") != "ambiguous_bare_selector" or dropped.get("tool_name") != "click":
+        return False, None
+    dropped_selector = str(dropped.get("selector") or "").strip()
+    if not dropped_selector:
+        return False, None
+
+    dropped_index = dropped.get("trajectory_index")
+    if not isinstance(dropped_index, int) or dropped_index < 0 or dropped_index >= len(scout_trajectory):
+        return False, None
+    source_url = str(scout_trajectory[dropped_index].get("source_url") or "").strip()
+    if not source_url:
+        return False, None
+
+    for refiner_index in range(dropped_index + 1, len(scout_trajectory)):
+        if refiner_index in claimed_refiner_indices:
+            continue
+        later = scout_trajectory[refiner_index]
+        if later.get("tool_name") != "click":
+            continue
+        if str(later.get("source_url") or "").strip() != source_url:
+            continue
+        later_selector = str(later.get("selector") or "").strip()
+        if not _stable_same_kind_bare_click_refiner(dropped_selector, later_selector):
+            continue
+        claimed_refiner_indices.add(refiner_index)
+        return True, {
+            "dropped_index": dropped_index,
+            "dropped_selector": dropped_selector,
+            "refiner_index": refiner_index,
+            "refiner_selector": later_selector,
+            "source_url": source_url,
+        }
+    return False, None
+
+
+UNCOVERED_RUNG_FINDING = "uncovered_rung"
+UNFORGIVEN_DROP_FINDING = "unforgiven_drop"
+UNRECORDED_INDEX_FINDING = "unrecorded_index"
+TRUNCATED_FINDING = "truncated"
+
+
+@dataclass(frozen=True, slots=True)
+class ObligationFinding:
+    kind: str
+    record: Mapping[str, Any] | None = None
+    trajectory_index: int | None = None
+
+
+def forgiven_dropped_indices(
+    diagnostics: SynthesisDiagnostics, scout_trajectory: Sequence[Mapping[str, Any]]
+) -> set[int]:
+    """Trajectory indices whose drop the closed forgiveness allowlist absolves, re-derived from the
+    synthesized diagnostics and trajectory so no forgiveness record needs to be transported."""
+    forgiven: set[int] = set()
+    claimed_refiner_indices: set[int] = set()
+    for dropped in diagnostics.dropped_interactions:
+        index = dropped.get("trajectory_index")
+        if _is_ignorable_entry_opener_drop(dropped, diagnostics):
+            if isinstance(index, int):
+                forgiven.add(index)
+            continue
+        superseded, _ = _bare_drop_superseded_on_screen(
+            dropped, scout_trajectory, claimed_refiner_indices=claimed_refiner_indices
+        )
+        if superseded and isinstance(index, int):
+            forgiven.add(index)
+    return forgiven
+
+
+def _recorded_partition_indices(diagnostics: SynthesisDiagnostics) -> set[int]:
+    recorded: set[int] = set()
+    for group in (
+        diagnostics.emitted_interactions,
+        diagnostics.dropped_interactions,
+        diagnostics.forgiven_interactions,
+    ):
+        for record in group:
+            index = record.get("trajectory_index")
+            if isinstance(index, int):
+                recorded.add(index)
+    return recorded
+
+
+def spine_partition_findings(
+    diagnostics: SynthesisDiagnostics,
+    draft_calls: Sequence[tuple[str, str]],
+    scout_trajectory: Sequence[Mapping[str, Any]],
+) -> list[ObligationFinding]:
+    """Partition-exhaustiveness obligation over the full retained-index manifest: an uncovered required
+    rung, a dropped interaction the allowlist does not forgive, a retained index in no record lane, or a
+    truncation are each a typed under-build finding. Forgiveness names the reason; it never absolves."""
+    findings: list[ObligationFinding] = []
+    for record in uncovered_required_emitted_interactions(diagnostics.emitted_interactions, draft_calls):
+        index = record.get("trajectory_index")
+        findings.append(
+            ObligationFinding(
+                kind=UNCOVERED_RUNG_FINDING,
+                record=record,
+                trajectory_index=index if isinstance(index, int) else None,
+            )
+        )
+    forgiven = forgiven_dropped_indices(diagnostics, scout_trajectory)
+    for dropped in diagnostics.dropped_interactions:
+        index = dropped.get("trajectory_index")
+        if isinstance(index, int) and index in forgiven:
+            continue
+        findings.append(
+            ObligationFinding(
+                kind=UNFORGIVEN_DROP_FINDING,
+                record=dropped,
+                trajectory_index=index if isinstance(index, int) else None,
+            )
+        )
+    recorded = _recorded_partition_indices(diagnostics)
+    for index in diagnostics.retained_trajectory_indices:
+        if index not in recorded:
+            findings.append(ObligationFinding(kind=UNRECORDED_INDEX_FINDING, trajectory_index=index))
+    if diagnostics.truncated:
+        findings.append(ObligationFinding(kind=TRUNCATED_FINDING))
+    return findings
+
+
+def uncovered_rung_records(findings: Sequence[ObligationFinding]) -> list[Mapping[str, Any]]:
+    return [finding.record for finding in findings if finding.kind == UNCOVERED_RUNG_FINDING and finding.record]
+
+
+def obligation_finding_reason_code(finding: ObligationFinding) -> str:
+    if finding.kind == UNCOVERED_RUNG_FINDING:
+        return SCOUTED_SPINE_UNDER_BUILD_REASON_CODE
+    if finding.kind == UNFORGIVEN_DROP_FINDING:
+        return SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE
+    if finding.kind == UNRECORDED_INDEX_FINDING:
+        return SCOUTED_SPINE_UNRECORDED_INDEX_REASON_CODE
+    return SCOUTED_SPINE_TRUNCATED_REASON_CODE
+
+
+def obligation_finding_selector(finding: ObligationFinding) -> str | None:
+    if finding.record is None:
+        return None
+    return str(finding.record.get("selector") or "") or None
+
+
+def obligation_finding_text(finding: ObligationFinding) -> str:
+    if finding.kind == UNCOVERED_RUNG_FINDING:
+        return missing_rung_text([finding.record]) if finding.record else "an uncovered scouted rung"
+    if finding.kind == UNFORGIVEN_DROP_FINDING:
+        record = finding.record or {}
+        tool_name = str(record.get("tool_name") or "unknown")
+        reason = str(record.get("reason_code") or "unknown")
+        index = record.get("trajectory_index", "?")
+        return f"dropped scout interaction {index} from `{tool_name}` ({reason})"
+    if finding.kind == UNRECORDED_INDEX_FINDING:
+        return f"scout interaction {finding.trajectory_index} was retained but landed in no persisted or forgiven lane"
+    return "the scout trajectory was truncated before every captured interaction was compiled"
+
+
+def render_obligation_findings(findings: Sequence[ObligationFinding]) -> str:
+    return "; ".join(obligation_finding_text(finding) for finding in findings)
 
 
 def missing_rung_text(uncovered: Sequence[Mapping[str, Any]]) -> str:

@@ -40,7 +40,7 @@ from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_c
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
     LIVE_SCOUT_CREDENTIAL_FIELDS,
-    SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
+    ObligationFinding,
     credential_scout_gap,
     first_matched_post_fill_submit_index,
     freeze_requested_output_extraction_candidate,
@@ -48,12 +48,16 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     is_generic_entry_opener_click,
     is_optional_dismissal_only_trajectory,
     missing_rung_text,
+    obligation_finding_reason_code,
+    obligation_finding_selector,
     render_missing_rung_call_sources,
+    render_obligation_findings,
     render_synthesized_offer_text,
+    spine_partition_findings,
     synthesize_code_block,
     synthesize_code_block_with_extraction,
     trajectory_has_browser_fill_interaction,
-    uncovered_required_emitted_interactions,
+    uncovered_rung_records,
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
@@ -474,9 +478,10 @@ _CHURN_REASON_CODES = frozenset({"code_authoring_guardrail_churn", "credential_p
 _SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL = "persisted_draft"
 
 
-def _scouted_spine_open_obligation(ctx: AgentContext) -> list[Mapping[str, Any]]:
-    """Required scouted rungs the latest persisted draft leaves uncovered; empty when no in-turn
-    persist exists or coverage holds."""
+def _scouted_spine_open_obligation(ctx: AgentContext) -> list[ObligationFinding]:
+    """Partition-exhaustiveness findings the latest persisted draft leaves open — uncovered required
+    rungs, dropped interactions the allowlist does not forgive, retained indices in no lane, and
+    truncation; empty when no in-turn persist exists or the full manifest is accounted for."""
     persisted_calls = ctx.persisted_draft_browser_calls
     if persisted_calls is None:
         return []
@@ -496,15 +501,20 @@ def _scouted_spine_open_obligation(ctx: AgentContext) -> list[Mapping[str, Any]]
     )
     if synthesized is None:
         return []
-    return uncovered_required_emitted_interactions(synthesized.diagnostics.emitted_interactions, persisted_calls)
+    return spine_partition_findings(synthesized.diagnostics, persisted_calls, trajectory)
 
 
-def _log_scouted_spine_unresolved(uncovered: list[Mapping[str, Any]], *, site: str) -> None:
+def _scouted_spine_missing_text(findings: list[ObligationFinding]) -> str:
+    uncovered = uncovered_rung_records(findings)
+    return missing_rung_text(uncovered) if uncovered else render_obligation_findings(findings)
+
+
+def _log_scouted_spine_unresolved(findings: list[ObligationFinding], *, site: str) -> None:
     LOG.info(
         "copilot_scouted_spine_under_build_unresolved",
         site=site,
-        missing_rung_count=len(uncovered),
-        missing_rungs=missing_rung_text(uncovered),
+        missing_rung_count=len(uncovered_rung_records(findings)),
+        missing_rungs=_scouted_spine_missing_text(findings),
     )
 
 
@@ -518,46 +528,50 @@ SCOUTED_SPINE_TURN_HALT_USER_REASON = (
 def log_scouted_spine_unresolved_at_turn_halt(ctx: AgentContext) -> bool:
     """Log-only and never raises: a failed obligation read must not block rendering the halt reply."""
     try:
-        uncovered = _scouted_spine_open_obligation(ctx)
+        findings = _scouted_spine_open_obligation(ctx)
     except Exception:
         LOG.warning("copilot_scouted_spine_turn_halt_check_failed", exc_info=True)
         return False
-    if not uncovered:
+    if not findings:
         return False
-    _log_scouted_spine_unresolved(uncovered, site="turn_halt")
+    _log_scouted_spine_unresolved(findings, site="turn_halt")
     return True
 
 
 def _scouted_spine_turn_end_nudge(ctx: AgentContext) -> str | None:
     try:
-        uncovered = _scouted_spine_open_obligation(ctx)
+        findings = _scouted_spine_open_obligation(ctx)
     except Exception:
         LOG.warning("copilot_scouted_spine_turn_end_check_failed", exc_info=True)
         return None
-    if not uncovered:
+    if not findings:
         return None
     if ctx.scouted_spine_checkpoint_fired:
-        _log_scouted_spine_unresolved(uncovered, site="turn_end")
+        _log_scouted_spine_unresolved(findings, site="turn_end")
         return None
     ctx.scouted_spine_checkpoint_fired = True
+    first = findings[0]
+    reason_code = obligation_finding_reason_code(first)
     repair_context = CodeAuthoringRepairContext(
         block_label=_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL,
-        reason_code=SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
-        selector=str(uncovered[0].get("selector") or "") or None,
+        reason_code=reason_code,
+        selector=obligation_finding_selector(first),
     )
     ctx.last_code_authoring_repair_context = repair_context
     record_build_test_outcome(ctx, recorded_outcome_from_authoring_repair_context(repair_context))
     _record_code_authoring_guardrail_reject(ctx)
-    missing_text = missing_rung_text(uncovered)
+    uncovered = uncovered_rung_records(findings)
+    missing_text = _scouted_spine_missing_text(findings)
     LOG.info(
         "copilot_scouted_spine_under_build",
         block_label=_SCOUTED_SPINE_CHECKPOINT_BLOCK_LABEL,
         site="turn_end",
+        reason_code=reason_code,
         missing_rung_count=len(uncovered),
         missing_rungs=missing_text,
     )
     nudge = (
-        f"The persisted draft under-builds the scouted spine ({SCOUTED_SPINE_UNDER_BUILD_REASON_CODE}): "
+        f"The persisted draft under-builds the scouted spine ({reason_code}): "
         f"missing rung(s): {missing_text}. Resubmit the code block through update_workflow so every scouted "
         "rung is replayed — reuse the synthesized code block verbatim."
     )
