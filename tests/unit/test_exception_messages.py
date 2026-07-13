@@ -38,6 +38,59 @@ def test_unknown_error_while_creating_browser_context_strips_call_log() -> None:
     assert "support@skyvern.com" in message
 
 
+def test_unknown_error_omits_browser_type_from_user_facing_message() -> None:
+    # The browser_type label can be a remote-browser vendor identity; keep it on the
+    # exception for structured logs but never surface it in the user-facing message.
+    sentinel = "zzz-secret-browser-label"
+    error = UnknownErrorWhileCreatingBrowserContext(sentinel, RuntimeError("setup failed"))
+    message = str(error)
+
+    assert sentinel not in message
+    assert error.browser_type == sentinel
+    assert "Failed to create browser context" in message
+
+
+def test_unknown_error_renders_redacted_inner_type_name() -> None:
+    # A SkyvernException may hide a sensitive class name behind user_facing_type_name; the
+    # wrapper must render that neutral token, never the real class name.
+    class _SecretVendorRateLimitError(SkyvernException):
+        @property
+        def user_facing_type_name(self) -> str:
+            return "RemoteBrowserRateLimitError"
+
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", _SecretVendorRateLimitError("slow down"))
+    message = str(error)
+
+    assert "SecretVendor" not in message
+    assert "RemoteBrowserRateLimitError" in message
+
+
+def test_unknown_error_preserves_real_inner_type_name_by_default() -> None:
+    # Failure classification keys off the parenthesized inner class name in the message, so a
+    # plain SkyvernException (no redaction) must still surface its real class name.
+    class _PlainProxyError(SkyvernException):
+        pass
+
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", _PlainProxyError("no proxy available"))
+    assert "_PlainProxyError" in str(error)
+
+
+def test_unknown_error_redacts_raw_cdp_endpoint_url() -> None:
+    # A raw connect_over_cdp failure echoes the ws/wss endpoint, which can carry the vendor
+    # host, a session-bearing query, or embedded credentials — none may reach the user.
+    inner_exception = Exception(
+        "browserType.connectOverCDP: WebSocket error: "
+        "wss://user:secret@remote.example.internal/session/tok-9f3a?apiKey=SEKRET connect ECONNREFUSED"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "wss://" not in message
+    assert "tok-9f3a" not in message
+    assert "SEKRET" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
 def test_captcha_not_solved_in_time_is_captcha_solve_error() -> None:
     # The action handler catches CaptchaSolveError before its generic arm; this
     # subclass relationship is what routes captcha-solve failures to the handled
