@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from asyncio import CancelledError
 from datetime import datetime
 from types import SimpleNamespace
@@ -14,12 +15,103 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     EXTRACT_ACTION_PROMPT_NAME,
     GEMINI_SAFETY_SETTINGS,
     LLMAPIHandlerFactory,
+    LLMCaller,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import FakeLLMResponse
+
+
+@pytest.mark.asyncio
+async def test_native_openai_compatible_capture_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native OpenAI-compatible calls retain Tokenless's routed request ID."""
+    request_kwargs: list[dict[str, Any]] = []
+
+    class FakeCompletion:
+        _request_id = "req_tokenless_123"
+
+        def model_dump(self) -> dict[str, Any]:
+            return {
+                "id": "chatcmpl_123",
+                "object": "chat.completion",
+                "model": "tokenless-ultra-saver",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> FakeCompletion:
+            request_kwargs.append(kwargs)
+            assert kwargs["model"] == "tokenless-ultra-saver"
+            assert kwargs["tools"] is None
+            return FakeCompletion()
+
+    class FakeClient:
+        chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    caller = object.__new__(LLMCaller)
+    caller.openai_client = FakeClient()
+    caller._native_openai_compatible = True
+    caller.original_llm_key = "OPENAI_COMPATIBLE"
+    caller.llm_key = "tokenless-pro"
+    caller.llm_config = SimpleNamespace(model_name="openai/tokenless-pro")
+
+    monkeypatch.setattr(api_handler_factory.settings, "SKYVERN_APP_URL", "")
+    monkeypatch.setattr(api_handler_factory.settings, "OPENAI_COMPATIBLE_MODEL_NAME", "tokenless-pro")
+    monkeypatch.setattr(
+        api_handler_factory.settings,
+        "OPENAI_COMPATIBLE_ADDITIONAL_MODEL_NAMES",
+        "tokenless-ultra-saver",
+    )
+    context = SimpleNamespace(
+        task_v2_id="tsk_eval_123",
+        task_id=None,
+        task_v2_requested_model="tokenless-ultra-saver",
+        tokenless_session_id=None,
+    )
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
+
+    response = await caller._dispatch_llm_call(messages=[{"role": "user", "content": "hello"}])
+    await caller._dispatch_llm_call(messages=[{"role": "user", "content": "hello again"}])
+
+    assert response.model == "tokenless-ultra-saver"
+    stats = await caller.get_call_stats(response)
+    assert stats.provider_request_id == "req_tokenless_123"
+    assert stats.input_tokens == 3
+    assert stats.output_tokens == 2
+    session_ids = [kwargs["extra_headers"]["Session-Id"] for kwargs in request_kwargs]
+    assert session_ids[0] == session_ids[1]
+    assert re.fullmatch(r"eval_skyvern_tsk_eval_123_\d{8}T\d{6}\.\d{6}Z", session_ids[0])
+
+
+def test_native_openai_compatible_handler_uses_llm_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The factory must select the native path when Tokenless instrumentation is enabled."""
+    llm_config = LLMConfig(
+        model_name="openai/tokenless-pro",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.settings, "OPENAI_COMPATIBLE_MODEL_KEY", "OPENAI_COMPATIBLE")
+    monkeypatch.setattr(api_handler_factory.settings, "OPENAI_COMPATIBLE_MODEL_NAME", "tokenless-pro")
+    monkeypatch.setattr(api_handler_factory.settings, "OPENAI_COMPATIBLE_USE_NATIVE_CLIENT", True)
+    monkeypatch.setattr(api_handler_factory.settings, "OPENAI_COMPATIBLE_API_KEY", "test-key")
+    monkeypatch.setattr(api_handler_factory.settings, "OPENAI_COMPATIBLE_API_BASE", "https://example.com/openai/v1")
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", MagicMock())
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("OPENAI_COMPATIBLE")
+
+    assert handler.__self__._native_openai_compatible is True
 
 
 @pytest.mark.asyncio

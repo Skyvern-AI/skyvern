@@ -54,6 +54,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.tokenless_usage import tokenless_usage_tracker
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts
 from skyvern.forge.sdk.cache import extraction_cache
@@ -133,6 +134,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
     WorkflowRequestBody,
     WorkflowRun,
+    WorkflowRunEvaluationCost,
+    WorkflowRunEvaluationLLMCall,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunResponseBase,
@@ -579,6 +582,133 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
     suffix = f" (auto-saved: {key})"
     title = _truncate_managed_browser_profile_part(title, MANAGED_BROWSER_PROFILE_NAME_MAX_LENGTH - len(suffix))
     return f"{title}{suffix}"
+
+
+def _build_task_v2_evaluation_metrics(
+    workflow_run_id: str,
+    calls: list[Any],
+    run_metrics: Any | None,
+) -> dict[str, Any]:
+    """Convert durable Task V2 call rows into the evaluator's safe report shape."""
+    call_type_counts = {
+        "planner": 0,
+        "check_completion": 0,
+        "generate_extraction_task": 0,
+        "generate_task_block": 0,
+        "extract_actions": 0,
+    }
+    model_call_counts: dict[str, int] = {}
+    prompt_call_counts: dict[str, int] = {}
+    llm_calls: list[WorkflowRunEvaluationLLMCall] = []
+    reasoning_tokens = 0
+    image_tokens = 0
+    for call in calls:
+        call_type = getattr(call, "call_type", "")
+        if call_type in call_type_counts:
+            call_type_counts[call_type] += 1
+        model = getattr(call, "model", None) or getattr(call, "requested_model", None)
+        if model:
+            model_call_counts[model] = model_call_counts.get(model, 0) + 1
+        prompt_name = getattr(call, "prompt_name", None)
+        if prompt_name:
+            prompt_call_counts[prompt_name] = prompt_call_counts.get(prompt_name, 0) + 1
+        reasoning_tokens += int(getattr(call, "reasoning_token_count", 0) or 0)
+        image_tokens += int(getattr(call, "image_token_count", 0) or 0)
+        llm_calls.append(
+            WorkflowRunEvaluationLLMCall(
+                call_id=call.task_v2_llm_call_id,
+                prompt_name=prompt_name or "unknown",
+                call_type=call_type or "other",
+                task_type=getattr(call, "task_type", None),
+                organization_id=getattr(call, "organization_id", None),
+                workflow_run_id=workflow_run_id,
+                workflow_id=getattr(call, "workflow_id", None),
+                workflow_permanent_id=getattr(call, "workflow_permanent_id", None),
+                task_v2_id=call.task_v2_id,
+                task_id=getattr(call, "task_id", None),
+                step_id=getattr(call, "step_id", None),
+                thought_id=getattr(call, "thought_id", None),
+                workflow_run_block_id=getattr(call, "workflow_run_block_id", None),
+                iteration=getattr(call, "iteration", None),
+                loop_item_count=getattr(call, "loop_item_count", None),
+                loop_index=getattr(call, "loop_index", None),
+                retry_index=int(getattr(call, "retry_index", 0) or 0),
+                is_speculative=bool(getattr(call, "is_speculative", False)),
+                llm_key=getattr(call, "llm_key", None),
+                model=getattr(call, "model", None),
+                requested_model=getattr(call, "requested_model", None),
+                input_tokens=int(getattr(call, "input_token_count", 0) or 0),
+                output_tokens=int(getattr(call, "output_token_count", 0) or 0),
+                reasoning_tokens=int(getattr(call, "reasoning_token_count", 0) or 0),
+                image_tokens=int(getattr(call, "image_token_count", 0) or 0),
+                cached_tokens=int(getattr(call, "cached_token_count", 0) or 0),
+                llm_cost_usd=(float(call.llm_cost) if call.llm_cost is not None else None),
+            )
+        )
+
+    iteration_count = int(getattr(run_metrics, "iteration_count", 0) or 0)
+    loop_item_count = int(getattr(run_metrics, "loop_item_count", 0) or 0)
+    retry_count = int(getattr(run_metrics, "retry_count", 0) or 0)
+    if calls:
+        iteration_count = max(
+            iteration_count,
+            max((getattr(call, "iteration", -1) or -1) + 1 for call in calls),
+        )
+        loop_item_count = max(
+            loop_item_count,
+            max(getattr(call, "loop_item_count", 0) or 0 for call in calls),
+        )
+        retry_count = max(
+            retry_count,
+            sum(1 for call in calls if (getattr(call, "retry_index", 0) or 0) > 0),
+        )
+
+    return {
+        "reasoning_tokens": reasoning_tokens,
+        "image_tokens": image_tokens,
+        "planner_call_count": call_type_counts["planner"],
+        "check_completion_call_count": call_type_counts["check_completion"],
+        "generate_extraction_task_call_count": call_type_counts["generate_extraction_task"],
+        "generate_task_block_call_count": call_type_counts["generate_task_block"],
+        "extract_actions_call_count": call_type_counts["extract_actions"],
+        "iteration_count": iteration_count,
+        "loop_item_count": loop_item_count,
+        "retry_count": retry_count,
+        "model_call_counts": model_call_counts,
+        "prompt_call_counts": prompt_call_counts,
+        "llm_calls": llm_calls,
+    }
+
+
+async def _get_task_v2_observability(
+    workflow_run_id: str,
+    organization_id: str,
+) -> tuple[list[Any], Any | None]:
+    """Read optional Task V2 metrics without breaking legacy/fake database adapters."""
+    observer = app.DATABASE.observer
+    calls: list[Any] = []
+    run_metrics = None
+    get_calls = getattr(observer, "get_task_v2_llm_calls_by_workflow_run_id", None)
+    if get_calls is not None:
+        try:
+            calls = await get_calls(workflow_run_id=workflow_run_id, organization_id=organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to read Task V2 LLM call metrics",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+    get_run_metrics = getattr(observer, "get_task_v2_run_metrics", None)
+    if get_run_metrics is not None:
+        try:
+            run_metrics = await get_run_metrics(workflow_run_id, organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to read Task V2 run metrics",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+    return calls, run_metrics
 
 
 class WorkflowService:
@@ -6805,6 +6935,101 @@ class WorkflowService:
             block_task,
         )
         return step_cost_sum + thought_cost_sum + block_llm_cost_sum
+
+    async def get_workflow_run_evaluation_cost(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> WorkflowRunEvaluationCost:
+        """Return target-agent LLM cost and token usage for an evaluation run.
+
+        Tokenless costs are resolved from its per-request usage API because the
+        router can fan out to multiple underlying model calls. Other providers use
+        Skyvern's existing database-backed LLM cost aggregation.
+        """
+        task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        tokenless_llm_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
+        is_tokenless_run = task_v2 is not None and task_v2.llm_key == tokenless_llm_key
+
+        if is_tokenless_run:
+            persisted_calls, run_metrics = await _get_task_v2_observability(workflow_run_id, organization_id)
+            persisted_request_call_ids = {
+                call.provider_request_id: call.task_v2_llm_call_id
+                for call in persisted_calls
+                if getattr(call, "provider_request_id", None)
+            }
+            tokenless_cost = await tokenless_usage_tracker.resolve(
+                workflow_run_id,
+                persisted_request_call_ids=persisted_request_call_ids,
+            )
+            observer = app.DATABASE.observer
+            update_call = getattr(observer, "update_task_v2_llm_call", None)
+            if update_call is not None:
+                for call_cost in tokenless_cost.resolved_call_costs:
+                    if call_cost.call_id is None:
+                        continue
+                    try:
+                        await update_call(
+                            call_cost.call_id,
+                            organization_id,
+                            llm_cost=call_cost.cost_nanos / 1_000_000_000,
+                            input_token_count=call_cost.input_tokens,
+                            output_token_count=call_cost.output_tokens,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to persist resolved Tokenless call cost",
+                            workflow_run_id=workflow_run_id,
+                            exc_info=True,
+                        )
+            calls, run_metrics = await _get_task_v2_observability(workflow_run_id, organization_id)
+            return WorkflowRunEvaluationCost(
+                workflow_run_id=workflow_run_id,
+                agent_cost_usd=tokenless_cost.agent_cost_usd,
+                input_tokens=tokenless_cost.input_tokens,
+                output_tokens=tokenless_cost.output_tokens,
+                tokenless_request_count=tokenless_cost.tokenless_request_count,
+                cost_status=tokenless_cost.cost_status,
+                **_build_task_v2_evaluation_metrics(workflow_run_id, calls, run_metrics),
+            )
+
+        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
+        task_ids = [task.task_id for task in workflow_run_tasks]
+        step_cost, thought_cost, block_cost, step_tokens, thought_tokens = await asyncio.gather(
+            app.DATABASE.tasks.get_step_cost_sum_by_task_ids(
+                task_ids=task_ids,
+                organization_id=organization_id,
+            ),
+            app.DATABASE.observer.get_thought_cost_sum_by_workflow_run_id(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ),
+            app.DATABASE.observer.get_block_llm_cost_sum_by_workflow_run_id(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ),
+            app.DATABASE.tasks.get_step_token_sums_by_task_ids(
+                task_ids=task_ids,
+                organization_id=organization_id,
+            ),
+            app.DATABASE.observer.get_thought_token_sums_by_workflow_run_id(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ),
+        )
+        calls, run_metrics = await _get_task_v2_observability(workflow_run_id, organization_id)
+        task_v2_metrics = _build_task_v2_evaluation_metrics(workflow_run_id, calls, run_metrics)
+        return WorkflowRunEvaluationCost(
+            workflow_run_id=workflow_run_id,
+            agent_cost_usd=step_cost + thought_cost + block_cost,
+            input_tokens=step_tokens[0] + thought_tokens[0],
+            output_tokens=step_tokens[1] + thought_tokens[1],
+            cost_status="exact",
+            **task_v2_metrics,
+        )
 
     async def build_workflow_run_status_response_by_workflow_id(
         self,

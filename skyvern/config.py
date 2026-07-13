@@ -416,6 +416,9 @@ class Settings(BaseSettings):
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
+    # Comma-separated aliases served by the same endpoint. Task V2 preserves the
+    # selected alias and the native client sends it as the request model.
+    OPENAI_COMPATIBLE_ADDITIONAL_MODEL_NAMES: str | None = None
     OPENAI_COMPATIBLE_API_KEY: str | None = None
     OPENAI_COMPATIBLE_API_BASE: str | None = None
     OPENAI_COMPATIBLE_API_VERSION: str | None = None
@@ -424,6 +427,7 @@ class Settings(BaseSettings):
     OPENAI_COMPATIBLE_SUPPORTS_VISION: bool = False
     OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX: bool = False
     OPENAI_COMPATIBLE_MODEL_KEY: str = "OPENAI_COMPATIBLE"
+    OPENAI_COMPATIBLE_USE_NATIVE_CLIENT: bool = False
     OPENAI_COMPATIBLE_REASONING_EFFORT: str | None = None
     OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN: str = "githubcopilot.com"
 
@@ -775,6 +779,20 @@ class Settings(BaseSettings):
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
+    def get_openai_compatible_model_names(self) -> list[str]:
+        """Return configured OpenAI-compatible model names in stable order."""
+        candidates = [self.OPENAI_COMPATIBLE_MODEL_NAME]
+        if self.OPENAI_COMPATIBLE_ADDITIONAL_MODEL_NAMES:
+            candidates.extend(self.OPENAI_COMPATIBLE_ADDITIONAL_MODEL_NAMES.split(","))
+        names: list[str] = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            name = candidate.strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
@@ -848,6 +866,13 @@ class Settings(BaseSettings):
         ]
         for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:
             mapping[model_name] = {"llm_key": azure_key if azure_enabled else openai_key, "label": label}
+
+        if self.ENABLE_OPENAI_COMPATIBLE:
+            for model_name in self.get_openai_compatible_model_names():
+                mapping[model_name] = {
+                    "llm_key": self.OPENAI_COMPATIBLE_MODEL_KEY,
+                    "label": f"OpenAI-compatible: {model_name}",
+                }
 
         # Anthropic models: prefer Bedrock when enabled, fall back to direct API
         if self.ENABLE_BEDROCK_ANTHROPIC:

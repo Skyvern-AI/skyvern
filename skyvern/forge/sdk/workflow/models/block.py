@@ -2398,6 +2398,7 @@ class ForLoopBlock(Block):
         outputs_with_loop_values: list[list[dict[str, Any]]] = []
         block_outputs: list[BlockResult] = []
         current_block: BlockTypeVar | None = None
+        task_v2_context = skyvern_context.current()
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
@@ -2529,14 +2530,21 @@ class ForLoopBlock(Block):
                     if cond_label in conditional_wrb_ids:
                         parent_wrb_id = conditional_wrb_ids[cond_label]
 
-                block_output = await loop_block.execute_safe(
-                    workflow_run_id=workflow_run_id,
-                    parent_workflow_run_block_id=parent_wrb_id,
-                    organization_id=organization_id,
-                    browser_session_id=browser_session_id,
-                    current_value=str(loop_over_value),
-                    current_index=loop_idx,
-                )
+                previous_task_v2_loop_index = task_v2_context.task_v2_loop_index if task_v2_context else None
+                if task_v2_context and task_v2_context.task_v2_id:
+                    task_v2_context.task_v2_loop_index = loop_idx
+                try:
+                    block_output = await loop_block.execute_safe(
+                        workflow_run_id=workflow_run_id,
+                        parent_workflow_run_block_id=parent_wrb_id,
+                        organization_id=organization_id,
+                        browser_session_id=browser_session_id,
+                        current_value=str(loop_over_value),
+                        current_index=loop_idx,
+                    )
+                finally:
+                    if task_v2_context and task_v2_context.task_v2_id:
+                        task_v2_context.task_v2_loop_index = previous_task_v2_loop_index
 
                 # Track conditional workflow_run_block_ids so branch targets
                 # can be parented to them.
@@ -2728,6 +2736,8 @@ class ForLoopBlock(Block):
         # ensures stale per-iteration baselines don't leak into subsequent blocks.
         outer_context = skyvern_context.current()
         outer_loop_state = outer_context.loop_internal_state if outer_context else None
+        outer_task_v2_loop_item_count = outer_context.task_v2_loop_item_count if outer_context else None
+        outer_task_v2_loop_index = outer_context.task_v2_loop_index if outer_context else None
         try:
             return await self._run_loop(
                 workflow_run_id=workflow_run_id,
@@ -2739,6 +2749,8 @@ class ForLoopBlock(Block):
         finally:
             if outer_context:
                 outer_context.loop_internal_state = outer_loop_state
+                outer_context.task_v2_loop_item_count = outer_task_v2_loop_item_count
+                outer_context.task_v2_loop_index = outer_task_v2_loop_index
 
     async def _run_loop(
         self,
@@ -2770,6 +2782,23 @@ class ForLoopBlock(Block):
             organization_id=organization_id,
             loop_values=loop_over_values,
         )
+        task_v2_context = skyvern_context.current()
+        task_v2_organization_id = organization_id or (task_v2_context.organization_id if task_v2_context else None)
+        if task_v2_context and task_v2_context.task_v2_id:
+            task_v2_context.task_v2_loop_item_count = len(loop_over_values)
+            if task_v2_organization_id:
+                try:
+                    await app.DATABASE.observer.increment_task_v2_loop_item_count(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=task_v2_organization_id,
+                        item_count=len(loop_over_values),
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to persist Task V2 loop item metrics",
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
 
         LOG.info(
             f"Number of loop_over values: {len(loop_over_values)}",

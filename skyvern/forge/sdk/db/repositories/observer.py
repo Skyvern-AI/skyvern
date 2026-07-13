@@ -16,7 +16,9 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
 from skyvern.forge.sdk.db.models import (
+    TaskV2LLMCallModel,
     TaskV2Model,
+    TaskV2RunMetricsModel,
     ThoughtModel,
     WorkflowRunBlockModel,
 )
@@ -141,6 +143,24 @@ class ObserverRepository(BaseRepository):
             total = (await session.execute(query)).scalar_one()
             return float(total)
 
+    @db_operation("get_thought_token_sums_by_workflow_run_id")
+    async def get_thought_token_sums_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> tuple[int, int]:
+        """Sum input and output LLM tokens across thoughts for a workflow run."""
+        async with self.Session() as session:
+            query = select(
+                func.coalesce(func.sum(ThoughtModel.input_token_count), 0),
+                func.coalesce(func.sum(ThoughtModel.output_token_count), 0),
+            ).where(
+                ThoughtModel.workflow_run_id == workflow_run_id,
+                ThoughtModel.organization_id == organization_id,
+            )
+            input_tokens, output_tokens = (await session.execute(query)).one()
+            return int(input_tokens), int(output_tokens)
+
     @db_operation("get_block_llm_cost_sum_by_workflow_run_id")
     async def get_block_llm_cost_sum_by_workflow_run_id(self, workflow_run_id: str, organization_id: str) -> float:
         """Sum `llm_cost` across all workflow_run_blocks for this workflow_run_id."""
@@ -152,6 +172,171 @@ class ObserverRepository(BaseRepository):
             )
             total = (await session.execute(query)).scalar_one()
             return float(total)
+
+    @db_operation("ensure_task_v2_run_metrics")
+    async def ensure_task_v2_run_metrics(
+        self,
+        *,
+        task_v2_id: str,
+        workflow_run_id: str,
+        organization_id: str,
+        workflow_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+    ) -> None:
+        """Create the durable Task V2 run counter row if it does not exist."""
+        async with self.Session() as session:
+            metrics = (
+                await session.scalars(
+                    select(TaskV2RunMetricsModel).where(
+                        TaskV2RunMetricsModel.workflow_run_id == workflow_run_id,
+                        TaskV2RunMetricsModel.organization_id == organization_id,
+                    )
+                )
+            ).first()
+            if metrics is None:
+                session.add(
+                    TaskV2RunMetricsModel(
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        workflow_id=workflow_id,
+                        workflow_permanent_id=workflow_permanent_id,
+                    )
+                )
+                await session.commit()
+
+    @db_operation("record_task_v2_iteration")
+    async def record_task_v2_iteration(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        iteration_count: int,
+    ) -> None:
+        """Persist the number of planning iterations reached by a Task V2 run."""
+        async with self.Session() as session:
+            metrics = (
+                await session.scalars(
+                    select(TaskV2RunMetricsModel).where(
+                        TaskV2RunMetricsModel.workflow_run_id == workflow_run_id,
+                        TaskV2RunMetricsModel.organization_id == organization_id,
+                    )
+                )
+            ).first()
+            if metrics is not None:
+                metrics.iteration_count = max(metrics.iteration_count or 0, iteration_count)
+                await session.commit()
+
+    @db_operation("increment_task_v2_loop_item_count")
+    async def increment_task_v2_loop_item_count(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        item_count: int,
+    ) -> None:
+        """Add generated loop items to a Task V2 run's durable counter."""
+        if item_count <= 0:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                update(TaskV2RunMetricsModel)
+                .where(
+                    TaskV2RunMetricsModel.workflow_run_id == workflow_run_id,
+                    TaskV2RunMetricsModel.organization_id == organization_id,
+                )
+                .values(loop_item_count=TaskV2RunMetricsModel.loop_item_count + item_count)
+            )
+            await session.commit()
+
+    @db_operation("increment_task_v2_retry_count")
+    async def increment_task_v2_retry_count(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> None:
+        """Increment the durable count of LLM calls made on a retry attempt."""
+        async with self.Session() as session:
+            await session.execute(
+                update(TaskV2RunMetricsModel)
+                .where(
+                    TaskV2RunMetricsModel.workflow_run_id == workflow_run_id,
+                    TaskV2RunMetricsModel.organization_id == organization_id,
+                )
+                .values(retry_count=TaskV2RunMetricsModel.retry_count + 1)
+            )
+            await session.commit()
+
+    @db_operation("get_task_v2_run_metrics")
+    async def get_task_v2_run_metrics(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> TaskV2RunMetricsModel | None:
+        """Return durable Task V2 run counters."""
+        async with self.Session() as session:
+            return (
+                await session.scalars(
+                    select(TaskV2RunMetricsModel).where(
+                        TaskV2RunMetricsModel.workflow_run_id == workflow_run_id,
+                        TaskV2RunMetricsModel.organization_id == organization_id,
+                    )
+                )
+            ).first()
+
+    @db_operation("create_task_v2_llm_call")
+    async def create_task_v2_llm_call(self, **values: Any) -> str:
+        """Persist one successful LLM response associated with a Task V2 run."""
+        async with self.Session() as session:
+            call = TaskV2LLMCallModel(**values)
+            session.add(call)
+            await session.flush()
+            call_id = call.task_v2_llm_call_id
+            await session.commit()
+            return call_id
+
+    @db_operation("update_task_v2_llm_call")
+    async def update_task_v2_llm_call(
+        self,
+        task_v2_llm_call_id: str,
+        organization_id: str,
+        **values: Any,
+    ) -> None:
+        """Update dimensions learned after an LLM response, such as task type."""
+        if not values:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                update(TaskV2LLMCallModel)
+                .where(
+                    TaskV2LLMCallModel.task_v2_llm_call_id == task_v2_llm_call_id,
+                    TaskV2LLMCallModel.organization_id == organization_id,
+                )
+                .values(**values)
+            )
+            await session.commit()
+
+    @db_operation("get_task_v2_llm_calls_by_workflow_run_id")
+    async def get_task_v2_llm_calls_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> list[TaskV2LLMCallModel]:
+        """Return Task V2 LLM calls in creation order for a workflow run."""
+        async with self.Session() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(TaskV2LLMCallModel)
+                        .where(
+                            TaskV2LLMCallModel.workflow_run_id == workflow_run_id,
+                            TaskV2LLMCallModel.organization_id == organization_id,
+                        )
+                        .order_by(TaskV2LLMCallModel.created_at, TaskV2LLMCallModel.task_v2_llm_call_id)
+                    )
+                ).all()
+            )
 
     @db_operation("increment_workflow_run_block_llm_cost")
     async def increment_workflow_run_block_llm_cost(

@@ -83,6 +83,15 @@ class SkyvernContext:
     workflow_run_id: str | None = None
     root_workflow_run_id: str | None = None
     task_v2_id: str | None = None
+    # Task V2 evaluation dimensions propagated to every LLM call in the run.
+    task_v2_iteration: int | None = None
+    task_v2_task_type: str | None = None
+    task_v2_loop_item_count: int | None = None
+    task_v2_loop_index: int | None = None
+    task_v2_retry_index: int = 0
+    task_v2_last_llm_call_id: str | None = None
+    task_v2_requested_model: str | None = None
+    tokenless_session_id: str | None = None
     max_steps_override: int | None = None
     browser_session_id: str | None = None
     browser_runtime: str | None = None

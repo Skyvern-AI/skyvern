@@ -129,6 +129,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowRequestBody,
     WorkflowRun,
+    WorkflowRunEvaluationCost,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
     WorkflowRunWithWorkflowResponse,
@@ -4400,6 +4401,30 @@ async def get_workflow_runs_by_id_legacy(
         created_at_start=created_at_start,
         created_at_end=created_at_end,
         exclude_child_runs=False,
+    )
+
+
+@legacy_base_router.get(
+    "/workflows/{workflow_id}/runs/{workflow_run_id}/evaluation-cost",
+    response_model=WorkflowRunEvaluationCost,
+    tags=["agent"],
+)
+async def get_workflow_run_evaluation_cost(
+    workflow_id: str,
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowRunEvaluationCost:
+    """Return exact target-agent LLM usage for an evaluation workflow run."""
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+        filter_deleted=False,
+    )
+    if workflow.workflow_permanent_id != workflow_id:
+        raise WorkflowNotFound(workflow_permanent_id=workflow_id)
+    return await app.WORKFLOW_SERVICE.get_workflow_run_evaluation_cost(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
     )
 
 

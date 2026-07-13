@@ -49,6 +49,8 @@ GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
 MICROSOFT_OAUTH_CREDENTIAL_PREFIX = "moac"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
+TASK_V2_LLM_CALL_PREFIX = "t2c"
+TASK_V2_RUN_METRICS_PREFIX = "t2m"
 THOUGHT_ID = "ot"
 ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
@@ -210,6 +212,16 @@ def generate_action_id() -> str:
 def generate_task_v2_id() -> str:
     int_id = generate_id()
     return f"{TASK_V2_ID}_{int_id}"
+
+
+def generate_task_v2_llm_call_id() -> str:
+    int_id = generate_id()
+    return f"{TASK_V2_LLM_CALL_PREFIX}_{int_id}"
+
+
+def generate_task_v2_run_metrics_id() -> str:
+    int_id = generate_id()
+    return f"{TASK_V2_RUN_METRICS_PREFIX}_{int_id}"
 
 
 def generate_thought_id() -> str:

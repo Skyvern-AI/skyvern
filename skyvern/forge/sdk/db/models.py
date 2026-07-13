@@ -63,6 +63,8 @@ from skyvern.forge.sdk.db.id import (
     generate_task_id,
     generate_task_run_id,
     generate_task_v2_id,
+    generate_task_v2_llm_call_id,
+    generate_task_v2_run_metrics_id,
     generate_thought_id,
     generate_totp_code_id,
     generate_workflow_copilot_chat_id,
@@ -1233,6 +1235,77 @@ class TaskV2Model(Base):
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     model = Column(JSON, nullable=True)
     failure_category = Column(JSON, nullable=True)
+
+
+class TaskV2RunMetricsModel(Base):
+    """Durable run-level counters for Task V2 evaluations."""
+
+    __tablename__ = "task_v2_run_metrics"
+    __table_args__ = (
+        Index("t2rm_org_created_at_index", "organization_id", "created_at"),
+        Index("t2rm_org_wfr_index", "organization_id", "workflow_run_id"),
+    )
+
+    task_v2_run_metrics_id = Column(String, primary_key=True, default=generate_task_v2_run_metrics_id)
+    task_v2_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False, unique=True)
+    workflow_id = Column(String, nullable=True)
+    workflow_permanent_id = Column(String, nullable=True)
+    iteration_count = Column(Integer, nullable=False, default=0, server_default="0")
+    loop_item_count = Column(Integer, nullable=False, default=0, server_default="0")
+    retry_count = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class TaskV2LLMCallModel(Base):
+    """One durable record for every successful LLM response associated with Task V2."""
+
+    __tablename__ = "task_v2_llm_calls"
+    __table_args__ = (
+        Index("t2llm_org_created_at_index", "organization_id", "created_at"),
+        Index("t2llm_org_wfr_index", "organization_id", "workflow_run_id"),
+        Index("t2llm_wfr_prompt_index", "workflow_run_id", "prompt_name"),
+        Index("t2llm_wfr_model_index", "workflow_run_id", "model"),
+        Index("t2llm_wfr_provider_request_index", "workflow_run_id", "provider_request_id"),
+    )
+
+    task_v2_llm_call_id = Column(String, primary_key=True, default=generate_task_v2_llm_call_id)
+    task_v2_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    workflow_id = Column(String, nullable=True)
+    workflow_permanent_id = Column(String, nullable=True)
+    task_id = Column(String, nullable=True)
+    step_id = Column(String, nullable=True)
+    thought_id = Column(String, nullable=True)
+    workflow_run_block_id = Column(String, nullable=True)
+
+    call_type = Column(String, nullable=False)
+    prompt_name = Column(String, nullable=False)
+    task_type = Column(String, nullable=True)
+    iteration = Column(Integer, nullable=True)
+    loop_item_count = Column(Integer, nullable=True)
+    loop_index = Column(Integer, nullable=True)
+    retry_index = Column(Integer, nullable=False, default=0, server_default="0")
+    is_speculative = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+
+    llm_key = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    requested_model = Column(String, nullable=True)
+    # Internal-only Tokenless attribution key. It is intentionally excluded from API models and logs.
+    provider_request_id = Column(String, nullable=True)
+    input_token_count = Column(Integer, nullable=False, default=0, server_default="0")
+    output_token_count = Column(Integer, nullable=False, default=0, server_default="0")
+    reasoning_token_count = Column(Integer, nullable=False, default=0, server_default="0")
+    image_token_count = Column(Integer, nullable=False, default=0, server_default="0")
+    cached_token_count = Column(Integer, nullable=False, default=0, server_default="0")
+    llm_cost = Column(Numeric, nullable=True)
+
+    status = Column(String, nullable=False, default="completed", server_default="'completed'")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
 
 class ThoughtModel(Base):

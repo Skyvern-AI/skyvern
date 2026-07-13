@@ -25,6 +25,23 @@ csv_headers = [
     "is_updated",
     "workflow_permanent_id",
     "workflow_run_id",
+    "agent_cost_usd",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "image_tokens",
+    "planner_call_count",
+    "check_completion_call_count",
+    "generate_extraction_task_call_count",
+    "generate_task_block_call_count",
+    "extract_actions_call_count",
+    "iteration_count",
+    "loop_item_count",
+    "retry_count",
+    "model_call_counts",
+    "prompt_call_counts",
+    "llm_calls",
+    "cost_status",
 ]
 
 BATCH_SIZE = 5
@@ -34,11 +51,32 @@ async def process_record(client: SkyvernClient, one_record: dict[str, Any]) -> d
     workflow_pid: str = one_record.get("workflow_permanent_id", "")
     workflow_run_id: str = one_record.get("workflow_run_id", "")
     workflow_run_response = await client.get_workflow_run(workflow_pid=workflow_pid, workflow_run_id=workflow_run_id)
+    evaluation_cost = await client.get_workflow_run_evaluation_cost(
+        workflow_pid=workflow_pid,
+        workflow_run_id=workflow_run_id,
+    )
     one_record.update(
         {
             "status": str(workflow_run_response.status),
-            "summary": workflow_run_response.task_v2.summary,
-            "output": workflow_run_response.task_v2.output,
+            "summary": workflow_run_response.task_v2.summary if workflow_run_response.task_v2 else None,
+            "output": workflow_run_response.task_v2.output if workflow_run_response.task_v2 else None,
+            "agent_cost_usd": evaluation_cost.agent_cost_usd,
+            "input_tokens": evaluation_cost.input_tokens,
+            "output_tokens": evaluation_cost.output_tokens,
+            "reasoning_tokens": evaluation_cost.reasoning_tokens,
+            "image_tokens": evaluation_cost.image_tokens,
+            "planner_call_count": evaluation_cost.planner_call_count,
+            "check_completion_call_count": evaluation_cost.check_completion_call_count,
+            "generate_extraction_task_call_count": evaluation_cost.generate_extraction_task_call_count,
+            "generate_task_block_call_count": evaluation_cost.generate_task_block_call_count,
+            "extract_actions_call_count": evaluation_cost.extract_actions_call_count,
+            "iteration_count": evaluation_cost.iteration_count,
+            "loop_item_count": evaluation_cost.loop_item_count,
+            "retry_count": evaluation_cost.retry_count,
+            "model_call_counts": json.dumps(evaluation_cost.model_call_counts, sort_keys=True),
+            "prompt_call_counts": json.dumps(evaluation_cost.prompt_call_counts, sort_keys=True),
+            "llm_calls": json.dumps([call.model_dump() for call in evaluation_cost.llm_calls]),
+            "cost_status": evaluation_cost.cost_status,
         }
     )
     if workflow_run_response.status != WorkflowRunStatus.completed:

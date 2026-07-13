@@ -19,6 +19,7 @@ load_dotenv()
 async def create_task_v2(
     base_url: str,
     cred: str,
+    model_name: str | None = None,
 ) -> None:
     start_forge_app()
 
@@ -43,6 +44,7 @@ async def create_task_v2(
             request_body = TaskV2Request(
                 url=case_data.url,
                 user_prompt=case_data.question,
+                model={"model_name": model_name} if model_name else None,
             )
             task_v2 = evaluator.queue_skyvern_task_v2(cruise_request=request_body, max_step=case_data.max_steps)
             dumped_data = case_data.model_dump()
@@ -64,8 +66,13 @@ async def create_task_v2(
 def main(
     base_url: str = typer.Option(..., "--base-url", help="base url for Skyvern client"),
     cred: str = typer.Option(..., "--cred", help="credential for Skyvern organization"),
+    model_name: str | None = typer.Option(
+        None,
+        "--model-name",
+        help="model name to use for Task V2, e.g. gemini-3.5-flash or tokenless-pro",
+    ),
 ) -> None:
-    asyncio.run(create_task_v2(base_url=base_url, cred=cred))
+    asyncio.run(create_task_v2(base_url=base_url, cred=cred, model_name=model_name))
 
 
 if __name__ == "__main__":

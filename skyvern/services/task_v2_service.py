@@ -100,6 +100,19 @@ NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS = 2000
 NAVIGATE_STRUCTURED_OUTPUT_MAX_CHARS = 10 * NAVIGATE_TERMINAL_OUTPUT_MAX_CHARS
 
 
+async def _best_effort_task_v2_metrics(method_name: str, **kwargs: Any) -> Any:
+    """Persist Task V2 metrics without allowing observability to break execution."""
+    observer = getattr(getattr(app, "DATABASE", None), "observer", None)
+    method = getattr(observer, method_name, None)
+    if method is None:
+        return None
+    try:
+        return await method(**kwargs)
+    except Exception:
+        LOG.warning("Task V2 metrics persistence failed", method=method_name, exc_info=True)
+        return None
+
+
 class InvalidTaskV2ModelError(ValueError):
     pass
 
@@ -729,9 +742,19 @@ async def run_task_v2_helper(
     context.root_workflow_run_id = root_workflow_run_id
     context.request_id = request_id
     context.task_v2_id = task_v2_id
+    context.task_v2_requested_model = task_v2.model.get("model_name") if task_v2.model else None
     context.run_id = current_run_id
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
+
+    await _best_effort_task_v2_metrics(
+        "ensure_task_v2_run_metrics",
+        task_v2_id=task_v2_id,
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        workflow_id=workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+    )
 
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
@@ -777,6 +800,18 @@ async def run_task_v2_helper(
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
     # The max_iterations limit applies to this single TaskV2 execution
     for i in range(max_iterations):
+        context.task_v2_iteration = i
+        context.task_v2_task_type = None
+        context.task_v2_loop_item_count = None
+        context.task_v2_loop_index = None
+        context.task_v2_retry_index = 0
+        context.task_v2_last_llm_call_id = None
+        await _best_effort_task_v2_metrics(
+            "record_task_v2_iteration",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            iteration_count=i + 1,
+        )
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
             organization_id=organization_id,
@@ -948,6 +983,14 @@ async def run_task_v2_helper(
                     "termination_reason": termination_reason,
                 },
             )
+            context.task_v2_task_type = task_type or None
+            if context.task_v2_last_llm_call_id and task_type:
+                await _best_effort_task_v2_metrics(
+                    "update_task_v2_llm_call",
+                    task_v2_llm_call_id=context.task_v2_last_llm_call_id,
+                    organization_id=organization_id,
+                    task_type=task_type,
+                )
 
             if user_goal_achieved is True:
                 LOG.info(
@@ -1519,6 +1562,8 @@ async def _generate_loop_task(
             raise Exception("is_loop_value_link not found in the output parameter of the extraction block")
         loop_values = output_value_obj.get(loop_values_key, [])
         is_loop_value_link = output_value_obj.get("is_loop_value_link")
+        context = skyvern_context.ensure_context()
+        context.task_v2_loop_item_count = len(loop_values) if isinstance(loop_values, list) else None
     except Exception:
         LOG.error(
             "Failed to validate the output parameter of the extraction block for the loop task",
@@ -1701,26 +1746,36 @@ async def _generate_extraction_task(
     max_retries = 3
     last_exc: Exception | None = None
     generate_extraction_task_response: dict[str, Any] | None = None
-    for attempt in range(max_retries):
-        try:
-            generate_extraction_task_response = await _get_task_v2_llm_api_handler(task_v2)(
-                generate_extraction_task_prompt,
-                task_v2=task_v2,
-                prompt_name="task_v2_generate_extraction_task",
-                organization_id=task_v2.organization_id,
-                system_prompt=task_v2.workflow_system_prompt,
-            )
-            break
-        except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
-            LOG.warning(
-                "Empty or invalid LLM response during extraction task generation, retrying",
-                attempt=attempt + 1,
-                max_attempts=max_retries,
-                error=str(e),
-            )
-            last_exc = e
-    else:
-        raise last_exc  # type: ignore[misc]
+    try:
+        for attempt in range(max_retries):
+            context.task_v2_retry_index = attempt
+            try:
+                generate_extraction_task_response = await _get_task_v2_llm_api_handler(task_v2)(
+                    generate_extraction_task_prompt,
+                    task_v2=task_v2,
+                    prompt_name="task_v2_generate_extraction_task",
+                    organization_id=task_v2.organization_id,
+                    system_prompt=task_v2.workflow_system_prompt,
+                )
+                break
+            except (InvalidLLMResponseFormat, EmptyLLMResponseError) as e:
+                LOG.warning(
+                    "Empty or invalid LLM response during extraction task generation, retrying",
+                    attempt=attempt + 1,
+                    max_attempts=max_retries,
+                    error=str(e),
+                )
+                if attempt + 1 < max_retries:
+                    await _best_effort_task_v2_metrics(
+                        "increment_task_v2_retry_count",
+                        workflow_run_id=workflow_run_id,
+                        organization_id=task_v2.organization_id,
+                    )
+                last_exc = e
+        else:
+            raise last_exc  # type: ignore[misc]
+    finally:
+        context.task_v2_retry_index = 0
 
     assert generate_extraction_task_response is not None
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)

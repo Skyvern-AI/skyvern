@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, List
+from typing import Any, List, Literal
 
 from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 from typing_extensions import deprecated
@@ -400,3 +400,59 @@ class WorkflowRunResponseBase(BaseModel):
 
 class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):
     workflow: Workflow
+
+
+class WorkflowRunEvaluationLLMCall(BaseModel):
+    """Safe, prompt/response metadata for one Task V2 LLM call."""
+
+    call_id: str
+    prompt_name: str
+    call_type: str
+    task_type: str | None = None
+    organization_id: str | None = None
+    workflow_run_id: str
+    workflow_id: str | None = None
+    workflow_permanent_id: str | None = None
+    task_v2_id: str
+    task_id: str | None = None
+    step_id: str | None = None
+    thought_id: str | None = None
+    workflow_run_block_id: str | None = None
+    iteration: int | None = None
+    loop_item_count: int | None = None
+    loop_index: int | None = None
+    retry_index: int = 0
+    is_speculative: bool = False
+    llm_key: str | None = None
+    model: str | None = None
+    requested_model: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    image_tokens: int = 0
+    cached_tokens: int = 0
+    llm_cost_usd: float | None = None
+
+
+class WorkflowRunEvaluationCost(BaseModel):
+    """Exact agent LLM usage and Task V2 dimensions for an evaluation run."""
+
+    workflow_run_id: str
+    agent_cost_usd: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    image_tokens: int = 0
+    tokenless_request_count: int = 0
+    cost_status: Literal["exact", "incomplete"]
+    planner_call_count: int = 0
+    check_completion_call_count: int = 0
+    generate_extraction_task_call_count: int = 0
+    generate_task_block_call_count: int = 0
+    extract_actions_call_count: int = 0
+    iteration_count: int = 0
+    loop_item_count: int = 0
+    retry_count: int = 0
+    model_call_counts: dict[str, int] = Field(default_factory=dict)
+    prompt_call_counts: dict[str, int] = Field(default_factory=dict)
+    llm_calls: list[WorkflowRunEvaluationLLMCall] = Field(default_factory=list)

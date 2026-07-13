@@ -14,7 +14,12 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import create_folder_if_not_exist
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskResponse, TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunResponseBase, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    WorkflowRequestBody,
+    WorkflowRunEvaluationCost,
+    WorkflowRunResponseBase,
+    WorkflowRunStatus,
+)
 from skyvern.schemas.runs import ProxyLocation
 
 
@@ -80,6 +85,21 @@ class SkyvernClient:
                 f"Expected to get workflow run response status 200, but got {response.status_code}"
             )
             return WorkflowRunResponseBase(**response.json())
+
+    async def get_workflow_run_evaluation_cost(
+        self,
+        workflow_pid: str,
+        workflow_run_id: str,
+    ) -> WorkflowRunEvaluationCost:
+        """Fetch exact target-agent LLM cost for one evaluation workflow run."""
+        url = f"{self.base_url}/workflows/{workflow_pid}/runs/{workflow_run_id}/evaluation-cost"
+        headers = {"x-api-key": self.credentials}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers)
+            assert response.status_code == 200, (
+                f"Expected evaluation cost response status 200, but got {response.status_code}: {response.text}"
+            )
+            return WorkflowRunEvaluationCost(**response.json())
 
 
 class Evaluator:

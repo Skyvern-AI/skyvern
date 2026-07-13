@@ -254,6 +254,20 @@ class TasksRepository(BaseRepository):
             total = (await session.execute(query)).scalar_one()
             return float(total)
 
+    @db_operation("get_step_token_sums_by_task_ids")
+    async def get_step_token_sums_by_task_ids(self, task_ids: list[str], organization_id: str) -> tuple[int, int]:
+        """Sum input and output LLM tokens across steps belonging to the task IDs."""
+        if not task_ids:
+            return 0, 0
+
+        async with self.Session() as session:
+            query = select(
+                func.coalesce(func.sum(StepModel.input_token_count), 0),
+                func.coalesce(func.sum(StepModel.output_token_count), 0),
+            ).where(StepModel.task_id.in_(task_ids), StepModel.organization_id == organization_id)
+            input_tokens, output_tokens = (await session.execute(query)).one()
+            return int(input_tokens), int(output_tokens)
+
     @db_operation("get_workflow_run_progress_timestamps")
     async def get_workflow_run_progress_timestamps(
         self,

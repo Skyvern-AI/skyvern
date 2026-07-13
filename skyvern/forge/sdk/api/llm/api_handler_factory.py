@@ -4,6 +4,8 @@ import json
 import time
 import warnings
 from asyncio import CancelledError
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 import litellm
@@ -33,6 +35,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.api.llm.tokenless_usage import tokenless_usage_tracker
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -107,6 +110,7 @@ CONTENT_FILTER_RESCUE_LLM_NAME_FLAG = "CONTENT_FILTER_RESCUE_LLM_NAME"
 _CONTENT_FILTER_RESCUE_CONTROL_VARIANTS = {None, False, "False", "false", "", "control"}
 _content_filter_rescue_handler_cache: dict[str, LLMAPIHandler] = {}
 _content_filter_rescue_logged: set[str] = set()
+_provider_request_id: ContextVar[str | None] = ContextVar("provider_request_id", default=None)
 
 
 def _content_filter_rescue_log_once(dedup_key: str) -> bool:
@@ -203,6 +207,50 @@ def _set_llm_context_attrs(
     span.set_attribute("screenshots_included", bool(screenshots))
     span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
     span.set_attribute("speculative", bool(is_speculative_step))
+    context = skyvern_context.current()
+    if context and context.task_v2_id:
+        task_v2_attributes = {
+            "task_v2_id": context.task_v2_id,
+            "task_v2_iteration": context.task_v2_iteration,
+            "task_v2_task_type": context.task_v2_task_type,
+            "task_v2_loop_item_count": context.task_v2_loop_item_count,
+            "task_v2_loop_index": context.task_v2_loop_index,
+            "task_v2_retry_index": context.task_v2_retry_index,
+        }
+        for name, value in task_v2_attributes.items():
+            if value is not None:
+                span.set_attribute(name, value)
+
+
+def _get_tokenless_session_id(task_v2: TaskV2 | None = None) -> str | None:
+    """Return a stable evaluation session ID for the current task."""
+    context = skyvern_context.current()
+    task_id = (
+        (context.task_v2_id if context else None)
+        or (context.task_id if context else None)
+        or (task_v2.observer_cruise_id if task_v2 else None)
+    )
+    if not task_id:
+        return None
+
+    session_prefix = f"eval_skyvern_{task_id}_"
+    if context is not None:
+        if context.tokenless_session_id and context.tokenless_session_id.startswith(session_prefix):
+            return context.tokenless_session_id
+        context.tokenless_session_id = f"{session_prefix}{datetime.now(UTC).strftime('%Y%m%dT%H%M%S.%fZ')}"
+        return context.tokenless_session_id
+    return f"{session_prefix}{datetime.now(UTC).strftime('%Y%m%dT%H%M%S.%fZ')}"
+
+
+def _get_openai_compatible_request_model(task_v2: TaskV2 | None = None) -> str | None:
+    """Return the validated model alias selected for the current Task V2 run."""
+    context = skyvern_context.current()
+    requested_model = context.task_v2_requested_model if context else None
+    if not requested_model and task_v2 and task_v2.model:
+        requested_model = task_v2.model.get("model_name")
+    if requested_model in settings.get_openai_compatible_model_names():
+        return requested_model
+    return None
 
 
 def _enrich_llm_span(
@@ -415,6 +463,7 @@ class LLMCallStats(BaseModel):
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None
     llm_cost: float | None = None
+    provider_request_id: str | None = None
 
 
 def _get_artifact_targets_and_persist_flag(
@@ -525,6 +574,114 @@ async def _persist_block_llm_cost(
             llm_cost=llm_cost,
             prompt_name=prompt_name,
         )
+
+
+_TASK_V2_CALL_TYPE_BY_PROMPT: dict[str, str] = {
+    "task_v2": "planner",
+    "task_v2_check_completion": "check_completion",
+    "task_v2_generate_extraction_task": "generate_extraction_task",
+    "task_v2_generate_task_block": "generate_task_block",
+    EXTRACT_ACTION_PROMPT_NAME: "extract_actions",
+}
+
+
+async def _persist_task_v2_llm_call(
+    *,
+    prompt_name: str,
+    task_v2: TaskV2 | None,
+    step: Step | None,
+    thought: Thought | None,
+    workflow_run_block_id: str | None,
+    llm_key: str | None,
+    configured_model: str | None,
+    actual_model: str | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    reasoning_tokens: int | None,
+    cached_tokens: int | None,
+    image_tokens: int | None,
+    llm_cost: float | None,
+    provider_request_id: str | None = None,
+) -> str | None:
+    """Persist safe per-call Task V2 metrics without recording prompts or credentials."""
+    context = skyvern_context.current()
+    if context is not None:
+        context.task_v2_last_llm_call_id = None
+
+    task_v2_id = context.task_v2_id if context else None
+    if task_v2_id is None and task_v2 is not None:
+        task_v2_id = task_v2.observer_cruise_id
+    workflow_run_id = context.workflow_run_id if context else None
+    if workflow_run_id is None and task_v2 is not None:
+        workflow_run_id = task_v2.workflow_run_id
+    organization_id = (context.organization_id if context else None) or (
+        step.organization_id if step else (thought.organization_id if thought else None)
+    )
+    if not task_v2_id or not workflow_run_id or not organization_id:
+        return None
+
+    retry_index = step.retry_index if step is not None else (context.task_v2_retry_index if context else 0)
+    requested_model = context.task_v2_requested_model if context else None
+    if task_v2 is not None and task_v2.model:
+        requested_model = requested_model or task_v2.model.get("model_name")
+    requested_model = requested_model or configured_model
+    call_id: str | None = None
+    try:
+        call_id = await app.DATABASE.observer.create_task_v2_llm_call(
+            task_v2_id=task_v2_id,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_id=context.workflow_id if context else task_v2.workflow_id if task_v2 else None,
+            workflow_permanent_id=(
+                context.workflow_permanent_id if context else task_v2.workflow_permanent_id if task_v2 else None
+            ),
+            task_id=step.task_id if step else context.task_id if context else None,
+            step_id=step.step_id if step else None,
+            thought_id=thought.observer_thought_id if thought else None,
+            workflow_run_block_id=workflow_run_block_id,
+            call_type=_TASK_V2_CALL_TYPE_BY_PROMPT.get(prompt_name, "other"),
+            prompt_name=prompt_name,
+            task_type=context.task_v2_task_type if context else None,
+            iteration=context.task_v2_iteration if context else None,
+            loop_item_count=context.task_v2_loop_item_count if context else None,
+            loop_index=context.task_v2_loop_index if context else None,
+            retry_index=max(retry_index or 0, 0),
+            is_speculative=bool(step and step.is_speculative),
+            llm_key=llm_key,
+            model=actual_model or configured_model,
+            requested_model=requested_model,
+            provider_request_id=provider_request_id,
+            input_token_count=int(input_tokens or 0),
+            output_token_count=int(output_tokens or 0),
+            reasoning_token_count=int(reasoning_tokens or 0),
+            image_token_count=int(image_tokens or 0),
+            cached_token_count=int(cached_tokens or 0),
+            # Tokenless's exact cost is resolved from its request detail API after the run.
+            llm_cost=None if provider_request_id else llm_cost,
+        )
+        if step is not None and retry_index and retry_index > 0:
+            await app.DATABASE.observer.increment_task_v2_retry_count(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+        if provider_request_id:
+            await tokenless_usage_tracker.record_request(
+                workflow_run_id=workflow_run_id,
+                request_id=provider_request_id,
+                call_id=call_id,
+            )
+        if context is not None:
+            context.task_v2_last_llm_call_id = call_id
+        return call_id
+    except Exception:
+        # Metrics must never make an otherwise valid browser run fail.
+        LOG.warning(
+            "Failed to persist Task V2 LLM call metrics",
+            workflow_run_id=workflow_run_id,
+            prompt_name=prompt_name,
+            exc_info=True,
+        )
+        return None
 
 
 def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> AllowedFailsPolicy | None:
@@ -1774,6 +1931,22 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, model_used or main_model_group, response
                 )
+                await _persist_task_v2_llm_call(
+                    prompt_name=prompt_name,
+                    task_v2=task_v2,
+                    step=step,
+                    thought=thought,
+                    workflow_run_block_id=workflow_run_block_id,
+                    llm_key=llm_key,
+                    configured_model=main_model_group,
+                    actual_model=actual_model,
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    cached_tokens=cached_tokens,
+                    image_tokens=image_tokens,
+                    llm_cost=llm_cost,
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1890,8 +2063,11 @@ class LLMAPIHandlerFactory:
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
-        # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for a custom header
-        if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
+        # OpenAI-compatible endpoints that need response metadata (for example, Tokenless's
+        # X-Request-Id) use the native client instead of LiteLLM's conversion path.
+        if (llm_key == settings.OPENAI_COMPATIBLE_MODEL_KEY and settings.OPENAI_COMPATIBLE_USE_NATIVE_CLIENT) or (
+            llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint()
+        ):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
@@ -2325,6 +2501,22 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, actual_model or llm_config.model_name, response
                 )
+                await _persist_task_v2_llm_call(
+                    prompt_name=prompt_name,
+                    task_v2=task_v2,
+                    step=step,
+                    thought=thought,
+                    workflow_run_block_id=workflow_run_block_id,
+                    llm_key=llm_key,
+                    configured_model=llm_config.model_name,
+                    actual_model=actual_model,
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    cached_tokens=cached_tokens,
+                    image_tokens=image_tokens,
+                    llm_cost=llm_cost,
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -2521,6 +2713,7 @@ class LLMCaller:
             self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
         self.openai_client = None
+        self._native_openai_compatible = False
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
         if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
@@ -2534,6 +2727,14 @@ class LLMCaller:
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             # For GitHub Copilot, use the actual model name from OPENAI_COMPATIBLE_MODEL_NAME
             self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
+            self.openai_client = AsyncOpenAI(
+                api_key=settings.OPENAI_COMPATIBLE_API_KEY,
+                base_url=settings.OPENAI_COMPATIBLE_API_BASE,
+                http_client=ForgeAsyncHttpxClientWrapper(),
+            )
+        elif self.llm_key == settings.OPENAI_COMPATIBLE_MODEL_KEY and settings.OPENAI_COMPATIBLE_USE_NATIVE_CLIENT:
+            self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
+            self._native_openai_compatible = True
             self.openai_client = AsyncOpenAI(
                 api_key=settings.OPENAI_COMPATIBLE_API_KEY,
                 base_url=settings.OPENAI_COMPATIBLE_API_BASE,
@@ -2588,6 +2789,11 @@ class LLMCaller:
             active_parameters.update(self.llm_config.litellm_params)  # type: ignore
 
         context = skyvern_context.current()
+        openai_compatible_request_model = (
+            _get_openai_compatible_request_model(task_v2) if self._native_openai_compatible else None
+        )
+        if openai_compatible_request_model:
+            _llm_span.set_attribute("llm_model", openai_compatible_request_model)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -2694,7 +2900,8 @@ class LLMCaller:
                     message_pattern=message_pattern,
                 )
             llm_request_payload = {
-                "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
+                "model": openai_compatible_request_model
+                or (self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name),
                 "messages": messages,
                 # we're not using active_parameters here because it may contain sensitive information
                 **parameters,
@@ -2720,6 +2927,8 @@ class LLMCaller:
                 response = await self._dispatch_llm_call(
                     messages=messages,
                     tools=tools,
+                    task_v2=task_v2,
+                    request_model=openai_compatible_request_model,
                     **active_parameters,
                 )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
@@ -2790,6 +2999,11 @@ class LLMCaller:
                     )
 
             call_stats = await self.get_call_stats(response)
+            if call_stats.provider_request_id and context and context.workflow_run_id:
+                await tokenless_usage_tracker.record_request(
+                    workflow_run_id=context.workflow_run_id,
+                    request_id=call_stats.provider_request_id,
+                )
             actual_model = _normalize_llm_model(getattr(response, "model", None) or self.llm_config.model_name)
             if step and not is_speculative_step:
                 await app.DATABASE.tasks.update_step(
@@ -2828,6 +3042,23 @@ class LLMCaller:
             duration_seconds = time.perf_counter() - start_time
             image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                 screenshots, actual_model or self.llm_config.model_name, response
+            )
+            await _persist_task_v2_llm_call(
+                prompt_name=prompt_name or "<unknown>",
+                task_v2=task_v2,
+                step=step,
+                thought=thought,
+                workflow_run_block_id=workflow_run_block_id,
+                llm_key=self.llm_key,
+                configured_model=self.llm_config.model_name,
+                actual_model=actual_model,
+                input_tokens=call_stats.input_tokens,
+                output_tokens=call_stats.output_tokens,
+                reasoning_tokens=call_stats.reasoning_tokens,
+                cached_tokens=call_stats.cached_tokens,
+                image_tokens=image_tokens,
+                llm_cost=call_stats.llm_cost,
+                provider_request_id=call_stats.provider_request_id,
             )
             LOG.info(
                 "LLM API handler duration metrics",
@@ -2968,15 +3199,22 @@ class LLMCaller:
         self,
         messages: list[dict[str, Any]],
         tools: list | None = None,
+        task_v2: TaskV2 | None = None,
+        request_model: str | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
+        _provider_request_id.set(None)
         if self.openai_client:
             # Extract OpenRouter-specific and GitHub Copilot-specific parameters
             extra_headers = {}
             if settings.SKYVERN_APP_URL:
                 extra_headers["HTTP-Referer"] = settings.SKYVERN_APP_URL
                 extra_headers["X-Title"] = "Skyvern"
+            if self._native_openai_compatible:
+                tokenless_session_id = _get_tokenless_session_id(task_v2)
+                if tokenless_session_id:
+                    extra_headers["Session-Id"] = tokenless_session_id
 
             # Add required headers for GitHub Copilot API
             if LLMAPIHandlerFactory.is_github_copilot_endpoint():
@@ -3002,12 +3240,15 @@ class LLMCaller:
                 openai_params["reasoning_effort"] = active_parameters["reasoning_effort"]
 
             completion = await self.openai_client.chat.completions.create(
-                model=self.llm_key,
+                model=request_model or self.llm_key,
                 messages=messages,
+                tools=tools or None,
                 extra_headers=extra_headers if extra_headers else None,
                 timeout=timeout,
                 **openai_params,
             )
+            if self._native_openai_compatible:
+                _provider_request_id.set(getattr(completion, "_request_id", None))
             # Convert OpenAI ChatCompletion to litellm ModelResponse format
             # litellm.utils.convert_to_model_response_object expects a dict
             response_dict = completion.model_dump()
@@ -3180,7 +3421,11 @@ class LLMCaller:
         empty_call_stats = LLMCallStats()
 
         # Handle OPENAI_COMPATIBLE provider GitHub Copilot
-        if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
+        if (
+            self.original_llm_key == "OPENAI_COMPATIBLE"
+            and LLMAPIHandlerFactory.is_github_copilot_endpoint()
+            and isinstance(response, (ModelResponse, CustomStreamWrapper))
+        ):
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
                 response
             )
@@ -3190,6 +3435,7 @@ class LLMCaller:
                 output_tokens=output_tokens,
                 cached_tokens=cached_tokens,
                 reasoning_tokens=reasoning_tokens,
+                provider_request_id=_provider_request_id.get(),
             )
 
         # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
@@ -3240,6 +3486,7 @@ class LLMCaller:
                 output_tokens=output_tokens,
                 cached_tokens=cached_tokens,
                 reasoning_tokens=reasoning_tokens,
+                provider_request_id=_provider_request_id.get(),
             )
         return empty_call_stats
 
