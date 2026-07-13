@@ -30,7 +30,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,

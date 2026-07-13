@@ -133,8 +133,8 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.typed_value_policy import should_reject_type_text_value
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
