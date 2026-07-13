@@ -236,6 +236,37 @@ def test_hollow_outcome_carries_observed_value_excerpt_off_the_structural_key() 
     assert "WTR-1842-DEMO" not in str(confirmation.structural_key_payload)
 
 
+def test_hollow_outcome_reason_code_unchanged_with_value_carrying_relation() -> None:
+    outcome = recorded_outcome_from_scout_act_observe_hollow(
+        interaction_tool="click",
+        selector="#view-statement",
+        current_url="https://portal.example.com/statement",
+        source_url="https://portal.example.com/statement",
+        page_evidence={
+            "page_title": "Statement",
+            "forms": [],
+            "key_value_relations": [
+                {
+                    "key_text": "March 2026 statement",
+                    "value_text": "Amount due: $3,927.75",
+                    "container_selector": "#result",
+                    "value_child_index": 1,
+                    "direct_child_count": 3,
+                    "visible": True,
+                    "value_visible": True,
+                }
+            ],
+            "key_value_relations_truncated": False,
+        },
+        recapture_attempted=True,
+        recapture_result="hollow",
+    )
+
+    assert outcome.reason_code == "scout_act_observe_hollow_after_interaction"
+    assert outcome.is_authoritative is True
+    assert "$3,927.75" not in str(outcome.structural_key_payload)
+
+
 def test_hollow_outcome_value_excerpt_falls_back_to_legacy_text_keys() -> None:
     from_visible_text = recorded_outcome_from_scout_act_observe_hollow(
         interaction_tool="click",
