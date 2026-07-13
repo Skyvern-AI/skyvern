@@ -15,6 +15,7 @@ import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneViewToggles } from "./RunPaneHeader";
 import { RunView } from "./RunView";
 
@@ -223,6 +224,7 @@ function LocationSpy() {
 function renderRunView(
   props: Partial<Parameters<typeof RunView>[0]> = {},
   initialEntry = "/",
+  compact = false,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -234,9 +236,12 @@ function renderRunView(
       <MemoryRouter initialEntries={[initialEntry]}>
         {/* The toggles live in the pane header (StudioShell); render them
             alongside the body, under a TooltipProvider, the way the shell
-            composes them. */}
+            composes them. Only headerExtras (the toggles) sit under the
+            compact context in production (StudioShell.tsx), not the body. */}
         <TooltipProvider delayDuration={0}>
-          <RunPaneViewToggles />
+          <StudioPaneCompactContext.Provider value={compact}>
+            <RunPaneViewToggles />
+          </StudioPaneCompactContext.Provider>
           <RunView workflowRunId="wr_1" {...props} />
         </TooltipProvider>
         <LocationSpy />
@@ -594,7 +599,9 @@ describe("RunView output signals", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
+    // This run has outputs, so the toggle's accessible name carries the new-
+    // output indicator suffix; match by prefix since that's not under test here.
+    fireEvent.click(scope.getByRole("button", { name: /^Outputs/ }));
 
     expect(scope.getByText("Run errors")).not.toBeNull();
     expect(scope.getAllByText("E_INVOICE_MISSING").length).toBeGreaterThan(0);
@@ -631,5 +638,52 @@ describe("RunView output signals", () => {
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
     expect(scope.queryByText("Run errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
+  });
+});
+
+describe("RunView output indicator", () => {
+  test("the Outputs toggle carries a new-output indicator when unviewed output exists", () => {
+    seedCompletedRun({ errors: [{ error_code: "E1", reasoning: "x" }] });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(
+      scope.getByRole("button", { name: "Outputs, content available" }),
+    ).not.toBeNull();
+  });
+
+  test("the indicator clears once the Outputs view is active", () => {
+    seedCompletedRun({ errors: [{ error_code: "E1", reasoning: "x" }] });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(
+      scope.getByRole("button", { name: "Outputs, content available" }),
+    );
+    expect(scope.getByRole("button", { name: "Outputs" })).not.toBeNull();
+    expect(
+      scope.queryByRole("button", { name: "Outputs, content available" }),
+    ).toBeNull();
+  });
+
+  test("no indicator when the run has no output signals", () => {
+    seedCompletedRun();
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    expect(scope.getByRole("button", { name: "Outputs" })).not.toBeNull();
+    expect(
+      scope.queryByRole("button", { name: "Outputs, content available" }),
+    ).toBeNull();
+  });
+
+  test("the indicator survives the header collapsing to icon-only", () => {
+    seedCompletedRun({ errors: [{ error_code: "E1", reasoning: "x" }] });
+    const { container } = renderRunView({}, "/", true);
+    const scope = within(container);
+
+    expect(
+      scope.getByRole("button", { name: "Outputs, content available" }),
+    ).not.toBeNull();
   });
 });

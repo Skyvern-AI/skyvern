@@ -234,7 +234,8 @@ async def test_verification_retries_before_failing(setup, tmp_path):
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        with patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await download(prompt="Download invoice", label="test_block")
 
         refs["fallback"].assert_not_called()
         assert refs["storage"].get_downloaded_files.call_count == 4  # 1 before + 3 retries
@@ -308,7 +309,8 @@ async def test_get_before_timeout_skips_verification(setup, tmp_path):
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        with patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await download(prompt="Download invoice", label="test_block")
 
         # Should NOT fall back — local verification passed, S3 verification skipped
         refs["fallback"].assert_not_called()
@@ -337,7 +339,8 @@ async def test_get_after_timeout_skips_verification(setup, tmp_path):
     try:
         from skyvern.services.script_service import download
 
-        await download(prompt="Download invoice", label="test_block")
+        with patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
+            await download(prompt="Download invoice", label="test_block")
 
         refs["fallback"].assert_not_called()
     finally:

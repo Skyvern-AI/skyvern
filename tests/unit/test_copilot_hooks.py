@@ -31,6 +31,11 @@ class _FakeContext:
     total_tokens_used: int | None = None
     last_artifact_health_blocker_reason: str | None = None
     completion_verification_result: Any = None
+    turn_ownership: Any = None
+    blocker_signal_claimant: Any = None
+    gate_precedence_conflict_events: list[Any] = field(default_factory=list)
+    output_contract_actuation_by_signature: dict[str, Any] = field(default_factory=dict)
+    output_contract_actuation_count_by_signature: dict[str, Any] = field(default_factory=dict)
 
 
 # `on_tool_end(context, agent, tool, result)` only reads `tool` and `result`;
@@ -497,6 +502,9 @@ class TestMCPFailedStepLoopDetection:
         ctx = MagicMock()
         ctx.consecutive_tool_tracker = []
         ctx.failed_tool_step_tracker = {}
+        ctx.turn_ownership = None
+        ctx.blocker_signal_claimant = None
+        ctx.gate_precedence_conflict_events = []
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
             overlays={"click": SchemaOverlay(post_hook=raising_post_hook)},
@@ -557,6 +565,9 @@ class TestMCPFailedStepLoopDetection:
         ctx = MagicMock()
         ctx.consecutive_tool_tracker = []
         ctx.failed_tool_step_tracker = {}
+        ctx.turn_ownership = None
+        ctx.blocker_signal_claimant = None
+        ctx.gate_precedence_conflict_events = []
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
             overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},
@@ -725,6 +736,9 @@ class TestMCPFailedStepLoopDetection:
         ctx = MagicMock()
         ctx.consecutive_tool_tracker = []
         ctx.failed_tool_step_tracker = {}
+        ctx.turn_ownership = None
+        ctx.blocker_signal_claimant = None
+        ctx.gate_precedence_conflict_events = []
         client = FakeClient()
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
@@ -1110,6 +1124,8 @@ class TestScoutedInteractionCapture:
             scout_trajectory=[],
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
+            prior_fill_carry=[],
+            fill_carry_rebound_done=False,
         )
         if policy is not None:
             ns.block_authoring_policy = policy
@@ -1331,7 +1347,13 @@ class TestScoutedInteractionCapture:
             {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
             ctx,
         )
-        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q", "typed_length": 8}]
+        assert ctx.scouted_interactions == [
+            {
+                "tool_name": "type_text",
+                "selector": "#q",
+                "typed_length": 8,
+            }
+        ]
         # the raw typed text is never captured (PII)
         assert all("text" not in item for item in ctx.scouted_interactions)
 
@@ -1367,7 +1389,11 @@ class TestScoutedInteractionCapture:
             ctx,
         )
         assert ctx.scouted_interactions == [
-            {"tool_name": "select_option", "selector": "#sort", "value": "price_asc"},
+            {
+                "tool_name": "select_option",
+                "selector": "#sort",
+                "value": "price_asc",
+            },
             {"tool_name": "press_key", "selector": "#q", "key": "Enter"},
         ]
 

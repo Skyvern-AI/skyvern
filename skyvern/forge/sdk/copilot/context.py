@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+import structlog
 from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
@@ -21,6 +22,8 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+
+LOG = structlog.get_logger()
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
@@ -82,6 +85,11 @@ class TurnNarrativePayload(TypedDict):
     verifiedSuccess: NotRequired[bool]
     # Verdict-state summary from the turn's latest evaluated adjudication.
     outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
+    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    credentialPrompt: NotRequired[dict[str, str]]
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
+    # credential pause (credential_pause.py) resolved during this turn.
+    credentialPause: NotRequired[dict[str, str]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -105,6 +113,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
+    from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
@@ -143,6 +152,26 @@ class ObservedPage(BaseModel):
     url: str = ""
     had_bounded_schema: bool = False
     reached_via: str = ""
+
+
+FillCarryToolName = Literal["type_text", "select_option", "fill_credential_field"]
+
+
+class FillCarry(BaseModel):
+    source_url: str = ""
+    selector: str = ""
+    tool_name: FillCarryToolName
+    role: str = ""
+    accessible_name: str = ""
+    typed_length: int = 0
+    typed_value: str = ""
+    value: str = ""
+    control_readonly: bool | None = None
+    control_disabled: bool | None = None
+    control_value_satisfied: bool | None = None
+    credential_id: str = ""
+    credential_field: str = ""
+    available_fields: list[str] | None = None
 
 
 class LoadedResultTargetContext(BaseModel):
@@ -212,12 +241,14 @@ class StructuredContext(BaseModel):
     page_inspection_calls_made: int = 0
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
     loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
+    fill_carry: list[FillCarry] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
         payload["loaded_result_targets"] = [
             _sanitized_loaded_result_target_payload(target) for target in self.loaded_result_targets
         ]
+        payload["fill_carry"] = [carry.model_dump(mode="json", exclude_none=True) for carry in self.fill_carry]
         return json.dumps(payload, indent=2)
 
     @classmethod
@@ -363,6 +394,94 @@ def render_loaded_result_context_for_prompt(global_llm_context: str) -> str:
 
 
 _MAX_OBSERVED_ACTED_PAGES = 20
+_MAX_FILL_CARRY = 20
+_FILL_CARRY_TEXT_CAP = 240
+_FILL_CARRY_TOOLS = frozenset({"type_text", "select_option", "fill_credential_field"})
+_FILL_CARRY_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+FillCarryPrimitive = str | int | bool | None
+
+
+def _carry_text(value: FillCarryPrimitive, *, max_chars: int = _FILL_CARRY_TEXT_CAP) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:max_chars]
+
+
+def _carry_int(value: FillCarryPrimitive) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _carry_bool(value: FillCarryPrimitive) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _fill_carry_from_scout_trajectory(
+    trajectory: Sequence[Mapping[str, FillCarryPrimitive]],
+    credential_field_inventory: Mapping[str, frozenset[str]] | None = None,
+) -> list[FillCarry]:
+    carry: list[FillCarry] = []
+    for interaction in trajectory:
+        tool_name = _carry_text(interaction.get("tool_name"), max_chars=40)
+        selector = _carry_text(interaction.get("selector"))
+        source_url = _carry_text(interaction.get("source_url"), max_chars=2048)
+        if tool_name not in _FILL_CARRY_TOOLS or not selector or not source_url:
+            continue
+        role = _carry_text(interaction.get("role"), max_chars=80)
+        accessible_name = _carry_text(interaction.get("accessible_name"), max_chars=160)
+        typed_length = _carry_int(interaction.get("typed_length"))
+        if tool_name == "type_text":
+            carry.append(
+                FillCarry(
+                    source_url=source_url,
+                    selector=selector,
+                    tool_name="type_text",
+                    role=role,
+                    accessible_name=accessible_name,
+                    typed_length=typed_length,
+                    typed_value=_carry_text(interaction.get("typed_value")),
+                    control_readonly=_carry_bool(interaction.get("control_readonly")),
+                    control_disabled=_carry_bool(interaction.get("control_disabled")),
+                    control_value_satisfied=_carry_bool(interaction.get("control_value_satisfied")),
+                )
+            )
+        elif tool_name == "select_option":
+            value = _carry_text(interaction.get("value"))
+            if value:
+                carry.append(
+                    FillCarry(
+                        source_url=source_url,
+                        selector=selector,
+                        tool_name="select_option",
+                        role=role,
+                        accessible_name=accessible_name,
+                        value=value,
+                    )
+                )
+        elif tool_name == "fill_credential_field":
+            credential_id = _carry_text(interaction.get("credential_id"))
+            credential_field = _carry_text(interaction.get("credential_field"), max_chars=20)
+            if credential_id and credential_field in _FILL_CARRY_CREDENTIAL_FIELDS:
+                inventory = (credential_field_inventory or {}).get(credential_id)
+                carry.append(
+                    FillCarry(
+                        source_url=source_url,
+                        selector=selector,
+                        tool_name="fill_credential_field",
+                        role=role,
+                        accessible_name=accessible_name,
+                        typed_length=typed_length,
+                        credential_id=credential_id,
+                        credential_field=credential_field,
+                        available_fields=sorted(inventory) if inventory else None,
+                    )
+                )
+    return carry[-_MAX_FILL_CARRY:]
 
 
 def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[dict[str, Any]]) -> list[ObservedPage]:
@@ -424,12 +543,20 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     loaded_result_targets = _loaded_result_targets_from_steer(
         getattr(ctx, "latest_evaluate_result_composition_steer", None)
     )
+    raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
+    raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    fill_carry = _fill_carry_from_scout_trajectory(
+        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
+        credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
+    )
     if (
         not raw_context
         and this_turn == 0
         and inspections_this_turn == 0
         and not flow_evidence
         and not loaded_result_targets
+        and not fill_carry
     ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
@@ -438,6 +565,13 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
     # Replace with this turn's targets so stale extraction hints do not persist.
     sc.loaded_result_targets = loaded_result_targets
+    sc.fill_carry = fill_carry
+    if fill_carry:
+        LOG.info(
+            "copilot_fill_carry_persisted",
+            source_url=fill_carry[0].source_url,
+            field_count=len(fill_carry),
+        )
     return sc.to_json_str()
 
 
@@ -532,8 +666,19 @@ class CopilotContext(AgentContext):
     target_block_label: str | None = None
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
+    prior_turn_outcome: TurnOutcome | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
+    requested_output_extraction_candidate: FrozenRequestedOutputExtractionCandidate | None = None
+
+    # Mid-build credential pause (credential_pause.py). last_run_skipped_unbound_credentials
+    # is set by tools/__init__.py's update_and_run_blocks skip branch; client_supports_credential_pause
+    # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
+    last_run_skipped_unbound_credentials: bool = False
+    client_supports_credential_pause: bool = False
+    credential_pause_used: bool = False
+    copilot_credential_pause_seconds: float = 0.0
+    credential_pause_outcome: str | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
@@ -590,6 +735,9 @@ class CopilotContext(AgentContext):
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
     last_outcome_gate_workflow_run_id: str | None = None
+    delivered_unverified_terminal: bool = False
+    delivered_unverified_workflow_run_id: str | None = None
+    delivered_unverified_observed_outputs: dict[str, Any] = field(default_factory=dict)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
@@ -633,7 +781,7 @@ class CopilotContext(AgentContext):
     repeated_failure_streak_count: int = 0
     last_repair_non_convergence_signature: str | None = None
     consecutive_non_converging_repair_count: int = 0
-    # Unlike the identity-keyed repair ceiling, this climbs even when every
+    # Unlike the progress-gated repair ceiling, this climbs even when every
     # rejection is different; it resets only on an accepted persist.
     code_authoring_guardrail_reject_count: int = 0
     # True when the most-recent such rejection deferred to the credential-scout
@@ -643,6 +791,7 @@ class CopilotContext(AgentContext):
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
+    recorded_persisted_block_run_workflow_run_id: str | None = None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
     recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
     # Turn-scoped monotonic marks of verified forward progress: the union of

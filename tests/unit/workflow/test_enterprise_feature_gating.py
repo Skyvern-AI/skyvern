@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ConditionalBlock,
     ForLoopBlock,
     NavigationBlock,
+    SplitPdfBlock,
     TaskV2Block,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -155,6 +156,19 @@ def test_ignores_stale_model_on_task_v2_block() -> None:
     )
 
     assert _collect_enterprise_gated_workflow_features(workflow) == set()
+
+
+def test_collects_gated_model_on_split_pdf_block() -> None:
+    split_block = SplitPdfBlock(
+        label="split",
+        file_url="{{ source }}",
+        prompt="Split by document.",
+        output_parameter=_output_parameter("split_output"),
+        model={"model_name": "claude-opus-4-6"},
+    )
+    workflow = _workflow([split_block])
+
+    assert _collect_enterprise_gated_workflow_features(workflow) == {"Anthropic Claude 4.6 Opus"}
 
 
 @pytest.mark.parametrize(

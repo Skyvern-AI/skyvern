@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_goal_satisfied_exit_result,
     _build_output_policy_blocked_result,
     _build_turn_halt_exit_result,
+    _build_wip_exit_result,
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
     _verified_workflow_success_reply,
@@ -26,10 +27,18 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
-from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPolicyReason, OutputPolicyVerdict
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
+from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    CopilotOutputKind,
+    OutputPolicyReason,
+    OutputPolicyVerdict,
+)
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from tests.unit.conftest import make_copilot_context as _ctx
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
@@ -335,6 +344,18 @@ def test_output_policy_specific_branches_bypass_recorded_terminal_fallback() -> 
     assert result.narrative_payload is not None
     assert result.narrative_payload["terminalMessage"] == result.user_response
     assert result.narrative_payload["responseType"] == "ASK_QUESTION"
+
+
+def test_output_policy_hard_block_priority_over_actuation_steer() -> None:
+    ctx = _ctx()
+
+    result = _blocked_result(ctx, OutputPolicyReason.RAW_SECRET_LEAK, OutputPolicyReason.ACTUATION_OBLIGATION_STEER)
+
+    assert result.user_response == _RAW_SECRET_LEAK_REFUSAL
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.reason_code == "output_policy_block"
+    assert result.turn_outcome.terminal_reason == "output_policy_block"
+    assert result.turn_outcome.reason_code != ACTUATION_OBLIGATION_STEER_REASON_CODE
 
 
 def test_shim_preserves_workflow_draft_when_signal_opts_in() -> None:
@@ -816,6 +837,30 @@ def test_unverified_blocker_still_renders_blocker_text() -> None:
     assert overridden.proposal_disposition != "review_tested"
 
 
+def test_delivered_unverified_exit_renders_observed_output_as_unvalidated() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_test_ok = True
+    ctx.last_full_workflow_test_ok = False
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+
+    result = _build_wip_exit_result(
+        ctx,
+        None,
+        default_reply="default",
+        unvalidated_reply="unvalidated",
+        tested_reply="tested",
+        terminal_reason="turn_halt:delivered_unverified",
+    )
+
+    assert "document_name: Resale Demand Package" in result.user_response
+    assert "not independently verified" in result.user_response
+    assert result.proposal_disposition == "review_untested"
+    assert result.workflow_yaml == ctx.last_workflow_yaml
+
+
 def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:
     ctx = _ctx()
     _seed_verified_outcome(ctx)
@@ -833,3 +878,211 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
     assert overridden.user_response == challenge_text
     assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
     assert overridden.proposal_disposition != "review_tested"
+
+
+def _churn_render_signal() -> CopilotToolBlockerSignal:
+    return _signal(
+        kind="loop_detected",
+        user_facing="I kept rewriting the generated code, but the safety checks rejected each version.",
+        internal_reason_code="code_authoring_guardrail_churn",
+    )
+
+
+def test_shim_denies_churn_render_while_ladder_owns_and_records_conflict() -> None:
+    ctx = _ctx()
+    signal = _churn_render_signal()
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, signal)
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    original = _agent_result("Model reply describing progress.")
+
+    result = _finalize_result_with_blocker_override(ctx, original)
+
+    assert result is original
+    assert any(
+        event.site == "final_reply_render"
+        and event.fingerprint == "output_contract_actuation>code_authoring_guardrail_churn"
+        for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_shim_renders_churn_after_ladder_resolves() -> None:
+    ctx = _ctx()
+    signal = _churn_render_signal()
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, signal)
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
+    original = _agent_result("Model reply describing progress.")
+
+    result = _finalize_result_with_blocker_override(ctx, original)
+
+    assert result is not original
+    assert signal.user_facing_reason in result.user_response
+
+
+def test_credential_priority_churn_still_renders_when_no_ladder_owns() -> None:
+    ctx = _ctx()
+    signal = _signal(
+        kind="loop_detected",
+        user_facing=CREDENTIAL_SCOUT_VERIFY_REPLY,
+        internal_reason_code="credential_priority_authoring_churn",
+    )
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, signal)
+
+    result = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert CREDENTIAL_SCOUT_VERIFY_REPLY in result.user_response
+
+
+def test_output_policy_blocked_result_surfaces_draft_when_blocker_render_denied() -> None:
+    ctx = _ctx()
+    fake_workflow: Any = object()
+    ctx.last_workflow = fake_workflow
+    ctx.last_workflow_yaml = "title: X\nworkflow_definition:\n  blocks: []\n"
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.CODE_AUTHORING_CHURN, _churn_render_signal())
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert result.updated_workflow is fake_workflow
+    assert any(event.site == "final_reply_render" for event in ctx.gate_precedence_conflict_events)
+
+
+def test_reconcile_turn_end_replaces_result_with_stalled_terminal() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    ctx.output_contract_pending_run_evidence["sig_a"] = ["output.confirmation_number"]
+    original = _agent_result("Model reply describing progress.")
+
+    result = agent_module._reconcile_turn_end_ownership(ctx, original)
+
+    assert result is not original
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind is TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert "I couldn't shape this workflow" in result.user_response
+
+
+def test_reconcile_turn_end_noop_without_live_grant() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
+    original = _agent_result()
+
+    assert agent_module._reconcile_turn_end_ownership(ctx, original) is original
+
+
+def test_reconcile_turn_end_failure_never_masks_original_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    def _boom(_: Any) -> None:
+        raise RuntimeError("reconcile failure")
+
+    monkeypatch.setattr(agent_module, "expire_output_contract_ladder_at_turn_end", _boom)
+    original = _agent_result()
+
+    assert agent_module._reconcile_turn_end_ownership(ctx, original) is original
+
+
+def _stalled_chat_request() -> WorkflowCopilotChatRequest:
+    return WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_xyz",
+        workflow_id="w_001",
+        workflow_copilot_chat_id="chat_abc",
+        message="build the workflow",
+        workflow_yaml="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_end_obligation_transforms_returned_result_on_normal_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[CopilotContext] = []
+
+    async def stub_impl(*, ctx_sink: list[CopilotContext], **_: Any) -> AgentResult:
+        ctx = _ctx()
+        ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+        ctx_sink.append(ctx)
+        captured.append(ctx)
+        return _agent_result("Model reply describing progress.")
+
+    monkeypatch.setattr(agent_module, "_run_copilot_turn_impl", stub_impl)
+
+    result = await agent_module.run_copilot_agent(
+        stream=object(),
+        organization_id="o_test",
+        chat_request=_stalled_chat_request(),
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=None,
+    )
+
+    ctx = captured[0]
+    assert ctx.turn_halt is not None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert "I couldn't shape this workflow" in result.user_response
+
+
+@pytest.mark.asyncio
+async def test_turn_end_obligation_preserves_error_terminal_and_expires_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[CopilotContext] = []
+
+    async def stub_impl(*, ctx_sink: list[CopilotContext], **_: Any) -> AgentResult:
+        ctx = _ctx()
+        ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+        ctx_sink.append(ctx)
+        captured.append(ctx)
+        raise RuntimeError("mid-turn failure")
+
+    monkeypatch.setattr(agent_module, "_run_copilot_turn_impl", stub_impl)
+
+    result = await agent_module.run_copilot_agent(
+        stream=object(),
+        organization_id="o_test",
+        chat_request=_stalled_chat_request(),
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=None,
+    )
+
+    ctx = captured[0]
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert "I couldn't shape this workflow" not in result.user_response
+
+
+def test_reconcile_turn_end_keeps_ask_question_result_and_expires_grant() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    original = AgentResult(
+        user_response="Which site should this run against?",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="ASK_QUESTION",
+    )
+
+    result = agent_module._reconcile_turn_end_ownership(ctx, original)
+
+    assert result is original
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+
+
+def test_reconcile_turn_end_keeps_cancelled_result_and_expires_grant() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    original = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        cancelled=True,
+    )
+
+    result = agent_module._reconcile_turn_end_ownership(ctx, original)
+
+    assert result is original
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED

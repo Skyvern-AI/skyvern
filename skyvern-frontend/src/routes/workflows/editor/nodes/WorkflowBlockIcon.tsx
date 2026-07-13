@@ -64,6 +64,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "send_email": {
       return <EnvelopeClosedIcon className={className} />;
     }
+    case "email_inbox": {
+      return <EnvelopeClosedIcon className={className} />;
+    }
     case "task": {
       return <ListBulletIcon className={className} />;
     }
@@ -89,6 +92,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
       return <FileTextIcon className={className} />;
     }
     case "pdf_fill": {
+      return <FileTextIcon className={className} />;
+    }
+    case "split_pdf": {
       return <FileTextIcon className={className} />;
     }
     case "goto_url": {

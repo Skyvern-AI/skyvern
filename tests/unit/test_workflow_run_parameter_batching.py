@@ -20,7 +20,8 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
 
 
@@ -68,6 +69,7 @@ def _make_service_with_mocks(
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
+        workflow_definition=WorkflowDefinition(blocks=[], parameters=[]),
     )
     workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
 
@@ -93,6 +95,214 @@ def reset_context() -> Generator[None]:
     skyvern_context.reset()
     yield
     skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_apply_initial_run_metadata_tags_uses_system_source_for_fallback_context() -> None:
+    explicit_context = TagWriteContext(caller_id="user_test", source=TagSource.MANUAL, caller_type=CallerType.USER)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
+
+        await WorkflowService._apply_initial_run_metadata_tags(
+            workflow_run_id="wr_x",
+            organization_id="o_x",
+            run_metadata={"env": "prod"},
+            context=None,
+        )
+
+        fallback_context = mock_app.DATABASE.tags.apply_run_tag_changes.await_args.kwargs["context"]
+        assert fallback_context.source == TagSource.SYSTEM
+        assert fallback_context.caller_type == CallerType.SYSTEM
+
+        await WorkflowService._apply_initial_run_metadata_tags(
+            workflow_run_id="wr_x",
+            organization_id="o_x",
+            run_metadata={"env": "prod"},
+            context=explicit_context,
+        )
+
+    assert mock_app.DATABASE.tags.apply_run_tag_changes.await_args_list[1].kwargs["context"] is explicit_context
+    assert explicit_context.source == TagSource.MANUAL
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_writes_run_metadata_as_run_tags() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+    request = WorkflowRequestBody(data={}, run_metadata={"env": "prod", "team": "growth"})
+    tag_context = TagWriteContext(caller_id="user_test", source=TagSource.MANUAL, caller_type=CallerType.USER)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            tag_write_context=tag_context,
+        )
+
+    mock_app.DATABASE.tags.apply_run_tag_changes.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=organization.organization_id,
+        sets={"env": "prod", "team": "growth"},
+        deletes=set(),
+        context=tag_context,
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_continues_when_initial_run_tag_write_fails() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+    request = WorkflowRequestBody(data={}, run_metadata={"env": "prod"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock(side_effect=RuntimeError("tag write failed"))
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert result is workflow_run
+    mock_app.DATABASE.tags.apply_run_tag_changes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_writes_create_time_system_tags() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.resolve_target_domain_for_run_provenance",
+            return_value="jobs.example.com",
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
+            return_value="known_platform",
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert result is workflow_run
+    mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=organization.organization_id,
+        sets={
+            "skyvern.trigger": "api",
+            "skyvern.target_domain": "jobs.example.com",
+            "skyvern.platform": "known_platform",
+        },
+        caller_id="system:creation-tagging",
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_writes_trigger_tag_when_target_domain_is_unavailable() -> None:
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
+            return_value=None,
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        organization_id="org_test",
+        sets={"skyvern.trigger": "api"},
+        caller_id="system:creation-tagging",
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_continues_when_creation_tag_write_fails() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
+            return_value="known_platform",
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock(side_effect=RuntimeError("tag write failed"))
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert result is workflow_run
+    mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_writes_provenance_tags_when_platform_detection_fails() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.resolve_target_domain_for_run_provenance",
+            return_value="jobs.example.com",
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
+            side_effect=RuntimeError("detector unavailable"),
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert result is workflow_run
+    mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        organization_id="org_test",
+        sets={"skyvern.trigger": "api", "skyvern.target_domain": "jobs.example.com"},
+        caller_id="system:creation-tagging",
+    )
 
 
 @pytest.mark.asyncio

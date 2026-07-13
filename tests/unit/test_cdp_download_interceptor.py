@@ -1,11 +1,16 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, extract_filename, is_download_response
+from skyvern.webeye.cdp_download_interceptor import (
+    CDPDownloadInterceptor,
+    _is_stale_interception_error,
+    extract_filename,
+    is_download_response,
+)
 
 
 class TestIsDownloadResponse:
@@ -705,3 +710,204 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
+
+
+class TestStaleInterceptionRace:
+    """Fetch.continueRequest/continueResponse can fail with 'Invalid InterceptionId' when the
+    interception is resolved/cancelled or its target detaches before our async handler responds.
+    That is a benign race (SKY-11964), not an error-level failure, and retrying it is futile."""
+
+    _MOD = "skyvern.webeye.cdp_download_interceptor"
+
+    def _make_interceptor(self) -> CDPDownloadInterceptor:
+        return CDPDownloadInterceptor(output_dir="/tmp/test_downloads")
+
+    def _make_cdp_session(self) -> MagicMock:
+        session = MagicMock()
+        session.send = AsyncMock()
+        return session
+
+    @staticmethod
+    def _response_event() -> dict:
+        return {
+            "requestId": "req-1",
+            "request": {"url": "https://example.com/analytics/collect"},
+            "resourceType": "XHR",
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "content-type", "value": "text/plain"}],
+        }
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            pytest.param("Protocol error (Fetch.continueResponse): Invalid InterceptionId", True, id="invalid_id"),
+            pytest.param("Protocol error (Fetch.continueRequest): Invalid InterceptionId", True, id="invalid_id_req"),
+            pytest.param("Target page, context or browser has been closed", True, id="target_closed"),
+            pytest.param("Session closed. Most likely the page has been closed.", True, id="session_closed"),
+            pytest.param("Protocol error (Fetch.continueResponse): Some other CDP failure", False, id="other_cdp"),
+            pytest.param("Connection reset by peer", False, id="generic"),
+        ],
+    )
+    def test_is_stale_interception_error(self, message: str, expected: bool) -> None:
+        assert _is_stale_interception_error(Exception(message)) is expected
+
+    @pytest.mark.asyncio
+    async def test_stale_continue_response_not_retried_or_error_logged(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): Invalid InterceptionId")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Only the original continueResponse — no futile recovery retry against a dead interception.
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_stale_response_error_still_retries_and_logs(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): boom")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Original continueResponse + one recovery attempt; real failures still surface as errors.
+        assert cdp_session.send.call_count == 2
+        mock_log.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_request_stage_error_not_logged_as_error(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueRequest): Invalid InterceptionId")
+        event = {
+            "requestId": "req-2",
+            "request": {"url": "https://example.com/page"},
+            "resourceType": "Document",
+            # No responseStatusCode — Request-stage event
+        }
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(event, cdp_session)
+
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+
+class TestBlobDownloadCapture:
+    """Browser-initiated blob: URL downloads (e.g. a page that builds the file client-side and
+    triggers a blob download) must be read back via SkyvernFrame and saved, not dropped."""
+
+    _READ_BLOB = "skyvern.webeye.cdp_download_interceptor.SkyvernFrame.read_blob_url_bytes"
+
+    @staticmethod
+    def _context(num_pages: int = 1) -> MagicMock:
+        context = MagicMock()
+        context.pages = [MagicMock() for _ in range(num_pages)]
+        return context
+
+    @pytest.mark.asyncio
+    async def test_blob_download_read_and_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        pdf_bytes = b"%PDF-1.4 fake blob invoice bytes"
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/abc-123", "suggestedFilename": "invoice.pdf"}
+            )
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == "invoice.pdf"
+        assert saved[0].read_bytes() == pdf_bytes
+
+    @pytest.mark.asyncio
+    async def test_blob_download_falls_through_pages_until_readable(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(num_pages=2)
+        pdf_bytes = b"%PDF blob"
+        read = AsyncMock(side_effect=[None, pdf_bytes])
+
+        with patch(self._READ_BLOB, new=read):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/xyz", "suggestedFilename": "bill.pdf"}
+            )
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == pdf_bytes
+        assert read.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_blob_download_threads_max_size_and_guards_oversize(self, tmp_path: Path) -> None:
+        import skyvern.webeye.cdp_download_interceptor as mod
+
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        read = AsyncMock(return_value=b"x" * 2048)  # exceeds the patched limit (defense-in-depth)
+
+        with patch.object(mod, "MAX_FILE_SIZE_BYTES", 1024), patch(self._READ_BLOB, new=read):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/big", "suggestedFilename": "huge.pdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        # the in-page size limit is threaded to the shared reader, and probe mode quiets the
+        # per-page fallback so non-owning pages don't spam ERROR logs
+        assert read.await_args.kwargs["max_size_bytes"] == 1024
+        assert read.await_args.kwargs["probe"] is True
+
+    @pytest.mark.asyncio
+    async def test_blob_download_unreadable_is_noop(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=None)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/gone", "suggestedFilename": "x.pdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blob_download_saves_distinct_file_with_identical_bytes(self, tmp_path: Path) -> None:
+        # Two independent downloads can share bytes but differ by name — the second must not be
+        # dropped just because matching bytes already exist on disk.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        pdf_bytes = b"%PDF identical bytes, different download"
+        (tmp_path / "prior.pdf").write_bytes(pdf_bytes)
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/second", "suggestedFilename": "invoice.pdf"}
+            )
+
+        names = sorted(p.name for p in tmp_path.iterdir())
+        assert names == ["invoice.pdf", "prior.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_blob_download_no_context_is_noop(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        with patch(self._READ_BLOB, new=AsyncMock()) as read:
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/none", "suggestedFilename": "x.pdf"}
+            )
+        read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blob_download_already_captured_via_fetch_is_skipped(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        url = "blob:https://example.com/dup"
+        interceptor._downloaded_urls.add(url)
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock()) as read:
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "x.pdf"})
+
+        read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []

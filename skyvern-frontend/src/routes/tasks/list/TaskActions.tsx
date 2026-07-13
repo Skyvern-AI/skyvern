@@ -15,6 +15,9 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -30,18 +33,24 @@ import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { DotsHorizontalIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  DotsHorizontalIcon,
+  ReloadIcon,
+  TokensIcon,
+} from "@radix-ui/react-icons";
 import { useId, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
+import type { Tag, TagKey } from "@/routes/workflows/types/tagTypes";
 import {
   TaskTemplateFormValues,
   taskTemplateFormSchema,
 } from "../create/TaskTemplateFormSchema";
 import { useNavigate } from "react-router-dom";
+import { RunTagPickerCommand } from "../components/tagging/RunTagPickerCommand";
 
 function createTaskTemplateRequestObject(
   values: TaskTemplateFormValues,
@@ -85,9 +94,21 @@ function createTaskTemplateRequestObject(
 
 type Props = {
   task: TaskApiResponse;
+  taggingEnabled?: boolean;
+  tagKeys?: Array<TagKey>;
+  labelSuggestions?: Array<string>;
+  valueSuggestionsByKey?: Map<string, Array<string>>;
+  currentTags?: Array<Tag>;
 };
 
-function TaskActions({ task }: Props) {
+function TaskActions({
+  task,
+  taggingEnabled = false,
+  tagKeys = [],
+  labelSuggestions = [],
+  valueSuggestionsByKey,
+  currentTags,
+}: Props) {
   const [open, setOpen] = useState(false);
   const id = useId();
   const queryClient = useQueryClient();
@@ -138,6 +159,8 @@ function TaskActions({ task }: Props) {
     mutation.mutate(values);
   }
 
+  const workflowRunId = task.workflow_run_id;
+
   return (
     <div className="flex">
       <Dialog open={open} onOpenChange={setOpen}>
@@ -166,6 +189,23 @@ function TaskActions({ task }: Props) {
             >
               Rerun Task
             </DropdownMenuItem>
+            {taggingEnabled && workflowRunId ? (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <TokensIcon className="mr-2 h-4 w-4" />
+                  Tags
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-72 p-0">
+                  <RunTagPickerCommand
+                    workflowRunId={workflowRunId}
+                    tagKeys={tagKeys}
+                    labelSuggestions={labelSuggestions}
+                    valueSuggestionsByKey={valueSuggestionsByKey}
+                    currentTags={currentTags}
+                  />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
         <DialogContent>

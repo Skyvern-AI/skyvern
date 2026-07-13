@@ -50,6 +50,13 @@ def get_fast_copilot_handler() -> Any | None:
         return None
 
 
+def get_lite_copilot_handler() -> Any | None:
+    try:
+        return app.WORKFLOW_COPILOT_LITE_LLM_API_HANDLER
+    except (RuntimeError, AttributeError):
+        return None
+
+
 async def resolve_main_copilot_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any | None:
     if workflow_permanent_id and organization_id:
         try:
@@ -105,4 +112,7 @@ async def resolve_lite_copilot_handler(workflow_permanent_id: str | None, organi
             posthog_handler = None
         if posthog_handler is not None:
             return posthog_handler
+    handler = get_lite_copilot_handler()
+    if handler is not None:
+        return handler
     return await resolve_workflow_copilot_handler(workflow_permanent_id, organization_id)

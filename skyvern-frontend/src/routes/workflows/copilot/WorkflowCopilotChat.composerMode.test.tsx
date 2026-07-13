@@ -81,8 +81,16 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowPermanentId: "wpid_1",
       workflowRunId: undefined,
     }),
+    useSearchParams: () => [new URLSearchParams(), vi.fn()],
   };
 });
+
+// This suite exercises the legacy (copilot_ux_v1 off) default-mode logic; no
+// test here touches copilot_ux_v1-gated behavior, so pin it off rather than
+// the stray `true` this file previously carried over from SKY-11973's mock.
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => false,
+}));
 
 const saveData = {
   title: "Test WF",
@@ -118,6 +126,12 @@ const saveData = {
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
+}));
+
+// Unrelated to this file's tests; the real hook needs a QueryClientProvider
+// this harness doesn't set up.
+vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";

@@ -7,8 +7,8 @@ def test_workflow_run_trigger_type_from_user_agent_ui_returns_manual() -> None:
     assert workflow_run_trigger_type_from_user_agent(SKYVERN_UI_USER_AGENT) == WorkflowRunTriggerType.manual
 
 
-def test_workflow_run_trigger_type_from_user_agent_mcp_returns_manual() -> None:
-    assert workflow_run_trigger_type_from_user_agent(SKYVERN_MCP_USER_AGENT) == WorkflowRunTriggerType.manual
+def test_workflow_run_trigger_type_from_user_agent_mcp_returns_mcp() -> None:
+    assert workflow_run_trigger_type_from_user_agent(SKYVERN_MCP_USER_AGENT) == WorkflowRunTriggerType.mcp
 
 
 def test_workflow_run_trigger_type_from_user_agent_none_returns_api() -> None:

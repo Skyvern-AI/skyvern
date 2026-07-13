@@ -399,7 +399,9 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
     )
 
 
-def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes() -> None:
+def test_repair_loop_state_counts_through_authoring_repair_context_identity_change() -> None:
+    # An identity change rotates the streak token but is not progress; the zero-run
+    # ceiling still does not terminalize.
     ctx = _ctx()
     ambiguous = CodeAuthoringRepairContext(
         block_label="retrieve_document_link",
@@ -431,9 +433,11 @@ def test_repair_loop_state_resets_when_authoring_repair_context_identity_changes
     run_execution_module._update_repair_loop_state(ctx, sandbox_contract)
 
     assert sandbox_contract.repair_decision.next_action == RepairNextAction.REPAIR
-    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 1
-    assert sandbox_contract.repair_loop_state.ceiling_reached is False
+    assert sandbox_contract.repair_loop_state.streak_token != contract.repair_loop_state.streak_token
+    assert sandbox_contract.repair_loop_state.consecutive_identical_repair_count == 3
+    assert sandbox_contract.repair_loop_state.ceiling_reached is True
     assert getattr(ctx, "blocker_signal", None) is None
+    assert ctx.turn_halt is None
 
 
 def _uncovered_output_turn_state(output_path: str) -> SimpleNamespace:
@@ -501,6 +505,25 @@ def test_persisted_run_outcome_is_not_excluded_from_repair_streak() -> None:
     state = _run_repair_loop_state(ctx)
     assert state.consecutive_identical_repair_count == 1
     assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+    repeat = _run_repair_loop_state(ctx)
+    assert repeat.consecutive_identical_repair_count == 2
+    assert ctx.synthesized_block_reopened_for_output_coverage is False
+
+
+def test_uncovered_output_reopen_preserves_prior_streak_count() -> None:
+    ctx = _ctx()
+    assert _run_repair_loop_state(ctx).consecutive_identical_repair_count == 1
+    assert _run_repair_loop_state(ctx).consecutive_identical_repair_count == 2
+
+    ctx.completion_criteria_turn_state = _uncovered_output_turn_state("output.document_name")
+    ctx.latest_recorded_build_test_outcome = _uncovered_output_author_reject("output.document_name")
+    reopened = _run_repair_loop_state(ctx)
+
+    assert ctx.synthesized_block_reopened_for_output_coverage is True
+    assert reopened.consecutive_identical_repair_count == 2
+    assert reopened.ceiling_reached is False
+    assert ctx.consecutive_non_converging_repair_count == 2
 
 
 def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_page_observation() -> None:
@@ -1399,6 +1422,132 @@ def test_unverified_completion_evidence_does_not_suppress_suspicious_success(
     assert contract.verification_result.user_goal_satisfied is False
 
 
+def test_degraded_delivered_unverified_completion_does_not_route_repair() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.last_run_blocks_workflow_run_id = "wr_unverified"
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_workflow_run_id = "wr_unverified"
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["__copilot_fallback_floor__run", "requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="__copilot_fallback_floor__run",
+                state="unsatisfied",
+                reason_code="no_evidence",
+            ),
+            CriterionVerdict(
+                criterion_id="requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:extract.document_name",
+                output_path="output.document_name",
+                grounding_mode="missing",
+                evidence_source="runtime_output",
+            ),
+        ],
+        degraded_criterion_ids=["__copilot_fallback_floor__run"],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "failure_categories": [{"category": "OUTCOME_UNVERIFIED"}],
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is False
+
+
+def test_delivered_unverified_does_not_mask_failed_blocks() -> None:
+    ctx = _ctx()
+    ctx.delivered_unverified_terminal = True
+    ctx.delivered_unverified_workflow_run_id = "wr_unverified"
+    ctx.delivered_unverified_observed_outputs = {"document_name": "Resale Demand Package"}
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "failed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+
+
+def test_degraded_path_without_terminal_state_still_routes_repair() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.last_run_blocks_workflow_run_id = "wr_unverified"
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["__copilot_fallback_floor__run", "requested_output"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="__copilot_fallback_floor__run",
+                state="unsatisfied",
+                reason_code="no_evidence",
+            ),
+            CriterionVerdict(
+                criterion_id="requested_output",
+                state="unsatisfied",
+                reason_code="structurally_abstained",
+                evidence_ref="block_outputs:extract.document_name",
+                output_path="output.document_name",
+                grounding_mode="missing",
+                evidence_source="runtime_output",
+            ),
+        ],
+        degraded_criterion_ids=["__copilot_fallback_floor__run"],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_unverified",
+                "overall_status": "completed",
+                "frontier_start_label": "extract",
+                "blocks": [{"label": "extract", "block_type": "EXTRACTION", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+
+
 @pytest.mark.parametrize(
     "completion_verification",
     [
@@ -1741,7 +1890,7 @@ def test_unresolved_symbol_context_does_not_preempt_terminal_challenge_stop() ->
                 "workflow_run_id": "wr_blocked",
                 "overall_status": "completed",
                 "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
                 "blocks": [
                     {
                         "label": "extract",
@@ -1841,7 +1990,7 @@ def test_terminal_challenge_preempts_clean_run_ok_contract_stops(
                 "workflow_run_id": run_id,
                 "overall_status": "completed",
                 "failure_reason": failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
                 "blocks": [
                     {
                         "label": "extract",
@@ -1877,7 +2026,7 @@ def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_v
                 "workflow_run_id": "wr_blocked_failed",
                 "overall_status": "failed",
                 "failure_reason": ctx.last_test_failure_reason,
-                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
                 "blocks": [{"label": "submit", "block_type": "NAVIGATION", "status": "failed"}],
             },
         },
@@ -1890,6 +2039,33 @@ def test_terminal_challenge_preempts_failed_run_even_with_satisfied_completion_v
     assert contract.verification_result.user_goal_satisfied is False
     assert contract.verification_result.completion_contract_satisfied is False
     assert contract.verification_result.remaining_blocker is not None
+
+
+def test_keyword_only_challenge_category_never_reaches_contract() -> None:
+    ctx = _ctx()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Run failed.",
+            "data": {
+                "workflow_run_id": "wr_failed",
+                "overall_status": "failed",
+                "failure_reason": "Timeout waiting for search results",
+                "failure_categories": [
+                    {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.7, "evidence_source": "keyword_only"},
+                ],
+                "blocks": [{"label": "search", "block_type": "NAVIGATION", "status": "failed"}],
+            },
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert "ANTI_BOT_DETECTION" not in contract.diagnosis_input.failure_categories
+    assert contract.repair_decision.next_action != RepairNextAction.STOP
+    assert "ANTI_BOT_CHALLENGE" not in contract.diagnosis_result.root_cause_identity.failure_categories
 
 
 def test_low_confidence_challenge_category_does_not_preempt_clean_run_ok_contract() -> None:
@@ -2175,6 +2351,7 @@ def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() ->
         extra={
             "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
             "evidence_source": "page_evidence",
+            "challenge_evidence_source": "challenge_state",
             "evidence_reason": "human verification requires human verification",
         },
     )
@@ -2182,6 +2359,7 @@ def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() ->
     payload = json.loads(_diagnosis_repair_tool_error(ctx, "update_and_run_blocks", "terminal challenge"))
 
     assert payload["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
+    assert payload["data"]["failure_categories"][0]["evidence_source"] == "challenge_state"
     assert ctx.latest_diagnosis_repair_contract is not None
     assert (
         ctx.latest_diagnosis_repair_contract.diagnosis_result.suspected_failure_type

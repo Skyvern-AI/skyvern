@@ -126,6 +126,19 @@ def test_scripts_repository_instantiation():
     assert hasattr(repo, "restore_workflow_script_if_matches")
 
 
+def test_self_heal_repository_instantiation():
+    from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
+
+    mock_session = MagicMock()
+    repo = SelfHealRepository(session_factory=mock_session, debug_enabled=False)
+    assert repo.Session is mock_session
+    assert hasattr(repo, "create_heal_episode")
+    assert hasattr(repo, "get_heal_episodes")
+    assert hasattr(repo, "create_heal_proposal")
+    assert hasattr(repo, "get_heal_proposals")
+    assert hasattr(repo, "update_heal_proposal_status")
+
+
 def test_workflow_parameters_repository_instantiation():
     from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 
@@ -247,6 +260,7 @@ def test_agent_db_has_typed_repo_attributes():
     """After refactoring, AgentDB should expose typed repository attributes."""
     from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
     from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
+    from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
     from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 
     with patch("skyvern.forge.sdk.db.agent_db.create_async_engine"):
@@ -256,6 +270,7 @@ def test_agent_db_has_typed_repo_attributes():
         assert isinstance(db.tasks, TasksRepository)
         assert isinstance(db.credentials, CredentialRepository)
         assert isinstance(db.credential_folders, CredentialFoldersRepository)
+        assert isinstance(db.self_heal, SelfHealRepository)
         # Migrated domains no longer have delegates on AgentDB:
         assert not hasattr(db, "create_workflow")
         assert not hasattr(db, "get_organization")

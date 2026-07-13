@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 
 from skyvern.cli.mcp_tools.code_block import skyvern_code_block_lint
+
+
+@pytest.fixture(autouse=True)
+def _stub_mypy_for_non_mypy_lint_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_mypy = ModuleType("mypy")
+    fake_mypy.__dict__["api"] = SimpleNamespace(run=lambda _args: ("", "", 0))
+    monkeypatch.setitem(sys.modules, "mypy", fake_mypy)
 
 
 def _has_security_error(result: dict, *, reason_code: str, surface: str | None = None) -> bool:

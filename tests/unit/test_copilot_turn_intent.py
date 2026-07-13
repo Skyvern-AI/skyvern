@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     _turn_intent_classification_from_raw,
     build_turn_intent,
     classify_turn_intent,
+    turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -339,6 +340,68 @@ def test_build_turn_intent_routes_raw_secret_to_refuse_over_llm_classification()
     assert intent.missing_context_question == "Store the credential in the Credentials UI."
     assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
     assert TurnIntentReasonCode.LLM_CLASSIFIER not in intent.reason_codes
+
+
+def test_build_turn_intent_defer_authoring_leaves_refuse_uncoerced_but_marks_reason() -> None:
+    policy = RequestPolicy(
+        authoring_intent="defer_authoring",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+    )
+
+    intent = build_turn_intent(
+        user_message="Fill the form on the open page now. Do not author or save a workflow yet.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        classifier_result=_classification(TurnIntentMode.REFUSE),
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING in intent.reason_codes
+
+
+def test_build_turn_intent_defer_authoring_raw_secret_drops_reason_and_keeps_refusal() -> None:
+    policy = RequestPolicy(
+        authoring_intent="defer_authoring",
+        credential_input_kind="raw_secret",
+        raw_secret_detected=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+        clarification_question="Store the credential in the Credentials UI.",
+    )
+
+    intent = build_turn_intent(
+        user_message="Fill the page now with password: hunter2, don't author a workflow yet.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        classifier_result=_classification(TurnIntentMode.BUILD),
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert intent.authority.requires_user_input is True
+    assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
+    assert TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING not in intent.reason_codes
+    assert turn_intent_defers_authoring_live_fill(intent) is False
+
+
+def test_turn_intent_defers_authoring_live_fill_false_for_ordinary_build() -> None:
+    intent = build_turn_intent(
+        user_message="Build a workflow that fills the form and run it.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        classifier_result=_classification(TurnIntentMode.BUILD),
+    )
+
+    assert turn_intent_defers_authoring_live_fill(intent) is False
 
 
 def test_build_turn_intent_redacts_user_goal() -> None:

@@ -135,10 +135,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-max-steps-override",
@@ -1372,6 +1370,352 @@
         "x-fern-sdk-method-name": "delete_folder"
       }
     },
+    "/v1/runs/{workflow_run_id}/tags": {
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Apply run tags",
+        "description": "Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
+        "operationId": "apply_run_tags_v1_runs__workflow_run_id__tags_post",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagApplyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully applied tag changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Invalid tag key or value"
+          }
+        },
+        "x-fern-sdk-method-name": "apply_run_tags"
+      },
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Get run tags",
+        "description": "Get the current tag state for a workflow run.",
+        "operationId": "get_run_tags_v1_runs__workflow_run_id__tags_get",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tags"
+      }
+    },
+    "/v1/runs/{workflow_run_id}/tags/{key}": {
+      "delete": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Delete run tag",
+        "description": "Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.",
+        "operationId": "delete_run_tag_v1_runs__workflow_run_id__tags__key__delete",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to delete",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key to delete"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag (or no-op if absent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_run_tag"
+      }
+    },
+    "/v1/runs/{workflow_run_id}/tags/history": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Get run tag history",
+        "description": "Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.",
+        "operationId": "get_run_tag_history_v1_runs__workflow_run_id__tags_history_get",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow run ID",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "Workflow run ID"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Max events to return",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Max events to return"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only return events at or after this timestamp",
+              "title": "Since"
+            },
+            "description": "Only return events at or after this timestamp"
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to events for a single tag key",
+              "title": "Key"
+            },
+            "description": "Filter to events for a single tag key"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagHistoryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tag_history"
+      }
+    },
     "/v1/tag-keys": {
       "get": {
         "tags": [
@@ -1576,6 +1920,24 @@
         "description": "List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
         "operationId": "list_tag_values_v1_tag_values_get",
         "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to values for a single tag key",
+              "title": "Key"
+            },
+            "description": "Filter to values for a single tag key"
+          },
           {
             "name": "x-api-key",
             "in": "header",
@@ -1992,6 +2354,149 @@
         },
         "x-hidden": true,
         "x-fern-sdk-method-name": "batch_get_workflow_tags_post"
+      }
+    },
+    "/v1/run-tags": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Batch get run tags",
+        "description": "Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.",
+        "operationId": "batch_get_run_tags_v1_run_tags_get",
+        "parameters": [
+          {
+            "name": "workflow_run_ids",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated workflow run IDs",
+              "examples": [
+                "wr_123,wr_456"
+              ],
+              "title": "Workflow Run Ids"
+            },
+            "description": "Comma-separated workflow run IDs"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many workflow run IDs requested"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "batch_get_run_tags"
+      },
+      "post": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Batch get run tags (POST)",
+        "description": "Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).",
+        "operationId": "batch_get_run_tags_post_v1_run_tags_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunTagsBatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagsBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many workflow run IDs requested"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-hidden": true,
+        "x-fern-sdk-method-name": "batch_get_run_tags_post"
       }
     },
     "/v1/artifacts/{artifact_id}/content": {
@@ -3225,6 +3730,9 @@
                 "schema": {}
               }
             }
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
@@ -5493,10 +6001,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-max-steps-override",
@@ -8753,7 +9259,8 @@
           "workflow_trigger",
           "google_sheets_read",
           "google_sheets_write",
-          "pdf_fill"
+          "pdf_fill",
+          "split_pdf"
         ],
         "title": "BlockType"
       },
@@ -9408,7 +9915,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -10519,6 +11026,31 @@
             "type": "string",
             "title": "Credential Id"
           },
+          "credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ids"
+          },
+          "selection_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Strategy"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10579,6 +11111,31 @@
           "credential_id": {
             "type": "string",
             "title": "Credential Id"
+          },
+          "credential_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Ids"
+          },
+          "selection_strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Strategy"
           }
         },
         "type": "object",
@@ -12853,7 +13410,8 @@
           "excel",
           "pdf",
           "image",
-          "docx"
+          "docx",
+          "zip"
         ],
         "title": "FileType"
       },
@@ -13494,6 +14052,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PdfFillBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/SplitPdfBlock"
                 }
               ],
               "discriminator": {
@@ -13519,6 +14080,7 @@
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
+                  "split_pdf": "#/components/schemas/SplitPdfBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
                   "text_prompt": "#/components/schemas/TextPromptBlock",
@@ -13763,6 +14325,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PdfFillBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/SplitPdfBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
@@ -14664,6 +15229,20 @@
             "title": "Save Response As File",
             "default": false
           },
+          "secret_response_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Response Paths"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14863,6 +15442,20 @@
             "type": "boolean",
             "title": "Save Response As File",
             "default": false
+          },
+          "secret_response_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Response Paths"
           },
           "parameter_keys": {
             "anyOf": [
@@ -15517,7 +16110,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -18443,6 +19036,84 @@
         ],
         "title": "RunStatus"
       },
+      "RunTagHistoryResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/TagHistoryItem"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "events"
+        ],
+        "title": "RunTagHistoryResponse"
+      },
+      "RunTagsBatchRequest": {
+        "properties": {
+          "workflow_run_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Workflow Run Ids",
+            "description": "Workflow run IDs to fetch tags for."
+          }
+        },
+        "type": "object",
+        "title": "RunTagsBatchRequest",
+        "description": "Body for ``POST /v1/run-tags`` (used when the run-id list would exceed\nthe URL length cap)."
+      },
+      "RunTagsBatchResponse": {
+        "properties": {
+          "run_tags": {
+            "additionalProperties": {
+              "items": {
+                "$ref": "#/components/schemas/TagItem"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Run Tags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_tags"
+        ],
+        "title": "RunTagsBatchResponse",
+        "description": "Response for the run-tags batch endpoint.\n\nRuns with no tags are present with an empty list so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nRuns outside the caller's org are silently absent (no leakage)."
+      },
+      "RunTagsResponse": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/TagResponse"
+            },
+            "type": "array",
+            "title": "Tags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "tags"
+        ],
+        "title": "RunTagsResponse",
+        "description": "Current tags for a workflow run."
+      },
       "RunWebhookReplayResponse": {
         "properties": {
           "run_id": {
@@ -18844,7 +19515,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -19081,6 +19752,247 @@
           "body"
         ],
         "title": "SendEmailBlockYAML"
+      },
+      "SplitPdfBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "split_pdf",
+            "title": "Block Type",
+            "default": "split_pdf"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "file_url": {
+            "type": "string",
+            "title": "File Url"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "llm_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "file_url",
+          "prompt"
+        ],
+        "title": "SplitPdfBlock"
+      },
+      "SplitPdfBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "split_pdf",
+            "title": "Block Type",
+            "default": "split_pdf"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "file_url": {
+            "type": "string",
+            "title": "File Url"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "llm_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "file_url",
+          "prompt"
+        ],
+        "title": "SplitPdfBlockYAML"
       },
       "TOTPCode": {
         "properties": {
@@ -19619,6 +20531,16 @@
           "removed_from_workflow_count": {
             "type": "integer",
             "title": "Removed From Workflow Count"
+          },
+          "removed_from_run_count": {
+            "type": "integer",
+            "title": "Removed From Run Count",
+            "default": 0
+          },
+          "removed_count": {
+            "type": "integer",
+            "title": "Removed Count",
+            "default": 0
           }
         },
         "type": "object",
@@ -19747,6 +20669,16 @@
           "removed_from_workflow_count": {
             "type": "integer",
             "title": "Removed From Workflow Count"
+          },
+          "removed_from_run_count": {
+            "type": "integer",
+            "title": "Removed From Run Count",
+            "default": 0
+          },
+          "removed_count": {
+            "type": "integer",
+            "title": "Removed Count",
+            "default": 0
           }
         },
         "type": "object",
@@ -20476,6 +21408,16 @@
             "type": "boolean",
             "title": "Script Run",
             "default": false
+          },
+          "trigger_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunTriggerType"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -22294,7 +23236,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -23200,6 +24142,11 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "without_page_information": {
+            "type": "boolean",
+            "title": "Without Page Information",
+            "default": false
           }
         },
         "type": "object",
@@ -23314,6 +24261,11 @@
           "disable_cache": {
             "type": "boolean",
             "title": "Disable Cache",
+            "default": false
+          },
+          "without_page_information": {
+            "type": "boolean",
+            "title": "Without Page Information",
             "default": false
           }
         },
@@ -23704,6 +24656,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PdfFillBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/SplitPdfBlock"
                 }
               ],
               "discriminator": {
@@ -23729,6 +24684,7 @@
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
+                  "split_pdf": "#/components/schemas/SplitPdfBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
                   "text_prompt": "#/components/schemas/TextPromptBlock",
@@ -23901,6 +24857,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PdfFillBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/SplitPdfBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
@@ -24701,6 +25660,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/PdfFillBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/SplitPdfBlock"
                 }
               ],
               "discriminator": {
@@ -24726,6 +25688,7 @@
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
+                  "split_pdf": "#/components/schemas/SplitPdfBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
                   "text_prompt": "#/components/schemas/TextPromptBlock",
@@ -24929,6 +25892,9 @@
                   "$ref": "#/components/schemas/PdfFillBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/SplitPdfBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/WorkflowTriggerBlockYAML"
                 },
                 {
@@ -24961,6 +25927,7 @@
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
                   "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
+                  "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
                   "task": "#/components/schemas/TaskBlockYAML",
                   "task_v2": "#/components/schemas/TaskV2BlockYAML",
                   "text_prompt": "#/components/schemas/TextPromptBlockYAML",
@@ -25985,6 +26952,17 @@
             ],
             "title": "Body"
           },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
           "instructions": {
             "anyOf": [
               {
@@ -26986,12 +27964,13 @@
         "type": "string",
         "enum": [
           "manual",
+          "mcp",
           "api",
           "scheduled",
           "webhook"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
       },
       "WorkflowSchedule": {
         "properties": {
@@ -27147,7 +28126,14 @@
             "title": "Timezone"
           },
           "enabled": {
-            "type": "boolean",
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Enabled",
             "default": true
           },

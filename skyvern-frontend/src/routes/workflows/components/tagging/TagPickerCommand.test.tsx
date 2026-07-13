@@ -109,6 +109,51 @@ describe("TagPickerCommand group-vs-value clarity", () => {
   });
 });
 
+describe("TagPickerCommand current-tag toggle", () => {
+  it("lists current tags and removes one when selected", () => {
+    const onApply = vi.fn();
+    const onRemove = vi.fn();
+    renderPicker(onApply, {
+      currentTags: [
+        { key: "env", value: "prod" },
+        { key: null, value: "urgent" },
+      ],
+      onRemove,
+    });
+
+    expect(screen.getByText("env: prod")).toBeTruthy();
+    fireEvent.click(screen.getByText("urgent"));
+
+    expect(onRemove).toHaveBeenCalledWith({ key: null, value: "urgent" });
+    expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("removes a typed tag when it is already current", () => {
+    const onApply = vi.fn();
+    const onRemove = vi.fn();
+    renderPicker(onApply, {
+      currentTags: [{ key: null, value: "urgent" }],
+      onRemove,
+    });
+
+    type("urgent");
+    fireEvent.click(screen.getByRole("option", { name: /Remove urgent/i }));
+
+    expect(onRemove).toHaveBeenCalledWith({ key: null, value: "urgent" });
+    expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("keeps bulk-style callers add-only when current tags are omitted", () => {
+    const onApply = vi.fn();
+    renderPicker(onApply);
+
+    type("urgent");
+    fireEvent.click(screen.getByRole("option"));
+
+    expect(onApply).toHaveBeenCalledWith({ key: null, value: "urgent" });
+  });
+});
+
 describe("TagPickerCommand disabled state", () => {
   it("does not apply a tag while disabled (guards a bulk apply already in flight)", () => {
     const onApply = vi.fn();
@@ -117,6 +162,45 @@ describe("TagPickerCommand disabled state", () => {
     type("prod");
     fireEvent.click(screen.getByText(/Add prod/));
 
+    expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("does not remove a current tag while disabled", () => {
+    const onRemove = vi.fn();
+    renderPicker(vi.fn(), {
+      currentTags: [{ key: null, value: "urgent" }],
+      onRemove,
+      disabled: true,
+    });
+
+    fireEvent.click(screen.getByText("urgent"));
+
+    expect(onRemove).not.toHaveBeenCalled();
+  });
+});
+
+describe("TagPickerCommand system tags", () => {
+  it("excludes reserved system groups from apply suggestions", () => {
+    const onApply = vi.fn();
+    renderPicker(onApply, {
+      tagKeys: [
+        {
+          key: "skyvern.platform",
+          description: null,
+          workflow_count: 1,
+        },
+      ],
+      valueSuggestionsByKey: new Map([["skyvern.platform", ["github"]]]),
+    });
+
+    type("skyvern");
+
+    expect(screen.queryByText("skyvern.platform:")).toBeNull();
+
+    type("skyvern.platform:");
+
+    expect(screen.queryByText("github")).toBeNull();
+    expect(screen.queryByText(/^Add /)).toBeNull();
     expect(onApply).not.toHaveBeenCalled();
   });
 });

@@ -44,6 +44,7 @@ export interface WorkflowCopilotChatRequest {
   cancel_token?: string;
   target_block_label?: string | null;
   fix_origin?: boolean;
+  keep_pending_proposal?: boolean;
 }
 
 export interface WorkflowCopilotCancelRequest {

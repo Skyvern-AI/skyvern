@@ -74,6 +74,9 @@ class ReachedDownloadTarget:
     download_kind: DownloadKind
     source_step: str
     already_registered: bool
+    # Stored ``trajectory_index`` of the last scouted interaction at the moment the affordance was
+    # observed; the synthesizer sequences the download terminal here instead of after the whole trajectory.
+    trajectory_anchor: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

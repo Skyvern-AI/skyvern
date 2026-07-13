@@ -12,7 +12,10 @@ import { Label } from "@/components/ui/label";
 import { UploadIcon } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState } from "react";
-import { parse as parseYAML, stringify as convertToYAML } from "yaml";
+import {
+  expandFileToWorkflowYamls,
+  extractTitleFromYaml,
+} from "./importWorkflowYaml";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
@@ -24,15 +27,6 @@ import {
 } from "@/components/ui/tooltip";
 import { AxiosError } from "axios";
 
-function isJsonString(str: string): boolean {
-  try {
-    JSON.parse(str);
-  } catch {
-    return false;
-  }
-  return true;
-}
-
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof AxiosError) {
     return error.response?.data?.detail || error.message || fallback;
@@ -42,27 +36,13 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-function extractTitleFromYaml(yaml: string): string | null {
-  try {
-    const parsed = parseYAML(yaml);
-    if (parsed && typeof parsed === "object" && "title" in parsed) {
-      const title = (parsed as { title?: unknown }).title;
-      if (typeof title === "string" && title.trim().length > 0) {
-        return title.trim();
-      }
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
 type DuplicateReason =
   | { kind: "existing"; existingTitle: string }
   | { kind: "intra-batch" }
   | { kind: "check-failed" };
 
 type PreparedYamlImport = {
+  id: string;
   fileName: string;
   yaml: string;
   title: string | null;
@@ -93,7 +73,7 @@ function ImportWorkflowButton({
 
   const createWorkflowFromYaml = async (
     yaml: string,
-    fileName: string,
+    label: string,
   ): Promise<boolean> => {
     try {
       const client = await getClient(credentialGetter);
@@ -115,7 +95,7 @@ function ImportWorkflowButton({
     } catch (error) {
       toast({
         variant: "destructive",
-        title: `Error importing ${fileName}`,
+        title: `Error importing ${label}`,
         description: getErrorMessage(error, "Failed to import agent"),
       });
       return false;
@@ -184,7 +164,7 @@ function ImportWorkflowButton({
       return;
     }
     const results = await Promise.all(
-      files.map((f) => createWorkflowFromYaml(f.yaml, f.fileName)),
+      files.map((f) => createWorkflowFromYaml(f.yaml, f.title ?? f.fileName)),
     );
     const successCount = results.filter(Boolean).length;
     if (successCount > 0) {
@@ -226,31 +206,44 @@ function ImportWorkflowButton({
       onImportStart?.();
     }
 
-    const prepared: PreparedYamlImport[] = await Promise.all(
+    const preparedPerFile = await Promise.all(
       yamlLikeFiles.map(async (file) => {
         const text = await file.text();
-        const isJson = isJsonString(text);
-        const yaml = isJson ? convertToYAML(JSON.parse(text)) : text;
-        const title = extractTitleFromYaml(yaml);
-        let duplicateReason: DuplicateReason | null = null;
-        if (title) {
-          try {
-            const existing = await findExistingWorkflowTitle(title);
-            if (existing) {
-              duplicateReason = { kind: "existing", existingTitle: existing };
-            }
-          } catch {
-            duplicateReason = { kind: "check-failed" };
-          }
+        let documents: string[];
+        try {
+          documents = expandFileToWorkflowYamls(text);
+        } catch {
+          documents = [text];
         }
-        return {
-          fileName: file.name,
-          yaml,
-          title,
-          duplicateReason,
-        };
+        return Promise.all(
+          documents.map(async (yaml, index) => {
+            const title = extractTitleFromYaml(yaml);
+            let duplicateReason: DuplicateReason | null = null;
+            if (title) {
+              try {
+                const existing = await findExistingWorkflowTitle(title);
+                if (existing) {
+                  duplicateReason = {
+                    kind: "existing",
+                    existingTitle: existing,
+                  };
+                }
+              } catch {
+                duplicateReason = { kind: "check-failed" };
+              }
+            }
+            return {
+              id: `${file.name}#${index}`,
+              fileName: file.name,
+              yaml,
+              title,
+              duplicateReason,
+            };
+          }),
+        );
       }),
     );
+    const prepared: PreparedYamlImport[] = preparedPerFile.flat();
 
     const titleCounts = new Map<string, number>();
     for (const p of prepared) {
@@ -399,7 +392,7 @@ function ImportWorkflowButton({
                 </p>
                 <ul className="space-y-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm">
                   {pendingDuplicates.map((dup) => (
-                    <li key={dup.fileName}>
+                    <li key={dup.id}>
                       <div>
                         <span className="font-medium">{dup.fileName}</span>
                         {dup.title && (

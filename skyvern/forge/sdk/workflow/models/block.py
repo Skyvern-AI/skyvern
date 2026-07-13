@@ -14,6 +14,7 @@ import re
 import shutil
 import smtplib
 import textwrap
+import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
@@ -21,7 +22,7 @@ from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
+from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -32,7 +33,7 @@ import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
-from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, TemplateSyntaxError, nodes
 from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -40,6 +41,7 @@ from opentelemetry import trace as otel_trace
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -88,7 +90,12 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
-from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, InvalidLLMResponseType
+from skyvern.forge.sdk.api.llm.exceptions import (
+    EmptyLLMResponseError,
+    InvalidLLMResponseFormat,
+    InvalidLLMResponseType,
+    LLMProviderErrorRetryableTask,
+)
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal
@@ -102,7 +109,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -140,6 +147,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
     RecordingPage,
+    json_safe_recorder_output,
     user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
@@ -153,6 +161,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -173,6 +182,9 @@ from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
+
+if TYPE_CHECKING:
+    from skyvern.forge.agent_functions import CodeBlockEngineFailure
 
 LOG = structlog.get_logger()
 
@@ -3934,6 +3946,95 @@ async def wrapper({default_args}):
                 best_start = step.line_start
         return best
 
+    def _static_goto_url_from_line(self, line: str) -> str | None:
+        # AST-only on purpose: substring/regex matching would also fire on comments and string
+        # literals containing ".goto(", handing element-rot heals a URL they must never get.
+        stripped = line.strip()
+        if not stripped:
+            return None
+        try:
+            # Parses one physical line at a time, so a goto(...) call whose args wrap onto another
+            # line SyntaxErrors here and is treated as "no goto on this line" (safe, not a false match).
+            tree = ast.parse(f"async def _probe():\n    {stripped}", mode="exec")
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "goto":
+                continue
+            # Supported authoring forms are positional (page.goto("...")) and keyword
+            # (page.goto(url="...")); check positional first, then fall back to url=.
+            if node.args:
+                url_node: ast.expr | None = node.args[0]
+            else:
+                url_node = next((keyword.value for keyword in node.keywords if keyword.arg == "url"), None)
+            if url_node is None:
+                return ""
+            if not isinstance(url_node, ast.Constant) or not isinstance(url_node.value, str):
+                return ""
+            parsed = urlparse(url_node.value)
+            return url_node.value if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+        return None
+
+    def _static_url_from_goal(self) -> str:
+        # The goal is human free text (prompt + step descriptions), not code, so a URL regex is
+        # appropriate here (unlike the AST-only code scan). This is the authored destination the
+        # heal should reach when the block's own navigation rotted. Returns the first well-formed
+        # absolute http(s) URL, else "".
+        texts = [self.prompt or ""]
+        if self.steps:
+            texts.extend(step.description or "" for step in self.steps)
+        for text in texts:
+            match = re.search(r"https?://[^\s'\"<>)\]]+", text)
+            if not match:
+                continue
+            candidate = match.group(0).rstrip(".,;")
+            parsed = urlparse(candidate)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                return candidate
+        return ""
+
+    def _derive_escalation_navigation_url(self, failing_line: int, recording_page: RecordingPage) -> str:
+        code_lines = self.code.splitlines()
+        failing_idx = failing_line - 1
+        failing_source_line = code_lines[failing_idx] if 0 <= failing_idx < len(code_lines) else ""
+
+        # None = no goto on the failing line; "" = a goto with a non-static arg; a str = static url.
+        failing_goto_url = self._static_goto_url_from_line(failing_source_line)
+        failing_line_is_goto = failing_goto_url is not None
+
+        try:
+            page_url = recording_page.url
+        except Exception:
+            page_url = None
+        current_url = page_url if isinstance(page_url, str) else None
+        is_error_seat = bool(current_url and current_url.startswith("chrome-error://"))
+
+        # Only a navigation-failure / error-page seat gets navigation recourse — element-rot heals
+        # must never navigate away from live SPA state (H8).
+        if not (failing_line_is_goto or is_error_seat):
+            return ""
+
+        # The block goal is the source of truth for the intended destination; the code's own goto is
+        # what rotted (e.g. the host went dead), so prefer a URL the goal names over re-navigating to
+        # the failing goto's possibly-dead target. Fall back to the code goto only when the goal
+        # names no static URL (a real goto that merely failed transiently is still worth a retry).
+        goal_url = self._static_url_from_goal()
+        if goal_url:
+            return goal_url
+
+        if failing_line_is_goto:
+            return failing_goto_url or ""
+
+        # Error-page seat with a non-goto failing line: walk backward for the nearest STATIC goto,
+        # not the first in the block — an earlier goto can be stale, a later one hasn't executed.
+        for line in reversed(code_lines[:failing_idx]):
+            line_url = self._static_goto_url_from_line(line)
+            if line_url:
+                return line_url
+        return ""
+
     async def _self_heal_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         # User-facing per-workflow setting, restricted to copilot-authored workflows —
         # pre-copilot code blocks must never gain agentic recovery from the toggle alone.
@@ -4037,13 +4138,21 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
         browser_session_id: str | None,
+        browser_state: BrowserState | None = None,
+        page: Page | None = None,
+        classification: HealClassification | None = None,
+        record_output_parameter: bool = True,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         if not await self._self_heal_enabled(workflow_run_context):
             return None
-        if not self._is_healable_page_failure(exception, recording_page):
+        effective_classification = classification or HealClassification(
+            healable=self._is_healable_page_failure(exception, recording_page),
+            skip_reason=None,
+        )
+        if not effective_classification.healable:
             return None
         if not self.prompt:
             return None
@@ -4090,10 +4199,26 @@ async def wrapper({default_args}):
             heal_max_steps = settings.MAX_STEPS_PER_RUN
             if organization.max_steps_per_run is not None:
                 heal_max_steps = min(heal_max_steps, organization.max_steps_per_run)
-            # Blank url: the heal takes over the live, half-mutated page rather than re-navigating to it
-            # (a truthy task.url makes the browser manager reload the page on the browser-session path).
+            escalation_url = (
+                self._derive_escalation_navigation_url(failing_line, recording_page) if failing_line is not None else ""
+            )
+            if escalation_url and browser_state is not None and page is not None:
+                # BROWSER_MANAGER can early-return a cached browser state without ever reading
+                # task.url, so escalation_task.url alone is not reliable navigation recourse.
+                # Drive the live browser_state/page the heal will run on directly instead.
+                try:
+                    await browser_state.navigate_to_url(page=page, url=escalation_url)
+                except Exception:
+                    LOG.warning(
+                        "Self-heal dead-nav escalation navigation failed; continuing from current page",
+                        workflow_run_block_id=workflow_run_block_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
+            # Kept in sync with the direct navigate above for task-record consistency; empty except
+            # on dead-navigation seats (element-rot heals must never navigate — H8 same-session invariant).
             escalation_task = await app.DATABASE.tasks.create_task(
-                url="",
+                url=escalation_url,
                 title=self.label,
                 navigation_goal=navigation_goal,
                 data_extraction_goal=None,
@@ -4147,6 +4272,7 @@ async def wrapper({default_args}):
                     task_block=None,
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=False,
+                    pre_resolved_browser_state=browser_state,
                 )
             finally:
                 current_context.task_id = previous_task_id
@@ -4181,7 +4307,10 @@ async def wrapper({default_args}):
                 )
                 task_output = TaskOutput.from_task(updated_task, downloaded_files)
                 output_parameter_value = workflow_run_context.mask_secrets_in_data(task_output.model_dump())
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
+                if record_output_parameter:
+                    await self.record_output_parameter_value(
+                        workflow_run_context, workflow_run_id, output_parameter_value
+                    )
                 await self._finalize_recovery_block(recovery_block_id, BlockStatus.completed, organization_id)
                 return await self.build_block_result(
                     success=True,
@@ -4219,6 +4348,106 @@ async def wrapper({default_args}):
             )
             await self._fail_escalation_task(escalation_task, escalation_step, recovery_block_id, organization_id)
             return None
+
+    @staticmethod
+    def _is_playwright_exception_class_name(exception_class: str | None) -> bool:
+        if exception_class is None:
+            return False
+        lowered = exception_class.lower()
+        if not lowered.startswith("playwright."):
+            return False
+        return lowered.rsplit(".", 1)[-1].endswith("error")
+
+    @staticmethod
+    def _secure_skip_reason_for_error_code(error_code: str | None) -> HealSkipReason:
+        if error_code == "timeout":
+            return HealSkipReason.timeout_class
+        if error_code == "insecure_code_detected":
+            return HealSkipReason.insecure_code
+        return HealSkipReason.unclassifiable
+
+    def _classify_secure_runner_failure(self, failure: CodeBlockEngineFailure | None) -> HealClassification:
+        if failure is None:
+            return HealClassification(healable=False, skip_reason=HealSkipReason.unclassifiable)
+        has_structured = (
+            failure.exception_class is not None
+            or failure.failing_line is not None
+            or failure.healability_hint is not None
+        )
+        if not has_structured:
+            # No healability_hint to disambiguate, so only the page-class code heals blind;
+            # user_code_error is ambiguous (could be a bare `raise`) and stays fail-closed.
+            if failure.error_code == "unsupported_page_operation":
+                return HealClassification(healable=True, skip_reason=None)
+            return HealClassification(
+                healable=False,
+                skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
+            )
+        if failure.healability_hint is True:
+            return HealClassification(healable=True, skip_reason=None)
+        if failure.healability_hint is None and self._is_playwright_exception_class_name(failure.exception_class):
+            return HealClassification(healable=True, skip_reason=None)
+        return HealClassification(
+            healable=False,
+            skip_reason=self._secure_skip_reason_for_error_code(failure.error_code),
+        )
+
+    async def _resolve_failure_with_heal(
+        self,
+        *,
+        exception: Exception | None,
+        failing_line: int | None,
+        build_failure_result: Callable[[], Awaitable[BlockResult]],
+        classification: HealClassification,
+        recorder: CodeBlockActionRecording,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        browser_session_id: str | None,
+        browser_state: BrowserState | None = None,
+        page: Page | None = None,
+    ) -> BlockResult:
+        healed: BlockResult | None = None
+        if classification.healable:
+            live_browser_state = browser_state or app.BROWSER_MANAGER.get_for_workflow_run(
+                workflow_run_id=workflow_run_id
+            )
+            exception_for_heal = exception or RuntimeError("CodeBlock failed")
+            healed = await self._attempt_self_heal(
+                exception=exception_for_heal,
+                failing_line=failing_line,
+                recording_page=recorder.recording_page,
+                classification=classification,
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                browser_state=live_browser_state,
+                page=page,
+                record_output_parameter=False,
+            )
+        if healed is not None:
+            output_obligation = OutputObligation.none
+            if healed.success:
+                output_obligation = (
+                    OutputObligation.observed
+                    if healed.output_parameter_value is not None
+                    else OutputObligation.vestigial
+                )
+            # Record output before finalizing so a failed write fails closed, never leaving a
+            # completed block without the output downstream consumers require.
+            if output_obligation in {OutputObligation.observed, OutputObligation.vestigial}:
+                await self.record_output_parameter_value(
+                    workflow_run_context,
+                    workflow_run_id,
+                    healed.output_parameter_value,
+                )
+            await recorder.finalize(success=healed.success)
+            return healed
+        await recorder.finalize(success=False)
+        return await build_failure_result()
 
     async def execute(
         self,
@@ -4371,26 +4600,6 @@ async def wrapper({default_args}):
             workflow_run_block_id=workflow_run_block_id,
             block_label=self.label,
         )
-        if use_codeblock_runner:
-            secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
-                block=self,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-                workflow_run_context=workflow_run_context,
-                parameter_values=parameter_values,
-                credential_parameter_keys=credential_parameter_keys,
-            )
-            LOG.info(
-                "Secure CodeBlock override returned",
-                override_returned_none=secure_code_block_result is None,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                block_label=self.label,
-            )
-            if secure_code_block_result is not None:
-                return secure_code_block_result
 
         # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
         # the standard action/artifact timeline and the agent can later take over on failure.
@@ -4408,6 +4617,87 @@ async def wrapper({default_args}):
 
         try:
             await recorder.link_block()
+            if use_codeblock_runner:
+                secure_code_block_result = await app.AGENT_FUNCTION.execute_code_block_override(
+                    block=self,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    workflow_run_context=workflow_run_context,
+                    parameter_values=parameter_values,
+                    credential_parameter_keys=credential_parameter_keys,
+                    recording_page=recording_page,
+                )
+                LOG.info(
+                    "Secure CodeBlock override returned",
+                    override_returned_none=secure_code_block_result is None,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                )
+                if secure_code_block_result is not None:
+                    await recorder.persist(recorder.recorded_actions())
+                    if secure_code_block_result.failure is not None:
+                        secure_failure = secure_code_block_result.failure
+                        secure_classification = self._classify_secure_runner_failure(secure_failure)
+
+                        async def build_secure_failure_result() -> BlockResult:
+                            if secure_code_block_result.block_result is not None:
+                                return secure_code_block_result.block_result
+                            return await self.build_block_result(
+                                success=False,
+                                failure_reason=(
+                                    secure_failure.failure_reason or "Code block failed in the secure runner"
+                                ),
+                                output_parameter_value=None,
+                                status=BlockStatus.failed,
+                                workflow_run_block_id=workflow_run_block_id,
+                                organization_id=organization_id,
+                            )
+
+                        return await self._resolve_failure_with_heal(
+                            exception=None,
+                            failing_line=secure_failure.failing_line,
+                            build_failure_result=build_secure_failure_result,
+                            classification=secure_classification,
+                            recorder=recorder,
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            browser_state=browser_state,
+                            page=page,
+                        )
+                    if secure_code_block_result.block_result is None:
+                        LOG.warning(
+                            "Secure CodeBlock runner returned success without block result",
+                            workflow_run_id=workflow_run_id,
+                            workflow_run_block_id=workflow_run_block_id,
+                            block_label=self.label,
+                        )
+                        await recorder.finalize(success=False)
+                        return await self.build_block_result(
+                            success=False,
+                            failure_reason="Secure code block runner returned no result",
+                            output_parameter_value=None,
+                            status=BlockStatus.failed,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    # failure=None does not imply success: infra arms (no browser/page, runner raise,
+                    # invalid output) return a failed block_result with no healable failure metadata.
+                    if not secure_code_block_result.block_result.success:
+                        await recorder.finalize(success=False)
+                        return secure_code_block_result.block_result
+                    await recorder.finalize(success=True)
+                    await self.record_output_parameter_value(
+                        workflow_run_context,
+                        workflow_run_id,
+                        secure_code_block_result.block_result.output_parameter_value,
+                    )
+                    return secure_code_block_result.block_result
             user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
             result = await self.execute_user_function_with_timeout(
                 user_function,
@@ -4458,29 +4748,35 @@ async def wrapper({default_args}):
                     )
                 )
             await recorder.persist(recorded)
-            healed = await self._attempt_self_heal(
+            legacy_healable = self._is_healable_page_failure(e, recording_page)
+            legacy_classification = HealClassification(
+                healable=legacy_healable,
+                skip_reason=None if legacy_healable else HealSkipReason.unclassifiable,
+            )
+
+            async def build_legacy_failure_result() -> BlockResult:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=failure_reason,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            return await self._resolve_failure_with_heal(
                 exception=e,
                 failing_line=failing_line,
-                recording_page=recording_page,
+                build_failure_result=build_legacy_failure_result,
+                classification=legacy_classification,
+                recorder=recorder,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
-            )
-            if healed is not None:
-                # Finalize the seat task to the heal outcome before the idempotent `finally` no-ops it,
-                # so a healed success no longer leaves the seat row failed under a completed block.
-                await recorder.finalize(success=healed.success)
-                return healed
-            await recorder.finalize(success=False)
-            return await self.build_block_result(
-                success=False,
-                failure_reason=failure_reason,
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
+                browser_state=browser_state,
+                page=page,
             )
 
         else:
@@ -4490,6 +4786,10 @@ async def wrapper({default_args}):
             # Safety net for paths the except arms miss (CancelledError, link_block failure).
             await recorder.finalize(success=False)
 
+        # A leaked recorder proxy (RecordingLocator/Page/Keyboard) is not JSON serializable and
+        # would either crash registration or, via the default= fallback, replace the value with a
+        # useless placeholder — normalize the wrapper family to its selector/marker first.
+        result = json_safe_recorder_output(result)
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
         )
@@ -4554,6 +4854,22 @@ def _default_text_prompt_schema() -> dict[str, Any]:
             }
         },
     }
+
+
+# Transient failures where a single bad response/connection should not fail the whole run.
+# Mirrors the extraction-path treatment (SKY-8264): empty responses and retryable provider
+# errors usually succeed on a second attempt, as do transient DB connection drops.
+# DB errors are narrowed to the connection-loss family (OperationalError/InterfaceError) so a
+# non-transient DB error (IntegrityError, DataError, ...) is not retried into a re-issued
+# paid LLM call. Response-format errors are intentionally excluded — execute() already
+# re-prompts on those with the validation feedback, which beats a blind retry.
+TEXT_PROMPT_RETRIABLE_LLM_EXCEPTIONS: tuple[type[Exception], ...] = (
+    EmptyLLMResponseError,
+    LLMProviderErrorRetryableTask,
+    OperationalError,
+    InterfaceError,
+)
+TEXT_PROMPT_MAX_ATTEMPTS = 3
 
 
 def _json_type_name(value: Any) -> str:
@@ -4759,8 +5075,28 @@ class TextPromptBlock(Block):
         json_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         default_llm_handler = await self._resolve_default_llm_handler(workflow_run_id, organization_id)
+        selected_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
+        # When the block sets no key (org-default path), derive the effective key from the
+        # resolved default handler (mirrors get_override_llm_api_handler) so the fallback
+        # upgrade still fires for default-configured Gemini runs. Used for the lookup only —
+        # selected_llm_key is overwritten solely when a fallback twin exists, so the
+        # no-fallback path stays identical to passing the original key/None.
+        fallback_lookup_key = (
+            selected_llm_key
+            or getattr(default_llm_handler, "llm_key", None)
+            or getattr(getattr(default_llm_handler, "__self__", None), "llm_key", None)
+        )
+        fallback_llm_key = app.AGENT_FUNCTION.get_fallback_llm_key(fallback_lookup_key)
+        if fallback_llm_key:
+            LOG.info(
+                "TextPromptBlock upgrading to fallback-capable LLM config",
+                block_label=self.label,
+                original_llm_key=fallback_lookup_key,
+                fallback_llm_key=fallback_llm_key,
+            )
+            selected_llm_key = fallback_llm_key
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key_for_organization(organization_id) or self.llm_key, default=default_llm_handler
+            selected_llm_key, default=default_llm_handler
         )
         schema_to_use = json_schema or self.json_schema or _default_text_prompt_schema()
 
@@ -4794,15 +5130,38 @@ class TextPromptBlock(Block):
             prompt=prompt,
             llm_key=self.llm_key,
         )
-        response = await llm_api_handler(
-            prompt=prompt,
-            prompt_name="text-prompt",
-            system_prompt=self.workflow_system_prompt,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-            force_dict=False,
-        )
+        response: dict[str, Any] | list | str | None = None
+        for attempt in range(TEXT_PROMPT_MAX_ATTEMPTS):
+            try:
+                response = await llm_api_handler(
+                    prompt=prompt,
+                    prompt_name="text-prompt",
+                    system_prompt=self.workflow_system_prompt,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                    force_dict=False,
+                )
+                break
+            except TEXT_PROMPT_RETRIABLE_LLM_EXCEPTIONS as e:
+                if attempt >= TEXT_PROMPT_MAX_ATTEMPTS - 1:
+                    LOG.warning(
+                        "TextPromptBlock LLM call failed after all retries",
+                        block_label=self.label,
+                        attempts=attempt + 1,
+                        error=str(e),
+                    )
+                    raise
+                backoff_time = 0.2 * (2**attempt)
+                LOG.warning(
+                    "Transient TextPromptBlock LLM/DB failure, retrying",
+                    block_label=self.label,
+                    attempt=attempt + 1,
+                    max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
+                    backoff_time=backoff_time,
+                    error=str(e),
+                )
+                await asyncio.sleep(backoff_time)
 
         if workflow_run_block:
             artifacts_to_persist.append((ArtifactType.LLM_RESPONSE, json.dumps(response).encode("utf-8")))
@@ -5227,6 +5586,18 @@ class FileUploadBlock(Block):
     azure_blob_container_name: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
     continue_on_empty: bool = Field(
         default=False,
@@ -5246,6 +5617,9 @@ class FileUploadBlock(Block):
 
         if self.path and workflow_run_context.has_parameter(self.path):
             parameters.append(workflow_run_context.get_parameter(self.path))
+
+        if self.prompt and workflow_run_context.has_parameter(self.prompt):
+            parameters.append(workflow_run_context.get_parameter(self.prompt))
 
         if self.s3_bucket and workflow_run_context.has_parameter(self.s3_bucket):
             parameters.append(workflow_run_context.get_parameter(self.s3_bucket))
@@ -5271,11 +5645,37 @@ class FileUploadBlock(Block):
         if self.google_drive_folder_id and workflow_run_context.has_parameter(self.google_drive_folder_id):
             parameters.append(workflow_run_context.get_parameter(self.google_drive_folder_id))
 
+        if self.sftp_host and workflow_run_context.has_parameter(self.sftp_host):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_host))
+
+        if self.sftp_username and workflow_run_context.has_parameter(self.sftp_username):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_username))
+
+        if self.sftp_password and workflow_run_context.has_parameter(self.sftp_password):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_password))
+
+        if self.sftp_private_key and workflow_run_context.has_parameter(self.sftp_private_key):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_private_key))
+
+        if self.sftp_private_key_passphrase and workflow_run_context.has_parameter(self.sftp_private_key_passphrase):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_private_key_passphrase))
+
+        if self.sftp_remote_path and workflow_run_context.has_parameter(self.sftp_remote_path):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_remote_path))
+
+        if self.sftp_host_key and workflow_run_context.has_parameter(self.sftp_host_key):
+            parameters.append(workflow_run_context.get_parameter(self.sftp_host_key))
+
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+
+        if self.prompt:
+            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
+                self.prompt, workflow_run_context
+            )
 
         if self.s3_bucket:
             self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
@@ -5309,6 +5709,36 @@ class FileUploadBlock(Block):
             self.google_drive_folder_id = self.format_block_parameter_template_from_workflow_run_context(
                 self.google_drive_folder_id, workflow_run_context
             )
+        if self.sftp_host:
+            self.sftp_host = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_host, workflow_run_context
+            )
+        if self.sftp_username:
+            self.sftp_username = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_username, workflow_run_context
+            )
+        if self.sftp_password:
+            self.sftp_password = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_password, workflow_run_context
+            )
+        if self.sftp_private_key:
+            self.sftp_private_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_private_key, workflow_run_context
+            )
+        if self.sftp_private_key_passphrase:
+            self.sftp_private_key_passphrase = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_private_key_passphrase, workflow_run_context
+            )
+        if self.sftp_remote_path:
+            self.sftp_remote_path = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_remote_path, workflow_run_context
+            )
+        if self.sftp_host_key:
+            self.sftp_host_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.sftp_host_key, workflow_run_context
+            )
+
+        self._apply_workflow_system_prompt(workflow_run_context)
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
@@ -5388,6 +5818,36 @@ class FileUploadBlock(Block):
             google_drive_folder_id=folder_id,
         )
 
+    def _build_sftp_destination(
+        self,
+        *,
+        file_path: str,
+        host: str,
+        port: int,
+        username: str,
+        password: str | None,
+        private_key: str | None,
+        private_key_passphrase: str | None,
+        remote_path: str | None,
+        host_key: str | None,
+    ) -> FileUploadDestination:
+        filename = Path(file_path).name
+        remote_target = sftp_service.build_remote_target(remote_path, filename)
+        remote_uri = f"sftp://{host}:{port}/{remote_target.lstrip('/')}"
+        return FileUploadDestination(
+            storage_type=FileStorageType.SFTP,
+            customer_uri=remote_uri,
+            sdk_uri=remote_uri,
+            sftp_host=host,
+            sftp_port=port,
+            sftp_username=username,
+            sftp_password=password,
+            sftp_private_key=private_key,
+            sftp_private_key_passphrase=private_key_passphrase,
+            sftp_remote_path=remote_path,
+            sftp_host_key=host_key,
+        )
+
     @staticmethod
     def _candidate_download_signal_run_ids(
         *,
@@ -5425,6 +5885,123 @@ class FileUploadBlock(Block):
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
         return files_to_upload
+
+    async def _select_files_to_upload_with_prompt(
+        self,
+        *,
+        prompt: str,
+        files_to_upload: list[str],
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> tuple[list[str], str]:
+        candidate_paths_by_exact_name: dict[str, str] = {}
+        candidate_paths_by_normalized_name: dict[str, str] = {}
+        colliding_normalized_names: set[str] = set()
+        candidate_file_names: list[str] = []
+        for candidate_file_path in files_to_upload:
+            candidate_name = Path(candidate_file_path).name
+            candidate_paths_by_exact_name[candidate_name] = candidate_file_path
+            candidate_file_names.append(candidate_name[:300])
+
+            normalized_name = unicodedata.normalize("NFC", candidate_name)
+            if normalized_name in colliding_normalized_names:
+                continue
+            existing_path = candidate_paths_by_normalized_name.get(normalized_name)
+            if existing_path is not None and existing_path != candidate_file_path:
+                # Distinct files that normalize to the same basename are only safe to resolve by exact spelling.
+                colliding_normalized_names.add(normalized_name)
+                candidate_paths_by_normalized_name.pop(normalized_name)
+            else:
+                candidate_paths_by_normalized_name[normalized_name] = candidate_file_path
+
+        llm_prompt = prompt_engine.load_prompt(
+            "file-upload-select-files",
+            user_instructions=prompt,
+            candidate_file_names=candidate_file_names,
+        )
+        llm_key = self.override_llm_key_for_organization(organization_id)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
+
+        workflow_run_block = None
+        try:
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                workflow_run_block_id, organization_id
+            )
+        except Exception as e:
+            LOG.error(
+                "Failed to fetch workflow_run_block for FileUploadBlock selection artifacts",
+                block_label=self.label,
+                workflow_run_block_id=workflow_run_block_id,
+                error=e,
+            )
+
+        llm_response = await llm_api_handler(
+            prompt=llm_prompt,
+            prompt_name="file-upload-select-files",
+            system_prompt=self.workflow_system_prompt,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            force_dict=False,
+        )
+
+        if workflow_run_block:
+            try:
+                await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                    workflow_run_block=workflow_run_block,
+                    artifacts=[
+                        (ArtifactType.LLM_PROMPT, llm_prompt.encode("utf-8")),
+                        (ArtifactType.LLM_RESPONSE, json.dumps(llm_response).encode("utf-8")),
+                    ],
+                )
+            except Exception as e:
+                LOG.error(
+                    "Failed to save FileUploadBlock selection artifacts",
+                    block_label=self.label,
+                    workflow_run_block_id=workflow_run_block_id,
+                    error=e,
+                )
+
+        if not isinstance(llm_response, dict):
+            raise ValueError("File upload selection LLM response must be a JSON object")
+        reasoning = llm_response.get("reasoning")
+        if not isinstance(reasoning, str):
+            raise ValueError("File upload selection LLM response reasoning must be a string")
+
+        selected_names = llm_response.get("files_to_upload")
+        if not isinstance(selected_names, list) or not all(isinstance(name, str) for name in selected_names):
+            raise ValueError("File upload selection LLM response files_to_upload must be a list of strings")
+
+        selected_paths: list[str] = []
+        seen_paths: set[str] = set()
+        unmatched_names: list[str] = []
+        for selected_name in selected_names:
+            resolved_candidate_path = candidate_paths_by_exact_name.get(selected_name)
+            if resolved_candidate_path is None:
+                normalized_name = unicodedata.normalize("NFC", selected_name)
+                if normalized_name not in colliding_normalized_names:
+                    resolved_candidate_path = candidate_paths_by_normalized_name.get(normalized_name)
+            if resolved_candidate_path is None:
+                unmatched_names.append(selected_name)
+                continue
+            if resolved_candidate_path in seen_paths:
+                continue
+            seen_paths.add(resolved_candidate_path)
+            selected_paths.append(resolved_candidate_path)
+
+        # Any selected name outside the candidate list means the response cannot be trusted; fail closed.
+        if unmatched_names:
+            LOG.warning(
+                "FileUploadBlock prompt selected names that are not candidates",
+                block_label=self.label,
+                workflow_run_block_id=workflow_run_block_id,
+                unmatched_name_count=len(unmatched_names),
+                unmatched_names=[name[:100] for name in unmatched_names[:3]],
+            )
+            raise ValueError(
+                f"File upload selection returned {len(unmatched_names)} name(s) that are not candidate files"
+            )
+
+        return selected_paths, reasoning
 
     def _get_files_in_alternate_candidate_download_dirs(
         self,
@@ -5608,6 +6185,13 @@ class FileUploadBlock(Block):
                 missing_parameters.append("google_credential_id")
             if not self.google_drive_folder_id:
                 missing_parameters.append("google_drive_folder_id")
+        elif self.storage_type == FileStorageType.SFTP:
+            if not self.sftp_host:
+                missing_parameters.append("sftp_host")
+            if not self.sftp_username:
+                missing_parameters.append("sftp_username")
+            if not self.sftp_password and not self.sftp_private_key:
+                missing_parameters.append("sftp_password or sftp_private_key")
         else:
             return await self.build_block_result(
                 success=False,
@@ -5650,7 +6234,7 @@ class FileUploadBlock(Block):
             files_to_upload = []
             max_file_count = (
                 MAX_UPLOAD_FILE_COUNT
-                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE}
+                if self.storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
                 else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
             )
             files_to_upload = self._get_files_to_upload_from_download_dir(
@@ -5730,6 +6314,42 @@ class FileUploadBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
+
+            if files_to_upload and self.prompt and self.prompt.strip():
+                candidate_count = len(files_to_upload)
+                files_to_upload, selection_reasoning = await self._select_files_to_upload_with_prompt(
+                    prompt=self.prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                selected_count = len(files_to_upload)
+                LOG.info(
+                    "FileUploadBlock prompt selection completed",
+                    block_label=self.label,
+                    candidate_count=candidate_count,
+                    selected_count=selected_count,
+                )
+
+                if not files_to_upload:
+                    LOG.warning(
+                        "FileUploadBlock prompt selected no files; treating as no-op",
+                        block_label=self.label,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        candidate_count=candidate_count,
+                        selected_count=selected_count,
+                        reasoning=selection_reasoning,
+                    )
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
+                    return await self.build_block_result(
+                        success=True,
+                        failure_reason=None,
+                        output_parameter_value=uploaded_uris,
+                        status=BlockStatus.completed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
 
             if self.storage_type == FileStorageType.S3:
                 actual_aws_access_key_id = (
@@ -5817,6 +6437,42 @@ class FileUploadBlock(Block):
                     )
                     uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
+            elif self.storage_type == FileStorageType.SFTP:
+                actual_sftp_username = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
+                )
+                actual_sftp_password = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_password) or self.sftp_password
+                )
+                actual_sftp_private_key = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key)
+                    or self.sftp_private_key
+                )
+                actual_sftp_passphrase = (
+                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key_passphrase)
+                    or self.sftp_private_key_passphrase
+                )
+                sftp_port = 22 if self.sftp_port is None else self.sftp_port
+                for file_path in files_to_upload:
+                    destination = self._build_sftp_destination(
+                        file_path=file_path,
+                        host=self.sftp_host or "",
+                        port=sftp_port,
+                        username=actual_sftp_username or "",
+                        password=actual_sftp_password,
+                        private_key=actual_sftp_private_key,
+                        private_key_passphrase=actual_sftp_passphrase,
+                        remote_path=self.sftp_remote_path,
+                        host_key=self.sftp_host_key,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=organization_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
+                LOG.info("FileUploadBlock File(s) uploaded to SFTP", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation
                 raise ValueError(f"Unsupported storage type: {self.storage_type}")
@@ -7796,6 +8452,11 @@ class ValidationBlock(BaseTaskBlock):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
+    # Opt-in: when True, the validation prompt excludes the page DOM/URL/screenshots and
+    # evaluates the criterion against durable data only (prior block outputs, workflow inputs).
+    # Default False keeps today's page-aware behavior.
+    without_page_information: bool = False
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -7822,12 +8483,20 @@ class ValidationBlock(BaseTaskBlock):
                 organization_id=organization_id,
             )
 
-        return await super().execute(
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
-            kwargs=kwargs,
-        )
+        context = skyvern_context.current()
+        prev_without_page_information = context.validation_without_page_information if context else False
+        if context:
+            context.validation_without_page_information = self.without_page_information
+        try:
+            return await super().execute(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                kwargs=kwargs,
+            )
+        finally:
+            if context:
+                context.validation_without_page_information = prev_without_page_information
 
 
 class ActionBlock(BaseTaskBlock):
@@ -10317,6 +10986,10 @@ class WorkflowTriggerBlock(Block):
         workflow_run_context: WorkflowRunContext,
     ) -> Any:
         """Render a single Jinja2 template string, handling the | json filter marker."""
+        credential_id = self._resolve_exact_credential_id_payload_template(value, workflow_run_context)
+        if credential_id is not None:
+            return credential_id
+
         rendered = self.format_block_parameter_template_from_workflow_run_context(
             value, workflow_run_context, env=jinja_json_finalize_strict_env
         )
@@ -10334,6 +11007,46 @@ class WorkflowTriggerBlock(Block):
                 "Remove the surrounding text or remove the '| json' filter.",
             )
         return rendered
+
+    def _resolve_exact_credential_id_payload_template(
+        self,
+        value: str,
+        workflow_run_context: WorkflowRunContext,
+    ) -> str | None:
+        """Preserve raw credential IDs when a trigger payload forwards a credential input."""
+        try:
+            parsed = jinja_sandbox_env.parse(value)
+        except TemplateSyntaxError:
+            return None
+
+        if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output):
+            return None
+
+        rendered_nodes = [
+            node
+            for node in parsed.body[0].nodes
+            if not (isinstance(node, nodes.TemplateData) and not node.data.strip())
+        ]
+        if len(rendered_nodes) != 1:
+            return None
+        expression = rendered_nodes[0]
+        if isinstance(expression, nodes.Name):
+            parameter_key = expression.name
+        elif (
+            isinstance(expression, nodes.Filter)
+            and expression.name == "json"
+            and isinstance(expression.node, nodes.Name)
+        ):
+            parameter_key = expression.node.name
+        else:
+            return None
+
+        get_credential_id = getattr(workflow_run_context, "get_resolved_credential_parameter_id", None)
+        if not callable(get_credential_id):
+            return None
+
+        credential_id = get_credential_id(parameter_key)
+        return credential_id if isinstance(credential_id, str) and credential_id else None
 
     def _render_scalar_with_path(
         self,
@@ -10708,11 +11421,13 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 # Late import: google_sheets_blocks imports Block from this module, so top-level import would cycle.
+from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E402
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -10741,8 +11456,10 @@ BlockSubclasses = Union[
     PrintPageBlock,
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,
+    EmailInboxBlock,
     GoogleSheetsWriteBlock,
     PdfFillBlock,
+    SplitPdfBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

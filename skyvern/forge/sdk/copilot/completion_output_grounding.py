@@ -4,21 +4,29 @@ import ast
 import json
 import re
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
+from dataclasses import replace
 from typing import Any, Literal, Protocol
 
+import structlog
 import yaml
 
 from skyvern.forge.sdk.copilot.completion_verification import CriterionVerdict, EvidenceSourceKind, RunEvidenceSnapshot
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     ExpectedOutputValue,
+    JudgmentPredicate,
+    JudgmentTruthCondition,
     RequestedOutputEvidenceSource,
+    _coerce_judgment_truth_condition,
     _is_judgment_boolean_criterion,
     lookup_requested_output_path_alias,
     schema_output_path_aliases_from_criteria,
 )
+from skyvern.forge.sdk.copilot.task_output_envelope import _TASK_ENVELOPE_BLOCK_TYPES, _TASK_OUTPUT_PAYLOAD_FIELDS
 from skyvern.utils.yaml_loader import safe_load_no_dates
+
+LOG = structlog.get_logger()
 
 _GOAL_PATH_INDEX_PATTERN = re.compile(r"\[\d+\]")
 _REQUESTED_OUTPUT_PREFIX = "output."
@@ -28,6 +36,9 @@ _IGNORED_RUNTIME_FIELD_NAMES = frozenset({"evidence_text"})
 _INDEPENDENT_EVIDENCE_SOURCES: frozenset[EvidenceSourceKind] = frozenset(
     {"independent_page_evidence", "registered_output_parameter", "registered_artifact_content"}
 )
+# A judgment boolean may only be decided by page evidence observed after the run. The other
+# "independent" sources are registered by the generated code, so they can carry a fabricated packet.
+_JUDGMENT_EVIDENCE_SOURCES: frozenset[EvidenceSourceKind] = frozenset({"independent_page_evidence"})
 _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 _MIN_CARRIER_VALUE_CHARS = 4
@@ -37,8 +48,13 @@ _PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workfl
 
 class _GroundingCtx(Protocol):
     code_artifact_metadata: object
+    workflow_verification_evidence: _WorkflowVerificationEvidenceCtx | None
     last_workflow_yaml: str | None
     workflow_yaml: str | None
+
+
+class _WorkflowVerificationEvidenceCtx(Protocol):
+    code_artifact_metadata: object
 
 
 def split_requested_output_criteria(
@@ -49,7 +65,7 @@ def split_requested_output_criteria(
     for criterion in criteria:
         if (
             criterion.output_path
-            and criterion.level != "definition"
+            and (criterion.level != "definition" or _is_judgment_boolean_criterion(criterion))
             and not criterion.method_mandated
             and criterion.kind != "validation_classification"
             and _normalize_output_path(criterion.output_path)
@@ -66,16 +82,20 @@ def grade_requested_output_criteria(
     snapshot: RunEvidenceSnapshot,
 ) -> list[CriterionVerdict]:
     requested_path_aliases = schema_output_path_aliases_from_criteria(criteria)
-    raw_authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx)
-    authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, requested_path_aliases)
-    declared_judgment_output_paths = _producer_declared_judgment_output_paths(copilot_ctx.code_artifact_metadata)
+    metadata = _grounding_code_artifact_metadata(copilot_ctx)
+    raw_authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, metadata=metadata)
+    authored_paths_by_label = _authored_output_contract_paths_by_label(
+        copilot_ctx, requested_path_aliases, metadata=metadata
+    )
+    declared_judgment_output_paths = _producer_declared_judgment_output_paths(metadata)
+    declared_judgment_truth_conditions = _producer_declared_judgment_truth_conditions(metadata)
     verdicts: list[CriterionVerdict] = []
     for criterion in criteria:
         path = _normalize_output_path(criterion.output_path)
-        # A carrier verdict is already sourced from independent evidence and only returned on a
-        # positive confirmation, so the early return skips the self-emission veto path that no
-        # longer applies; abstentions fall through to normal authored-path grading.
-        carrier_verdict = _carrier_confirmation(criterion, path, snapshot)
+        # A carrier verdict is sourced from independent evidence. The judgment arm may return an
+        # unsatisfied evidence_contradicts verdict, which must reach the grade loop unswallowed;
+        # scalar-carrier abstentions and non-confirmations fall through to normal authored-path grading.
+        carrier_verdict = _carrier_confirmation(criterion, path, snapshot, declared_judgment_truth_conditions)
         if carrier_verdict is not None:
             verdicts.append(carrier_verdict)
             continue
@@ -92,22 +112,6 @@ def grade_requested_output_criteria(
                 )
             )
             continue
-        independent_labels = {
-            label for label, source in snapshot.block_output_sources.items() if source in _INDEPENDENT_EVIDENCE_SOURCES
-        }
-        accepted_runtime_outputs = dict(
-            _accepted_runtime_outputs(snapshot.block_outputs, accepted_labels, independent_labels)
-        )
-        accepted_output_sources = {
-            label: source
-            for label, source in snapshot.block_output_sources.items()
-            if label in accepted_runtime_outputs
-        }
-        accepted_authored_paths = set().union(*(authored_paths_by_label[label] for label in accepted_labels))
-        accepted_raw_authored_paths = set().union(
-            *(raw_authored_paths_by_label.get(label, set()) for label in accepted_labels)
-        )
-        projection_roots = _runtime_projection_roots(accepted_authored_paths | accepted_raw_authored_paths)
         expected_value = criterion.expected_output_value
         expected_shape = criterion.expected_output_shape
         grounding_mode = _criterion_grounding_mode(criterion)
@@ -121,6 +125,28 @@ def grade_requested_output_criteria(
             _is_judgment_boolean_criterion(criterion) or requires_declared_independent_evidence
         )
         trace_fields = _criterion_trace_fields(criterion, grounding_mode, effective_evidence_source)
+        independent_labels = {
+            label for label, source in snapshot.block_output_sources.items() if source in _INDEPENDENT_EVIDENCE_SOURCES
+        }
+        accepted_runtime_output_items = _accepted_runtime_outputs(
+            snapshot.block_outputs, accepted_labels, independent_labels
+        )
+        if judgment_grounding_bars_self_emission:
+            accepted_runtime_output_items = sorted(
+                accepted_runtime_output_items,
+                key=lambda item: 0 if item[0] in independent_labels else 1,
+            )
+        accepted_runtime_outputs = dict(accepted_runtime_output_items)
+        accepted_output_sources = {
+            label: source
+            for label, source in snapshot.block_output_sources.items()
+            if label in accepted_runtime_outputs
+        }
+        accepted_authored_paths = set().union(*(authored_paths_by_label[label] for label in accepted_labels))
+        accepted_raw_authored_paths = set().union(
+            *(raw_authored_paths_by_label.get(label, set()) for label in accepted_labels)
+        )
+        projection_roots = _runtime_projection_roots(accepted_authored_paths | accepted_raw_authored_paths)
         if expected_value is not None:
             refutation = _independent_evidence_text_refutation(
                 accepted_runtime_outputs,
@@ -265,11 +291,100 @@ def grade_requested_output_criteria(
     return verdicts
 
 
+def floor_rekeyed_path_backing(
+    copilot_ctx: _GroundingCtx,
+    criteria: list[CompletionCriterion],
+    emission_block_outputs: Mapping[str, Any],
+    emission_block_output_sources: Mapping[str, EvidenceSourceKind],
+    emission_block_types: Mapping[str, str | None],
+    runtime_envelope_labels: Collection[str] = frozenset(),
+) -> dict[str, bool]:
+    """Which floor-rekeyed markers have a meaningful runtime/registered value at their original
+    ``floor_rekeyed_from_path`` in an emission-only evidence view (page and artifact observations
+    excluded by construction), resolved with the requested-output grader's accepted-producer-label,
+    alias, and projection machinery. The rule is identical whether or not the artifact emitted
+    anything: absent emission reads as unbacked."""
+    marked = [criterion for criterion in criteria if criterion.requested_output_floor_rekeyed]
+    if not marked:
+        return {}
+    effective_criteria = [
+        replace(criterion, output_path=criterion.floor_rekeyed_from_path)
+        for criterion in marked
+        if criterion.floor_rekeyed_from_path
+    ]
+    aliases = schema_output_path_aliases_from_criteria(effective_criteria)
+    metadata = _grounding_code_artifact_metadata(copilot_ctx)
+    raw_authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, metadata=metadata)
+    authored_paths_by_label = _authored_output_contract_paths_by_label(copilot_ctx, aliases, metadata=metadata)
+    independent_labels = {
+        label for label, source in emission_block_output_sources.items() if source in _INDEPENDENT_EVIDENCE_SOURCES
+    }
+    envelope_labels = {
+        label
+        for label in emission_block_outputs
+        if (emission_block_types.get(label) or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES
+    }
+    backing: dict[str, bool] = {}
+    for criterion in marked:
+        path = _normalize_output_path(criterion.floor_rekeyed_from_path)
+        backing[criterion.id] = _floor_rekeyed_path_emission_present(
+            path,
+            emission_block_outputs,
+            authored_paths_by_label,
+            raw_authored_paths_by_label,
+            independent_labels,
+            envelope_labels,
+            runtime_envelope_labels,
+        )
+    return backing
+
+
+def _floor_rekeyed_path_emission_present(
+    path: str,
+    block_outputs: Mapping[str, Any],
+    authored_paths_by_label: dict[str, set[str]],
+    raw_authored_paths_by_label: dict[str, set[str]],
+    independent_labels: set[str],
+    envelope_labels: set[str],
+    runtime_envelope_labels: Collection[str],
+) -> bool:
+    if not path:
+        return False
+    accepted_labels = {label for label, paths in authored_paths_by_label.items() if path in paths}
+    if accepted_labels:
+        candidate_labels = accepted_labels
+        accepted_authored_paths = set().union(*(authored_paths_by_label[label] for label in accepted_labels))
+        accepted_raw_authored_paths = set().union(
+            *(raw_authored_paths_by_label.get(label, set()) for label in accepted_labels)
+        )
+        projection_roots = _runtime_projection_roots(accepted_authored_paths | accepted_raw_authored_paths)
+        if accepted_labels & envelope_labels:
+            projection_roots |= set(_TASK_OUTPUT_PAYLOAD_FIELDS)
+    elif envelope_labels:
+        if len(runtime_envelope_labels) > 1:
+            # No authored contract names the producer, so with more than one task-envelope block the
+            # emission is unattributable and a coincidental match in an unrelated block must not back
+            # it. A single envelope block is the unambiguous producer.
+            return False
+        candidate_labels = envelope_labels
+        projection_roots = set(_TASK_OUTPUT_PAYLOAD_FIELDS)
+    else:
+        return False
+    accepted_runtime_output_items = _accepted_runtime_outputs(block_outputs, candidate_labels, independent_labels)
+    if not accepted_runtime_output_items:
+        return False
+    match_state, _ref = _runtime_output_path_presence(dict(accepted_runtime_output_items), path, projection_roots)
+    return match_state == "present"
+
+
 def _carrier_confirmation(
-    criterion: CompletionCriterion, path: str, snapshot: RunEvidenceSnapshot
+    criterion: CompletionCriterion,
+    path: str,
+    snapshot: RunEvidenceSnapshot,
+    declared_judgment_truth_conditions: Mapping[str, JudgmentTruthCondition],
 ) -> CriterionVerdict | None:
-    if _is_judgment_boolean_criterion(criterion):
-        return None
+    if _is_judgment_boolean_criterion(criterion) or path in declared_judgment_truth_conditions:
+        return _judgment_carrier_verdict(criterion, path, snapshot, declared_judgment_truth_conditions)
     value_text = _carrier_scalar_text(criterion.expected_output_value)
     if value_text is None or len(value_text) < _MIN_CARRIER_VALUE_CHARS:
         return None
@@ -509,6 +624,233 @@ def _producer_declared_judgment_output_paths(metadata: object) -> set[str]:
     return paths
 
 
+def _producer_declared_judgment_truth_conditions(metadata: object) -> dict[str, JudgmentTruthCondition]:
+    if not isinstance(metadata, Mapping):
+        return {}
+    conditions: dict[str, JudgmentTruthCondition] = {}
+    for artifact in metadata.values():
+        if not isinstance(artifact, Mapping):
+            continue
+        declared_criteria = artifact.get("completion_criteria")
+        if not isinstance(declared_criteria, list):
+            continue
+        for declared in declared_criteria:
+            if not isinstance(declared, Mapping):
+                continue
+            normalized = _normalize_output_path(declared.get("output_path"))
+            condition = _coerce_judgment_truth_condition(
+                declared.get("judgment_predicate"), declared.get("judgment_polarity_when_holds")
+            )
+            if condition is None and declared.get("requested_output_evidence_source") == "independent_run_evidence":
+                condition = _producer_declared_path_judgment_truth_condition(normalized)
+            if normalized and condition is not None:
+                conditions.setdefault(normalized, condition)
+    return conditions
+
+
+def _producer_declared_path_judgment_truth_condition(output_path: str) -> JudgmentTruthCondition | None:
+    if output_path == "login_gate_blocks_target":
+        return JudgmentTruthCondition(predicate="login_gate_blocks_target", polarity_when_holds=True)
+    return None
+
+
+def _grounding_code_artifact_metadata(copilot_ctx: _GroundingCtx) -> object:
+    metadata = copilot_ctx.code_artifact_metadata
+    if _metadata_has_authored_output_contract(metadata):
+        return metadata
+    evidence = copilot_ctx.workflow_verification_evidence
+    if evidence is not None and _metadata_has_authored_output_contract(evidence.code_artifact_metadata):
+        return evidence.code_artifact_metadata
+    return metadata
+
+
+def _metadata_has_authored_output_contract(metadata: object) -> bool:
+    if not isinstance(metadata, Mapping):
+        return False
+    return any(
+        isinstance(artifact, Mapping) and bool(_artifact_contract_paths(artifact)) for artifact in metadata.values()
+    )
+
+
+def _judgment_carrier_verdict(
+    criterion: CompletionCriterion,
+    path: str,
+    snapshot: RunEvidenceSnapshot,
+    declared_judgment_truth_conditions: Mapping[str, JudgmentTruthCondition],
+) -> CriterionVerdict | None:
+    expected_value = _bool_canonical(criterion.expected_output_value)
+    if expected_value is None:
+        expected_value = _emitted_judgment_boolean(snapshot, path)
+    if expected_value is None:
+        return None
+    condition = criterion.judgment_truth_condition or declared_judgment_truth_conditions.get(path)
+    if condition is None:
+        return None
+    origin = "criterion" if criterion.judgment_truth_condition is not None else "producer_metadata"
+    trace_fields = _criterion_trace_fields(
+        criterion,
+        "judgment_boolean",
+        "independent_run_evidence"
+        if path in declared_judgment_truth_conditions
+        else criterion.requested_output_evidence_source,
+    )
+    confirmed: CriterionVerdict | None = None
+    confirmed_label: str | None = None
+    abstention_label: str | None = None
+    abstention_source: EvidenceSourceKind | None = None
+    for label, payload in snapshot.block_outputs.items():
+        source = snapshot.block_output_sources.get(label)
+        if source not in _JUDGMENT_EVIDENCE_SOURCES or not isinstance(payload, Mapping):
+            continue
+        if abstention_label is None:
+            abstention_label = label
+            abstention_source = source
+        predicate_holds = _judgment_packet_predicate_holds(condition.predicate, payload)
+        if predicate_holds is None:
+            continue
+        observed_value = condition.polarity_when_holds if predicate_holds else not condition.polarity_when_holds
+        if observed_value != expected_value:
+            _log_judgment_evidence_verdict(condition, label, "evidence_contradicts", origin)
+            return CriterionVerdict(
+                criterion_id=criterion.id,
+                state="unsatisfied",
+                reason_code="evidence_contradicts",
+                evidence_ref=f"block_outputs:{label}",
+                missing_evidence=f"independent evidence contradicted output.{path}",
+                evidence_source=source,
+                **trace_fields,
+            )
+        if confirmed is None:
+            confirmed_label = label
+            confirmed = CriterionVerdict(
+                criterion_id=criterion.id,
+                state="satisfied",
+                reason_code="evidence_confirms",
+                evidence_ref=f"block_outputs:{label}",
+                evidence_source=source,
+                **trace_fields,
+            )
+    if confirmed is not None and confirmed_label is not None:
+        _log_judgment_evidence_verdict(condition, confirmed_label, "evidence_confirms", origin)
+    if confirmed is None and abstention_label is not None:
+        return CriterionVerdict(
+            criterion_id=criterion.id,
+            state="unsatisfied",
+            reason_code=_STRUCTURAL_ABSTENTION_REASON_CODE,
+            evidence_ref=f"block_outputs:{abstention_label}",
+            missing_evidence=f"independent evidence did not structurally decide output.{path}",
+            evidence_source=abstention_source,
+            **trace_fields,
+        )
+    return confirmed
+
+
+def _emitted_judgment_boolean(snapshot: RunEvidenceSnapshot, path: str) -> bool | None:
+    parts = _path_parts(path)
+    observed_values: set[bool] = set()
+    for label, payload in snapshot.block_outputs.items():
+        if snapshot.block_output_sources.get(label) in _INDEPENDENT_EVIDENCE_SOURCES:
+            continue
+        values, _source_path = _runtime_path_values(payload, parts, path, set())
+        for value in values:
+            canonical = _bool_canonical(value)
+            if canonical is None:
+                return None
+            observed_values.add(canonical)
+    if len(observed_values) == 1:
+        return next(iter(observed_values))
+    return None
+
+
+def _log_judgment_evidence_verdict(
+    condition: JudgmentTruthCondition, packet_label: str, verdict: str, origin: str
+) -> None:
+    LOG.info(
+        "copilot_judgment_evidence_verdict",
+        predicate=condition.predicate,
+        packet_label=packet_label,
+        verdict=verdict,
+        origin=origin,
+    )
+
+
+def _judgment_packet_predicate_holds(predicate: JudgmentPredicate, packet: Mapping[str, object]) -> bool | None:
+    if predicate == "login_gate_blocks_target":
+        return _login_gate_blocks_target(packet)
+    return None
+
+
+def _login_gate_blocks_target(packet: Mapping[str, object]) -> bool | None:
+    forms = _packet_mapping_list(packet.get("forms"))
+    result_containers = _packet_mapping_list(packet.get("result_containers"))
+    navigation_targets = _packet_mapping_list(packet.get("navigation_targets"))
+    if _has_structural_result_container(result_containers):
+        return False
+    if _has_enabled_password_field(forms) and (_has_submit_control(forms) or _has_gated_submit_control(packet, forms)):
+        return True
+    if not forms and not result_containers and not navigation_targets:
+        return None
+    return None
+
+
+def _packet_mapping_list(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _has_enabled_password_field(forms: list[Mapping[str, object]]) -> bool:
+    for form in forms:
+        for field in _packet_mapping_list(form.get("fields")):
+            if field.get("disabled") is True:
+                continue
+            field_type = field.get("type")
+            if isinstance(field_type, str) and field_type.casefold() == "password":
+                return True
+    return False
+
+
+def _has_submit_control(forms: list[Mapping[str, object]]) -> bool:
+    for form in forms:
+        for control in _packet_mapping_list(form.get("submit_controls")):
+            control_type = control.get("type")
+            selector = control.get("selector")
+            if isinstance(control_type, str) and control_type.casefold() in {"", "button", "submit"}:
+                return True
+            if isinstance(selector, str) and selector.strip():
+                return True
+    return False
+
+
+def _has_gated_submit_control(packet: Mapping[str, object], forms: list[Mapping[str, object]]) -> bool:
+    for form in forms:
+        for control in _packet_mapping_list(form.get("submit_controls")):
+            if control.get("disabled") is True:
+                return True
+    challenge_state = packet.get("challenge_state")
+    if isinstance(challenge_state, Mapping):
+        if challenge_state.get("gates_submit_controls") is True:
+            return True
+        if _packet_mapping_list(challenge_state.get("gated_submit_controls")):
+            return True
+    return False
+
+
+def _has_structural_result_container(containers: list[Mapping[str, object]]) -> bool:
+    for container in containers:
+        row_count = container.get("row_count")
+        if isinstance(row_count, int) and row_count > 0:
+            return True
+        for key in ("selector", "id", "tag", "row_selector"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+        rows = container.get("sample_rows")
+        if isinstance(rows, list) and rows:
+            return True
+    return False
+
+
 def _schema_boolean_output_paths(schema: Mapping[str, Any] | None, prefix: str = "") -> set[str]:
     if not isinstance(schema, Mapping):
         return set()
@@ -534,9 +876,9 @@ def _schema_boolean_output_paths(schema: Mapping[str, Any] | None, prefix: str =
 
 
 def _authored_output_contract_paths_by_label(
-    copilot_ctx: _GroundingCtx, aliases: dict[str, str] | None = None
+    copilot_ctx: _GroundingCtx, aliases: dict[str, str] | None = None, *, metadata: object | None = None
 ) -> dict[str, set[str]]:
-    metadata = copilot_ctx.code_artifact_metadata
+    metadata = metadata if metadata is not None else copilot_ctx.code_artifact_metadata
     code_by_label = _code_blocks_by_label(copilot_ctx)
     paths_by_label: dict[str, set[str]] = {}
     if isinstance(metadata, Mapping):

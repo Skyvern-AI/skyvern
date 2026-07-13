@@ -38,7 +38,8 @@ import { DebugStoreProvider } from "@/store/DebugStoreContext";
 import { BrowserProfileDetailPage } from "@/routes/browserProfiles/BrowserProfileDetailPage.tsx";
 import { BrowserProfilesPage } from "@/routes/browserProfiles/BrowserProfilesPage.tsx";
 import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
-import { IntegrationsUnavailable } from "@/routes/integrations/IntegrationsUnavailable";
+import { GoogleOAuthCallback } from "@/routes/integrations/GoogleOAuthCallback";
+import { Integrations } from "@/routes/integrations/Integrations";
 import { RecipeComingSoonPage } from "@/routes/recipes/RecipeComingSoonPage";
 import { RecipesPage } from "@/routes/recipes/RecipesPage";
 import { RunRouter } from "@/routes/runs/RunRouter";
@@ -398,7 +399,15 @@ const router = createBrowserRouter([
         children: [
           {
             index: true,
-            element: <IntegrationsUnavailable />,
+            element: <Integrations />,
+          },
+          {
+            path: "google/callback",
+            element: <GoogleOAuthCallback />,
+          },
+          {
+            path: "microsoft/callback",
+            element: <Navigate to="/integrations" replace />,
           },
         ],
       },

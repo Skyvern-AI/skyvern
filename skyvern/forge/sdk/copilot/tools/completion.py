@@ -5,8 +5,11 @@ from typing import Any, Protocol
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    _GroundingCtx,
+    floor_rekeyed_path_backing,
     grade_requested_output_criteria,
     split_requested_output_criteria,
 )
@@ -20,6 +23,8 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
     carry_degraded_criterion_ids,
+    carry_floor_rekeyed_criterion_ids,
+    carry_floor_rekeyed_path_backing,
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
@@ -51,12 +56,17 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
     derive_from_block_outputs,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, is_fallback_floor_criterion
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    _is_judgment_boolean_criterion,
+    is_fallback_floor_criterion,
+)
 from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
+    _TASK_ENVELOPE_BLOCK_TYPES,
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     _copilot_seconds_remaining,
     _current_workflow_block_labels,
@@ -64,13 +74,14 @@ from ._shared import (
     _failed_run_block_labels,
     _is_meaningful_extracted_data,
     _registered_output_parameter_payloads,
+    _registered_output_payload_view,
     _valid_runtime_anchor_url,
     _workflow_output_parameter_payloads,
 )
 from .blockers import (
     _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
-    _looks_like_anti_bot_blocker,
+    _artifact_challenge_flag_from_result,
     _run_blocks_structured_blocker_message,
 )
 
@@ -294,9 +305,16 @@ def _authored_output_contract_path(value: object) -> str:
     return f"output.{path}"
 
 
-def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
-    run_criteria = [c for c in criteria if getattr(c, "level", "run") != "definition"]
-    definition_criteria = [c for c in criteria if getattr(c, "level", "run") == "definition"]
+def _split_criteria_by_plane(
+    criteria: list[CompletionCriterion],
+) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
+    run_criteria: list[CompletionCriterion] = []
+    definition_criteria: list[CompletionCriterion] = []
+    for criterion in criteria:
+        if criterion.level != "definition" or (criterion.output_path and _is_judgment_boolean_criterion(criterion)):
+            run_criteria.append(criterion)
+        else:
+            definition_criteria.append(criterion)
     return run_criteria, definition_criteria
 
 
@@ -402,6 +420,7 @@ async def _maybe_run_completion_verification_from_page_observation(
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
         verification = carry_degraded_criterion_ids(verification, criteria)
+        verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
         copilot_ctx.completion_verification_result = verification
         record_completion_verification(copilot_ctx, verification)
         _record_adjudication_on_turn_state(copilot_ctx, verification)
@@ -466,6 +485,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                     contingent_criterion_ids=contingent_ids,
                     contingent_on_by_criterion_id=contingent_on_by_id,
                     contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                    requested_output_criteria_count=len(requested_output_criteria),
                 )
                 if run_result is not None
                 else CompletionVerificationResult(
@@ -553,9 +573,11 @@ async def _maybe_run_completion_verification_from_page_observation(
                 contingent_criterion_ids=contingent_ids,
                 contingent_on_by_criterion_id=contingent_on_by_id,
                 contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                requested_output_criteria_count=len(requested_output_criteria),
             )
 
     verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     if (
         isinstance(existing, CompletionVerificationResult)
         and not verification.is_fully_satisfied()
@@ -672,7 +694,7 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
         return False
     structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot, _empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
-    if structured_blocker and (anti_bot or _looks_like_anti_bot_blocker(structured_blocker)):
+    if structured_blocker and (anti_bot or _artifact_challenge_flag_from_result(result, copilot_ctx)):
         return False
     return True
 
@@ -696,13 +718,15 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
 
 
 def _failure_category_names(result: dict[str, Any]) -> list[str]:
+    """Carrier-backed category names only: an uncorroborated anti-bot stamp must
+    not count toward the artifact-health exclusion set."""
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
     raw_categories = data.get("failure_categories")
     if not isinstance(raw_categories, list):
         return []
     categories: list[str] = []
-    for item in raw_categories:
+    for item in carrier_backed_anti_bot_categories(raw_categories):
         if not isinstance(item, dict):
             continue
         category = item.get("category")
@@ -792,6 +816,15 @@ def _bind_independent_post_run_page_evidence(
         key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS
     }
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
+    LOG.info(
+        "copilot_post_run_page_evidence_snapshot_binding",
+        workflow_run_id=run_id,
+        packet_label=_POST_RUN_PAGE_OBSERVATION_LABEL,
+        evidence_source="independent_page_evidence",
+        evidence_workflow_run_id=evidence.get("workflow_run_id"),
+        evidence_observed_after_workflow_run=evidence.get("observed_after_workflow_run"),
+        evidence_source_tool=evidence.get("source_tool"),
+    )
 
 
 def _bind_registered_artifact_evidence(
@@ -821,6 +854,99 @@ def _pre_run_page_reference_text(reference: PreRunPageReference | None, run_id: 
     return reference.text or None
 
 
+def _floor_rekeyed_emission_evidence(
+    copilot_ctx: _GroundingCtx, run_data: Mapping[str, Any] | None
+) -> tuple[dict[str, Any], dict[str, EvidenceSourceKind], dict[str, str | None], set[str]]:
+    """Emission-only evidence view for floor-rekeyed backing: this run's block runtime outputs and
+    registered output parameters, each envelope-sliced with its producer block's type so metadata-only
+    envelopes carry no signal. Page and registered-artifact observations never enter by construction.
+    The fourth element is the labels of task-envelope blocks that ran this run — a producer that
+    emitted nothing drops from the evidence view, so this is the only signal of how many candidate
+    producers exist when no authored contract names one."""
+    block_outputs: dict[str, Any] = {}
+    block_output_sources: dict[str, EvidenceSourceKind] = {}
+    block_types: dict[str, str | None] = {}
+    runtime_envelope_labels: set[str] = set()
+    if not isinstance(run_data, Mapping):
+        return block_outputs, block_output_sources, block_types, runtime_envelope_labels
+    current_labels = set(_current_workflow_block_labels(copilot_ctx))
+    blocks = run_data.get("blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            block_type = block.get("block_type")
+            extracted = block.get("extracted_data")
+            if isinstance(label, str) and label in current_labels:
+                if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES:
+                    runtime_envelope_labels.add(label)
+                sliced = _registered_output_payload_view(extracted, block_type)
+                if _is_meaningful_extracted_data(sliced):
+                    block_outputs[label] = sliced
+                    block_output_sources[label] = "runtime_output"
+                    block_types[label] = block_type
+            for output_key, output_value in _workflow_output_parameter_payloads(extracted).items():
+                block_outputs[output_key] = _registered_output_payload_view(output_value, block_type)
+                block_output_sources[output_key] = "registered_output_parameter"
+                block_types[output_key] = block_type
+    for output_key, output_value in _workflow_output_parameter_payloads(run_data.get("output")).items():
+        if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
+            continue
+        block_outputs.setdefault(output_key, output_value)
+        block_output_sources.setdefault(output_key, "registered_output_parameter")
+    for registered in _registered_output_parameter_payloads(run_data):
+        registered_output_key = registered.get("output_parameter_key")
+        registered_block_type = registered.get("block_type")
+        registered_output_value = _registered_output_payload_view(registered.get("value"), registered_block_type)
+        registered_block_label = registered.get("block_label")
+        if isinstance(registered_output_key, str) and registered_output_key:
+            block_outputs[registered_output_key] = registered_output_value
+            block_output_sources[registered_output_key] = "registered_output_parameter"
+            block_types[registered_output_key] = registered_block_type
+        if isinstance(registered_block_label, str) and registered_block_label in current_labels:
+            if isinstance(registered_output_key, str) and registered_output_key:
+                existing = block_outputs.get(registered_block_label)
+                if isinstance(existing, dict):
+                    merged = dict(existing)
+                    merged.setdefault(registered_output_key, registered_output_value)
+                    block_outputs[registered_block_label] = merged
+                else:
+                    block_outputs[registered_block_label] = {registered_output_key: registered_output_value}
+                block_output_sources.setdefault(registered_block_label, "registered_output_parameter")
+                block_types.setdefault(registered_block_label, registered_block_type)
+            else:
+                block_outputs[registered_block_label] = registered_output_value
+                block_output_sources[registered_block_label] = "registered_output_parameter"
+                block_types[registered_block_label] = registered_block_type
+    return block_outputs, block_output_sources, block_types, runtime_envelope_labels
+
+
+def _carry_floor_rekeyed_backing(
+    copilot_ctx: _GroundingCtx,
+    verification: CompletionVerificationResult,
+    criteria: list[CompletionCriterion],
+    run_data: Mapping[str, Any] | None,
+) -> CompletionVerificationResult:
+    if not verification.floor_rekeyed_criterion_ids:
+        return verification
+    (
+        emission_block_outputs,
+        emission_block_output_sources,
+        emission_block_types,
+        runtime_envelope_labels,
+    ) = _floor_rekeyed_emission_evidence(copilot_ctx, run_data)
+    backing = floor_rekeyed_path_backing(
+        copilot_ctx,
+        criteria,
+        emission_block_outputs,
+        emission_block_output_sources,
+        emission_block_types,
+        runtime_envelope_labels=runtime_envelope_labels,
+    )
+    return carry_floor_rekeyed_path_backing(verification, backing)
+
+
 def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> RunEvidenceSnapshot:
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
@@ -843,13 +969,23 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
                 block_outputs[label] = evidence_output
                 block_output_sources[label] = "runtime_output"
             for output_key, output_value in _workflow_output_parameter_payloads(output).items():
+                if not _is_meaningful_extracted_data(
+                    _registered_output_payload_view(output_value, block.get("block_type"))
+                ):
+                    continue
                 block_outputs[output_key] = output_value
                 block_output_sources[output_key] = "registered_output_parameter"
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
+        if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
+            continue
         block_outputs[output_key] = output_value
         block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
+        if not _is_meaningful_extracted_data(
+            _registered_output_payload_view(registered.get("value"), registered.get("block_type"))
+        ):
+            continue
         registered_output_value = _completion_evidence_payload(registered.get("value"))
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
@@ -1177,7 +1313,14 @@ async def _maybe_run_completion_verification(
     criteria = _completion_verification_criteria(copilot_ctx)
     criteria = _reconcile_download_completion_criterion(copilot_ctx, result, criteria)
     verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
-    return carry_degraded_criterion_ids(verification, criteria) if verification is not None else None
+    if verification is None:
+        return None
+    verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
+    run_data = result.get("data")
+    return _carry_floor_rekeyed_backing(
+        copilot_ctx, verification, criteria, run_data if isinstance(run_data, dict) else None
+    )
 
 
 async def _completion_verification_from_run_result(
@@ -1243,6 +1386,7 @@ async def _completion_verification_from_run_result(
                 contingent_criterion_ids=contingent_ids,
                 contingent_on_by_criterion_id=contingent_on_by_id,
                 contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                requested_output_criteria_count=len(requested_output_criteria),
             )
         if not definition_verdicts:
             return None
@@ -1305,6 +1449,7 @@ async def _completion_verification_from_run_result(
                         contingent_criterion_ids=contingent_ids,
                         contingent_on_by_criterion_id=contingent_on_by_id,
                         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                        requested_output_criteria_count=len(requested_output_criteria),
                     )
                 return CompletionVerificationResult(
                     status="unavailable",
@@ -1335,6 +1480,7 @@ async def _completion_verification_from_run_result(
                         contingent_criterion_ids=contingent_ids,
                         contingent_on_by_criterion_id=contingent_on_by_id,
                         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+                        requested_output_criteria_count=len(requested_output_criteria),
                     )
                 return CompletionVerificationResult(
                     status="unavailable",
@@ -1396,6 +1542,7 @@ async def _completion_verification_from_run_result(
         contingent_criterion_ids=contingent_ids,
         contingent_on_by_criterion_id=contingent_on_by_id,
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
+        requested_output_criteria_count=len(requested_output_criteria),
     )
 
 
@@ -1520,10 +1667,17 @@ def _tool_visible_result_after_completion_verification(
     outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
     if outcome_unverified_reason is None:
         return result
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    if (
+        copilot_ctx.delivered_unverified_terminal
+        and isinstance(run_id, str)
+        and run_id == copilot_ctx.delivered_unverified_workflow_run_id
+    ):
+        return result
     if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
         return result
 
-    data = result.get("data")
     copied_data = dict(data) if isinstance(data, dict) else {}
     copied_data["failure_reason"] = outcome_unverified_reason
     copied_data["completion_verification"] = (

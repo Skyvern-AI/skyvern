@@ -1367,7 +1367,6 @@ async def test_handle_action_discards_xhr_staging_when_native_file_present(
     task, step, page, browser_state, scraped_page, action = _make_download_click_context(
         now=now, organization=organization, page_url="https://example.com/download"
     )
-
     callbacks: dict[str, object] = {}
     page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
 
@@ -1430,6 +1429,7 @@ async def test_handle_action_uses_xhr_staging_fallback_when_no_native_file(
     task, step, page, browser_state, scraped_page, action = _make_download_click_context(
         now=now, organization=organization, page_url="https://example.com/download"
     )
+    task.download_timeout = 0.01
 
     callbacks: dict[str, object] = {}
     page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
@@ -1452,6 +1452,9 @@ async def test_handle_action_uses_xhr_staging_fallback_when_no_native_file(
 
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            # No native file lands in the observed dir, so the wait loop would burn
+            # the full no-signal grace before falling back to xhr staging; shorten it.
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
             patch(
@@ -1487,6 +1490,7 @@ async def test_handle_action_moves_multiple_staged_xhr_files_as_fallback(
     task, step, page, browser_state, scraped_page, action = _make_download_click_context(
         now=now, organization=organization, page_url="https://example.com/download"
     )
+    task.download_timeout = 0.01
 
     callbacks: dict[str, object] = {}
     page.on.side_effect = lambda event, cb: callbacks.__setitem__(event, cb)
@@ -1511,6 +1515,9 @@ async def test_handle_action_moves_multiple_staged_xhr_files_as_fallback(
 
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
+            # No native file lands in the observed dir, so the wait loop would burn
+            # the full no-signal grace before falling back to xhr staging; shorten it.
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
             patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
             patch(
@@ -2015,7 +2022,7 @@ async def test_handle_action_adopted_session_helper_failure_does_not_short_circu
         organization,
         workflow_run_id="wr-1",
         browser_session_id="bs-1",
-        download_timeout=2.0,
+        download_timeout=0.01,
     )
     step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
 
