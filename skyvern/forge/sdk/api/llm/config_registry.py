@@ -264,6 +264,42 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            "gpt-5.6-sol",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            "gpt-5.6-terra",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            "gpt-5.6-luna",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -891,6 +927,81 @@ if settings.ENABLE_AZURE_GPT5_4:
                 api_key=settings.AZURE_GPT5_4_API_KEY,
                 api_version=settings.AZURE_GPT5_4_API_VERSION,
                 model_info={"model_name": "azure/gpt-5.4"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_SOL:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_SOL_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_SOL_DEPLOYMENT",
+                "AZURE_GPT5_6_SOL_API_KEY",
+                "AZURE_GPT5_6_SOL_API_BASE",
+                "AZURE_GPT5_6_SOL_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_SOL_API_BASE,
+                api_key=settings.AZURE_GPT5_6_SOL_API_KEY,
+                api_version=settings.AZURE_GPT5_6_SOL_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-sol"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_TERRA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_TERRA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_TERRA_DEPLOYMENT",
+                "AZURE_GPT5_6_TERRA_API_KEY",
+                "AZURE_GPT5_6_TERRA_API_BASE",
+                "AZURE_GPT5_6_TERRA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_TERRA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_TERRA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_TERRA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-terra"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_LUNA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_LUNA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_LUNA_DEPLOYMENT",
+                "AZURE_GPT5_6_LUNA_API_KEY",
+                "AZURE_GPT5_6_LUNA_API_BASE",
+                "AZURE_GPT5_6_LUNA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_LUNA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_LUNA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_LUNA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-luna"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,
@@ -1961,12 +2072,32 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
-            max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
+            ),
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
+        "OPENROUTER_XIAOMI_MIMO_V2_5",
+        LLMConfig(
+            "openrouter/xiaomi/mimo-v2.5",
+            ["OPENROUTER_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            # MiMo v2.5 is a reasoning model; uncapped it emits 100k+ reasoning/output
+            # tokens (multi-minute calls) on short prompts. Cap output + reasoning effort.
+            max_completion_tokens=16384,
+            reasoning_effort="low",
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENROUTER_API_KEY,
+                api_base=settings.OPENROUTER_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openrouter/xiaomi/mimo-v2.5"},
             ),
         ),
     )

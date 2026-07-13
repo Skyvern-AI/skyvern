@@ -3,6 +3,11 @@ import { Status, WorkflowRunApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
+import {
+  getActiveOrgQueryKeyScope,
+  getOrgScopedQueryKey,
+  useActiveOrgId,
+} from "@/store/ActiveOrgContext";
 
 type QueryReturnType = Array<WorkflowRunApiResponse>;
 type UseQueryOptions = Omit<
@@ -16,6 +21,10 @@ type Props = {
   page: number;
   pageSize?: number;
   search?: string;
+  // ANDed with the internal gating (workflow id + globalWorkflows loaded).
+  enabled?: boolean;
+  createdAtStart?: string;
+  createdAtEnd?: string;
 } & UseQueryOptions;
 
 function useWorkflowRunsQuery({
@@ -24,21 +33,31 @@ function useWorkflowRunsQuery({
   page,
   pageSize,
   search,
+  enabled,
+  createdAtStart,
+  createdAtEnd,
   ...queryOptions
 }: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
 
   return useQuery<Array<WorkflowRunApiResponse>>({
-    queryKey: [
-      "workflowRuns",
-      { statusFilters },
-      workflowPermanentId,
-      page,
-      pageSize,
-      search,
-    ],
-    queryFn: async () => {
+    queryKey: getOrgScopedQueryKey(
+      [
+        "workflowRuns",
+        { statusFilters },
+        workflowPermanentId,
+        page,
+        pageSize,
+        search,
+        createdAtStart,
+        createdAtEnd,
+      ],
+      activeOrgQueryKeyScope,
+    ),
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -59,14 +78,21 @@ function useWorkflowRunsQuery({
       if (search) {
         params.append("search_key", search);
       }
+      if (createdAtStart) {
+        params.append("created_at_start", createdAtStart);
+      }
+      if (createdAtEnd) {
+        params.append("created_at_end", createdAtEnd);
+      }
 
       return client
         .get(`/workflows/${workflowPermanentId}/runs`, {
           params,
+          signal,
         })
         .then((response) => response.data);
     },
-    enabled: !!workflowPermanentId && !!globalWorkflows,
+    enabled: !!workflowPermanentId && !!globalWorkflows && (enabled ?? true),
     ...queryOptions,
   });
 }

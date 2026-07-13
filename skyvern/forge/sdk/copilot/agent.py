@@ -10,7 +10,7 @@ import contextlib
 import json
 import re
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.experimentation.llm_prompt_config import LLMAPIHandler
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 import structlog
@@ -32,46 +32,115 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot import llm_config
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
+    clear_terminal_evidence_on_workflow_edit,
+    compose_terminal_evidence_user_facing_reason,
     contains_internal_machinery_leak,
+    refresh_held_loop_blocker_evidence,
+    terminal_evidence_from_ctx,
+    terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
-from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase, initial_build_phase
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    _VALUE_EXCERPT_MAX,
+    RecordedBuildTestOutcome,
+    RecordedOutcomeBindingConstraint,
+    RecordedOutcomeGroundingRequirement,
+    observed_value_extraction_scaffold_lines,
+)
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    freeze_requested_output_extraction_candidate,
+    is_optional_dismissal_only_trajectory,
+    render_synthesized_offer_text,
+    synthesize_code_block,
+    synthesize_code_block_with_extraction,
+    trajectory_has_browser_fill_interaction,
+)
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    StoredCriteriaSnapshot,
+    apply_requested_output_producer_floor,
+    build_turn_state,
+    reconcile_completion_criteria,
+    requested_output_paths,
+)
+from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
+from skyvern.forge.sdk.copilot.config import (
+    SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+    normalize_block_authoring_policy,
+)
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
+    OUTPUT_OWNER_AMBIGUITY_REASON_CODE,
     AgentResult,
+    CodeAuthoringRepairContext,
     CopilotContext,
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
+    NarrativeOutcomeAdjudication,
     ResponseType,
     StructuredContext,
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
 )
-from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified, verified_goal_satisfied_context
+from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
+from skyvern.forge.sdk.copilot.enforcement import (
+    BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+    SCOUTED_SPINE_TURN_HALT_USER_REASON,
+    artifact_health_blocked,
+    log_scouted_spine_unresolved_at_turn_halt,
+    outcome_fully_verified,
+    recycle_admits_present_completion_contract_ask,
+    requested_output_extraction_plan,
+    requested_output_extraction_plan_changed,
+    synthesized_persistence_reopened,
+    synthesized_persistence_reopened_after_failed_run,
+    synthesized_trajectory_is_goal_complete,
+    verified_goal_claim_authorized,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
+    record_criteria_lifecycle,
     record_gate_decision,
 )
+from skyvern.forge.sdk.copilot.output_contracts import (
+    OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+    OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    ACTUATION_OBLIGATION_UNMET_REASON_CODE,
     UNVALIDATED_DISCLOSURE_PHRASES,
     WORKFLOW_PRESENT_SENTINEL,
+    ActuationObligationEvaluation,
+    ActuationObligationStatus,
+    CannotActReason,
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
+    actuation_obligation_key,
     build_output_policy_diagnostics,
     derive_output_kind,
+    evaluate_actuation_obligation,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
     normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
+    prior_turn_satisfies_actuation_terminal_condition,
+    request_policy_requires_durable_fill,
+    turn_intent_requires_actuation,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
@@ -82,37 +151,54 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     build_recoverable_failure,
     clean_recorded_failure_text,
     format_recoverable_failure_reply,
-    iter_exception_chain,
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
+    CompletionCriterion,
     RequestPolicy,
     build_request_policy,
+    credential_prompt_reason,
+    is_defer_authoring_durable_fill_criterion,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
+    flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHalt, turn_halt_to_trace_data
+from skyvern.forge.sdk.copilot.turn_halt import (
+    _INVOLUNTARY_BLOCKER_REASON_CODES,
+    CopilotTurnHalt,
+    TurnHalt,
+    TurnHaltKind,
+    expire_output_contract_ladder_at_turn_end,
+    raise_if_turn_halt,
+    turn_halt_to_trace_data,
+)
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
     RequiredContextKey,
     TurnIntent,
-    TurnIntentClassification,
+    TurnIntentClassifierResult,
+    TurnIntentExpectedOutput,
     TurnIntentMode,
+    TurnIntentReasonCode,
     build_turn_intent,
     classify_turn_intent,
+    turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
     derive_response_kind,
+    with_copilot_code_mode_diagnostics,
 )
+from skyvern.forge.sdk.copilot.turn_ownership import blocker_signal_render_allowed
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -143,7 +229,11 @@ def _render_code_only_browser_authoring_prompt() -> str:
         "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
         "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
         "re-derive its locators. Only hand-author the steps it does not cover, such as the\n"
-        "extraction or report block that returns the structured result."
+        "extraction or report block that returns the structured result. Direct browser\n"
+        "evaluate is a scouting tool; persisted code blocks must not use page.evaluate,\n"
+        "page.evaluate_handle, page.request, or page.context. Use locators and locator\n"
+        "DOM-reading methods such as inner_text, text_content, get_attribute, count, and\n"
+        "is_visible instead."
     )
 
 
@@ -197,7 +287,17 @@ def _copilot_turn_span(
         yield span
 
 
-def _resolve_request_policy_handler(llm_api_handler: Any) -> Any:
+async def _resolve_request_policy_handler(
+    llm_api_handler: LLMAPIHandler | None, workflow_permanent_id: str | None, organization_id: str | None
+) -> Any:
+    lite_handler = await llm_config.resolve_lite_copilot_handler(workflow_permanent_id, organization_id)
+    if lite_handler is not None:
+        return lite_handler
+    LOG.warning(
+        "copilot request policy lite handler unavailable, falling back to main handler",
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
     return llm_api_handler
 
 
@@ -209,12 +309,15 @@ class RequestPolicyGuardrailInputs:
     chat_history_messages: list[WorkflowCopilotChatHistoryMessage]
     global_llm_context: str
     organization_id: str
-    handler: Any
+    request_policy_handler: Any
+    turn_intent_handler: LLMAPIHandler | None
     previous_user_message: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
+    fix_origin: bool = False
+    stored_completion_criteria: StoredCriteriaSnapshot | None = None
 
 
 class CopilotRequestPolicyMissingError(Exception):
@@ -343,11 +446,73 @@ def _request_policy_agent_inputs(
     return user_message, chat_history_text
 
 
+def _stored_active_completion_criteria(
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> list[CompletionCriterion] | None:
+    snapshot = policy_inputs.stored_completion_criteria
+    if snapshot is None or snapshot.active is None:
+        return None
+    return list(snapshot.active.criteria)
+
+
+def _log_requested_output_producer_floor(rekeyed_paths: tuple[str, ...]) -> None:
+    if not rekeyed_paths:
+        return
+    LOG.info(
+        "copilot requested-output producer floor",
+        requested_output_floor_rekeyed_paths=list(rekeyed_paths),
+        requested_output_floor_rekeyed_count=len(rekeyed_paths),
+    )
+
+
+def _reconcile_completion_criteria_on_context(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    fresh_criteria = list(policy.completion_criteria)
+    durable_fill_carriers = [c for c in fresh_criteria if is_defer_authoring_durable_fill_criterion(c)]
+    floored_fresh, fresh_floor_rekeyed_paths = apply_requested_output_producer_floor(fresh_criteria)
+    if fresh_floor_rekeyed_paths:
+        policy.completion_criteria = list(floored_fresh)
+    snapshot = policy_inputs.stored_completion_criteria
+    if snapshot is None:
+        _log_requested_output_producer_floor(fresh_floor_rekeyed_paths)
+        _restore_durable_fill_carriers(policy, durable_fill_carriers)
+        return
+    requested_output_path_aliases = (
+        ctx.copilot_config.requested_output_path_aliases if ctx.copilot_config is not None else None
+    )
+    decision = reconcile_completion_criteria(
+        snapshot,
+        fresh_criteria,
+        actionable=policy.user_response_policy != "ask_clarification",
+        requested_output_path_aliases=requested_output_path_aliases,
+    )
+    ctx.completion_criteria_turn_state = build_turn_state(snapshot, decision)
+    record_criteria_lifecycle(ctx, decision.to_trace_data())
+    LOG.info("copilot completion criteria reconciled", **decision.to_trace_data())
+    floored_criteria, floor_rekeyed_paths = apply_requested_output_producer_floor(decision.criteria)
+    if decision.action == "adopt_stored" or floor_rekeyed_paths:
+        policy.completion_criteria = list(floored_criteria)
+    _log_requested_output_producer_floor(floor_rekeyed_paths)
+    _restore_durable_fill_carriers(policy, durable_fill_carriers)
+
+
+def _restore_durable_fill_carriers(policy: RequestPolicy, carriers: list[CompletionCriterion]) -> None:
+    if not carriers:
+        return
+    present_ids = {criterion.id for criterion in policy.completion_criteria}
+    missing = [carrier for carrier in carriers if carrier.id not in present_ids]
+    if missing:
+        policy.completion_criteria = list(policy.completion_criteria) + missing
+
+
 def _store_request_policy_on_context(
     ctx: CopilotContext,
     policy: RequestPolicy,
     policy_inputs: RequestPolicyGuardrailInputs,
-    turn_intent_classification: TurnIntentClassification | None = None,
+    turn_intent_classifier_result: TurnIntentClassifierResult | None = None,
 ) -> None:
     agent_user_message, policy_chat_history_text = _request_policy_agent_inputs(
         policy,
@@ -355,15 +520,7 @@ def _store_request_policy_on_context(
         chat_history_text=policy_inputs.chat_history_text,
         previous_user_message=policy_inputs.previous_user_message,
     )
-    ctx.request_policy = policy
-    ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
-    ctx.user_message = agent_user_message
-    ctx.block_goal_main_goal = _build_block_goal_main_goal(
-        user_message=agent_user_message,
-        chat_history_text=policy_chat_history_text,
-        global_llm_context=policy_inputs.global_llm_context,
-    )
-    ctx.turn_intent = build_turn_intent(
+    turn_intent = build_turn_intent(
         user_message=policy_inputs.user_message,
         workflow_yaml=policy_inputs.workflow_yaml,
         chat_history=policy_inputs.chat_history_messages,
@@ -373,8 +530,19 @@ def _store_request_policy_on_context(
         workflow_permanent_id=policy_inputs.workflow_permanent_id,
         workflow_run_id=policy_inputs.workflow_run_id,
         browser_session_id=policy_inputs.browser_session_id,
-        classification=turn_intent_classification,
+        classifier_result=turn_intent_classifier_result,
+        fix_origin=policy_inputs.fix_origin,
     )
+    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
+    ctx.request_policy = policy
+    ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
+    ctx.user_message = agent_user_message
+    ctx.block_goal_main_goal = _build_block_goal_main_goal(
+        user_message=agent_user_message,
+        chat_history_text=policy_chat_history_text,
+        global_llm_context=policy_inputs.global_llm_context,
+    )
+    ctx.turn_intent = turn_intent
 
 
 def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
@@ -459,6 +627,393 @@ def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
     )
 
 
+def _clean_authoring_repair_prompt_atom(value: str, *, max_chars: int = 160) -> str:
+    cleaned = redact_raw_secrets_for_prompt(value).replace("\r", " ").replace("\n", " ").strip()
+    if contains_internal_machinery_leak(cleaned):
+        return ""
+    return cleaned[:max_chars]
+
+
+def _render_authoring_repair_prompt_list(items: list[str], *, max_items: int = 20) -> str:
+    cleaned = [_clean_authoring_repair_prompt_atom(item) for item in items[:max_items]]
+    return ", ".join(item for item in cleaned if item) or "(none)"
+
+
+def _render_selector_repair_alternatives(alternatives: list[dict[str, str]], *, max_items: int = 8) -> list[str]:
+    lines: list[str] = []
+    for alternative in alternatives[:max_items]:
+        tool_name = _clean_authoring_repair_prompt_atom(str(alternative.get("tool_name") or ""), max_chars=60)
+        role = _clean_authoring_repair_prompt_atom(str(alternative.get("role") or ""), max_chars=80)
+        selector = _clean_authoring_repair_prompt_atom(str(alternative.get("selector") or ""), max_chars=180)
+        if not selector:
+            continue
+        parts = [f"tool_name={tool_name or '(unknown)'}"]
+        if role:
+            parts.append(f"role={role}")
+        parts.append(f"selector={selector}")
+        lines.append("- " + ", ".join(parts))
+    return lines
+
+
+def _render_unresolved_name_binding_actions(
+    unresolved_names: list[str], available_parameter_keys: list[str], *, max_items: int = 20
+) -> list[str]:
+    available_keys = {
+        key
+        for raw_key in available_parameter_keys
+        for key in [_clean_authoring_repair_prompt_atom(raw_key, max_chars=80)]
+        if key
+    }
+    lines: list[str] = []
+    for raw_name in unresolved_names[:max_items]:
+        name = _clean_authoring_repair_prompt_atom(raw_name, max_chars=80)
+        if not name:
+            continue
+        if name in available_keys:
+            lines.append(
+                f"- {name} -> existing workflow parameter key {name} -> parameter_keys -> bare variable {name}"
+            )
+            continue
+        lines.append(
+            f"- {name} -> create workflow string parameter key {name} -> parameter_keys -> bare variable {name}"
+        )
+    return lines
+
+
+def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
+    if ctx is None:
+        return ""
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return ""
+    repair_context = ctx.last_code_authoring_repair_context
+    if not isinstance(repair_context, CodeAuthoringRepairContext):
+        return ""
+    LOG.info(
+        "copilot code authoring repair context rendered",
+        reason_code=repair_context.reason_code,
+        block_label=repair_context.block_label,
+        unresolved_names=repair_context.unresolved_names,
+    )
+    available_parameter_keys = repair_context.available_parameter_keys
+    binding_candidates = repair_context.binding_candidates or repair_context.unresolved_names
+
+    lines = [
+        "CODE AUTHORING REPAIR CONTEXT:",
+        f"block_label: {_clean_authoring_repair_prompt_atom(repair_context.block_label)}",
+        f"reason_code: {_clean_authoring_repair_prompt_atom(repair_context.reason_code)}",
+        f"unresolved_names: {_render_authoring_repair_prompt_list(repair_context.unresolved_names)}",
+        f"declared_parameter_keys: {_render_authoring_repair_prompt_list(repair_context.parameter_keys)}",
+        f"available_parameter_keys: {_render_authoring_repair_prompt_list(available_parameter_keys)}",
+        f"binding_candidates: {_render_authoring_repair_prompt_list(binding_candidates)}",
+        f"allowed_global_names: {_render_authoring_repair_prompt_list(repair_context.allowed_global_names)}",
+    ]
+    if repair_context.reason_code == "runtime_missing_output_dependency":
+        lines.extend(
+            [
+                f"missing_output_key: {_clean_authoring_repair_prompt_atom(repair_context.missing_output_key or '')}",
+                f"available_output_keys: {_render_authoring_repair_prompt_list(repair_context.available_output_keys)}",
+                "output_dependency_failure_class: "
+                f"{_clean_authoring_repair_prompt_atom(repair_context.output_dependency_failure_class or '')}",
+                "current_block_parameter_keys: "
+                f"{_render_authoring_repair_prompt_list(repair_context.current_block_parameter_keys)}",
+            ]
+        )
+    if repair_context.selector:
+        lines.append(f"selector: {_clean_authoring_repair_prompt_atom(repair_context.selector)}")
+    if repair_context.source_url:
+        lines.append(f"source_url: {_clean_authoring_repair_prompt_atom(repair_context.source_url)}")
+    if repair_context.refiner_selector:
+        lines.append(f"refiner_selector: {_clean_authoring_repair_prompt_atom(repair_context.refiner_selector)}")
+    if repair_context.reason_code == "runtime_block_failure":
+        if repair_context.runtime_failure_reason:
+            lines.append(
+                f"runtime_failure_reason: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_reason)}"
+            )
+        if repair_context.runtime_failure_class:
+            lines.append(
+                f"runtime_failure_class: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_class)}"
+            )
+        if repair_context.failed_block_status:
+            lines.append(
+                f"failed_block_status: {_clean_authoring_repair_prompt_atom(repair_context.failed_block_status)}"
+            )
+        if repair_context.workflow_run_id:
+            workflow_run_id = _clean_authoring_repair_prompt_atom(repair_context.workflow_run_id)
+            if workflow_run_id:
+                lines.append(f"workflow_run_id: {workflow_run_id}")
+        if repair_context.current_origin:
+            lines.append(f"current_origin: {_clean_authoring_repair_prompt_atom(repair_context.current_origin)}")
+        lines.append(f"current_url_present: {str(repair_context.current_url_present).lower()}")
+        lines.append(f"current_title_present: {str(repair_context.current_title_present).lower()}")
+        if repair_context.page_evidence_source:
+            page_evidence_source = _clean_authoring_repair_prompt_atom(repair_context.page_evidence_source)
+            if page_evidence_source:
+                lines.append(f"page_evidence_source: {page_evidence_source}")
+        lines.append(f"observed_after_workflow_run: {str(repair_context.observed_after_workflow_run).lower()}")
+        if repair_context.page_form_summaries:
+            lines.append(f"page_forms: {_render_authoring_repair_prompt_list(repair_context.page_form_summaries)}")
+        if repair_context.page_result_summaries:
+            lines.append(f"page_results: {_render_authoring_repair_prompt_list(repair_context.page_result_summaries)}")
+        if repair_context.page_action_summaries:
+            lines.append(f"page_actions: {_render_authoring_repair_prompt_list(repair_context.page_action_summaries)}")
+        if repair_context.page_challenge_summaries:
+            lines.append(
+                f"page_challenges: {_render_authoring_repair_prompt_list(repair_context.page_challenge_summaries)}"
+            )
+    if repair_context.reason_code == "metadata_reject":
+        if repair_context.runtime_failure_reason:
+            lines.append(
+                f"runtime_failure_reason: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_reason)}"
+            )
+        if repair_context.runtime_failure_class:
+            lines.append(
+                f"runtime_failure_class: {_clean_authoring_repair_prompt_atom(repair_context.runtime_failure_class)}"
+            )
+        if repair_context.metadata_contract_source:
+            lines.append(
+                "metadata_contract_source: "
+                f"{_clean_authoring_repair_prompt_atom(repair_context.metadata_contract_source)}"
+            )
+        if repair_context.metadata_contract_reason_code:
+            lines.append(
+                "metadata_contract_reason_code: "
+                f"{_clean_authoring_repair_prompt_atom(repair_context.metadata_contract_reason_code)}"
+            )
+        if repair_context.required_goal_value_paths:
+            lines.append(
+                "required_goal_value_paths: "
+                f"{_render_authoring_repair_prompt_list(repair_context.required_goal_value_paths)}"
+            )
+        if repair_context.required_extraction_schema_paths:
+            lines.append(
+                "required_extraction_schema_paths: "
+                f"{_render_authoring_repair_prompt_list(repair_context.required_extraction_schema_paths)}"
+            )
+        if repair_context.required_code_return_paths:
+            lines.append(
+                "required_code_return_paths: "
+                f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
+            )
+    if repair_context.required_block_structure:
+        lines.append(
+            f"required_block_structure: {_clean_authoring_repair_prompt_atom(repair_context.required_block_structure)}"
+        )
+        if repair_context.spine_stage_count is not None:
+            lines.append(f"spine_stage_count: {repair_context.spine_stage_count}")
+        if repair_context.spine_split_blockers:
+            lines.append(
+                f"spine_split_blockers: {_render_authoring_repair_prompt_list(repair_context.spine_split_blockers)}"
+            )
+        lines.append(
+            "Author one browser-stage code block per scouted mutation stage and a final extraction-only code block "
+            "that returns the required output paths; do not collapse the browser spine into the extraction block."
+        )
+    if repair_context.reason_code == OUTPUT_OWNER_AMBIGUITY_REASON_CODE:
+        lines.append(
+            "output_owner_candidate_labels: "
+            f"{_render_authoring_repair_prompt_list(repair_context.output_owner_candidate_labels)}"
+        )
+        lines.append(
+            "required_output_owner_paths: "
+            f"{_render_authoring_repair_prompt_list(repair_context.required_code_return_paths)}"
+        )
+        lines.append(
+            "Designate exactly one code block as the sole output owner for the required paths and declare its "
+            "code_artifact_metadata; do not leave the requested output split across or absent from the code blocks."
+        )
+    selector_alternative_lines = _render_selector_repair_alternatives(repair_context.selector_alternatives)
+    if selector_alternative_lines:
+        lines.append("same_page_selector_alternatives:")
+        lines.extend(selector_alternative_lines)
+    if repair_context.allowed_helper_surface:
+        lines.append("allowed_helper_surface:")
+        for helper_name, attributes in sorted(repair_context.allowed_helper_surface.items()):
+            helper = _clean_authoring_repair_prompt_atom(helper_name)
+            rendered_attributes = _render_authoring_repair_prompt_list(attributes, max_items=40)
+            if helper:
+                lines.append(f"{helper}: {rendered_attributes}")
+    if repair_context.reason_code == SANDBOX_UNRESOLVED_NAME_REASON_CODE:
+        binding_action_lines = _render_unresolved_name_binding_actions(
+            repair_context.unresolved_names, available_parameter_keys
+        )
+        if binding_action_lines:
+            lines.append("binding_actions:")
+            lines.extend(binding_action_lines)
+        lines.append(
+            "For workflow-input-like unresolved names, ensure a workflow string parameter exists, "
+            "list the exact key in the code block's parameter_keys, reference the exact key as a bare Python "
+            "variable in code, do not hardcode the eval value, and rerun via update_and_run_blocks."
+        )
+    if repair_context.reason_code == "synthesized_parameter_binding_ambiguous":
+        binding_action_lines = _render_unresolved_name_binding_actions(
+            repair_context.unresolved_names, available_parameter_keys
+        )
+        if binding_action_lines:
+            lines.append("binding_actions:")
+            lines.extend(binding_action_lines)
+        lines.append(
+            "For synthesized parameter binding, declare and use the exact workflow input key, include that exact "
+            "key in the code block's parameter_keys, reference it as a bare Python variable in code, do not guess "
+            "or hardcode the runtime value, and rerun via update_and_run_blocks."
+        )
+    if repair_context.reason_code == "ambiguous_bare_selector":
+        lines.append(
+            "For ambiguous selectors, do not re-emit the bare selector or a positional nth selector. "
+            "Use the same-page alternatives when they are stable, or re-scout the same page and choose a "
+            "stable role/name/data attribute."
+        )
+    if repair_context.reason_code == "runtime_block_failure":
+        lines.append(
+            "For runtime failures, adapt the next code block to the observed page state and do not re-emit "
+            "the same failing selector or name path."
+        )
+    if repair_context.reason_code == "runtime_missing_output_dependency":
+        lines.append(
+            "For missing prior block outputs, bind to an actual available_output_key or repair the producing/current "
+            "code block so the output exists; do not create a workflow parameter for missing_output_key."
+        )
+    if repair_context.reason_code == "metadata_reject":
+        lines.append(
+            "For metadata rejects, author code_artifact_metadata with goal_value_paths, valid extraction_schema, "
+            "and code return paths matching required requested output child paths; rerun update_and_run_blocks."
+        )
+    lines.append(_clean_authoring_repair_prompt_atom(repair_context.repair_instruction, max_chars=260))
+    return "\n\n" + "\n".join(line for line in lines if line)
+
+
+def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
+    if ctx is None:
+        return ""
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return ""
+    outcome = ctx.latest_recorded_build_test_outcome
+    if not isinstance(outcome, RecordedBuildTestOutcome) or not outcome.is_authoritative:
+        return ""
+    LOG.info(
+        "copilot recorded build-test outcome rendered",
+        phase=outcome.phase,
+        reason_code=outcome.reason_code,
+        structural_key=outcome.structural_key,
+        workflow_run_id=outcome.workflow_run_id,
+    )
+    lines = [
+        "RECORDED BUILD-TEST OUTCOME:",
+        f"phase: {_clean_authoring_repair_prompt_atom(outcome.phase)}",
+        f"attempted_tool: {_clean_authoring_repair_prompt_atom(outcome.attempted_tool)}",
+        f"attempted_target: {_clean_authoring_repair_prompt_atom(outcome.attempted_target)}",
+        f"attempted_block_label: {_clean_authoring_repair_prompt_atom(outcome.attempted_block_label)}",
+        f"verdict: {_clean_authoring_repair_prompt_atom(outcome.verdict)}",
+        f"reason_code: {_clean_authoring_repair_prompt_atom(outcome.reason_code)}",
+        f"structural_key: {_clean_authoring_repair_prompt_atom(outcome.structural_key or '')}",
+        f"block_labels: {_render_authoring_repair_prompt_list(outcome.block_labels)}",
+        f"page_evidence_refs: {_render_authoring_repair_prompt_list(outcome.page_evidence_refs)}",
+    ]
+    if outcome.missing_requested_output_facts:
+        lines.append("missing_requested_output_facts:")
+        lines.append(
+            "Use the exact output_path values in goal_value_paths and returned output; "
+            "output_root is diagnostic grouping only."
+        )
+        for fact in outcome.missing_requested_output_facts[:8]:
+            if not isinstance(fact, dict):
+                continue
+            fields = []
+            for key in ("output_root", "output_path", "value_status", "reason_code"):
+                value = fact.get(key)
+                if isinstance(value, str) and value.strip():
+                    fields.append(f"{key}={_clean_authoring_repair_prompt_atom(value)}")
+            if fields:
+                lines.append(f"- {'; '.join(fields)}")
+    if outcome.workflow_run_id:
+        lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    if outcome.observed_evidence_summary:
+        lines.append(f"observed_evidence: {_clean_authoring_repair_prompt_atom(outcome.observed_evidence_summary)}")
+    if outcome.observed_page_value_excerpt:
+        rendered_values = _clean_authoring_repair_prompt_atom(
+            outcome.observed_page_value_excerpt, max_chars=_VALUE_EXCERPT_MAX
+        )
+        output_paths = [
+            _clean_authoring_repair_prompt_atom(str(fact.get("output_path")))
+            for fact in outcome.missing_requested_output_facts
+            if isinstance(fact, dict) and isinstance(fact.get("output_path"), str) and fact.get("output_path")
+        ]
+        scaffold_lines = observed_value_extraction_scaffold_lines(rendered_values, output_paths)
+        lines.extend(scaffold_lines)
+        LOG.info(
+            "copilot_observed_value_scaffold_surfaced",
+            excerpt_len=len(rendered_values),
+            output_path_count=len(output_paths),
+            scaffold_line_count=len(scaffold_lines),
+        )
+    grounding = getattr(ctx, "recorded_outcome_grounding_requirement", None)
+    if isinstance(grounding, RecordedOutcomeGroundingRequirement) and grounding.payload is not None:
+        payload = grounding.payload
+        LOG.info(
+            "copilot recorded outcome grounding rendered",
+            repeated_structural_key=payload.repeated_structural_key,
+            workflow_run_id=payload.workflow_run_id,
+            observed_after_workflow_run=payload.observed_after_workflow_run,
+        )
+        lines.extend(
+            [
+                "RECORDED OUTCOME GROUNDING EVIDENCE:",
+                f"repeated_structural_key: {_clean_authoring_repair_prompt_atom(payload.repeated_structural_key)}",
+                f"source_tool: {payload.source_tool}",
+                f"observed_after_workflow_run: {str(payload.observed_after_workflow_run).lower()}",
+                f"observed_empty_page: {str(payload.observed_empty_page).lower()}",
+                f"challenge_gated: {str(payload.challenge_gated).lower()}",
+                f"capture_degraded: {str(payload.capture_degraded).lower()}",
+                f"diagnostic_reason: {_clean_authoring_repair_prompt_atom(payload.diagnostic_reason)}",
+                f"current_url_present: {str(payload.current_url_present).lower()}",
+                f"current_title_present: {str(payload.current_title_present).lower()}",
+            ]
+        )
+        if payload.target_url:
+            lines.append(f"target_url: {_clean_authoring_repair_prompt_atom(payload.target_url)}")
+        if payload.source_url:
+            lines.append(f"source_url: {_clean_authoring_repair_prompt_atom(payload.source_url)}")
+        if payload.requirement_workflow_run_id:
+            lines.append(f"requirement_workflow_run_id: {payload.requirement_workflow_run_id}")
+        if payload.payload_workflow_run_id:
+            lines.append(f"payload_workflow_run_id: {payload.payload_workflow_run_id}")
+        if payload.workflow_run_id:
+            lines.append(f"grounding_workflow_run_id: {payload.workflow_run_id}")
+        if payload.current_origin:
+            lines.append(f"current_origin: {_clean_authoring_repair_prompt_atom(payload.current_origin)}")
+        if payload.form_summaries:
+            lines.append(f"forms: {_render_authoring_repair_prompt_list(payload.form_summaries)}")
+        if payload.result_container_summaries:
+            lines.append(
+                f"result_containers: {_render_authoring_repair_prompt_list(payload.result_container_summaries)}"
+            )
+        if payload.navigation_action_summaries:
+            lines.append(
+                f"navigation_actions: {_render_authoring_repair_prompt_list(payload.navigation_action_summaries)}"
+            )
+        if payload.challenge_control_summaries:
+            lines.append(
+                f"challenge_controls: {_render_authoring_repair_prompt_list(payload.challenge_control_summaries)}"
+            )
+    binding = ctx.recorded_outcome_binding_constraint
+    if isinstance(binding, RecordedOutcomeBindingConstraint):
+        lines.extend(
+            [
+                "RECORDED OUTCOME BINDING CONSTRAINT:",
+                f"frontier_facet: {_clean_authoring_repair_prompt_atom(binding.frontier_facet)}",
+                f"owning_block_labels: {_render_authoring_repair_prompt_list(binding.owning_block_labels)}",
+                f"diagnostic_reason: {_clean_authoring_repair_prompt_atom(binding.diagnostic_reason)}",
+                "The next authored change must move the named frontier facet on the owning block(s); an unchanged "
+                "frontier is rejected before rerun.",
+            ]
+        )
+    else:
+        lines.append(
+            "Before saving or rerunning, change the next authored step, selector, extraction, or binding based on "
+            "this recorded structure."
+        )
+    return "\n\n" + "\n".join(line for line in lines if line)
+
+
 def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     """Pre-authoring offer of the synthesized code block.
 
@@ -470,16 +1025,68 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="policy_not_code_only_browser")
         return ""
-    if ctx.update_workflow_called:
+    reopened_after_failed_run = synthesized_persistence_reopened_after_failed_run(ctx)
+    reopened = synthesized_persistence_reopened(ctx)
+    if ctx.update_workflow_called and not reopened:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
-        return ""
-    if ctx.synthesized_block_offered:
-        LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_offered")
         return ""
     if not ctx.scout_trajectory:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="empty_trajectory")
         return ""
-    synthesized = synthesize_code_block(ctx.scout_trajectory)
+    trajectory_len = len(ctx.scout_trajectory)
+    previous_offer_len = ctx.synthesized_block_offered_trajectory_len
+    trajectory_goal_complete = synthesized_trajectory_is_goal_complete(ctx)
+    extraction_plan = requested_output_extraction_plan(ctx)
+    request_policy = getattr(ctx, "request_policy", None)
+    if (
+        request_policy is not None
+        and requested_output_paths(request_policy.completion_criteria)
+        and extraction_plan is None
+    ):
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="extraction_plan_unavailable")
+        return ""
+    plan_changed = requested_output_extraction_plan_changed(ctx, extraction_plan)
+    reopened = reopened or plan_changed
+    if (
+        ctx.synthesized_block_offered
+        and trajectory_len < previous_offer_len + SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD
+        and (not trajectory_goal_complete or getattr(ctx, "synthesized_block_offered_goal_complete", False))
+        and not reopened
+        and not plan_changed
+    ):
+        LOG.debug(
+            "copilot_synthesized_block_offer_skipped",
+            reason="already_offered",
+            previous_trajectory_len=previous_offer_len,
+            trajectory_len=trajectory_len,
+        )
+        return ""
+    if is_optional_dismissal_only_trajectory(ctx.scout_trajectory):
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="optional_dismissal_only")
+        return ""
+    fill_step_count = sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if str(interaction.get("tool_name") or "") in {"type_text", "select_option", "fill_credential_field"}
+    )
+    LOG.info(
+        "copilot_synthesis_input_fill_steps",
+        trajectory_len=len(ctx.scout_trajectory),
+        fill_step_count=fill_step_count,
+    )
+    synthesized = (
+        synthesize_code_block_with_extraction(
+            ctx.scout_trajectory,
+            extraction_plan,
+            strict_selectors=True,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+        if extraction_plan is not None
+        else synthesize_code_block(
+            ctx.scout_trajectory,
+            reached_download_target=getattr(ctx, "reached_download_target", None),
+        )
+    )
     if synthesized is None:
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",
@@ -487,13 +1094,28 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
             trajectory_len=len(ctx.scout_trajectory),
         )
         return ""
+    if extraction_plan is not None:
+        candidate = freeze_requested_output_extraction_candidate(synthesized, extraction_plan, source="generated")
+        if candidate is None:
+            return ""
+        existing_candidate = ctx.requested_output_extraction_candidate
+        if existing_candidate is not None and existing_candidate != candidate and not reopened:
+            LOG.warning("copilot_requested_output_extraction_candidate_mismatch")
+            return ""
+        ctx.requested_output_extraction_candidate = candidate
     ctx.synthesized_block_offered = True
+    ctx.synthesized_block_offered_trajectory_len = trajectory_len
+    ctx.synthesized_block_offered_goal_complete = trajectory_goal_complete
+    if reopened_after_failed_run:
+        ctx.synthesized_block_reopened_after_failed_run = True
     LOG.info(
         "copilot_synthesized_block_offer_rendered",
-        trajectory_len=len(ctx.scout_trajectory),
+        trajectory_len=trajectory_len,
+        previous_trajectory_len=previous_offer_len,
         code_len=len(synthesized.code),
     )
-    return "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory)
+    goal = ctx.block_goal_main_goal or ctx.user_message or ""
+    return "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory, goal=goal)
 
 
 def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
@@ -525,6 +1147,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         return (
             prompt
             + _runtime_verification_evidence_prompt(ctx)
+            + _recorded_build_test_outcome_prompt(ctx)
+            + _code_authoring_repair_context_prompt(ctx)
             + _synthesized_block_offer_prompt(ctx)
             + _docs_answer_turn_directive(ctx.turn_intent)
         )
@@ -553,6 +1177,7 @@ def _build_user_context(
     user_message: str,
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
+    runnable_draft_summary: str = "",
     repeated_reply_warning: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
@@ -561,21 +1186,23 @@ def _build_user_context(
     ``escape_code_fences`` before the template interpolates it into a
     triple-backtick block. Without this, a value containing a literal
     ``` would close the fence early and let the model see the rest as
-    system-level content (the classic code-fence breakout). The old
-    copilot path in ``workflow_copilot.py`` and ``feasibility_gate.py``
-    both apply the same guard.
+    system-level content (the classic code-fence breakout).
     """
     workflow_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
+    global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
+    loaded_result_context = render_loaded_result_context_for_prompt(global_llm_context)
     return prompt_engine.load_prompt(
         template="workflow-copilot-user",
         workflow_yaml=escape_code_fences(workflow_yaml),
         workflow_summary=escape_code_fences(_build_workflow_summary(workflow_yaml)),
         chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history_text)),
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)),
+        loaded_result_context=escape_code_fences(redact_raw_secrets_for_prompt(loaded_result_context)),
         debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
+        runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
         repeated_reply_warning=escape_code_fences(repeated_reply_warning or ""),
     )
 
@@ -679,6 +1306,151 @@ def _turn_intent_disables_tools(turn_intent: TurnIntent | None) -> bool:
     return not authority.may_update_workflow and not authority.may_run_blocks
 
 
+_DRAFT_ONLY_MCP_TOOL_ALLOWLIST = frozenset({"get_block_schema", "validate_block"})
+_DRAFT_ONLY_NATIVE_TOOL_DENYLIST = frozenset(
+    {"discover_workflow_entrypoint", "inspect_page_for_composition", "fill_credential_field"}
+)
+_MUTATING_BROWSER_SCOUT_TOOLS = frozenset({"click", "press_key", "type_text", "select_option", "fill_credential_field"})
+_STRUCTURAL_CANNOT_ACT_REASON_CODES = frozenset(
+    {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
+)
+_FinalActionDataValue = str | int | float | bool | None
+_ACTUATION_OBLIGATION_STEER_REPLY = (
+    "I need to act in the browser for this request. Please let me try the browser action, or tell me what blocks it."
+)
+_ACTUATION_OBLIGATION_UNMET_REPLY = (
+    "I still did not act in the browser for this request, so I cannot treat the task as completed. "
+    "Please retry or tell me what prevented the browser action."
+)
+
+
+def _request_policy_disables_browser_scout_tools(request_policy: RequestPolicy | None) -> bool:
+    return (
+        isinstance(request_policy, RequestPolicy)
+        and request_policy.allow_update_workflow
+        and not request_policy.allow_run_blocks
+        and (request_policy.testing_intent == "skip_test" or request_policy.allow_missing_credentials_in_draft)
+    )
+
+
+def _turn_intent_requires_browser_state(turn_intent: TurnIntent | None) -> bool:
+    return isinstance(turn_intent, TurnIntent) and RequiredContextKey.BROWSER_STATE in turn_intent.required_context
+
+
+def _turn_intent_browser_only_tools(turn_intent: TurnIntent | None) -> bool:
+    return (
+        isinstance(turn_intent, TurnIntent)
+        and turn_intent.mode == TurnIntentMode.BUILD
+        and RequiredContextKey.BROWSER_STATE in turn_intent.required_context
+        and not turn_intent.authority.may_update_workflow
+        and not turn_intent.authority.may_run_blocks
+    )
+
+
+def _successful_mutating_browser_action_count(ctx: CopilotContext) -> int:
+    return sum(
+        1
+        for interaction in ctx.scout_trajectory
+        if isinstance(interaction, Mapping) and interaction.get("tool_name") in _MUTATING_BROWSER_SCOUT_TOOLS
+    )
+
+
+def _successful_durable_fill_count(ctx: CopilotContext) -> int:
+    return int(trajectory_has_browser_fill_interaction(ctx.scout_trajectory))
+
+
+def _typed_cannot_act_reason(ctx: CopilotContext) -> CannotActReason | None:
+    signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
+    if signal is None:
+        return None
+    if signal.blocker_kind == "authority_denied":
+        return None
+    if signal.blocker_kind == "missing_required_context":
+        return CannotActReason.MISSING_FIELD_VALUE
+    if signal.recovery_hint == "ask_user_clarifying":
+        return CannotActReason.AMBIGUOUS_TARGET
+    if signal.internal_reason_code in _STRUCTURAL_CANNOT_ACT_REASON_CODES:
+        return CannotActReason.STRUCTURAL_BLOCKER
+    return None
+
+
+def _evaluate_actuation_obligation_for_output(
+    ctx: CopilotContext,
+    action_data: Mapping[str, _FinalActionDataValue],
+    response_type: str,
+    output_kind: CopilotOutputKind,
+) -> ActuationObligationEvaluation:
+    cannot_act_reason = _typed_cannot_act_reason(ctx)
+    evaluation = evaluate_actuation_obligation(
+        turn_intent=ctx.turn_intent,
+        response_type=response_type,
+        output_kind=output_kind,
+        successful_mutating_browser_actions=_successful_mutating_browser_action_count(ctx),
+        cannot_act_reason=cannot_act_reason,
+        prior_turn_outcome=ctx.prior_turn_outcome,
+    )
+    if evaluation.status != ActuationObligationStatus.ALLOWED:
+        return evaluation
+    if (
+        not _turn_intent_browser_only_tools(ctx.turn_intent)
+        or not request_policy_requires_durable_fill(ctx.request_policy)
+        or response_type != "REPLY"
+        or output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER
+    ):
+        return evaluation
+    if _successful_durable_fill_count(ctx) > 0 or cannot_act_reason is not None:
+        return evaluation
+    obligation_key = actuation_obligation_key(ctx.turn_intent)
+    if prior_turn_satisfies_actuation_terminal_condition(ctx.prior_turn_outcome, obligation_key):
+        return ActuationObligationEvaluation(
+            status=ActuationObligationStatus.TERMINAL,
+            reason_code=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+            obligation_key=obligation_key,
+        )
+    return ActuationObligationEvaluation(
+        status=ActuationObligationStatus.STEER,
+        reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+        obligation_key=obligation_key,
+    )
+
+
+def _actuation_obligation_diagnostics(
+    ctx: CopilotContext,
+    evaluation: ActuationObligationEvaluation,
+) -> dict[str, str | int | bool | None]:
+    if (
+        not turn_intent_requires_actuation(ctx.turn_intent)
+        and evaluation.status == ActuationObligationStatus.ALLOWED
+        and evaluation.cannot_act_reason is None
+    ):
+        return {}
+    return {
+        "actuation_obligation_status": evaluation.status.value,
+        "actuation_obligation_reason_code": evaluation.reason_code or None,
+        "actuation_obligation_key": evaluation.obligation_key or None,
+        "cannot_act_reason": evaluation.cannot_act_reason.value if evaluation.cannot_act_reason is not None else None,
+        "successful_mutating_browser_actions": _successful_mutating_browser_action_count(ctx),
+        "durable_fill_required": request_policy_requires_durable_fill(ctx.request_policy),
+        "successful_durable_browser_fills": _successful_durable_fill_count(ctx),
+    }
+
+
+def _mcp_tool_surface_for_turn(
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+    turn_intent: TurnIntent | None,
+    request_policy: RequestPolicy | None = None,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    if _turn_intent_disables_tools(turn_intent):
+        return {}, {}
+    if _request_policy_disables_browser_scout_tools(request_policy):
+        return (
+            {name: target for name, target in alias_map.items() if name in _DRAFT_ONLY_MCP_TOOL_ALLOWLIST},
+            {name: overlay for name, overlay in overlays.items() if name in _DRAFT_ONLY_MCP_TOOL_ALLOWLIST},
+        )
+    return alias_map, overlays
+
+
 def _native_tools_for_turn(
     native_tools: list[Any],
     turn_intent: TurnIntent | None,
@@ -688,6 +1460,8 @@ def _native_tools_for_turn(
     # use them. The tool implementations enforce TurnIntent/RequestPolicy
     # authority and return structured blockers; removing a tool lets the model
     # hit an SDK-level ModelBehaviorError if static prompt text still names it.
+    if _request_policy_disables_browser_scout_tools(request_policy):
+        return [tool for tool in native_tools if getattr(tool, "name", None) not in _DRAFT_ONLY_NATIVE_TOOL_DENYLIST]
     return list(native_tools)
 
 
@@ -719,6 +1493,11 @@ _FAILURE_FOLLOW_UP = {
 }
 
 
+def _join_capped_labels(labels: list[str], cap: int = 6) -> str:
+    shown = ", ".join(labels[:cap])
+    return f"{shown}, ..." if len(labels) > cap else shown
+
+
 def _partial_verification_response(ctx: CopilotContext) -> str | None:
     evidence = ctx.workflow_verification_evidence
     if not evidence.has_evidence():
@@ -726,16 +1505,34 @@ def _partial_verification_response(ctx: CopilotContext) -> str | None:
     if evidence.full_workflow_verified:
         return None
 
+    coverage_complete = (
+        bool(evidence.block_verified) and not evidence.unverified_block_labels and not evidence.per_tool_budget_on_block
+    )
+    if coverage_complete:
+        count = len(evidence.block_verified)
+        block_word = "block" if count == 1 else "blocks"
+        labels = _join_capped_labels(evidence.block_verified)
+        failure_reason = (evidence.failure_reason or "").strip()
+        if failure_reason:
+            return (
+                f"I saved a draft workflow and ran all {count} {block_word} ({labels}), but the run did not "
+                f"confirm the workflow end-to-end: {failure_reason}. Keep the draft to iterate on, or discard."
+            )
+        return (
+            f"I saved a draft workflow and ran all {count} {block_word} ({labels}), but I couldn't confirm the "
+            "workflow end-to-end this turn. Keep the draft to iterate on, or discard."
+        )
+
     detail_parts: list[str] = []
     if evidence.block_verified:
-        detail_parts.append("verified block(s): " + ", ".join(evidence.block_verified[:6]))
+        detail_parts.append("verified block(s): " + _join_capped_labels(evidence.block_verified))
     if evidence.live_page_state_verified:
         page = evidence.page_title or evidence.current_url or "the current browser page"
         detail_parts.append(f"verified current browser state: {page}")
     if evidence.per_tool_budget_on_block:
-        detail_parts.append("per-tool budget hit on: " + ", ".join(evidence.per_tool_budget_on_block[:6]))
+        detail_parts.append("per-tool budget hit on: " + _join_capped_labels(evidence.per_tool_budget_on_block))
     if evidence.unverified_block_labels:
-        detail_parts.append("unverified block(s): " + ", ".join(evidence.unverified_block_labels[:6]))
+        detail_parts.append("unverified block(s): " + _join_capped_labels(evidence.unverified_block_labels))
 
     details = " ".join(detail_parts)
     if details:
@@ -755,11 +1552,16 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     block_count = ctx.last_update_block_count if isinstance(ctx.last_update_block_count, int) else None
     positive_block_count = block_count if block_count is not None and block_count > 0 else None
 
-    if outcome_fully_verified(ctx) and has_keepable_draft and positive_block_count is not None:
-        block_word = "block" if positive_block_count == 1 else "blocks"
+    if outcome_fully_verified(ctx) and has_keepable_draft:
+        if positive_block_count is not None:
+            block_word = "block" if positive_block_count == 1 else "blocks"
+            return (
+                f"I created a workflow with {positive_block_count} {block_word} and verified the requested "
+                "outcome from workflow run evidence and the current browser page. The workflow is ready to review."
+            )
         return (
-            f"I created a workflow with {positive_block_count} {block_word} and verified the requested "
-            "outcome from the current browser page after the run. The workflow is ready to review."
+            "I built the workflow and verified the requested outcome from workflow run evidence and the current "
+            "browser page. The workflow is ready to review."
         )
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
@@ -833,6 +1635,10 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
 
 
 def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
+    if artifact_health_blocked(ctx):
+        return False
+    if outcome_fully_verified(ctx):
+        return True
     result = ctx.completion_verification_result
     if result is None:
         return True
@@ -840,7 +1646,9 @@ def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
         # Verification was required for this run but could not produce a verdict
         # (unavailable): do not surface the workflow as verified on run status alone.
         return False
-    return result.is_fully_satisfied()
+    if result.is_fully_satisfied():
+        return True
+    return only_structural_requested_output_abstentions(result)
 
 
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
@@ -855,6 +1663,32 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     ):
         return ctx.last_workflow, ctx.last_workflow_yaml
     return None, None
+
+
+_BUILT_UNVERIFIED_COMPLETED_REPLY = (
+    "I built the workflow and the test run completed, but the goal outcome was not independently verified. "
+    "The workflow is available on the canvas for review."
+)
+
+
+def _should_use_built_unverified_completed_reply(
+    ctx: CopilotContext,
+    *,
+    response_type: str,
+    updated_workflow: Any,
+    validated: bool,
+    blocker_active: bool,
+) -> bool:
+    return (
+        response_type == "REPLY"
+        and updated_workflow is not None
+        and validated
+        and not blocker_active
+        and ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and not ctx.last_test_suspicious_success
+        and not verified_goal_claim_authorized(ctx)
+    )
 
 
 def _make_agent_result(
@@ -889,11 +1723,73 @@ def _make_agent_result(
             payload_updates["proposalDisposition"] = proposal_disposition
         if turn_outcome is not None and "responseKind" not in narrative_payload:
             payload_updates["responseKind"] = turn_outcome.response_kind.value
+        if "credentialPrompt" not in narrative_payload:
+            policy = ctx.request_policy if ctx is not None else None
+            reason = credential_prompt_reason(policy, kwargs.get("user_response"))
+            if reason:
+                payload_updates["credentialPrompt"] = {"reason": reason}
+        if ctx is not None and "credentialPause" not in narrative_payload:
+            pause_outcome = ctx.credential_pause_outcome
+            if pause_outcome:
+                pause_payload = {"outcome": pause_outcome}
+                if pause_outcome == "connected" and ctx.request_policy and ctx.request_policy.resolved_credentials:
+                    pause_payload["credentialId"] = ctx.request_policy.resolved_credentials[-1].credential_id
+                payload_updates["credentialPause"] = pause_payload
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
-            payload_updates["verifiedSuccess"] = bool(verified_goal_satisfied_context(ctx))
+            payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
+        if ctx is not None and "outcomeAdjudication" not in narrative_payload:
+            adjudication = _build_outcome_adjudication_payload(ctx)
+            if adjudication is not None:
+                payload_updates["outcomeAdjudication"] = adjudication
         if payload_updates:
             kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
-    return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
+    result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
+    if ctx is not None and result.turn_outcome is not None:
+        result.turn_outcome = with_copilot_code_mode_diagnostics(result.turn_outcome, ctx)
+    if ctx is not None and not result.apply_without_review:
+        result.apply_without_review = _should_apply_code_only_success_without_review(ctx, result.proposal_disposition)
+    if ctx is not None and result.completion_criteria_turn_state is None:
+        result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    if ctx is not None and result.code_artifact_metadata is None:
+        evidence_metadata = getattr(
+            getattr(ctx, "workflow_verification_evidence", None), "code_artifact_metadata", None
+        )
+        ctx_metadata = getattr(ctx, "code_artifact_metadata", None)
+        if isinstance(evidence_metadata, dict) and evidence_metadata:
+            result.code_artifact_metadata = evidence_metadata
+        elif isinstance(ctx_metadata, dict) and ctx_metadata:
+            result.code_artifact_metadata = ctx_metadata
+    return result
+
+
+def _should_apply_code_only_success_without_review(ctx: CopilotContext, disposition: object) -> bool:
+    return (
+        disposition == "auto_applicable"
+        and verified_goal_claim_authorized(ctx)
+        and ctx.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and not ctx.last_test_suspicious_success
+        and ctx.has_staged_proposal
+        and ctx.staged_workflow is not None
+    )
+
+
+def _build_outcome_adjudication_payload(ctx: CopilotContext) -> NarrativeOutcomeAdjudication | None:
+    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    if turn_state is None:
+        return None
+    counts = turn_state.last_verdict_state_counts or {}
+    payload: NarrativeOutcomeAdjudication = {
+        "satisfiedCount": int(counts.get("satisfied", 0)),
+        "unsatisfiedCount": int(counts.get("unsatisfied", 0)),
+        "unknownCount": int(counts.get("unknown", 0)),
+        "claimTier": "verified_goal_satisfied" if verified_goal_claim_authorized(ctx) else "built_unverified",
+    }
+    if turn_state.decision is not None:
+        payload["criteriaEpoch"] = turn_state.decision.epoch
+        payload["criteriaLifecycleReason"] = turn_state.decision.reason
+    return payload
 
 
 _BLOCK_STATUS_TO_UI_STATE: dict[str, str] = {
@@ -989,6 +1885,15 @@ def _build_narrative_payload(
     }
 
 
+def _log_output_policy_parity(ctx: CopilotContext, *, has_workflow_proposal: bool, workflow_attempted: bool) -> None:
+    LOG.info(
+        "copilot.output_policy_parity",
+        has_workflow_proposal=has_workflow_proposal,
+        workflow_attempted=workflow_attempted,
+        **ctx.genuine_attempt_parity_fields(),
+    )
+
+
 def _build_exit_result(
     ctx: CopilotContext,
     user_response: str,
@@ -1004,7 +1909,10 @@ def _build_exit_result(
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason or ("cancel" if cancelled else None),
     )
-    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    workflow_attempted = ctx.has_genuine_workflow_attempt()
+    _log_output_policy_parity(
+        ctx, has_workflow_proposal=verified_workflow is not None, workflow_attempted=workflow_attempted
+    )
     output_kind = derive_output_kind(
         response_type="REPLY",
         request_policy=ctx.request_policy,
@@ -1070,16 +1978,42 @@ def _build_exit_result(
     )
 
 
-def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+async def _build_goal_satisfied_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    *,
+    terminal_reason: str = "verified_goal_satisfied",
+    exit_site: str = "verified_goal_satisfied",
+    flush_goal_satisfied: bool = True,
+) -> AgentResult:
     # Bypass one extra LLM turn after a full workflow test already satisfies
     # the diagnosis contract.
+    if flush_goal_satisfied and ctx.stream is not None:
+        try:
+            await flush_goal_satisfied_tool_result(ctx.stream, ctx)
+        except Exception as flush_err:
+            LOG.warning("copilot_goal_satisfied_tool_result_flush_failed", error=str(flush_err))
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    user_response = "I created and tested the workflow successfully."
+    clean_test = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
+    if clean_test and verified_goal_claim_authorized(ctx):
+        user_response = _verified_workflow_success_reply(ctx)
+    elif clean_test:
+        user_response = (
+            "I built the workflow and the test run completed, but the goal outcome was not "
+            "independently verified. Review the draft to confirm it does what you need."
+        )
+    elif ctx.last_test_ok is False:
+        user_response = "I reached the requested outcome, but the workflow test did not finish successfully."
+    else:
+        user_response = (
+            "I reached the requested outcome, but the workflow has not been tested end-to-end. "
+            "Review the draft before using it."
+        )
     final_text, outcome = apply_repeated_reply_guard(
         final_text=user_response,
         attempted_kind=derive_response_kind(ctx.turn_intent),
         blocked_signatures=ctx.blocked_reply_signatures,
-        terminal_reason="verified_goal_satisfied",
+        terminal_reason=terminal_reason,
         turn_intent=ctx.turn_intent,
         tool_calls=[
             str(entry.get("tool") or entry.get("name") or "")
@@ -1137,7 +2071,11 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
             workflow_yaml=verified_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            proposal_disposition="auto_applicable",
+            proposal_disposition="auto_applicable"
+            if verified_workflow is not None and verified_goal_claim_authorized(ctx)
+            else "review_tested"
+            if verified_workflow is not None
+            else "no_proposal",
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -1148,8 +2086,21 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
                 narrative_summary=ctx.narrative_summary,
             ),
         ),
-        exit_site="verified_goal_satisfied",
+        exit_site=exit_site,
     )
+
+
+async def _build_built_unverified_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    return await _build_goal_satisfied_exit_result(
+        ctx,
+        global_llm_context,
+        terminal_reason=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+        exit_site=BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+        flush_goal_satisfied=False,
+    )
+
+
+_SCOUTED_SPINE_HALT_REPLY_KINDS = frozenset({TurnHaltKind.LOOP_DETECTED, TurnHaltKind.REPAIR_CEILING_REACHED})
 
 
 def _build_turn_halt_exit_result(
@@ -1157,12 +2108,32 @@ def _build_turn_halt_exit_result(
     global_llm_context: str | None,
     halt: TurnHalt,
 ) -> AgentResult:
+    under_build_open = log_scouted_spine_unresolved_at_turn_halt(ctx)
+    if halt.kind == TurnHaltKind.DELIVERED_UNVERIFIED:
+        reply = _delivered_unverified_reply(ctx) or _BUILT_UNVERIFIED_COMPLETED_REPLY
+        return _build_wip_exit_result(
+            ctx,
+            global_llm_context,
+            default_reply=reply,
+            unvalidated_reply=reply,
+            tested_reply=reply,
+            terminal_reason=f"turn_halt:{halt.kind.value}",
+        )
     signal = halt.blocker_signal
-    user_response = (
-        signal.user_facing_reason
-        if isinstance(signal, CopilotToolBlockerSignal)
-        else "I could not continue this turn safely. Tell me what to change and I'll try again."
-    )
+    if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
+        refresh_held_loop_blocker_evidence(ctx)
+        signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
+    if under_build_open and halt.kind in _SCOUTED_SPINE_HALT_REPLY_KINDS:
+        user_response = SCOUTED_SPINE_TURN_HALT_USER_REASON
+        # The blocker-override finalizer re-renders from the held signal, so the
+        # reframed reason must live there, not just in the local reply.
+        if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal):
+            ctx.blocker_signal = ctx.blocker_signal.model_copy(update={"user_facing_reason": user_response})
+            ctx.blocker_signal_claimant = None
+    elif isinstance(signal, CopilotToolBlockerSignal):
+        user_response = signal.user_facing_reason
+    else:
+        user_response = "I could not continue this turn safely. Tell me what to change and I'll try again."
     return _build_exit_result(
         ctx,
         user_response,
@@ -1186,6 +2157,7 @@ _MAX_TURNS_REPLY_UNVALIDATED = (
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
+_VERIFIED_WORKFLOW_SUCCESS_REPLY = "I created and tested the workflow successfully."
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
     "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
@@ -1254,6 +2226,201 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
+_VERIFIED_CLASSIFICATION_CONTEXT_KEYS = (
+    "visible_page_path_label",
+    "safest_reachable_next_step",
+    "recommended_next_action",
+)
+_VERIFIED_CLASSIFICATION_GATE_KEYS = (
+    "observed_gate_phrase",
+    "gate_phrase",
+    "gate_summary",
+    "blocked_by",
+)
+_VERIFIED_CLASSIFICATION_GATE_PHRASES = ("Sign in or register to continue",)
+_VERIFIED_TERMINAL_VALUE_MAX_CHARS = 180
+
+
+def _terminal_summary_scalar(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return str(value)
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.strip().split())
+    if not cleaned or contains_internal_machinery_leak(cleaned):
+        return None
+    if len(cleaned) > _VERIFIED_TERMINAL_VALUE_MAX_CHARS:
+        cleaned = cleaned[: _VERIFIED_TERMINAL_VALUE_MAX_CHARS - 1].rstrip() + "..."
+    return cleaned
+
+
+def _delivered_unverified_reply(ctx: CopilotContext) -> str | None:
+    if getattr(ctx, "delivered_unverified_terminal", False) is not True:
+        return None
+    parts: list[str] = []
+    observed_outputs = getattr(ctx, "delivered_unverified_observed_outputs", {})
+    if not isinstance(observed_outputs, dict):
+        observed_outputs = {}
+    for key, value in observed_outputs.items():
+        rendered = _terminal_summary_scalar(value)
+        if rendered is None and isinstance(value, list | dict):
+            try:
+                rendered = redact_raw_secrets_for_prompt(json.dumps(value, sort_keys=True))
+            except TypeError:
+                rendered = None
+        if isinstance(key, str) and key.strip() and rendered and not contains_internal_machinery_leak(rendered):
+            parts.append(f"{key}: {rendered[:_VERIFIED_TERMINAL_VALUE_MAX_CHARS]}")
+    if parts:
+        return (
+            "I built and ran the workflow. The latest run returned "
+            f"{'; '.join(parts[:4])}. That value was not independently verified, so review the draft before using it."
+        )
+    return (
+        "I built and ran the workflow, and the latest run returned the requested output. "
+        "That output was not independently verified, so review the draft before using it."
+    )
+
+
+def _verified_output_value(ctx: CopilotContext, output_key: str | None) -> Any:
+    if not output_key:
+        return None
+    block_outputs = ctx.verified_terminal_block_outputs or ctx.verified_block_outputs or {}
+    for output in block_outputs.values():
+        if isinstance(output, dict) and output_key in output:
+            return output.get(output_key)
+    return None
+
+
+def _verified_adjacent_output_parts(ctx: CopilotContext) -> list[str]:
+    parts: list[str] = []
+    block_outputs = ctx.verified_terminal_block_outputs or ctx.verified_block_outputs or {}
+    login_gate_phrase_found = False
+
+    def append_gate_phrase(value: Any) -> None:
+        nonlocal login_gate_phrase_found
+        if isinstance(value, str):
+            for phrase in _VERIFIED_CLASSIFICATION_GATE_PHRASES:
+                if phrase.lower() in value.lower():
+                    login_gate_phrase_found = True
+                    parts.append(f"observed_gate_phrase={phrase}")
+            return
+        if isinstance(value, list | tuple | set):
+            for item in value:
+                append_gate_phrase(item)
+
+    for output in block_outputs.values():
+        if not isinstance(output, dict):
+            continue
+        for key in (*_VERIFIED_CLASSIFICATION_CONTEXT_KEYS, *_VERIFIED_CLASSIFICATION_GATE_KEYS):
+            value = _terminal_summary_scalar(output.get(key))
+            if value is not None:
+                parts.append(f"{key}={value}")
+        for value in output.values():
+            append_gate_phrase(value)
+    if login_gate_phrase_found:
+        parts.append("login-gated")
+    return list(dict.fromkeys(parts))
+
+
+def _verified_classification_summary(ctx: CopilotContext) -> str | None:
+    if not verified_goal_claim_authorized(ctx) or not outcome_fully_verified(ctx):
+        return None
+    result = ctx.completion_verification_result
+    if result is None or not result.is_fully_satisfied():
+        return None
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if policy is None:
+        return None
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    parts: list[str] = []
+    login_gated_confirmed = False
+    for criterion in policy.completion_criteria:
+        if criterion.kind != "validation_classification":
+            continue
+        verdict = verdict_by_id.get(criterion.id)
+        if verdict is None or not verdict.satisfied:
+            continue
+        output_key = criterion.classification_output_key or verdict.output_path
+        actual = _verified_output_value(ctx, output_key)
+        display_value = _terminal_summary_scalar(actual)
+        if output_key and display_value is not None:
+            parts.append(f"{output_key}={display_value}")
+        actual_text = actual.strip().lower() if isinstance(actual, str) else None
+        if (
+            isinstance(output_key, str)
+            and output_key in {"login_only", "login_gated", "path_login_only"}
+            and actual is True
+        ) or actual_text in {"login-gated", "login_gated"}:
+            login_gated_confirmed = True
+    if login_gated_confirmed:
+        parts.append("login-gated")
+    parts.extend(_verified_adjacent_output_parts(ctx))
+    if not parts:
+        return None
+    return "; ".join(dict.fromkeys(parts))
+
+
+def _verified_workflow_success_reply(ctx: CopilotContext) -> str:
+    summary = _verified_classification_summary(ctx)
+    if summary is None:
+        return _VERIFIED_WORKFLOW_SUCCESS_REPLY
+    return f"{_VERIFIED_WORKFLOW_SUCCESS_REPLY} Verified result: {summary}."
+
+
+@dataclass(frozen=True)
+class _TypedRunOutcomeReply:
+    user_response: str
+    demonstrated: bool
+
+
+def _safe_run_outcome_display_reason(recorded: RecordedRunOutcome) -> str | None:
+    reason = run_outcome_display_reason(recorded.display_reason)
+    if reason is None or contains_internal_machinery_leak(reason):
+        return None
+    try:
+        assert_clean_user_facing_text(reason)
+    except ValueError:
+        return None
+    return reason.rstrip(".")
+
+
+def _render_typed_run_outcome_reply(
+    ctx: CopilotContext,
+    *,
+    response_type: ResponseType,
+    has_verified_workflow: bool,
+    blocker_active: bool,
+) -> _TypedRunOutcomeReply | None:
+    if blocker_active or response_type != "REPLY":
+        return None
+    recorded = ctx.last_run_outcome
+    if not isinstance(recorded, RecordedRunOutcome):
+        return None
+    if recorded.verdict == "demonstrated":
+        if not has_verified_workflow or not verified_goal_claim_authorized(ctx):
+            return None
+        return _TypedRunOutcomeReply(
+            user_response=f"{_verified_workflow_success_reply(ctx)} The latest run demonstrated the requested outcome.",
+            demonstrated=True,
+        )
+
+    reason = _safe_run_outcome_display_reason(recorded)
+    if recorded.verdict == "not_demonstrated":
+        user_response = (
+            "I built and ran the workflow, but the latest run did not demonstrate the requested outcome. "
+            "Review the draft before using it."
+        )
+    else:
+        user_response = (
+            "I built and ran the workflow, but the latest run could not verify the requested outcome. "
+            "Review the draft before using it."
+        )
+    if reason is not None:
+        user_response = f"{user_response} Reason: {reason}."
+    return _TypedRunOutcomeReply(user_response=user_response, demonstrated=False)
+
 
 # Pre-validated safe string the finalization shim falls back to when the
 # rendered blocker reply somehow trips OutputPolicy. Asserted clean at module
@@ -1289,6 +2456,72 @@ except ValueError as _fallback_validation_error:
     )
 
 
+def _verified_terminal_preserve_result(
+    ctx: CopilotContext, result: AgentResult, *, exit_site: str
+) -> AgentResult | None:
+    """When the judge confirmed the outcome, hold the tested proposal and the
+    success reply instead of letting an involuntary blocker render over it."""
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    if verified_workflow is None:
+        return None
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=_verified_workflow_success_reply(ctx),
+        attempted_kind=derive_response_kind(ctx.turn_intent),
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason="verified_goal_satisfied",
+        turn_intent=ctx.turn_intent,
+    )
+    output_kind = derive_output_kind(
+        response_type="REPLY",
+        request_policy=ctx.request_policy,
+        updated_workflow=verified_workflow,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+    )
+    verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type="REPLY",
+        user_response=final_text,
+        global_llm_context=None,
+        workflow_yaml=verified_yaml,
+        has_workflow_proposal=True,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+        output_kind=output_kind,
+    )
+    if not verdict.allowed:
+        return None
+    LOG.info(
+        "copilot verified outcome preserved tested proposal over blocker",
+        exit_site=exit_site,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+    )
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=verified_workflow,
+        global_llm_context=result.global_llm_context,
+        response_type="REPLY",
+        workflow_yaml=verified_yaml,
+        workflow_was_persisted=ctx.workflow_persisted,
+        clear_proposed_workflow=False,
+        total_tokens=result.total_tokens,
+        cancelled=result.cancelled,
+        proposal_disposition="review_tested",
+        turn_outcome=outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
+    )
+
+
 def _finalize_result_with_blocker_override(
     ctx: CopilotContext, result: AgentResult, *, exit_site: str = "unspecified"
 ) -> AgentResult:
@@ -1301,6 +2534,12 @@ def _finalize_result_with_blocker_override(
         return result
     if not local_signal.renders_final_reply:
         return result
+    if not blocker_signal_render_allowed(ctx, local_signal):
+        return result
+    if local_signal.internal_reason_code in _INVOLUNTARY_BLOCKER_REASON_CODES and outcome_fully_verified(ctx):
+        preserved = _verified_terminal_preserve_result(ctx, result, exit_site=exit_site)
+        if preserved is not None:
+            return preserved
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
 
@@ -1692,6 +2931,39 @@ def _build_wip_exit_result(
             terminal_reason=effective_terminal,
         )
 
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    if outcome_fully_verified(ctx) and verified_workflow is not None:
+        final_text, outcome = _guard(tested_reply)
+        proposal_disposition = "auto_applicable" if verified_goal_claim_authorized(ctx) else "review_tested"
+        return _finalize_result_with_blocker_override(
+            ctx,
+            _make_agent_result(
+                ctx,
+                user_response=final_text,
+                updated_workflow=verified_workflow,
+                global_llm_context=global_llm_context,
+                workflow_yaml=verified_yaml,
+                workflow_was_persisted=ctx.workflow_persisted,
+                has_staged_proposal=ctx.has_staged_proposal,
+                staged_workflow_yaml=ctx.staged_workflow_yaml,
+                staged_workflow=ctx.staged_workflow,
+                canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
+                total_tokens=ctx.total_tokens_used,
+                proposal_disposition=proposal_disposition,
+                cancelled=cancelled,
+                turn_outcome=outcome,
+                turn_id=ctx.turn_id,
+                narrative_summary=ctx.narrative_summary,
+                narrative_payload=_build_narrative_payload(
+                    ctx,
+                    terminal="response",
+                    terminal_message=final_text,
+                    narrative_summary=ctx.narrative_summary,
+                ),
+            ),
+            exit_site="wip_verified_terminal_proposal",
+        )
+
     # When an unverified edit/run has overwritten ``last_workflow``, prefer the
     # verified shape while still forcing explicit review.
     if (
@@ -1738,13 +3010,20 @@ def _build_wip_exit_result(
     ):
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
-        if unvalidated and recorded_failure_reply:
+        delivered_reply = _delivered_unverified_reply(ctx)
+        if delivered_reply is not None:
+            reply = delivered_reply
+            unvalidated = True
+        elif unvalidated and recorded_failure_reply:
             reply = recorded_failure_reply
             if halted_mid_progress:
                 reply = _ensure_unvalidated_proposal_affordance(reply)
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
         final_text, outcome = _guard(reply)
+        proposal_disposition = "review_untested" if unvalidated else "review_tested"
+        if not unvalidated and verified_goal_claim_authorized(ctx):
+            proposal_disposition = "auto_applicable"
         return _finalize_result_with_blocker_override(
             ctx,
             _make_agent_result(
@@ -1759,7 +3038,7 @@ def _build_wip_exit_result(
                 staged_workflow=ctx.staged_workflow,
                 canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
                 total_tokens=ctx.total_tokens_used,
-                proposal_disposition="review_untested" if unvalidated else "auto_applicable",
+                proposal_disposition=proposal_disposition,
                 cancelled=cancelled,
                 turn_outcome=outcome,
                 turn_id=ctx.turn_id,
@@ -1877,6 +3156,48 @@ def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | Non
     )
 
 
+async def _resolve_wrapped_exception_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    *,
+    goal_satisfied: bool,
+    error: BaseException,
+    workflow_permanent_id: str | None,
+) -> AgentResult:
+    error_type = type(error).__name__
+    try:
+        raise_if_turn_halt(ctx, verified=outcome_fully_verified(ctx))
+    except CopilotTurnHalt as halt_exc:
+        LOG.info(
+            "Copilot run stopped after typed turn halt from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            error_type=error_type,
+            **turn_halt_to_trace_data(halt_exc.halt),
+        )
+        return _build_turn_halt_exit_result(ctx, global_llm_context, halt_exc.halt)
+    turn_halt = ctx.turn_halt
+    if isinstance(turn_halt, TurnHalt):
+        LOG.info(
+            "Copilot run stopped after typed turn halt from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            error_type=error_type,
+            **turn_halt_to_trace_data(turn_halt),
+        )
+        return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
+    if goal_satisfied:
+        # The Agents SDK can wrap exceptions raised from hooks; keep this
+        # fallback so a verified-goal stop is not rendered as a generic error.
+        LOG.info(
+            "Copilot run stopped after verified goal satisfaction from wrapped exception",
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
+            error_type=error_type,
+        )
+        return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
+    LOG.error("Copilot agent error", error=str(error), exc_info=True)
+    return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
+
+
 async def _translate_to_agent_result(
     result: RunResultStreaming,
     ctx: CopilotContext,
@@ -1904,7 +3225,11 @@ async def _translate_to_agent_result(
     # Bind the signal to a local so the proposal-cascade gating below can't
     # desync from the inline override if ctx mutates mid-translate.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    render_blocker_reply = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    render_blocker_reply = (
+        local_blocker_signal is not None
+        and local_blocker_signal.renders_final_reply
+        and blocker_signal_render_allowed(ctx, local_blocker_signal)
+    )
     blocker_active = render_blocker_reply
     if local_blocker_signal is not None and render_blocker_reply:
         # Override only user-visible text + resp_type so REPLACE_WORKFLOW and ASK_QUESTION gating skip the model's side-effect path; the shim is the sole renderer.
@@ -1922,6 +3247,22 @@ async def _translate_to_agent_result(
     def _with_inline_reject_note(response: Any, detail: str) -> str:
         note = detail if not contains_internal_machinery_leak(detail) else _INLINE_REJECT_NOTE_FALLBACK
         return f"{response}\n\n(Note: {note})"
+
+    turn_intent = ctx.turn_intent if isinstance(ctx.turn_intent, TurnIntent) else None
+    may_update_workflow = turn_intent is None or turn_intent.authority.may_update_workflow
+    if resp_type == "REPLACE_WORKFLOW" and turn_intent is not None and not turn_intent.authority.may_update_workflow:
+        # A no-mutation turn (e.g. DIAGNOSE) must not stage a draft even via an inline REPLACE_WORKFLOW, which
+        # bypasses the may_update_workflow=False authority enforced on the update_workflow tool. Downgrade to a
+        # REPLY so the diagnosis still lands but no edit is staged; the user applies it on a follow-up edit turn.
+        LOG.info(
+            "copilot suppressed inline REPLACE_WORKFLOW on no-mutation turn",
+            turn_intent_mode=turn_intent.mode.value,
+        )
+        user_response = _with_inline_reject_note(
+            user_response,
+            "Diagnosing a failed run doesn't edit the workflow on its own — confirm and I'll apply the change.",
+        )
+        resp_type = "REPLY"
 
     if resp_type == "REPLACE_WORKFLOW":
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
@@ -1999,12 +3340,17 @@ async def _translate_to_agent_result(
                 ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
+            # Inline REPLACE_WORKFLOW bypasses the update_workflow tool, so apply the same default here.
+            workflow_yaml = default_data_write_continue_on_failure(
+                workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml
+            )
             try:
-                last_workflow = _process_workflow_yaml(
+                last_workflow = await _process_workflow_yaml(
                     workflow_id=chat_request.workflow_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     organization_id=organization_id,
                     workflow_yaml=workflow_yaml,
+                    settings_fallback_yaml=ctx.last_workflow_yaml or ctx.workflow_yaml,
                 )
                 last_workflow_yaml = workflow_yaml
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
@@ -2021,12 +3367,19 @@ async def _translate_to_agent_result(
     # never run, so a leftover ``last_test_ok is True`` from an earlier tested
     # (but different) yaml must not promote this untested one.
     # ``blocker_active`` should already have rewritten resp_type away from
-    # REPLACE_WORKFLOW above; explicit guard here defends against future
-    # refactors that re-emit REPLACE_WORKFLOW post-rendering.
-    if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow and not blocker_active:
+    # REPLACE_WORKFLOW above, and a no-mutation turn was downgraded to REPLY;
+    # the explicit guards here defend against future refactors that re-emit
+    # REPLACE_WORKFLOW post-rendering or bypass the downgrade.
+    if (
+        resp_type == "REPLACE_WORKFLOW"
+        and last_workflow is not ctx.last_workflow
+        and not blocker_active
+        and may_update_workflow
+    ):
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
+        clear_terminal_evidence_on_workflow_edit(ctx)
         # Inline REPLACE_WORKFLOW is untested by construction; emit a draft
         # envelope without staging onto ctx so terminal auto-accept can't fire,
         # and suppress the workflow payload so the canvas does not render it.
@@ -2074,8 +3427,27 @@ async def _translate_to_agent_result(
         elif not salvaged_reply:
             user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    # Default-true preserves backwards-compat with stale prompts and missing fields.
-    agent_admits_incomplete = _is_explicit_false(action_data.get("goal_reached"))
+    verified_terminal_ready = (
+        verified_workflow is not None and verified_goal_claim_authorized(ctx) and not blocker_active
+    )
+    if verified_terminal_ready:
+        resp_type = "REPLY"
+        user_response = _verified_workflow_success_reply(ctx)
+        agent_admits_incomplete = False
+    else:
+        # Default-true preserves backwards-compat with stale prompts and missing fields.
+        agent_admits_incomplete = _is_explicit_false(
+            action_data.get("goal_reached")
+        ) and not verified_goal_claim_authorized(ctx)
+    typed_outcome_reply = _render_typed_run_outcome_reply(
+        ctx,
+        response_type=resp_type,
+        has_verified_workflow=verified_workflow is not None,
+        blocker_active=blocker_active,
+    )
+    if typed_outcome_reply is not None:
+        user_response = typed_outcome_reply.user_response
+        agent_admits_incomplete = not typed_outcome_reply.demonstrated
 
     last_workflow = None
     last_workflow_yaml = None
@@ -2108,7 +3480,18 @@ async def _translate_to_agent_result(
         structured = StructuredContext.from_json_str(llm_context_raw)
     structured.merge_turn_summary(ctx.tool_activity)
     enriched_context = structured.to_json_str()
-    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    workflow_attempted = ctx.has_genuine_workflow_attempt()
+    _log_output_policy_parity(
+        ctx, has_workflow_proposal=last_workflow is not None, workflow_attempted=workflow_attempted
+    )
+    if _should_use_built_unverified_completed_reply(
+        ctx,
+        response_type=resp_type,
+        updated_workflow=last_workflow,
+        validated=not unvalidated,
+        blocker_active=blocker_active,
+    ):
+        user_response = _BUILT_UNVERIFIED_COMPLETED_REPLY
     output_kind = derive_output_kind(
         response_type=resp_type,
         request_policy=ctx.request_policy,
@@ -2130,6 +3513,15 @@ async def _translate_to_agent_result(
         unvalidated=unvalidated,
         output_kind=output_kind,
     )
+    actuation_obligation = _evaluate_actuation_obligation_for_output(ctx, action_data, resp_type, output_kind)
+    if actuation_obligation.status == ActuationObligationStatus.STEER:
+        raw_output_policy_verdict.add(OutputPolicyReason.ACTUATION_OBLIGATION_STEER)
+    actuation_obligation_terminal = actuation_obligation.status == ActuationObligationStatus.TERMINAL
+    if actuation_obligation_terminal:
+        resp_type = "REPLY"
+        user_response = _ACTUATION_OBLIGATION_UNMET_REPLY
+        last_workflow = None
+        last_workflow_yaml = None
     output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
     unbacked_workflow_delivery_rewritten = False
@@ -2183,6 +3575,7 @@ async def _translate_to_agent_result(
         hard_block_reason_codes=list(output_policy_verdict.reason_codes),
         soft_rewrite_reason_codes=soft_rewrite_reasons,
     )
+    output_policy_diagnostics.update(_actuation_obligation_diagnostics(ctx, actuation_obligation))
     trace_data = output_policy_verdict_to_trace_data(
         output_policy_verdict,
         surface="final_translation",
@@ -2213,15 +3606,22 @@ async def _translate_to_agent_result(
         else []
     )
     reason_code = ",".join(reason_codes)
+    terminal_reason = None
+    if actuation_obligation_terminal:
+        reason_code = ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        terminal_reason = ACTUATION_OBLIGATION_UNMET_REASON_CODE
 
     final_user_response, turn_outcome = apply_repeated_reply_guard(
         final_text=final_user_response,
         attempted_kind=attempted_kind,
         blocked_signatures=ctx.blocked_reply_signatures,
         reason_code=reason_code,
+        terminal_reason=terminal_reason,
         turn_intent=ctx.turn_intent,
         tool_calls=[name for name in tool_call_names if name],
     )
+    if actuation_obligation.reason_code:
+        turn_outcome = turn_outcome.model_copy(update={"actuation_obligation_key": actuation_obligation.obligation_key})
 
     return _finalize_result_with_blocker_override(
         ctx,
@@ -2261,26 +3661,50 @@ async def _translate_to_agent_result(
     )
 
 
-def _build_feasibility_clarification_result(
+def _structural_infeasibility_question(turn_intent: TurnIntent | None) -> str | None:
+    """The clarifying question for a turn the classifier judged structurally infeasible.
+
+    Returns the question only when the turn-intent landed on CLARIFY carrying the
+    structurally_infeasible reason and a usable question, so a questionless verdict
+    (already failed open in build_turn_intent) cannot trigger the pre-loop bail.
+    """
+    if not isinstance(turn_intent, TurnIntent):
+        return None
+    # Defense-in-depth: build_turn_intent already forces CLARIFY or drops a questionless verdict.
+    if turn_intent.mode != TurnIntentMode.CLARIFY:
+        return None
+    if TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE not in turn_intent.reason_codes:
+        return None
+    question = (turn_intent.missing_context_question or "").strip()
+    return question or None
+
+
+def _infeasibility_bail_question(turn_intent: TurnIntent | None) -> str | None:
+    """The pre-loop clarification question, or None when the turn must not bail. A
+    defer-authoring live-fill turn decides feasibility post-session at the actuation
+    hook, so it never takes the pre-loop bail even when judged structurally infeasible."""
+    if turn_intent_defers_authoring_live_fill(turn_intent):
+        return None
+    return _structural_infeasibility_question(turn_intent)
+
+
+def _build_infeasibility_clarification_result(
     question: str,
-    rationale: str | None,
     user_message: str,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
     ctx: CopilotContext,
 ) -> AgentResult:
-    """Construct an AgentResult for the feasibility-gate fast-path.
+    """Construct an AgentResult for the structural-infeasibility fast-path.
 
-    Preserves structured cross-turn context, sets user_goal from the
-    classifier's rationale (or the raw user message as a fallback), and
-    appends a decisions_made entry so a follow-up turn can see that a
-    clarification was already asked and return ``proceed`` instead of
-    re-asking.
+    Preserves structured cross-turn context, sets user_goal from the user message
+    when unset, and appends a decisions_made entry so a follow-up turn can see that
+    a clarification was already asked and proceed instead of re-asking.
     """
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     if not structured.user_goal:
-        structured.user_goal = (rationale or user_message)[:300]
-    structured.decisions_made.append(f"feasibility-gate clarification asked: {question}")
+        structured.user_goal = user_message[:300]
+    structured.decisions_made.append(f"infeasibility clarification asked: {question}")
     enriched_context = structured.to_json_str()
 
     final_text, outcome = apply_repeated_reply_guard(
@@ -2299,7 +3723,7 @@ def _build_feasibility_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=True,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -2314,42 +3738,84 @@ def _build_feasibility_clarification_result(
     )
 
 
-_RETRIABLE_LLM_ERROR_NAMES = {
-    "APIConnectionError",
-    "APITimeoutError",
-    "APIError",
-    "InternalServerError",
-    "RateLimitError",
-    "ServiceUnavailableError",
-    "Timeout",
-}
-_RETRIABLE_LLM_ERROR_TEXT = (
-    "rate limit",
-    "timeout",
-    "timed out",
-    "temporarily unavailable",
-    "service unavailable",
-    "connection error",
-    "connection reset",
-    "internal server error",
-    "server error",
-    "overloaded",
+_DEFER_AUTHORING_NO_SESSION_MESSAGE = (
+    "You asked me to fill the page live now instead of authoring a workflow, but I don't have a live "
+    "browser session open on that page to act on. Open the page in a live browser session and I'll fill it directly."
 )
-_LLM_ERROR_MODULE_MARKERS = ("openai", "litellm", "anthropic")
 
 
-def _is_retriable_llm_error(exc: BaseException) -> bool:
-    for item in iter_exception_chain(exc):
-        module = type(item).__module__.lower()
-        name = type(item).__name__
-        text = str(item).lower()
-        if name in _RETRIABLE_LLM_ERROR_NAMES and any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS):
-            return True
-        if any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS) and any(
-            phrase in text for phrase in _RETRIABLE_LLM_ERROR_TEXT
-        ):
-            return True
-    return False
+def apply_defer_authoring_actuation_entry(
+    ctx: CopilotContext,
+    validated_browser_session_id: str | None,
+    *,
+    user_message: str,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+) -> AgentResult | None:
+    """With a validated live session, enters COMPOSING and enables live actuation while workflow
+    mutation stays blocked by the authority gate; without one, returns a deterministic honest terminal."""
+    turn_intent = ctx.turn_intent
+    if not isinstance(turn_intent, TurnIntent):
+        return None
+    if not turn_intent_defers_authoring_live_fill(turn_intent):
+        return None
+    if not validated_browser_session_id:
+        return _build_defer_authoring_no_session_result(
+            user_message=user_message,
+            prior_global_llm_context=prior_global_llm_context,
+            prior_workflow_yaml=prior_workflow_yaml,
+            ctx=ctx,
+        )
+    if turn_intent.mode in NO_MUTATION_TURN_INTENT_MODES:
+        turn_intent.mode = TurnIntentMode.BUILD
+        turn_intent.expected_output = TurnIntentExpectedOutput.RUN_RESULT
+    if RequiredContextKey.BROWSER_STATE not in turn_intent.required_context:
+        turn_intent.required_context.append(RequiredContextKey.BROWSER_STATE)
+    ctx.build_phase = BuildPhase.COMPOSING
+    return None
+
+
+def _build_defer_authoring_no_session_result(
+    *,
+    user_message: str,
+    prior_global_llm_context: str | None,
+    prior_workflow_yaml: str | None,
+    ctx: CopilotContext,
+) -> AgentResult:
+    structured = StructuredContext.from_json_str(prior_global_llm_context)
+    if not structured.user_goal:
+        structured.user_goal = user_message[:300]
+    structured.decisions_made.append("defer-authoring live fill deferred: no live browser session")
+
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=_DEFER_AUTHORING_NO_SESSION_MESSAGE,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="defer_authoring_no_live_session",
+    )
+    return _finalize_result_with_blocker_override(
+        ctx,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=None,
+            global_llm_context=structured.to_json_str(),
+            response_type="ASK_QUESTION",
+            workflow_yaml=prior_workflow_yaml or None,
+            workflow_was_persisted=False,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
+            turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
+        ),
+        exit_site="defer_authoring_no_live_session",
+    )
 
 
 def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None:
@@ -2388,7 +3854,7 @@ def _build_request_policy_clarification_result(
             response_type="ASK_QUESTION",
             workflow_yaml=prior_workflow_yaml or None,
             workflow_was_persisted=False,
-            clear_proposed_workflow=True,
+            clear_proposed_workflow=not outcome_fully_verified(ctx),
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
@@ -2445,6 +3911,7 @@ def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKin
         OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS,
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+        OutputPolicyReason.ACTUATION_OBLIGATION_STEER,
     }
     if any(reason in clarification_reasons for reason in verdict.reason_codes):
         return CopilotOutputKind.CLARIFICATION_REQUEST
@@ -2471,7 +3938,12 @@ def _evaluate_copilot_final_output_policy(
     elif isinstance(getattr(ctx, "last_workflow_yaml", None), str):
         workflow_yaml = ctx.last_workflow_yaml
 
-    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    workflow_attempted = ctx.has_genuine_workflow_attempt()
+    _log_output_policy_parity(
+        ctx,
+        has_workflow_proposal=bool(workflow_yaml or ctx.last_workflow is not None),
+        workflow_attempted=workflow_attempted,
+    )
     surface_untested_draft = _should_surface_untested_draft_despite_question(ctx, response_type)
     policy_response_type = "REPLY" if surface_untested_draft else response_type
     if surface_untested_draft:
@@ -2506,7 +3978,20 @@ def _evaluate_copilot_final_output_policy(
         workflow_attempted=workflow_attempted,
         output_kind=output_kind,
     )
+    actuation_obligation = _evaluate_actuation_obligation_for_output(
+        ctx,
+        action_data,
+        policy_response_type,
+        output_kind,
+    )
+    if actuation_obligation.status == ActuationObligationStatus.STEER:
+        raw_verdict.add(OutputPolicyReason.ACTUATION_OBLIGATION_STEER)
+    elif actuation_obligation.status == ActuationObligationStatus.TERMINAL:
+        raw_verdict.add(OutputPolicyReason.ACTUATION_OBLIGATION_UNMET)
     hard_verdict = hard_block_output_policy_verdict(raw_verdict)
+    deferred_reason_codes = _defer_avoidable_ask_to_recycle(ctx, hard_verdict, response_type)
+    if deferred_reason_codes is not None:
+        hard_verdict = OutputPolicyVerdict(allowed=True, output_kind=hard_verdict.output_kind)
     diagnostics = build_output_policy_diagnostics(
         raw_verdict=raw_verdict,
         final_verdict=hard_verdict,
@@ -2516,7 +4001,30 @@ def _evaluate_copilot_final_output_policy(
         hard_block_reason_codes=list(hard_verdict.reason_codes),
         soft_rewrite_reason_codes=[],
     )
+    diagnostics.update(_actuation_obligation_diagnostics(ctx, actuation_obligation))
+    if deferred_reason_codes is not None:
+        diagnostics["deferred_to_recycle"] = True
+        diagnostics["deferred_reason_codes"] = [reason.value for reason in deferred_reason_codes]
     return hard_verdict, response_type, diagnostics
+
+
+def _defer_avoidable_ask_to_recycle(
+    ctx: CopilotContext,
+    hard_verdict: OutputPolicyVerdict,
+    response_type: str,
+) -> list[OutputPolicyReason] | None:
+    if hard_verdict.allowed or response_type != "ASK_QUESTION":
+        return None
+    if list(hard_verdict.reason_codes) != [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION]:
+        return None
+    if not recycle_admits_present_completion_contract_ask(ctx):
+        return None
+    LOG.info(
+        "copilot.output_policy_avoidable_deferred_to_recycle",
+        deferred_reason_codes=[reason.value for reason in hard_verdict.reason_codes],
+        **ctx.genuine_attempt_parity_fields(),
+    )
+    return list(hard_verdict.reason_codes)
 
 
 def _build_copilot_input_guardrails(
@@ -2537,24 +4045,26 @@ def _build_copilot_input_guardrails(
                 chat_history=policy_inputs.chat_history_messages,
                 global_llm_context=policy_inputs.global_llm_context,
                 organization_id=policy_inputs.organization_id,
-                handler=policy_inputs.handler,
+                handler=policy_inputs.request_policy_handler,
+                active_criteria=_stored_active_completion_criteria(policy_inputs),
+                config=getattr(ctx, "copilot_config", None) if isinstance(ctx, CopilotContext) else None,
             )
             if isinstance(ctx, CopilotContext):
-                turn_intent_classification = None
+                turn_intent_classifier_result = None
                 if policy.user_response_policy != "ask_clarification" or policy.raw_secret_handling == "redacted_draft":
-                    turn_intent_classification = await classify_turn_intent(
+                    turn_intent_classifier_result = await classify_turn_intent(
                         user_message=policy_inputs.user_message,
                         workflow_yaml=policy_inputs.workflow_yaml,
                         chat_history=policy_inputs.chat_history_messages,
                         global_llm_context=policy_inputs.global_llm_context,
                         request_policy=policy,
-                        handler=policy_inputs.handler,
+                        handler=policy_inputs.turn_intent_handler,
                     )
                 _store_request_policy_on_context(
                     ctx,
                     policy,
                     policy_inputs,
-                    turn_intent_classification=turn_intent_classification,
+                    turn_intent_classifier_result=turn_intent_classifier_result,
                 )
         blocked = isinstance(policy, RequestPolicy) and policy.user_response_policy == "ask_clarification"
         if isinstance(policy, RequestPolicy):
@@ -2657,7 +4167,11 @@ def _build_output_policy_blocked_result(
     # steering-only blockers should still flow through normal output-policy
     # salvage so internal tool text is scrubbed and saved drafts can surface.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    blocker_active = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    blocker_active = (
+        local_blocker_signal is not None
+        and local_blocker_signal.renders_final_reply
+        and blocker_signal_render_allowed(ctx, local_blocker_signal)
+    )
     preserved_workflow = (
         ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
     )
@@ -2668,6 +4182,9 @@ def _build_output_policy_blocked_result(
     )
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     add_saved_draft_copy = False
+    fallback_user_response: str | None = None
+    composed_from_recorded_evidence = False
+    evidence = terminal_evidence_from_ctx(ctx)
     if (
         request_policy is not None
         and request_policy.clarification_question
@@ -2693,22 +4210,96 @@ def _build_output_policy_blocked_result(
             "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
         )
         add_saved_draft_copy = True
+    elif OutputPolicyReason.ACTUATION_OBLIGATION_UNMET in verdict.reason_codes:
+        user_response = _ACTUATION_OBLIGATION_UNMET_REPLY
+    elif OutputPolicyReason.ACTUATION_OBLIGATION_STEER in verdict.reason_codes:
+        user_response = _ACTUATION_OBLIGATION_STEER_REPLY
     elif preserved_workflow is not None:
         user_response = (
             "I could not safely return that chat reply, but the workflow draft is still saved. "
             "Please review the draft or adjust the request and try again."
         )
+        fallback_user_response = user_response
+        if terminal_evidence_has_recorded_state(evidence):
+            composed_response, tiers = compose_terminal_evidence_user_facing_reason(
+                "I could not safely return that chat reply.",
+                "Please review the recorded evidence or adjust the request and try again.",
+                evidence,
+            )
+            if any(tier != "draft" for tier in tiers):
+                user_response = composed_response
+                add_saved_draft_copy = "draft" in tiers
+                composed_from_recorded_evidence = True
     else:
         user_response = "I could not safely return that chat reply. Please adjust the request and try again."
+        fallback_user_response = user_response
+        if terminal_evidence_has_recorded_state(evidence):
+            composed_response, tiers = compose_terminal_evidence_user_facing_reason(
+                "I could not safely return that chat reply.",
+                "Please review the recorded evidence or adjust the request and try again.",
+                evidence,
+            )
+            if any(tier != "draft" for tier in tiers):
+                user_response = composed_response
+                composed_from_recorded_evidence = True
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+    has_non_actuation_hard_block = any(
+        reason
+        not in {
+            OutputPolicyReason.ACTUATION_OBLIGATION_STEER,
+            OutputPolicyReason.ACTUATION_OBLIGATION_UNMET,
+        }
+        for reason in verdict.reason_codes
+    )
+    if has_non_actuation_hard_block:
+        blocked_reason_code = "output_policy_block"
+        blocked_terminal_reason: str | None = "output_policy_block"
+    elif OutputPolicyReason.ACTUATION_OBLIGATION_UNMET in verdict.reason_codes:
+        blocked_reason_code = ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        blocked_terminal_reason = ACTUATION_OBLIGATION_UNMET_REASON_CODE
+    else:
+        blocked_reason_code = ACTUATION_OBLIGATION_STEER_REASON_CODE
+        blocked_terminal_reason = None
     final_user_response, output_policy_outcome = apply_repeated_reply_guard(
         final_text=user_response,
         attempted_kind=ResponseKind.CLARIFY,
         blocked_signatures=ctx.blocked_reply_signatures,
-        reason_code="output_policy_block",
-        terminal_reason="output_policy_block",
+        reason_code=blocked_reason_code,
+        terminal_reason=blocked_terminal_reason,
     )
+    if blocked_reason_code in {ACTUATION_OBLIGATION_STEER_REASON_CODE, ACTUATION_OBLIGATION_UNMET_REASON_CODE}:
+        key = ""
+        if output_policy_diagnostics is not None:
+            key = str(output_policy_diagnostics.get("actuation_obligation_key") or "")
+        output_policy_outcome = output_policy_outcome.model_copy(
+            update={"actuation_obligation_key": key or actuation_obligation_key(ctx.turn_intent)}
+        )
+    if composed_from_recorded_evidence and fallback_user_response is not None:
+        composed_verdict = evaluate_output_policy(
+            request_policy=ctx.request_policy,
+            response_type="ASK_QUESTION",
+            user_response=final_user_response,
+            global_llm_context=None,
+            workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
+            has_workflow_proposal=preserved_workflow is not None,
+            workflow_was_persisted=ctx.workflow_persisted,
+            workflow_attempted=ctx.has_genuine_workflow_attempt(),
+            unvalidated=ctx.last_test_ok is not True,
+            output_kind=verdict.output_kind,
+        )
+        if not composed_verdict.allowed:
+            LOG.warning(
+                "copilot output-policy recorded-evidence fallback failed output policy; using generic fallback",
+                output_policy_reasons=[code.value for code in composed_verdict.reason_codes],
+            )
+            final_user_response, output_policy_outcome = apply_repeated_reply_guard(
+                final_text=fallback_user_response,
+                attempted_kind=ResponseKind.CLARIFY,
+                blocked_signatures=ctx.blocked_reply_signatures,
+                reason_code="output_policy_block",
+                terminal_reason="output_policy_block",
+            )
     return _make_agent_result(
         ctx,
         user_response=final_user_response,
@@ -2750,6 +4341,31 @@ def _build_output_policy_blocked_result(
     )
 
 
+def _result_carries_terminal_outcome(result: AgentResult) -> bool:
+    if result.cancelled or result.response_type == "ASK_QUESTION":
+        return True
+    return result.turn_outcome is not None and bool(result.turn_outcome.terminal_reason)
+
+
+def _reconcile_turn_end_ownership(
+    ctx: CopilotContext | None, result: AgentResult, *, preserve_result: bool = False
+) -> AgentResult:
+    """Turn-end obligation: a GRANTED advisory signature always expires here, and only a silent
+    non-terminal reply is replaced by the stalled terminal; its own try keeps a reconcile failure
+    from masking the turn's real result."""
+    if ctx is None:
+        return result
+    try:
+        rewrite = not (preserve_result or _result_carries_terminal_outcome(result) or outcome_fully_verified(ctx))
+        halt = expire_output_contract_ladder_at_turn_end(ctx, emit_stalled_terminal=rewrite)
+        if halt is None:
+            return result
+        return _build_turn_halt_exit_result(ctx, result.global_llm_context, halt)
+    except Exception:
+        LOG.warning("copilot_turn_end_ownership_reconcile_failed", exc_info=True)
+        return result
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -2765,6 +4381,8 @@ async def run_copilot_agent(
     turn_id: str | None = None,
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
+    stored_completion_criteria: StoredCriteriaSnapshot | None = None,
+    prior_turn_outcome: TurnOutcome | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -2772,12 +4390,12 @@ async def run_copilot_agent(
     if turn_id is None:
         turn_id = uuid.uuid4().hex
     normalized_turn_index = turn_index if turn_index is not None else 0
+    ctx_sink: list[CopilotContext] = []
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
         # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
         ensure_tracing_initialized()
-        ctx_sink: list[CopilotContext] = []
         with _copilot_turn_span(
             chat_request=chat_request,
             chat_history=chat_history,
@@ -2785,7 +4403,7 @@ async def run_copilot_agent(
             turn_id=turn_id,
         ) as turn_span:
             try:
-                return await _run_copilot_turn_impl(
+                result = await _run_copilot_turn_impl(
                     stream=stream,
                     organization_id=organization_id,
                     chat_request=chat_request,
@@ -2801,7 +4419,10 @@ async def run_copilot_agent(
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
                     ctx_sink=ctx_sink,
+                    stored_completion_criteria=stored_completion_criteria,
+                    prior_turn_outcome=prior_turn_outcome,
                 )
+                return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, result)
             except Exception as exc:
                 LOG.error(
                     "Copilot turn unhandled error",
@@ -2824,7 +4445,10 @@ async def run_copilot_agent(
                     turn_id=turn_id,
                     turn_index=normalized_turn_index,
                 )
-                return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+                error_result = _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+                return _reconcile_turn_end_ownership(
+                    ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True
+                )
             finally:
                 finalize_outcome_verification_trace(ctx_sink[0] if ctx_sink else None, turn_span)
     except Exception as exc:
@@ -2848,7 +4472,8 @@ async def run_copilot_agent(
             turn_id=turn_id,
             turn_index=normalized_turn_index,
         )
-        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
+        error_result = _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
+        return _reconcile_turn_end_ownership(ctx_sink[0] if ctx_sink else None, error_result, preserve_result=True)
 
 
 async def _run_copilot_turn_impl(
@@ -2868,12 +4493,16 @@ async def _run_copilot_turn_impl(
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
     ctx_sink: list[CopilotContext] | None = None,
+    stored_completion_criteria: StoredCriteriaSnapshot | None = None,
+    prior_turn_outcome: TurnOutcome | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
     safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
     safe_workflow_yaml = redact_raw_secrets_for_prompt(chat_request.workflow_yaml or "")
-    safe_global_llm_context = redact_raw_secrets_for_prompt(global_llm_context or "")
+    safe_global_llm_context = sanitize_global_llm_context_for_prompt(
+        redact_raw_secrets_for_prompt(global_llm_context or "")
+    )
     previous_user_messages = [msg.content for msg in chat_history if msg.sender == "user"]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
 
@@ -2929,8 +4558,23 @@ async def _run_copilot_turn_impl(
         turn_id=turn_id,
         turn_index=turn_index,
         prior_block_count=prior_block_count,
+        prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+        prior_turn_outcome=prior_turn_outcome,
         block_authoring_policy=copilot_config.block_authoring_policy,
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
+        copilot_config=copilot_config,
+        target_block_label=getattr(chat_request, "target_block_label", None),
+        client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
+    )
+    LOG.info(
+        "copilot_block_authoring_policy_resolved",
+        block_authoring_policy=normalize_block_authoring_policy(ctx.block_authoring_policy).name,
+        block_authoring_policy_value=normalize_block_authoring_policy(ctx.block_authoring_policy).value,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        workflow_id=ctx.workflow_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+        turn_id=ctx.turn_id,
+        impose_synthesized_code_block=ctx.impose_synthesized_code_block,
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
@@ -2949,12 +4593,19 @@ async def _run_copilot_turn_impl(
         chat_history_messages=list(chat_history),
         global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
-        handler=_resolve_request_policy_handler(llm_api_handler),
+        request_policy_handler=await _resolve_request_policy_handler(
+            llm_api_handler,
+            chat_request.workflow_permanent_id,
+            organization_id,
+        ),
+        turn_intent_handler=llm_api_handler,
         previous_user_message=previous_user_message,
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
+        fix_origin=getattr(chat_request, "fix_origin", False),
+        stored_completion_criteria=stored_completion_criteria,
     )
     request_policy_guardrails = _build_copilot_input_guardrails(
         InputGuardrail,
@@ -2962,7 +4613,7 @@ async def _run_copilot_turn_impl(
         policy_inputs=policy_inputs,
     )
     # Run the request-policy guardrail as the authoritative input gate before
-    # feasibility checks, browser/session setup, model execution, or tool calls.
+    # browser/session setup, model execution, or tool calls.
     # Do not also attach it to the main Agent; the SDK would invoke it again and
     # duplicate policy telemetry.
     request_policy_guardrail_result = await request_policy_guardrails[0].run(
@@ -3013,6 +4664,7 @@ async def _run_copilot_turn_impl(
     ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
+    ctx.prior_fill_carry = [carry.model_dump() for carry in prior_structured_context.fill_carry]
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
@@ -3027,21 +4679,11 @@ async def _run_copilot_turn_impl(
         prior_page_inspection_calls_made=ctx.prior_page_inspection_calls_made,
     )
 
-    # Preflight feasibility classifier — fires on every turn so mid-session pivots
-    # to impossible targets are caught the same as first-turn structural mismatches.
-    from skyvern.forge.sdk.copilot.feasibility_gate import run_feasibility_gate
-
-    feasibility_verdict = await run_feasibility_gate(
-        user_message=agent_user_message,
-        workflow_yaml=safe_workflow_yaml,
-        chat_history=safe_chat_history_text,
-        global_llm_context=safe_global_llm_context,
-        handler=llm_api_handler,
-    )
-    if feasibility_verdict.verdict == "ask_clarification" and feasibility_verdict.question:
-        return _build_feasibility_clarification_result(
-            question=feasibility_verdict.question,
-            rationale=feasibility_verdict.rationale,
+    # Infeasibility rides on turn_intent: a verdict carrying a question bails to a pre-loop clarification.
+    infeasibility_question = _infeasibility_bail_question(ctx.turn_intent)
+    if infeasibility_question is not None:
+        return _build_infeasibility_clarification_result(
+            question=infeasibility_question,
             user_message=agent_user_message,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
@@ -3050,6 +4692,7 @@ async def _run_copilot_turn_impl(
 
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotBuiltUnverified,
         CopilotGoalSatisfied,
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
@@ -3069,6 +4712,15 @@ async def _run_copilot_turn_impl(
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
     ctx.browser_session_id = validated_browser_session_id
+    defer_authoring_terminal = apply_defer_authoring_actuation_entry(
+        ctx,
+        validated_browser_session_id,
+        user_message=agent_user_message,
+        prior_global_llm_context=global_llm_context,
+        prior_workflow_yaml=chat_request.workflow_yaml,
+    )
+    if defer_authoring_terminal is not None:
+        return defer_authoring_terminal
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
         llm_api_handler,
@@ -3078,10 +4730,8 @@ async def _run_copilot_turn_impl(
     output_guardrails = _build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
 
     alias_map = get_skyvern_mcp_alias_map()
-    overlays = _build_skyvern_mcp_overlays()
-    if _turn_intent_disables_tools(ctx.turn_intent):
-        alias_map = {}
-        overlays = {}
+    overlays = _build_skyvern_mcp_overlays(copilot_config.block_authoring_policy)
+    alias_map, overlays = _mcp_tool_surface_for_turn(alias_map, overlays, ctx.turn_intent, ctx.request_policy)
 
     native_tools = _native_tools_for_turn(list(NATIVE_TOOLS), ctx.turn_intent, ctx.request_policy)
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in native_tools]
@@ -3094,20 +4744,35 @@ async def _run_copilot_turn_impl(
     )
 
     user_workflow_change_summary = ""
+    runnable_draft_summary = ""
     repeated_reply_warning = ""
     if isinstance(ctx.turn_context_packet, TurnContextPacket):
         if ctx.turn_context_packet.workflow_change_context is not None:
             user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
+        if ctx.turn_context_packet.runnable_draft_context is not None:
+            runnable_draft_summary = ctx.turn_context_packet.runnable_draft_context.rendered_summary
         if ctx.turn_context_packet.repeated_reply_context is not None:
             repeated_reply_warning = ctx.turn_context_packet.repeated_reply_context.rendered_summary
+
+    scoped_global_llm_context = safe_global_llm_context
+    if ctx.target_block_label:
+        # Defang the user-supplied label before embedding it in the instruction: collapse
+        # whitespace and drop quotes so it can't break out of the string or inject directives.
+        safe_target_block_label = re.sub(r"\s+", " ", ctx.target_block_label).replace('"', "").strip()[:200]
+        scoped_global_llm_context = (
+            f'CRITICAL: Regenerate ONLY the block labeled "{safe_target_block_label}". '
+            "Preserve every other block's code, goal, steps, and configuration exactly as-is.\n\n"
+            f"{safe_global_llm_context}"
+        )
 
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
-        global_llm_context=safe_global_llm_context,
+        global_llm_context=scoped_global_llm_context,
         debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
+        runnable_draft_summary=runnable_draft_summary,
         repeated_reply_warning=repeated_reply_warning,
     )
 
@@ -3273,7 +4938,14 @@ async def _run_copilot_turn_impl(
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
                 )
-                return _build_goal_satisfied_exit_result(ctx, global_llm_context)
+                return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
+            except CopilotBuiltUnverified:
+                LOG.info(
+                    "Copilot run stopped after built-unverified repair-inert outcome",
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                    workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
+                )
+                return await _build_built_unverified_exit_result(ctx, global_llm_context)
             except CopilotTurnHalt as exc:
                 LOG.info(
                     "Copilot run stopped after typed turn halt",
@@ -3348,24 +5020,10 @@ async def _run_copilot_turn_impl(
         except Exception:
             LOG.error("Copilot agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
-        turn_halt = getattr(ctx, "turn_halt", None)
-        if isinstance(turn_halt, TurnHalt):
-            LOG.info(
-                "Copilot run stopped after typed turn halt from wrapped exception",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                error_type=type(e).__name__,
-                **turn_halt_to_trace_data(turn_halt),
-            )
-            return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
-        if goal_satisfied:
-            # The Agents SDK can wrap exceptions raised from hooks; keep this
-            # fallback so a verified-goal stop is not rendered as a generic error.
-            LOG.info(
-                "Copilot run stopped after verified goal satisfaction from wrapped exception",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
-                error_type=type(e).__name__,
-            )
-            return _build_goal_satisfied_exit_result(ctx, global_llm_context)
-        LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
+        return await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context,
+            goal_satisfied=goal_satisfied,
+            error=e,
+            workflow_permanent_id=chat_request.workflow_permanent_id,
+        )

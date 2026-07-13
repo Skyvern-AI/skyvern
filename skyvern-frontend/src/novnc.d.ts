@@ -29,11 +29,17 @@ declare module "@novnc/novnc/lib/rfb.js" {
     _display: RfbDisplay;
     resizeSession: boolean;
     scaleViewport: boolean;
+    // 0–9; JPEG quality for Tight-encoded regions (default 6).
+    qualityLevel: number;
+    // 0–9; zlib compression for stream data (default 2).
+    compressionLevel: number;
     constructor(target: HTMLElement, url: string, options?: RFBOptions);
 
     addEventListener(event: string, listener: (e: RfbEvent) => void): void;
     removeEventListener(event: string, listener: (e: RfbEvent) => void): void;
+    clipboardPasteFrom(text: string): void;
     disconnect(): void;
+    sendKey(keysym: number, code: string, down?: boolean): void;
     viewportChange(): void;
   }
 }

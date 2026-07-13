@@ -22,6 +22,7 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.utils.script_file_paths import build_script_file_storage_uri
 from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
 
 LOG = structlog.get_logger()
@@ -122,7 +123,12 @@ class LocalStorage(BaseStorage):
     def build_script_file_uri(
         self, *, organization_id: str, script_id: str, script_version: int, file_path: str
     ) -> str:
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/scripts/{script_id}/{script_version}/{file_path}"
+        return build_script_file_storage_uri(
+            f"file://{self.artifact_path}/{settings.ENV}/{organization_id}",
+            script_id=script_id,
+            script_version=script_version,
+            file_path=file_path,
+        )
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None
@@ -322,6 +328,29 @@ class LocalStorage(BaseStorage):
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a browser profile from local storage. Best-effort: a missing profile is a no-op."""
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to delete browser profile outside storage base path",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        if not stored_folder_path.exists():
+            return
+        try:
+            shutil.rmtree(stored_folder_path)
+        except Exception:
+            LOG.exception(
+                "Failed to delete local browser profile",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                path=str(stored_folder_path),
+            )
 
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         pass

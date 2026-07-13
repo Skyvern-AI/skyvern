@@ -9,6 +9,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -16,15 +17,38 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     loop_blocker_evidence_from_ctx,
     refresh_held_loop_blocker_evidence,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    maybe_satisfy_recorded_outcome_grounding_requirement,
+    recorded_outcome_grounding_requires_current_page,
+)
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    artifact_challenge_flag_key,
+    is_carrier_backed_category_entry,
+)
+from skyvern.forge.sdk.copilot.completion_verification import (
+    structured_record_has_goal_content as _structured_record_candidate_has_goal_content,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import (
+    TOTAL_TIMEOUT_SECONDS,
+    synthesized_block_persistence_signal,
+    terminal_challenge_blocker_signal_from_current_page_evidence,
+    uncovered_output_reject_scout_steer_signal,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
 from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    AuthorTimeGateAblationPayload,
+    output_contract_ladder_unresolved,
+    record_author_time_gate_ablation_event,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
@@ -46,9 +70,30 @@ from ._shared import (
     _is_meaningful_extracted_data,
     _parse_workflow_blocks,
     _raw_yaml_proxy_location,
+    _registered_output_parameter_payloads,
+    _workflow_output_parameter_payloads,
 )
 
 LOG = structlog.get_logger()
+
+_CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS = (
+    BLOCK_RUNNING_TOOLS
+    | PAGE_INSPECTION_TOOLS
+    | frozenset({"click", "navigate_browser", "press_key", "scroll", "select_option", "type_text"})
+)
+_OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
+_RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS = BLOCK_RUNNING_TOOLS | frozenset(
+    {
+        "update_workflow",
+        "click",
+        "fill_credential_field",
+        "navigate_browser",
+        "press_key",
+        "scroll",
+        "select_option",
+        "type_text",
+    }
+)
 
 
 async def _safe_read_workflow_run(
@@ -749,6 +794,22 @@ def _post_budget_terminal_challenge_signal(
     return _terminal_challenge_signal(reason=reason, arguments=arguments, tool_name=tool_name)
 
 
+def _current_page_terminal_challenge_signal(
+    ctx: AgentContext, arguments: dict[str, Any] | None, tool_name: str
+) -> CopilotToolBlockerSignal | None:
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
+        ctx,
+        blocked_tool=tool_name,
+        evidence_source="page_evidence",
+    )
+    if signal is None:
+        return None
+    requested_labels = _requested_block_label_set(arguments)
+    if requested_labels:
+        signal = signal.model_copy(update={"extra": {**dict(signal.extra), "block_labels": sorted(requested_labels)}})
+    return signal
+
+
 _RECONCILIATION_REQUIRES_INPUT_USER_FACING = (
     "The previous run was canceled. Tell me whether to retry, keep the draft as-is, or adjust the workflow first."
 )
@@ -829,10 +890,25 @@ _ANTI_BOT_BLOCKER_TERMS: tuple[str, ...] = (
     "access denied",
     "anti-bot",
     "bot block",
+    "browser access barrier",
+    "browser or environment port block",
+    "browser port forbidden",
+    "browser refused to render",
+    "browser_port_forbidden",
+    "browser_or_environment_port_block",
     "captcha",
     "challenge",
     "human verification",
+    "port-forbidden",
+    "requested port",
     "verify you are human",
+)
+# Multi-word anti-bot phrases only: the bare tokens ``captcha``/``challenge`` are
+# excluded so business text mentioning them does not false-positive when a code-block
+# value is scanned regardless of its key.
+_BROAD_SINGLE_TOKEN_TERMS: frozenset[str] = frozenset({"captcha", "challenge"})
+_ANTI_BOT_BLOCKER_PHRASES: tuple[str, ...] = tuple(
+    term for term in _ANTI_BOT_BLOCKER_TERMS if term not in _BROAD_SINGLE_TOKEN_TERMS
 )
 # Strict subset of ``_STRUCTURED_BLOCKER_KEY_TERMS`` for the flag/status rules that
 # scan arbitrary code-block JSON; broad terms like ``verification`` stay string-only.
@@ -863,33 +939,66 @@ def _looks_like_anti_bot_blocker(text: str) -> bool:
     return any(term in lowered for term in _ANTI_BOT_BLOCKER_TERMS)
 
 
-def _structured_blocker_message(value: object, *, depth: int = 0, include_flag_keys: bool = False) -> str | None:
+def _looks_like_anti_bot_phrase(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _ANTI_BOT_BLOCKER_PHRASES)
+
+
+def _structured_blocker_message(
+    value: object,
+    *,
+    depth: int = 0,
+    include_flag_keys: bool = False,
+    key_terms: frozenset[str] = _STRUCTURED_BLOCKER_KEY_TERMS,
+    declared_keys: frozenset[str] = frozenset(),
+    scan_all_values_for_anti_bot: bool = False,
+) -> str | None:
     if depth > 5:
         return None
     if isinstance(value, dict):
         for key, item in value.items():
             normalized_key = _normalize_structured_key(key)
+            if normalized_key in declared_keys:
+                continue
             if not isinstance(item, str) or not item.strip():
                 continue
             has_blocker_key = normalized_key in _STRUCTURED_BLOCKER_MESSAGE_KEYS or any(
-                term in normalized_key for term in _STRUCTURED_BLOCKER_KEY_TERMS
+                term in normalized_key for term in key_terms
             )
-            if has_blocker_key or (
-                normalized_key in {"message", "error", "failure_reason", "reason"}
-                and _looks_like_anti_bot_blocker(item)
+            if (
+                has_blocker_key
+                or (
+                    normalized_key in {"message", "error", "failure_reason", "reason"}
+                    and _looks_like_anti_bot_blocker(item)
+                )
+                or (scan_all_values_for_anti_bot and _looks_like_anti_bot_phrase(item))
             ):
                 return item.strip()[:240]
+        for item in value.values():
+            nested = _structured_blocker_message(
+                item,
+                depth=depth + 1,
+                include_flag_keys=include_flag_keys,
+                key_terms=key_terms,
+                declared_keys=declared_keys,
+                scan_all_values_for_anti_bot=scan_all_values_for_anti_bot,
+            )
+            if nested:
+                return nested
         if include_flag_keys:
             flagged = _blocker_flag_or_status_message(value)
             if flagged:
                 return flagged
-        for item in value.values():
-            nested = _structured_blocker_message(item, depth=depth + 1, include_flag_keys=include_flag_keys)
-            if nested:
-                return nested
     elif isinstance(value, list):
         for item in value:
-            nested = _structured_blocker_message(item, depth=depth + 1, include_flag_keys=include_flag_keys)
+            nested = _structured_blocker_message(
+                item,
+                depth=depth + 1,
+                include_flag_keys=include_flag_keys,
+                key_terms=key_terms,
+                declared_keys=declared_keys,
+                scan_all_values_for_anti_bot=scan_all_values_for_anti_bot,
+            )
             if nested:
                 return nested
     return None
@@ -917,7 +1026,31 @@ def _blocker_flag_or_status_message(value: dict[str, Any]) -> str | None:
     return None
 
 
-def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None:
+def _declared_code_output_keys(copilot_ctx: Any, block_label: object) -> frozenset[str]:
+    """Output keys the block's code-artifact metadata declares as goal content
+    (claimed-outcome ids, entities, required tokens) — the #12034 typed source.
+    A declared key is never string-matched into a blocker signal."""
+    metadata = getattr(copilot_ctx, "code_artifact_metadata", None) if copilot_ctx is not None else None
+    if not isinstance(metadata, dict) or not isinstance(block_label, str):
+        return frozenset()
+    entry = metadata.get(block_label)
+    if not isinstance(entry, dict):
+        return frozenset()
+    declared: set[str] = set()
+    claims = entry.get("claimed_outcomes")
+    for claim in claims if isinstance(claims, list) else []:
+        if not isinstance(claim, dict):
+            continue
+        for field_name in ("id", "entities", "required_tokens"):
+            value = claim.get(field_name)
+            values = value if isinstance(value, list) else [value]
+            declared.update(
+                _normalize_structured_key(item) for item in values if isinstance(item, str) and item.strip()
+            )
+    return frozenset(declared)
+
+
+def _run_blocks_structured_blocker_message(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:
     data = result.get("data")
     if not isinstance(data, dict):
         return None
@@ -934,7 +1067,17 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None
         if block.get("status") != "completed":
             continue
         if _is_code_block_type(block_type):
-            blocker = _structured_blocker_message(block.get("extracted_data"), include_flag_keys=True)
+            # Code-block outputs are arbitrary JSON the model authored: key matching
+            # uses the strict term set (broad terms like ``verification`` belong to
+            # the page-text arms) and metadata-declared goal keys are exempt. A value
+            # carrying a real anti-bot phrase is still caught regardless of its key.
+            blocker = _structured_blocker_message(
+                block.get("extracted_data"),
+                include_flag_keys=True,
+                key_terms=_STRICT_BLOCKER_FLAG_TERMS,
+                declared_keys=_declared_code_output_keys(copilot_ctx, block.get("label")),
+                scan_all_values_for_anti_bot=True,
+            )
         elif block_type in _DATA_PRODUCING_BLOCK_TYPES:
             payload = _block_data_payload(block.get("extracted_data"), block_type)
             blocker = _structured_blocker_message(payload)
@@ -945,26 +1088,65 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None
     return None
 
 
-def _is_blocker_term_key(key: object) -> bool:
+def _artifact_challenge_flag_from_result(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:
+    """First typed anti-bot artifact marker in the run output, or ``None``. This is
+    the artifact carrier; free-text scans are not. Only block outputs and registered
+    output parameters are typed payloads, so their string marker values count; the
+    run envelope's own string fields are prose/status (``failure_reason`` etc.) and
+    are scanned for typed boolean flags only, never marker values."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None
+    flag = artifact_challenge_flag_key(
+        {key: value for key, value in data.items() if key != "blocks"},
+        match_marker_values=False,
+    )
+    if flag:
+        return flag
+    blocks = data.get("blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("status") != "completed":
+                continue
+            declared_keys = (
+                _declared_code_output_keys(copilot_ctx, block.get("label"))
+                if _is_code_block_type(block.get("block_type"))
+                else frozenset()
+            )
+            flag = artifact_challenge_flag_key(block.get("extracted_data"), declared_keys=declared_keys)
+            if flag:
+                return flag
+    for registered in _registered_output_parameter_payloads(data):
+        flag = artifact_challenge_flag_key(registered.get("value"))
+        if flag:
+            return flag
+    return None
+
+
+def _is_blocker_term_key(key: object, declared_keys: frozenset[str] = frozenset()) -> bool:
     normalized_key = _normalize_structured_key(key)
-    return any(term in normalized_key for term in _STRUCTURED_BLOCKER_KEY_TERMS)
+    if normalized_key in declared_keys:
+        return False
+    return any(term in normalized_key for term in _STRICT_BLOCKER_FLAG_TERMS)
 
 
-def _code_output_contains_collection(value: Any, *, depth: int = 0) -> bool:
+def _code_output_contains_collection(
+    value: Any, *, depth: int = 0, declared_keys: frozenset[str] = frozenset()
+) -> bool:
     if depth > 5:
         return False
     if isinstance(value, (list, tuple)):
         return True
     if isinstance(value, dict):
         return any(
-            _code_output_contains_collection(item, depth=depth + 1)
+            _code_output_contains_collection(item, depth=depth + 1, declared_keys=declared_keys)
             for key, item in value.items()
-            if not _is_blocker_term_key(key)
+            if not _is_blocker_term_key(key, declared_keys)
         )
     return False
 
 
-def _code_output_has_goal_content(value: Any, *, depth: int = 0) -> bool:
+def _code_output_has_goal_content(value: Any, *, depth: int = 0, declared_keys: frozenset[str] = frozenset()) -> bool:
     """Goal content in a code block's output: a non-empty string, truthy number, or
     non-empty collection surviving after blocker-term, status, and boolean entries
     are stripped (status/state values are machine shape, not goal data)."""
@@ -980,9 +1162,10 @@ def _code_output_has_goal_content(value: Any, *, depth: int = 0) -> bool:
         return len(value) > 0
     if isinstance(value, dict):
         return any(
-            _code_output_has_goal_content(item, depth=depth + 1)
+            _code_output_has_goal_content(item, depth=depth + 1, declared_keys=declared_keys)
             for key, item in value.items()
-            if not _is_blocker_term_key(key) and _normalize_structured_key(key) not in _BLOCKER_STATUS_KEYS
+            if not _is_blocker_term_key(key, declared_keys)
+            and _normalize_structured_key(key) not in _BLOCKER_STATUS_KEYS
         )
     return False
 
@@ -1019,6 +1202,42 @@ def _goal_value_paths_for_code_block(copilot_ctx: Any | None, label: Any) -> lis
                     seen.add(path)
                     paths.append(path)
     return paths
+
+
+def _parse_metadata_extraction_schema(value: Any) -> dict[str, Any] | None:
+    # Keep in sync with workflow_update._parse_extraction_schema; duplicated locally
+    # so runtime blockers do not import the authoring validator.
+    if isinstance(value, dict):
+        return value or None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.casefold() in {"null", "none"} or text.casefold().startswith("<fill"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def _extraction_schema_for_code_block(copilot_ctx: Any | None, label: Any) -> dict[str, Any] | None:
+    if copilot_ctx is None or not isinstance(label, str):
+        return None
+    metadata = getattr(copilot_ctx, "code_artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    entry = metadata.get(label)
+    if not isinstance(entry, dict):
+        return None
+    # claimed_outcomes wins when both groups declare a schema; they are expected to carry the same value.
+    for row_group in (entry.get("claimed_outcomes"), entry.get("terminal_verifier_expectations")):
+        rows = [row for row in row_group if isinstance(row, dict)] if isinstance(row_group, list) else []
+        for row in rows:
+            schema = _parse_metadata_extraction_schema(row.get("extraction_schema"))
+            if schema is not None:
+                return schema
+    return None
 
 
 _GOAL_PATH_INDEX_PATTERN = re.compile(r"\[\d+\]")
@@ -1068,10 +1287,39 @@ def _iter_goal_value_path_values(value: Any, path_parts: list[str]) -> list[Any]
 
 def _code_output_goal_paths_have_content(value: Any, goal_value_paths: list[str]) -> bool:
     for path in goal_value_paths:
-        values = _iter_goal_value_path_values(value, _normalize_goal_value_path(path))
-        if not any(_code_output_has_goal_content(item) for item in values):
+        path_parts = _normalize_goal_value_path(path)
+        values = _iter_goal_value_path_values(value, path_parts)
+        if not values and _goal_value_path_targets_registered_download(path):
+            values = _registered_download_output_values(value)
+        if not any(_code_output_goal_path_value_has_content(item) for item in values):
             return False
     return True
+
+
+def _code_output_goal_path_value_has_content(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    return _code_output_has_goal_content(value)
+
+
+def _goal_value_path_targets_registered_download(path: str) -> bool:
+    normalized = path.strip()
+    if normalized.startswith("$."):
+        normalized = normalized[2:]
+    elif normalized.startswith("$"):
+        normalized = normalized[1:]
+    head = normalized.split(".", 1)[0].split("[", 1)[0].strip()
+    return head in REGISTERED_DOWNLOAD_OUTPUT_KEYS
+
+
+def _registered_download_output_values(value: Any) -> list[Any]:
+    if not isinstance(value, Mapping):
+        return []
+    return [value[key] for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS if key in value]
+
+
+def _code_output_has_registered_download_content(value: Any) -> bool:
+    return any(_code_output_has_goal_content(item) for item in _registered_download_output_values(value))
 
 
 def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
@@ -1274,12 +1522,40 @@ def _challenge_gated_anti_bot_rerun_signal(
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     refresh_held_loop_blocker_evidence(ctx)
-    detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
-    if detected is not None:
-        return _emit_tool_blocker_signal(
-            ctx,
-            _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
-        )
+    if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_TOOLS:
+        current_page_challenge_signal = _current_page_terminal_challenge_signal(ctx, arguments, tool_name)
+        if current_page_challenge_signal is not None:
+            return _emit_tool_blocker_signal(ctx, current_page_challenge_signal)
+
+    uncovered_output_steer = uncovered_output_reject_scout_steer_signal(ctx, tool_name)
+    if uncovered_output_steer is not None:
+        return _emit_tool_blocker_signal(ctx, uncovered_output_steer)
+
+    persistence_signal = synthesized_block_persistence_signal(ctx, tool_name)
+    if persistence_signal is not None:
+        grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
+        if grounding_signal is not None:
+            LOG.info(
+                "copilot recorded outcome grounding enforced over persistence force",
+                tool_name=tool_name,
+            )
+            return _emit_tool_blocker_signal(ctx, grounding_signal)
+        return _emit_tool_blocker_signal(ctx, persistence_signal)
+
+    # While a typed output-contract actuation ladder is still unresolved for the authoring tools, the
+    # bounded ladder (not a generic loop backstop) owns the turn's outcome; the guards re-engage the moment
+    # the ladder reaches an advisory-consumed run or a typed terminal.
+    output_contract_owns_turn = (
+        tool_name in _OUTPUT_CONTRACT_LADDER_AUTHORING_TOOLS and output_contract_ladder_unresolved(ctx)
+    )
+
+    if not output_contract_owns_turn:
+        detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
+        if detected is not None:
+            return _emit_tool_blocker_signal(
+                ctx,
+                _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
+            )
 
     # Consecutive same-name guard: false-positives on the intended iterative
     # build (one new block per update_and_run_blocks). Block-running tools
@@ -1287,8 +1563,12 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     # exempt because a username+password+TOTP form legitimately needs three
     # consecutive calls; its failed-step guard above stays argument-aware.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list) and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS:
-        detected = detect_tool_loop(tracker, tool_name)
+    if (
+        isinstance(tracker, list)
+        and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
+        and not output_contract_owns_turn
+    ):
+        detected = detect_tool_loop(tracker, tool_name, arguments)
         if detected is not None:
             return _emit_tool_blocker_signal(
                 ctx,
@@ -1411,10 +1691,56 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         late_signal = _late_block_running_call_signal(ctx, tool_name)
         if late_signal is not None:
             return _emit_tool_blocker_signal(ctx, late_signal)
+    grounding_signal = _recorded_outcome_grounding_signal(ctx, tool_name)
+    if grounding_signal is not None:
+        return _emit_tool_blocker_signal(ctx, grounding_signal)
     return None
 
 
 _build_loop_blocker_signal = build_loop_blocker_signal
+
+
+def _recorded_outcome_grounding_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
+    if tool_name not in _RECORDED_OUTCOME_GROUNDING_MUTATION_TOOLS:
+        return None
+    if maybe_satisfy_recorded_outcome_grounding_requirement(ctx):
+        return None
+    if not recorded_outcome_grounding_requires_current_page(ctx):
+        return None
+    requirement = ctx.recorded_outcome_grounding_requirement
+    if requirement is None:
+        return None
+    payload: AuthorTimeGateAblationPayload = {
+        "phase": requirement.phase,
+        "outcome_reason_code": requirement.reason_code,
+        "workflow_run_id": requirement.workflow_run_id,
+        "block_labels": list(requirement.block_labels),
+        "required_tool": requirement.required_tool,
+        "required_target_url": requirement.required_target_url,
+    }
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id="recorded_outcome_grounding",
+        reason_code="recorded_outcome_grounding_required",
+        fingerprint=requirement.structural_key,
+        blocked_tool=tool_name,
+        payload=payload,
+    ):
+        return None
+    return CopilotToolBlockerSignal(
+        blocker_kind="missing_required_context",
+        agent_steering_text=(
+            "The repeated recorded build-test outcome is still ungrounded. Call "
+            'inspect_page_for_composition(target_url="current_page") and use that bounded page '
+            "evidence before the next workflow mutation or browser mutation."
+        ),
+        user_facing_reason="I need to inspect the current page before changing the workflow again.",
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=frozenset({"inspect_page_for_composition"}),
+        renders_final_reply=False,
+        internal_reason_code="recorded_outcome_grounding_required",
+        blocked_tool=tool_name,
+    )
 
 
 def _analyze_run_blocks(
@@ -1437,7 +1763,7 @@ def _analyze_run_blocks(
     precomputed_categories = data.get("failure_categories")
     if isinstance(precomputed_categories, list) and precomputed_categories:
         for cat in precomputed_categories:
-            if isinstance(cat, dict) and cat.get("category") == "ANTI_BOT_DETECTION":
+            if isinstance(cat, dict) and trusted_terminal_challenge_category_name(cat) is not None:
                 anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
                 break
         return anti_bot_match, False, precomputed_categories
@@ -1463,6 +1789,7 @@ def _analyze_run_blocks(
     has_data_blocks = False
     any_data_output = False
     missing_metadata_goal_content = False
+    complete_structured_record_output = False
 
     blocks = data.get("blocks")
     if isinstance(blocks, list):
@@ -1487,13 +1814,40 @@ def _analyze_run_blocks(
                 extracted = block.get("extracted_data")
                 if extracted is None:
                     continue
-                structured_blocker = _structured_blocker_message(extracted, include_flag_keys=True)
+                declared_keys = _declared_code_output_keys(copilot_ctx, block.get("label"))
+                structured_blocker = _structured_blocker_message(
+                    extracted,
+                    include_flag_keys=True,
+                    key_terms=_STRICT_BLOCKER_FLAG_TERMS,
+                    declared_keys=declared_keys,
+                    scan_all_values_for_anti_bot=True,
+                )
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)
+                output_parameter_payloads = _workflow_output_parameter_payloads(extracted)
+                if output_parameter_payloads:
+                    has_data_blocks = True
+                    if any(_is_meaningful_extracted_data(value) for value in output_parameter_payloads.values()):
+                        any_data_output = True
+                    if any(_structured_record_has_goal_content(value) for value in output_parameter_payloads.values()):
+                        complete_structured_record_output = True
+                extraction_schema = _extraction_schema_for_code_block(copilot_ctx, block.get("label"))
+                # Array-typed schemas would coerce the keyed dict return to [] (fill_missing_fields), making the
+                # goal-path check below read a real extraction as empty; the keyed-return floor guarantees a dict.
+                if (
+                    extraction_schema is not None
+                    and isinstance(extracted, dict)
+                    and extraction_schema.get("type") != "array"
+                ):
+                    extracted = validate_and_fill_extraction_result(extracted, extraction_schema)
                 goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
                 if goal_value_paths:
                     has_data_blocks = True
-                    if _code_output_goal_paths_have_content(extracted, goal_value_paths):
+                    if (
+                        _code_output_has_registered_download_content(extracted)
+                        or _code_output_goal_paths_have_content(extracted, goal_value_paths)
+                        or _structured_record_has_goal_content(extracted)
+                    ):
                         any_data_output = True
                     else:
                         # Terminal goal paths are conjunctive: one missing
@@ -1505,18 +1859,70 @@ def _analyze_run_blocks(
                     continue
                 # A code output joins the emptiness denominator only when it declares a
                 # collection shape; action-only outputs are exempt.
-                if _code_output_contains_collection(extracted):
+                if _code_output_contains_collection(extracted, declared_keys=declared_keys):
                     has_data_blocks = True
-                if _code_output_has_goal_content(extracted):
+                if _code_output_has_goal_content(extracted, declared_keys=declared_keys):
                     any_data_output = True
+
+    top_level_output_payloads = _workflow_output_parameter_payloads(data.get("output"))
+    if top_level_output_payloads:
+        has_data_blocks = True
+        if any(_is_meaningful_extracted_data(value) for value in top_level_output_payloads.values()):
+            any_data_output = True
+        if any(_structured_record_has_goal_content(value) for value in top_level_output_payloads.values()):
+            complete_structured_record_output = True
+
+    registered_payloads = _registered_output_parameter_payloads(data)
+    if registered_payloads:
+        has_data_blocks = True
+        for registered in registered_payloads:
+            value = registered.get("value")
+            if _is_meaningful_extracted_data(value):
+                any_data_output = True
+            if _structured_record_has_goal_content(value):
+                complete_structured_record_output = True
+            structured_blocker = _structured_blocker_message(
+                value,
+                include_flag_keys=True,
+                key_terms=_STRICT_BLOCKER_FLAG_TERMS,
+                scan_all_values_for_anti_bot=True,
+            )
+            if structured_blocker:
+                texts_to_scan.append(structured_blocker)
 
     combined = "\n".join(texts_to_scan)
     categories = classify_from_failure_reason(combined)
     if categories:
         for cat in categories:
             if cat.get("category") == "ANTI_BOT_DETECTION":
-                anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
+                if is_carrier_backed_category_entry(cat):
+                    anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
+                else:
+                    LOG.info(
+                        "copilot anti-bot classifier match keyword-only-suppressed",
+                        workflow_run_id=data.get("workflow_run_id"),
+                    )
                 break
 
+    if complete_structured_record_output:
+        if missing_metadata_goal_content:
+            LOG.info(
+                "copilot run evidence: a complete structured-record output suppressed a "
+                "per-block missing-metadata-goal-content signal",
+                workflow_run_id=data.get("workflow_run_id"),
+            )
+        missing_metadata_goal_content = False
     empty_data_blocks = (has_data_blocks and not any_data_output) or missing_metadata_goal_content
     return anti_bot_match, empty_data_blocks, categories
+
+
+def _structured_record_has_goal_content(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    candidates = [value]
+    candidates.extend(
+        nested
+        for key, nested in value.items()
+        if isinstance(key, str) and key.endswith("_output") and isinstance(nested, dict)
+    )
+    return any(_structured_record_candidate_has_goal_content(candidate) for candidate in candidates)

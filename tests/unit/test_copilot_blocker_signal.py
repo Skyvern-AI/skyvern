@@ -6,6 +6,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
+    SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
     BlockerKind,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     to_trace_data,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from tests.unit.conftest import make_copilot_context as _copilot_ctx
 
 
 def _make(
@@ -26,6 +28,7 @@ def _make(
     cleared_by_tools: frozenset[str] = frozenset(),
     internal_reason_code: str = "some_reason",
     blocked_tool: str = "update_workflow",
+    renders_final_reply: bool = True,
 ) -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
         blocker_kind=kind,
@@ -36,6 +39,7 @@ def _make(
         internal_reason_code=internal_reason_code,
         blocked_tool=blocked_tool,
         classifier_mode="docs_answer",
+        renders_final_reply=renders_final_reply,
     )
 
 
@@ -286,14 +290,151 @@ def test_stash_blocker_signal_active_terminal_replaces_per_tool_budget() -> None
     assert ctx.tool_blocker_signals == [budget, active_terminal]
 
 
+def test_stash_output_contract_terminal_replaces_held_churn_stop() -> None:
+    for reason_code in ("output_source_unobservable", "actuation_exhausted"):
+        ctx = _Ctx()
+        churn = _make(
+            kind="loop_detected",
+            internal_reason_code="code_authoring_guardrail_churn",
+            renders_final_reply=True,
+        )
+        oc_terminal = _make(
+            kind="tool_error",
+            internal_reason_code=reason_code,
+            renders_final_reply=True,
+        )
+        stash_blocker_signal(ctx, churn)
+        stash_blocker_signal(ctx, oc_terminal)
+        assert ctx.blocker_signal is oc_terminal
+
+
+def test_stash_output_contract_terminal_replaces_any_held_loop_detected() -> None:
+    for loop_reason in (
+        "loop_detected_generic",
+        "loop_detected_repeated_failed_step",
+        "loop_detected_consecutive_same_tool",
+        "credential_priority_authoring_churn",
+    ):
+        ctx = _Ctx()
+        loop_signal = _make(kind="loop_detected", internal_reason_code=loop_reason, renders_final_reply=True)
+        oc_terminal = _make(
+            kind="tool_error", internal_reason_code="output_source_unobservable", renders_final_reply=True
+        )
+        stash_blocker_signal(ctx, loop_signal)
+        stash_blocker_signal(ctx, oc_terminal)
+        assert ctx.blocker_signal is oc_terminal
+
+
+def test_stash_loop_detected_does_not_replace_held_output_contract_terminal() -> None:
+    ctx = _Ctx()
+    oc_terminal = _make(kind="tool_error", internal_reason_code="actuation_exhausted", renders_final_reply=True)
+    loop_signal = _make(kind="loop_detected", internal_reason_code="loop_detected_generic", renders_final_reply=True)
+    stash_blocker_signal(ctx, oc_terminal)
+    stash_blocker_signal(ctx, loop_signal)
+    assert ctx.blocker_signal is oc_terminal
+
+
+def test_stash_churn_stop_does_not_replace_held_output_contract_terminal() -> None:
+    ctx = _Ctx()
+    oc_terminal = _make(
+        kind="tool_error",
+        internal_reason_code="output_source_unobservable",
+        renders_final_reply=True,
+    )
+    churn = _make(
+        kind="loop_detected",
+        internal_reason_code="code_authoring_guardrail_churn",
+        renders_final_reply=True,
+    )
+    stash_blocker_signal(ctx, oc_terminal)
+    stash_blocker_signal(ctx, churn)
+    assert ctx.blocker_signal is oc_terminal
+
+
+def test_stash_grounding_replaces_synthesized_persistence_tool_error() -> None:
+    ctx = _Ctx()
+    existing = _make(
+        kind="tool_error",
+        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+        renders_final_reply=False,
+    )
+    grounding = _make(
+        kind="missing_required_context",
+        internal_reason_code="recorded_outcome_grounding_required",
+        renders_final_reply=False,
+    )
+
+    stash_blocker_signal(ctx, existing)
+    payload = stash_blocker_signal(ctx, grounding)
+
+    assert payload == grounding.agent_steering_text
+    assert ctx.blocker_signal is grounding
+    assert ctx.latest_tool_blocker_signal is grounding
+    assert ctx.tool_blocker_signals == [existing, grounding]
+
+
+def test_stash_grounding_replaces_generic_non_final_tool_error() -> None:
+    ctx = _Ctx()
+    existing = _make(kind="tool_error", internal_reason_code="tool_error_generic", renders_final_reply=False)
+    grounding = _make(
+        kind="missing_required_context",
+        internal_reason_code="recorded_outcome_grounding_required",
+        renders_final_reply=False,
+    )
+
+    stash_blocker_signal(ctx, existing)
+    stash_blocker_signal(ctx, grounding)
+
+    assert ctx.blocker_signal is grounding
+
+
+def test_stash_grounding_does_not_replace_final_reply_blocker() -> None:
+    ctx = _Ctx()
+    existing = _make(
+        kind="tool_error",
+        internal_reason_code=SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE,
+        renders_final_reply=True,
+    )
+    grounding = _make(
+        kind="missing_required_context",
+        internal_reason_code="recorded_outcome_grounding_required",
+        renders_final_reply=False,
+    )
+
+    stash_blocker_signal(ctx, existing)
+    stash_blocker_signal(ctx, grounding)
+
+    assert ctx.blocker_signal is existing
+    assert ctx.latest_tool_blocker_signal is grounding
+
+
+def test_stash_repair_ceiling_replaces_non_final_grounding_blocker() -> None:
+    ctx = _Ctx()
+    grounding = _make(
+        kind="missing_required_context",
+        internal_reason_code="recorded_outcome_grounding_required",
+        renders_final_reply=False,
+    )
+    repair_ceiling = _make(
+        kind="loop_detected",
+        internal_reason_code="repair_ceiling_reached",
+        renders_final_reply=True,
+    )
+
+    stash_blocker_signal(ctx, grounding)
+    payload = stash_blocker_signal(ctx, repair_ceiling)
+
+    assert payload == repair_ceiling.agent_steering_text
+    assert ctx.blocker_signal is repair_ceiling
+    assert ctx.latest_tool_blocker_signal is repair_ceiling
+
+
 def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> None:
     """The field is declared on both AgentContext (parent) and CopilotContext
     (child) per the field-shadowing convention. Default values must stay in
     sync so callers reading via the AgentContext annotation see the same
     initial state as callers reading via CopilotContext."""
-    from types import SimpleNamespace
 
-    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.copilot.runtime import AgentContext
 
     agent_ctx = AgentContext(
@@ -322,17 +463,6 @@ def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> No
     assert copilot_ctx.tool_blocker_signals == []
 
 
-def _copilot_ctx() -> CopilotContext:
-    return CopilotContext(
-        organization_id="org",
-        workflow_id="wf",
-        workflow_permanent_id="wfp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
-
-
 _CONSECUTIVE_LOOP_MESSAGE = "LOOP DETECTED: 'evaluate' has been called 3 times consecutively."
 _LATE_RECORDED_REASON = (
     "Failed: The run completed but did not demonstrate the goal outcome(s): the requested record is checked "
@@ -349,6 +479,8 @@ def test_stash_refreshes_held_loop_signal_with_evidence_recorded_after_the_stash
     assert dict(loop_signal.extra) == {}
 
     ctx.last_outcome_gate_reason = _LATE_RECORDED_REASON
+    ctx.last_outcome_gate_workflow_run_id = "wr_latest"
+    ctx.last_run_blocks_workflow_run_id = "wr_latest"
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     ctx.has_staged_proposal = True
 

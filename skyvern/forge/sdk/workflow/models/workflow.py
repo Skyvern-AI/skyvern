@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, List, Literal
+from typing import Any, List
 
 from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 from typing_extensions import deprecated
@@ -16,7 +16,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -36,7 +36,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
-    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
@@ -137,7 +137,9 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
+    browser_profile_key: str | None = None
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
@@ -148,6 +150,7 @@ class Workflow(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = None
     adaptive_caching: bool = False
+    enable_self_healing: bool = False
     code_version: int | None = None
     generate_script_on_terminal: bool = False
     run_sequentially: bool | None = None
@@ -156,6 +159,9 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
+    # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
+    copilot_authored: bool = False
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -342,7 +348,6 @@ class WorkflowRunResponseBase(BaseModel):
     failure_category: list[dict[str, Any]] | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
-    webhook_delivery_status: Literal["pending", "failed"] | None = None
     webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
@@ -364,8 +369,11 @@ class WorkflowRunResponseBase(BaseModel):
     total_steps: int | None = None
     total_cost: float | None = Field(
         default=None,
-        deprecated=True,
-        description="Deprecated. Public workflow-run responses no longer expose cost; use credits_used fields instead.",
+        description=(
+            "Estimated workflow-run cost as the list-price value of credits consumed "
+            "(credits x list credit rate), not the amount invoiced; enterprise contract "
+            "pricing and legacy billing may differ. Null when cost is unavailable."
+        ),
     )
     credits_used: int = 0
     cached_credits_used: int = 0

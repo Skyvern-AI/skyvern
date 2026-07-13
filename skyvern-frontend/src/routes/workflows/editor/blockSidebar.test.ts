@@ -1,4 +1,6 @@
-import { describe, expect, test } from "vitest";
+// @vitest-environment jsdom
+
+import { afterEach, describe, expect, test } from "vitest";
 
 import {
   isBlockSidebarOpen,
@@ -6,7 +8,13 @@ import {
   HEADER_RIGHT_INSET_OPEN,
   BLOCK_SIDEBAR_WIDTH_VAR,
   BLOCK_SIDEBAR_RIGHT_GAP,
+  getBlockSidebarGutterPx,
+  getContainedBlockSidebarWidth,
 } from "./blockSidebar";
+
+afterEach(() => {
+  document.documentElement.style.fontSize = "";
+});
 
 describe("isBlockSidebarOpen", () => {
   test("returns true when in edit mode with a selected block", () => {
@@ -52,5 +60,24 @@ describe("right-inset class constants", () => {
   test("the CSS var name and gap are exported as a single source of truth", () => {
     expect(BLOCK_SIDEBAR_WIDTH_VAR).toBe("--block-sidebar-w");
     expect(BLOCK_SIDEBAR_RIGHT_GAP).toBe("1.5rem");
+  });
+});
+
+describe("getContainedBlockSidebarWidth", () => {
+  test("returns the requested numeric width when the editor shell is unmeasured", () => {
+    expect(getContainedBlockSidebarWidth(640, null)).toBe(640);
+  });
+
+  test("clamps to the editor shell gutter when measured", () => {
+    expect(getContainedBlockSidebarWidth(640, 500)).toBe(452);
+  });
+
+  test("derives the gutter from the document root font size", () => {
+    document.documentElement.style.fontSize = "20px";
+
+    const gutterPx = getBlockSidebarGutterPx(document.documentElement);
+
+    expect(gutterPx).toBe(60);
+    expect(getContainedBlockSidebarWidth(640, 500, gutterPx)).toBe(440);
   });
 });

@@ -53,6 +53,27 @@ def mock_app() -> Any:
 
 
 @pytest.mark.asyncio
+async def test_auto_generated_run_is_completed_through_workflow_service(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_request.workflow_run_id = None
+    workflow = MagicMock(workflow_id="w_test", workflow_permanent_id="wpid_test", title="t")
+    workflow_run = MagicMock(workflow_run_id="wr_test", workflow_id="w_test")
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock(return_value=workflow)
+    mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=workflow_run)
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock(return_value=workflow_run)
+    mock_app.DATABASE.workflow_runs.update_workflow_run = AsyncMock(return_value=workflow_run)
+    mock_app.DATABASE.tasks.create_task = AsyncMock(side_effect=RuntimeError("stop after completion"))
+
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app):
+        with pytest.raises(RuntimeError, match="stop after completion"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed.assert_awaited_once_with(workflow_run_id="wr_test")
+    mock_app.DATABASE.workflow_runs.update_workflow_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_handler_returns_422_when_action_raises_skyvern_action_failed(
     mock_request: Any, mock_organization: Any, mock_app: Any
 ) -> None:

@@ -55,6 +55,9 @@ class WorkflowRunBlock(BaseModel):
     subject: str | None = None
     body: str | None = None
 
+    # prompt block / text prompt block / for loop block
+    prompt: str | None = None
+
     # human interaction block
     instructions: str | None = None
     positive_descriptor: str | None = None
@@ -69,6 +72,9 @@ class WorkflowRunBlock(BaseModel):
     # Set when a script→AI fallback fires on this block. `None` covers
     # clean cached execution, always-agent blocks, and pre-column rows.
     script_run: ScriptRunResponse | None = None
+
+    # Count of files this block downloaded; scalar mirror of output["downloaded_files"].
+    downloaded_file_count: int | None = None
 
 
 class WorkflowRunTimelineType(StrEnum):

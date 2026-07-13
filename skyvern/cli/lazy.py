@@ -105,11 +105,32 @@ class _LazyPlaceholder(click.Command):
 
 
 # ---------------------------------------------------------------------------
+# Click-version-robust group base
+# ---------------------------------------------------------------------------
+
+
+class SkyvernTyperGroup(typer.core.TyperGroup):
+    """TyperGroup that prints help and exits 0 when invoked with no subcommand.
+
+    Click 8.2 changed ``no_args_is_help`` to raise ``NoArgsIsHelpError`` (a
+    ``UsageError``, exit code 2) instead of echoing help and exiting 0 as click
+    <8.2 did. Re-implementing the pre-8.2 branch here keeps ``skyvern <group>``
+    exiting 0 regardless of the installed click version.
+    """
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not args and self.no_args_is_help and not ctx.resilient_parsing:
+            click.echo(ctx.get_help(), color=ctx.color)
+            ctx.exit()
+        return super().parse_args(ctx, args)
+
+
+# ---------------------------------------------------------------------------
 # LazyTyperGroup
 # ---------------------------------------------------------------------------
 
 
-class LazyTyperGroup(typer.core.TyperGroup):
+class LazyTyperGroup(SkyvernTyperGroup):
     """A TyperGroup subclass that includes lazily-registered commands.
 
     Commands registered via :func:`register_lazy_command` appear in

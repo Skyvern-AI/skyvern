@@ -6,7 +6,9 @@ import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 import { AppNode, type WorkflowBlockNode } from "../nodes";
 import { ActionBlockForm } from "./BlockConfigForm/ActionBlockForm";
 import { CodeBlockBlockForm } from "./BlockConfigForm/CodeBlockBlockForm";
+import { ConditionalBlockForm } from "./BlockConfigForm/ConditionalBlockForm";
 import { DownloadBlockForm } from "./BlockConfigForm/DownloadBlockForm";
+import { EmailInboxBlockForm } from "./BlockConfigForm/EmailInboxBlockForm";
 import { ExtractionBlockForm } from "./BlockConfigForm/ExtractionBlockForm";
 import { FileDownloadBlockForm } from "./BlockConfigForm/FileDownloadBlockForm";
 import { FileParserBlockForm } from "./BlockConfigForm/FileParserBlockForm";
@@ -20,7 +22,9 @@ import { LoopBlockForm } from "./BlockConfigForm/LoopBlockForm";
 import { NavigationBlockForm } from "./BlockConfigForm/NavigationBlockForm";
 import { PDFParserBlockForm } from "./BlockConfigForm/PDFParserBlockForm";
 import { PrintPageBlockForm } from "./BlockConfigForm/PrintPageBlockForm";
+import { PdfFillBlockForm } from "./BlockConfigForm/PdfFillBlockForm";
 import { SendEmailBlockForm } from "./BlockConfigForm/SendEmailBlockForm";
+import { SplitPdfBlockForm } from "./BlockConfigForm/SplitPdfBlockForm";
 import { TaskBlockForm } from "./BlockConfigForm/TaskBlockForm";
 import { Taskv2BlockForm } from "./BlockConfigForm/Taskv2BlockForm";
 import { TextPromptBlockForm } from "./BlockConfigForm/TextPromptBlockForm";
@@ -35,20 +39,6 @@ type WorkflowBlockNodeType = WorkflowBlockNode["type"];
 
 type BlockFormComponent = ComponentType<{ blockId: string }>;
 
-// BranchesEditor runs auto-default-branch + auto-activeBranchId repair
-// effects; mounting it in the sidebar would fire the same repairs from
-// two concurrent instances. The canvas tile is the authoritative mount.
-function ConditionalSidebarPlaceholder() {
-  return (
-    <div
-      data-testid="block-config-form-conditional-placeholder"
-      className="px-4 py-4 text-sm text-slate-400"
-    >
-      Edit conditional branches on the canvas tile.
-    </div>
-  );
-}
-
 const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   task: TaskBlockForm,
   taskv2: Taskv2BlockForm,
@@ -58,9 +48,10 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   login: LoginBlockForm,
   wait: WaitBlockForm,
   loop: LoopBlockForm,
-  conditional: ConditionalSidebarPlaceholder,
+  conditional: ConditionalBlockForm,
   textPrompt: TextPromptBlockForm,
   sendEmail: SendEmailBlockForm,
+  emailInbox: EmailInboxBlockForm,
   codeBlock: CodeBlockBlockForm,
   fileParser: FileParserBlockForm,
   fileDownload: FileDownloadBlockForm,
@@ -73,9 +64,11 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   url: URLBlockForm,
   http_request: HttpRequestBlockForm,
   printPage: PrintPageBlockForm,
+  pdfFill: PdfFillBlockForm,
   workflowTrigger: WorkflowTriggerBlockForm,
   googleSheetsRead: GoogleSheetsReadBlockForm,
   googleSheetsWrite: GoogleSheetsWriteBlockForm,
+  splitPdf: SplitPdfBlockForm,
 };
 
 function BlockConfigForm({ blockId }: Readonly<{ blockId: string }>) {

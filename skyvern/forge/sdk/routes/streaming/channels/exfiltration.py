@@ -43,6 +43,10 @@ class ExfiltratedEvent:
     params: dict = dataclasses.field(default_factory=dict)
     source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
     timestamp: float = dataclasses.field(default_factory=lambda: time.time())  # seconds since epoch
+    # Monotonic order assigned at the earliest synchronous capture point so the
+    # interpreter can restore chronological order after async materialization
+    # (e.g. console json_value round-trips) reorders events under load.
+    capture_seq: int = -1
 
 
 OnExfiltrationEvent = t.Callable[[list[ExfiltratedEvent]], None]
@@ -67,6 +71,9 @@ class ExfiltrationChannel(CdpChannel):
         weakref.WeakKeyDictionary()
     )
     _binding_registered_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
+    _adorn_init_script_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
+    _rearm_in_flight_pages: t.ClassVar[weakref.WeakKeyDictionary[Page, bool]] = weakref.WeakKeyDictionary()
+    _rearm_pending_full_nav_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
 
     def __init__(self, *, on_event: OnExfiltrationEvent, vnc_channel: VncChannel) -> None:
         self.cdp_session: CDPSession | None = None
@@ -78,8 +85,26 @@ class ExfiltrationChannel(CdpChannel):
         self._network_activity_count = 0
         self._last_network_activity_emit = 0.0
         self._network_activity_flush_task: asyncio.Task[None] | None = None
+        self._capture_paused = False
+        self._capture_seq = 0
 
         super().__init__(vnc_channel=vnc_channel)
+
+    def _next_capture_seq(self) -> int:
+        seq = self._capture_seq
+        self._capture_seq += 1
+        return seq
+
+    def pause_capture(self) -> None:
+        self._capture_paused = True
+
+    def resume_capture(self) -> None:
+        self._capture_paused = False
+
+    def _emit_events(self, messages: list[ExfiltratedEvent]) -> None:
+        if self._capture_paused:
+            return
+        self.on_event(messages)
 
     def _track_event_task(self, coro: t.Coroutine[t.Any, t.Any, None]) -> None:
         task = asyncio.create_task(coro)
@@ -159,11 +184,32 @@ class ExfiltrationChannel(CdpChannel):
         for fingerprint in expired:
             self._recent_console_event_fingerprints.pop(fingerprint, None)
 
-    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+    # Excluded from the fingerprint: advances by ms when one interaction is re-captured across a reconnect.
+    _CONSOLE_FINGERPRINT_VOLATILE_KEYS: t.ClassVar[frozenset[str]] = frozenset({"timestamp"})
+
+    def _console_fingerprint(self, event_data: dict[str, t.Any]) -> str:
+        # Drop None values (recursively) as well as volatile keys: the binding,
+        # Playwright-console, and raw-CDP transports materialize the same event
+        # with None-vs-absent differences (JSON.stringify drops undefined keys;
+        # the binding serializes them to null), which otherwise defeats dedup.
+        stable = self._strip_none(
+            {k: v for k, v in event_data.items() if k not in self._CONSOLE_FINGERPRINT_VOLATILE_KEYS}
+        )
         try:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"))
         except TypeError:
-            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"), default=str)
+            return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+
+    @classmethod
+    def _strip_none(cls, value: t.Any) -> t.Any:
+        if isinstance(value, dict):
+            return {k: cls._strip_none(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [cls._strip_none(item) for item in value]
+        return value
+
+    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+        fingerprint = self._console_fingerprint(event_data)
 
         now = time.monotonic()
         self._prune_console_dedup_cache(now)
@@ -174,11 +220,11 @@ class ExfiltrationChannel(CdpChannel):
         self._recent_console_event_fingerprints[fingerprint] = now
         return True
 
-    def _emit_console_event(self, event_data: dict[str, t.Any]) -> None:
+    def _emit_console_event(self, event_data: dict[str, t.Any], capture_seq: int) -> None:
         if not self._should_emit_console_event(event_data):
             return
 
-        self.on_event(
+        self._emit_events(
             [
                 ExfiltratedEvent(
                     kind="exfiltrated-event",
@@ -186,6 +232,7 @@ class ExfiltrationChannel(CdpChannel):
                     params=event_data,
                     source=ExfiltratedEventSource.CONSOLE,
                     timestamp=time.time(),
+                    capture_seq=capture_seq,
                 )
             ]
         )
@@ -197,9 +244,9 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        active_channel._emit_console_event(event_data)
+        active_channel._emit_console_event(event_data, active_channel._next_capture_seq())
 
-    async def _handle_console_event_async(self, msg: ConsoleMessage) -> None:
+    async def _handle_console_event_async(self, msg: ConsoleMessage, capture_seq: int) -> None:
         """Parse Playwright console messages for exfiltrated event data."""
         event_data: dict[str, t.Any] | None = None
         try:
@@ -217,12 +264,12 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        self._emit_console_event(event_data)
+        self._emit_console_event(event_data, capture_seq)
 
     def _handle_console_event(self, msg: ConsoleMessage) -> None:
-        self._track_event_task(self._handle_console_event_async(msg))
+        self._track_event_task(self._handle_console_event_async(msg, self._next_capture_seq()))
 
-    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any]) -> None:
+    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any], capture_seq: int) -> None:
         raw_args = params.get("args")
         if not isinstance(raw_args, list):
             return
@@ -231,14 +278,16 @@ class ExfiltrationChannel(CdpChannel):
         if event_data is None:
             return
 
-        self._emit_console_event(event_data)
+        self._emit_console_event(event_data, capture_seq)
 
     async def _attach_page_cdp_console_capture(self, page: Page) -> CDPSession | None:
         cdp_session = await page.context.new_cdp_session(page)
         await cdp_session.send("Runtime.enable")
         cdp_session.on(
             "Runtime.consoleAPICalled",
-            lambda params: self._track_event_task(self._handle_runtime_console_event_async(params)),
+            lambda params: self._track_event_task(
+                self._handle_runtime_console_event_async(params, self._next_capture_seq())
+            ),
         )
         return cdp_session
 
@@ -320,10 +369,96 @@ class ExfiltrationChannel(CdpChannel):
                 params=params,
                 source=ExfiltratedEventSource.CDP,
                 timestamp=time.time(),
+                capture_seq=self._next_capture_seq(),
             ),
         ]
 
-        self.on_event(messages)
+        self._emit_events(messages)
+
+        if event_name in ("nav:frame_navigated", "nav:navigated_within_document"):
+            page = self.page
+            if page and not page.url.startswith("devtools:"):
+                self._schedule_page_rearm(
+                    page,
+                    event_name=event_name,
+                    wait_for_load=event_name == "nav:frame_navigated",
+                )
+
+    def _schedule_page_rearm(self, page: Page, *, event_name: str, wait_for_load: bool) -> None:
+        if page.url.startswith("devtools:"):
+            return
+
+        in_flight_wait_for_load = self._rearm_in_flight_pages.get(page)
+        if in_flight_wait_for_load is not None:
+            if wait_for_load and not in_flight_wait_for_load:
+                self._rearm_pending_full_nav_pages.add(page)
+            return
+
+        self._track_event_task(
+            self._rearm_page_after_navigation(page, event_name=event_name, wait_for_load=wait_for_load)
+        )
+
+    async def rearm_all_pages(self) -> None:
+        browser_context = self.browser_context
+        if not browser_context:
+            page = self.page
+            if page and not page.url.startswith("devtools:"):
+                self._schedule_page_rearm(page, event_name="recording:rearm", wait_for_load=False)
+            return
+
+        for page in list(browser_context.pages):
+            if page.url.startswith("devtools:"):
+                continue
+            self._schedule_page_rearm(page, event_name="recording:rearm", wait_for_load=False)
+
+    async def _rearm_page_after_navigation(
+        self,
+        page: Page,
+        *,
+        event_name: str,
+        wait_for_load: bool = True,
+    ) -> None:
+        if page.url.startswith("devtools:"):
+            return
+
+        self._rearm_in_flight_pages[page] = wait_for_load
+        try:
+            LOG.info(
+                "re-applying exfiltration and adornment after navigation",
+                class_name=self.class_name,
+                event_name=event_name,
+                url=page.url,
+            )
+
+            if wait_for_load:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except Exception:
+                    LOG.warning(
+                        "navigation re-arm timed out waiting for domcontentloaded",
+                        class_name=self.class_name,
+                        event_name=event_name,
+                        url=page.url,
+                        exc_info=True,
+                    )
+
+            try:
+                await self._ensure_binding(page)
+                await self.exfiltrate(page)
+                await self.adorn(page)
+            except Exception:
+                LOG.warning(
+                    "failed to re-arm exfiltration after navigation",
+                    class_name=self.class_name,
+                    event_name=event_name,
+                    url=page.url,
+                    exc_info=True,
+                )
+        finally:
+            self._rearm_in_flight_pages.pop(page, None)
+            if page in self._rearm_pending_full_nav_pages:
+                self._rearm_pending_full_nav_pages.discard(page)
+                self._schedule_page_rearm(page, event_name="nav:frame_navigated", wait_for_load=True)
 
     async def adorn(self, page: Page) -> t.Self:
         """Add a mouse-following follower to the page."""
@@ -332,8 +467,10 @@ class ExfiltrationChannel(CdpChannel):
 
         LOG.info(f"{self.class_name} adorning page.", url=page.url)
 
-        (await page.evaluate(self.js("adorn")),)
-        (await page.add_init_script(self.js("adorn")),)
+        await page.evaluate(self.js("adorn"))
+        if page not in self._adorn_init_script_pages:
+            await page.add_init_script(self.js("adorn"))
+            self._adorn_init_script_pages.add(page)
 
         LOG.info(f"{self.class_name} adornment complete on page.", url=page.url)
 

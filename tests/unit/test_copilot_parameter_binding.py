@@ -16,6 +16,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+import pytest
+
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -41,32 +43,29 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 # --------------------------------------------------------------------------- #
 
 
-def test_classify_workflow_parameter_should_have_already_been_set() -> None:
-    message = "Workflow parameter product_sku should have already been set through workflow run parameters"
-    categories = classify_from_failure_reason(message)
-    assert categories is not None
-    assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
-
-
-def test_classify_output_parameter_context_init_error() -> None:
-    message = "Output parameter extract_output should have already been set through workflow run context init"
-    categories = classify_from_failure_reason(message)
-    assert categories is not None
-    assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
-
-
-def test_classify_secret_parameter_context_init_error() -> None:
-    message = "SecretParameter totp should have already been set through workflow run context init"
-    categories = classify_from_failure_reason(message)
-    assert categories is not None
-    assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
-
-
-def test_classify_pre_run_invariant_message() -> None:
-    message = (
-        "Pre-run invariant: workflow_definition and persisted parameter rows disagree. "
-        "workflow missing persisted: ['ticker (string)']"
-    )
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            "Workflow parameter product_sku should have already been set through workflow run parameters",
+            id="workflow_parameter",
+        ),
+        pytest.param(
+            "Output parameter extract_output should have already been set through workflow run context init",
+            id="output_parameter",
+        ),
+        pytest.param(
+            "SecretParameter totp should have already been set through workflow run context init",
+            id="secret_parameter",
+        ),
+        pytest.param(
+            "Pre-run invariant: workflow_definition and persisted parameter rows disagree. "
+            "workflow missing persisted: ['ticker (string)']",
+            id="pre_run_invariant",
+        ),
+    ],
+)
+def test_classify_parameter_binding_raise_messages(message: str) -> None:
     categories = classify_from_failure_reason(message)
     assert categories is not None
     assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
@@ -242,33 +241,16 @@ def _param_binding_categories() -> list[dict]:
     return [{"category": "PARAMETER_BINDING_ERROR", "confidence_float": 0.95}]
 
 
-def test_signature_parameter_binding_ignores_key_name() -> None:
+def test_signature_non_category_only_failure_preserves_selector_shape() -> None:
     sig_a = compute_failure_signature(
         frontier_start_label="extract",
-        failure_reason="Workflow parameter product_sku should have already been set through workflow run parameters",
-        failure_categories=_param_binding_categories(),
-        suspicious_success=False,
-    )
-    sig_b = compute_failure_signature(
-        frontier_start_label="extract",
-        failure_reason="Workflow parameter ticker should have already been set through workflow run parameters",
-        failure_categories=_param_binding_categories(),
-        suspicious_success=False,
-    )
-    assert sig_a is not None
-    assert sig_a == sig_b
-
-
-def test_signature_non_parameter_binding_preserves_text() -> None:
-    sig_a = compute_failure_signature(
-        frontier_start_label="extract",
-        failure_reason="Element not found for selector #foo",
+        failure_reason="Element not found for selector: #foo",
         failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}],
         suspicious_success=False,
     )
     sig_b = compute_failure_signature(
         frontier_start_label="extract",
-        failure_reason="Element not found for selector #bar",
+        failure_reason="Element not found for selector: #bar",
         failure_categories=[{"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8}],
         suspicious_success=False,
     )
@@ -285,36 +267,45 @@ def test_signature_success_returns_none() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_nudge_warn_picks_parameter_binding_when_category_is_binding() -> None:
+@pytest.mark.parametrize(
+    "streak, emitted_at, category, expected_nudge",
+    [
+        pytest.param(
+            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
+            0,
+            "PARAMETER_BINDING_ERROR",
+            POST_PARAMETER_BINDING_WARN_NUDGE,
+            id="warn_parameter_binding",
+        ),
+        pytest.param(
+            REPEATED_FRONTIER_STREAK_STOP_AT,
+            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
+            "PARAMETER_BINDING_ERROR",
+            POST_PARAMETER_BINDING_STOP_NUDGE,
+            id="stop_parameter_binding",
+        ),
+        pytest.param(
+            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
+            0,
+            "ELEMENT_NOT_FOUND",
+            POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
+            id="warn_generic",
+        ),
+        pytest.param(
+            REPEATED_FRONTIER_STREAK_STOP_AT,
+            REPEATED_FRONTIER_STREAK_ESCALATE_AT,
+            "ANTI_BOT_DETECTION",
+            POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
+            id="stop_generic",
+        ),
+    ],
+)
+def test_nudge_selection_matrix(streak: int, emitted_at: int, category: str, expected_nudge: Any) -> None:
     ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_ESCALATE_AT
-    ctx.repeated_failure_nudge_emitted_at_streak = 0
-    ctx.last_failure_category_top = "PARAMETER_BINDING_ERROR"
-    assert _repeated_frontier_failure_nudge(ctx) is POST_PARAMETER_BINDING_WARN_NUDGE
-
-
-def test_nudge_stop_picks_parameter_binding_when_category_is_binding() -> None:
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_STOP_AT
-    ctx.repeated_failure_nudge_emitted_at_streak = REPEATED_FRONTIER_STREAK_ESCALATE_AT
-    ctx.last_failure_category_top = "PARAMETER_BINDING_ERROR"
-    assert _repeated_frontier_failure_nudge(ctx) is POST_PARAMETER_BINDING_STOP_NUDGE
-
-
-def test_nudge_warn_keeps_generic_when_category_is_other() -> None:
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_ESCALATE_AT
-    ctx.repeated_failure_nudge_emitted_at_streak = 0
-    ctx.last_failure_category_top = "ELEMENT_NOT_FOUND"
-    assert _repeated_frontier_failure_nudge(ctx) is POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE
-
-
-def test_nudge_stop_keeps_generic_when_category_is_other() -> None:
-    ctx = _make_ctx()
-    ctx.repeated_failure_streak_count = REPEATED_FRONTIER_STREAK_STOP_AT
-    ctx.repeated_failure_nudge_emitted_at_streak = REPEATED_FRONTIER_STREAK_ESCALATE_AT
-    ctx.last_failure_category_top = "ANTI_BOT_DETECTION"
-    assert _repeated_frontier_failure_nudge(ctx) is POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE
+    ctx.repeated_failure_streak_count = streak
+    ctx.repeated_failure_nudge_emitted_at_streak = emitted_at
+    ctx.last_failure_category_top = category
+    assert _repeated_frontier_failure_nudge(ctx) is expected_nudge
 
 
 def test_nudge_below_threshold_returns_none() -> None:

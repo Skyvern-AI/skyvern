@@ -27,13 +27,14 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.schemas.credentials import (
+    BitwardenItemOverview,
     CredentialItem,
     CredentialType,
+    CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
     SecretCredential,
 )
-from skyvern.forge.sdk.services.credentials import parse_totp_secret
 from skyvern.utils.strings import is_uuid
 
 LOG = structlog.get_logger()
@@ -45,6 +46,87 @@ class BitwardenItemType(IntEnum):
     SECURE_NOTE = 2
     CREDIT_CARD = 3
     IDENTITY = 4
+
+
+BITWARDEN_CUSTOM_FIELD_TYPE_HIDDEN = 1
+CREDIT_CARD_BILLING_ADDRESS_FIELDS = (
+    "line1",
+    "line2",
+    "city",
+    "state",
+    "state_code",
+    "postal_code",
+    "country",
+    "country_code",
+)
+
+
+def _credit_card_extra_custom_field_values(credential: CreditCardCredential) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if credential.billing_address is not None:
+        for key, value in credential.billing_address.model_dump(exclude_none=True).items():
+            if value:
+                values[f"billing_address_{key}"] = value
+    if credential.billing_email:
+        values["billing_email"] = credential.billing_email
+    if credential.billing_phone:
+        values["billing_phone"] = credential.billing_phone
+    if credential.metadata:
+        for key, value in credential.metadata.items():
+            if key and value:
+                values[f"metadata_{key}"] = value
+    return values
+
+
+def _build_bitwarden_custom_fields(credential: CreditCardCredential) -> list[dict[str, str | int | None]]:
+    return [
+        {
+            "name": name,
+            "value": value,
+            "type": BITWARDEN_CUSTOM_FIELD_TYPE_HIDDEN,
+            "linkedId": None,
+        }
+        for name, value in _credit_card_extra_custom_field_values(credential).items()
+    ]
+
+
+def _extract_credit_card_extra_custom_field_values(item: dict) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field in item.get("fields") or []:
+        name = field.get("name")
+        value = field.get("value")
+        if not isinstance(name, str) or not isinstance(value, str) or not value:
+            continue
+        if name == "billing_email" or name == "billing_phone" or name.startswith("billing_address_"):
+            values[name] = value
+        elif name.startswith("metadata_"):
+            values[name] = value
+    return values
+
+
+def _credit_card_credential_from_bitwarden_item(item: dict) -> CreditCardCredential:
+    card = item["card"]
+    extra_values = _extract_credit_card_extra_custom_field_values(item)
+    address_values = {
+        key: extra_values[f"billing_address_{key}"]
+        for key in CREDIT_CARD_BILLING_ADDRESS_FIELDS
+        if f"billing_address_{key}" in extra_values
+    }
+    metadata = {
+        key.removeprefix("metadata_"): value for key, value in extra_values.items() if key.startswith("metadata_")
+    }
+    return CreditCardCredential(
+        card_holder_name=card["cardholderName"],
+        card_number=card["number"],
+        card_exp_month=card["expMonth"],
+        card_exp_year=card["expYear"],
+        card_cvv=card["code"],
+        card_brand=card["brand"],
+        billing_address=CreditCardBillingAddress(**address_values) if address_values else None,
+        billing_email=extra_values.get("billing_email"),
+        billing_phone=extra_values.get("billing_phone"),
+        metadata=metadata or None,
+    )
 
 
 def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
@@ -61,7 +143,7 @@ def get_bitwarden_item_type_code(item_type: BitwardenItemType) -> int:
 def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
     if item["type"] == BitwardenItemType.LOGIN:
         login = item["login"]
-        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+        totp = BitwardenService.normalize_totp_config(login.get("totp", ""))
         return CredentialItem(
             item_id=item["id"],
             credential=PasswordCredential(
@@ -73,17 +155,9 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
             credential_type=CredentialType.PASSWORD,
         )
     elif item["type"] == BitwardenItemType.CREDIT_CARD:
-        card = item["card"]
         return CredentialItem(
             item_id=item["id"],
-            credential=CreditCardCredential(
-                card_holder_name=card["cardholderName"],
-                card_number=card["number"],
-                card_exp_month=card["expMonth"],
-                card_exp_year=card["expYear"],
-                card_cvv=card["code"],
-                card_brand=card["brand"],
-            ),
+            credential=_credit_card_credential_from_bitwarden_item(item),
             name=item["name"],
             credential_type=CredentialType.CREDIT_CARD,
         )
@@ -109,6 +183,55 @@ def get_list_response_item_from_bitwarden_item(item: dict) -> CredentialItem:
         )
     else:
         raise BitwardenGetItemError(f"Unsupported item type: {item['type']}")
+
+
+def get_bitwarden_item_overview_from_bitwarden_item(
+    item: dict,
+    allowed_collection_ids: list[str] | None = None,
+    preferred_collection_id: str | None = None,
+) -> BitwardenItemOverview | None:
+    item_id, title, item_type = item.get("id"), item.get("name"), item.get("type")
+    if not isinstance(item_type, int):
+        return None
+    try:
+        credential_type = {
+            BitwardenItemType.LOGIN: CredentialType.PASSWORD,
+            BitwardenItemType.CREDIT_CARD: CredentialType.CREDIT_CARD,
+            BitwardenItemType.SECURE_NOTE: CredentialType.SECRET,
+            BitwardenItemType.IDENTITY: CredentialType.SECRET,
+        }[BitwardenItemType(item_type)]
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(item_id, str) or not isinstance(title, str):
+        return None
+
+    collection_ids = [str(collection_id) for collection_id in item.get("collectionIds") or [] if collection_id]
+    allowed_collection_ids = allowed_collection_ids or []
+    # Collection-scoped CLI queries can omit collectionIds, so keep the queried collection as a fallback.
+    collection_id = (
+        preferred_collection_id
+        if preferred_collection_id and preferred_collection_id in collection_ids
+        else next((cid for cid in collection_ids if cid in allowed_collection_ids), None)
+        or (collection_ids[0] if collection_ids else preferred_collection_id)
+    )
+    login = item.get("login")
+    uris = login.get("uris") if isinstance(login, dict) else []
+    url = next(
+        (
+            uri.get("uri")
+            for uri in uris or []
+            if isinstance(uri, dict) and isinstance(uri.get("uri"), str) and uri.get("uri")
+        ),
+        None,
+    )
+
+    return BitwardenItemOverview(
+        item_id=item_id,
+        title=title,
+        collection_id=collection_id,
+        credential_type=credential_type,
+        url=url,
+    )
 
 
 def is_valid_email(email: str | None) -> bool:
@@ -159,6 +282,8 @@ class RunCommandResult(BaseModel):
 
 
 class BitwardenService:
+    _cli_session_lock: asyncio.Lock = asyncio.Lock()
+
     @staticmethod
     def _is_ignorable_login_stderr(stderr: str) -> bool:
         lines = [line.strip() for line in stderr.splitlines() if line.strip()]
@@ -249,6 +374,98 @@ class BitwardenService:
         return None
 
     @staticmethod
+    async def _list_items_using_cli(
+        session_key: str,
+        bw_organization_id: str | None = None,
+        collection_id: str | None = None,
+        timeout: int = 60,
+    ) -> list[dict]:
+        list_command = ["bw", "list", "items", "--session", session_key]
+        if bw_organization_id:
+            list_command.extend(["--organizationid", bw_organization_id])
+        if collection_id:
+            list_command.extend(["--collectionid", collection_id])
+
+        items_result = await BitwardenService.run_command(list_command, timeout=timeout)
+        if items_result.returncode != 0:
+            raise BitwardenListItemsError(f"Failed to list Bitwarden items. Error: {items_result.stderr}")
+
+        try:
+            items = json.loads(items_result.stdout)
+            if isinstance(items, list):
+                return items
+        except json.JSONDecodeError:
+            pass
+        raise BitwardenListItemsError("Failed to parse items JSON")
+
+    @staticmethod
+    async def list_item_overviews(
+        client_id: str | None,
+        client_secret: str | None,
+        master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
+        email: str,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+    ) -> list[BitwardenItemOverview]:
+        if not email or not master_password:
+            raise BitwardenLoginError("Bitwarden item listing requires org-scoped email and master password")
+
+        await BitwardenService._apply_jitter()
+        async with asyncio.timeout(timeout):
+            async with BitwardenService._cli_session_lock:
+                try:
+                    # The Bitwarden CLI stores active login state globally, so the whole session workflow is locked.
+                    await BitwardenService.logout()
+                    await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
+                    await BitwardenService.sync()
+                    session_key = await BitwardenService.unlock(master_password)
+                    raw_items_with_preferred_collection: list[tuple[dict, str | None]] = []
+
+                    if bw_organization_id:
+                        raw_items = await BitwardenService._list_items_using_cli(
+                            session_key=session_key,
+                            bw_organization_id=bw_organization_id,
+                            timeout=timeout,
+                        )
+                        allowed_collection_ids = set(bw_collection_ids or [])
+                        if allowed_collection_ids:
+                            raw_items = [
+                                item
+                                for item in raw_items
+                                if any(cid in allowed_collection_ids for cid in item.get("collectionIds") or [])
+                            ]
+                        raw_items_with_preferred_collection = [(item, None) for item in raw_items]
+                    elif bw_collection_ids:
+                        for collection_id in bw_collection_ids:
+                            raw_items = await BitwardenService._list_items_using_cli(
+                                session_key=session_key,
+                                collection_id=collection_id,
+                                timeout=timeout,
+                            )
+                            raw_items_with_preferred_collection.extend((item, collection_id) for item in raw_items)
+                    else:
+                        raw_items = await BitwardenService._list_items_using_cli(
+                            session_key=session_key, timeout=timeout
+                        )
+                        raw_items_with_preferred_collection = [(item, None) for item in raw_items]
+
+                    overviews: list[BitwardenItemOverview] = []
+                    seen_item_ids: set[str] = set()
+                    for item, preferred_collection_id in raw_items_with_preferred_collection:
+                        overview = get_bitwarden_item_overview_from_bitwarden_item(
+                            item,
+                            allowed_collection_ids=bw_collection_ids,
+                            preferred_collection_id=preferred_collection_id,
+                        )
+                        if overview is not None and overview.item_id not in seen_item_ids:
+                            seen_item_ids.add(overview.item_id)
+                            overviews.append(overview)
+                    return overviews
+                finally:
+                    await BitwardenService.logout()
+
+    @staticmethod
     async def get_secret_value_from_url(
         client_id: str | None,
         client_secret: str | None,
@@ -278,18 +495,19 @@ class BitwardenService:
             timeout = (i + 1) * timeout
             try:
                 async with asyncio.timeout(timeout):
-                    return await BitwardenService._get_secret_value_from_url(
-                        client_id=client_id,
-                        client_secret=client_secret,
-                        master_password=master_password,
-                        bw_organization_id=bw_organization_id,
-                        bw_collection_ids=bw_collection_ids,
-                        url=url,
-                        collection_id=collection_id,
-                        item_id=item_id,
-                        timeout=timeout,
-                        email=email,
-                    )
+                    async with BitwardenService._cli_session_lock:
+                        return await BitwardenService._get_secret_value_from_url(
+                            client_id=client_id,
+                            client_secret=client_secret,
+                            master_password=master_password,
+                            bw_organization_id=bw_organization_id,
+                            bw_collection_ids=bw_collection_ids,
+                            url=url,
+                            collection_id=collection_id,
+                            item_id=item_id,
+                            timeout=timeout,
+                            email=email,
+                        )
             except BitwardenAccessDeniedError as e:
                 raise e
             except Exception as e:
@@ -301,23 +519,28 @@ class BitwardenService:
             )
 
     @staticmethod
-    def extract_totp_secret(totp_value: str) -> str:
+    def normalize_totp_config(totp_value: str) -> str:
         """
-        Extract the TOTP secret from either a raw secret or a TOTP URI.
+        Preserve the raw TOTP value from Bitwarden.
 
         Args:
-            totp_value: Raw TOTP secret or URI (otpauth://totp/...)
+            totp_value: Raw TOTP secret, URI, or provider-specific payload.
 
         Returns:
-            The extracted TOTP secret
+            The raw TOTP value
 
         Example:
-            >>> BitwardenService.extract_totp_secret("AAAAAABBBBBBB")
+            >>> BitwardenService.normalize_totp_config("AAAAAABBBBBBB")
             "AAAAAABBBBBBB"
-            >>> BitwardenService.extract_totp_secret("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
-            "AAAAAABBBBBBB"
+            >>> BitwardenService.normalize_totp_config("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
+            "otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB"
         """
-        return parse_totp_secret(totp_value)
+        return totp_value.strip()
+
+    @staticmethod
+    def extract_totp_secret(totp_value: str) -> str:
+        """Compatibility shim for callers using the old method name."""
+        return BitwardenService.normalize_totp_config(totp_value)
 
     @staticmethod
     async def _get_secret_value_from_url(
@@ -353,7 +576,7 @@ class BitwardenService:
                     raise BitwardenGetItemError(f"Failed to parse item JSON for item ID: {item_id}")
 
                 login = item["login"]
-                totp = BitwardenService.extract_totp_secret(login.get("totp") or "")
+                totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
 
                 return {
                     BitwardenConstants.USERNAME: login.get("username") or "",
@@ -415,7 +638,7 @@ class BitwardenService:
                     continue
 
                 login = item["login"]
-                totp = BitwardenService.extract_totp_secret(login.get("totp") or "")
+                totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
 
                 bitwarden_result.append(
                     BitwardenQueryResult(
@@ -474,17 +697,18 @@ class BitwardenService:
             await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(timeout):
-                return await BitwardenService._get_sensitive_information_from_identity(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    master_password=master_password,
-                    bw_organization_id=bw_organization_id,
-                    bw_collection_ids=bw_collection_ids,
-                    collection_id=collection_id,
-                    identity_key=identity_key,
-                    identity_fields=identity_fields,
-                    email=email,
-                )
+                async with BitwardenService._cli_session_lock:
+                    return await BitwardenService._get_sensitive_information_from_identity(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        master_password=master_password,
+                        bw_organization_id=bw_organization_id,
+                        bw_collection_ids=bw_collection_ids,
+                        collection_id=collection_id,
+                        identity_key=identity_key,
+                        identity_fields=identity_fields,
+                        email=email,
+                    )
         except BitwardenAccessDeniedError as e:
             raise e
         except Exception as e:
@@ -748,6 +972,7 @@ class BitwardenService:
                 BitwardenConstants.CREDIT_CARD_CVV: credit_card_data["code"],
                 BitwardenConstants.CREDIT_CARD_BRAND: credit_card_data["brand"],
             }
+            mapped_credit_card_data.update(_extract_credit_card_extra_custom_field_values(item))
 
             return mapped_credit_card_data
         finally:
@@ -777,16 +1002,17 @@ class BitwardenService:
             await BitwardenService._apply_jitter()
         try:
             async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
-                return await BitwardenService._get_credit_card_data(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    master_password=master_password,
-                    bw_organization_id=bw_organization_id,
-                    bw_collection_ids=bw_collection_ids,
-                    collection_id=collection_id,
-                    item_id=item_id,
-                    email=email,
-                )
+                async with BitwardenService._cli_session_lock:
+                    return await BitwardenService._get_credit_card_data(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        master_password=master_password,
+                        bw_organization_id=bw_organization_id,
+                        bw_collection_ids=bw_collection_ids,
+                        collection_id=collection_id,
+                        item_id=item_id,
+                        email=email,
+                    )
         except BitwardenAccessDeniedError as e:
             raise e
         except Exception as e:
@@ -830,7 +1056,7 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Failed to get login item by ID: {item_id}")
 
         login = response["data"]["login"]
-        totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+        totp = BitwardenService.normalize_totp_config(login.get("totp", ""))
         if not login:
             raise BitwardenGetItemError(f"Item with ID: {item_id} is not a login item")
 
@@ -894,6 +1120,7 @@ class BitwardenService:
         item_template["type"] = get_bitwarden_item_type_code(BitwardenItemType.CREDIT_CARD)
         item_template["name"] = name
         item_template["card"] = credit_card_template
+        item_template["fields"] = _build_bitwarden_custom_fields(credential)
         item_template["collectionIds"] = [collection_id]
         item_template["organizationId"] = bw_organization_id
 
@@ -1145,20 +1372,12 @@ class BitwardenService:
                 ),
             )
         elif response["data"]["type"] == BitwardenItemType.CREDIT_CARD:
-            credit_card_item = response["data"]["card"]
             name = response["data"]["name"]
             return CredentialItem(
                 item_id=item_id,
                 credential_type=CredentialType.CREDIT_CARD,
                 name=name,
-                credential=CreditCardCredential(
-                    card_holder_name=credit_card_item["cardholderName"],
-                    card_number=credit_card_item["number"],
-                    card_exp_month=credit_card_item["expMonth"],
-                    card_exp_year=credit_card_item["expYear"],
-                    card_cvv=credit_card_item["code"],
-                    card_brand=credit_card_item["brand"],
-                ),
+                credential=_credit_card_credential_from_bitwarden_item(response["data"]),
             )
         elif response["data"]["type"] == BitwardenItemType.SECURE_NOTE:
             name = response["data"]["name"]

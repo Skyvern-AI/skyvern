@@ -4,6 +4,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDe
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
+from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
 from skyvern.services.browser_recording.types import RecordingDraftStep
 
@@ -36,6 +37,16 @@ class CreateBrowserSessionRequest(BaseModel):
                 return proxy_location
             return GeoTarget.model_validate(proxy_location)
         return proxy_location
+
+    proxy_session_id: str | None = Field(
+        default=None,
+        description="Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.",
+    )
+
+    @field_validator("proxy_session_id")
+    @classmethod
+    def validate_proxy_session_id_field(cls, value: str | None) -> str | None:
+        return validate_proxy_session_id(value)
 
     extensions: list[Extensions] | None = Field(
         default=None,

@@ -43,6 +43,8 @@ async def test_run_local_screencast_happy_path(monkeypatch: pytest.MonkeyPatch) 
         entity_id="task_123",
         entity_type="task",
         check_finalized=check_finalized,
+        workflow_run_id="wr_123",
+        organization_id=None,
     )
     get_current_status.assert_awaited_once()
     send_status_mock.assert_awaited_once_with(websocket, "task_id", "task_123", "completed")

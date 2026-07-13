@@ -104,6 +104,9 @@ export default {
         elevated: "var(--shadow-elevated)",
         popover: "var(--shadow-popover)",
       },
+      transitionTimingFunction: {
+        sidebar: "cubic-bezier(0.32, 0.72, 0, 1)",
+      },
       keyframes: {
         "accordion-down": {
           from: { height: "0" },
@@ -139,6 +142,18 @@ export default {
           "0%, 100%": { boxShadow: "0 0 8px 2px rgba(234, 179, 8, 0.3)" },
           "50%": { boxShadow: "0 0 24px 8px rgba(234, 179, 8, 0.6)" },
         },
+        "analytics-pulse-ring": {
+          from: { boxShadow: "0 0 0 0 hsl(var(--foreground) / 0.35)" },
+          to: { boxShadow: "0 0 0 8px hsl(var(--foreground) / 0)" },
+        },
+        "copilot-row-flash-success": {
+          "0%, 30%": { backgroundColor: "rgba(16, 185, 129, 0.22)" },
+          "100%": { backgroundColor: "transparent" },
+        },
+        "copilot-row-flash-error": {
+          "0%, 30%": { backgroundColor: "rgba(244, 63, 94, 0.22)" },
+          "100%": { backgroundColor: "transparent" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
@@ -151,6 +166,9 @@ export default {
         "collapsible-up-fade":
           "collapsible-up-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
         glow: "glow 2.5s ease-in-out infinite",
+        "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
+        "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",
+        "copilot-row-flash-error": "copilot-row-flash-error 0.6s ease-out",
       },
     },
   },

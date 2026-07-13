@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.forge.agent import ForgeAgent, _build_open_tabs_context
+from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.prompts import prompt_engine
+from skyvern.webeye.utils.page import build_open_tabs_context
 
 _BASE_KWARGS: dict[str, Any] = {
     "navigation_goal": "close the stuck tab and continue",
@@ -35,7 +36,9 @@ class TestClosePageGate:
             **_BASE_KWARGS,
         )
         assert '"CLOSE_PAGE"' in rendered
-        assert "close the current tab" in rendered.lower()
+        assert "closes the current tab" in rendered.lower()
+        # close-by-index is documented even when SWITCH_TAB is unavailable
+        assert "tab_index" in rendered
 
     @pytest.mark.parametrize("template", ["extract-action", "extract-action-static"])
     def test_no_close_page_without_tab_context(self, template: str) -> None:
@@ -71,7 +74,7 @@ class TestOpenTabsContextSection:
             **_BASE_KWARGS,
         )
         assert "Open browser tabs" in rendered
-        assert "other tabs are shown for context only" in rendered
+        assert "tab_index" in rendered
         assert "[current]" in rendered
         assert "https://main.test" in rendered
         assert "https://pdf.test/viewer" in rendered
@@ -183,7 +186,7 @@ class TestNewTabSwitchTabGate:
             **_BASE_KWARGS,
         )
         assert "use SWITCH_TAB" in switch_on
-        assert "context only" not in switch_on
+        assert "by default" not in switch_on
 
         switch_off = prompt_engine.load_prompt(
             "extract-action-dynamic",
@@ -194,7 +197,7 @@ class TestNewTabSwitchTabGate:
             **_BASE_KWARGS,
         )
         assert "use SWITCH_TAB" not in switch_off
-        assert "context only" in switch_off
+        assert "by default" in switch_off
 
 
 class TestTabCacheVariant:
@@ -222,7 +225,7 @@ class TestBuildOpenTabsContext:
     @pytest.mark.asyncio
     async def test_returns_none_when_working_page_is_none(self) -> None:
         browser_state = MagicMock()
-        result = await _build_open_tabs_context(browser_state, None)
+        result = await build_open_tabs_context(browser_state, None)
         assert result is None
         browser_state.list_valid_pages.assert_not_called()
 
@@ -232,7 +235,7 @@ class TestBuildOpenTabsContext:
         page.url = "https://example.test"
         browser_state = MagicMock()
         browser_state.list_valid_pages = AsyncMock(return_value=[page])
-        result = await _build_open_tabs_context(browser_state, page)
+        result = await build_open_tabs_context(browser_state, page)
         assert result is None
 
     @pytest.mark.asyncio
@@ -248,7 +251,7 @@ class TestBuildOpenTabsContext:
         browser_state = MagicMock()
         browser_state.list_valid_pages = AsyncMock(return_value=[page0, page1])
 
-        result = await _build_open_tabs_context(browser_state, page1)
+        result = await build_open_tabs_context(browser_state, page1)
         assert result is not None
         assert "Tab 0: https://example.test/main (Main Page)" in result
         assert "Tab 1 [current]: https://example.test/viewer (PDF Viewer)" in result
@@ -266,7 +269,7 @@ class TestBuildOpenTabsContext:
         browser_state = MagicMock()
         browser_state.list_valid_pages = AsyncMock(return_value=[page0, page1])
 
-        result = await _build_open_tabs_context(browser_state, page1)
+        result = await build_open_tabs_context(browser_state, page1)
         assert result is not None
         assert "Tab 0: https://example.test/main" in result
         assert "(Main Page)" not in result
@@ -286,7 +289,7 @@ class TestBuildOpenTabsContext:
         browser_state = MagicMock()
         browser_state.list_valid_pages = AsyncMock(return_value=[page0, page1])
 
-        result = await _build_open_tabs_context(browser_state, page1)
+        result = await build_open_tabs_context(browser_state, page1)
         assert result is not None
         assert "..." in result
         for line in result.splitlines():
@@ -308,7 +311,7 @@ class TestBuildOpenTabsContext:
         browser_state = MagicMock()
         browser_state.list_valid_pages = AsyncMock(return_value=[page0, page1])
 
-        result = await _build_open_tabs_context(browser_state, page1)
+        result = await build_open_tabs_context(browser_state, page1)
         assert result is not None
         assert "..." in result
         for line in result.splitlines():

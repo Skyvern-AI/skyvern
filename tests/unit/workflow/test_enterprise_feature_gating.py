@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ConditionalBlock,
     ForLoopBlock,
     NavigationBlock,
+    SplitPdfBlock,
     TaskV2Block,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -157,6 +158,19 @@ def test_ignores_stale_model_on_task_v2_block() -> None:
     assert _collect_enterprise_gated_workflow_features(workflow) == set()
 
 
+def test_collects_gated_model_on_split_pdf_block() -> None:
+    split_block = SplitPdfBlock(
+        label="split",
+        file_url="{{ source }}",
+        prompt="Split by document.",
+        output_parameter=_output_parameter("split_output"),
+        model={"model_name": "claude-opus-4-6"},
+    )
+    workflow = _workflow([split_block])
+
+    assert _collect_enterprise_gated_workflow_features(workflow) == {"Anthropic Claude 4.6 Opus"}
+
+
 @pytest.mark.parametrize(
     ("model_name", "feature_name"),
     [
@@ -187,6 +201,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
     workflow = _workflow([_navigation_block("openai", engine=RunEngine.openai_cua)])
     workflow_run = SimpleNamespace(
         workflow_run_id="wr_1",
+        workflow_id=workflow.workflow_id,
         workflow_permanent_id=workflow.workflow_permanent_id,
         browser_profile_id=None,
         browser_address=None,
@@ -208,7 +223,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
 
     svc = WorkflowService()
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=workflow_run))
-    monkeypatch.setattr(svc, "get_workflow_by_permanent_id", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
     mark_workflow_run_as_failed = AsyncMock(return_value=failed_workflow_run)
     clean_up_workflow = AsyncMock()
     monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_workflow_run_as_failed)

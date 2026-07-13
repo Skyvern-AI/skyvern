@@ -22,6 +22,11 @@ import {
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import {
+  RunTypeFilterDropdown,
+  RunTypeGroup,
+  runTypeGroupToRunTypes,
+} from "@/components/RunTypeFilterDropdown";
 import { TriggerTypeBadge } from "@/components/TriggerTypeBadge";
 import {
   Pagination,
@@ -42,6 +47,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import {
   basicLocalTimeFormat,
   basicTimeFormat,
@@ -49,7 +55,7 @@ import {
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -94,8 +100,34 @@ function parseStatusParam(raw: string | null): Array<Status> {
   return out;
 }
 
+const runTypeGroupValues = new Set<string>(Object.values(RunTypeGroup));
+
+function parseRunTypeParam(raw: string | null): Array<RunTypeGroup> {
+  if (!raw) {
+    return [];
+  }
+  const seen = new Set<RunTypeGroup>();
+  const out: Array<RunTypeGroup> = [];
+  for (const token of raw.split(",")) {
+    const trimmed = token.trim();
+    if (!runTypeGroupValues.has(trimmed)) {
+      continue;
+    }
+    const group = trimmed as RunTypeGroup;
+    if (seen.has(group)) {
+      continue;
+    }
+    seen.add(group);
+    out.push(group);
+  }
+  return out;
+}
+
 // Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
 function inferTriggerType(run: TaskRunListItem): TriggerType | null {
+  if (run.trigger_type) {
+    return run.trigger_type;
+  }
   if (
     run.task_run_type === TaskRunType.WorkflowRun &&
     run.run_id.startsWith("wr_sched_")
@@ -105,9 +137,17 @@ function inferTriggerType(run: TaskRunListItem): TriggerType | null {
   return null;
 }
 
-function getRunNavigationPath(run: TaskRunListItem): string {
+function getRunNavigationPath(
+  run: TaskRunListItem,
+  studioEnabled: boolean,
+): string {
   switch (run.task_run_type) {
     case TaskRunType.WorkflowRun:
+      // With the studio on, workflow runs open in its Run tab; otherwise they
+      // use the standalone run page (also the fallback when there is no wpid).
+      return studioEnabled && run.workflow_permanent_id
+        ? `/agents/${run.workflow_permanent_id}/studio?wr=${run.run_id}`
+        : `/runs/${run.run_id}`;
     case TaskRunType.TaskV2:
       return `/runs/${run.run_id}`;
     case TaskRunType.TaskV1:
@@ -135,6 +175,14 @@ function RunHistory() {
     () => parseStatusParam(searchParams.get("status")),
     [searchParams],
   );
+  const runTypeGroups = useMemo(
+    () => parseRunTypeParam(searchParams.get("run_type")),
+    [searchParams],
+  );
+  const runTypeFilters = useMemo(
+    () => runTypeGroups.flatMap((group) => runTypeGroupToRunTypes[group]),
+    [runTypeGroups],
+  );
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
@@ -144,14 +192,17 @@ function RunHistory() {
     page,
     pageSize: itemsPerPage,
     statusFilters,
+    runTypeFilters,
     search: effectiveSearch,
   });
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   const { data: rawNextPageRuns } = useRunsQuery({
     page: page + 1,
     pageSize: itemsPerPage,
     statusFilters,
+    runTypeFilters,
     search: effectiveSearch,
     enabled: rawRuns?.length === itemsPerPage,
   });
@@ -183,28 +234,9 @@ function RunHistory() {
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
 
-  const { matchesParameter, isSearchActive } =
-    useKeywordSearch(debouncedSearch);
-  const {
-    expandedRows,
-    toggleExpanded: toggleParametersExpanded,
-    setAutoExpandedRows,
-  } = useParameterExpansion();
-
-  useEffect(() => {
-    if (!isSearchActive) {
-      setAutoExpandedRows([]);
-      return;
-    }
-
-    const workflowRunIds =
-      runs
-        ?.filter((run) => run.task_run_type === TaskRunType.WorkflowRun)
-        .map((run) => run.run_id)
-        .filter((id): id is string => Boolean(id)) ?? [];
-
-    setAutoExpandedRows(workflowRunIds);
-  }, [isSearchActive, runs, setAutoExpandedRows]);
+  const { matchesParameter } = useKeywordSearch(debouncedSearch);
+  const { expandedRows, toggleExpanded: toggleParametersExpanded } =
+    useParameterExpansion();
 
   function handleNavigate(event: React.MouseEvent, path: string) {
     if (event.ctrlKey || event.metaKey) {
@@ -258,7 +290,7 @@ function RunHistory() {
       );
       const isWorkflowRun = run.task_run_type === TaskRunType.WorkflowRun;
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
-      const navPath = getRunNavigationPath(run);
+      const navPath = getRunNavigationPath(run, studioEnabled);
       const triggerType = inferTriggerType(run);
 
       const titleContent =
@@ -384,6 +416,7 @@ function RunHistory() {
 
   const hasActiveFilters =
     statusFilters.length > 0 ||
+    runTypeGroups.length > 0 ||
     !!debouncedSearch ||
     !!workflowPermanentIdFilter;
   const showOnboardingEmpty =
@@ -408,11 +441,11 @@ function RunHistory() {
             description="Every time you run a workflow, the result shows up on this page. Create your first workflow to get started."
             primaryAction={{
               label: "Create your first workflow",
-              onClick: () => navigate("/workflows"),
+              onClick: () => navigate("/agents"),
             }}
             secondaryAction={{
               label: "Browse templates",
-              onClick: () => navigate("/workflows"),
+              onClick: () => navigate("/agents"),
             }}
           />
         </div>
@@ -454,19 +487,34 @@ function RunHistory() {
               disabled={!!workflowPermanentIdFilter}
               className="w-48 lg:w-72"
             />
-            <StatusFilterDropdown
-              values={statusFilters}
-              onChange={(filters) => {
-                const params = new URLSearchParams(searchParams);
-                if (filters.length === 0) {
-                  params.delete("status");
-                } else {
-                  params.set("status", filters.join(","));
-                }
-                params.set("page", "1");
-                setSearchParams(params, { replace: true });
-              }}
-            />
+            <div className="flex items-center gap-2">
+              <RunTypeFilterDropdown
+                values={runTypeGroups}
+                onChange={(groups) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (groups.length === 0) {
+                    params.delete("run_type");
+                  } else {
+                    params.set("run_type", groups.join(","));
+                  }
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
+              <StatusFilterDropdown
+                values={statusFilters}
+                onChange={(filters) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (filters.length === 0) {
+                    params.delete("status");
+                  } else {
+                    params.set("status", filters.join(","));
+                  }
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
+            </div>
           </div>
           <div className="overflow-hidden rounded-lg border border-border">
             <Table className="sm:table-fixed">
@@ -565,7 +613,7 @@ function WorkflowRunParametersInline({
       workflowRunId,
       "params-inline",
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -577,6 +625,7 @@ function WorkflowRunParametersInline({
       return client
         .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
           params,
+          signal,
         })
         .then((r) => r.data);
     },

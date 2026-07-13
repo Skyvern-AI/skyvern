@@ -5,16 +5,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.copilot.agent import _native_tools_for_turn
+from skyvern.forge.sdk.copilot.agent import _mcp_tool_surface_for_turn, _native_tools_for_turn
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import (
     NATIVE_TOOLS,
     _authority_tool_error,
+    _build_skyvern_mcp_overlays,
     _get_run_results,
     _turn_intent_tool_error,
     _update_workflow,
+    get_skyvern_mcp_alias_map,
 )
 from skyvern.forge.sdk.copilot.turn_intent import (
     UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
@@ -80,10 +82,8 @@ def _assert_signal(
     ("mode", "tool_name", "expected_reason"),
     [
         (TurnIntentMode.DOCS_ANSWER, "update_workflow", "turn_intent_no_mutation_update_blocked"),
-        (TurnIntentMode.DIAGNOSE, "run_blocks_and_collect_debug", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.DOCS_ANSWER, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.DOCS_ANSWER, "list_credentials", "turn_intent_credential_metadata_blocked"),
-        (TurnIntentMode.DIAGNOSE, "list_credentials", "turn_intent_credential_metadata_blocked"),
         (TurnIntentMode.CLARIFY, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.CLARIFY, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.REFUSE, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
@@ -107,31 +107,154 @@ def test_no_mutation_turn_intent_blocks_mutating_tools(
     _assert_signal(signal, internal_reason_code=expected_reason, classifier_mode=mode.value, blocked_tool=tool_name)
 
 
-def test_turn_intent_gate_allows_draft_update_without_run_authority() -> None:
+def _diagnose_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.DIAGNOSE,
+        authority=TurnIntentAuthority(
+            may_update_workflow=False,
+            may_run_blocks=False,
+            may_read_run_context=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_reason"),
+    [
+        ("run_blocks_and_collect_debug", "turn_intent_no_mutation_run_blocked"),
+        ("update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
+        ("update_workflow", "turn_intent_no_mutation_update_blocked"),
+        ("inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
+        ("list_credentials", "turn_intent_credential_metadata_blocked"),
+    ],
+)
+def test_diagnose_denied_tool_soft_blocks_and_continues_to_diagnosis(tool_name: str, expected_reason: str) -> None:
+    # A denied tool in a diagnose turn stays denied but must not terminate the turn: the blocker is a
+    # non-terminating soft steer toward an evidence-grounded fix, covering every denied tool class.
+    signal = _turn_intent_tool_error(_ctx(_diagnose_intent()), tool_name)
+    assert signal is not None
+    assert signal.internal_reason_code == expected_reason
+    assert signal.blocked_tool == tool_name
+    assert signal.classifier_mode == TurnIntentMode.DIAGNOSE.value
+    # the load-bearing assertions: soft, non-terminating, steered at the run evidence + a confirmable fix
+    assert signal.blocker_kind == "tool_error"
+    assert signal.renders_final_reply is False
+    assert signal.recovery_hint == "retry_with_different_tool"
+    steer = signal.agent_steering_text.lower()
+    assert "diagnose" in steer and "fix" in steer
+    assert "i'll respond with the information i already have" not in signal.user_facing_reason.lower()
+    for token in _LEAK_TOKENS:
+        assert token not in signal.user_facing_reason
+
+
+@pytest.mark.parametrize("tool_name", ["update_workflow", "update_and_run_blocks", "run_blocks_and_collect_debug"])
+def test_diagnose_soft_block_still_denies_side_effect(tool_name: str) -> None:
+    # A non-terminating soft block still returns a blocker, so the side-effecting tool is denied and never runs;
+    # renders_final_reply governs only whether the turn ends, not whether the side effect runs.
+    signal = _turn_intent_tool_error(_ctx(_diagnose_intent()), tool_name)
+    assert signal is not None
+    assert tool_name not in signal.cleared_by_tools
+
+
+@pytest.mark.parametrize(
+    ("mode", "authority_kwargs", "target_entities", "tool_name"),
+    [
+        pytest.param(
+            TurnIntentMode.DRAFT_ONLY,
+            {"may_update_workflow": True, "may_run_blocks": False},
+            {},
+            "update_workflow",
+            id="draft_update_without_run_authority",
+        ),
+        pytest.param(
+            TurnIntentMode.BUILD,
+            {"may_update_workflow": True, "may_run_blocks": False},
+            {},
+            "inspect_page_for_composition",
+            id="build_page_inspection_with_update_authority",
+        ),
+        pytest.param(
+            TurnIntentMode.BUILD,
+            {"may_update_workflow": True, "may_run_blocks": False},
+            {},
+            "list_credentials",
+            id="credential_metadata_with_update_authority",
+        ),
+        pytest.param(
+            TurnIntentMode.BUILD,
+            {"may_update_workflow": True, "may_run_blocks": True},
+            {},
+            "update_and_run_blocks",
+            id="build_update_and_run_authority",
+        ),
+        pytest.param(
+            TurnIntentMode.EDIT,
+            {"may_update_workflow": True, "may_run_blocks": True},
+            {"workflow_change": ["add_invoice_download_step"]},
+            "update_and_run_blocks",
+            id="edit_with_target_context",
+        ),
+        pytest.param(
+            TurnIntentMode.DIAGNOSE,
+            {"may_update_workflow": False, "may_run_blocks": True, "may_read_run_context": True},
+            {},
+            "run_blocks_and_collect_debug",
+            id="diagnose_run_with_retest_authority",
+        ),
+        pytest.param(
+            TurnIntentMode.DIAGNOSE,
+            {"may_update_workflow": False, "may_run_blocks": False, "may_read_run_context": True},
+            {},
+            "get_run_results",
+            id="diagnose_allows_get_run_results_tool",
+        ),
+    ],
+)
+def test_turn_intent_gate_allows_authorized_tool(
+    mode: TurnIntentMode,
+    authority_kwargs: dict[str, bool],
+    target_entities: dict[str, list[str]],
+    tool_name: str,
+) -> None:
+    intent = TurnIntent(
+        mode=mode,
+        target_entities=target_entities,
+        authority=TurnIntentAuthority(**authority_kwargs),
+    )
+
+    assert _turn_intent_tool_error(_ctx(intent), tool_name) is None
+
+
+def test_draft_only_credential_code_policy_prunes_browser_tool_surface() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.DRAFT_ONLY,
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
     )
-
-    assert _turn_intent_tool_error(_ctx(intent), "update_workflow") is None
-
-
-def test_turn_intent_gate_allows_build_page_inspection_with_update_authority() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+    policy = RequestPolicy(
+        testing_intent="skip_test",
+        allow_update_workflow=True,
+        allow_run_blocks=False,
+        allow_missing_credentials_in_draft=True,
     )
 
-    assert _turn_intent_tool_error(_ctx(intent), "inspect_page_for_composition") is None
-
-
-def test_turn_intent_gate_allows_credential_metadata_with_update_authority() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+    alias_map, overlays = _mcp_tool_surface_for_turn(
+        get_skyvern_mcp_alias_map(),
+        _build_skyvern_mcp_overlays(),
+        intent,
+        policy,
     )
+    native_names = {getattr(tool, "name", None) for tool in _native_tools_for_turn(list(NATIVE_TOOLS), intent, policy)}
 
-    assert _turn_intent_tool_error(_ctx(intent), "list_credentials") is None
+    assert set(alias_map) == {"get_block_schema", "validate_block"}
+    assert set(overlays) == {"get_block_schema", "validate_block"}
+    for browser_tool in {"navigate_browser", "evaluate", "click", "type_text"}:
+        assert browser_tool not in alias_map
+        assert browser_tool not in overlays
+    assert "update_workflow" in native_names
+    assert "list_credentials" in native_names
+    assert "fill_credential_field" not in native_names
+    assert "discover_workflow_entrypoint" not in native_names
+    assert "inspect_page_for_composition" not in native_names
 
 
 def test_turn_intent_gate_blocks_draft_only_run_tools() -> None:
@@ -152,15 +275,6 @@ def test_turn_intent_gate_blocks_draft_only_run_tools() -> None:
     assert "update_workflow" in signal.cleared_by_tools
 
 
-def test_turn_intent_gate_allows_build_update_and_run_authority() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
-
-    assert _turn_intent_tool_error(_ctx(intent), "update_and_run_blocks") is None
-
-
 def test_turn_intent_gate_blocks_edit_without_target_context() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
@@ -176,16 +290,6 @@ def test_turn_intent_gate_blocks_edit_without_target_context() -> None:
     )
     assert signal is not None
     assert signal.recovery_hint == "ask_user_clarifying"
-
-
-def test_turn_intent_gate_allows_edit_with_target_context() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.EDIT,
-        target_entities={"workflow_change": ["add_invoice_download_step"]},
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
-
-    assert _turn_intent_tool_error(_ctx(intent), "update_and_run_blocks") is None
 
 
 def test_turn_intent_gate_blocks_edit_with_default_current_workflow_only() -> None:
@@ -380,22 +484,16 @@ def test_get_run_results_routes_through_authority_dispatcher_but_request_policy_
     assert ctx.blocker_signal is None
 
 
-def test_diagnose_allows_get_run_results_tool() -> None:
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(TurnIntentMode.UNKNOWN, id="unknown_without_run_context"),
+        pytest.param(TurnIntentMode.DOCS_ANSWER, id="docs_answer"),
+    ],
+)
+def test_no_run_context_mode_blocks_get_run_results(mode: TurnIntentMode) -> None:
     intent = TurnIntent(
-        mode=TurnIntentMode.DIAGNOSE,
-        authority=TurnIntentAuthority(
-            may_update_workflow=False,
-            may_run_blocks=False,
-            may_read_run_context=True,
-        ),
-    )
-
-    assert _turn_intent_tool_error(_ctx(intent), "get_run_results") is None
-
-
-def test_unknown_without_run_context_blocks_get_run_results() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.UNKNOWN,
+        mode=mode,
         authority=TurnIntentAuthority(),
     )
 
@@ -403,22 +501,7 @@ def test_unknown_without_run_context_blocks_get_run_results() -> None:
     _assert_signal(
         signal,
         internal_reason_code="turn_intent_context_read_blocked",
-        classifier_mode="unknown",
-        blocked_tool="get_run_results",
-    )
-
-
-def test_docs_answer_blocks_get_run_results() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.DOCS_ANSWER,
-        authority=TurnIntentAuthority(),
-    )
-
-    signal = _turn_intent_tool_error(_ctx(intent), "get_run_results")
-    _assert_signal(
-        signal,
-        internal_reason_code="turn_intent_context_read_blocked",
-        classifier_mode="docs_answer",
+        classifier_mode=mode.value,
         blocked_tool="get_run_results",
     )
 
@@ -440,35 +523,40 @@ def test_docs_answer_blocks_get_run_results_even_with_read_flag() -> None:
     assert {getattr(tool, "name", None) for tool in filtered} == {tool.name for tool in NATIVE_TOOLS}
 
 
-def test_within_turn_override_pending_reconciliation_allows_read() -> None:
+@pytest.mark.parametrize(
+    ("mode", "authority_kwargs", "ctx_kwargs"),
+    [
+        pytest.param(
+            TurnIntentMode.UNKNOWN,
+            {},
+            {"pending_reconciliation_run_id": "wr_pending_test"},
+            id="pending_reconciliation_allows_read",
+        ),
+        pytest.param(
+            TurnIntentMode.BUILD,
+            {"may_update_workflow": True, "may_run_blocks": True},
+            {"last_successful_run_blocks_workflow_run_id": "wr_completed_this_turn"},
+            id="successful_run_blocks_allows_read",
+        ),
+        pytest.param(
+            TurnIntentMode.BUILD,
+            {"may_update_workflow": True, "may_run_blocks": True},
+            {"last_run_blocks_workflow_run_id": "wr_failed_this_turn"},
+            id="failed_run_blocks_allows_read",
+        ),
+    ],
+)
+def test_within_turn_override_allows_read(
+    mode: TurnIntentMode,
+    authority_kwargs: dict[str, bool],
+    ctx_kwargs: dict[str, str],
+) -> None:
     intent = TurnIntent(
-        mode=TurnIntentMode.UNKNOWN,
-        authority=TurnIntentAuthority(),
+        mode=mode,
+        authority=TurnIntentAuthority(**authority_kwargs),
     )
 
-    ctx = _ctx(intent, pending_reconciliation_run_id="wr_pending_test")
-
-    assert _turn_intent_tool_error(ctx, "get_run_results") is None
-
-
-def test_within_turn_override_successful_run_blocks_allows_read() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
-
-    ctx = _ctx(intent, last_successful_run_blocks_workflow_run_id="wr_completed_this_turn")
-
-    assert _turn_intent_tool_error(ctx, "get_run_results") is None
-
-
-def test_within_turn_override_failed_run_blocks_allows_read() -> None:
-    intent = TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
-    )
-
-    ctx = _ctx(intent, last_run_blocks_workflow_run_id="wr_failed_this_turn")
+    ctx = _ctx(intent, **ctx_kwargs)
 
     assert _turn_intent_tool_error(ctx, "get_run_results") is None
 
@@ -519,6 +607,7 @@ async def test_get_run_results_defaults_to_successful_same_turn_run() -> None:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
 
         result = await _get_run_results({}, ctx)
 
@@ -539,6 +628,7 @@ async def test_get_run_results_defaults_to_latest_same_turn_run_when_no_success(
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
 
         result = await _get_run_results({}, ctx)
 
@@ -588,6 +678,7 @@ async def test_get_run_results_uses_pending_reconciliation_run_when_id_omitted()
     with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
+        mock_app.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
         result = await _get_run_results({}, ctx)
 
     assert result["ok"] is True

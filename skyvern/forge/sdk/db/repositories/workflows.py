@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import Select, exists, func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -27,14 +27,13 @@ from skyvern.forge.sdk.db.models import (
     WorkflowParameterModel,
     WorkflowRunModel,
     WorkflowScheduleModel,
-    WorkflowTagEventModel,
     WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.db.tag_filters import workflow_tag_wpid_subqueries
 from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
-from skyvern.forge.sdk.workflow.models.tags import TagEventType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
@@ -103,7 +102,9 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
+        browser_profile_key: str | None = None,
         model: dict[str, Any] | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
@@ -113,6 +114,7 @@ class WorkflowsRepository(BaseRepository):
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
+        enable_self_healing: bool = False,
         code_version: int | None = None,
         generate_script_on_terminal: bool = False,
         run_sequentially: bool = False,
@@ -136,7 +138,9 @@ class WorkflowsRepository(BaseRepository):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
+                pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
+                browser_profile_key=browser_profile_key,
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
@@ -144,6 +148,7 @@ class WorkflowsRepository(BaseRepository):
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
+                enable_self_healing=enable_self_healing,
                 code_version=code_version,
                 generate_script_on_terminal=generate_script_on_terminal,
                 run_sequentially=run_sequentially,
@@ -191,6 +196,20 @@ class WorkflowsRepository(BaseRepository):
             )
             await session.execute(update_deleted_at_query)
             await session.commit()
+
+    @db_operation("is_workflow_copilot_authored")
+    async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
+        """Any version ever stamped by copilot marks the lineage. The latest row alone is not a
+        durable signal: user saves re-stamp created_by/edited_by, while copilot back-stamps v1 on
+        copilot-born workflows. Deleted versions still count — provenance is historical."""
+        copilot_version_exists = (
+            select(WorkflowModel.workflow_id)
+            .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
+            .filter(or_(WorkflowModel.created_by == "copilot", WorkflowModel.edited_by == "copilot"))
+            .limit(1)
+        )
+        async with self.Session() as session:
+            return (await session.scalar(copilot_version_exists)) is not None
 
     @db_operation("get_workflow")
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow | None:
@@ -486,47 +505,8 @@ class WorkflowsRepository(BaseRepository):
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
             if workflow_tags:
-                exact_values_by_key: dict[str, list[str]] = {}
-                key_only_terms: list[str] = []
-                value_only_terms: list[str] = []
-                for key, value in workflow_tags:
-                    if key is not None and value is not None:
-                        exact_values_by_key.setdefault(key, []).append(value)
-                    elif key is not None:
-                        key_only_terms.append(key)
-                    elif value is not None:
-                        value_only_terms.append(value)
-
-                def _active_set_subquery() -> Select:
-                    return (
-                        select(WorkflowTagEventModel.workflow_permanent_id)
-                        .where(WorkflowTagEventModel.organization_id == organization_id)
-                        .where(WorkflowTagEventModel.deleted_at.is_(None))
-                        .where(WorkflowTagEventModel.superseded_at.is_(None))
-                        .where(WorkflowTagEventModel.event_type == TagEventType.SET.value)
-                    )
-
-                # AND across distinct terms; OR within a key for exact terms.
-                for key, values in exact_values_by_key.items():
-                    main_query = main_query.where(
-                        WorkflowModel.workflow_permanent_id.in_(
-                            _active_set_subquery()
-                            .where(WorkflowTagEventModel.key == key)
-                            .where(WorkflowTagEventModel.value.in_(values))
-                        )
-                    )
-                for key in key_only_terms:
-                    main_query = main_query.where(
-                        WorkflowModel.workflow_permanent_id.in_(
-                            _active_set_subquery().where(WorkflowTagEventModel.key == key)
-                        )
-                    )
-                for value in value_only_terms:
-                    main_query = main_query.where(
-                        WorkflowModel.workflow_permanent_id.in_(
-                            _active_set_subquery().where(WorkflowTagEventModel.value == value)
-                        )
-                    )
+                for subquery in workflow_tag_wpid_subqueries(workflow_tags, organization_id):
+                    main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(subquery))
             if search_key:
                 search_like = f"%{search_key}%"
                 title_like = WorkflowModel.title.ilike(search_like)
@@ -692,7 +672,9 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
@@ -700,6 +682,7 @@ class WorkflowsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -740,8 +723,12 @@ class WorkflowsRepository(BaseRepository):
                     workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if pin_saved_session_ip is not None:
+                    workflow.pin_saved_session_ip = pin_saved_session_ip
                 if browser_profile_id is not _UNSET:
                     workflow.browser_profile_id = cast(str | None, browser_profile_id)
+                if browser_profile_key is not _UNSET:
+                    workflow.browser_profile_key = cast(str | None, browser_profile_key)
                 if model is not _UNSET:
                     workflow.model = model
                 if max_screenshot_scrolling_times is not _UNSET:
@@ -756,6 +743,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.ai_fallback = ai_fallback
                 if adaptive_caching is not _UNSET:
                     workflow.adaptive_caching = cast(bool, adaptive_caching)
+                if enable_self_healing is not _UNSET:
+                    workflow.enable_self_healing = cast(bool, enable_self_healing)
                 if run_sequentially is not None:
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
@@ -1002,7 +991,9 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
+        browser_profile_key: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         max_elapsed_time_minutes: int | None | object = _UNSET,
@@ -1010,6 +1001,7 @@ class WorkflowsRepository(BaseRepository):
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         adaptive_caching: bool | object = _UNSET,
+        enable_self_healing: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -1086,8 +1078,12 @@ class WorkflowsRepository(BaseRepository):
                 workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if pin_saved_session_ip is not None:
+                workflow.pin_saved_session_ip = pin_saved_session_ip
             if browser_profile_id is not _UNSET:
                 workflow.browser_profile_id = cast(str | None, browser_profile_id)
+            if browser_profile_key is not _UNSET:
+                workflow.browser_profile_key = cast(str | None, browser_profile_key)
             if model is not _UNSET:
                 workflow.model = model
             if max_screenshot_scrolling_times is not _UNSET:
@@ -1102,6 +1098,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.ai_fallback = ai_fallback
             if adaptive_caching is not _UNSET:
                 workflow.adaptive_caching = cast(bool, adaptive_caching)
+            if enable_self_healing is not _UNSET:
+                workflow.enable_self_healing = cast(bool, enable_self_healing)
             if run_sequentially is not None:
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:

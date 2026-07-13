@@ -23,6 +23,7 @@ from skyvern.schemas.workflows import (
     CodeBlockYAML,
     ConditionalBlockYAML,
     DownloadToS3BlockYAML,
+    EmailInboxBlockYAML,
     ExtractionBlockYAML,
     FileDownloadBlockYAML,
     FileParserBlockYAML,
@@ -34,9 +35,11 @@ from skyvern.schemas.workflows import (
     HumanInteractionBlockYAML,
     LoginBlockYAML,
     NavigationBlockYAML,
+    PdfFillBlockYAML,
     PDFParserBlockYAML,
     PrintPageBlockYAML,
     SendEmailBlockYAML,
+    SplitPdfBlockYAML,
     TaskBlockYAML,
     TaskV2BlockYAML,
     TextPromptBlockYAML,
@@ -81,8 +84,11 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.PDF_PARSER.value: PDFParserBlockYAML,
     BlockType.HUMAN_INTERACTION.value: HumanInteractionBlockYAML,
     BlockType.PRINT_PAGE.value: PrintPageBlockYAML,
+    BlockType.PDF_FILL.value: PdfFillBlockYAML,
+    BlockType.SPLIT_PDF.value: SplitPdfBlockYAML,
     BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
     BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
+    BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
     BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
 }
 
@@ -113,8 +119,11 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
+    "pdf_fill": "Fill a PDF form (AcroForm fields, or flat PDFs via OCR overlay) from a prompt and structured payload",
+    "split_pdf": "Split one PDF into multiple PDFs by prompt and save each to S3",
     "workflow_trigger": "Trigger another workflow by permanent ID, with optional payload and wait-for-completion",
     "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
+    "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
 }
 
@@ -247,6 +256,21 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "payload": {"url": "{{ some_parameter }}"},
         "wait_for_completion": True,
     },
+    "pdf_fill": {
+        "block_type": "pdf_fill",
+        "label": "fill_application_pdf",
+        "file_url": "{{ source_pdf_output }}",
+        "prompt": "Fill the application using the applicant payload.",
+        "payload": "{{ applicant | json }}",
+        "parameter_keys": ["source_pdf_output", "applicant"],
+    },
+    "split_pdf": {
+        "block_type": "split_pdf",
+        "label": "split_combined_pdf",
+        "file_url": "{{ source_pdf_output }}",
+        "prompt": "Split this combined PDF into one file per document; name each by document type.",
+        "parameter_keys": ["source_pdf_output"],
+    },
     "google_sheets_read": {
         "block_type": "google_sheets_read",
         "label": "read_sheet_data",
@@ -255,6 +279,14 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "range": "A1:D100",
         "credential_id": "{{ google_credential_id }}",
         "has_header_row": True,
+    },
+    "email_inbox": {
+        "block_type": "email_inbox",
+        "label": "find_invoice_email",
+        "email_client": "gmail",
+        "credential_id": "{{ gmail_credential_id }}",
+        "folder": "INBOX",
+        "prompt": "Find invoice approval emails that need a reply.",
     },
     "google_sheets_write": {
         "block_type": "google_sheets_write",
@@ -371,7 +403,11 @@ async def skyvern_block_schema(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Get the schema for a workflow block type, or list all available types if block_type is omitted."""
+    """Get the schema for a workflow block type, or list all available types if block_type is omitted.
+
+    Accepts ONLY a block_type string (e.g. 'navigation'); it does NOT accept a block definition or a
+    format argument. To check a full block definition you have authored, use skyvern_block_validate
+    (block_json=...) instead."""
 
     action = "skyvern_block_schema"
 
@@ -453,8 +489,14 @@ async def skyvern_block_validate(
         str,
         Field(description="JSON string of a single block definition to validate"),
     ],
+    code_only: Annotated[
+        bool,
+        Field(description="When true, structurally reject non-code browser/page block types (code-only mode)"),
+    ] = False,
 ) -> dict[str, Any]:
-    """Validate a workflow block definition before using it in skyvern_workflow_create. Returns field-level errors."""
+    """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
+    it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
+    block type first, use skyvern_block_schema(block_type=...)."""
     action = "skyvern_block_validate"
 
     try:
@@ -480,6 +522,27 @@ async def skyvern_block_validate(
                 "Provide a JSON object with at least block_type and label fields",
             ),
         )
+
+    if code_only:
+        # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
+        from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
+            collect_code_only_banned_items,
+        )
+
+        banned_items = collect_code_only_banned_items([raw])
+        if banned_items:
+            labels = ", ".join(sorted({label for label, _ in banned_items}))
+            types = ", ".join(sorted({block_type for _, block_type in banned_items}))
+            return make_result(
+                action,
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
+                    "In code-only mode, use a `code` block for durable browser/page work instead of "
+                    "task/navigation/extraction/etc.",
+                ),
+            )
 
     adapter = _get_block_adapter()
     try:

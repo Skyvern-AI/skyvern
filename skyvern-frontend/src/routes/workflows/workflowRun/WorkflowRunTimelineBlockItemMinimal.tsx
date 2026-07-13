@@ -23,10 +23,11 @@ function WorkflowRunTimelineBlockItemMinimal({ block, subItems }: Props) {
   const showStatusIndicator = block.status !== null;
   const showSuccessIndicator =
     showStatusIndicator && block.status === Status.Completed;
+  const showTerminatedIndicator =
+    showStatusIndicator && block.status === Status.Terminated;
   const showFailureIndicator =
     showStatusIndicator &&
     (block.status === Status.Failed ||
-      block.status === Status.Terminated ||
       block.status === Status.TimedOut ||
       block.status === Status.Canceled);
 
@@ -43,6 +44,7 @@ function WorkflowRunTimelineBlockItemMinimal({ block, subItems }: Props) {
         <ItemStatusIndicator
           failure={showFailureIndicator}
           success={showSuccessIndicator}
+          terminated={showTerminatedIndicator}
         >
           <WorkflowBlockIcon workflowBlockType={block.block_type} />
         </ItemStatusIndicator>

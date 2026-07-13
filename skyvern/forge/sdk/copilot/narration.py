@@ -36,7 +36,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
 
@@ -46,6 +46,13 @@ LOG = structlog.get_logger()
 # a burst of transitions (tool cluster + workflow_updated arriving together)
 # from producing back-to-back emissions.
 MIN_NARRATION_GAP_SECONDS = 10.0
+
+# Floor on how often narrator_poll_tick re-fetches block statuses from the DB.
+# That fetch is a free read, not an LLM call, so it must not share the
+# narration floor above -- it only needs a small burst guard. Well below the
+# caller's RUN_BLOCKS_POLL_INTERVAL_SECONDS (5.0 in run_execution.py), so it
+# never actually binds at today's cadence -- it's a ceiling, not a throttle.
+MIN_BLOCK_STATUS_POLL_GAP_SECONDS = 1.0
 
 # Cap on how many tool round-trips we hand to the narrator LLM. The narrator
 # only needs recent context; keeping this small caps prompt cost.
@@ -64,6 +71,12 @@ MAX_DESIGN_ACTIVITY_ENTRIES = 50
 # Tools whose calls/results are never surfaced in the user-facing activity log.
 # Mirror of the FE ACTIVITY_TOOL_DENYLIST in narrativeState.ts.
 ACTIVITY_TOOL_DENYLIST = frozenset({"list_credentials", "get_run_results", "get_browser_screenshot"})
+
+# Shared classification for a code-authoring reject the streaming adapter renders
+# as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
+# consumed by the SSE layer (streaming_adapter) — one source of truth for both.
+CODE_REPAIR_PROGRESS_SURFACE_KIND = "code_repair_progress"
+CODE_REPAIR_PROGRESS_TEXT = "Refining the workflow's code"
 
 _TOOL_ACTIVITY_DISPLAY_LABELS = {
     # Mirror of the FE ACTIVITY_TOOL_DISPLAY_LABELS in narrativeState.ts.
@@ -182,6 +195,8 @@ class NarratorState:
     block_activity: dict[str, list[NarrativeActivityEntry]] = field(default_factory=dict)
     design_activity: list[NarrativeActivityEntry] = field(default_factory=list)
     running_block_label: str | None = None
+    # Per-turn (NarratorState lives one turn); collapses repeated code-repair progress to one entry.
+    emitted_progress_texts: set[str] = field(default_factory=set)
 
     def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
         if entry is None:
@@ -548,16 +563,21 @@ _TRANSITION_LABELS: dict[TransitionKind, str] = {
 _MAX_DETAILS_CHARS = 240
 
 
-def extract_tool_details(tool_name: str, parsed: dict[str, Any]) -> str:
+def extract_tool_details(tool_name: str, parsed: dict[str, Any], *, success: bool | None = None) -> str:
     """Compact narrator-friendly excerpt from a tool's parsed payload.
 
     Intentionally narrow: counts, domains, and high-level statuses only.
     Raw labels (block names, field names, URL paths, page content) are excluded
     so they can't reach the narrator prompt and be echoed at the user.
+
+    ``success`` lets a caller override the raw ``ok`` field (e.g. a precondition
+    redirect that streaming_adapter has already reclassified as non-failure) so this
+    detail line doesn't contradict the entry's own success status in the narrator prompt.
     """
     if not isinstance(parsed, dict):
         return ""
-    if not parsed.get("ok", True):
+    ok = parsed.get("ok", True) if success is None else success
+    if not ok:
         return "last action failed"
 
     data = parsed.get("data")
@@ -810,12 +830,12 @@ async def narrator_poll_tick(
     """
     now = time.monotonic()
     block_changed = current_block_ts != prior_block_ts
-    gate_open = (now - last_block_fetch_monotonic) >= MIN_NARRATION_GAP_SECONDS
+    fetch_gate_open = (now - last_block_fetch_monotonic) >= MIN_BLOCK_STATUS_POLL_GAP_SECONDS
 
     next_prior_block_ts = prior_block_ts
     next_last_fetch = last_block_fetch_monotonic
 
-    if block_changed and gate_open:
+    if block_changed and fetch_gate_open:
         next_last_fetch = now
         try:
             blocks = await fetch_block_statuses()

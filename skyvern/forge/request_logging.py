@@ -6,13 +6,14 @@ import typing
 
 import structlog
 from starlette.concurrency import iterate_in_threadpool
+from starlette.requests import ClientDisconnect
+from starlette.responses import Response
 
 from skyvern.config import settings
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
 
-    from fastapi import Response
     from starlette.requests import Request
 
 LOG = structlog.get_logger()
@@ -26,6 +27,10 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/credentials/totp",
     "POST /api/v1/totp",
     "GET /v1/credentials/totp",
+    "PUT /v1/google/oauth/config",
+    "PUT /api/v1/google/oauth/config",
+    "POST /v1/google/oauth/callback",
+    "POST /api/v1/google/oauth/callback",
 }
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -174,7 +179,15 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
         return await call_next(request)
 
     start_time = time.monotonic()
-    body_bytes = await request.body()
+    try:
+        body_bytes = await request.body()
+    except ClientDisconnect:
+        # The client closed the connection before the body finished streaming, so no
+        # response will reach it. Short-circuit with a benign 499 instead of letting
+        # the disconnect escape this BaseHTTPMiddleware (which wraps it in an
+        # ExceptionGroup) and surface as an unhandled error in tracking.
+        LOG.info("api.client_disconnect", method=request.method, path=request.url.path)
+        return Response(status_code=499)
     # ensure downstream handlers can access body again
     try:
         request._body = body_bytes  # type: ignore[attr-defined]

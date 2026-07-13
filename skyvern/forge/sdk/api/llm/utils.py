@@ -190,6 +190,20 @@ def is_truncated_response(response: litellm.ModelResponse) -> bool:
     )
 
 
+def is_content_filtered_response(response: litellm.ModelResponse) -> bool:
+    # Gemini's non-configurable safety filters (prohibited-content / SPII) block PII-heavy
+    # prompts at the input stage, returning finish_reason=content_filter with empty content.
+    # This is a valid ModelResponse, so litellm's router fallback never fires — the caller
+    # must detect it and retry on a non-Gemini fallback explicitly (SKY-11766).
+    if not response.choices:
+        return False
+    choice = response.choices[0]
+    return (
+        getattr(choice, "finish_reason", None) == "content_filter"
+        and getattr(getattr(choice, "message", None), "content", None) is None
+    )
+
+
 def parse_api_response(
     response: litellm.ModelResponse, add_assistant_prefix: bool = False, force_dict: bool = True
 ) -> dict[str, Any] | Any:

@@ -12,37 +12,53 @@ jobs:
   check-version-change:
     runs-on: ubuntu-latest
     outputs:
-      version_changed: ${{ steps.check.outputs.version_changed }}
+      should_publish: ${{ steps.check.outputs.should_publish }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Check if version changed
+      - name: Decide whether to publish
         id: check
         run: |
-          # Get version from current pyproject.toml
+          # Compare current vs previous commit, AND check PyPI for the new version.
+          # Without the PyPI check, reverts (1.0.37 -> 1.0.36) and re-bumps after a
+          # revert (1.0.36 -> 1.0.37, where 1.0.37 was already published) both look
+          # like "version changed" and crash the publish step with HTTP 400.
           CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 
-          # Get version from previous commit
           git checkout HEAD^1
           PREVIOUS_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 
-          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
-            echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION"
-            echo "version_changed=true" >> $GITHUB_OUTPUT
+          if [ "$CURRENT_VERSION" = "$PREVIOUS_VERSION" ]; then
+            echo "Version unchanged at $CURRENT_VERSION; skipping publish."
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION."
+
+          # Treat both skyvern and skyvern-ui as already-published only if both
+          # are present on PyPI at the new version. If either is missing (e.g.
+          # the first release of a new sibling package), proceed.
+          PYPI_INDEX="https://pypi.org/pypi"
+          SKYVERN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PYPI_INDEX/skyvern/$CURRENT_VERSION/json")
+          SKYVERN_UI_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PYPI_INDEX/skyvern-ui/$CURRENT_VERSION/json")
+          echo "PyPI lookup: skyvern=$SKYVERN_STATUS skyvern-ui=$SKYVERN_UI_STATUS"
+
+          if [ "$SKYVERN_STATUS" = "200" ] && [ "$SKYVERN_UI_STATUS" = "200" ]; then
+            echo "Both packages already at $CURRENT_VERSION on PyPI; skipping publish."
+            echo "should_publish=false" >> $GITHUB_OUTPUT
           else
-            echo "Version remained at $CURRENT_VERSION"
-            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "should_publish=true" >> $GITHUB_OUTPUT
           fi
   run-ci:
     needs: check-version-change
-    if: needs.check-version-change.outputs.version_changed == 'true'
+    if: needs.check-version-change.outputs.should_publish == 'true'
     uses: ./.github/workflows/ci.yml
   build-sdk:
     runs-on: ubuntu-latest
     needs: [check-version-change, run-ci]
-    if: needs.check-version-change.outputs.version_changed == 'true'
+    if: needs.check-version-change.outputs.should_publish == 'true'
     steps:
       - name: Check out Git repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -123,7 +139,12 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist/skyvern-ui/
+          # Defense-in-depth: if check-version-change ever misses an edge case
+          # (e.g. half-published release where one sibling landed), skip files
+          # already on PyPI rather than failing the whole publish step.
+          skip-existing: true
       - name: Publish skyvern to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist/skyvern/
+          skip-existing: true

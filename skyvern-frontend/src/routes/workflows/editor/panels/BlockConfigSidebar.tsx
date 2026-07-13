@@ -1,7 +1,7 @@
 import { Cross2Icon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   BLOCK_SIDEBAR_WIDTH_MAX,
@@ -22,6 +22,10 @@ import { isStartNode } from "../nodes/StartNode/types";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowBlockType } from "../../types/workflowTypes";
+import {
+  getBlockSidebarGutterPx,
+  getContainedBlockSidebarWidth,
+} from "../blockSidebar";
 import { BlockConfigForm } from "./BlockConfigForm";
 import { useHasInteractedThisSession } from "./useHasInteractedThisSession";
 import { WorkflowNodeLibraryPanel } from "./WorkflowNodeLibraryPanel";
@@ -44,6 +48,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   task: "task",
   textPrompt: "text_prompt",
   sendEmail: "send_email",
+  emailInbox: "email_inbox",
   codeBlock: "code",
   fileParser: "file_url_parser",
   upload: "upload_to_s3",
@@ -65,6 +70,8 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   workflowTrigger: "workflow_trigger",
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
+  pdfFill: "pdf_fill",
+  splitPdf: "split_pdf",
 };
 
 function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {
@@ -75,6 +82,57 @@ function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {
 }
 
 const FOOTER_TICK_INTERVAL_MS = 10_000;
+
+type SidebarIdentity = {
+  label: string;
+  isStart: boolean;
+  blockType: WorkflowBlockType | null;
+};
+
+function getSidebarIdentity(node: AppNode | null): SidebarIdentity {
+  const isStart = node ? isStartNode(node) : false;
+  const blockType = node ? getBlockTypeFromNode(node) : null;
+  const label = isStart
+    ? "Agent Settings"
+    : typeof node?.data?.label === "string" && node.data.label.length > 0
+      ? node.data.label
+      : blockType
+        ? workflowBlockTitle[blockType]
+        : "";
+  return { label, isStart, blockType };
+}
+
+function SidebarIdentityIcon({
+  identity,
+}: Readonly<{ identity: SidebarIdentity }>) {
+  // The gear doubles as the generic "settings" glyph: it covers both the start
+  // node and the unknown-block fallback (a detached/untyped node has no icon).
+  return (
+    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
+      {!identity.isStart && identity.blockType ? (
+        <WorkflowBlockIcon
+          workflowBlockType={identity.blockType}
+          className="size-4"
+        />
+      ) : (
+        <GearIcon className="size-4" />
+      )}
+    </div>
+  );
+}
+
+function measureElementWidth(element: HTMLElement): number | null {
+  const boundingWidth = element.getBoundingClientRect().width;
+  if (boundingWidth > 0) {
+    return boundingWidth;
+  }
+
+  if (element.offsetWidth > 0) {
+    return element.offsetWidth;
+  }
+
+  return null;
+}
 
 function formatUpdatedAgo(updatedAt: number, now: number): string {
   const elapsedSec = Math.max(0, Math.floor((now - updatedAt) / 1000));
@@ -175,49 +233,40 @@ function EditableBlockTitle({
 
 function BlockConfigSidebarBody({
   selectedBlockId,
+  identity,
   onClose,
-}: Readonly<{ selectedBlockId: string; onClose: () => void }>) {
-  const reactFlowInstance = useReactFlow<AppNode>();
-  const node = reactFlowInstance.getNode(selectedBlockId);
-
-  const isStart = node ? isStartNode(node) : false;
-  const blockType = node ? getBlockTypeFromNode(node) : null;
-  const label = isStart
-    ? "Agent Settings"
-    : typeof node?.data?.label === "string" && node.data.label.length > 0
-      ? node.data.label
-      : blockType
-        ? workflowBlockTitle[blockType]
-        : "";
-
+}: Readonly<{
+  selectedBlockId: string;
+  identity: SidebarIdentity;
+  onClose: () => void;
+}>) {
   return (
     <>
       <header className="flex h-20 items-center justify-between gap-3 border-b border-border px-6">
         <div className="flex min-w-0 items-center gap-3">
-          {isStart ? (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
-              <GearIcon className="size-4" />
-            </div>
-          ) : blockType ? (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={blockType}
-                className="size-4"
-              />
-            </div>
+          {identity.isStart || identity.blockType ? (
+            <SidebarIdentityIcon identity={identity} />
           ) : null}
           <div className="min-w-0">
-            {isStart ? (
+            {identity.isStart ? (
               <h2 className="truncate text-sm font-medium text-slate-100">
-                {label}
+                {identity.label}
               </h2>
             ) : (
               <EditableBlockTitle
                 key={selectedBlockId}
                 blockId={selectedBlockId}
-                fallbackLabel={label}
+                fallbackLabel={identity.label}
               />
             )}
+            {identity.blockType ? (
+              <p
+                className="truncate text-xs text-slate-400"
+                title={workflowBlockTitle[identity.blockType]}
+              >
+                {workflowBlockTitle[identity.blockType]}
+              </p>
+            ) : null}
             <SubLabel />
           </div>
         </div>
@@ -230,7 +279,10 @@ function BlockConfigSidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div
+        data-testid="block-config-sidebar-body"
+        className="flex-1 overflow-y-auto px-6 py-5"
+      >
         <BlockConfigForm blockId={selectedBlockId} />
       </div>
       <UpdatedAgoFooter blockId={selectedBlockId} />
@@ -270,7 +322,10 @@ function BlockLibrarySidebarBody({
           <Cross2Icon className="h-4 w-4" />
         </button>
       </header>
-      <div className="flex-1 overflow-hidden px-5 py-4">
+      <div
+        data-testid="block-library-sidebar-body"
+        className="flex min-h-0 flex-1 overflow-hidden px-6 py-5"
+      >
         <WorkflowNodeLibraryPanel onNodeClick={onAddNode} />
       </div>
     </>
@@ -279,11 +334,24 @@ function BlockLibrarySidebarBody({
 
 type BlockConfigSidebarProps = {
   onAddNode?: (props: AddNodeProps) => void;
+  // In the studio shell the panel's top/bottom edges align with the Copilot
+  // column's py-3 inset rather than the legacy editor's header offsets.
+  embedded?: boolean;
 };
 
-function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
+function BlockConfigSidebar({
+  onAddNode,
+  embedded = false,
+}: BlockConfigSidebarProps) {
+  const resizableRef = useRef<Resizable | null>(null);
+  const reactFlowInstance = useReactFlow<AppNode>();
+  const [editorShellMetrics, setEditorShellMetrics] = useState(() => ({
+    gutterPx: getBlockSidebarGutterPx(null),
+    width: null as number | null,
+  }));
   const width = useBlockSidebarWidthStore((s) => s.width);
   const setWidth = useBlockSidebarWidthStore((s) => s.setWidth);
+  const setRenderedWidth = useBlockSidebarWidthStore((s) => s.setRenderedWidth);
   const mode = useWorkflowEditorMode();
   const selectedBlockId = useWorkflowPanelStore(
     (state) => state.selectedBlockId,
@@ -298,6 +366,20 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
     (state) => state.closeWorkflowPanel,
   );
   const flushPendingCommit = usePendingCommitsStore((state) => state.flush);
+  const containedWidth = getContainedBlockSidebarWidth(
+    width,
+    editorShellMetrics.width,
+    editorShellMetrics.gutterPx,
+  );
+  const containedMaxWidth = getContainedBlockSidebarWidth(
+    BLOCK_SIDEBAR_WIDTH_MAX,
+    editorShellMetrics.width,
+    editorShellMetrics.gutterPx,
+  );
+  const containedMinWidth = Math.min(
+    BLOCK_SIDEBAR_WIDTH_MIN,
+    containedMaxWidth,
+  );
 
   // Auto-commit on block switch. When `selectedBlockId` flips
   // from A → B, flush any pending commit registered by the dispatcher
@@ -316,10 +398,74 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
 
   const showLibrary =
     workflowPanelState.active && workflowPanelState.content === "nodeLibrary";
+  const sidebarVisible =
+    showLibrary || (mode !== "build" && selectedBlockId !== null);
 
-  // In build mode the block-config form is unavailable, but the node library
-  // must still render so users can insert blocks from the canvas.
-  if (mode === "build" && !showLibrary) {
+  const selectedNode =
+    !showLibrary && selectedBlockId !== null
+      ? (reactFlowInstance.getNode(selectedBlockId) ?? null)
+      : null;
+  const selectedIdentity = getSidebarIdentity(selectedNode);
+
+  useLayoutEffect(() => {
+    if (!sidebarVisible) {
+      setEditorShellMetrics({
+        gutterPx: getBlockSidebarGutterPx(null),
+        width: null,
+      });
+      return;
+    }
+
+    const parentElement = resizableRef.current?.resizable?.parentElement;
+    if (parentElement === undefined || parentElement === null) {
+      setEditorShellMetrics({
+        gutterPx: getBlockSidebarGutterPx(null),
+        width: null,
+      });
+      return;
+    }
+
+    const updateEditorShellMetrics = () => {
+      setEditorShellMetrics({
+        gutterPx: getBlockSidebarGutterPx(parentElement),
+        width: measureElementWidth(parentElement),
+      });
+    };
+
+    updateEditorShellMetrics();
+
+    if (typeof ResizeObserver === "undefined") {
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      window.addEventListener("resize", updateEditorShellMetrics);
+      return () => {
+        window.removeEventListener("resize", updateEditorShellMetrics);
+      };
+    }
+
+    const resizeObserver = new ResizeObserver(updateEditorShellMetrics);
+    resizeObserver.observe(parentElement);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [sidebarVisible]);
+
+  useLayoutEffect(() => {
+    if (!sidebarVisible) {
+      return;
+    }
+
+    setRenderedWidth(containedWidth);
+  }, [containedWidth, setRenderedWidth, sidebarVisible]);
+
+  // The block-config form only renders when the sidebar shows it directly: build
+  // mode gives each block/start node its own inline editor, and the studio shell
+  // keeps settings inline in the blocks. In both, the sidebar only hosts the
+  // block library (so users can still insert blocks from the canvas).
+  if ((mode === "build" || embedded) && !showLibrary) {
     return null;
   }
 
@@ -329,12 +475,13 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
 
   return (
     <Resizable
-      size={{ width, height: "auto" }}
-      minWidth={BLOCK_SIDEBAR_WIDTH_MIN}
-      maxWidth={BLOCK_SIDEBAR_WIDTH_MAX}
+      ref={resizableRef}
+      size={{ width: containedWidth, height: "auto" }}
+      minWidth={containedMinWidth}
+      maxWidth={containedMaxWidth}
       enable={{ left: true }}
-      onResizeStop={(_e, _dir, _ref, delta) => {
-        setWidth(width + delta.width);
+      onResizeStop={(_e, _dir, ref) => {
+        setWidth(ref.offsetWidth);
       }}
       handleClasses={{ left: "block-sidebar-resize-handle" }}
       handleStyles={{
@@ -350,30 +497,32 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
         right: "1.5rem",
         bottom: "1.5rem",
       }}
-      className={cn(
-        "z-30 flex flex-col",
-        "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
-      )}
+      className="z-30"
     >
-      <aside
-        data-testid="block-config-sidebar"
+      <div
         className={cn(
-          "flex h-full w-full flex-col",
-          "duration-200 ease-out animate-in slide-in-from-right-5",
+          "relative h-full w-full overflow-hidden",
+          "rounded-xl border border-border bg-slate-elevation2 shadow-xl",
         )}
       >
-        {showLibrary ? (
-          <BlockLibrarySidebarBody
-            onAddNode={(props) => onAddNode?.(props)}
-            onClose={closeWorkflowPanel}
-          />
-        ) : selectedBlockId !== null ? (
-          <BlockConfigSidebarBody
-            selectedBlockId={selectedBlockId}
-            onClose={() => setSelectedBlockId(null)}
-          />
-        ) : null}
-      </aside>
+        <aside
+          data-testid="block-config-sidebar"
+          className="flex h-full w-full flex-col duration-200 ease-out animate-in slide-in-from-right-5"
+        >
+          {showLibrary ? (
+            <BlockLibrarySidebarBody
+              onAddNode={(props) => onAddNode?.(props)}
+              onClose={closeWorkflowPanel}
+            />
+          ) : selectedBlockId !== null ? (
+            <BlockConfigSidebarBody
+              selectedBlockId={selectedBlockId}
+              identity={selectedIdentity}
+              onClose={() => setSelectedBlockId(null)}
+            />
+          ) : null}
+        </aside>
+      </div>
     </Resizable>
   );
 }

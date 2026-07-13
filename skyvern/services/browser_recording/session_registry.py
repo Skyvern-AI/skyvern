@@ -27,14 +27,37 @@ class RecordingInterpretationSessionRegistry:
         organization_id: str,
         workflow_permanent_id: str,
         on_update: OnRecordingInterpretationUpdate,
+        deltas_enabled: bool = False,
+        recording_attempt_id: str | None = None,
     ) -> None:
-        self.discard_session(browser_session_id)
         self._prune_expired_sessions()
+        existing = self._sessions.get(browser_session_id)
+        # Reuse the cached session only for a reconnect to the SAME recording. A
+        # new recording sends a different recording_attempt_id, so its events must
+        # not be appended to the prior session's already-consumed state machines
+        # (which would emit zero new draft steps). Clients that omit the id keep
+        # the legacy reuse behavior.
+        if (
+            existing is not None
+            and existing.workflow_permanent_id == workflow_permanent_id
+            and existing.organization_id == organization_id
+            and not existing.finalized
+            and (recording_attempt_id is None or existing.recording_attempt_id == recording_attempt_id)
+        ):
+            existing.on_update = on_update
+            existing.set_deltas_enabled(deltas_enabled)
+            self._last_seen[browser_session_id] = time.monotonic()
+            existing.emit_snapshot()
+            return
+
+        self.discard_session(browser_session_id)
         self._sessions[browser_session_id] = RecordingInterpretationSession(
             browser_session_id=browser_session_id,
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
             on_update=on_update,
+            deltas_enabled=deltas_enabled,
+            recording_attempt_id=recording_attempt_id,
         )
         self._last_seen[browser_session_id] = time.monotonic()
 
@@ -46,6 +69,20 @@ class RecordingInterpretationSessionRegistry:
 
         self._last_seen[browser_session_id] = time.monotonic()
         session.ingest_events(events)
+
+    def pause_capture(self, browser_session_id: str) -> None:
+        session = self._sessions.get(browser_session_id)
+        if not session:
+            return
+
+        session.pause_capture()
+
+    def resume_capture(self, browser_session_id: str) -> None:
+        session = self._sessions.get(browser_session_id)
+        if not session:
+            return
+
+        session.resume_capture()
 
     async def stop_session(self, browser_session_id: str) -> list[RecordingDraftStep]:
         session = self._sessions.pop(browser_session_id, None)

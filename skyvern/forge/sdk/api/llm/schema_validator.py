@@ -276,7 +276,7 @@ def validate_and_fill_extraction_result(
         LOG.info("Schema is invalid, returning extraction result as-is without transformations")
         return extraction_result
 
-    LOG.info("Validating and filling extraction result against schema")
+    LOG.info("Validating and filling extraction result against schema", sampling=True)
 
     try:
         filled_result = fill_missing_fields(extraction_result, schema)
@@ -293,7 +293,7 @@ def validate_and_fill_extraction_result(
                     errors=validation_errors,
                 )
 
-        LOG.info("Successfully validated and filled extraction result")
+        LOG.info("Successfully validated and filled extraction result", sampling=True)
         return filled_result
     except Exception as e:
         LOG.error(

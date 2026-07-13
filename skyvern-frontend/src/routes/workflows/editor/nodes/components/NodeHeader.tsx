@@ -6,29 +6,45 @@ import {
   ReloadIcon,
   StopIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
 
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation, Status } from "@/api/types";
+import {
+  ProxyLocation,
+  Status,
+  type DebugLoginBlockCompatibilityResponse,
+} from "@/api/types";
 import { NoticeMe } from "@/components/NoticeMe";
 import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useOnChange } from "@/hooks/useOnChange";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+import { useDuplicateNodeCallback } from "@/routes/workflows/hooks/useDuplicateNodeCallback";
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserSessionRateLimit";
+import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useBlockRunTarget } from "@/routes/workflows/editor/hooks/useBlockRunTarget";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { DebugSessionProfileIncompatibleDialog } from "@/routes/workflows/debugger/DebugSessionProfileIncompatibleDialog";
+import {
+  DEBUG_LOGIN_GATE_CREDENTIALS_PAGE_SIZE,
+  decideDebugLoginPlayGate,
+  gateActionFromBackendCompatibility,
+  type CredentialsLoadState,
+  type DebugSessionProfileIncompatibilityReason,
+} from "@/routes/workflows/debugger/debugSessionProfileCompatibility";
 import {
   debuggableWorkflowBlockTypes,
   scriptableWorkflowBlockTypes,
@@ -43,6 +59,12 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import {
+  RUN_APPEND_PANES,
+  STUDIO_PANES_PARAM,
+  withPanesOpen,
+} from "@/routes/workflows/studio/panes";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
@@ -50,6 +72,7 @@ import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
 } from "@/store/WorkflowSettingsStore";
+import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn, formatDate, toDate } from "@/util/utils";
 import {
   statusIsAFailureType,
@@ -116,6 +139,7 @@ interface Transmutations {
 
 interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
+  blockTitle?: string;
   disabled?: boolean;
   editable: boolean;
   extraActions?: React.ReactNode;
@@ -171,7 +195,10 @@ const getPayload = (opts: {
     toast({
       variant: "warning",
       title: "Extra HTTP Headers",
-      description: "Invalid extra HTTP Headers JSON",
+      description: `Invalid extra HTTP Headers JSON: ${getJsonParseErrorDetail(
+        String(opts.workflowSettings.extraHttpHeaders ?? ""),
+        e,
+      )}`,
     });
   }
 
@@ -212,6 +239,7 @@ const getPayload = (opts: {
 
 function NodeHeader({
   blockLabel,
+  blockTitle: blockTitleOverride,
   disabled = false,
   editable,
   extraActions,
@@ -224,11 +252,9 @@ function NodeHeader({
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
-  const {
-    blockLabel: urlBlockLabel,
-    workflowPermanentId,
-    workflowRunId,
-  } = useParams();
+  const { workflowPermanentId } = useParams();
+  const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
+    useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
@@ -241,17 +267,22 @@ function NodeHeader({
     id: nodeId,
     initialValue: blockLabel,
   });
-  const blockTitle = workflowBlockTitle[type];
+  const blockTitle = blockTitleOverride ?? workflowBlockTitle[type];
+  const duplicateNodeCallback = useDuplicateNodeCallback();
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
+  const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflowRun } = useWorkflowRunQuery({
+    workflowRunId: activeWorkflowRunId,
+  });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
@@ -267,17 +298,29 @@ function NodeHeader({
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
-    urlBlockLabel !== undefined &&
-    urlBlockLabel === blockLabel;
+    targetBlockLabel !== undefined &&
+    targetBlockLabel === blockLabel;
 
   const thisBlockIsTargetted =
-    urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+    targetBlockLabel !== undefined && targetBlockLabel === blockLabel;
 
   const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
   );
+  const {
+    data: credentials,
+    isLoading: credentialsIsLoading,
+    isError: credentialsIsError,
+    refetch: refetchCredentials,
+  } = useCredentialsQuery({
+    enabled: type === "login" && !!debugSession,
+    page_size: DEBUG_LOGIN_GATE_CREDENTIALS_PAGE_SIZE,
+  });
+  const [profileIncompatibilityReason, setProfileIncompatibilityReason] =
+    useState<DebugSessionProfileIncompatibilityReason | null>(null);
+  const compatibilityLookupInFlightRef = useRef(false);
   const [showParamsDialog, setShowParamsDialog] = useState(false);
   const [parametersToPrompt, setParametersToPrompt] = useState<
     WorkflowParameter[]
@@ -325,36 +368,41 @@ function NodeHeader({
   });
 
   useEffect(() => {
-    if (!workflowRun || !workflowPermanentId || !workflowRunId) {
+    if (
+      !workflowRun ||
+      !workflowPermanentId ||
+      !activeWorkflowRunId ||
+      // Only block-scoped runs toast per block; full runs report via the run
+      // surfaces (?wr= without ?bl=).
+      targetBlockLabel === undefined
+    ) {
       return;
     }
 
     if (
-      workflowRunId === workflowRun?.workflow_run_id &&
+      activeWorkflowRunId === workflowRun?.workflow_run_id &&
       statusIsFinalized(workflowRun)
     ) {
-      // navigate(`/workflows/${workflowPermanentId}/build`);
-
       if (statusIsAFailureType(workflowRun)) {
         toast({
           variant: "destructive",
-          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
           description: `Reason: ${workflowRun.failure_reason}`,
         });
       } else if (statusIsFinalized(workflowRun)) {
         toast({
           variant: "success",
-          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
         });
       }
     }
   }, [
     queryClient,
-    urlBlockLabel,
+    targetBlockLabel,
     navigate,
     workflowPermanentId,
     workflowRun,
-    workflowRunId,
+    activeWorkflowRunId,
   ]);
 
   const runBlock = useMutation({
@@ -391,7 +439,7 @@ function NodeHeader({
         throw new ValidationFailureError();
       }
 
-      await saveWorkflow.mutateAsync();
+      await saveWorkflow.mutateAsync(undefined);
 
       if (!workflowPermanentId) {
         log.error("Run block: there is no workflowPermanentId");
@@ -487,13 +535,14 @@ function NodeHeader({
         browserSessionId: debugSession.browser_session_id,
       });
 
-      return await client.post<Payload, { data: { run_id: string } }>(
+      const response = await client.post<Payload, { data: { run_id: string } }>(
         "/run/workflows/blocks",
         body,
       );
+      return { response, mergedParameters };
     },
-    onSuccess: (response) => {
-      if (!response) {
+    onSuccess: (result) => {
+      if (!result?.response) {
         log.error("Run block: no response", {
           workflowPermanentId,
           blockLabel,
@@ -506,6 +555,14 @@ function NodeHeader({
           description: "No response",
         });
         return;
+      }
+
+      const { response, mergedParameters } = result;
+
+      if (workflowPermanentId) {
+        useDebuggerLastRunValuesStore
+          .getState()
+          .setLastRunValues(workflowPermanentId, mergedParameters);
       }
 
       log.info("Run block: run started", {
@@ -522,9 +579,22 @@ function NodeHeader({
         description: "The agent block run has been started successfully",
       });
 
-      navigate(
-        `/workflows/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
-      );
+      if (studioEnabled) {
+        // One navigation carries the pane state (open panes never move or
+        // close; the run surfaces append); other query params intentionally
+        // reset for the fresh run.
+        const panes = withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
+        const search = new URLSearchParams({
+          wr: response.data.run_id,
+          bl: label,
+        });
+        search.set(STUDIO_PANES_PARAM, panes.join(","));
+        navigate(`/agents/${workflowPermanentId}/studio?${search}`);
+      } else {
+        navigate(
+          `/agents/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
+        );
+      }
     },
     onError: (error: AxiosError | ValidationFailureError) => {
       // The block-validation gate threw a typed error and already showed
@@ -567,7 +637,9 @@ function NodeHeader({
       const browserSessionId = debugSession.browser_session_id;
       const client = await getClient(credentialGetter);
       return client
-        .post(`/runs/${browserSessionId}/workflow_run/${workflowRunId}/cancel/`)
+        .post(
+          `/runs/${browserSessionId}/workflow_run/${activeWorkflowRunId}/cancel/`,
+        )
         .then((response) => response.data);
     },
     onSuccess: () => {
@@ -601,7 +673,7 @@ function NodeHeader({
     },
   });
 
-  const handleOnPlay = () => {
+  const proceedWithPlay = () => {
     const blocks = workflow?.workflow_definition?.blocks ?? [];
     const numBlocksInWorkflow = blocks.length;
 
@@ -644,6 +716,126 @@ function NodeHeader({
     runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
   };
 
+  const handleOnPlay = async () => {
+    // Fail-closed pre-flight: a still-loading credentials list (or an
+    // errored / pagination-missed credential) can produce a null credential
+    // profile that the compatibility check would misread as "compatible",
+    // silently bypassing the mismatch modal. Block the play with a recovery
+    // affordance until we have a definitive answer.
+    const credentialsState: CredentialsLoadState = credentialsIsLoading
+      ? "loading"
+      : credentialsIsError
+        ? "error"
+        : "ready";
+    const blocks = workflow?.workflow_definition?.blocks ?? [];
+    const block = findWorkflowBlockByLabel(blocks, blockLabel);
+
+    const gate = decideDebugLoginPlayGate({
+      blockType: type,
+      hasDebugSession: !!debugSession,
+      credentialsState,
+      block,
+      credentials,
+      pbsBrowserProfileId: debugSession?.pbs_browser_profile_id ?? null,
+    });
+
+    if (gate.kind === "block-loading") {
+      toast({
+        variant: "warning",
+        title: "Loading credentials",
+        description:
+          "Credentials are still loading. Please try again in a moment.",
+      });
+      return;
+    }
+
+    if (gate.kind === "block-retry" && gate.reason === "credentials-error") {
+      // Settled-in-error leaves the gate permanently blocked until React
+      // Query refetches. Trigger a refetch and tell the user to try again;
+      // the next click re-evaluates against the fresh query state.
+      void refetchCredentials();
+      toast({
+        variant: "warning",
+        title: "Couldn't load credentials",
+        description: "Retrying — try Play again once the toast clears.",
+      });
+      return;
+    }
+
+    if (gate.kind === "block-retry" && gate.reason === "credential-not-found") {
+      // The credential the LoginBlock references is not in the bounded
+      // useCredentialsQuery window (paginated past it, deleted, etc.).
+      // Refetching the same page can't fix that, so ask the backend to
+      // resolve the credential through the org-scoped lookup the run path
+      // uses, and apply that verdict directly.
+      if (!workflowPermanentId) {
+        toast({
+          variant: "warning",
+          title: "Couldn't verify credential",
+          description:
+            "Workflow context not ready. Refresh the page and try again.",
+        });
+        return;
+      }
+      if (compatibilityLookupInFlightRef.current) {
+        toast({
+          variant: "warning",
+          title: "Checking compatibility…",
+          description: "Already verifying the credential — please wait.",
+        });
+        return;
+      }
+      compatibilityLookupInFlightRef.current = true;
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<
+          unknown,
+          { data: DebugLoginBlockCompatibilityResponse }
+        >(`/debug-session/${workflowPermanentId}/login-block-compatibility`, {
+          params: { block_label: blockLabel },
+        });
+        const verdict = gateActionFromBackendCompatibility(response.data);
+        if (verdict.kind === "show-modal") {
+          setProfileIncompatibilityReason(verdict.reason);
+          return;
+        }
+        if (verdict.kind === "block-retry") {
+          toast({
+            variant: "warning",
+            title: "Couldn't verify credential",
+            description:
+              "The credential lookup returned an unexpected response. Try Play again, or refresh the page.",
+          });
+          return;
+        }
+        proceedWithPlay();
+        return;
+      } catch (error) {
+        log.error("Compatibility lookup failed", {
+          workflowPermanentId,
+          blockLabel,
+          error,
+        });
+        toast({
+          variant: "warning",
+          title: "Couldn't verify credential",
+          description:
+            "The credential lookup didn't complete. Try Play again, or refresh the page.",
+        });
+        return;
+      } finally {
+        compatibilityLookupInFlightRef.current = false;
+      }
+    }
+
+    if (gate.kind === "show-modal") {
+      setProfileIncompatibilityReason(gate.reason);
+      return;
+    }
+
+    proceedWithPlay();
+  };
+
   const handleOnCancel = () => {
     cancelBlock.mutate();
   };
@@ -660,6 +852,12 @@ function NodeHeader({
   const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isCanvasLocked = useIsCanvasLocked();
   const dragGatedByMode = isDragGatedByMode({ isRecording, isCanvasLocked });
+  const duplicateDisabledReason = isBlockFinallyGated(
+    blockLabel,
+    workflowSettingsStore.finallyBlockLabel,
+  )
+    ? "Finally block must run last"
+    : null;
 
   // Read-only canvases (compare/diff) drop the grip entirely - the handle
   // is inert there, so a faded button is just visual noise.
@@ -779,7 +977,9 @@ function NodeHeader({
             ) : (
               gripHandle
             ))}
-          <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+          <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+            {/* Without shrink-0, a long label or subtitle in the sibling
+            column steals width from this box before its own min-content. */}
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
           <div className="flex min-w-0 flex-col gap-1">
@@ -788,7 +988,10 @@ function NodeHeader({
               editable={editable}
               onChange={setLabel}
               titleClassName="text-base"
-              inputClassName="text-base"
+              // A negative margin here would shrink this auto-width column's
+              // measured size and clip short values via max-w-full, so the
+              // padding is offset with relative/left (paint-only) instead.
+              inputClassName="relative -left-1 px-1 text-base"
             />
 
             <div className="flex items-center gap-2">
@@ -819,7 +1022,12 @@ function NodeHeader({
                   </NoticeMe>
                 </div>
               ) : (
-                <span className="text-xs text-slate-400">{blockTitle}</span>
+                <span
+                  className="min-w-0 flex-1 truncate text-xs text-slate-400"
+                  title={blockTitle}
+                >
+                  {blockTitle}
+                </span>
               )}
               {workflowSettingsStore.finallyBlockLabel === blockLabel && (
                 <span className="rounded bg-amber-600/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
@@ -847,31 +1055,32 @@ function NodeHeader({
               </button>
             </div>
           )}
-          {debugStore.isDebugMode && isDebuggable && (
-            <button
-              disabled={workflowRunIsRunningOrQueued}
-              className={cn("rounded p-1 disabled:opacity-50", {
-                "hover:bg-muted": workflowRunIsRunningOrQueued,
-              })}
-            >
-              {runBlock.isPending ? (
-                <ReloadIcon className="size-6 animate-spin" />
-              ) : (
-                <PlayIcon
-                  className={cn("size-6", {
-                    "pointer-events-none fill-gray-500 text-gray-500":
-                      workflowRunIsRunningOrQueued ||
-                      !workflowPermanentId ||
-                      debugSession === undefined ||
-                      isRecording,
-                  })}
-                  onClick={() => {
-                    handleOnPlay();
-                  }}
-                />
-              )}
-            </button>
-          )}
+          {(debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
+            isDebuggable && (
+              <button
+                disabled={workflowRunIsRunningOrQueued}
+                className={cn("rounded p-1 disabled:opacity-50", {
+                  "hover:bg-muted": workflowRunIsRunningOrQueued,
+                })}
+              >
+                {runBlock.isPending ? (
+                  <ReloadIcon className="size-6 animate-spin" />
+                ) : (
+                  <PlayIcon
+                    className={cn("size-6", {
+                      "pointer-events-none fill-gray-500 text-gray-500":
+                        workflowRunIsRunningOrQueued ||
+                        !workflowPermanentId ||
+                        debugSession === undefined ||
+                        isRecording,
+                    })}
+                    onClick={() => {
+                      void handleOnPlay();
+                    }}
+                  />
+                )}
+              </button>
+            )}
           {collapseToggleButton}
           {disabled ? null : (
             <div>
@@ -882,8 +1091,19 @@ function NodeHeader({
                 })}
               >
                 <NodeActionMenu
+                  duplicateDisabledReason={duplicateDisabledReason}
+                  isDuplicable={
+                    !isReadOnlyScope && Boolean(duplicateNodeCallback)
+                  }
                   isScriptable={isScriptable}
                   isCanvasLocked={isCanvasLocked}
+                  onDuplicate={
+                    isReadOnlyScope || !duplicateNodeCallback
+                      ? undefined
+                      : () => {
+                          duplicateNodeCallback(nodeId);
+                        }
+                  }
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}
@@ -914,12 +1134,8 @@ function NodeHeader({
             },
             {
               onSuccess: () => {
-                if (workflowPermanentId) {
-                  useDebuggerLastRunValuesStore
-                    .getState()
-                    .setLastRunValues(workflowPermanentId, values);
-                }
-                // Close dialog on success - navigation also happens in mutation's onSuccess
+                // Close dialog on success - navigation and last-run-value
+                // persistence happen in the mutation's onSuccess.
                 setShowParamsDialog(false);
               },
               // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.
@@ -927,6 +1143,15 @@ function NodeHeader({
           );
         }}
         isLoading={runBlock.isPending}
+      />
+      <DebugSessionProfileIncompatibleDialog
+        open={profileIncompatibilityReason !== null}
+        reason={profileIncompatibilityReason}
+        onContinue={() => {
+          setProfileIncompatibilityReason(null);
+          proceedWithPlay();
+        }}
+        onCancel={() => setProfileIncompatibilityReason(null)}
       />
     </>
   );

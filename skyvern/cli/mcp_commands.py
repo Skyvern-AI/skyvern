@@ -22,6 +22,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from .console import console
+from .lazy import SkyvernTyperGroup
 from .setup_commands import (
     _backup_config_path,
     _claude_code_global_config_path,
@@ -47,8 +48,12 @@ from .setup_commands import (
     _write_mcp_config,
 )
 
-mcp_app = typer.Typer(help="Manage local MCP configs and optional saved Skyvern profiles.", no_args_is_help=True)
-profile_app = typer.Typer(help="Manage saved Skyvern MCP profiles.", no_args_is_help=True)
+mcp_app = typer.Typer(
+    cls=SkyvernTyperGroup,
+    help="Manage local MCP configs and optional saved Skyvern profiles.",
+    no_args_is_help=True,
+)
+profile_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage saved Skyvern MCP profiles.", no_args_is_help=True)
 mcp_app.add_typer(profile_app, name="profile")
 LOG = structlog.get_logger(__name__)
 

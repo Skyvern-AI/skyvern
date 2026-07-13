@@ -24,6 +24,7 @@ APPROVED_TAGS = {
     "Tags",
     "Schedules",
     "Credentials",
+    "Custom LLMs",
     "Browser Sessions",
     "Browser Profiles",
     "Artifacts",

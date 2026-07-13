@@ -8,7 +8,6 @@ import {
   CrossCircledIcon,
   MinusCircledIcon,
   PauseIcon,
-  StopIcon,
   StopwatchIcon,
   UpdateIcon,
 } from "@radix-ui/react-icons";
@@ -16,6 +15,7 @@ import {
 import { Status } from "@/api/types";
 import { cn } from "@/util/utils";
 
+import { TerminatedIcon } from "./terminatedVisual";
 import { Badge } from "./ui/badge";
 
 type StatusVariant =
@@ -59,6 +59,9 @@ function Pill({ tone, className, children }: PillProps) {
 type Props = {
   className?: string;
   status: Status | "pending";
+  // By default the label is sr-only below md (compact pill in dense tables);
+  // set this where the label must stay visible at every width, e.g. a tab chip.
+  alwaysShowLabel?: boolean;
 };
 
 function variantForStatus(status: Status | "pending"): StatusVariant {
@@ -98,7 +101,7 @@ function iconForStatus(status: Status | "pending") {
     case Status.TimedOut:
       return <StopwatchIcon className={cls} />;
     case Status.Terminated:
-      return <StopIcon className={cls} />;
+      return <TerminatedIcon className={cls} />;
     case Status.Skipped:
       return <MinusCircledIcon className={cls} />;
     case Status.Paused:
@@ -109,7 +112,7 @@ function iconForStatus(status: Status | "pending") {
   }
 }
 
-function StatusBadge({ className, status }: Props) {
+function StatusBadge({ className, status, alwaysShowLabel = false }: Props) {
   const statusText = status === "timed_out" ? "timed out" : status;
 
   return (
@@ -122,7 +125,9 @@ function StatusBadge({ className, status }: Props) {
       title={statusText}
     >
       {iconForStatus(status)}
-      <span className="sr-only md:not-sr-only">{statusText}</span>
+      <span className={alwaysShowLabel ? undefined : "sr-only md:not-sr-only"}>
+        {statusText}
+      </span>
     </Badge>
   );
 }

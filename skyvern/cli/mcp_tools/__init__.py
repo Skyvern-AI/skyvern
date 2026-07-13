@@ -75,6 +75,14 @@ from .browser import (
     skyvern_validate,
     skyvern_wait,
 )
+from .browser_profiles import (
+    skyvern_browser_profile_create,
+    skyvern_browser_profile_delete,
+    skyvern_browser_profile_get,
+    skyvern_browser_profile_list,
+    skyvern_browser_profile_update,
+)
+from .code_block import skyvern_code_block_lint, skyvern_code_block_synthesize
 from .credential import (
     skyvern_credential_delete,
     skyvern_credential_get,
@@ -157,6 +165,12 @@ from .workflow import (
     skyvern_workflow_status,
     skyvern_workflow_update,
     skyvern_workflow_update_folder,
+)
+
+_RUN_TASK_TOOL_DESCRIPTION = (
+    "Run a one-off autonomous trial via the highest-cost AI path. "
+    "Not for production or reusable automations. "
+    "Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute."
 )
 
 
@@ -281,6 +295,15 @@ Precision tools support intent (AI), selector (deterministic), or hybrid (both) 
 - console_messages and network_requests capture events from session start — call anytime.
 - Workflow, schedule, credential, script, folder, and block tools do NOT need a browser session.
 - schedule_create requires an existing workflow_permanent_id — call workflow_list or workflow_create first.
+- get_html reads an element by selector on the CURRENT page — navigate first; there is no fetch-HTML-by-URL.
+- workflow_get and workflow_run need a KNOWN workflow_permanent_id (wpid_); run starts a NEW run. To \
+search, browse, or paginate workflows use workflow_list — do NOT pass query/search/page/only_workflows \
+to workflow_get or workflow_create. To re-run an existing run, use workflow_retry with its workflow_run_id (wr_).
+- workflow_create/update take the ENTIRE workflow serialized into `definition` (title, blocks, and \
+parameters all inside); flat top-level fields are rejected.
+- browser_session_create MAKES a new session and takes no session_id/url/steps/selector — load a url with \
+navigate, run steps with execute, using the returned session_id. session_list returns ALL sessions (no pagination).
+- block_schema takes a block_type string only (no definition/format); validate a full block with block_validate(block_json=...).
 
 ## Session Lifecycle
 
@@ -349,13 +372,24 @@ mcp.tool(tags={"session"}, annotations=_ro("List Browser Sessions"))(skyvern_bro
 mcp.tool(tags={"session"}, annotations=_ro("Get Browser Session"))(skyvern_browser_session_get)
 mcp.tool(tags={"session"}, annotations=_web_mut("Connect to Browser Session"))(skyvern_browser_session_connect)
 
+# -- Browser profile management --
+mcp.tool(tags={"browser_profile"}, annotations=_mut("Create Browser Profile"))(skyvern_browser_profile_create)
+mcp.tool(tags={"browser_profile"}, annotations=_ro("List Browser Profiles"))(skyvern_browser_profile_list)
+mcp.tool(tags={"browser_profile"}, annotations=_ro("Get Browser Profile"))(skyvern_browser_profile_get)
+mcp.tool(tags={"browser_profile"}, annotations=_mut("Update Browser Profile"))(skyvern_browser_profile_update)
+mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(skyvern_browser_profile_delete)
+
 # -- Primary tools (AI-powered exploration + observation) --
 # Browser tools run against arbitrary websites. Read-only inspection remains
 # non-destructive, but still open-world because the target site is unbounded.
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
-mcp.tool(tags={"ai_powered"}, annotations=_web_dest("Run Autonomous Browser Task (AI)"))(skyvern_run_task)
+mcp.tool(
+    description=_RUN_TASK_TOOL_DESCRIPTION,
+    tags={"ai_powered"},
+    annotations=_web_dest("Run Autonomous Browser Task (AI)"),
+)(skyvern_run_task)
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
@@ -424,6 +458,8 @@ mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern
 # -- Block discovery + validation (no browser needed) --
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Synthesize Code Block"))(skyvern_code_block_synthesize)
 
 # -- Organization settings (no browser needed) --
 mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
@@ -485,6 +521,12 @@ __all__ = [
     "skyvern_browser_session_list",
     "skyvern_browser_session_get",
     "skyvern_browser_session_connect",
+    # Browser profiles
+    "skyvern_browser_profile_create",
+    "skyvern_browser_profile_list",
+    "skyvern_browser_profile_get",
+    "skyvern_browser_profile_update",
+    "skyvern_browser_profile_delete",
     # Primary (AI-powered)
     "skyvern_act",
     "skyvern_extract",
@@ -542,6 +584,8 @@ __all__ = [
     # Block discovery + validation
     "skyvern_block_schema",
     "skyvern_block_validate",
+    "skyvern_code_block_lint",
+    "skyvern_code_block_synthesize",
     # Organization settings
     "skyvern_org_get",
     "skyvern_org_update",

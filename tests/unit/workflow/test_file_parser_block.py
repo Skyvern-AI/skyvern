@@ -7,18 +7,21 @@ token truncation, and error handling for DOCX files.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import docx
 import pytest
 
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.exceptions import InvalidFileType
-from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock
+from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import FileType
+from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
 
 
 def _make_output_parameter(key: str) -> OutputParameter:
@@ -40,6 +43,15 @@ def _make_file_parser_block(file_url: str, file_type: FileType) -> FileParserBlo
         output_parameter=_make_output_parameter("test_output"),
         file_url=file_url,
         file_type=file_type,
+    )
+
+
+def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
+    return PDFParserBlock(
+        label="test_pdf_parser",
+        block_type=BlockType.PDF_PARSER,
+        output_parameter=_make_output_parameter("test_output"),
+        file_url=file_url,
     )
 
 
@@ -380,3 +392,389 @@ class TestExtractWithAiSerialization:
 
             _, kwargs = mock_load.call_args
             assert kwargs["extracted_text_content"] == "Hello\nWorld"
+
+
+@pytest.mark.asyncio
+class TestExtractWithAiSchemaValidation:
+    """Tests for schema adherence in FileParserBlock AI extraction."""
+
+    @staticmethod
+    def _patch_prompt_and_handler(mp: pytest.MonkeyPatch, handler: AsyncMock, prompt: str = "base prompt") -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value=prompt),
+        )
+
+    async def test_array_schema_does_not_force_dict(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
+        captured: dict[str, object] = {}
+
+        async def fake_handler(**kwargs: Any) -> list[dict[str, str]]:
+            captured["force_dict"] = kwargs["force_dict"]
+            return [{"name": "Alice"}]
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_prompt_and_handler(mp, handler)
+
+            result = await block._extract_with_ai("name\nAlice", MagicMock())
+
+        assert captured["force_dict"] is False
+        assert result == [{"name": "Alice"}]
+
+    async def test_object_schema_wrong_root_retries_without_prevalidation_coercion(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        responses: list[Any] = [[{"name": "Alice"}], {"name": "Alice"}]
+        prompts: list[str] = []
+        force_dict_values: list[bool] = []
+
+        async def fake_handler(**kwargs: Any) -> Any:
+            prompts.append(kwargs["prompt"])
+            force_dict_values.append(kwargs["force_dict"])
+            return responses.pop(0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_prompt_and_handler(mp, handler)
+
+            result = await block._extract_with_ai("name\nAlice", MagicMock())
+
+        assert result == {"name": "Alice"}
+        assert handler.await_count == 2
+        assert force_dict_values == [False, False]
+        assert "previous response failed JSON schema validation" in prompts[1]
+        assert "expected type object, got array" in prompts[1]
+
+    async def test_invalid_schema_fails_before_llm_retry(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {"type": 123}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock()
+            self._patch_prompt_and_handler(mp, handler)
+
+            with pytest.raises(ValueError, match="File parser JSON schema is invalid"):
+                await block._extract_with_ai("name\nAlice", MagicMock())
+
+        handler.assert_not_awaited()
+
+    async def test_schema_validation_failure_retries_with_sanitized_prompt(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
+        secret_like_value = "customer-private-value-" + ("x" * 300)
+        responses: list[Any] = [{"name": secret_like_value}, [{"name": "Alice"}]]
+        prompts: list[str] = []
+
+        async def fake_handler(**kwargs: Any) -> Any:
+            prompts.append(kwargs["prompt"])
+            return responses.pop(0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_prompt_and_handler(mp, handler)
+
+            result = await block._extract_with_ai("name\nAlice", MagicMock())
+
+        assert result == [{"name": "Alice"}]
+        assert handler.await_count == 2
+        assert prompts[0] == "base prompt"
+        assert "previous response failed JSON schema validation" in prompts[1]
+        assert "expected type array, got object" in prompts[1]
+        assert secret_like_value not in prompts[1]
+        assert "customer-private-value" not in prompts[1]
+
+    async def test_response_format_failure_retries_with_sanitized_prompt(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        raw_bad_response = "not-json-customer-private-value-" + ("x" * 300)
+        prompts: list[str] = []
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            prompts.append(kwargs["prompt"])
+            if len(prompts) == 1:
+                raise InvalidLLMResponseFormat(raw_bad_response)
+            return {"name": "Alice"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_prompt_and_handler(mp, handler)
+
+            result = await block._extract_with_ai("name\nAlice", MagicMock())
+
+        assert result == {"name": "Alice"}
+        assert handler.await_count == 2
+        assert "InvalidLLMResponseFormat" in prompts[1]
+        assert raw_bad_response not in prompts[1]
+        assert "customer-private-value" not in prompts[1]
+
+
+@pytest.mark.asyncio
+class TestPDFParserSchemaValidation:
+    """Tests for schema adherence in the deprecated PDFParserBlock."""
+
+    @staticmethod
+    def _patch_execute_dependencies(mp: pytest.MonkeyPatch, block: PDFParserBlock, handler: AsyncMock) -> AsyncMock:
+        workflow_run_context = MagicMock()
+        workflow_run_context.has_parameter.return_value = False
+        record_output_parameter_value = AsyncMock()
+
+        async def fake_build_block_result(self: PDFParserBlock, **kwargs: Any) -> BlockResult:
+            kwargs.pop("organization_id", None)
+            return BlockResult(output_parameter=self.output_parameter, **kwargs)
+
+        mp.setattr(
+            PDFParserBlock, "get_workflow_run_context", staticmethod(lambda workflow_run_id: workflow_run_context)
+        )
+        mp.setattr(PDFParserBlock, "record_output_parameter_value", record_output_parameter_value)
+        mp.setattr(PDFParserBlock, "build_block_result", fake_build_block_result)
+        mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value="/tmp/test.pdf"))
+        mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", MagicMock(return_value="name\nAlice"))
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="base prompt"),
+        )
+        mp.setattr("skyvern.forge.sdk.workflow.models.block.app.LLM_API_HANDLER", handler)
+        return record_output_parameter_value
+
+    async def test_execute_retries_schema_validation_without_prevalidation_coercion(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/data.pdf")
+        block.json_schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        responses: list[Any] = [[{"name": "Alice"}], {"name": "Alice"}]
+        prompts: list[str] = []
+        force_dict_values: list[bool] = []
+
+        async def fake_handler(**kwargs: Any) -> Any:
+            prompts.append(kwargs["prompt"])
+            force_dict_values.append(kwargs["force_dict"])
+            return responses.pop(0)
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            record_output_parameter_value = self._patch_execute_dependencies(mp, block, handler)
+
+            result = await block.execute("workflow-run", "workflow-run-block", organization_id="org-1")
+
+        assert result.success is True
+        assert result.status == BlockStatus.completed
+        assert result.output_parameter_value == {"name": "Alice"}
+        assert handler.await_count == 2
+        assert force_dict_values == [False, False]
+        assert "previous response failed JSON schema validation" in prompts[1]
+        assert "expected type object, got array" in prompts[1]
+        record_output_parameter_value.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestOcrPdfPages:
+    """Tests for the per-page vision-LLM OCR path for scanned PDFs (SKY-10960)."""
+
+    @staticmethod
+    def _patch_handler(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="prompt"),
+        )
+
+    async def test_each_page_transcribed_and_concatenated_in_order(self) -> None:
+        """One LLM call per page; every page is concatenated in page order with markers."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+        page_text = {
+            b"img-1": "Cover sheet",
+            b"img-2": "Demographics",
+            b"img-3": "Provider: JORDAN SAMPLE MD",
+        }
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": page_text[image]}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"img-1", b"img-2", b"img-3"])
+
+        # One call per page — the multi-page document is never sent as a single collapsed call.
+        assert handler.await_count == 3
+        for call in handler.await_args_list:
+            assert len(call.kwargs["screenshots"]) == 1
+        # Late-page content survives the single-call collapse.
+        assert "Provider: JORDAN SAMPLE MD" in result
+        assert "Cover sheet" in result and "Demographics" in result
+        assert result.index("--- Page 1 ---") < result.index("--- Page 2 ---") < result.index("--- Page 3 ---")
+
+    async def test_invalid_ocr_response_retries_with_sanitized_prompt(self) -> None:
+        """A missing extracted_text field is retried without echoing invalid content."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+        secret_like_value = "customer-private-value-" + ("x" * 300)
+        prompts: list[str] = []
+        force_dict_values: list[bool] = []
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            prompts.append(kwargs["prompt"])
+            force_dict_values.append(kwargs["force_dict"])
+            if len(prompts) == 1:
+                return {"wrong_field": secret_like_value}
+            return {"extracted_text": "Recovered page text"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"img-1"])
+
+        assert handler.await_count == 2
+        assert force_dict_values == [False, False]
+        assert "Recovered page text" in result
+        assert "previous OCR response failed JSON validation" in prompts[1]
+        assert "must include extracted_text as a string" in prompts[1]
+        assert secret_like_value not in prompts[1]
+        assert "customer-private-value" not in prompts[1]
+
+    async def test_order_preserved_when_a_later_page_resolves_first(self) -> None:
+        """Output stays in page order even if an earlier page's call finishes last."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"slow-1":
+                await asyncio.sleep(0.05)
+                return {"extracted_text": "first page body"}
+            return {"extracted_text": "second page body"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"slow-1", b"fast-2"])
+
+        assert result.index("first page body") < result.index("second page body")
+
+    async def test_failed_page_is_skipped_not_fatal(self) -> None:
+        """A per-page OCR failure is logged and skipped; the other pages still extract."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"bad":
+                raise RuntimeError("vision model timeout")
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"good-1", b"bad", b"good-3"])
+
+        assert handler.await_count == 3
+        assert "text for good-1" in result and "text for good-3" in result
+        assert "--- Page 2 ---" not in result
+
+    async def test_all_pages_failed_raises(self) -> None:
+        """A total OCR outage (every page errors) propagates instead of returning empty text."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            raise RuntimeError("vision model outage")
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            with pytest.raises(RuntimeError, match="vision model outage"):
+                await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
+
+    async def test_empty_pages_contribute_nothing(self) -> None:
+        """Pages that OCR to empty text add neither a marker nor content."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": "" if image == b"blank" else "real content"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            result = await block._ocr_pdf_pages([b"blank", b"page-2"])
+
+        assert "--- Page 1 ---" not in result
+        assert "--- Page 2 ---" in result and "real content" in result
+
+    async def test_truncates_at_page_boundary_on_token_limit(self) -> None:
+        """Concatenation stops at a page boundary once the token budget is exceeded."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": f"content {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+            # Each page chunk counts as 10 tokens; a 15-token budget admits only the first page.
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+
+            result = await block._ocr_pdf_pages([b"page-1", b"page-2", b"page-3"])
+
+        assert "--- Page 1 ---" in result
+        assert "--- Page 2 ---" not in result and "--- Page 3 ---" not in result
+
+    async def test_parse_pdf_file_routes_empty_text_to_per_page_ocr(self) -> None:
+        """A scanned PDF (no extractable text layer) is routed through per-page OCR."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": f"page {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "")
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+                lambda *a, **kw: [b"A", b"B"],
+            )
+
+            result = await block._parse_pdf_file("/tmp/scan.pdf")
+
+        assert handler.await_count == 2
+        assert "page A" in result and "page B" in result

@@ -36,7 +36,7 @@ class CredentialResponse(UniversalBaseModel):
 
     vault_type: typing.Optional[CredentialVaultType] = pydantic.Field(default=None)
     """
-    Which vault stores this credential (e.g., 'bitwarden', 'azure_vault', 'custom')
+    Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')
     """
 
     browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)
@@ -57,6 +57,11 @@ class CredentialResponse(UniversalBaseModel):
     save_browser_session_intent: typing.Optional[bool] = pydantic.Field(default=None)
     """
     Whether the user intends to save a browser session, regardless of test outcome
+    """
+
+    folder_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the credential folder this credential belongs to, if any
     """
 
     if IS_PYDANTIC_V2:

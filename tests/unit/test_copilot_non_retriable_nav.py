@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     POST_NON_RETRIABLE_NAV_ERROR_STOP_NUDGE,
@@ -21,7 +22,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _extract_url_from_nav_error,
     _maybe_raise_non_retriable_nav,
     _needs_failed_test_nudge,
-    _needs_repeated_null_data_nudge,
     _needs_suspicious_success_nudge,
     _non_retriable_nav_error_nudge,
     _repeated_frontier_failure_nudge,
@@ -32,11 +32,15 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_workflow_update_result,
     _tool_loop_error,
 )
+from skyvern.schemas.runs import ProxyLocation
 
 _DNS_FAILURE_REASON = (
     "Failed to navigate to url https://www.example.invalid/path. Error message: net::ERR_NAME_NOT_RESOLVED"
 )
 _CERT_FAILURE_REASON = "Failed to navigate to url https://expired.example. Error message: net::ERR_CERT_DATE_INVALID"
+_TUNNEL_FAILURE_REASON = (
+    "Failed to navigate to url https://proxy.example. Error message: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
 _GENERIC_FAILURE_REASON = "Timeout waiting for element #submit"
 
 
@@ -56,32 +60,27 @@ def _fresh_context() -> CopilotContext:
 # ---------------------------------------------------------------------------
 
 
-def test_detect_matches_dns_error_in_block_failure_reason() -> None:
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": _DNS_FAILURE_REASON}]}}
-    assert _detect_non_retriable_nav_error(result) == _DNS_FAILURE_REASON
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(_DNS_FAILURE_REASON, id="dns_standard_format"),
+        pytest.param(
+            "Failed to navigate to url not-a-url. Error message: net::ERR_INVALID_URL",
+            id="invalid_url_standard_format",
+        ),
+        pytest.param("net::ERR_NAME_RESOLUTION_FAILED happened mid-flight", id="name_resolution_mid_string"),
+        pytest.param("SSL error: net::ERR_SSL_PROTOCOL_ERROR", id="ssl_prefixed"),
+        pytest.param(_TUNNEL_FAILURE_REASON, id="tunnel_connection_failed"),
+    ],
+)
+def test_detect_matches_error_in_block_failure_reason(reason: str) -> None:
+    result = {"ok": False, "data": {"blocks": [{"failure_reason": reason}]}}
+    assert _detect_non_retriable_nav_error(result) == reason
 
 
 def test_detect_matches_cert_error_in_run_level_failure_reason() -> None:
     result = {"ok": False, "data": {"failure_reason": _CERT_FAILURE_REASON, "blocks": []}}
     assert _detect_non_retriable_nav_error(result) == _CERT_FAILURE_REASON
-
-
-def test_detect_matches_invalid_url_error() -> None:
-    invalid_url = "Failed to navigate to url not-a-url. Error message: net::ERR_INVALID_URL"
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": invalid_url}]}}
-    assert _detect_non_retriable_nav_error(result) == invalid_url
-
-
-def test_detect_matches_name_resolution_failed() -> None:
-    reason = "net::ERR_NAME_RESOLUTION_FAILED happened mid-flight"
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": reason}]}}
-    assert _detect_non_retriable_nav_error(result) == reason
-
-
-def test_detect_matches_ssl_error() -> None:
-    reason = "SSL error: net::ERR_SSL_PROTOCOL_ERROR"
-    result = {"ok": False, "data": {"blocks": [{"failure_reason": reason}]}}
-    assert _detect_non_retriable_nav_error(result) == reason
 
 
 def test_detect_returns_none_for_generic_failure() -> None:
@@ -182,6 +181,36 @@ def test_workflow_update_clears_non_retriable_flag_and_signature_latch() -> None
     # Consistency check: the other per-test fields are also reset (pre-existing behavior).
     assert ctx.last_test_ok is None
     assert ctx.last_test_failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("rollout_enabled", "workflow_proxy_location", "expected_proxy_location"),
+    [
+        (False, None, ProxyLocation.RESIDENTIAL),
+        (True, None, ProxyLocation.NONE),
+        (False, ProxyLocation.RESIDENTIAL_GB, ProxyLocation.RESIDENTIAL_GB),
+        (False, ProxyLocation.NONE, ProxyLocation.NONE),
+    ],
+)
+def test_workflow_update_records_runtime_proxy_default(
+    monkeypatch: pytest.MonkeyPatch,
+    rollout_enabled: bool,
+    workflow_proxy_location: ProxyLocation | None,
+    expected_proxy_location: ProxyLocation,
+) -> None:
+    monkeypatch.setattr(settings, "RUNTIME_PROXY_DEFAULT_NONE_ENABLED", rollout_enabled)
+    ctx = _fresh_context()
+
+    _record_workflow_update_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {"block_count": 1},
+            "_workflow": SimpleNamespace(workflow_id="wf_new", proxy_location=workflow_proxy_location),
+        },
+    )
+
+    assert ctx.effective_workflow_proxy_location == expected_proxy_location
 
 
 def test_workflow_update_does_not_clear_flag_on_failed_update() -> None:
@@ -333,41 +362,11 @@ def test_check_enforcement_pre_empts_post_update_nudge() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_needs_failed_test_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.test_after_update_done = True
-    ctx.last_test_ok = False
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_failed_test_nudge(ctx) is False
-
-
 def test_needs_failed_test_nudge_still_fires_without_flag() -> None:
     ctx = _fresh_context()
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     assert _needs_failed_test_nudge(ctx) is True
-
-
-def test_needs_suspicious_success_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_suspicious_success = True
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_suspicious_success_nudge(ctx) is False
-
-
-def test_needs_repeated_null_data_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 5
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _needs_repeated_null_data_nudge(ctx) is False
-
-
-def test_repeated_frontier_failure_nudge_suppressed_when_flag_set() -> None:
-    ctx = _fresh_context()
-    ctx.repeated_failure_streak_count = 5
-    ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
-    assert _repeated_frontier_failure_nudge(ctx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -460,27 +459,17 @@ def test_all_competing_branches_silent_after_latch() -> None:
     # Reproduce the full steady state after the one-shot stop nudge has
     # latched: ctx has a non-retriable error, last_test_ok=False,
     # test_after_update_done=True, and all counters are set such that the
-    # other branches would normally fire. Assert all four helpers are silent.
+    # other branches would normally fire. Assert each helper is silent.
     ctx = _fresh_context()
     ctx.test_after_update_done = True
     ctx.last_test_ok = False
     ctx.last_test_suspicious_success = True
-    ctx.null_data_streak_count = 5
     ctx.repeated_failure_streak_count = 5
     ctx.last_test_non_retriable_nav_error = _DNS_FAILURE_REASON
 
     assert _needs_failed_test_nudge(ctx) is False
     assert _needs_suspicious_success_nudge(ctx) is False
-    assert _needs_repeated_null_data_nudge(ctx) is False
     assert _repeated_frontier_failure_nudge(ctx) is None
-
-
-def test_without_flag_competing_branches_still_active() -> None:
-    # Inverse: same setup but without the flag — all relevant branches fire.
-    ctx = _fresh_context()
-    ctx.test_after_update_done = True
-    ctx.last_test_ok = False
-    assert _needs_failed_test_nudge(ctx) is True
 
 
 # ---------------------------------------------------------------------------

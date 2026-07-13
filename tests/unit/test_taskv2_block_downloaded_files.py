@@ -32,86 +32,6 @@ def _output_parameter(key: str) -> OutputParameter:
     )
 
 
-def test_taskv2_output_includes_downloaded_files_filtered_by_loop() -> None:
-    """When inside a loop, TaskV2Block output should include only THIS iteration's downloaded files."""
-    # Simulate baseline: iteration started with a.pdf already downloaded
-    loop_state = {
-        "downloaded_file_signatures_before_iteration": [
-            ["a.pdf", "abc", "https://files/a.pdf"],
-        ],
-    }
-
-    # Storage returns all files (a.pdf from before + b.pdf downloaded this iteration)
-    all_files = [
-        _file("https://files/a.pdf?sig=old", "a.pdf", "abc"),
-        _file("https://files/b.pdf?sig=new", "b.pdf", "def"),
-    ]
-
-    # Apply the same filter that TaskV2Block now uses
-    filtered = filter_downloaded_files_for_current_iteration(all_files, loop_state)
-
-    # Build output dict the same way TaskV2Block does
-    task_v2_output = {
-        "task_id": "oc_test",
-        "status": "completed",
-        "summary": None,
-        "extracted_information": None,
-        "failure_reason": None,
-        "downloaded_files": [fi.model_dump() for fi in filtered],
-        "downloaded_file_urls": [fi.url for fi in filtered],
-        "task_screenshot_artifact_ids": [],
-        "workflow_screenshot_artifact_ids": [],
-    }
-
-    assert len(task_v2_output["downloaded_files"]) == 1
-    assert task_v2_output["downloaded_files"][0]["filename"] == "b.pdf"
-    assert task_v2_output["downloaded_file_urls"] == ["https://files/b.pdf?sig=new"]
-
-
-def test_taskv2_output_includes_all_files_outside_loop() -> None:
-    """Outside a loop (no loop_internal_state), all downloaded files should be included."""
-    all_files = [
-        _file("https://files/a.pdf", "a.pdf", "abc"),
-        _file("https://files/b.pdf", "b.pdf", "def"),
-    ]
-
-    filtered = filter_downloaded_files_for_current_iteration(all_files, None)
-
-    task_v2_output = {
-        "downloaded_files": [fi.model_dump() for fi in filtered],
-        "downloaded_file_urls": [fi.url for fi in filtered],
-    }
-
-    assert len(task_v2_output["downloaded_files"]) == 2
-    assert task_v2_output["downloaded_file_urls"] == [
-        "https://files/a.pdf",
-        "https://files/b.pdf",
-    ]
-
-
-def test_taskv2_output_empty_when_no_new_downloads_in_iteration() -> None:
-    """If no new files were downloaded in this iteration, both lists should be empty."""
-    loop_state = {
-        "downloaded_file_signatures_before_iteration": [
-            ["a.pdf", "abc", "https://files/a.pdf"],
-        ],
-    }
-
-    all_files = [
-        _file("https://files/a.pdf?sig=old", "a.pdf", "abc"),
-    ]
-
-    filtered = filter_downloaded_files_for_current_iteration(all_files, loop_state)
-
-    task_v2_output = {
-        "downloaded_files": [fi.model_dump() for fi in filtered],
-        "downloaded_file_urls": [fi.url for fi in filtered],
-    }
-
-    assert task_v2_output["downloaded_files"] == []
-    assert task_v2_output["downloaded_file_urls"] == []
-
-
 def test_taskv2_context_loop_state_available_after_nested_task_execution() -> None:
     """Verify loop_internal_state survives nested task execution and remains available for filtering."""
     loop_state = {
@@ -180,7 +100,13 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
     )
     skyvern_context.set(parent_context)
 
-    outer_workflow_run = SimpleNamespace(proxy_location=None, max_screenshot_scrolls=None)
+    outer_workflow_run = SimpleNamespace(
+        proxy_location=None,
+        max_screenshot_scrolls=None,
+        browser_address=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+    )
     child_workflow_run = SimpleNamespace(failure_reason=None)
     organization = SimpleNamespace(organization_id="org_1", organization_name="Org 1")
     a_zip = _file("file:///app/downloads/wr_parent/a.zip", "a.zip", "abc")

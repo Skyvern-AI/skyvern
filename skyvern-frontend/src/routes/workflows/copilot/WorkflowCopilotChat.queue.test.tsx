@@ -6,7 +6,10 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
 
@@ -92,8 +95,15 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowPermanentId: "wpid_1",
       workflowRunId: undefined,
     }),
+    useSearchParams: () => [new URLSearchParams(), vi.fn()],
   };
 });
+
+vi.mock("posthog-js/react", () => ({
+  // "copilot_ux_v1" stays off — this file's fixtures pin today's headline
+  // strings, not the disposition-first reorder behind that flag.
+  useFeatureFlagEnabled: (flag: string) => flag !== "copilot_ux_v1",
+}));
 
 const saveData = {
   title: "Test WF",
@@ -109,7 +119,9 @@ const saveData = {
     proxyLocation: null,
     webhookCallbackUrl: null,
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
+    browserProfileKey: null,
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
@@ -127,6 +139,12 @@ const saveData = {
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
+}));
+
+// Unrelated to this file's tests; the real hook needs a QueryClientProvider
+// this harness doesn't set up.
+vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
@@ -159,8 +177,10 @@ const workflowDraft = () => ({
   workflow: { workflow_id: "wf_draft" },
 });
 
-async function renderChat() {
-  const view = render(<WorkflowCopilotChat />);
+async function renderChat(
+  props: ComponentProps<typeof WorkflowCopilotChat> = {},
+) {
+  const view = render(<WorkflowCopilotChat {...props} />);
   // Let the mount-time chat-history fetch settle.
   await waitFor(() =>
     expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
@@ -211,6 +231,11 @@ beforeEach(() => {
     proposed_workflow: null,
     auto_accept: false,
   };
+  useCopilotActionStore.setState({
+    pendingBuild: null,
+    generatingBlockLabel: null,
+    cancelNonce: 0,
+  });
 });
 
 afterEach(() => {
@@ -225,6 +250,45 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(textarea().disabled).toBe(false);
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  });
+
+  it("labels the in-flight follow-up action as the next send", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(
+      screen.getByText(
+        "Copilot is working. Your next send will wait for the next turn.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByPlaceholderText("Type a message to send next…"),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send next" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+  });
+
+  it("explains that the next send waits while the live browser is starting", async () => {
+    render(
+      <WorkflowCopilotChat requiresLiveBrowser isLiveBrowserReady={false} />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByPlaceholderText("Type a prompt to send when ready..."),
+      ).toBeTruthy(),
+    );
+
+    expect(
+      screen.getByText(
+        "Live browser is starting. Your next send will wait until it connects.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+    // The old copy conflated sending with queuing; guard against its return.
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+    expect(screen.queryByText(/Send now to queue your prompt/)).toBeNull();
+    expect(screen.queryByPlaceholderText(/Type a prompt to queue/)).toBeNull();
   });
 
   it("still sends the message when dictation audio upload fails", async () => {
@@ -296,6 +360,145 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(textarea().disabled).toBe(false);
     expect(cancelPost).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  });
+
+  it("clears the queued block-build target on cancel so it cannot leak into the next message", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Arm a block-level Generate while the turn is in flight: it queues behind
+    // the active turn, capturing the target block label in a ref.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // Cancel the queued block-build before it sends.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+
+    // Finish the original turn and send an unrelated follow-up.
+    await completeOldestStream("first done");
+    await submit("a normal follow-up");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    const followUp = streamCalls.find(
+      (call) => call.body.message === "a normal follow-up",
+    );
+    expect(followUp).toBeTruthy();
+    expect(
+      (followUp!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBeNull();
+  });
+
+  it("keeps the block generating label set while its build waits behind an in-flight turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Arm a block-level Generate while a turn is in flight: it queues behind it.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+      "open_page",
+    );
+
+    // The unrelated turn ends; the queued block build then drains into its own
+    // stream. The generating label must survive both events.
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+      "open_page",
+    );
+    expect(
+      (streamCalls[1]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBe("open_page");
+
+    // The label clears only once the block-build turn itself finishes.
+    await act(async () => {
+      streamCalls[1]!.onMessage(terminalResponse("block rebuilt"));
+      streamCalls[1]!.resolve();
+    });
+    await waitFor(() =>
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull(),
+    );
+  });
+
+  it("does not arm a block-build target when its generate no-ops behind a queued prompt", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Queue a normal follow-up behind the in-flight turn.
+    await submit("second message");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // A block Generate now no-ops (a prompt is already queued); it must neither
+    // arm the block target nor leave the block stuck generating.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() =>
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull(),
+    );
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // The queued follow-up drains normally, unscoped to any block.
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    const drained = streamCalls.find(
+      (call) => call.body.message === "second message",
+    );
+    expect(drained).toBeTruthy();
+    expect(
+      (drained!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBeNull();
+  });
+
+  it("drops a queued block build when its Stop is pressed, sparing the active turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Arm a block Generate while the turn is in flight: it queues behind it.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+      "open_page",
+    );
+
+    // Press the block's Stop: drop the queued build without cancelling the
+    // unrelated in-flight turn.
+    await act(async () => {
+      useCopilotActionStore.getState().requestCancel();
+    });
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+
+    // The original turn completes; the dropped build must not drain into a stream.
+    await completeOldestStream("first done");
+    await act(async () => {});
+    expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
   it("resets the live narrative when a stream throws without a terminal", async () => {
@@ -509,6 +712,150 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("keeps a rejected history-loaded auto-applicable draft labeled as proposed changes", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "I drafted workflow changes for review.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: false,
+            proposalDisposition: "auto_applicable",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 1,
+              blockLabels: ["open_page"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage: "I drafted workflow changes for review.",
+            narrativeSummary: "I drafted workflow changes for review.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    await renderChat({ docked: true, portalTarget });
+
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    });
+
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Applied changes")).toBeNull();
+    portalTarget.remove();
+  });
+
+  it("relabels an auto-applicable draft as applied changes once accepted", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "I drafted workflow changes for review.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: false,
+            proposalDisposition: "auto_applicable",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 1,
+              blockLabels: ["open_page"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage: "I drafted workflow changes for review.",
+            narrativeSummary: "I drafted workflow changes for review.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    await renderChat({ docked: true, portalTarget });
+
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Applied changes")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
+    );
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/apply-proposed-workflow",
+      expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+    );
+    expect(screen.getByText("Applied changes")).toBeTruthy();
+    expect(screen.queryByText("Proposed changes")).toBeNull();
+    portalTarget.remove();
   });
 
   it("renders an ASK_QUESTION response payload as a question", async () => {

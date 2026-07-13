@@ -1,4 +1,6 @@
 import { Skeleton } from "@/components/ui/skeleton";
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 import { useGlobalWorkflowsQuery } from "../workflows/hooks/useGlobalWorkflowsQuery";
 import { useNavigate } from "react-router-dom";
 import { WorkflowTemplateCard } from "./WorkflowTemplateCard";
@@ -15,6 +17,7 @@ import {
 function WorkflowTemplates() {
   const { data: workflowTemplates, isLoading } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
+  const studioEnabled = useWorkflowStudioEnabled();
 
   if (isLoading) {
     return (
@@ -26,7 +29,7 @@ function WorkflowTemplates() {
     );
   }
 
-  if (!workflowTemplates) {
+  if (!workflowTemplates || workflowTemplates.length === 0) {
     return null;
   }
 
@@ -54,7 +57,10 @@ function WorkflowTemplates() {
                 }
                 onClick={() => {
                   navigate(
-                    `/workflows/${workflow.workflow_permanent_id}/build`,
+                    workflowEditorPath(
+                      workflow.workflow_permanent_id,
+                      studioEnabled,
+                    ),
                   );
                 }}
               />

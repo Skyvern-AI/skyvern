@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable, cast
 
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
 
 # Sentinel marker for native JSON type injection via | json filter.
 _JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
@@ -33,6 +34,37 @@ def _json_finalize(value: Any) -> Any:
     instead of Python repr. Strings (including `| tojson` output) pass through unchanged."""
     if isinstance(value, (dict, list)):
         return json.dumps(value, default=str)
+    return value
+
+
+def render_templates_in_json_value(value: object, render_string: Callable[[str], str]) -> object:
+    """Recursively render Jinja templates in nested JSON-like structures, honoring the
+    `{{ expr | json }}` filter for type-preserving JSON injection."""
+    if isinstance(value, str):
+        rendered = render_string(value)
+        if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
+            json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                raise FailedToFormatJinjaStyleParameter(value, f"Raw JSON filter produced invalid JSON: {json_str}")
+        if _JSON_TYPE_MARKER in rendered:
+            raise FailedToFormatJinjaStyleParameter(
+                value,
+                "The '| json' filter can only be used for complete value replacement. "
+                "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
+                "Remove the surrounding text or remove the '| json' filter.",
+            )
+        return rendered
+    if isinstance(value, list):
+        return [render_templates_in_json_value(item, render_string) for item in value]
+    if isinstance(value, dict):
+        return {
+            cast(str, render_templates_in_json_value(key, render_string)): render_templates_in_json_value(
+                val, render_string
+            )
+            for key, val in value.items()
+        }
     return value
 
 

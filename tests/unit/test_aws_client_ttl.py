@@ -2,7 +2,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ProfileNotFound
 
 from skyvern.forge.sdk.api import aws
 
@@ -10,6 +10,46 @@ _EXPIRED_TOKEN_ERROR = ClientError(
     {"Error": {"Code": "ExpiredTokenException", "Message": "Token expired"}},
     "S3Operation",
 )
+
+
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": code}}, "GetObject")
+
+
+@pytest.mark.parametrize("code", ["NoSuchKey", "NotFound", "404"])
+def test_is_not_found_error_true_for_missing_object_codes(code: str) -> None:
+    client = aws.AsyncAWSClient()
+    assert client._is_not_found_error(_client_error(code)) is True
+
+
+@pytest.mark.parametrize("error", [_client_error("AccessDenied"), Exception("boom")])
+def test_is_not_found_error_false_for_other_errors(error: Exception) -> None:
+    client = aws.AsyncAWSClient()
+    assert client._is_not_found_error(error) is False
+
+
+@pytest.mark.asyncio
+async def test_download_file_missing_key_returns_none_without_traceback() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("NoSuchKey"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/missing.zip")
+    assert result is None
+    mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_file_real_error_still_logs_exception() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("AccessDenied"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/denied.zip")
+    assert result is None
+    mock_log.exception.assert_called_once()
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +81,68 @@ def test_refresh_session_creates_new_session():
     old_session = client.session
     client.refresh_session()
     assert client.session is not old_session
+
+
+def test_no_profile_session_creation_uses_default_credential_chain(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    session = MagicMock()
+
+    with patch.object(aws.aioboto3, "Session", return_value=session) as mock_session:
+        client = aws.AsyncAWSClient()
+        mock_session.assert_not_called()
+
+        assert client.session is session
+
+        mock_session.assert_called_once_with(
+            aws_access_key_id=None,
+            aws_secret_access_key=None,
+            profile_name=None,
+        )
+
+
+def test_session_attribute_remains_settable_for_compatibility():
+    session = MagicMock()
+    client = aws.AsyncAWSClient()
+
+    client.session = session
+
+    assert client.session is session
+
+
+@pytest.mark.asyncio
+async def test_missing_profile_is_deferred_until_aws_operation():
+    profile_name = "__skyvern_missing_profile__"
+
+    with patch.object(aws.aioboto3, "Session", side_effect=ProfileNotFound(profile=profile_name)) as mock_session:
+        client = aws.AsyncAWSClient(profile_name=profile_name)
+        mock_session.assert_not_called()
+
+        with patch.object(aws.LOG, "exception") as mock_log_exception:
+            result = await client.get_secret("example-secret")
+
+        assert result is None
+        mock_session.assert_called_once_with(
+            aws_access_key_id=None,
+            aws_secret_access_key=None,
+            profile_name=profile_name,
+        )
+        mock_log_exception.assert_called_once()
+        assert mock_log_exception.call_args.kwargs["error_code"] == "AWSSessionConfigurationError"
+
+
+@pytest.mark.asyncio
+async def test_missing_profile_raise_path_surfaces_scoped_error():
+    profile_name = "__skyvern_missing_profile__"
+
+    with patch.object(aws.aioboto3, "Session", side_effect=ProfileNotFound(profile=profile_name)):
+        client = aws.AsyncAWSClient(profile_name=profile_name)
+
+        with pytest.raises(aws.AWSSessionConfigurationError, match=f"AWS profile '{profile_name}'.*s3 client"):
+            await client.upload_file_from_path(
+                uri="s3://test-bucket/test-key.png",
+                file_path="/tmp/test.png",
+                raise_exception=True,
+            )
 
 
 @pytest.mark.asyncio

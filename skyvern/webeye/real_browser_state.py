@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections.abc import Awaitable, Callable
 from typing import Literal
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import BrowserContext, Page, Playwright
+from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_PAGE_CLOSE_TIMEOUT, NAVIGATION_MAX_RETRY_TIME
@@ -34,6 +35,7 @@ LOG = structlog.get_logger()
 
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
+RECOVERABLE_BLANK_PAGE_URLS = {":"}
 
 
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
@@ -57,6 +59,7 @@ class RealBrowserState(BrowserState):
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
+        release_driver_on_close: bool = False,
     ):
         self.__page = page
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
@@ -70,6 +73,26 @@ class RealBrowserState(BrowserState):
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
+        # Stamped for states attached to a caller-provided remote browser
+        # (``browser_address``): the local Playwright driver exists solely for
+        # this state and must be released on close even when the remote
+        # browser is left running.
+        self.release_driver_on_close = release_driver_on_close
+        # One-shot callbacks fired first inside ``close()``. Cleared after
+        # firing so re-entry into ``close()`` is safe.
+        self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
+
+    def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._on_close_callbacks.append(callback)
+
+    async def _run_on_close_callbacks(self) -> None:
+        callbacks = self._on_close_callbacks
+        self._on_close_callbacks = []
+        for callback in callbacks:
+            try:
+                await callback()
+            except Exception:
+                LOG.debug("on-close callback raised; ignored", exc_info=True)
 
     async def __assert_page(self) -> Page:
         page = await self.get_working_page()
@@ -79,13 +102,19 @@ class RealBrowserState(BrowserState):
         LOG.error("BrowserState has no page", urls=[p.url for p in pages])
         raise MissingBrowserStatePage()
 
-    async def _close_all_other_pages(self) -> None:
+    async def _close_all_other_pages(self, discard_orphaned_videos: bool = False) -> None:
         cur_page = await self.get_working_page()
         if not self.browser_context or not cur_page:
             return
         pages = self.browser_context.pages
         for page in pages:
             if page != cur_page:
+                if discard_orphaned_videos:
+                    # Tombstone before any await: set_popup_video_listener's registration for
+                    # this same page may still be in flight, and must observe the tombstone
+                    # whenever it resolves rather than re-appending after we remove it below.
+                    self.browser_artifacts.discard_page_video(page)
+                    await self._discard_video_artifact(page)
                 try:
                     async with asyncio.timeout(2):
                         await page.close()
@@ -93,6 +122,29 @@ class RealBrowserState(BrowserState):
                     LOG.warning("Timeout to close the page. Skip closing the page", url=page.url)
                 except Exception:
                     LOG.exception("Error while closing the page", url=page.url)
+
+    async def _discard_video_artifact(self, page: Page) -> None:
+        # This page never became the working page — its video must not be registered.
+        video = page.video
+        if not video:
+            return
+        try:
+            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
+                path = str(await video.path())
+        except Exception:
+            # Best-effort: leave the artifact registered rather than raising — the
+            # near-empty video is uploaded as-is instead of silently disappearing.
+            try:
+                page_origin = urlparse(page.url).hostname or "unknown"
+            except Exception:
+                page_origin = "unknown"
+            LOG.warning("Could not get video path to discard orphaned artifact", page_origin=page_origin, exc_info=True)
+            return
+        video_artifacts = self.browser_artifacts.video_artifacts
+        filtered = [va for va in video_artifacts if va.video_path != path]
+        if len(filtered) != len(video_artifacts):
+            LOG.debug("Discarded orphaned video artifact", video_path=path)
+        self.browser_artifacts.video_artifacts = filtered
 
     async def check_and_fix_state(
         self,
@@ -136,7 +188,15 @@ class RealBrowserState(BrowserState):
         if await self.get_working_page() is None:
             page: Page | None = None
             use_existing_page = False
-            if browser_address and len(self.browser_context.pages) > 0:
+            # Some remote browser sessions bind their capture/streaming to the
+            # CDP target that existed at session creation. Opening a new tab
+            # and then running _close_all_other_pages detaches that binding
+            # from the page the agent actually navigates. Reuse the existing
+            # page so the remote session stays aligned with the active target.
+            has_remote_browser_session = bool(
+                self.browser_artifacts and self.browser_artifacts.remote_browser_session_id
+            )
+            if (browser_address or has_remote_browser_session) and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
                 if pages:
                     page = pages[-1]
@@ -146,7 +206,7 @@ class RealBrowserState(BrowserState):
 
             await self.set_working_page(page, 0)
             if not use_existing_page:
-                await self._close_all_other_pages()
+                await self._close_all_other_pages(discard_orphaned_videos=True)
 
             if url and not _same_page_ignoring_fragment(page.url, url):
                 await self.navigate_to_url(page=page, url=url)
@@ -185,21 +245,22 @@ class RealBrowserState(BrowserState):
             LOG.info("No http, https or blank page found in the browser context, return None")
             return None
 
-        # Honor a tab explicitly selected via NEW_TAB/SWITCH_TAB while it is still open and no
-        # new tab has appeared since selection. A newly-opened tab (any page not in the snapshot)
-        # auto-takes focus, preserving the legacy last-page behavior; closing an unrelated tab
-        # does not drop the pin.
+        # Honor a tab explicitly selected via NEW_TAB/SWITCH_TAB while it is still open.
+        # A genuinely new tab auto-takes focus, preserving legacy last-page behavior; a
+        # recoverable blank marker from a download flow does not break the selected-tab pin.
         active_page = self.__active_page
-        if (
-            active_page is not None
-            and not active_page.is_closed()
-            and active_page in pages
-            and all(page in self.__active_page_known_pages for page in pages)
-        ):
-            self.__page = active_page
-            return active_page
+        if active_page is not None and not active_page.is_closed() and active_page in pages:
+            if all(page in self.__active_page_known_pages for page in pages):
+                self.__page = active_page
+                return active_page
 
-        # No (or stale) pin: fall back to the last http/https page as the working page.
+            new_pages = [page for page in pages if page not in self.__active_page_known_pages]
+            if new_pages and all(page.url in RECOVERABLE_BLANK_PAGE_URLS for page in new_pages):
+                # Do not add marker pages to known_pages; they should remain ignored until closed.
+                self.__page = active_page
+                return active_page
+
+        # No (or stale) pin: fall back to the newest valid page.
         self.__active_page = None
         self.__active_page_known_pages = set()
         last_page = pages[-1]
@@ -362,6 +423,69 @@ class RealBrowserState(BrowserState):
             page = await self.__assert_page()
         return page
 
+    def is_connected(self) -> bool:
+        # A reused browser state (e.g. a persistent debug session) can have a stopped driver
+        # after a prior owner's cleanup; page.goto then raises "Connection closed while reading
+        # from the driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
+        # _close_was_called, so also inspect the shared driver Connection's closed-error.
+        context = self.browser_context
+        if context is None:
+            return False
+        impl = getattr(context, "_impl_obj", None)
+        if getattr(impl, "_close_was_called", False) is True or getattr(impl, "_closed", False) is True:
+            return False
+        connection = getattr(impl, "_connection", None)
+        if getattr(connection, "_closed_error", None) is not None:
+            return False
+        browser = getattr(context, "browser", None)
+        if browser is None:
+            return True
+        try:
+            return browser.is_connected()
+        except Exception:
+            return False
+
+    async def reconnect(
+        self,
+        proxy_location: ProxyLocationInput = None,
+        workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
+        browser_profile_id: str | None = None,
+    ) -> None:
+        # The old driver pipe is gone, so check_and_fix_state must not reuse self.pw; start a
+        # fresh Playwright driver and reconnect to the same (still-alive) remote browser.
+        stale_pw = self.pw
+        self.browser_context = None
+        await self.set_working_page(None)
+        self.pw = await async_playwright().start()
+        try:
+            await self.check_and_fix_state(
+                proxy_location=proxy_location,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
+            )
+        except Exception:
+            # The caller abandons this state on failure, so stop the just-started driver too or it leaks.
+            try:
+                await self.pw.stop()
+            except Exception:
+                LOG.debug("Failed to stop the new Playwright driver after a failed reconnect", exc_info=True)
+            raise
+        finally:
+            try:
+                await stale_pw.stop()
+            except Exception:
+                LOG.debug("Failed to stop the stale Playwright driver during reconnect", exc_info=True)
+
     async def close_current_open_page(self) -> bool:
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
@@ -441,7 +565,10 @@ class RealBrowserState(BrowserState):
         max_retries: int = settings.MAX_SCRAPING_RETRIES,
         scrape_exclude: ScrapeExcludeFunc | None = None,
         take_screenshots: bool = True,
-        draw_boxes: bool = True,
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # The parameter is retained for backwards compatibility and is scheduled for removal.
+        # New call sites must not pass ``draw_boxes=True``.
+        draw_boxes: bool = False,
         max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
         support_empty_page: bool = False,
@@ -468,8 +595,21 @@ class RealBrowserState(BrowserState):
             must_included_tags=must_included_tags,
         )
 
-    async def close(self, close_browser_on_completion: bool = True) -> None:
-        LOG.info("Closing browser state")
+    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None:
+        # ``release_driver`` decouples the local Playwright driver's lifetime
+        # from the remote browser's: callers that retain this state for reuse
+        # (persistent sessions, parent/child sharing) must pass False; None
+        # defers to ``close_browser_on_completion`` plus the creation-time
+        # ``release_driver_on_close`` marker.
+        if release_driver is None:
+            release_driver = close_browser_on_completion or self.release_driver_on_close
+        LOG.info("Closing browser state", sampling=True)
+        # Only fire on-close observers on a real teardown. Shared / parent-child
+        # close calls pass ``close_browser_on_completion=False`` to leave the
+        # browser alive for another run; firing callbacks then would stop the
+        # surviving run's publisher and freeze its livestream.
+        if close_browser_on_completion:
+            await self._run_on_close_callbacks()
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
@@ -492,7 +632,7 @@ class RealBrowserState(BrowserState):
 
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                if self.pw and close_browser_on_completion:
+                if self.pw and release_driver:
                     try:
                         LOG.info("Stopping playwright")
                         await self.pw.stop()

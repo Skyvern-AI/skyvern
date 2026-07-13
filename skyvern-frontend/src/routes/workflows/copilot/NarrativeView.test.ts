@@ -774,6 +774,44 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.accent).toBe("ok");
   });
 
+  it("renders a clean built-unverified run as ran, not stopped", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        draft: draft3,
+        blocks: [
+          summaryBlock("block_one"),
+          summaryBlock("block_two"),
+          summaryBlock("block_three"),
+        ],
+        proposalDisposition: "auto_applicable",
+        responseKind: "build",
+        verifiedSuccess: false,
+      }),
+    );
+    expect(summary.headline).toBe("Built and ran the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
+  it("renders a clean built-unverified edit as ran, not re-tested", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        draft: draft3,
+        blocks: [
+          summaryBlock("block_one"),
+          summaryBlock("block_two"),
+          summaryBlock("block_three"),
+        ],
+        priorBlockCount: 2,
+        responseKind: "build",
+        verifiedSuccess: false,
+      }),
+    );
+    expect(summary.headline).toBe("Applied edits and ran the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
   it.each([
     [buildTurn({ responseKind: "build", verifiedSuccess: false }), "Stopped"],
     [
@@ -813,7 +851,7 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
       "Workflow ready for review",
     ],
   ])(
-    "never renders green when the verdict refused the success claim (%#)",
+    "keeps stopped or review-required states when there is no clean completed run (%#)",
     (turn, headline) => {
       const summary = computeTurnSummary(turn);
       expect(summary.headline).toBe(headline);
@@ -859,6 +897,105 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.headline).toBe("Built and tested the workflow");
     expect(summary.accent).toBe("ok");
     expect(summary.stats).toEqual(["15:02", "3 blocks ran", "3 new"]);
+  });
+});
+
+describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", () => {
+  it("a pending untested draft outranks a non-build responseKind (old: Question)", () => {
+    const turn = buildTurn({
+      responseKind: "clarify",
+      draft: draft3,
+      proposalDisposition: "review_untested",
+    });
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("a pending tested draft outranks a non-build responseKind too", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        draft: draft3,
+        proposalDisposition: "review_tested",
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Workflow ready for review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("fallback chain: an untested draft outranks needsInput text when responseKind is null", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_untested",
+      terminalMessage: "Could you provide the login details?",
+    });
+    expect(turn.responseKind).toBeNull();
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+  });
+
+  it("old payload (hydrated, no responseKind) still gets the uxV1 draft-review reorder", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({ proposalDisposition: "review_untested" }),
+    )!;
+    expect(turn.responseKind).toBeNull();
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+  });
+
+  it("renames the pure-ask clarify headline to Needs your input", () => {
+    const summary = computeTurnSummary(
+      buildTurn({ responseKind: "clarify", verifiedSuccess: false }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Needs your input");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it.each([
+    ["refuse", "Declined"],
+    ["diagnose", "Answered"],
+  ] as const)(
+    "leaves %s as %s under uxV1 — only the clarify/Question case renames",
+    (kind, headline) => {
+      const summary = computeTurnSummary(
+        buildTurn({ responseKind: kind, verifiedSuccess: false }),
+        { uxV1: true },
+      );
+      expect(summary.headline).toBe(headline);
+      expect(summary.accent).toBe("qa");
+    },
+  );
+
+  it("isStoppedWithDraft keeps absolute precedence under uxV1 too", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        cancelled: true,
+        draft: draft3,
+        proposalDisposition: "review_untested",
+        responseKind: "build",
+        verifiedSuccess: true,
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Stopped with a draft");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("uxV1 fallback needsInput still renders Needs your input when no draft is pending", () => {
+    const turn = buildTurn({
+      terminalMessage: "Could you provide the login details?",
+    });
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Needs your input");
   });
 });
 

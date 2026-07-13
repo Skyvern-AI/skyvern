@@ -195,7 +195,10 @@ async def scrape_website(
     max_retries: int = settings.MAX_SCRAPING_RETRIES,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
-    draw_boxes: bool = True,
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # The parameter is retained for backwards compatibility and is scheduled for removal.
+    # New call sites must not pass ``draw_boxes=True``.
+    draw_boxes: bool = False,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
@@ -271,10 +274,13 @@ async def scrape_website(
         )
 
 
-async def get_frame_text(iframe: Frame) -> str:
+async def get_frame_text(iframe: Frame, scrape_exclude: ScrapeExcludeFunc | None = None) -> str:
     """
     Get all the visible text in the iframe.
     :param iframe: Frame instance to get the text from.
+    :param scrape_exclude: Optional ``filter_frames``-style predicate returning a
+        ``ScrapeFrameDecision``; ``exclude`` means skip. The top-level caller must pass
+        a starting frame the predicate would not itself exclude.
     :return: All the visible text from the iframe.
     """
     js_script = "() => document.body.innerText"
@@ -294,6 +300,10 @@ async def get_frame_text(iframe: Frame) -> str:
         if child_frame.is_detached():
             continue
 
+        # Skip excluded frames before any CDP probe.
+        if scrape_exclude is not None and (await scrape_exclude(child_frame.page, child_frame)).exclude:
+            continue
+
         try:
             child_frame_element = await child_frame.frame_element()
         except Exception:
@@ -307,7 +317,7 @@ async def get_frame_text(iframe: Frame) -> str:
         if not await child_frame_element.is_visible():
             continue
 
-        text += await get_frame_text(child_frame)
+        text += await get_frame_text(child_frame, scrape_exclude)
 
     return text
 
@@ -379,7 +389,10 @@ async def scrape_web_unsafe(
     cleanup_element_tree: CleanupElementTreeFunc,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
-    draw_boxes: bool = True,
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # The parameter is retained for backwards compatibility and is scheduled for removal.
+    # New call sites must not pass ``draw_boxes=True``.
+    draw_boxes: bool = False,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
@@ -499,7 +512,7 @@ async def scrape_web_unsafe(
     if not elements and not support_empty_page:
         raise NoElementFound()
 
-    text_content = await get_frame_text(page.main_frame)
+    text_content = await get_frame_text(page.main_frame, scrape_exclude)
 
     html = ""
     window_dimension = None
@@ -561,17 +574,34 @@ async def get_all_children_frames(page: Page) -> list[Frame]:
     return frames
 
 
-async def filter_frames(frames: list[Frame], scrape_exclude: ScrapeExcludeFunc | None = None) -> list[Frame]:
-    filtered_frames = []
+async def filter_frames(
+    frames: list[Frame], scrape_exclude: ScrapeExcludeFunc | None = None
+) -> tuple[list[Frame], list[dict]]:
+    """Split ``frames`` into the ones to scrape and any placeholder nodes to inject.
+
+    Placeholder nodes come from ``scrape_exclude`` callbacks that skip a frame but want
+    a non-interactable signal node left in its place (e.g. a cross-origin captcha the
+    element tree cannot otherwise reach). Identical placeholders are de-duplicated so a
+    vendor rendering the same widget across several frames only surfaces once.
+    """
+    filtered_frames: list[Frame] = []
+    placeholder_nodes: list[dict] = []
     for frame in frames:
         if frame.is_detached():
             continue
 
-        if scrape_exclude is not None and await scrape_exclude(frame.page, frame):
+        if scrape_exclude is None:
+            filtered_frames.append(frame)
+            continue
+
+        decision = await scrape_exclude(frame.page, frame)
+        if decision.placeholder is not None and decision.placeholder not in placeholder_nodes:
+            placeholder_nodes.append(decision.placeholder)
+        if decision.exclude:
             continue
 
         filtered_frames.append(frame)
-    return filtered_frames
+    return filtered_frames, placeholder_nodes
 
 
 async def add_frame_interactable_elements(
@@ -642,8 +672,8 @@ async def get_interactable_element_tree(
     )
 
     context = skyvern_context.ensure_context()
-    frames = await get_all_children_frames(page)
-    frames = await filter_frames(frames, scrape_exclude)
+    all_frames = await get_all_children_frames(page)
+    frames, placeholder_nodes = await filter_frames(all_frames, scrape_exclude)
     # Iframe-heavy pages dominate the 1.8s p95 here; frame_count lets us
     # slice element_tree latency by page complexity.
     otel_trace.get_current_span().set_attribute("frame_count", len(frames))
@@ -663,6 +693,11 @@ async def get_interactable_element_tree(
             element_tree,
             must_included_tags,
         )
+
+    # Placeholder nodes stand in for frames the filter skipped but wants the LLM to
+    # still see (e.g. a cross-origin captcha inside a closed shadow root). They join the
+    # element tree only — never ``elements`` — so they can never become a click target.
+    element_tree.extend(placeholder_nodes)
 
     return elements, element_tree
 

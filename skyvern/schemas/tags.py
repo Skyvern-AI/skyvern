@@ -8,11 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEYS,
-    SKYVERN_TAG_NAMESPACE,
     TAG_DESCRIPTION_MAX_LENGTH,
-    TAG_KEY_REGEX,
+    assert_user_writable_tag_key,
     normalize_optional_tag_key,
     normalize_optional_tag_value,
+    normalize_tag_color,
     normalize_tag_description,
     normalize_tag_value,
 )
@@ -26,13 +26,7 @@ def _assert_user_key_writable(key: str) -> None:
     write paths."""
     if not isinstance(key, str):
         raise ValueError("tag key must be a string")
-    if key.startswith(SKYVERN_TAG_NAMESPACE):
-        raise ValueError(f"tag keys must not start with the reserved '{SKYVERN_TAG_NAMESPACE}' prefix")
-    if not TAG_KEY_REGEX.match(key):
-        raise ValueError(
-            "tag keys must match '^[A-Za-z0-9][A-Za-z0-9_.-]*$' "
-            "(alphanumeric, underscore, dot, hyphen; must start with alphanumeric)"
-        )
+    assert_user_writable_tag_key(key)
 
 
 class TagInput(BaseModel):
@@ -101,6 +95,28 @@ class TagApplyRequest(BaseModel):
         default_factory=list,
         description="Tags to soft-delete. List of {key?, value?} targets.",
     )
+    colors: dict[str, str] | None = Field(
+        default=None,
+        description="Optional map of grouped tag key to palette color name for the value being set. "
+        "Keys absent from this map keep their existing color or receive a random palette color.",
+    )
+
+    @field_validator("colors", mode="before")
+    @classmethod
+    def _normalize_colors(cls, v: object) -> dict[str, str] | None:
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("colors must be a JSON object mapping a tag key to a palette color")
+        if len(v) > RUN_METADATA_MAX_KEYS:
+            raise ValueError(f"colors can include at most {RUN_METADATA_MAX_KEYS} entries")
+        normalized: dict[str, str] = {}
+        for key, color in v.items():
+            normalized_key = normalize_optional_tag_key(key)
+            if normalized_key is None:
+                raise ValueError("colors keys must be non-empty tag keys")
+            normalized[normalized_key] = normalize_tag_color(color)
+        return normalized
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -148,6 +164,13 @@ class TagsResponse(BaseModel):
     tags: list[TagResponse]
 
 
+class RunTagsResponse(BaseModel):
+    """Current tags for a workflow run."""
+
+    workflow_run_id: str
+    tags: list[TagResponse]
+
+
 class TagHistoryItem(BaseModel):
     """One row from ``GET /v1/workflows/{wpid}/tags/history``."""
 
@@ -168,6 +191,11 @@ class TagHistoryResponse(BaseModel):
     events: list[TagHistoryItem]
 
 
+class RunTagHistoryResponse(BaseModel):
+    workflow_run_id: str
+    events: list[TagHistoryItem]
+
+
 class TagKey(BaseModel):
     """Tag-key registry entry."""
 
@@ -185,6 +213,8 @@ class TagKeyDeleteResponse(BaseModel):
 
     key: str
     removed_from_workflow_count: int
+    removed_from_run_count: int = 0
+    removed_count: int = 0
 
 
 class TagKeyUpdate(BaseModel):
@@ -205,6 +235,93 @@ class TagKeyUpdate(BaseModel):
         return normalize_tag_description(v)
 
 
+class TagValue(BaseModel):
+    """Tag-value color registry entry: the palette color assigned to a grouped
+    (key, value) pair."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    key: str
+    value: str
+    color: str
+    workflow_count: int = Field(
+        default=0,
+        description="Number of non-deleted workflows currently carrying this (key, value) label.",
+    )
+
+
+class TagValueUpdate(BaseModel):
+    """Body for ``PATCH /v1/tag-values/{key}``. The value rides in the body, not the
+    path, so values containing ``/`` stay addressable."""
+
+    value: str = Field(description="Tag value (label) under the key to recolor.")
+    color: str = Field(description="Palette color name to assign to this (key, value).")
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _normalize_value(cls, v: object) -> str:
+        return normalize_tag_value(v)
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def _normalize_color(cls, v: object) -> str:
+        return normalize_tag_color(v)
+
+
+class TagValueRename(BaseModel):
+    """Body for ``PATCH /v1/tag-values/{key}/rename``. Both the current and the new
+    value ride in the body so values containing ``/`` stay addressable."""
+
+    value: str = Field(description="Current tag value (label) under the key to rename.")
+    new_value: str = Field(description="New tag value (label) to rename it to.")
+
+    @field_validator("value", "new_value", mode="before")
+    @classmethod
+    def _normalize_value(cls, v: object) -> str:
+        return normalize_tag_value(v)
+
+    @model_validator(mode="after")
+    def _new_value_is_distinct_and_addressable(self) -> TagValueRename:
+        if self.new_value == self.value:
+            raise ValueError("new_value must differ from the current value")
+        # Grouped values reserve '*' as the group filter wildcard (mirrors TagInput).
+        if self.new_value == "*":
+            raise ValueError("grouped tag values must not be exactly '*' (reserved as the group filter wildcard)")
+        return self
+
+
+class TagValueRenameResponse(BaseModel):
+    """Response for ``PATCH /v1/tag-values/{key}/rename``: the renamed label with its
+    carried-over color and the number of workflows re-tagged."""
+
+    key: str
+    value: str
+    color: str
+    renamed_workflow_count: int
+
+
+class TagValueDelete(BaseModel):
+    """Body for ``DELETE /v1/tag-values/{key}``. The value rides in the body, not the
+    path, so values containing ``/`` stay addressable."""
+
+    value: str = Field(description="Tag value (label) under the key to soft-delete.")
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _normalize_value(cls, v: object) -> str:
+        return normalize_tag_value(v)
+
+
+class TagValueDeleteResponse(BaseModel):
+    """Response for ``DELETE /v1/tag-values/{key}``."""
+
+    key: str
+    value: str
+    removed_from_workflow_count: int
+    removed_from_run_count: int = 0
+    removed_count: int = 0
+
+
 class WorkflowTagsBatchRequest(BaseModel):
     """Body for ``POST /v1/workflow-tags`` (used when the wpid list would
     exceed the URL length cap)."""
@@ -212,6 +329,16 @@ class WorkflowTagsBatchRequest(BaseModel):
     workflow_permanent_ids: list[str] = Field(
         default_factory=list,
         description="Workflow permanent IDs to fetch tags for.",
+    )
+
+
+class RunTagsBatchRequest(BaseModel):
+    """Body for ``POST /v1/run-tags`` (used when the run-id list would exceed
+    the URL length cap)."""
+
+    workflow_run_ids: list[str] = Field(
+        default_factory=list,
+        description="Workflow run IDs to fetch tags for.",
     )
 
 
@@ -231,3 +358,13 @@ class WorkflowTagsBatchResponse(BaseModel):
     Workflows outside the caller's org are silently absent (no leakage)."""
 
     workflow_tags: dict[str, list[TagItem]]
+
+
+class RunTagsBatchResponse(BaseModel):
+    """Response for the run-tags batch endpoint.
+
+    Runs with no tags are present with an empty list so the frontend can
+    distinguish "fetched, none set" from "not fetched" without a second call.
+    Runs outside the caller's org are silently absent (no leakage)."""
+
+    run_tags: dict[str, list[TagItem]]

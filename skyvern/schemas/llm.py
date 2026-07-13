@@ -121,11 +121,12 @@ class LLMRouterConfig(LLMConfigBase):
     """Base-safe router config with the same settings-default sentinel invariant as LLMConfig."""
 
     model_list: list[LLMRouterModelConfig]
-    # All three redis parameters are required. Even if there isn't a password, it should be an empty string.
+    # Router configs should set all Redis fields; use an empty string when there is no password.
     main_model_group: str
     redis_host: str | None = None
     redis_port: int | None = None
     redis_password: str | None = None
+    redis_max_connections: int | None = None
     fallback_model_group: str | list[str] | None = None
     routing_strategy: Literal[
         "simple-shuffle",

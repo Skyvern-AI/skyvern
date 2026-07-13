@@ -436,11 +436,62 @@ def _validate_definition_structure(json_def: dict[str, Any] | None, action: str)
     return None
 
 
+def _extract_workflow_blocks(definition: dict[str, Any]) -> list[Any]:
+    block_lists: list[list[Any]] = []
+    top_level_blocks = definition.get("blocks")
+    if isinstance(top_level_blocks, list):
+        block_lists.append(top_level_blocks)
+
+    workflow_definition = definition.get("workflow_definition")
+    if isinstance(workflow_definition, dict):
+        workflow_blocks = workflow_definition.get("blocks")
+        if isinstance(workflow_blocks, list) and workflow_blocks is not top_level_blocks:
+            block_lists.append(workflow_blocks)
+
+    return [block for blocks in block_lists for block in blocks]
+
+
+def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str) -> dict[str, Any] | None:
+    blocks = _extract_workflow_blocks(definition)
+    if not blocks:
+        return None
+
+    # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
+    from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
+        collect_code_only_banned_items,
+    )
+
+    banned_items = collect_code_only_banned_items(blocks)
+    if not banned_items:
+        return None
+
+    labels = ", ".join(sorted({label for label, _ in banned_items}))
+    types = ", ".join(sorted({block_type for _, block_type in banned_items}))
+    return make_result(
+        action,
+        ok=False,
+        error=make_error(
+            ErrorCode.INVALID_INPUT,
+            f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
+            "In code-only mode, use a `code` block for durable browser/page work instead of "
+            "task/navigation/extraction/etc.",
+        ),
+    )
+
+
+def _validate_code_only_definition(definition: str, fmt: str, action: str) -> dict[str, Any] | None:
+    raw, _ = _load_definition_dict(definition, fmt)
+    if raw is None:
+        return None
+    return _validate_code_only_workflow_blocks(raw, action)
+
+
 _CODE_V2_DEFAULTS: dict[str, Any] = {
     "code_version": 2,
     "run_with": "agent",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
+_WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = ("run_sequentially", "sequential_key")
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
@@ -489,6 +540,11 @@ def _normalize_json_definition(raw: Any) -> dict[str, Any]:
         raise ValueError("Workflow definition missing 'title' field")
     if "workflow_definition" not in raw:
         raise ValueError("Workflow definition missing 'workflow_definition' object")
+
+    if _has_runtime_definition_shape(raw.get("workflow_definition")):
+        # An echoed GET payload is in runtime shape; convert before validation so block<->parameter
+        # links survive instead of being lost to the raw-dict fallback below.
+        raw = {**raw, "workflow_definition": _workflow_definition_to_authoring_shape(raw["workflow_definition"])}
 
     try:
         normalized = WorkflowCreateYAMLRequestSchema.model_validate(raw)
@@ -609,6 +665,28 @@ async def _inject_workflow_update_proxy_default(definition: str, fmt: str, workf
     return _dump_definition_dict(raw, parsed_format)
 
 
+async def _inject_workflow_update_top_level_settings(definition: str, fmt: str, workflow_id: str) -> str:
+    """Preserve workflow-level settings that schema defaults would otherwise clobber."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    missing_fields = [field for field in _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS if field not in raw]
+    if not missing_fields:
+        return definition
+
+    existing_workflow = await get_workflow_by_id(workflow_id)
+    changed = False
+    for field in missing_fields:
+        existing_value = existing_workflow.get(field)
+        if existing_value is not None:
+            raw[field] = existing_value
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
 # Parameter types that are auto-managed (credentials and secrets set via the UI) and should
 # always be preserved from the existing workflow during MCP updates, regardless of what the
 # caller sends. These should NEVER be modifiable via MCP — only via the UI credential picker.
@@ -635,6 +713,128 @@ def _strip_runtime_fields(param: dict[str, Any]) -> dict[str, Any]:
         for k, v in param.items()
         if k not in _RUNTIME_EXACT_FIELDS and not any(k.endswith(s) for s in _RUNTIME_FIELD_SUFFIXES)
     }
+
+
+def _parameter_to_authoring_shape(param: Any) -> dict[str, Any] | None:
+    """Convert one runtime parameter dict to its authoring shape, or None to drop it.
+
+    Auto-generated output parameters are regenerated (and rejected if author-supplied) by the
+    converter, so they are dropped. Context parameters carry a resolved ``source`` object at
+    runtime but the authoring schema wants ``source_parameter_key``.
+    """
+    if not isinstance(param, dict):
+        return param
+    if param.get("parameter_type") == ParameterType.OUTPUT.value:
+        return None
+    authoring = _strip_runtime_fields(param)
+    source = authoring.get("source")
+    if isinstance(source, dict) and source.get("key"):
+        authoring.pop("source", None)
+        authoring.setdefault("source_parameter_key", source["key"])
+    return authoring
+
+
+def _block_to_authoring_shape(block: Any) -> Any:
+    """Convert one runtime block dict to its authoring shape, recursing into ``loop_blocks``.
+
+    Runtime blocks expose resolved ``parameters`` objects plus an ``output_parameter`` and (for
+    loops) a resolved ``loop_over`` object; the authoring schema uses ``parameter_keys``, carries no
+    output parameter, and references the loop source via ``loop_over_parameter_key``. Without this
+    inverse, a get -> edit -> update round trip silently drops non-credential block<->parameter links.
+    """
+    if not isinstance(block, dict):
+        return block
+    authoring = dict(block)
+    label = authoring.get("label")
+    output_key = f"{label}_output" if isinstance(label, str) else None
+
+    resolved = authoring.pop("parameters", None)
+    authoring.pop("output_parameter", None)
+    if isinstance(resolved, list):
+        derived = [
+            param["key"]
+            for param in resolved
+            if isinstance(param, dict) and param.get("key") and param.get("key") != output_key
+        ]
+        if derived:
+            existing = [k for k in (authoring.get("parameter_keys") or []) if isinstance(k, str)]
+            authoring["parameter_keys"] = existing + [k for k in derived if k not in existing]
+
+    loop_over = authoring.get("loop_over")
+    if isinstance(loop_over, dict):
+        authoring.pop("loop_over", None)
+        if loop_over.get("key"):
+            authoring.setdefault("loop_over_parameter_key", loop_over["key"])
+    elif loop_over is None and "loop_over" in authoring:
+        authoring.pop("loop_over", None)
+
+    loop_blocks = authoring.get("loop_blocks")
+    if isinstance(loop_blocks, list):
+        authoring["loop_blocks"] = [_block_to_authoring_shape(child) for child in loop_blocks]
+
+    return authoring
+
+
+def _block_authoring_parameter_keys(block: dict[str, Any]) -> list[str]:
+    """The block's parameter links as authoring keys, read from either an explicit ``parameter_keys``
+    list (authoring shape) or the resolved ``parameters`` objects (runtime shape returned by GET),
+    excluding the block's own auto ``{label}_output``."""
+    label = block.get("label")
+    output_key = f"{label}_output" if isinstance(label, str) else None
+    keys: list[str] = [k for k in (block.get("parameter_keys") or []) if isinstance(k, str)]
+    seen = set(keys)
+    for param in block.get("parameters") or []:
+        if isinstance(param, dict):
+            key = param.get("key")
+            if isinstance(key, str) and key != output_key and key not in seen:
+                keys.append(key)
+                seen.add(key)
+    return keys
+
+
+def _workflow_definition_to_authoring_shape(wf_def: Any) -> Any:
+    """Convert a runtime ``workflow_definition`` dict (as returned by GET) to the authoring shape the
+    create/update path consumes. Inverse of the relevant parts of ``convert_workflow_definition``.
+    """
+    if not isinstance(wf_def, dict):
+        return wf_def
+    authoring = dict(wf_def)
+    params = authoring.get("parameters")
+    if isinstance(params, list):
+        converted = [shaped for shaped in (_parameter_to_authoring_shape(p) for p in params) if shaped is not None]
+        authoring["parameters"] = converted
+    blocks = authoring.get("blocks")
+    if isinstance(blocks, list):
+        authoring["blocks"] = [_block_to_authoring_shape(block) for block in blocks]
+    return authoring
+
+
+def _has_runtime_definition_shape(wf_def: Any) -> bool:
+    """Whether a ``workflow_definition`` carries runtime-only fields, so it needs authoring conversion."""
+    if not isinstance(wf_def, dict):
+        return False
+    params = wf_def.get("parameters")
+    if isinstance(params, list):
+        for param in params:
+            if isinstance(param, dict) and (
+                param.get("parameter_type") == ParameterType.OUTPUT.value or isinstance(param.get("source"), dict)
+            ):
+                return True
+
+    def _block_has_runtime(block: Any) -> bool:
+        if not isinstance(block, dict):
+            return False
+        if (
+            isinstance(block.get("parameters"), list)
+            or "output_parameter" in block
+            or isinstance(block.get("loop_over"), dict)
+        ):
+            return True
+        loop_blocks = block.get("loop_blocks")
+        return isinstance(loop_blocks, list) and any(_block_has_runtime(child) for child in loop_blocks)
+
+    blocks = wf_def.get("blocks")
+    return isinstance(blocks, list) and any(_block_has_runtime(block) for block in blocks)
 
 
 def _is_protected_update_parameter(param: Any) -> bool:
@@ -687,32 +887,84 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> str:
+def _iter_positional_block_matches(
+    existing_blocks: list[dict[str, Any]],
+    update_blocks: list[dict[str, Any]],
+    *,
+    parent_has_identity: bool = True,
+) -> list[tuple[str | None, bool]]:
+    """Return positional block types plus whether position identifies the block.
+
+    A position is considered identifying only when the sibling shape is unchanged
+    and the block either kept its label or is the sole child under an identified
+    parent. This lets us repair dropped block_type values for singleton edits
+    without using bare index to swap credentials across reordered siblings.
+    """
+    result: list[tuple[str | None, bool]] = []
+    existing_dict_blocks = [block for block in existing_blocks if isinstance(block, dict)]
+    update_dict_blocks = [block for block in update_blocks if isinstance(block, dict)]
+    same_sibling_count = len(existing_dict_blocks) == len(update_dict_blocks)
+
+    for index, update_block in enumerate(update_dict_blocks):
+        existing_block = existing_dict_blocks[index] if same_sibling_count else None
+        raw_existing_block_type = existing_block.get("block_type") if existing_block else None
+        existing_block_type = raw_existing_block_type if isinstance(raw_existing_block_type, str) else None
+        existing_label = existing_block.get("label") if existing_block else None
+        update_label = update_block.get("label")
+        stable_label_match = bool(existing_label and update_label and existing_label == update_label)
+        singleton_position = same_sibling_count and len(update_dict_blocks) == 1
+        has_identity = parent_has_identity and same_sibling_count and (stable_label_match or singleton_position)
+        result.append((existing_block_type, has_identity))
+
+        update_loop_blocks = update_block.get("loop_blocks")
+        if not isinstance(update_loop_blocks, list):
+            continue
+
+        existing_loop_blocks = existing_block.get("loop_blocks") if existing_block else None
+        if not isinstance(existing_loop_blocks, list):
+            existing_loop_blocks = []
+        result.extend(
+            _iter_positional_block_matches(
+                existing_loop_blocks,
+                update_loop_blocks,
+                parent_has_identity=has_identity,
+            )
+        )
+
+    return result
+
+
+async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow_id: str) -> tuple[str, list[str]]:
     """Preserve protected credential/secret parameters during MCP workflow updates.
 
     Credential references should NEVER be modifiable via MCP — the existing workflow's
     values always win. This function:
       1. Always replaces protected parameters with the existing workflow's versions
          (even if the caller includes them — they may have stale/wrong data).
-      2. Injects credential parameter_keys into blocks using type-based matching
-         (login blocks always get ALL credential keys) with label-based fallback
-         for non-login blocks.
+      2. Injects credential parameter_keys into blocks using per-block matches
+         with label-based fallback.
+      3. Re-attaches non-credential block<->parameter links the caller dropped for a
+         still-declared parameter (best-effort, surfaced as warnings).
+
+    Returns the (possibly rewritten) definition string and any human-facing warnings.
     """
+
+    warnings: list[str] = []
 
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None:
-        return definition
+        return definition, warnings
 
     wf_def = raw.get("workflow_definition")
     if not isinstance(wf_def, dict):
-        return definition
+        return definition, warnings
 
     update_params: list[dict[str, Any]] = wf_def.get("parameters", [])
 
     existing_workflow = await get_workflow_by_id(workflow_id)
     existing_wf_def = existing_workflow.get("workflow_definition")
     if not isinstance(existing_wf_def, dict):
-        return definition
+        return definition, warnings
 
     existing_params: list[dict[str, Any]] = existing_wf_def.get("parameters", [])
 
@@ -742,11 +994,6 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
         wf_def["parameters"] = update_params
 
     # --- Step 2: Inject credential parameter keys into blocks ---
-    # Login blocks get credential-type keys via type-based matching (resilient to label
-    # renames by Claude). Non-login blocks fall back to label-based matching — so if Claude
-    # renames a non-login block that references aws_secret/bitwarden/etc., the key reference
-    # is lost. This asymmetry is accepted because login blocks are the critical path for
-    # credential injection; non-login secret refs are rare and still work when labels match.
     all_cred_keys: set[str] = set()
     login_cred_keys: set[str] = set()
     for param in existing_params:
@@ -758,29 +1005,92 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
     if all_cred_keys:
         existing_blocks: list[dict[str, Any]] = existing_wf_def.get("blocks", [])
         update_blocks: list[dict[str, Any]] = wf_def.get("blocks", [])
+        existing_blocks_flat = _iter_blocks_flat(existing_blocks)
+        update_blocks_flat = _iter_blocks_flat(update_blocks)
+        n_existing_blocks = len(existing_blocks_flat)
+        n_update_blocks = len(update_blocks_flat)
+        positional_block_matches = _iter_positional_block_matches(existing_blocks, update_blocks)
 
-        # Build label-based map for fallback (non-login blocks)
+        existing_block_type_by_label: dict[str, str] = {}
+        # Login labels resolve through existing_block_login_cred_keys; this map
+        # keeps all protected keys for non-login label recovery.
         existing_block_cred_keys: dict[str, list[str]] = {}
-        for block in _iter_blocks_flat(existing_blocks):
+        existing_block_login_cred_keys: dict[str, list[str]] = {}
+        existing_login_block_login_keys: list[list[str]] = []
+        existing_login_block_count = 0
+        for block in existing_blocks_flat:
+            raw_existing_block_type = block.get("block_type")
+            existing_block_type = raw_existing_block_type if isinstance(raw_existing_block_type, str) else None
+            existing_pkeys = block.get("parameter_keys") or []
+            cred_keys = sorted(k for k in existing_pkeys if k in all_cred_keys)
+            login_keys = sorted(k for k in existing_pkeys if k in login_cred_keys)
+            if existing_block_type == "login":
+                existing_login_block_count += 1
+                if login_keys:
+                    existing_login_block_login_keys.append(login_keys)
+
             label = block.get("label")
             if not label:
                 continue
-            existing_pkeys = block.get("parameter_keys") or []
-            cred_keys = [k for k in existing_pkeys if k in all_cred_keys]
+            if existing_block_type:
+                existing_block_type_by_label[label] = existing_block_type
             if cred_keys:
                 existing_block_cred_keys[label] = cred_keys
+            if login_keys:
+                existing_block_login_cred_keys[label] = login_keys
 
-        for block in _iter_blocks_flat(update_blocks):
+        # Label matches identify block ownership. Positional reuse can only restore
+        # a dropped login type when the login credential choice is unambiguous.
+        use_positional_correspondence = n_existing_blocks == n_update_blocks
+        single_global_login_cred_keys = sorted(login_cred_keys) if len(login_cred_keys) == 1 else []
+        single_existing_login_block_keys = (
+            existing_login_block_login_keys[0]
+            if len(existing_login_block_login_keys) == 1 and existing_login_block_count == 1
+            else []
+        )
+        single_login_cred_keys = single_existing_login_block_keys or single_global_login_cred_keys
+
+        for index, block in enumerate(update_blocks_flat):
             block_type = block.get("block_type")
             label = block.get("label")
+            positional_block_type: str | None = None
+            positional_has_identity = False
+            if use_positional_correspondence and index < len(positional_block_matches):
+                positional_block_type, positional_has_identity = positional_block_matches[index]
 
             keys_to_inject: list[str] = []
+            block_type_to_restore: str | None = None
             if block_type == "login":
-                keys_to_inject = sorted(login_cred_keys)
+                if label and label in existing_block_login_cred_keys:
+                    keys_to_inject = existing_block_login_cred_keys[label]
+                elif single_login_cred_keys:
+                    keys_to_inject = single_login_cred_keys
+            elif not block_type:
+                # Recover by stable label first. If identity is gone, only recover
+                # the single-login case; leave other ambiguous secrets untouched.
+                label_block_type = existing_block_type_by_label.get(label) if label else None
+                if label_block_type == "login":
+                    if label and label in existing_block_login_cred_keys:
+                        keys_to_inject = existing_block_login_cred_keys[label]
+                        block_type_to_restore = label_block_type
+                    elif single_login_cred_keys:
+                        keys_to_inject = single_login_cred_keys
+                        block_type_to_restore = label_block_type
+                elif label_block_type:
+                    if label and label in existing_block_cred_keys:
+                        keys_to_inject = existing_block_cred_keys[label]
+                        block_type_to_restore = label_block_type
+                elif positional_has_identity and positional_block_type == "login":
+                    if single_login_cred_keys:
+                        keys_to_inject = single_login_cred_keys
+                        block_type_to_restore = positional_block_type
             elif label and label in existing_block_cred_keys:
-                keys_to_inject = sorted(existing_block_cred_keys[label])
+                keys_to_inject = existing_block_cred_keys[label]
 
             if keys_to_inject:
+                if block_type_to_restore:
+                    block["block_type"] = block_type_to_restore
+                    modified = True
                 block_pkeys: list[str] = list(block.get("parameter_keys") or [])
                 current_keys = set(block_pkeys)
                 for cred_key in keys_to_inject:
@@ -789,10 +1099,47 @@ async def _inject_workflow_update_parameters(definition: str, fmt: str, workflow
                         modified = True
                 block["parameter_keys"] = block_pkeys
 
-    if not modified:
-        return definition
+    # --- Step 3: Re-attach non-credential block<->parameter links the caller dropped ---
+    # Plain workflow/context/output parameter links live only in a block's parameter_keys. When the
+    # caller (often an LLM) regenerates a block and omits a key that the same-label block carried
+    # before — while still declaring the parameter — re-attach it. Unlike credentials this is
+    # best-effort and warned: to intentionally drop the link, remove the parameter declaration too.
+    declared_keys = {p["key"] for p in update_params if isinstance(p, dict) and p.get("key")}
+    prior_block_param_keys: dict[str, list[str]] = {}
+    for block in _iter_blocks_flat(existing_wf_def.get("blocks", [])):
+        if not isinstance(block, dict):
+            continue
+        label = block.get("label")
+        if isinstance(label, str):
+            prior_block_param_keys[label] = _block_authoring_parameter_keys(block)
 
-    return _dump_definition_dict(raw, parsed_format)
+    for block in _iter_blocks_flat(wf_def.get("blocks", [])):
+        if not isinstance(block, dict):
+            continue
+        label = block.get("label")
+        if not isinstance(label, str) or label not in prior_block_param_keys:
+            continue
+        block_link_keys = _block_authoring_parameter_keys(block)
+        block_link_set = set(block_link_keys)
+        added = False
+        for link_key in prior_block_param_keys[label]:
+            if link_key in all_cred_keys or link_key in block_link_set or link_key not in declared_keys:
+                continue
+            block_link_keys.append(link_key)
+            block_link_set.add(link_key)
+            warnings.append(
+                f"Re-attached parameter '{link_key}' to block '{label}': it was linked in the prior version "
+                f"and this update omitted it. To intentionally drop the link, remove the parameter too."
+            )
+            added = True
+            modified = True
+        if added:
+            block["parameter_keys"] = block_link_keys
+
+    if not modified:
+        return definition, warnings
+
+    return _dump_definition_dict(raw, parsed_format), warnings
 
 
 def _parse_definition(definition: str, fmt: str) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
@@ -833,16 +1180,32 @@ def _parse_definition(definition: str, fmt: str) -> tuple[dict[str, Any] | None,
 
 async def skyvern_workflow_list(
     search: Annotated[str | None, "Search across workflow titles, folder names, and parameter metadata"] = None,
+    query: Annotated[
+        str | None,
+        "Deprecated alias for search. Use search for new calls.",
+    ] = None,
     page: Annotated[int, Field(description="Page number (1-based)", ge=1)] = 1,
     page_size: Annotated[int, Field(description="Results per page", ge=1, le=100)] = 10,
     only_workflows: Annotated[bool, "Only return multi-step workflows (exclude saved tasks)"] = False,
 ) -> dict[str, Any]:
     """Find and browse available Skyvern workflows. Use when you need to discover what workflows exist,
     search for a workflow by name, or list all workflows for an organization."""
+    if search is not None and query is not None and search != query:
+        return make_result(
+            "skyvern_workflow_list",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Provide either search or query, not conflicting values",
+                "Use search for new calls; query is a compatibility alias.",
+            ),
+        )
+
+    effective_search = search if search is not None else query
     with Timer() as timer:
         try:
             workflows = await list_workflows_raw(
-                search=search,
+                search=effective_search,
                 page=page,
                 page_size=page_size,
                 only_workflows=only_workflows,
@@ -864,7 +1227,9 @@ async def skyvern_workflow_list(
             "page_size": page_size,
             "count": len(workflows),
             "has_more": len(workflows) == page_size,
-            "sdk_equivalent": f"await skyvern.get_workflows(search_key={search!r}, page={page}, page_size={page_size})",
+            "sdk_equivalent": (
+                f"await skyvern.get_workflows(search_key={effective_search!r}, page={page}, page_size={page_size})"
+            ),
         },
         timing_ms=timer.timing_ms,
     )
@@ -874,8 +1239,12 @@ async def skyvern_workflow_get(
     workflow_id: Annotated[str, "Workflow permanent ID (starts with wpid_)"],
     version: Annotated[int | None, "Specific version to retrieve (latest if omitted)"] = None,
 ) -> dict[str, Any]:
-    """Get the full definition of a specific workflow. Use when you need to inspect a workflow's
-    blocks, parameters, and configuration before running or updating it."""
+    """Get the full definition of ONE workflow by its known workflow_id (wpid_...). Use to inspect a
+    workflow's blocks, parameters, and configuration before running or updating it.
+
+    This fetches a single workflow by id only — it does NOT search, browse, or paginate, and rejects
+    arguments like query/search/page/page_size/only_workflows. To find a workflow by name or see what
+    exists, call skyvern_workflow_list first, then pass the returned workflow_id here."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_get"):
         return err
 
@@ -901,6 +1270,14 @@ async def skyvern_workflow_get(
                 timing_ms=timer.timing_ms,
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check your API key and workflow ID"),
             )
+
+    if isinstance(wf_data, dict) and isinstance(wf_data.get("workflow_definition"), dict):
+        # Return the authoring shape so a get -> edit -> update round trip preserves block<->parameter
+        # links (parameter_keys / loop_over_parameter_key / source_parameter_key) the runtime shape hides.
+        wf_data = {
+            **wf_data,
+            "workflow_definition": _workflow_definition_to_authoring_shape(wf_data["workflow_definition"]),
+        }
 
     version_str = f", version={version}" if version is not None else ""
     return make_result(
@@ -984,9 +1361,24 @@ async def skyvern_workflow_create(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto' (tries JSON first, falls back to YAML)")
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
+    code_only: Annotated[
+        bool,
+        Field(
+            description="When true, structurally reject non-code browser/page block types before persisting "
+            "(code-only mode)"
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
+
+    The ENTIRE workflow — its title, blocks, and parameters — must be serialized INTO the `definition`
+    string (YAML or JSON). Do NOT pass title, blocks, parameters, or other workflow fields as separate
+    top-level arguments; only definition/format/folder_id/code_only are accepted and any other top-level
+    field is rejected. Minimal JSON definition:
+    {"title": "My workflow", "workflow_definition": {"blocks": [...], "parameters": [...]}}.
+    This creates from a definition — it does not list or search; to browse existing workflows use
+    skyvern_workflow_list.
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
@@ -995,7 +1387,7 @@ async def skyvern_workflow_create(
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
-    applies to workflow-level fields (persist_browser_session, extra_http_headers,
+    applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
     totp_verification_url, totp_identifier, etc.) AND block-level overrides (max_retries,
     max_steps_per_run, totp_identifier, complete_criterion, error_code_mapping,
     continue_on_failure, engine, model, etc.). The schema defaults are intentional; silently
@@ -1027,6 +1419,13 @@ async def skyvern_workflow_create(
 
     if err := _validate_definition_structure(json_def, "skyvern_workflow_create"):
         return err
+
+    if code_only:
+        if json_def is not None:
+            if err := _validate_code_only_workflow_blocks(json_def, "skyvern_workflow_create"):
+                return err
+        elif err := _validate_code_only_definition(definition, format, "skyvern_workflow_create"):
+            return err
 
     with Timer() as timer:
         try:
@@ -1063,9 +1462,20 @@ async def skyvern_workflow_update(
     format: Annotated[  # noqa: A002
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
+    code_only: Annotated[
+        bool,
+        Field(
+            description="When true, structurally reject non-code browser/page block types before persisting "
+            "(code-only mode)"
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
-    parameters, or configuration. Creates a new version of the workflow."""
+    parameters, or configuration. Creates a new version of the workflow.
+
+    The ENTIRE updated workflow — its title, blocks, and parameters — must be serialized INTO the
+    `definition` string; do NOT pass title/blocks/parameters as separate top-level arguments (only
+    workflow_id/definition/format/code_only are accepted, any other top-level field is rejected)."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_update"):
         return err
 
@@ -1080,9 +1490,15 @@ async def skyvern_workflow_update(
             ),
         )
 
+    if code_only:
+        if err := _validate_code_only_definition(definition, format, "skyvern_workflow_update"):
+            return err
+
+    param_warnings: list[str] = []
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, workflow_id)
-        definition = await _inject_workflow_update_parameters(definition, format, workflow_id)
+        definition = await _inject_workflow_update_top_level_settings(definition, format, workflow_id)
+        definition, param_warnings = await _inject_workflow_update_parameters(definition, format, workflow_id)
     except NotFoundError:
         return make_result(
             "skyvern_workflow_update",
@@ -1094,7 +1510,7 @@ async def skyvern_workflow_update(
             ),
         )
     except Exception as e:
-        LOG.warning("workflow_update_proxy_default_injection_failed", workflow_id=workflow_id, error=str(e))
+        LOG.warning("workflow_update_preprocessing_failed", workflow_id=workflow_id, error=str(e))
         return make_result(
             "skyvern_workflow_update",
             ok=False,
@@ -1146,6 +1562,8 @@ async def skyvern_workflow_update(
     data = _serialize_workflow(workflow)
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     data["sdk_equivalent"] = f"await skyvern.update_workflow({workflow_id!r}, {fmt_label}=<definition>)"
+    if param_warnings:
+        data["warnings"] = param_warnings
     return make_result("skyvern_workflow_update", data=data, timing_ms=timer.timing_ms)
 
 
@@ -1288,6 +1706,9 @@ async def skyvern_workflow_run(
     ] = None,
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
+    Starts a NEW run and requires a workflow_id (wpid_...), NOT a workflow_run_id. To re-run an existing
+    terminal run with its original parameters, use skyvern_workflow_retry (which takes a workflow_run_id);
+    to inspect a past run, use skyvern_workflow_status or skyvern_workflow_run_list.
     Returns immediately by default (async) — set wait=true to block until completion.
     Default timeout is 300s (5 minutes). For longer workflows, increase timeout_seconds
     or use wait=false and poll with skyvern_workflow_status."""
@@ -1491,7 +1912,8 @@ async def skyvern_workflow_retry(
     workflow_run_id: Annotated[str, "Workflow run ID to retry (wr_...)"],
 ) -> dict[str, Any]:
     """Retry a terminal workflow run. Creates a new workflow run using the original run
-    parameters and run settings."""
+    parameters and run settings. Takes a workflow_run_id (wr_...), NOT a workflow_id — to start a
+    fresh run from a workflow definition instead, use skyvern_workflow_run."""
     if err := validate_workflow_run_id(workflow_run_id, "skyvern_workflow_retry"):
         return err
 

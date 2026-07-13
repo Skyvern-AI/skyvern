@@ -14,6 +14,7 @@ from skyvern.exceptions import (
     TaskAlreadyCanceled,
     TaskAlreadyTimeout,
 )
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -208,6 +209,11 @@ class PromptedTaskRequest(TaskRequest):
         description="Whether to publish the workflow created from the prompt.",
         examples=[True, False],
     )
+    generate_script: bool | None = Field(
+        default=None,
+        description="Whether to generate scripts for runs of the workflow created from the prompt.",
+        examples=[True, False],
+    )
     run_with: str | None = Field(
         default=None,
         description="The executor to run the task with.",
@@ -337,8 +343,12 @@ class Task(TaskBase):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
-                return mapping.get(model_name, {}).get("llm_key")
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key(organization_id=self.organization_id)
+                llm_key = mapping.get(model_name, {}).get("llm_key")
+                if llm_key:
+                    return llm_key
+                if is_custom_llm_model_name(model_name):
+                    raise ValueError("Custom LLM model not found for organization")
 
         return None
 

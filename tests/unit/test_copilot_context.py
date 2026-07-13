@@ -2,36 +2,56 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from skyvern.forge.sdk.copilot.context import ObservedPage, StructuredContext, _merge_observed_acted_pages
+import pytest
+
+from skyvern.forge.sdk.copilot.context import (
+    FillCarry,
+    LoadedResultTargetContext,
+    ObservedPage,
+    StructuredContext,
+    _fill_carry_from_scout_trajectory,
+    _merge_observed_acted_pages,
+    finalize_discovery_counter_in_global_llm_context,
+    render_loaded_result_context_for_prompt,
+    sanitize_global_llm_context_for_prompt,
+)
+from skyvern.forge.sdk.copilot.result_evidence import (
+    loaded_result_composition_evidence_from_page,
+    loaded_result_target_structure_signature,
+)
+from tests.unit.copilot_test_helpers import make_raw_loaded_result_context
 
 
-def test_merge_turn_summary_caps_urls_visited() -> None:
+@pytest.mark.parametrize(
+    ("tool", "summary_template", "list_attr", "last_value_attr", "expected_last_value"),
+    [
+        ("navigate_browser", "Navigated to https://site{i}.test", "urls_visited", "url", "https://site59.test"),
+        ("type_text", "Typed into '#field{i}'", "fields_filled", "selector", "#field59"),
+        ("list_credentials", "Found 1 for site {i}", "credentials_checked", None, None),
+    ],
+    ids=["urls_visited", "fields_filled", "credentials_checked"],
+)
+def test_merge_turn_summary_caps_activity(
+    tool: str,
+    summary_template: str,
+    list_attr: str,
+    last_value_attr: str | None,
+    expected_last_value: str | None,
+) -> None:
     ctx = StructuredContext()
-    activity = [{"tool": "navigate_browser", "summary": f"Navigated to https://site{i}.test"} for i in range(60)]
+    activity = [{"tool": tool, "summary": summary_template.format(i=i)} for i in range(60)]
     ctx.merge_turn_summary(activity)
 
-    assert len(ctx.urls_visited) == 40
+    capped = getattr(ctx, list_attr)
+    assert len(capped) == 40
     # Oldest entries trimmed; most recent survive.
-    assert ctx.urls_visited[-1].url == "https://site59.test"
-
-
-def test_merge_turn_summary_caps_fields_filled() -> None:
-    ctx = StructuredContext()
-    activity = [{"tool": "type_text", "summary": f"Typed into '#field{i}'"} for i in range(60)]
-    ctx.merge_turn_summary(activity)
-
-    assert len(ctx.fields_filled) == 40
-    assert ctx.fields_filled[-1].selector == "#field59"
-
-
-def test_merge_turn_summary_caps_credentials_checked() -> None:
-    ctx = StructuredContext()
-    activity = [{"tool": "list_credentials", "summary": f"Found 1 for site {i}"} for i in range(60)]
-    ctx.merge_turn_summary(activity)
-
-    assert len(ctx.credentials_checked) == 40
+    if last_value_attr is not None:
+        assert getattr(capped[-1], last_value_attr) == expected_last_value
 
 
 def test_merge_turn_summary_records_resolved_credential_ids() -> None:
@@ -71,6 +91,368 @@ def test_resolved_credential_ids_survive_context_roundtrip() -> None:
     assert [check.credential_id for check in rehydrated.credentials_checked] == ["cred_amazon"]
 
 
+def test_loaded_result_targets_roundtrip_without_selector_fields_or_legacy_signature() -> None:
+    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
+    ctx = StructuredContext(
+        loaded_result_targets=[
+            LoadedResultTargetContext(
+                selector="#results",
+                is_table=True,
+                row_selector="tr.statement",
+                row_count=2,
+                structure_signature="legacy-selector-derived-sig",
+            )
+        ]
+    )
+
+    raw = ctx.to_json_str()
+    rehydrated = StructuredContext.from_json_str(ctx.to_json_str())
+
+    assert "#results" not in raw
+    assert "tr.statement" not in raw
+    assert "legacy-selector-derived-sig" not in raw
+    assert rehydrated.loaded_result_targets == [
+        LoadedResultTargetContext(
+            is_table=True,
+            row_count=2,
+            structure_signature=expected_signature,
+        )
+    ]
+
+
+def test_sanitize_global_llm_context_strips_loaded_result_selectors_and_recomputes_legacy_signature() -> None:
+    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
+    raw = make_raw_loaded_result_context(include_user_goal=True, include_sample_rows=True)
+
+    sanitized = sanitize_global_llm_context_for_prompt(raw)
+
+    assert "Jane" not in sanitized
+    assert "Customer" not in sanitized
+    assert "123456" not in sanitized
+    assert "987654321" not in sanitized
+    assert "legacy-selector-derived-sig" not in sanitized
+    payload = json.loads(sanitized)
+    assert payload["loaded_result_targets"] == [
+        {
+            "is_table": True,
+            "row_count": 2,
+            "structure_signature": expected_signature,
+        }
+    ]
+
+
+def test_sanitize_global_llm_context_recomputes_legacy_signature_without_selector_keys() -> None:
+    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
+    raw = json.dumps(
+        {
+            "user_goal": "extract loaded results",
+            "loaded_result_targets": [
+                {
+                    "is_table": True,
+                    "row_count": 2,
+                    "structure_signature": "legacy-selector-derived-sig",
+                }
+            ],
+        }
+    )
+
+    sanitized = sanitize_global_llm_context_for_prompt(raw)
+
+    assert "legacy-selector-derived-sig" not in sanitized
+    payload = json.loads(sanitized)
+    assert payload["loaded_result_targets"] == [
+        {
+            "is_table": True,
+            "row_count": 2,
+            "structure_signature": expected_signature,
+        }
+    ]
+
+
+def test_finalize_context_persists_latest_loaded_result_targets_sanitizes_selectors() -> None:
+    selector = '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]'
+    row_selector = 'tr[data-account="987654321"]'
+    pii_steer = loaded_result_composition_evidence_from_page(
+        {
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": selector,
+                    "row_selector": row_selector,
+                    "row_count": 2,
+                    "sample_rows": ["May 2026 $42.00"],
+                    "text": "Statement results",
+                    "evidence_source": "evaluate",
+                    "observation_id": "obs-1",
+                }
+            ]
+        }
+    )
+    generic_steer = loaded_result_composition_evidence_from_page(
+        {
+            "result_containers": [
+                {
+                    "tag": "table",
+                    "selector": "#results",
+                    "row_selector": "tr.statement",
+                    "row_count": 2,
+                    "sample_rows": ["May 2026 $42.00"],
+                    "text": "Statement results",
+                    "evidence_source": "evaluate",
+                    "observation_id": "obs-1",
+                }
+            ]
+        }
+    )
+    assert pii_steer is not None
+    assert generic_steer is not None
+    assert pii_steer.structure_signature == generic_steer.structure_signature
+    assert pii_steer.targets[0].structure_signature == generic_steer.targets[0].structure_signature
+
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=pii_steer,
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
+
+    assert raw is not None
+    assert selector not in raw
+    assert row_selector not in raw
+    assert "Jane" not in raw
+    assert "Customer" not in raw
+    assert "123456" not in raw
+    assert "987654321" not in raw
+    assert "May 2026 $42.00" not in raw
+    assert "Statement results" not in raw
+    assert "evaluate" not in raw
+    assert "obs-1" not in raw
+    persisted_target = json.loads(raw)["loaded_result_targets"][0]
+    assert persisted_target == {
+        "is_table": True,
+        "row_count": 2,
+        "structure_signature": generic_steer.targets[0].structure_signature,
+    }
+    structured = StructuredContext.from_json_str(raw)
+    assert structured.loaded_result_targets == [
+        LoadedResultTargetContext(
+            is_table=True,
+            row_count=2,
+            structure_signature=generic_steer.targets[0].structure_signature,
+        )
+    ]
+
+
+def test_finalize_context_clears_stale_loaded_result_targets_when_no_current_steer() -> None:
+    stale_context = StructuredContext(
+        user_goal="extract loaded results",
+        loaded_result_targets=[
+            LoadedResultTargetContext(
+                is_table=True,
+                row_count=2,
+                structure_signature=loaded_result_target_structure_signature(is_table=True, row_count=2),
+            )
+        ],
+    )
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=1,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, stale_context.to_json_str())
+
+    assert raw is not None
+    payload = json.loads(raw)
+    assert payload["loaded_result_targets"] == []
+    assert StructuredContext.from_json_str(raw).loaded_result_targets == []
+    assert render_loaded_result_context_for_prompt(raw) == ""
+
+
+def test_fill_carry_from_scout_trajectory_scrubs_raw_values_and_credential_names() -> None:
+    carry = _fill_carry_from_scout_trajectory(
+        [
+            {
+                "tool_name": "type_text",
+                "selector": "#lookup",
+                "source_url": "https://example.com/form",
+                "typed_length": 8,
+                "typed_value": "SKU-1234",
+                "raw_typed_value": "not-persisted",
+                "role": "textbox",
+                "accessible_name": "Product search",
+            },
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#password",
+                "source_url": "https://example.com/form",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "password",
+                "credential_name": "Saved Login",
+            },
+        ]
+    )
+
+    assert carry == [
+        FillCarry(
+            source_url="https://example.com/form",
+            selector="#lookup",
+            tool_name="type_text",
+            role="textbox",
+            accessible_name="Product search",
+            typed_length=8,
+            typed_value="SKU-1234",
+        ),
+        FillCarry(
+            source_url="https://example.com/form",
+            selector="#password",
+            tool_name="fill_credential_field",
+            typed_length=10,
+            credential_id="cred_123",
+            credential_field="password",
+        ),
+    ]
+    dumped = json.dumps([item.model_dump() for item in carry])
+    assert "not-persisted" not in dumped
+    assert "Saved Login" not in dumped
+
+
+def test_finalize_context_persists_fill_carry() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+        scout_trajectory=[
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/form",
+                "typed_length": 8,
+                "typed_value": "SKU-1234",
+            }
+        ],
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
+
+    assert raw is not None
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.fill_carry == [
+        FillCarry(
+            source_url="https://example.com/form",
+            selector="#search",
+            tool_name="type_text",
+            typed_length=8,
+            typed_value="SKU-1234",
+        )
+    ]
+
+
+def test_fill_carry_records_credential_field_inventory() -> None:
+    carry = _fill_carry_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ],
+        credential_field_inventory={"cred_123": frozenset({"username", "password"})},
+    )
+
+    assert [item.available_fields for item in carry] == [["password", "username"]]
+
+
+def test_fill_carry_without_inventory_serializes_like_legacy_payload() -> None:
+    carry = _fill_carry_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ]
+    )
+
+    assert [item.available_fields for item in carry] == [None]
+    serialized = StructuredContext(fill_carry=carry).to_json_str()
+    assert "available_fields" not in serialized
+    legacy_round_trip = StructuredContext.from_json_str(serialized)
+    assert legacy_round_trip.fill_carry[0].available_fields is None
+
+
+def test_finalize_context_persists_credential_inventory_on_fill_carry() -> None:
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=0,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+        scout_trajectory=[
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ],
+        scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
+
+    assert raw is not None
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.fill_carry[0].available_fields == ["password", "username"]
+
+
+def test_finalize_context_clears_fill_carry_when_current_turn_has_no_fills() -> None:
+    inbound = StructuredContext(
+        fill_carry=[
+            FillCarry(
+                source_url="https://example.com/form",
+                selector="#search",
+                tool_name="type_text",
+                typed_length=8,
+                typed_value="SKU-1234",
+            )
+        ]
+    ).to_json_str()
+    ctx = SimpleNamespace(
+        prior_discovery_calls_made=0,
+        discovery_calls_this_turn=1,
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        latest_evaluate_result_composition_steer=None,
+        scout_trajectory=[{"tool_name": "click", "selector": "#go", "source_url": "https://example.com/form"}],
+    )
+
+    raw = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+
+    assert raw is not None
+    assert StructuredContext.from_json_str(raw).fill_carry == []
+
+
 def test_merge_turn_summary_falls_back_to_summary_without_structured_credentials() -> None:
     ctx = StructuredContext()
     ctx.merge_turn_summary([{"tool": "list_credentials", "summary": "Found 0 credential(s)"}])
@@ -99,6 +481,78 @@ def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
     by_url = {page.url: page for page in pages}
     assert by_url["https://example.com/cart"].had_bounded_schema is True
     assert by_url["https://example.com/cart"].reached_via == "interaction"
+
+
+@dataclass
+class _Ctx:
+    prior_discovery_calls_made: int = 0
+    discovery_calls_this_turn: int = 0
+
+
+def test_structured_context_default_discovery_calls_made_is_zero() -> None:
+    assert StructuredContext().discovery_calls_made == 0
+
+
+def test_structured_context_round_trip_preserves_discovery_calls_made() -> None:
+    sc = StructuredContext(user_goal="x", discovery_calls_made=2)
+    raw = sc.to_json_str()
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.discovery_calls_made == 2
+
+
+def test_finalize_writes_summed_counter_into_outgoing_context() -> None:
+    inbound = StructuredContext(user_goal="x", discovery_calls_made=1).to_json_str()
+    ctx = _Ctx(prior_discovery_calls_made=1, discovery_calls_this_turn=1)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 2
+    assert sc.user_goal == "x"
+
+
+def test_finalize_writes_zero_when_no_calls_made_and_no_prior() -> None:
+    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=0)
+    # No prior context + no this-turn activity -> no need to invent a context.
+    assert finalize_discovery_counter_in_global_llm_context(ctx, None) is None
+
+
+def test_finalize_writes_prior_when_this_turn_is_zero_and_prior_context_exists() -> None:
+    inbound = StructuredContext(user_goal="g", discovery_calls_made=2).to_json_str()
+    ctx = _Ctx(prior_discovery_calls_made=2, discovery_calls_this_turn=0)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 2
+
+
+def test_finalize_handles_string_only_inbound_context() -> None:
+    """Legacy `global_llm_context` was a plain string. The migration path in
+    `StructuredContext.from_json_str` should preserve the string in
+    user_goal and zero the counter."""
+    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=1)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, "legacy string context")
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 1
+    assert sc.user_goal == "legacy string context"
+
+
+def test_finalize_handles_invalid_json_inbound() -> None:
+    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=1)
+    out = finalize_discovery_counter_in_global_llm_context(ctx, "{not valid json")
+    assert out is not None
+    sc = StructuredContext.from_json_str(out)
+    assert sc.discovery_calls_made == 1
+
+
+def test_finalize_treats_none_ctx_as_passthrough_in_factory() -> None:
+    """The factory in agent.py passes ctx=None for very-early errors (before
+    CopilotContext is constructed). The finalizer itself isn't called in that
+    branch — _make_agent_result skips it — but verify that the StructuredContext
+    round-trip itself still preserves a counter set by an earlier turn."""
+    inbound = StructuredContext(discovery_calls_made=2).to_json_str()
+    parsed = json.loads(inbound)
+    assert parsed["discovery_calls_made"] == 2
 
 
 class TestCopilotContext:

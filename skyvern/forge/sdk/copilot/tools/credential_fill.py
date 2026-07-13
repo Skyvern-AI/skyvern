@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pyotp
 import structlog
 
 from skyvern.cli.core.session_manager import get_page
@@ -16,8 +15,8 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
-from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
-from skyvern.forge.sdk.services.credentials import parse_totp_secret
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential, TotpType
+from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 
 from .banned_blocks import _copilot_block_authoring_policy
 from .blockers import _tool_loop_error
@@ -39,6 +38,25 @@ LOG = structlog.get_logger()
 
 _CREDENTIAL_FILL_FIELDS = frozenset({"username", "password", "totp"})
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
+
+
+async def _normalize_totp_config_for_organization(totp_secret: str, organization_id: str) -> str:
+    enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+        totp_secret,
+        organization_id=organization_id,
+    )
+    if enterprise_totp_secret is not None:
+        return enterprise_totp_secret
+    return normalize_totp_config(totp_secret)
+
+
+def _runtime_otp_steering_error(credential_id: str) -> str:
+    return (
+        f"Credential `{credential_id}` receives one-time codes by email/SMS, so `fill_credential_field` cannot "
+        "safely retrieve the code during scouting without a workflow run/task context to anchor polling. "
+        "Persist the OTP step in a code block as `await <credential_parameter>.otp()` after the action that "
+        "triggers delivery; the runtime will poll for the fresh code during the workflow run without exposing it."
+    )
 
 
 def _scrub_secret_from_text(text: str, secret_value: str) -> str:
@@ -120,9 +138,18 @@ async def _resolve_credential_fill_value(
         register_secret_scrub_value(copilot_ctx, value)
     else:
         if not credential.totp:
+            # A saved OTP identifier means the code is delivered out-of-band;
+            # only runtime polling has the run/task context needed to resolve it.
+            if credential.totp_identifier or credential.totp_type in {TotpType.EMAIL, TotpType.TEXT}:
+                return None, "", _runtime_otp_steering_error(credential_id)
             return None, "", f"Credential `{credential_id}` has no TOTP secret configured."
         try:
-            value = pyotp.TOTP(parse_totp_secret(credential.totp)).now()
+            value = generate_totp_code(
+                await _normalize_totp_config_for_organization(
+                    credential.totp,
+                    copilot_ctx.organization_id,
+                )
+            )
         except Exception:
             LOG.warning(
                 "fill_credential_field could not generate a TOTP code",
@@ -133,6 +160,11 @@ async def _resolve_credential_fill_value(
         register_secret_scrub_value(copilot_ctx, value)
     if not value:
         return None, "", f"Credential `{credential_id}` has no `{field}` value."
+    copilot_ctx.scouted_credential_field_inventory_by_credential_id[credential_id] = frozenset(
+        field_name
+        for field_name, field_value in (("username", credential.username), ("password", credential.password))
+        if field_value
+    )
     return value, credential_item.name, None
 
 

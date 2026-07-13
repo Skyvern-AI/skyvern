@@ -10,11 +10,36 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import yaml
+from agents import GuardrailFunctionOutput, InputGuardrail
+from agents.run_context import RunContextWrapper
+from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent import (
+    _VERIFIED_WORKFLOW_SUCCESS_REPLY,
+    _build_built_unverified_exit_result,
+    _build_goal_satisfied_exit_result,
+    _resolve_wrapped_exception_exit_result,
+    _synthesized_block_offer_prompt,
+    _verified_workflow_or_none,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    StoredCriteriaSet,
+    StoredCriteriaSnapshot,
+    build_turn_state,
+    plan_persistence,
+    reconcile_completion_criteria,
+)
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -24,29 +49,124 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON,
+    CopilotBuiltUnverified,
     CopilotGoalSatisfied,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
+    _check_enforcement,
+    built_unverified_repair_inert_context,
+    verified_goal_claim_authorized,
+    verified_goal_satisfied_context,
+)
+from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.output_policy import (
+    ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+    ACTUATION_OBLIGATION_STEER_REASON_CODE,
+    ACTUATION_OBLIGATION_UNMET_REASON_CODE,
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
+    _MAX_COMPLETION_CRITERIA,
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
+    CompletionCriterion,
     RequestPolicy,
+    _classifier_fallback_policy,
     _classify_request,
+    build_classifier_fallback_floor,
     build_transcript_context,
+    is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.completion import (
+    _authored_output_contract_criteria,
+    _completion_verification_criteria,
+    _maybe_run_completion_verification,
+)
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
+    TurnHalt,
+    TurnHaltKind,
+    raise_if_turn_halt,
+    stash_repair_ceiling_turn_halt,
+)
+from skyvern.forge.sdk.copilot.turn_intent import (
+    RequiredContextKey,
+    TurnIntent,
+    TurnIntentAuthority,
+    TurnIntentMode,
+    TurnIntentReasonCode,
+)
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
+from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 
 _HISTORY_SENTINEL_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_prompt_offer_compiles_plan_and_refreshes_when_observation_changes() -> None:
+    criterion = CompletionCriterion(
+        id="record_id",
+        outcome="Record Identifier",
+        output_path="output.record_id",
+    )
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy = RequestPolicy(completion_criteria=[criterion])
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=(criterion,)))
+    ctx.copilot_config = CopilotConfig(requested_output_path_aliases={"record identifier": "output.record_id"})
+    ctx.scout_trajectory = [
+        {"tool_name": "click", "selector": "#show-details", "source_url": "https://example.com/provider"}
+    ]
+
+    def packet(step: int) -> dict[str, object]:
+        return {
+            "step": step,
+            "reached_via": "interaction",
+            "had_bounded_schema": True,
+            "evidence": {
+                "source_tool": "scout_interaction",
+                "interaction_tool": "click",
+                "interaction_selector": "#show-details",
+                "inspection_warnings": [],
+                "result_containers_truncated": False,
+                "key_value_relations_truncated": False,
+                "key_value_relations": [
+                    {
+                        "key_text": "Record Identifier",
+                        "container_selector": ".record-kv",
+                        "container_match_count": 1,
+                        "container_position": 0,
+                        "value_child_index": 1,
+                        "direct_child_count": 2,
+                        "visible": True,
+                        "value_visible": True,
+                    }
+                ],
+                "result_containers": [],
+            },
+        }
+
+    ctx.flow_evidence = [packet(2)]
+    first = _synthesized_block_offer_prompt(ctx)
+    ctx.flow_evidence.append(packet(3))
+    second = _synthesized_block_offer_prompt(ctx)
+
+    assert 'page.locator(".record-kv").nth(0)' in first
+    assert 'return {"output": {"record_id": _extraction_value_0}}' in first
+    assert second == ""
+    assert "Extraction plan identity" in first
+    assert ctx.requested_output_extraction_candidate is not None
 
 
 def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]:
@@ -60,29 +180,14 @@ def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]
     ]
 
 
-def _ctx(**overrides):
-    from skyvern.forge.sdk.copilot.context import CopilotContext
-
-    defaults = dict(
-        organization_id="org-1",
-        workflow_id="wf-1",
-        workflow_permanent_id="wfp-1",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=MagicMock(),
-    )
-    defaults.update(overrides)
-    return CopilotContext(**defaults)
-
-
-def _verified_goal_contract(*, next_action: RepairNextAction = RepairNextAction.NO_CHANGE) -> DiagnosisRepairContract:
+def _unverified_no_repair_contract() -> DiagnosisRepairContract:
     return DiagnosisRepairContract(
         diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
         diagnosis_result=DiagnosisResult(),
-        repair_decision=RepairDecision(next_action=next_action),
+        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
         verification_result=VerificationResult(
-            user_goal_satisfied=True,
-            completion_contract_satisfied=True,
+            user_goal_satisfied=False,
+            completion_contract_satisfied=False,
         ),
     )
 
@@ -105,59 +210,6 @@ class TestFailedTestResponseNormalization:
         assert "draft workflow with 2 blocks" in rewritten
         assert "test failed" in rewritten.lower()
         assert "Call log:" not in rewritten
-
-    def test_pre_run_coverage_guard_uses_completion_contract(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Go to https://the-internet.herokuapp.com/download and then download the first file.",
-            request_policy=SimpleNamespace(completion_contract="complete when the download starts"),
-            last_update_block_count=1,
-            coverage_nudge_count=0,
-        )
-
-        error = _pre_run_workflow_coverage_error(ctx)
-
-        assert error is not None
-        assert "has not been run" in error
-        assert ctx.coverage_nudge_count == 1
-
-    def test_pre_run_coverage_guard_allows_single_final_action_contract(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Click Delete. Your goal is complete when the Delete button disappears.",
-            request_policy=SimpleNamespace(completion_contract="complete when the Delete button disappears"),
-            last_update_block_count=1,
-            coverage_nudge_count=0,
-        )
-
-        assert _pre_run_workflow_coverage_error(ctx) is None
-        assert ctx.coverage_nudge_count == 0
-
-    def test_pre_run_coverage_guard_allows_single_goto_bootstrap(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
-
-        ctx = _ctx(
-            user_message="Go to example.com, fill the search form, and extract the results.",
-            request_policy=SimpleNamespace(completion_contract="complete when result rows are extracted"),
-            last_update_block_count=1,
-            last_workflow=SimpleNamespace(
-                workflow_definition={
-                    "blocks": [
-                        {
-                            "label": "open_search_page",
-                            "block_type": "goto_url",
-                            "url": "https://example.com/search",
-                        }
-                    ]
-                }
-            ),
-            coverage_nudge_count=0,
-        )
-
-        assert _pre_run_workflow_coverage_error(ctx) is None
-        assert ctx.coverage_nudge_count == 0
 
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
@@ -439,6 +491,194 @@ workflow_definition:
         assert "verified block(s): extract_results" in rewritten
         assert "per-tool budget hit on: search_registry" in rewritten
 
+    def test_coverage_complete_adjudication_failure_drops_chain_coverage_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        failure_reason = (
+            "The run completed but did not demonstrate the goal outcome(s): "
+            "workflow title is 'Example Heading Extractor v2'. Add an end-state confirmation."
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_main_heading", "open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason=failure_reason,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("I verified the workflow end-to-end.", ctx)
+
+        assert "verified part of it" not in rewritten
+        assert "verified block(s)" not in rewritten
+        assert "extract_main_heading" in rewritten
+        assert "open_example_page" in rewritten
+        assert failure_reason in rewritten
+
+    def test_coverage_complete_appends_ellipsis_when_blocks_exceed_cap(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        blocks = [f"block_{i}" for i in range(8)]
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=blocks,
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason="The run completed but did not demonstrate the goal outcome(s): title check.",
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "ran all 8 blocks" in rewritten
+        assert "block_0, block_1, block_2, block_3, block_4, block_5, ..." in rewritten
+        assert "block_6" not in rewritten
+
+    def test_partial_frame_appends_ellipsis_when_unverified_blocks_exceed_cap(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=[f"block_{i}" for i in range(7)],
+                per_tool_budget_on_block=[],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" in rewritten
+        assert "unverified block(s): block_0, block_1, block_2, block_3, block_4, block_5, ..." in rewritten
+
+    def test_genuinely_partial_via_unverified_blocks_keeps_existing_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=["extract_main_heading"],
+                per_tool_budget_on_block=[],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" in rewritten
+        assert "unverified block(s): extract_main_heading" in rewritten
+
+    def test_genuinely_partial_via_per_tool_budget_keeps_existing_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=["search_block"],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" in rewritten
+        assert "per-tool budget hit on: search_block" in rewritten
+
+    def test_coverage_complete_without_failure_reason_uses_no_details_fallback(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason=None,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" not in rewritten
+        assert "verified block(s): open_example_page" not in rewritten
+        assert "keep the draft" in rewritten.lower()
+
+    def test_empty_detail_evidence_keeps_bare_fallback(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                test_attempted_but_incomplete=True,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "full workflow chain has not been verified end-to-end" in rewritten
+        assert "verified part of it" not in rewritten
+        assert "verified block(s)" not in rewritten
+
+    def test_no_frame_asserts_end_to_end_verified_while_unverified(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        # Frame A renders execution vocabulary only; the word "verified" must never appear.
+        ctx_a = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_main_heading", "open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason="The run completed but did not demonstrate the goal outcome(s): title check.",
+            ),
+        )
+        reply_a = _rewrite_failed_test_response("done", ctx_a)
+        assert "ran all 2 blocks" in reply_a
+        assert "verified" not in reply_a.lower()
+
+        # Frame B keeps the partial frame; its only end-to-end claim is the truthful negation.
+        ctx_b = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=["extract_main_heading"],
+                per_tool_budget_on_block=[],
+            ),
+        )
+        reply_b = _rewrite_failed_test_response("done", ctx_b)
+        assert "verified part of it" in reply_b
+        assert "has not been verified end-to-end" in reply_b
+
     def test_runtime_verification_evidence_prompt_surfaces_state_for_agent(self) -> None:
         ctx = _ctx(
             workflow_verification_evidence=WorkflowVerificationEvidence(
@@ -464,6 +704,380 @@ workflow_definition:
         assert "per_tool_budget_on_block:" in prompt
         assert "run only missing block labels" in prompt
 
+    def test_unresolved_symbol_repair_context_prompt_is_policy_gated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        info_calls: list[tuple[str, dict[str, str | list[str]]]] = []
+
+        def capture_info(event: str, **kwargs: str | list[str]) -> None:
+            info_calls.append((event, kwargs))
+
+        monkeypatch.setattr(agent_module.LOG, "info", capture_info)
+        repair_context = CodeAuthoringRepairContext(
+            block_label="search_registry",
+            reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+            unresolved_names=["confirmation_number"],
+            parameter_keys=[],
+            available_parameter_keys=["confirmation_number"],
+            binding_candidates=["confirmation_number"],
+            allowed_global_names=["Exception", "json", "page"],
+            allowed_helper_surface={"json": ["dumps", "loads"]},
+        )
+        enabled_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        standard_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            last_code_authoring_repair_context=repair_context,
+        )
+        wrong_reason_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context.model_copy(
+                update={"reason_code": "SANDBOX_SAFETY_CHECK"}
+            ),
+        )
+
+        enabled_prompt = agent_module._code_authoring_repair_context_prompt(enabled_ctx)
+
+        assert "CODE AUTHORING REPAIR CONTEXT" in enabled_prompt
+        assert "block_label: search_registry" in enabled_prompt
+        assert "unresolved_names: confirmation_number" in enabled_prompt
+        assert "declared_parameter_keys: (none)" in enabled_prompt
+        assert "available_parameter_keys: confirmation_number" in enabled_prompt
+        assert "binding_candidates: confirmation_number" in enabled_prompt
+        assert (
+            "confirmation_number -> existing workflow parameter key confirmation_number -> parameter_keys -> "
+            "bare variable confirmation_number"
+        ) in enabled_prompt
+        assert "ensure a workflow string parameter exists" in enabled_prompt
+        assert "list the exact key in the code block's parameter_keys" in enabled_prompt
+        assert "do not hardcode the eval value" in enabled_prompt
+        assert "rerun via update_and_run_blocks" in enabled_prompt
+        assert "json: dumps, loads" in enabled_prompt
+        assert "create a workflow string parameter" not in enabled_prompt
+        assert agent_module._code_authoring_repair_context_prompt(standard_ctx) == ""
+        wrong_reason_prompt = agent_module._code_authoring_repair_context_prompt(wrong_reason_ctx)
+        assert "CODE AUTHORING REPAIR CONTEXT" in wrong_reason_prompt
+        assert "reason_code: SANDBOX_SAFETY_CHECK" in wrong_reason_prompt
+        assert (
+            "copilot code authoring repair context rendered",
+            {
+                "reason_code": SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+                "block_label": "search_registry",
+                "unresolved_names": ["confirmation_number"],
+            },
+        ) in info_calls
+
+    def test_unresolved_symbol_repair_context_prompt_creates_exact_parameter_when_missing(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code=SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+            unresolved_names=["confirmation_number"],
+            parameter_keys=[],
+            available_parameter_keys=[],
+            binding_candidates=["confirmation_number"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "available_parameter_keys: (none)" in prompt
+        assert "binding_candidates: confirmation_number" in prompt
+        assert (
+            "confirmation_number -> create workflow string parameter key confirmation_number -> parameter_keys -> "
+            "bare variable confirmation_number"
+        ) in prompt
+        assert "do not hardcode the eval value" in prompt
+        assert "rerun via update_and_run_blocks" in prompt
+
+    def test_missing_output_dependency_prompt_uses_available_outputs_not_workflow_parameters(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="read_resource_table",
+            reason_code="runtime_missing_output_dependency",
+            missing_output_key="create_resource_output",
+            available_output_keys=["search_output"],
+            current_block_parameter_keys=["create_resource_output"],
+            output_dependency_failure_class="missing_prior_block_output",
+            repair_instruction=(
+                "repair the missing prior block output dependency by binding to an actual available prior output key "
+                "or changing the producing/current code block so the dependency is real; do not invent a workflow "
+                "parameter for this missing output key."
+            ),
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "reason_code: runtime_missing_output_dependency" in prompt
+        assert "missing_output_key: create_resource_output" in prompt
+        assert "available_output_keys: search_output" in prompt
+        assert "current_block_parameter_keys: create_resource_output" in prompt
+        assert "bind to an actual available_output_key" in prompt
+        assert "do not create a workflow parameter for missing_output_key" in prompt
+        assert "create workflow string parameter key create_resource_output" not in prompt
+
+    def test_synthesized_parameter_binding_prompt_uses_exact_key(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="synthesized_parameter_binding_ambiguous",
+            unresolved_names=["enter_confirmation"],
+            parameter_keys=["enter_confirmation"],
+            available_parameter_keys=["confirmation_number"],
+            binding_candidates=["enter_confirmation", "confirmation_number"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "reason_code: synthesized_parameter_binding_ambiguous" in prompt
+        assert "binding_candidates: enter_confirmation, confirmation_number" in prompt
+        assert "declare and use the exact workflow input key" in prompt
+        assert "include that exact key in the code block's parameter_keys" in prompt
+        assert "reference it as a bare Python variable in code" in prompt
+        assert "do not guess or hardcode the runtime value" in prompt
+        assert "rerun via update_and_run_blocks" in prompt
+
+    def test_ambiguous_selector_repair_context_prompt_includes_selector_details(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com/orders",
+            refiner_selector='button[data-action="status"]',
+            repair_instruction="Use a unique selector from the same page before saving the code block.",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "CODE AUTHORING REPAIR CONTEXT" in prompt
+        assert "reason_code: ambiguous_bare_selector" in prompt
+        assert "selector: button" in prompt
+        assert "source_url: https://example.com/orders" in prompt
+        assert 'refiner_selector: button[data-action="status"]' in prompt
+        assert "Use a unique selector from the same page" in prompt
+
+    def test_ambiguous_selector_repair_context_prompt_includes_same_page_alternatives(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="order_status",
+            reason_code="ambiguous_bare_selector",
+            selector="button",
+            source_url="https://example.com",
+            refiner_selector=None,
+            selector_alternatives=[
+                {"tool_name": "type_text", "role": "textbox", "selector": "#order-id"},
+                {"tool_name": "click", "role": "button", "selector": 'role=button[name="Order status"]'},
+            ],
+            repair_instruction="Replace the ambiguous bare selector with a stable same-page control.",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert "same_page_selector_alternatives:" in prompt
+        assert "tool_name=type_text, role=textbox, selector=#order-id" in prompt
+        assert 'tool_name=click, role=button, selector=role=button[name="Order status"]' in prompt
+        assert "re-scout the same page" in prompt
+        assert "stable role/name/data attribute" in prompt
+        assert "button:nth-of-type" not in prompt
+        assert "secret-token" not in prompt
+
+    def test_runtime_repair_context_prompt_includes_failure_and_page_state(self) -> None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="search_registry",
+            reason_code="runtime_block_failure",
+            runtime_failure_reason='Timeout waiting for locator("#results")',
+            runtime_failure_class="timeout_waiting_for_selector",
+            failed_block_status="failed",
+            workflow_run_id="wr_failed",
+            current_origin="https://example.test",
+            current_url_present=True,
+            current_title_present=True,
+            page_evidence_source="inspect_page_for_composition",
+            observed_after_workflow_run=True,
+            page_form_summaries=["Search #search"],
+            page_result_summaries=["No results No matching records"],
+            page_action_summaries=["Search button.search disabled"],
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert 'runtime_failure_reason: Timeout waiting for locator("#results")' in prompt
+        assert "runtime_failure_class: timeout_waiting_for_selector" in prompt
+        assert "failed_block_status: failed" in prompt
+        assert "current_origin: https://example.test" in prompt
+        assert "current_url_present: true" in prompt
+        assert "current_title_present: true" in prompt
+        assert "observed_after_workflow_run: true" in prompt
+        assert "page_forms: Search #search" in prompt
+        assert "page_results: No results No matching records" in prompt
+        assert "page_actions: Search button.search disabled" in prompt
+        assert "adapt the next code block to the observed page state" in prompt
+        assert "do not re-emit the same failing selector or name path" in prompt
+
+    def test_metadata_repair_context_prompt_includes_failure_and_contract_guidance(self) -> None:
+        long_reason = "missing requested output child paths " + ("x" * 220)
+        repair_context = CodeAuthoringRepairContext(
+            block_label="lookup_status",
+            reason_code="metadata_reject",
+            runtime_failure_reason=long_reason,
+            runtime_failure_class="requested_output_contract_missing_output_coverage",
+            required_goal_value_paths=["output.record_id", "output.flags"],
+            required_extraction_schema_paths=["output.record_id", "output.flags"],
+            required_code_return_paths=["output.record_id", "output.flags"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+            repair_instruction=(
+                "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths."
+            ),
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        standard_ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            last_code_authoring_repair_context=repair_context,
+        )
+
+        prompt = agent_module._code_authoring_repair_context_prompt(ctx)
+
+        assert agent_module._code_authoring_repair_context_prompt(standard_ctx) == ""
+        assert "reason_code: metadata_reject" in prompt
+        assert "block_label: lookup_status" in prompt
+        assert "runtime_failure_reason: missing requested output child paths " in prompt
+        assert "x" * 180 not in prompt
+        assert "runtime_failure_class: requested_output_contract_missing_output_coverage" in prompt
+        assert "metadata_contract_source: requested_output_contract" in prompt
+        assert "metadata_contract_reason_code: requested_output_contract_missing_output_coverage" in prompt
+        assert "required_goal_value_paths: output.record_id, output.flags" in prompt
+        assert "required_extraction_schema_paths: output.record_id, output.flags" in prompt
+        assert "required_code_return_paths: output.record_id, output.flags" in prompt
+        assert "code_artifact_metadata" in prompt
+        assert "goal_value_paths" in prompt
+        assert "valid extraction_schema" in prompt
+        assert "code return paths" in prompt
+        assert "required requested output child paths" in prompt
+        assert "rerun update_and_run_blocks" in prompt
+        assert "Declare code_artifact_metadata goal_value_paths" in prompt
+        assert "Coastal" not in prompt
+
+    def test_recorded_build_test_outcome_prompt_renders_structural_grounding(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                attempted_block_label="search_records",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                workflow_run_id="wr_failed",
+                structural_failure_identity="runtime:timeout_waiting_for_selector:failed",
+                page_evidence_refs=["form:Search #search", "result:#results rows=unknown"],
+                observed_evidence_summary="Timeout waiting for results.",
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "RECORDED BUILD-TEST OUTCOME" in prompt
+        assert "phase: persisted_block_run" in prompt
+        assert "reason_code: runtime_block_failure" in prompt
+        assert "page_evidence_refs: form:Search #search, result:#results rows=unknown" in prompt
+        assert "change the next authored step, selector, extraction, or binding based on" in prompt
+
+    def test_recorded_build_test_outcome_prompt_renders_exact_missing_output_paths(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="repairable_failure",
+                reason_code="outcome_not_demonstrated",
+                structural_failure_identity="completion:unsatisfied-output",
+                missing_requested_output_facts=[
+                    {
+                        "output_path": "output.confirmation_number",
+                        "output_root": "output",
+                        "value_status": "no_typed_value",
+                        "reason_code": "no_evidence",
+                    }
+                ],
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "output_path=output.confirmation_number" in prompt
+        assert "output_root=output" in prompt
+        assert "Use the exact output_path values in goal_value_paths and returned output" in prompt
+        assert "output_root is diagnostic grouping only" in prompt
+
+    def test_recorded_build_test_outcome_prompt_surfaces_observed_page_values(self) -> None:
+        long_value = "Request WTR-1842-DEMO for account 100245 confirmed. " + "detail " * 40
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="scout_evaluate",
+                attempted_tool="scout_interaction",
+                attempted_target="#submit",
+                verdict="repairable_failure",
+                reason_code="scout_act_observe_hollow_after_interaction",
+                structural_failure_identity="scout_act_observe:hollow",
+                page_evidence_refs=["origin:https://example.com"],
+                observed_page_value_excerpt=long_value.strip(),
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        value_line = next(line for line in prompt.splitlines() if line.startswith("observed_page_values:"))
+        assert "WTR-1842-DEMO" in value_line
+        assert "100245" in value_line
+        assert len(value_line) > 200
+
+    def test_recorded_build_test_outcome_prompt_binds_observed_values_on_metadata_reject(self) -> None:
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="author_time_reject",
+                attempted_tool="update_workflow",
+                verdict="authoring_rejected",
+                reason_code="metadata_reject",
+                structural_failure_identity="author_time:metadata_reject",
+                observed_page_value_excerpt="Request WTR-1842-DEMO for account 100245 confirmed.",
+                missing_requested_output_facts=[
+                    {"output_root": "output", "output_path": "output.confirmation_number"},
+                    {"output_root": "output", "output_path": "output.account_number"},
+                ],
+            ),
+        )
+
+        prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
+
+        assert "OBSERVED PAGE VALUES CONTRACT" in prompt
+        assert "observed_values: Request WTR-1842-DEMO for account 100245 confirmed." in prompt
+        assert "- output.confirmation_number: <observed value>" in prompt
+        assert "- output.account_number: <observed value>" in prompt
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""
@@ -472,8 +1086,6 @@ class TestVerifiedWorkflowOrNone:
         return object()
 
     def test_passes_workflow_when_tested_successfully(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
         wf = self._wf()
         ctx = _ctx(
             last_workflow=wf,
@@ -483,50 +1095,47 @@ class TestVerifiedWorkflowOrNone:
         )
         assert _verified_workflow_or_none(ctx) == (wf, "foo: bar")
 
-    def test_zeros_when_only_frontier_tested_successfully(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(
-            last_workflow=self._wf(),
-            last_workflow_yaml="foo: bar",
-            last_test_ok=True,
-            last_full_workflow_test_ok=False,
-        )
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_when_test_failed(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(last_workflow=self._wf(), last_workflow_yaml="foo: bar", last_test_ok=False)
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_when_untested_update(self) -> None:
-        # Exactly the scenario where _record_workflow_update_result reset
-        # last_test_ok to None after a standalone update_workflow or after
-        # the agent edited post-failure without re-testing.
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(last_workflow=self._wf(), last_workflow_yaml="foo: bar", last_test_ok=None)
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_when_no_last_workflow(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(last_workflow=None, last_test_ok=True)
-        assert _verified_workflow_or_none(ctx) == (None, None)
-
-    def test_zeros_on_suspicious_success(self) -> None:
-        # _record_run_blocks_result sets last_test_ok=None when blocks ran ok
-        # but produced no meaningful extraction data. Still an unverified
-        # outcome; must not surface a proposal.
-        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
-
-        ctx = _ctx(
-            last_workflow=self._wf(),
-            last_workflow_yaml="foo: bar",
-            last_test_ok=None,
-            last_test_suspicious_success=True,
-        )
+    @pytest.mark.parametrize(
+        "ctx_overrides",
+        [
+            pytest.param(
+                {
+                    "last_workflow": object(),
+                    "last_workflow_yaml": "foo: bar",
+                    "last_test_ok": True,
+                    "last_full_workflow_test_ok": False,
+                },
+                id="only_frontier_tested_successfully",
+            ),
+            pytest.param(
+                {"last_workflow": object(), "last_workflow_yaml": "foo: bar", "last_test_ok": False},
+                id="test_failed",
+            ),
+            # _record_workflow_update_result resets last_test_ok to None after a standalone
+            # update_workflow or after the agent edited post-failure without re-testing.
+            pytest.param(
+                {"last_workflow": object(), "last_workflow_yaml": "foo: bar", "last_test_ok": None},
+                id="untested_update",
+            ),
+            pytest.param(
+                {"last_workflow": None, "last_test_ok": True},
+                id="no_last_workflow",
+            ),
+            # _record_run_blocks_result sets last_test_ok=None when blocks ran ok but produced no
+            # meaningful extraction data. Still an unverified outcome; must not surface a proposal.
+            pytest.param(
+                {
+                    "last_workflow": object(),
+                    "last_workflow_yaml": "foo: bar",
+                    "last_test_ok": None,
+                    "last_test_suspicious_success": True,
+                },
+                id="suspicious_success",
+            ),
+        ],
+    )
+    def test_zeros_on_unverified_outcome(self, ctx_overrides: dict) -> None:
+        ctx = _ctx(**ctx_overrides)
         assert _verified_workflow_or_none(ctx) == (None, None)
 
 
@@ -559,6 +1168,10 @@ class TestVerifiedGoalSatisfiedStop:
                 result=result,
             )
 
+        assert ctx.goal_satisfied_tool_name == "update_and_run_blocks"
+        assert ctx.goal_satisfied_tool_output is not None
+        assert ctx.goal_satisfied_tool_output["ok"] is True
+
         assert ctx.tool_activity[-1]["tool"] == "update_and_run_blocks"
 
     def test_wrapped_goal_satisfied_error_context_is_recognized(self) -> None:
@@ -572,6 +1185,201 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert verified_goal_satisfied_context(ctx)
 
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_fallback_reaches_goal_satisfied_after_verified_consume(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="repair ceiling",
+            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            recovery_hint="report_blocker_to_user",
+            preserves_workflow_draft=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+        raise_if_turn_halt(ctx, verified=True)
+
+        assert not isinstance(ctx.turn_halt, TurnHalt)
+        assert verified_goal_satisfied_context(ctx)
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        assert result.proposal_disposition != "no_proposal"
+
+    def test_verified_turn_halt_suppresses_active_run_terminal_evidence_only(self) -> None:
+        ctx = _ctx()
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="active run reached requested state",
+            user_facing_reason="active run reached requested state",
+            recovery_hint="report_blocker_to_user",
+            internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        ctx.latest_tool_blocker_signal = signal
+        ctx.tool_blocker_signals.append(signal)
+        ctx.turn_halt = TurnHalt(
+            kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
+            blocker_signal=signal,
+            extra={"source": "run_execution"},
+        )
+
+        raise_if_turn_halt(ctx, verified=True)
+
+        assert not isinstance(ctx.turn_halt, TurnHalt)
+        assert ctx.blocker_signal is None
+        assert ctx.latest_tool_blocker_signal is None
+        assert ctx.tool_blocker_signals == []
+
+    def test_verified_turn_halt_keeps_terminal_challenge_blocker(self) -> None:
+        ctx = _ctx()
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="stop on terminal challenge",
+            user_facing_reason="The site requires human verification.",
+            recovery_hint="stop",
+            internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=signal)
+
+        with pytest.raises(CopilotTurnHalt):
+            raise_if_turn_halt(ctx, verified=True)
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_resolver_renders_success_over_involuntary_halt(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="repair ceiling",
+            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            recovery_hint="report_blocker_to_user",
+            preserves_workflow_draft=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+        result = await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context=None,
+            goal_satisfied=True,
+            error=RuntimeError("sdk-wrapped hook exception"),
+            workflow_permanent_id="wfp-1",
+        )
+
+        assert result.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        assert result.proposal_disposition != "no_proposal"
+        assert result.updated_workflow is ctx.last_workflow
+        assert not isinstance(ctx.turn_halt, TurnHalt)
+        assert ctx.blocker_signal is None
+        assert signal.user_facing_reason not in result.user_response
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_resolver_surfaces_voluntary_challenge(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        challenge_text = "The site requires a verification challenge I can't complete on my own."
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="stop on terminal challenge",
+            user_facing_reason=challenge_text,
+            recovery_hint="stop",
+            internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=signal)
+
+        result = await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context=None,
+            goal_satisfied=True,
+            error=RuntimeError("sdk-wrapped hook exception"),
+            workflow_permanent_id="wfp-1",
+        )
+
+        assert result.user_response == challenge_text
+        assert result.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
+
+    @pytest.mark.asyncio
+    async def test_wrapped_exception_resolver_renders_blocker_when_not_judge_verified(self) -> None:
+        ctx = _ctx(
+            last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        # The broad legacy gate passes (goal_satisfied) but the judge confirmed nothing, so
+        # outcome_fully_verified is False and the involuntary halt must not be suppressed.
+        ctx.completion_verification_result = None
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text="repair ceiling",
+            user_facing_reason="I could not get the run to pass after several repair attempts.",
+            recovery_hint="report_blocker_to_user",
+            preserves_workflow_draft=True,
+            internal_reason_code="repair_ceiling_reached",
+            blocked_tool="update_and_run_blocks",
+        )
+        ctx.blocker_signal = signal
+        stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+        result = await _resolve_wrapped_exception_exit_result(
+            ctx,
+            global_llm_context=None,
+            goal_satisfied=True,
+            error=RuntimeError("sdk-wrapped hook exception"),
+            workflow_permanent_id="wfp-1",
+        )
+
+        assert result.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
+        assert signal.user_facing_reason in result.user_response
+
     def test_wrapped_goal_satisfied_error_context_requires_no_change(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
 
@@ -582,6 +1390,30 @@ class TestVerifiedGoalSatisfiedStop:
         )
 
         assert not verified_goal_satisfied_context(ctx)
+
+    def test_check_enforcement_stops_after_structural_built_unverified_terminal(self) -> None:
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+        )
+
+        assert verified_goal_satisfied_context(ctx) is False
+        assert built_unverified_repair_inert_context(ctx) is True
+        assert verified_goal_claim_authorized(ctx) is False
+        with pytest.raises(CopilotBuiltUnverified):
+            _check_enforcement(ctx)
 
     def test_verified_goal_satisfied_context_rejects_undercovered_workflow(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
@@ -599,7 +1431,8 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert not verified_goal_satisfied_context(ctx)
 
-    def test_goal_satisfied_exit_result_surfaces_tested_workflow(self) -> None:
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_surfaces_tested_workflow(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
 
         workflow = object()
@@ -611,12 +1444,185 @@ class TestVerifiedGoalSatisfiedStop:
             tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
         )
 
-        result = _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is workflow
         assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
-        assert result.proposal_disposition == "auto_applicable"
-        assert "tested" in result.user_response.lower()
+        assert result.proposal_disposition == "review_tested"
+        assert result.apply_without_review is False
+        # No adjudicated outcome evidence: the turn ends but the claim renders
+        # built-but-unverified instead of a tested-success claim.
+        assert "not independently verified" in result.user_response.lower()
+        assert result.narrative_payload is not None
+        assert result.narrative_payload["terminal"] == "response"
+        assert result.narrative_payload["verifiedSuccess"] is False
+
+        from skyvern.forge.sdk.copilot.completion_verification import (
+            CompletionVerificationResult,
+            CriterionVerdict,
+        )
+
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        verified = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+        assert verified.proposal_disposition == "auto_applicable"
+        assert "tested" in verified.user_response.lower()
+        assert verified.narrative_payload is not None
+        assert verified.narrative_payload["verifiedSuccess"] is True
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_renders_structural_abstention_as_built_unverified(self) -> None:
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+
+        assert verified_goal_satisfied_context(ctx) is False
+        assert built_unverified_repair_inert_context(ctx) is True
+        assert verified_goal_claim_authorized(ctx) is False
+
+        result = await _build_built_unverified_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is workflow
+        assert result.proposal_disposition == "review_tested"
+        assert result.apply_without_review is False
+        assert "not independently verified" in result.user_response.lower()
+        assert result.turn_outcome is not None
+        assert result.turn_outcome.terminal_reason == BUILT_UNVERIFIED_REPAIR_INERT_TERMINAL_REASON
+        assert result.narrative_payload is not None
+        assert result.narrative_payload["verifiedSuccess"] is False
+
+    def test_corroborated_structural_abstention_avoids_built_unverified_terminal(self) -> None:
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0", "c0__requested_output_corroborator"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                        evidence_ref="block_outputs:extract_first_three_quotes.quotes",
+                        output_path="output.quotes",
+                        grounding_mode="missing",
+                    ),
+                    CriterionVerdict(
+                        criterion_id="c0__requested_output_corroborator",
+                        state="satisfied",
+                        reason_code="evidence_confirms",
+                    ),
+                ],
+            ),
+        )
+
+        assert verified_goal_satisfied_context(ctx) is True
+        assert built_unverified_repair_inert_context(ctx) is False
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_carries_outcome_adjudication(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_criteria_store import (
+            CompletionCriteriaTurnState,
+            ReconcileDecision,
+        )
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_criteria_turn_state = CompletionCriteriaTurnState(
+            decision=ReconcileDecision(action="create", reason="not_subset", epoch=2, criteria=()),
+            last_verdict_state_counts={"satisfied": 2, "unsatisfied": 0, "unknown": 0},
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        payload = result.narrative_payload
+        assert payload is not None
+        adjudication = payload["outcomeAdjudication"]
+        assert adjudication["criteriaEpoch"] == 2
+        assert adjudication["criteriaLifecycleReason"] == "not_subset"
+        assert adjudication["satisfiedCount"] == 2
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_does_not_claim_success_after_failed_test(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=False,
+            last_full_workflow_test_ok=False,
+            last_artifact_health_blocker_reason=(
+                "Artifact-health blocker in block(s) extract_results: deterministic generated-code/runtime SyntaxError"
+            ),
+            last_artifact_health_blocker_labels=["extract_results"],
+            last_artifact_health_failure_classes=["SyntaxError"],
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "failed"}],
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert "tested successfully" not in result.user_response.lower()
+        assert "did not finish successfully" in result.user_response.lower()
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_does_not_claim_failed_test_when_not_tested(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        ctx = _ctx(
+            last_workflow=None,
+            last_workflow_yaml=None,
+            last_test_ok=None,
+            last_full_workflow_test_ok=False,
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert "tested successfully" not in result.user_response.lower()
+        assert "did not finish successfully" not in result.user_response.lower()
+        assert "not been tested end-to-end" in result.user_response.lower()
 
 
 class TestSupersededAgentIntentGates:
@@ -629,11 +1635,6 @@ class TestSupersededAgentIntentGates:
 class TestRequestPolicyInputGuardrail:
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_computes_and_stores_request_policy(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             testing_intent="skip_test",
             credential_input_kind="credential_name",
@@ -650,7 +1651,8 @@ class TestRequestPolicyInputGuardrail:
             chat_history_messages=_history(("user", "build the login workflow")),
             global_llm_context="",
             organization_id="org-1",
-            handler=object(),
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
             previous_user_message="build the login workflow",
         )
 
@@ -675,16 +1677,77 @@ class TestRequestPolicyInputGuardrail:
             chat_history=policy_inputs.chat_history_messages,
             global_llm_context="",
             organization_id="org-1",
-            handler=policy_inputs.handler,
+            handler=policy_inputs.request_policy_handler,
+            active_criteria=None,
+            config=None,
         )
 
     @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_routes_request_policy_to_fast_handler_and_turn_intent_to_main(
+        self, monkeypatch
+    ) -> None:
+        request_policy_handler = object()
+        turn_intent_handler = object()
+        policy = RequestPolicy()
+        build_request_policy = AsyncMock(return_value=policy)
+        classify_turn_intent = AsyncMock(return_value=None)
+        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        monkeypatch.setattr(agent_module, "classify_turn_intent", classify_turn_intent)
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="build and test it",
+            workflow_yaml="workflow: yaml",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=request_policy_handler,
+            turn_intent_handler=turn_intent_handler,
+        )
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )
+
+        await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=_ctx()))
+
+        assert build_request_policy.await_args is not None
+        assert build_request_policy.await_args.kwargs["handler"] is request_policy_handler
+        assert classify_turn_intent.await_args is not None
+        assert classify_turn_intent.await_args.kwargs["handler"] is turn_intent_handler
+
+    @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_forwards_stored_active_criteria(self, monkeypatch) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="The main heading is extracted into the run output"),),
+        )
+        build_request_policy = AsyncMock(return_value=RequestPolicy())
+        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="run it again",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            request_policy_handler=object(),
+            turn_intent_handler=object(),
+            stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        )
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )
+        await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=_ctx()))
+
+        assert build_request_policy.await_args is not None
+        assert build_request_policy.await_args.kwargs["active_criteria"] == list(stored.criteria)
+
+    @pytest.mark.asyncio
     async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             credential_input_kind="raw_secret",
             user_response_policy="ask_clarification",
@@ -706,7 +1769,8 @@ class TestRequestPolicyInputGuardrail:
                 chat_history_messages=[],
                 global_llm_context="",
                 organization_id="org-1",
-                handler=None,
+                request_policy_handler=None,
+                turn_intent_handler=None,
             ),
         )
 
@@ -720,11 +1784,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_request_policy_proceeds_on_workflow_behavior_question(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             credential_input_kind="none",
             testing_intent="unspecified",
@@ -748,7 +1807,8 @@ class TestRequestPolicyInputGuardrail:
                 ),
                 global_llm_context="",
                 organization_id="org-1",
-                handler=object(),
+                request_policy_handler=object(),
+                turn_intent_handler=object(),
             ),
         )
 
@@ -763,11 +1823,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_request_policy_proceeds_on_bare_keyvault_slotfill(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         policy = RequestPolicy(
             credential_input_kind="none",
             testing_intent="unspecified",
@@ -787,7 +1842,8 @@ class TestRequestPolicyInputGuardrail:
                 ),
                 global_llm_context="",
                 organization_id="org-1",
-                handler=object(),
+                request_policy_handler=object(),
+                turn_intent_handler=object(),
             ),
         )
 
@@ -801,11 +1857,6 @@ class TestRequestPolicyInputGuardrail:
 
     @pytest.mark.asyncio
     async def test_raw_secret_redacted_draft_policy_sanitizes_agent_input(self, monkeypatch) -> None:
-        from agents import GuardrailFunctionOutput, InputGuardrail
-        from agents.run_context import RunContextWrapper
-
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         raw_message = (
             "Convert this SDK snippet into a workflow:\n"
             "client = DemoClient(api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890')"
@@ -830,7 +1881,8 @@ class TestRequestPolicyInputGuardrail:
                 chat_history_messages=[],
                 global_llm_context="",
                 organization_id="org-1",
-                handler=None,
+                request_policy_handler=None,
+                turn_intent_handler=None,
             ),
         )
 
@@ -892,6 +1944,31 @@ def _chat_request() -> SimpleNamespace:
         workflow_id="wf-1",
         workflow_permanent_id="wfp-1",
         workflow_copilot_chat_id="chat-1",
+        workflow_yaml="",
+    )
+
+
+def _browser_actuation_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        required_context=[RequiredContextKey.BROWSER_STATE],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+
+def _unknown_browser_actuation_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.UNKNOWN,
+        required_context=[RequiredContextKey.BROWSER_STATE],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+
+def _browser_actuation_intent_without_browser_state(*, mode: TurnIntentMode) -> TurnIntent:
+    return TurnIntent(
+        mode=mode,
+        required_context=[],
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
     )
 
 
@@ -984,8 +2061,220 @@ class TestBlockGoalMainGoal:
 
 class TestRuntimeBlockGoalPersistenceBoundary:
     @pytest.mark.asyncio
+    async def test_update_and_run_blocks_metadata_repair_context_preflight_blocks_before_update(
+        self, monkeypatch
+    ) -> None:
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: extract_entry_output
+      code: |
+        return {"output": {"summary": "found"}}
+"""
+        repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id", "output.flags"],
+            required_extraction_schema_paths=["output.record_id", "output.flags"],
+            required_code_return_paths=["output.record_id", "output.flags"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            tools_module,
+            "_tool_loop_error",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("loop check should not run")),
+        )
+        monkeypatch.setattr(
+            tools_module,
+            "_update_workflow",
+            AsyncMock(side_effect=AssertionError("_update_workflow should not run")),
+        )
+        record_calls: list[tuple[str, dict[str, object]]] = []
+        monkeypatch.setattr(
+            tools_module,
+            "record_tool_step_result_for_ctx",
+            lambda _ctx, tool, _args, result: record_calls.append((tool, result)),
+        )
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert "cannot attempt a run" in parsed["error"]
+        assert parsed["data"]["reason_code"] == "metadata_contract_required_before_run"
+        assert parsed["data"]["authoring_repair_context"]["required_goal_value_paths"] == [
+            "output.flags",
+            "output.record_id",
+        ]
+        assert parsed["data"]["metadata_repair_contract"]["block_label"] == "extract_entry_output"
+        assert record_calls
+        assert record_calls[0][0] == "update_and_run_blocks"
+        assert record_calls[0][1]["data"]["reason_code"] == "metadata_contract_required_before_run"
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_metadata_contract_scaffold_reaches_update_workflow(self, monkeypatch) -> None:
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: extract_entry_output
+      code: |
+        return {"output": {"record_id": "ABC123", "flags": ["enabled"]}}
+"""
+        repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id", "output.flags"],
+            required_extraction_schema_paths=["output.record_id", "output.flags"],
+            required_code_return_paths=["output.record_id", "output.flags"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        captured_metadata: list[dict[str, object]] = []
+
+        async def fake_update_workflow(payload, _ctx, **_kwargs):
+            captured_metadata.extend(payload["code_artifact_metadata"])
+            captured_metadata.append({"formation_prepared": _kwargs["formation_prepared"]})
+            return {"ok": False, "error": "sentinel update reached", "data": {"from_update": True}}
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed["error"] == "sentinel update reached"
+        assert captured_metadata
+        assert captured_metadata[0]["block_label"] == "extract_entry_output"
+        assert captured_metadata[0]["artifact_id"] == "code_artifact:extract_entry_output"
+        assert captured_metadata[0]["claimed_outcomes"][0]["goal_value_paths"] == [
+            "output.flags",
+            "output.record_id",
+        ]
+        assert captured_metadata[-1]["formation_prepared"] is True
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_typed_advisory_static_return_gap_reaches_run(self, monkeypatch) -> None:
+        workflow_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: extract_entry_output
+      code: |
+        return "not a structured output"
+"""
+        required_paths = {"output.record_id"}
+        schema = workflow_update_module._schema_template_text_for_required_paths(required_paths)
+        repair_context = CodeAuthoringRepairContext(
+            block_label="extract_entry_output",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["output.record_id"],
+            required_extraction_schema_paths=["output.record_id"],
+            required_code_return_paths=["output.record_id"],
+            metadata_contract_source="requested_output_contract",
+            metadata_contract_reason_code="requested_output_contract_missing_output_coverage",
+        )
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_code_authoring_repair_context=repair_context,
+        )
+        ctx.turn_id = "metadata-contract-run-preflight"
+        signature = workflow_update_module._output_contract_signature(
+            ctx=ctx,
+            workflow_yaml=workflow_yaml,
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+            required_paths=required_paths,
+        )
+        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
+        captured: dict[str, object] = {}
+
+        async def fake_update_workflow(payload, update_ctx, **_kwargs):
+            captured["update_called"] = True
+            captured["metadata"] = payload["code_artifact_metadata"]
+            update_ctx.workflow_yaml = payload["workflow_yaml"]
+            update_ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+            return {"ok": True, "data": {"block_count": 1}}
+
+        async def fake_run_blocks(params, _ctx, **_kwargs):
+            captured["run_called"] = True
+            captured["run_params"] = params
+            return {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr-1",
+                    "overall_status": "completed",
+                    "blocks": [{"label": "extract_entry_output", "status": "completed"}],
+                },
+            }
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(
+            tools_module, "_plan_frontier", lambda *args: (["extract_entry_output"], {}, "extract_entry_output")
+        )
+        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps(
+                {
+                    "workflow_yaml": workflow_yaml,
+                    "block_labels": ["extract_entry_output"],
+                }
+            ),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is True
+        assert captured["update_called"] is True
+        assert captured["run_called"] is True
+        update_metadata = captured["metadata"]
+        assert isinstance(update_metadata, list)
+        assert update_metadata[0]["block_label"] == "extract_entry_output"
+        assert update_metadata[0]["claimed_outcomes"][0]["goal_value_paths"] == ["output.record_id"]
+        assert update_metadata[0]["claimed_outcomes"][0]["extraction_schema"] == schema
+
+    @pytest.mark.asyncio
     async def test_update_and_run_blocks_persists_clean_yaml(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import tools as tools_module
         from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 
         clean_yaml = """
@@ -997,12 +2286,19 @@ workflow_definition:
       label: submit
       navigation_goal: Submit the contact form.
 """
-        captured: dict[str, str] = {}
+        captured: dict[str, str | bool] = {}
 
-        async def fake_update_workflow(payload, ctx, allow_missing_credentials=False):
+        async def fake_update_workflow(
+            payload,
+            ctx,
+            allow_missing_credentials=False,
+            allow_static_output_uncertainty=False,
+            formation_prepared=False,
+        ):
             captured["workflow_yaml"] = payload["workflow_yaml"]
             ctx.workflow_yaml = payload["workflow_yaml"]
-            workflow = _process_workflow_yaml(
+            workflow = await _process_workflow_yaml(
+                settings_fallback_yaml="enable_self_healing: false",
                 workflow_id=ctx.workflow_id,
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 organization_id=ctx.organization_id,
@@ -1011,6 +2307,7 @@ workflow_definition:
             return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
 
         async def fake_run_blocks(params, ctx, **kwargs):
+            captured["run_called"] = True
             return {
                 "ok": True,
                 "data": {
@@ -1025,15 +2322,15 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
         monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit"))
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
 
         ctx = _ctx(
-            user_message="Submit a contact form.",
+            user_message="Go to https://the-internet.herokuapp.com/download and then download the first file.",
             block_goal_main_goal="Submit a contact form.",
+            request_policy=RequestPolicy(completion_contract="complete when the download starts"),
         )
         result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
@@ -1042,6 +2339,8 @@ workflow_definition:
 
         assert json.loads(result)["ok"] is True
         assert captured["workflow_yaml"] == clean_yaml
+        assert captured["run_called"] is True
+        assert ctx.coverage_nudge_count == 0
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 
@@ -1061,6 +2360,230 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
 
+    def test_actuation_required_reply_without_browser_mutation_returns_steer(self) -> None:
+        ctx = _ctx(turn_intent=_browser_actuation_intent())
+        result = _fake_run_result({"type": "REPLY", "user_response": "I can fill those fields for you."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.turn_outcome is not None
+        assert agent_result.turn_outcome.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+        assert agent_result.turn_outcome.actuation_obligation_key == ACTUATION_OBLIGATION_BROWSER_ACTION_KEY
+
+    def test_repeated_actuation_required_reply_without_browser_mutation_returns_terminal(self) -> None:
+        ctx = _ctx(
+            turn_intent=_browser_actuation_intent(),
+            prior_turn_outcome=TurnOutcome(
+                response_kind=ResponseKind.CLARIFY,
+                reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+                actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I can fill those fields for you."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.updated_workflow is None
+        assert agent_result.turn_outcome is not None
+        assert agent_result.turn_outcome.reason_code == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        assert agent_result.turn_outcome.terminal_reason == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+        assert agent_result.turn_outcome.actuation_obligation_key == ACTUATION_OBLIGATION_BROWSER_ACTION_KEY
+
+    def test_unknown_click_with_authority_denied_blocker_returns_reply(self) -> None:
+        ctx = _ctx(turn_intent=_unknown_browser_actuation_intent())
+        ctx.scout_trajectory.append({"tool_name": "click"})
+        ctx.blocker_signal = CopilotToolBlockerSignal(
+            blocker_kind="authority_denied",
+            agent_steering_text="Use browser tools.",
+            user_facing_reason="I'll respond with the information I already have.",
+            recovery_hint="report_blocker_to_user",
+            internal_reason_code="turn_intent_no_mutation_run_blocked",
+            blocked_tool="update_and_run_blocks",
+            classifier_mode="unknown",
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I'll respond with the information I have."})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.turn_outcome is not None
+        assert agent_result.turn_outcome.reason_code != ACTUATION_OBLIGATION_STEER_REASON_CODE
+
+    def test_verified_terminal_state_surfaces_workflow_despite_weak_final_reply(self) -> None:
+        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="title: Verified Draft",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
+        ctx.verified_terminal_proposal_ready = True
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Do you want me to keep repairing?"})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert agent_result.updated_workflow is workflow
+        assert agent_result.workflow_yaml == "title: Verified Draft"
+        assert agent_result.clear_proposed_workflow is False
+        assert agent_result.proposal_disposition == "auto_applicable"
+
+    def test_wip_exit_structural_abstention_stays_review_only(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+
+        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow=workflow,
+            last_workflow_yaml="title: Structural Draft",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_unverified_no_repair_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[
+                    CriterionVerdict(
+                        criterion_id="c0",
+                        state="unsatisfied",
+                        reason_code="structurally_abstained",
+                    )
+                ],
+            ),
+        )
+
+        agent_result = agent_module._build_wip_exit_result(
+            ctx,
+            global_llm_context=None,
+            default_reply="Timed out.",
+            unvalidated_reply="Draft needs review.",
+            tested_reply="Tested.",
+            terminal_reason="max_turns",
+        )
+
+        assert verified_goal_claim_authorized(ctx) is False
+        assert agent_result.updated_workflow is workflow
+        assert agent_result.proposal_disposition == "review_tested"
+        assert agent_result.apply_without_review is False
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["verifiedSuccess"] is False
+
+    def test_wip_exit_verified_claim_still_auto_applies_code_only(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+
+        workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[]))
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow=workflow,
+            last_workflow_yaml="title: Verified Draft",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            has_staged_proposal=True,
+            staged_workflow=workflow,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+
+        agent_result = agent_module._build_wip_exit_result(
+            ctx,
+            global_llm_context=None,
+            default_reply="Timed out.",
+            unvalidated_reply="Draft needs review.",
+            tested_reply="Tested.",
+            terminal_reason="max_turns",
+        )
+
+        assert verified_goal_claim_authorized(ctx) is True
+        assert agent_result.updated_workflow is workflow
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.apply_without_review is True
+
+    def test_output_field_confirmation_question_is_blocked_when_contract_present(self) -> None:
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                user_response_policy="proceed",
+                completion_contract_status="present",
+                completion_criteria=[
+                    CompletionCriterion(id="provider", outcome="The returned record identifies the provider."),
+                ],
+            )
+        )
+        result = _fake_run_result(
+            {
+                "type": "ASK_QUESTION",
+                "user_response": "Please confirm the output fields before I build and test this workflow.",
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.updated_workflow is None
+        assert agent_result.clear_proposed_workflow is False
+        assert agent_result.proposal_disposition == "no_proposal"
+        assert agent_result.output_policy_diagnostics is not None
+        assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is False
+        assert agent_result.output_policy_diagnostics["hard_block_reason_codes"] == [
+            "avoidable_output_field_confirmation"
+        ]
+
+    def test_credential_clarification_question_remains_allowed_with_request_policy(self) -> None:
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                user_response_policy="ask_clarification",
+                clarification_question="Which saved credential should I use?",
+                clarification_reason="credential_name_unresolved",
+                completion_contract_status="present",
+                completion_criteria=[
+                    CompletionCriterion(id="provider", outcome="The returned record identifies the provider."),
+                ],
+            ),
+        )
+        result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which saved credential should I use?"})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.clear_proposed_workflow is True
+        assert agent_result.output_policy_diagnostics is not None
+        assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is True
+        assert "avoidable_output_field_confirmation" not in agent_result.output_policy_diagnostics["raw_reason_codes"]
+
     def test_inline_replace_workflow_resets_test_ok_after_prior_pass(self, monkeypatch) -> None:
         # A prior run_blocks test passed for the old workflow (ctx.last_test_ok=True,
         # ctx.last_workflow=old_wf). The agent then emits inline REPLACE_WORKFLOW
@@ -1070,7 +2593,7 @@ class TestTranslateToAgentResultGating:
         new_wf = SimpleNamespace(name="new-from-replace")
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
-            lambda **kwargs: new_wf,
+            AsyncMock(return_value=new_wf),
         )
 
         ctx = _ctx(
@@ -1102,11 +2625,45 @@ class TestTranslateToAgentResultGating:
         assert agent_result.workflow_yaml is None
         assert agent_result.response_type == "REPLACE_WORKFLOW"
 
+    def test_inline_replace_workflow_suppressed_on_no_mutation_turn(self, monkeypatch) -> None:
+        # A DIAGNOSE turn is may_update_workflow=False, but an inline REPLACE_WORKFLOW bypasses the
+        # may_update_workflow authority enforced on the update_workflow tool. The translate helper must downgrade
+        # it to a REPLY so the diagnosis lands without processing or staging the REPLACE candidate.
+        def _must_not_process(**kwargs):
+            raise AssertionError("inline REPLACE_WORKFLOW was processed on a no-mutation turn")
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _must_not_process)
+        ctx = _ctx(
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.DIAGNOSE,
+                authority=TurnIntentAuthority(
+                    may_update_workflow=False, may_run_blocks=False, may_read_run_context=True
+                ),
+            ),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "Here's the fixed workflow.",
+                "workflow_yaml": "new: yaml",
+            }
+        )
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+        # Downgraded to REPLY; the REPLACE candidate is neither processed (the patch would have raised) nor staged.
+        assert agent_result.response_type == "REPLY"
+        assert ctx.last_workflow is None
+        assert agent_result.updated_workflow is None
+        assert "confirm and i'll apply" in agent_result.user_response.lower()
+
     def test_inline_replace_workflow_rejects_stale_block_metadata(self, monkeypatch) -> None:
         # Inline REPLACE_WORKFLOW bypasses _update_workflow, so it must also
         # reject a corrected workflow whose labels/titles still describe the
         # prior subject.
-        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
         prior_yaml = """
@@ -1151,7 +2708,7 @@ workflow_definition:
         assert agent_result.workflow_yaml is None
 
     def test_inline_replace_workflow_rejects_page_dependent_blocks_without_inspection(self, monkeypatch) -> None:
-        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
 
         submitted_yaml = """
@@ -1193,7 +2750,7 @@ workflow_definition:
     def test_code_only_inline_replace_workflow_rejects_native_browser_block(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.output_policy import OutputPolicyVerdict
 
-        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        process_mock = AsyncMock(return_value=SimpleNamespace(name="new"))
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
         monkeypatch.setattr(agent_module, "evaluate_output_policy", lambda **kwargs: OutputPolicyVerdict())
 
@@ -1223,15 +2780,10 @@ workflow_definition:
         assert agent_result.workflow_yaml is None
 
     def test_inline_replace_with_invalid_yaml_keeps_prior_pass(self, monkeypatch) -> None:
-        # _process_workflow_yaml raising on a malformed REPLACE must leave
-        # ctx untouched — no spurious last_test_ok reset, no workflow swap —
-        # so a prior tested workflow remains available.
-        import yaml as yaml_mod
-
         tested_wf = SimpleNamespace(name="tested")
 
         def boom(**kwargs):
-            raise yaml_mod.YAMLError("mangled yaml")
+            raise yaml.YAMLError("mangled yaml")
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", boom)
 
@@ -1555,9 +3107,146 @@ workflow_definition:
         assert agent_result.workflow_yaml == "title: drafted"
         assert agent_result.proposal_disposition == "review_untested"
 
-    def test_goal_reached_default_true_keeps_verified_path(self) -> None:
-        # Backwards-compat: stale prompts that omit goal_reached must continue
-        # to surface a tested workflow as validated.
+    def test_goal_reached_false_cannot_underclaim_verified_outcome(self) -> None:
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        wf = SimpleNamespace(name="verified")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: verified",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            last_update_block_count=4,
+            last_run_outcome=RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_secret"),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "I drafted the workflow, but it has not been tested end-to-end.",
+                "goal_reached": False,
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.workflow_yaml == "title: verified"
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert "draft" not in agent_result.user_response.lower()
+        assert "not been tested" not in agent_result.user_response.lower()
+        assert "tested end-to-end" not in agent_result.user_response.lower()
+        assert "created and tested" in agent_result.user_response.lower()
+        assert "demonstrated the requested outcome" in agent_result.user_response.lower()
+        assert "wr_secret" not in agent_result.user_response
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["verifiedSuccess"] is True
+
+    def test_demonstrated_recorded_outcome_overrides_misleading_free_text(self) -> None:
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        wf = SimpleNamespace(name="verified")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: verified",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(verdict="demonstrated"),
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+        result = _fake_run_result(
+            {
+                "type": "REPLY",
+                "user_response": "The test could not verify the requested result.",
+                "goal_reached": True,
+            }
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert "demonstrated the requested outcome" in agent_result.user_response.lower()
+        assert "could not verify" not in agent_result.user_response.lower()
+
+    def test_not_demonstrated_recorded_outcome_stays_conservative_and_sanitized(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(
+                verdict="not_demonstrated",
+                display_reason="Statement month was still April.",
+                workflow_run_id="wr_hidden",
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "review_untested"
+        assert "did not demonstrate the requested outcome" in agent_result.user_response.lower()
+        assert "statement month was still april" in agent_result.user_response.lower()
+        assert "all set" not in agent_result.user_response.lower()
+        assert "wr_hidden" not in agent_result.user_response
+
+    def test_not_evaluated_recorded_outcome_reports_run_unverified_not_untested(self) -> None:
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_run_outcome=RecordedRunOutcome(verdict="not_evaluated", display_reason="Output judge unavailable."),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "review_untested"
+        assert "could not verify the requested outcome" in agent_result.user_response.lower()
+        assert "did not demonstrate" not in agent_result.user_response.lower()
+        assert "output judge unavailable" in agent_result.user_response.lower()
+        assert "untested" not in agent_result.user_response.lower()
+
+    @pytest.mark.parametrize(
+        "payload_extras",
+        [
+            # Backwards-compat: stale prompts that omit goal_reached must continue
+            # to surface a tested workflow as validated.
+            pytest.param({}, id="default_absent"),
+            pytest.param({"goal_reached": True}, id="explicit_true"),
+        ],
+    )
+    def test_goal_reached_true_keeps_verified_path(self, payload_extras: dict) -> None:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
             last_workflow=wf,
@@ -1565,6 +3254,36 @@ workflow_definition:
             last_test_ok=True,
             last_full_workflow_test_ok=True,
             last_update_block_count=3,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", **payload_extras})
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is wf
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.apply_without_review is False
+
+    def test_code_only_verified_build_applies_without_review(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+
+        wf = SimpleNamespace(name="drafted")
+        ctx = _ctx(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_update_block_count=3,
+            has_staged_proposal=True,
+            staged_workflow=wf,
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
         agent_result = asyncio.run(
@@ -1575,25 +3294,7 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.proposal_disposition == "auto_applicable"
-
-    def test_goal_reached_true_explicit_keeps_verified_path(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_update_block_count=3,
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.apply_without_review is True
 
     def test_goal_reached_string_false_is_coerced(self) -> None:
         # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
@@ -1749,7 +3450,7 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
-    def test_unbacked_workflow_claim_not_rewritten_when_proposal_exists(self) -> None:
+    def test_clean_unverified_run_uses_deterministic_terminal_copy_when_proposal_exists(self) -> None:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
             last_workflow=wf,
@@ -1764,7 +3465,10 @@ workflow_definition:
             )
         )
 
-        assert agent_result.user_response == "Here's the workflow."
+        assert agent_result.user_response == (
+            "I built the workflow and the test run completed, but the goal outcome was not independently verified. "
+            "The workflow is available on the canvas for review."
+        )
         assert agent_result.updated_workflow is wf
 
     def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
@@ -1794,7 +3498,7 @@ workflow_definition:
     def test_inline_replace_workflow_persists_clean_agent_yaml(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
-        def fake_process(**kwargs):
+        async def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
@@ -1816,7 +3520,7 @@ workflow_definition:
     def test_inline_replace_workflow_does_not_denormalize_resolved_goal(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
-        def fake_process(**kwargs):
+        async def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
@@ -1897,6 +3601,28 @@ workflow_definition:
         assert agent_result.response_type == "REPLY"
         assert agent_result.clear_proposed_workflow is False
 
+    def test_reply_with_unverified_clean_run_uses_deterministic_terminal_copy(self) -> None:
+        workflow = SimpleNamespace(name="final")
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="final: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "The workflow is ready."})
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is workflow
+        assert "the workflow is ready" not in agent_result.user_response.lower()
+        assert "not independently verified" in agent_result.user_response.lower()
+        assert agent_result.proposal_disposition == "auto_applicable"
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["verifiedSuccess"] is False
+
 
 class TestCredentialRefusalReachesAgent:
     """Prove the SKY-9189 refusal rule is actually delivered to the agent.
@@ -1930,6 +3656,73 @@ class TestCredentialRefusalReachesAgent:
         assert "Use validate_block only for allowed non-browser helper blocks" in prompt
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeMCPServerManager:
+            def __init__(self, servers):
+                self.active_servers = servers
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        def fake_resolve_model_config(_handler, *, copilot_config=None, llm_key_override=None):
+            del copilot_config, llm_key_override
+            return "model-primary", object(), "PRIMARY", True
+
+        run_with_enforcement = AsyncMock(
+            return_value=_fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True})
+        )
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            fake_resolve_model_config,
+        )
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.enforcement.run_with_enforcement",
+            run_with_enforcement,
+        )
+
+        with capture_logs() as logs:
+            result = await agent_module.run_copilot_agent(
+                stream=MagicMock(),
+                organization_id="org-1",
+                chat_request=SimpleNamespace(
+                    message="build it",
+                    workflow_id="wf-1",
+                    workflow_permanent_id="wfp-1",
+                    workflow_copilot_chat_id="chat-1",
+                    workflow_yaml="",
+                    browser_session_id=None,
+                ),
+                chat_history=[],
+                global_llm_context=None,
+                debug_run_info_text="",
+                llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+                api_key="sk-test",
+                config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
+                turn_id="turn-1",
+            )
+
+        policy_event = next(log for log in logs if log["event"] == "copilot_block_authoring_policy_resolved")
+
+        assert result.user_response == "ok"
+        assert policy_event["block_authoring_policy"] == "CODE_ONLY_BROWSER"
+        assert policy_event["block_authoring_policy_value"] == BlockAuthoringPolicy.CODE_ONLY_BROWSER.value
+        assert policy_event["workflow_permanent_id"] == "wfp-1"
+        assert policy_event["workflow_id"] == "wf-1"
+        assert policy_event["workflow_copilot_chat_id"] == "chat-1"
+        assert policy_event["turn_id"] == "turn-1"
 
     def test_native_tools_carry_refusal_reference(self) -> None:
         import re
@@ -1997,6 +3790,241 @@ class TestNativeToolSurface:
 
 
 class TestRequestPolicyCredentialResolution:
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_uses_configured_default_timeout_budget(self, monkeypatch) -> None:
+        from skyvern.config import Settings, settings
+        from skyvern.forge.sdk.copilot import request_policy as rp
+
+        default_timeout = Settings.model_fields["COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS"].default
+        assert default_timeout == 12.0
+
+        observed_timeouts: list[float | None] = []
+        real_wait_for = rp.asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout=None):
+            observed_timeouts.append(timeout)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", default_timeout)
+        monkeypatch.setattr(rp.time, "monotonic", lambda: 1000.0)
+        monkeypatch.setattr(rp.asyncio, "wait_for", recording_wait_for)
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "success"
+        assert observed_timeouts == [default_timeout]
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_timeout_does_not_retry(self, monkeypatch) -> None:
+        from skyvern.config import settings
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.5)
+            return {"credential_input_kind": "none", "completion_contract": None}
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "timeout"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_slow_but_within_budget_returns_real_policy(self, monkeypatch) -> None:
+        from skyvern.config import settings
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.5)
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.05)
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "success"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "present"
+        assert policy.completion_contract
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_malformed_payload_falls_back_without_retry(self) -> None:
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "I can build that workflow."
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_retries_transient_error_then_succeeds(self) -> None:
+        class RateLimitError(Exception):
+            __module__ = "openai"
+
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RateLimitError("rate limit")
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 2
+        assert policy.classifier_status == "success"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_retries_transient_error_then_falls_back(self) -> None:
+        class RateLimitError(Exception):
+            __module__ = "openai"
+
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            raise RateLimitError("rate limit")
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com/account.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 2
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_non_retriable_error_does_not_retry(self) -> None:
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            raise ValueError("bad request")
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com/account.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_transient_error_exhausting_budget_labels_transient(
+        self, monkeypatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as rp
+
+        class RateLimitError(Exception):
+            __module__ = "openai"
+
+        # deadline calc, then iteration-1 remaining; every later call reads past the deadline so the
+        # retry never starts and the budget-exhaustion path labels the prior retriable error.
+        clock = iter([1000.0, 1000.0])
+        monkeypatch.setattr(rp.time, "monotonic", lambda: next(clock, 1_000_000.0))
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            raise RateLimitError("rate limit")
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com/account.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "transient_error"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "present"
+
     @pytest.mark.asyncio
     async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
@@ -2455,6 +4483,65 @@ workflow_definition:
         assert policy.allow_run_blocks is False
         assert policy.allow_missing_credentials_in_draft is True
         assert policy.requires_user_clarification is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_policy_resolves_explicit_saved_credential_name(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(
+            credential_id="cred_portal",
+            name="mock-portal-login",
+            tested_url="https://portal.example/login",
+        )
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            raise ValueError("classifier unavailable")
+
+        policy = await build_request_policy(
+            user_message='Log into the portal with saved credential named "mock-portal-login".',
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.completion_contract_status == "present"
+        assert policy.credential_input_kind == "credential_name"
+        assert policy.credential_refs == ["mock-portal-login"]
+        assert policy.resolved_credentials == [credential]
+
+    @pytest.mark.asyncio
+    async def test_fallback_policy_does_not_substring_match_saved_credential_name(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_login", name="login", tested_url=None)
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            raise ValueError("classifier unavailable")
+
+        policy = await build_request_policy(
+            user_message="Log in to the portal using my saved credential.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.completion_contract_status == "present"
+        assert policy.credential_input_kind == "none"
+        assert policy.credential_refs == []
+        credentials.get_credentials.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
@@ -3262,7 +5349,7 @@ workflow_definition:
 
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
-            lambda **kwargs: workflow,
+            AsyncMock(return_value=workflow),
         )
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
@@ -3541,7 +5628,6 @@ class TestRunBlocksCredentialApproval:
 
     @pytest.mark.asyncio
     async def test_update_and_run_blocks_rejects_unapproved_credential_at_shared_run_seam(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot import tools as tools_module
         from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 
         workflow = self._workflow("cred_unapproved")
@@ -3562,7 +5648,6 @@ class TestRunBlocksCredentialApproval:
         monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
         monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["login"], {}, "login"))
         monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
         monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
@@ -3659,6 +5744,24 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert prompt.index("RESPONSE-TYPE CLASSIFICATION") < prompt.index("**Option 1: Reply to the user**")
 
 
+class TestValidationClassificationOutputContractRule:
+    def test_build_system_prompt_requires_exact_top_level_classification_contract_keys(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        prompt = _build_system_prompt(tool_usage_guide="", security_rules="")
+
+        assert "validation_classification_output_contracts" in prompt
+        assert "explicitly `return` a dict" in prompt
+        assert "Do not rely on schema defaults or exposed top-level locals" in prompt
+        assert "exact `return_key` as a top-level key" in prompt
+        assert "goal_value_paths" in prompt
+        assert "extraction_schema" in prompt
+        assert "reject code-only output blocks without that metadata" in prompt
+        assert "observed_gate_phrase" in prompt
+        assert "Synonyms such as `path_login_only`, `classification`, or prose in `evidence_text`" in prompt
+        assert "do not replace the required key" in prompt
+
+
 class TestCopilotConfig:
     def test_system_prompt_uses_custom_security_rules(self) -> None:
         prompt = agent_module._build_system_prompt(
@@ -3690,9 +5793,6 @@ class TestCopilotConfig:
 
         FakeRateLimitError.__module__ = "openai"
 
-        async def fake_feasibility_gate(**_kwargs):
-            return SimpleNamespace(verdict="proceed", question=None, rationale=None)
-
         class FakeMCPServerManager:
             def __init__(self, servers):
                 self.active_servers = servers
@@ -3718,10 +5818,6 @@ class TestCopilotConfig:
             ]
         )
 
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.feasibility_gate.run_feasibility_gate",
-            fake_feasibility_gate,
-        )
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
             AsyncMock(return_value=None),
@@ -4317,3 +6413,537 @@ class TestCredentialClarificationIncludesUiDirections:
         assert (
             policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
         )
+
+
+class TestStructuralInfeasibilityQuestion:
+    def _intent(
+        self,
+        *,
+        mode: TurnIntentMode,
+        reason_codes: list[TurnIntentReasonCode],
+        question: str | None,
+    ) -> TurnIntent:
+        return TurnIntent(
+            mode=mode,
+            reason_codes=reason_codes,
+            missing_context_question=question,
+        )
+
+    def test_returns_question_for_clarify_infeasible_with_question(self) -> None:
+        intent = self._intent(
+            mode=TurnIntentMode.CLARIFY,
+            reason_codes=[TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+            question="Which source has the filings?",
+        )
+        assert agent_module._structural_infeasibility_question(intent) == "Which source has the filings?"
+
+    @pytest.mark.parametrize(
+        "mode, reason_codes, question",
+        [
+            pytest.param(
+                TurnIntentMode.CLARIFY,
+                [TurnIntentReasonCode.LOW_CONFIDENCE_CLARIFICATION],
+                "What workflow should I build or change?",
+                id="reason_code_absent",
+            ),
+            pytest.param(
+                TurnIntentMode.BUILD,
+                [TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+                "Which source has the filings?",
+                id="mode_not_clarify",
+            ),
+            pytest.param(
+                TurnIntentMode.CLARIFY,
+                [TurnIntentReasonCode.STRUCTURALLY_INFEASIBLE],
+                "   ",
+                id="blank_question",
+            ),
+        ],
+    )
+    def test_returns_none_for_non_infeasible_intent(
+        self,
+        mode: TurnIntentMode,
+        reason_codes: list[TurnIntentReasonCode],
+        question: str | None,
+    ) -> None:
+        intent = self._intent(mode=mode, reason_codes=reason_codes, question=question)
+        assert agent_module._structural_infeasibility_question(intent) is None
+
+    def test_returns_none_for_non_turn_intent(self) -> None:
+        assert agent_module._structural_infeasibility_question(None) is None
+
+
+class TestClassifierFallbackCompletionFloor:
+    @pytest.mark.asyncio
+    async def test_timeout_fallback_emits_gradeable_run_floor(self, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.05)
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            await asyncio.sleep(0.5)
+            return {"credential_input_kind": "none", "completion_contract": None}
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "timeout"
+        assert policy.completion_criteria
+        assert all(c.level == "run" for c in policy.completion_criteria)
+        assert all(c.implicit for c in policy.completion_criteria)
+        assert policy.completion_criteria[0].method_mandated is False
+        assert all(is_fallback_floor_criterion(c) for c in policy.completion_criteria)
+        assert policy.completion_contract is None
+        assert policy.completion_contract_status == "present"
+
+        trace = policy.to_trace_data()
+        assert trace["completion_criteria_count"] == 1
+        assert trace["completion_criteria_method_mandated_count"] == len(policy.completion_criteria) - 1
+        assert trace["has_completion_contract"] is False
+
+    def test_floor_base_reaches_judge_satisfaction_set(self) -> None:
+        policy = _classifier_fallback_policy([], raw_secret_present=False, failure_kind="timeout")
+        ctx = SimpleNamespace(request_policy=policy)
+
+        assert policy.completion_criteria
+        assert _completion_verification_criteria(ctx) == [policy.completion_criteria[0]]
+
+    def test_credential_aware_floor_adds_one_run_plane_criterion(self) -> None:
+        base = build_classifier_fallback_floor([])
+        credentialed = build_classifier_fallback_floor(["cred_1"])
+
+        assert len(credentialed) == len(base) + 1
+        assert all(c.level == "run" for c in credentialed)
+        assert all(c.implicit for c in credentialed)
+        assert credentialed[0].method_mandated is False
+        assert credentialed[1].method_mandated is True
+        assert len({c.id for c in credentialed}) == len(credentialed)
+
+    def test_floor_respects_max_criteria_cap(self) -> None:
+        floor = build_classifier_fallback_floor([f"cred_{i}" for i in range(50)])
+
+        assert len(floor) <= _MAX_COMPLETION_CRITERIA
+
+    def test_raw_secret_fallback_still_blocks_with_empty_criteria(self) -> None:
+        policy = _classifier_fallback_policy(["cred_1"], raw_secret_present=True, failure_kind="timeout")
+
+        assert policy.raw_secret_handling == "block"
+        assert policy.completion_criteria == []
+        assert policy.completion_contract_status == "unknown"
+
+    def test_reconcile_all_floor_fresh_with_no_stored_set_does_not_create(self) -> None:
+        snapshot = StoredCriteriaSnapshot(active=None, next_epoch=1)
+        floor = build_classifier_fallback_floor(["cred_1"])
+
+        decision = reconcile_completion_criteria(snapshot, list(floor), actionable=True)
+
+        assert decision.action == "none"
+        assert decision.reason == "no_criteria"
+        assert decision.criteria == ()
+
+        turn_state = build_turn_state(snapshot, decision)
+        plan = plan_persistence(turn_state)
+
+        assert plan is None or plan.create_epoch is None
+
+    def test_reconcile_all_floor_fresh_keeps_stored_real_epoch(self) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_real",
+            goal_epoch=3,
+            criteria=(CompletionCriterion(id="c0", outcome="The confirmation number is captured"),),
+        )
+        snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=4)
+        floor = build_classifier_fallback_floor(["cred_1"])
+
+        decision = reconcile_completion_criteria(snapshot, list(floor), actionable=True)
+
+        assert decision.action == "adopt_stored"
+        assert decision.reason == "empty_fresh"
+        assert decision.superseded_set_id is None
+        assert decision.criteria == stored.criteria
+
+    def test_reconcile_real_all_implicit_set_still_supersedes(self) -> None:
+        stored = StoredCriteriaSet(
+            set_id="wccs_old",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="The old goal is reached", implicit=True),),
+        )
+        snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
+        real_fresh = [CompletionCriterion(id="c0", outcome="A different goal is reached", implicit=True)]
+
+        decision = reconcile_completion_criteria(snapshot, real_fresh, actionable=True)
+
+        assert decision.action == "create"
+        assert decision.reason == "not_subset"
+        assert decision.superseded_set_id == "wccs_old"
+
+    def test_successful_classifier_turn_keeps_full_criteria_without_sentinel(self) -> None:
+        criteria = [
+            CompletionCriterion(id="c0", outcome="The account page is visible"),
+            CompletionCriterion(id="c1", outcome="The confirmation number is captured"),
+        ]
+
+        assert not any(is_fallback_floor_criterion(c) for c in criteria)
+
+
+class TestDeclaredEqualsGradedCompletionCriteria:
+    @staticmethod
+    def _policy(total: int, method_mandated: int) -> RequestPolicy:
+        criteria = [
+            CompletionCriterion(id=f"c{i}", outcome=f"outcome {i}", method_mandated=i < method_mandated)
+            for i in range(total)
+        ]
+        return RequestPolicy(completion_criteria=criteria)
+
+    @pytest.mark.parametrize("total, method_mandated", [(6, 2), (8, 1), (5, 0)])
+    def test_declared_count_equals_graded_set_across_shapes(self, total: int, method_mandated: int) -> None:
+        policy = self._policy(total, method_mandated)
+        ctx = SimpleNamespace(request_policy=policy)
+        graded = total - method_mandated
+
+        declared = policy.to_trace_data()["completion_criteria_count"]
+        assert declared == len(policy.graded_completion_criteria())
+        assert declared == len(_completion_verification_criteria(ctx))
+        assert declared == graded
+        assert policy.to_trace_data()["completion_criteria_method_mandated_count"] == method_mandated
+
+    def test_graded_set_excludes_only_method_mandated_criteria(self) -> None:
+        policy = self._policy(6, 2)
+
+        graded = policy.graded_completion_criteria()
+        assert all(not criterion.method_mandated for criterion in graded)
+        assert {criterion.id for criterion in graded} == {"c2", "c3", "c4", "c5"}
+
+    @pytest.mark.asyncio
+    async def test_fallback_floor_uses_authored_output_contract_paths_for_completion(self) -> None:
+        label = "validate_public_path"
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            code_artifact_metadata={
+                label: {
+                    "claimed_outcomes": [
+                        {
+                            "goal_value_paths": [
+                                "output.public_form_exists",
+                                "output.visible_page_path_label",
+                                "output.recommended_next_action",
+                            ]
+                        }
+                    ],
+                    "terminal_verifier_expectations": [
+                        {
+                            "goal_value_paths": [
+                                "output.public_form_exists",
+                                "output.visible_page_path_label",
+                                "output.recommended_next_action",
+                            ]
+                        }
+                    ],
+                }
+            },
+            workflow_yaml=(
+                "title: Utility path\n"
+                "workflow_definition:\n"
+                "  blocks:\n"
+                "    - block_type: code\n"
+                f"      label: {label}\n"
+                "      code: |\n"
+                "        return {}\n"
+            ),
+            last_workflow_yaml=None,
+            completion_verification_result=None,
+            copilot_total_timeout_exceeded=False,
+            reached_download_target=None,
+            workflow_verification_evidence=SimpleNamespace(block_verified=[]),
+            verified_prefix_labels=[],
+            verified_block_outputs={},
+            post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
+            completion_criteria_turn_state=None,
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_public_path",
+                    "overall_status": "completed",
+                    "blocks": [
+                        {
+                            "label": label,
+                            "status": "completed",
+                            "extracted_data": {
+                                "public_form_exists": True,
+                                "visible_page_path_label": "sign in",
+                                "recommended_next_action": "authenticate",
+                                "evidence_text": "diagnostic only",
+                            },
+                        }
+                    ],
+                    "executed_block_labels": [label],
+                },
+            },
+            0,
+        )
+
+        assert verification is not None
+        assert "__copilot_fallback_floor__run" not in verification.criterion_ids
+        assert {verdict.output_path for verdict in verification.verdicts} == {
+            "output.public_form_exists",
+            "output.visible_page_path_label",
+            "output.recommended_next_action",
+        }
+        assert not any(verdict.satisfied for verdict in verification.verdicts)
+        assert all(verdict.reason_code != "evidence_confirms" for verdict in verification.verdicts)
+
+    def test_fallback_floor_uses_repair_context_output_contract_paths_when_metadata_missing(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            code_artifact_metadata={},
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=[
+                    "output.public_form_exists",
+                    "output.visible_page_path_label",
+                    "output.recommended_next_action",
+                ],
+            ),
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_fallback_floor_prefers_repair_context_paths_over_stale_metadata(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            code_artifact_metadata={
+                "stale_output": {
+                    "claimed_outcomes": [{"goal_value_paths": ["output.old_path"]}],
+                }
+            },
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=[
+                    "output.public_form_exists",
+                    "output.visible_page_path_label",
+                    "output.recommended_next_action",
+                ],
+            ),
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert "output.old_path" not in {criterion.output_path for criterion in criteria}
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_staged_contract_uses_durable_metadata_before_repair_context(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            code_artifact_metadata={
+                "stale_output": {
+                    "claimed_outcomes": [{"goal_value_paths": ["output.old_path"]}],
+                }
+            },
+            workflow_verification_evidence=SimpleNamespace(
+                code_artifact_metadata={
+                    "validate_public_path": {
+                        "claimed_outcomes": [
+                            {
+                                "goal_value_paths": [
+                                    "output.public_form_exists",
+                                    "output.visible_page_path_label",
+                                    "output.recommended_next_action",
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=["output.repair_context_only"],
+            ),
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+        assert "output.old_path" not in {criterion.output_path for criterion in criteria}
+        assert "output.repair_context_only" not in {criterion.output_path for criterion in criteria}
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_staged_contract_uses_ctx_metadata_when_evidence_metadata_empty(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            code_artifact_metadata={
+                "validate_public_path": {
+                    "claimed_outcomes": [{"goal_value_paths": ["output.public_form_exists"]}],
+                }
+            },
+            last_code_authoring_repair_context=None,
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [(criterion.id, criterion.output_path) for criterion in criteria] == [
+            ("__copilot_authored_output__output_public_form_exists", "output.public_form_exists")
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+    def test_staged_contract_canonicalizes_block_local_metadata_paths(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            workflow_verification_evidence=SimpleNamespace(
+                code_artifact_metadata={
+                    "validate_public_path": {
+                        "claimed_outcomes": [
+                            {
+                                "goal_value_paths": [
+                                    "public_form_exists",
+                                    "visible_page_path_label",
+                                    "recommended_next_action",
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            code_artifact_metadata={},
+            last_code_authoring_repair_context=None,
+        )
+
+        criteria = _authored_output_contract_criteria(ctx)
+
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.public_form_exists",
+            "output.recommended_next_action",
+            "output.visible_page_path_label",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_staged_contract_missing_durable_metadata_fails_closed_without_fallback_floor(self) -> None:
+        ctx = SimpleNamespace(
+            request_policy=RequestPolicy(
+                completion_criteria=build_classifier_fallback_floor([]),
+                classifier_status="fallback",
+            ),
+            has_staged_proposal=True,
+            staged_workflow=object(),
+            code_artifact_metadata={},
+            workflow_verification_evidence=SimpleNamespace(code_artifact_metadata={}),
+            last_code_authoring_repair_context=CodeAuthoringRepairContext(
+                block_label="validate_public_path",
+                reason_code="metadata_reject",
+                required_goal_value_paths=[
+                    "output.public_form_exists",
+                    "output.visible_page_path_label",
+                    "output.recommended_next_action",
+                ],
+            ),
+            workflow_yaml="title: Utility path\nworkflow_definition:\n  blocks: []\n",
+            last_workflow_yaml=None,
+            completion_verification_result=None,
+            copilot_total_timeout_exceeded=False,
+            reached_download_target=None,
+            verified_prefix_labels=[],
+            verified_block_outputs={},
+            post_run_page_observation_after_failed_test=False,
+            composition_page_evidence=None,
+            completion_criteria_turn_state=None,
+        )
+
+        criteria = _completion_verification_criteria(ctx)
+
+        assert [criterion.id for criterion in criteria] == ["__copilot_authored_output_contract_missing"]
+        assert [criterion.output_path for criterion in criteria] == [
+            "output.__copilot_missing_authored_output_contract__"
+        ]
+        assert not any(is_fallback_floor_criterion(criterion) for criterion in criteria)
+
+        verification = await _maybe_run_completion_verification(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_missing_contract",
+                    "overall_status": "completed",
+                    "blocks": [
+                        {
+                            "label": "validate_public_path",
+                            "status": "completed",
+                            "extracted_data": {
+                                "public_form_exists": True,
+                                "visible_page_path_label": "sign in",
+                                "recommended_next_action": "authenticate",
+                                "evidence_text": "diagnostic only",
+                            },
+                        }
+                    ],
+                    "executed_block_labels": ["validate_public_path"],
+                },
+            },
+            0,
+        )
+
+        assert verification is not None
+        assert "__copilot_fallback_floor__run" not in verification.criterion_ids
+        assert verification.criterion_ids == ["__copilot_authored_output_contract_missing"]
+        assert not verification.is_fully_satisfied()

@@ -1,5 +1,11 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
-import { DebugToBuildRedirect } from "@/routes/workflows/DebugToBuildRedirect";
+import {
+  BuildRoute,
+  DebugRoute,
+  EditRoute,
+  StudioRoute,
+} from "@/routes/workflows/StudioRouteGates";
+import { LegacyWorkflowsRedirect } from "@/routes/workflows/LegacyWorkflowsRedirect";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { BrowserSessions } from "@/routes/browserSessions/BrowserSessions";
 import { PageLayout } from "./components/PageLayout";
@@ -7,6 +13,7 @@ import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";
 import { RootLayout } from "./routes/root/RootLayout";
 import { Settings } from "./routes/settings/Settings";
+import { LabelManagement } from "./routes/settings/LabelManagement";
 import { CreateNewTaskFormPage } from "./routes/tasks/create/CreateNewTaskFormPage";
 import { RetryTask } from "./routes/tasks/create/retry/RetryTask";
 import { StepArtifactsLayout } from "./routes/tasks/detail/StepArtifactsLayout";
@@ -15,7 +22,6 @@ import { TaskDetails } from "./routes/tasks/detail/TaskDetails";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
-import { Debugger } from "@/routes/workflows/debugger/Debugger";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowScriptDetailPage } from "./routes/workflows/WorkflowScriptDetailPage";
 import { WorkflowScriptsPage } from "./routes/workflows/WorkflowScriptsPage";
@@ -23,7 +29,6 @@ import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
-import { WorkflowEditor } from "./routes/workflows/editor/WorkflowEditor";
 import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
@@ -33,7 +38,8 @@ import { DebugStoreProvider } from "@/store/DebugStoreContext";
 import { BrowserProfileDetailPage } from "@/routes/browserProfiles/BrowserProfileDetailPage.tsx";
 import { BrowserProfilesPage } from "@/routes/browserProfiles/BrowserProfilesPage.tsx";
 import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
-import { IntegrationsUnavailable } from "@/routes/integrations/IntegrationsUnavailable";
+import { GoogleOAuthCallback } from "@/routes/integrations/GoogleOAuthCallback";
+import { Integrations } from "@/routes/integrations/Integrations";
 import { RecipeComingSoonPage } from "@/routes/recipes/RecipeComingSoonPage";
 import { RecipesPage } from "@/routes/recipes/RecipesPage";
 import { RunRouter } from "@/routes/runs/RunRouter";
@@ -212,7 +218,11 @@ const router = createBrowserRouter([
         ],
       },
       {
-        path: "workflows",
+        path: "workflows/*",
+        element: <LegacyWorkflowsRedirect />,
+      },
+      {
+        path: "agents",
         element: <WorkflowsPageLayout />,
         children: [
           {
@@ -229,23 +239,27 @@ const router = createBrowserRouter([
               },
               {
                 path: "build",
-                element: <Debugger />,
+                element: <BuildRoute />,
               },
               {
                 path: ":workflowRunId/:blockLabel/build",
-                element: <Debugger />,
+                element: <BuildRoute />,
               },
               {
                 path: "debug",
-                element: <DebugToBuildRedirect />,
+                element: <DebugRoute />,
               },
               {
                 path: ":workflowRunId/:blockLabel/debug",
-                element: <DebugToBuildRedirect />,
+                element: <DebugRoute />,
               },
               {
                 path: "edit",
-                element: <WorkflowEditor />,
+                element: <EditRoute />,
+              },
+              {
+                path: "studio",
+                element: <StudioRoute />,
               },
               {
                 path: "run",
@@ -349,6 +363,10 @@ const router = createBrowserRouter([
             index: true,
             element: <Settings />,
           },
+          {
+            path: "labels",
+            element: <LabelManagement />,
+          },
         ],
       },
       {
@@ -381,7 +399,15 @@ const router = createBrowserRouter([
         children: [
           {
             index: true,
-            element: <IntegrationsUnavailable />,
+            element: <Integrations />,
+          },
+          {
+            path: "google/callback",
+            element: <GoogleOAuthCallback />,
+          },
+          {
+            path: "microsoft/callback",
+            element: <Navigate to="/integrations" replace />,
           },
         ],
       },

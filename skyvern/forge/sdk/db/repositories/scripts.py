@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -41,6 +42,20 @@ from skyvern.schemas.scripts import (
 )
 
 LOG = structlog.get_logger()
+
+# Cap the size of any single ``IN (...)`` clause so batched lookups stay index-friendly
+# and well under the driver's bind-parameter ceiling even for wpids with many cached scripts.
+_SCRIPT_IN_CLAUSE_CHUNK_SIZE = 500
+
+
+def _dedup_into_chunks(ids: list[str], chunk_size: int = _SCRIPT_IN_CLAUSE_CHUNK_SIZE) -> list[list[str]]:
+    """Order-preserving dedup, split so no single ``IN (...)`` clause exceeds the bind-param ceiling.
+
+    ``dict.fromkeys`` (not ``set()``) is used so the input order is preserved, which keeps query
+    plans and logs stable. Empty input yields ``[]``.
+    """
+    unique_ids = list(dict.fromkeys(ids))
+    return [unique_ids[start : start + chunk_size] for start in range(0, len(unique_ids), chunk_size)]
 
 
 def _script_status_value(status: ScriptStatus | str) -> str:
@@ -173,6 +188,49 @@ class ScriptsRepository(BaseRepository):
             if script := (await session.scalars(get_script_query)).first():
                 return convert_to_script(script)
             return None
+
+    @db_operation("get_latest_scripts_by_ids")
+    async def get_latest_scripts_by_ids(
+        self,
+        organization_id: str,
+        script_ids: list[str],
+    ) -> dict[str, Script]:
+        """Batch variant of ``get_script``: latest non-deleted version per script_id, keyed by script_id.
+
+        Served by the ``uc_org_script_version`` index on (organization_id, script_id, version).
+        """
+        result: dict[str, Script] = {}
+        chunks = _dedup_into_chunks(script_ids)
+        if not chunks:
+            return result
+
+        # One session spans all chunks: each chunk query reuses a single pooled connection
+        # rather than checking one out per chunk.
+        async with self.Session() as session:
+            for chunk in chunks:
+                latest_versions_subquery = (
+                    select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
+                    .filter(ScriptModel.organization_id == organization_id)
+                    .filter(ScriptModel.script_id.in_(chunk))
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .group_by(ScriptModel.script_id)
+                    .subquery()
+                )
+                query = (
+                    select(ScriptModel)
+                    .join(
+                        latest_versions_subquery,
+                        and_(
+                            ScriptModel.script_id == latest_versions_subquery.c.script_id,
+                            ScriptModel.version == latest_versions_subquery.c.latest_version,
+                        ),
+                    )
+                    .filter(ScriptModel.organization_id == organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                )
+                for record in (await session.scalars(query)).all():
+                    result[record.script_id] = convert_to_script(record)
+        return result
 
     @db_operation("get_script_revision")
     async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
@@ -498,6 +556,34 @@ class ScriptsRepository(BaseRepository):
             else:
                 raise NotFoundError("Script block not found")
 
+    @db_operation("clear_script_block_run_signatures")
+    async def clear_script_block_run_signatures(
+        self,
+        *,
+        organization_id: str,
+        script_block_ids: Sequence[str],
+    ) -> int:
+        chunks = _dedup_into_chunks(list(script_block_ids))
+        if not chunks:
+            return 0
+
+        total_updated = 0
+        async with self.Session() as session:
+            for chunk in chunks:
+                stmt = (
+                    update(ScriptBlockModel)
+                    .where(ScriptBlockModel.organization_id == organization_id)
+                    .where(ScriptBlockModel.script_block_id.in_(chunk))
+                    .where(ScriptBlockModel.run_signature.isnot(None))
+                    .values(run_signature=None, modified_at=naive_utc_now())
+                )
+                result = await session.execute(stmt)
+                total_updated += result.rowcount or 0
+
+            await session.commit()
+
+        return total_updated
+
     @db_operation("get_script_files")
     async def get_script_files(self, script_revision_id: str, organization_id: str) -> list[ScriptFile]:
         async with self.Session() as session:
@@ -643,6 +729,38 @@ class ScriptsRepository(BaseRepository):
                 )
             ).all()
             return [convert_to_script_block(record) for record in records]
+
+    @db_operation("get_script_blocks_by_script_revision_ids")
+    async def get_script_blocks_by_script_revision_ids(
+        self,
+        organization_id: str,
+        script_revision_ids: list[str],
+    ) -> dict[str, list[ScriptBlock]]:
+        """Batch variant: script blocks for each script_revision_id, keyed by revision id.
+
+        Served by the btree index on ``script_blocks.script_revision_id``. Revision ids with no
+        blocks are simply absent from the result; callers use ``.get(revision_id, [])``.
+        """
+        result: dict[str, list[ScriptBlock]] = {}
+        chunks = _dedup_into_chunks(script_revision_ids)
+        if not chunks:
+            return result
+
+        # One session spans all chunks: each chunk query reuses a single pooled connection
+        # rather than checking one out per chunk.
+        async with self.Session() as session:
+            for chunk in chunks:
+                records = (
+                    await session.scalars(
+                        select(ScriptBlockModel)
+                        .filter(ScriptBlockModel.script_revision_id.in_(chunk))
+                        .filter(ScriptBlockModel.organization_id == organization_id)
+                        .order_by(ScriptBlockModel.created_at.asc())
+                    )
+                ).all()
+                for record in records:
+                    result.setdefault(record.script_revision_id, []).append(convert_to_script_block(record))
+        return result
 
     @db_operation("create_workflow_script")
     async def create_workflow_script(

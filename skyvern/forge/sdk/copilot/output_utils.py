@@ -425,6 +425,28 @@ def _structured_failure_summary_for_user(
     return None
 
 
+# Blocker kinds where the tool was redirected before it ran (a precondition/authority
+# gate), not a real failure. `tool_error` and `loop_detected` keep failure affect —
+# something actually broke or the agent is stuck.
+_NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"phase_gated", "missing_required_context", "authority_denied"})
+
+
+def user_facing_success(
+    result: dict[str, Any],
+    *,
+    blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None = None,
+) -> bool:
+    """Whether a tool result should render without failure affect in the user-facing
+    activity stream. A raw ``ok=False`` still counts as success here when it's explained
+    by a precondition/authority blocker signal — the agent was redirected, not broken."""
+    if result.get("ok", True):
+        return True
+    return any(
+        signal.blocker_kind in _NEUTRAL_REDIRECT_BLOCKER_KINDS and _blocker_signal_matches_result(signal, result)
+        for signal in _iter_blocker_signals(blocker_signal)
+    )
+
+
 _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 
@@ -512,7 +534,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
             return "Evaluated JavaScript"
         return f"Evaluated JavaScript — returned {_describe_value_shape(result_val)}"
     if tool_name == "click":
-        return f"Clicked '{data.get('selector', '?')}'"
+        target = data.get("effective_target") or data.get("selector") or data.get("resolved_selector") or "?"
+        return f"Clicked '{target}'"
     if tool_name == "type_text":
         length = data.get("typed_length") or data.get("text_length", "?")
         return f"Typed {length} chars into '{data.get('selector', '?')}'"
@@ -542,14 +565,26 @@ def summarize_tool_result_detail(
     *,
     tool_name: str | None = None,
     blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None = None,
+    success: bool | None = None,
 ) -> str | None:
-    """Tooltip-grade failure detail (longer cap than ``summarize_tool_result``); None on success."""
-    if result.get("ok", False):
+    """Tooltip-grade failure detail (longer cap than ``summarize_tool_result``); None on success.
+
+    ``success`` lets a caller pass the already-reclassified value (e.g. a phase/authority
+    redirect that ``user_facing_success`` upgraded from raw ``ok: false``) so this field
+    doesn't contradict the row's own success flag — same override shape as
+    ``narration.extract_tool_details``.
+    """
+    if result.get("ok", False) if success is None else success:
         return None
     structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
     if structured is not None:
         return structured
-    return _sanitize_failure_text(_extract_failure_message(result), max_chars=max_chars)
+    failure_message = _extract_failure_message(result)
+    # Same internal-validator convention _translate_failure_for_user maps to the generic
+    # summary — the tooltip-grade detail must not leak the raw text either.
+    if any(marker in failure_message.lower() for marker in _INTERNAL_VALIDATION_MARKERS):
+        return _USER_FACING_GENERIC_FAILURE
+    return _sanitize_failure_text(failure_message, max_chars=max_chars)
 
 
 _JINJA_ERROR_MARKERS: tuple[str, ...] = ("Failed to format jinja", "Jinja style parameter")
@@ -564,6 +599,13 @@ _ENGINE_INSTRUCTION_MARKERS: tuple[str, ...] = (
     "waiting for locator",
 )
 _USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.IGNORECASE)
+# Shared prefix for internal workflow-authoring validator rejects (stale block metadata,
+# banned block types, missing observation evidence, raw YAML/pydantic errors). Validators
+# import this constant rather than hand-typing the prefix, so a future validator can't
+# silently bypass the leak-suppression below by phrasing its reject text differently.
+# The full text is written for the agent to self-correct, never for the user.
+INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
+_INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PREFIX.strip(": ").lower(),)
 
 _USER_FACING_LOOP_MESSAGE = "The agent got stuck retrying the same step — moving on."
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
@@ -578,6 +620,8 @@ def _translate_failure_for_user(error_text: str) -> str:
     if any(marker in error_text for marker in _JINJA_ERROR_MARKERS):
         return _USER_FACING_JINJA_MESSAGE
     lowered = error_text.lower()
+    if any(marker in lowered for marker in _INTERNAL_VALIDATION_MARKERS):
+        return _USER_FACING_GENERIC_FAILURE
     if any(marker in lowered for marker in _ENGINE_INSTRUCTION_MARKERS):
         return _USER_FACING_GENERIC_FAILURE
     if _USE_TOOL_NAME_RE.search(error_text):

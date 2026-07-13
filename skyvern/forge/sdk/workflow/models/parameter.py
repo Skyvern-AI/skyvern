@@ -125,6 +125,8 @@ class CredentialParameter(Parameter):
     workflow_id: str
 
     credential_id: str
+    credential_ids: list[str] | None = None
+    selection_strategy: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -232,6 +234,8 @@ class WorkflowParameterType(StrEnum):
                     raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
                 return lower_case in ["true", "1"]
             elif self == WorkflowParameterType.JSON:
+                if isinstance(value, (dict, list)):
+                    return value
                 return json.loads(value)
             elif self == WorkflowParameterType.FILE_URL:
                 return value

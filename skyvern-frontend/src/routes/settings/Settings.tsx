@@ -20,6 +20,8 @@ import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { BitwardenCredentialForm } from "@/components/BitwardenCredentialForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
+import { CustomLLMConfigForm } from "@/components/CustomLLMConfigForm";
+import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { useVersionQuery } from "@/hooks/useVersionQuery";
 import { formatVersion, getAppVersion } from "@/util/version";
 
@@ -123,6 +125,28 @@ function Settings() {
         </CardHeader>
         <CardContent className="p-8">
           <CustomCredentialServiceConfigForm />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Google OAuth</CardTitle>
+          <CardDescription>
+            Configure the OAuth client used by Google integrations.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-8">
+          <GoogleOAuthClientConfigForm />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Custom LLMs</CardTitle>
+          <CardDescription>
+            Add custom OpenAI-compatible, Ollama, or OpenRouter models.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-8">
+          <CustomLLMConfigForm />
         </CardContent>
       </Card>
       {(getAppVersion() !== "development" || versionData?.version) && (

@@ -1,15 +1,17 @@
-"""Tests for the additive helpers landed on workflow_copilot.py in PR 7.
+"""Tests for the small pure helpers on workflow_copilot.py.
 
-``_should_restore_persisted_workflow`` and ``_restore_workflow_definition`` are
-the rollback safety net for the ``ENABLE_WORKFLOW_COPILOT_V2`` path: without
-them a client disconnect or mid-stream agent failure would leave the workflow
-mutated on disk. These tests were deferred from PR 6's
-``test_copilot_sdk_contracts.py`` because the helpers only exist after PR 7's
-hand-edit lands.
+Covers the rollback/auto-accept safety net (``_should_restore_persisted_workflow``,
+``_effective_auto_accept``, ``_proposal_disposition``) for the
+``ENABLE_WORKFLOW_COPILOT_V2`` path, YAML normalization
+(``_normalize_copilot_yaml``), prior-YAML resolution
+(``_blockless_submission_fallback``, ``_prior_copilot_workflow_yaml``), and the
+SSE terminal-frame invariant (``_ensure_terminal_frame``, SKY-9232).
 """
 
 from __future__ import annotations
 
+import asyncio
+import textwrap
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -17,8 +19,11 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.routes.workflow_copilot import (
+    _blockless_submission_fallback,
     _effective_auto_accept,
+    _ensure_terminal_frame,
     _normalize_copilot_yaml,
+    _prior_copilot_workflow_yaml,
     _proposal_disposition,
     _should_restore_persisted_workflow,
 )
@@ -41,6 +46,7 @@ def _agent_result(
     r.proposal_disposition = proposal_disposition
     r.cancelled = cancelled
     r.updated_workflow = updated_workflow
+    r.apply_without_review = kwargs.pop("apply_without_review", False)
     # SKY-10318: explicitly set the new staging flag so MagicMock truthiness
     # doesn't accidentally trigger the degraded-path branch in
     # `_should_restore_persisted_workflow`.
@@ -65,55 +71,37 @@ class TestShouldRestorePersistedWorkflow:
         assert _should_restore_persisted_workflow(False, not_persisted) is False
         assert _should_restore_persisted_workflow(False, None) is False
 
-    def test_review_untested_timeout_wip_forces_rollback_under_auto_accept(self) -> None:
-        agent_result = _agent_result(
-            persisted=True, proposal_disposition="review_untested", updated_workflow=MagicMock()
-        )
-
-        assert _should_restore_persisted_workflow(True, agent_result) is True
-        assert _should_restore_persisted_workflow(False, agent_result) is True
-
-    def test_cancelled_wip_forces_rollback_under_auto_accept(self) -> None:
-        agent_result = _agent_result(persisted=True, cancelled=True, updated_workflow=MagicMock())
-
-        assert _should_restore_persisted_workflow(True, agent_result) is True
-        assert _should_restore_persisted_workflow(False, agent_result) is True
-
-    def test_review_tested_wip_forces_rollback_under_auto_accept(self) -> None:
-        agent_result = _agent_result(persisted=True, proposal_disposition="review_tested", updated_workflow=MagicMock())
+    @pytest.mark.parametrize(
+        "override_kwargs",
+        [
+            pytest.param({"proposal_disposition": "review_untested"}, id="review_untested"),
+            pytest.param({"cancelled": True}, id="cancelled"),
+            pytest.param({"proposal_disposition": "review_tested"}, id="review_tested"),
+        ],
+    )
+    def test_wip_forces_rollback_under_auto_accept(self, override_kwargs: dict[str, Any]) -> None:
+        agent_result = _agent_result(persisted=True, updated_workflow=MagicMock(), **override_kwargs)
 
         assert _should_restore_persisted_workflow(True, agent_result) is True
         assert _should_restore_persisted_workflow(False, agent_result) is True
 
 
 class TestEffectiveAutoAccept:
-    def test_review_untested_overrides_auto_accept(self) -> None:
-        review_untested = MagicMock()
-        review_untested.proposal_disposition = "review_untested"
-        review_untested.cancelled = False
-
-        assert _effective_auto_accept(True, review_untested) is False
-        assert _effective_auto_accept(False, review_untested) is False
-
-    def test_cancelled_overrides_auto_accept(self) -> None:
-        cancelled = MagicMock()
-        cancelled.cancelled = True
-
-        assert _effective_auto_accept(True, cancelled) is False
-        assert _effective_auto_accept(False, cancelled) is False
-
-    def test_review_tested_overrides_auto_accept(self) -> None:
-        review_tested = MagicMock()
-        review_tested.proposal_disposition = "review_tested"
-        review_tested.cancelled = False
-
-        assert _effective_auto_accept(True, review_tested) is False
-        assert _effective_auto_accept(False, review_tested) is False
-
-    def test_no_proposal_disposition_overrides_auto_accept(self) -> None:
+    @pytest.mark.parametrize(
+        ("proposal_disposition", "cancelled"),
+        [
+            pytest.param("review_untested", False, id="review_untested"),
+            pytest.param("auto_applicable", True, id="cancelled"),
+            pytest.param("review_tested", False, id="review_tested"),
+            pytest.param("no_proposal", False, id="no_proposal"),
+        ],
+    )
+    def test_disposition_or_cancellation_overrides_auto_accept(
+        self, proposal_disposition: str, cancelled: bool
+    ) -> None:
         result = MagicMock()
-        result.proposal_disposition = "no_proposal"
-        result.cancelled = False
+        result.proposal_disposition = proposal_disposition
+        result.cancelled = cancelled
 
         assert _effective_auto_accept(True, result) is False
         assert _effective_auto_accept(False, result) is False
@@ -128,10 +116,20 @@ class TestEffectiveAutoAccept:
         validated = MagicMock()
         validated.proposal_disposition = "auto_applicable"
         validated.cancelled = False
+        validated.apply_without_review = False
 
         assert _effective_auto_accept(True, validated) is True
         assert _effective_auto_accept(False, validated) is False
         assert _effective_auto_accept(None, validated) is False
+
+    def test_apply_without_review_overrides_auto_accept_setting(self) -> None:
+        validated = MagicMock()
+        validated.proposal_disposition = "auto_applicable"
+        validated.cancelled = False
+        validated.apply_without_review = True
+
+        assert _effective_auto_accept(False, validated) is True
+        assert _effective_auto_accept(None, validated) is True
 
     def test_no_agent_result_is_not_auto_applicable(self) -> None:
         assert _proposal_disposition(None) == "no_proposal"
@@ -243,3 +241,198 @@ class TestNormalizeCopilotYamlProxyLocation:
 
         with pytest.raises(ValidationError):
             _normalize_copilot_yaml(yaml_str)
+
+
+_PROPOSED_YAML = textwrap.dedent(
+    """\
+    title: t
+    workflow_definition:
+      parameters: []
+      blocks:
+        - block_type: goto_url
+          label: open_site
+          url: https://example.com
+    """
+)
+
+_PERSISTED_YAML = textwrap.dedent(
+    """\
+    title: t
+    workflow_definition:
+      parameters: []
+      blocks:
+        - block_type: goto_url
+          label: open_site
+          url: https://example.com
+        - block_type: navigation
+          label: do_thing
+          navigation_goal: Click the primary action.
+    """
+)
+
+_USER_MODIFIED_YAML = _PROPOSED_YAML + (
+    "    - block_type: text_prompt\n      label: summarize_result\n      llm_key: x\n      prompt: ok\n"
+)
+
+
+_BLOCKLESS_EXPLICIT_YAML = "title: t\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
+
+
+class TestBlocklessSubmissionFallback:
+    def test_none_submission_with_prior_proposal_returns_fallback(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": _PROPOSED_YAML},
+                submitted_workflow_yaml=None,
+            )
+            == _PROPOSED_YAML
+        )
+
+    def test_empty_string_submission_with_prior_proposal_returns_fallback(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": _PROPOSED_YAML},
+                submitted_workflow_yaml="",
+            )
+            == _PROPOSED_YAML
+        )
+
+    def test_whitespace_only_submission_returns_fallback(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": _PROPOSED_YAML},
+                submitted_workflow_yaml="   \n",
+            )
+            == _PROPOSED_YAML
+        )
+
+    def test_explicit_blocks_empty_submission_is_NOT_overwritten(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": _PROPOSED_YAML},
+                submitted_workflow_yaml=_BLOCKLESS_EXPLICIT_YAML,
+            )
+            is None
+        )
+
+    def test_populated_submission_preserves_user_edit(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": _PROPOSED_YAML},
+                submitted_workflow_yaml=_USER_MODIFIED_YAML,
+            )
+            is None
+        )
+
+    def test_no_proposal_returns_none(self) -> None:
+        assert _blockless_submission_fallback(proposed_workflow=None, submitted_workflow_yaml="") is None
+
+    def test_empty_dict_proposal_returns_none(self) -> None:
+        assert _blockless_submission_fallback(proposed_workflow={}, submitted_workflow_yaml="") is None
+
+    def test_non_string_copilot_yaml_returns_none(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": None},
+                submitted_workflow_yaml="",
+            )
+            is None
+        )
+
+    def test_malformed_blockless_copilot_yaml_returns_none(self) -> None:
+        assert (
+            _blockless_submission_fallback(
+                proposed_workflow={"_copilot_yaml": _BLOCKLESS_EXPLICIT_YAML},
+                submitted_workflow_yaml="",
+            )
+            is None
+        )
+
+
+class TestPriorCopilotWorkflowYaml:
+    def test_uses_proposal_when_present(self) -> None:
+        assert (
+            _prior_copilot_workflow_yaml(
+                proposed_workflow={"_copilot_yaml": _PROPOSED_YAML},
+                persisted_workflow_yaml=_PERSISTED_YAML,
+            )
+            == _PROPOSED_YAML
+        )
+
+    def test_falls_back_to_persisted_when_no_proposal(self) -> None:
+        assert (
+            _prior_copilot_workflow_yaml(
+                proposed_workflow=None,
+                persisted_workflow_yaml=_PERSISTED_YAML,
+            )
+            == _PERSISTED_YAML
+        )
+
+    def test_falls_back_to_persisted_when_proposal_has_no_copilot_yaml(self) -> None:
+        assert (
+            _prior_copilot_workflow_yaml(
+                proposed_workflow={"some_other_field": "x"},
+                persisted_workflow_yaml=_PERSISTED_YAML,
+            )
+            == _PERSISTED_YAML
+        )
+
+    def test_falls_back_to_persisted_when_copilot_yaml_is_blockless(self) -> None:
+        assert (
+            _prior_copilot_workflow_yaml(
+                proposed_workflow={"_copilot_yaml": _BLOCKLESS_EXPLICIT_YAML},
+                persisted_workflow_yaml=_PERSISTED_YAML,
+            )
+            == _PERSISTED_YAML
+        )
+
+    def test_returns_none_when_neither_has_blocks(self) -> None:
+        assert (
+            _prior_copilot_workflow_yaml(
+                proposed_workflow={"_copilot_yaml": _BLOCKLESS_EXPLICIT_YAML},
+                persisted_workflow_yaml=_BLOCKLESS_EXPLICIT_YAML,
+            )
+            is None
+        )
+
+    def test_returns_none_when_no_inputs(self) -> None:
+        assert _prior_copilot_workflow_yaml(proposed_workflow=None, persisted_workflow_yaml=None) is None
+
+
+class _FakeStream:
+    def __init__(self, raise_on_send: BaseException | None = None) -> None:
+        self.sent: list[Any] = []
+        self._raise_on_send = raise_on_send
+
+    async def send(self, message: Any) -> None:
+        if self._raise_on_send is not None:
+            raise self._raise_on_send
+        self.sent.append(message)
+
+
+@pytest.mark.asyncio
+async def test_ensure_terminal_frame_noop_when_already_emitted() -> None:
+    stream = _FakeStream()
+    await _ensure_terminal_frame(stream, already_emitted=True)  # type: ignore[arg-type]
+    assert stream.sent == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_terminal_frame_sends_fallback_error_when_missing() -> None:
+    stream = _FakeStream()
+    await _ensure_terminal_frame(stream, already_emitted=False)  # type: ignore[arg-type]
+    assert len(stream.sent) == 1
+    frame = stream.sent[0]
+    assert getattr(frame, "error", "").startswith("The assistant didn't finish")
+
+
+@pytest.mark.asyncio
+async def test_ensure_terminal_frame_swallows_send_exception() -> None:
+    stream = _FakeStream(raise_on_send=RuntimeError("client already gone"))
+    await _ensure_terminal_frame(stream, already_emitted=False)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_ensure_terminal_frame_swallows_send_cancellation() -> None:
+    stream = _FakeStream(raise_on_send=asyncio.CancelledError())
+    await _ensure_terminal_frame(stream, already_emitted=False)  # type: ignore[arg-type]

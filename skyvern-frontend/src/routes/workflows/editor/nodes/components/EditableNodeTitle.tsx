@@ -6,7 +6,7 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 import { HorizontallyResizingInput } from "./HorizontallyResizingInput";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 type Props = {
   value: string;
@@ -27,24 +27,14 @@ function EditableNodeTitle({
   const [isTruncated, setIsTruncated] = useState(false);
   const titleRef = useRef<HTMLHeadingElement>(null);
 
-  useLayoutEffect(() => {
-    if (editing) {
-      return;
-    }
+  // Measure on hover rather than via a persistent ResizeObserver: an
+  // observer-driven setState here feeds a canvas relayout loop (React #185).
+  const measureTruncation = () => {
     const el = titleRef.current;
-    if (!el) {
-      return;
-    }
-    const measure = () => {
+    if (el) {
       setIsTruncated(el.scrollWidth > el.clientWidth);
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => {
-      observer.disconnect();
-    };
-  }, [value, editing]);
+    }
+  };
 
   if (!editing) {
     return (
@@ -54,6 +44,7 @@ function EditableNodeTitle({
             <h1
               ref={titleRef}
               className={cn("min-w-0 cursor-text truncate", titleClassName)}
+              onPointerEnter={measureTruncation}
               onClick={() => {
                 setEditing(true);
               }}
@@ -74,7 +65,9 @@ function EditableNodeTitle({
       disabled={!editable}
       size={1}
       autoFocus
-      className={cn("nopan w-min border-0 p-0", inputClassName)}
+      // HorizontallyResizingInput sets an inline pixel width with no
+      // ceiling; max-w-full caps it at the row's allotted space.
+      className={cn("nopan w-min max-w-full border-0 p-0", inputClassName)}
       onBlur={(event) => {
         if (!editable) {
           event.currentTarget.value = value;

@@ -14,6 +14,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 def _workflow_run() -> SimpleNamespace:
     return SimpleNamespace(
         browser_session_id="pbs_1",
+        browser_address=None,
         started_at=datetime(2026, 6, 4, 16, 0, tzinfo=UTC),
         finished_at=datetime(2026, 6, 4, 16, 30, tzinfo=UTC),
         organization_id="o_1",
@@ -131,6 +132,58 @@ async def test_legacy_run_recording_does_not_preempt_session_recording(monkeypat
 
     assert urls == ["session_url"]
     get_links.assert_not_awaited()  # the legacy run recording is not served
+
+
+@pytest.mark.asyncio
+async def test_session_run_own_recording_not_served_when_unfinalized(monkeypatch) -> None:
+    # A browser-session run's own (non-clip) recording is never finalized — its browser stays
+    # open on completion, so the per-run webm has no Duration/Cues and won't play. It must NOT
+    # be served as a last resort; the clip / finalized session recording cover session runs once
+    # the session closes (SKY-11086: "recording shows up but the video doesn't work").
+    monkeypatch.setattr(
+        app.DATABASE.artifacts,
+        "list_artifacts_for_run_by_type",
+        AsyncMock(return_value=[_legacy_artifact()]),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app.STORAGE, "get_shared_recordings_in_browser_session", AsyncMock(return_value=[]), raising=False
+    )
+    get_links = AsyncMock(return_value=["legacy_url"])
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "get_share_links_with_bundle_support", get_links, raising=False)
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "is_recording_archived", AsyncMock(return_value=False), raising=False)
+
+    urls, archived = await _fetch(_workflow_run())
+
+    assert urls == []
+    assert archived is False
+    get_links.assert_not_awaited()  # the unfinalized per-run recording is never served for a session run
+
+
+@pytest.mark.asyncio
+async def test_browser_address_run_own_recording_not_served_when_unfinalized(monkeypatch) -> None:
+    # Same invariant for a run pinned to a remote browser via browser_address (no browser_session_id):
+    # its browser also stays open on completion, so its own per-run recording never finalizes.
+    monkeypatch.setattr(
+        app.DATABASE.artifacts,
+        "list_artifacts_for_run_by_type",
+        AsyncMock(return_value=[_legacy_artifact()]),
+        raising=False,
+    )
+    get_session = AsyncMock(return_value=[])
+    monkeypatch.setattr(app.STORAGE, "get_shared_recordings_in_browser_session", get_session, raising=False)
+    get_links = AsyncMock(return_value=["legacy_url"])
+    monkeypatch.setattr(app.ARTIFACT_MANAGER, "get_share_links_with_bundle_support", get_links, raising=False)
+
+    run = _workflow_run()
+    run.browser_session_id = None
+    run.browser_address = "ws://browser.example:9222"
+
+    urls, archived = await _fetch(run)
+
+    assert urls == []
+    assert archived is False
+    get_links.assert_not_awaited()
 
 
 @pytest.mark.asyncio

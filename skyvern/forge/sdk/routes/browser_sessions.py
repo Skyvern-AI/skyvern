@@ -26,6 +26,8 @@ from skyvern.schemas.browser_sessions import (
     ProcessBrowserSessionRecordingResponse,
     UpdateBrowserSessionRequest,
 )
+from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 
@@ -93,6 +95,8 @@ async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
+    proxy_location = browser_session_request.proxy_location
+    proxy_session_id = browser_session_request.proxy_session_id
     if browser_session_request.browser_profile_id:
         profile = await app.DATABASE.browser_sessions.get_browser_profile(
             browser_session_request.browser_profile_id,
@@ -103,11 +107,27 @@ async def create_browser_session(
                 status_code=404,
                 detail=f"Browser profile {browser_session_request.browser_profile_id} not found",
             )
+        proxy_location_was_set = "proxy_location" in browser_session_request.model_fields_set
+        if not proxy_location_was_set:
+            proxy_location = profile.proxy_location
+        if "proxy_session_id" not in browser_session_request.model_fields_set:
+            if not proxy_location_was_set or should_generate_proxy_session_id(proxy_location):
+                proxy_session_id = profile.proxy_session_id
+            else:
+                proxy_session_id = None
+    if proxy_session_id and proxy_location is None:
+        proxy_location = ProxyLocation.RESIDENTIAL_ISP
+    if proxy_session_id and not should_generate_proxy_session_id(proxy_location):
+        raise HTTPException(
+            status_code=400,
+            detail="proxy_session_id is only supported with RESIDENTIAL_ISP proxy_location",
+        )
 
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=browser_session_request.timeout,
-        proxy_location=browser_session_request.proxy_location,
+        proxy_location=proxy_location,
+        proxy_session_id=proxy_session_id,
         extensions=browser_session_request.extensions,
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,
@@ -134,6 +154,7 @@ async def create_browser_session(
     summary="Close a session",
     responses={
         200: {"description": "Successfully closed browser session"},
+        404: {"description": "Browser session not found"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
@@ -149,6 +170,12 @@ async def close_browser_session(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if not browser_session:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
     await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
     return ORJSONResponse(
         content={"message": "Browser session closed"},

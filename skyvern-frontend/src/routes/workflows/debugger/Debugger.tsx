@@ -4,11 +4,9 @@ import { ReactFlowProvider } from "@xyflow/react";
 
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
+import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 import { WorkflowSettings } from "../types/workflowTypes";
-import {
-  getElements,
-  upgradeWorkflowBlocksV1toV2,
-} from "@/routes/workflows/editor/workflowEditorUtils";
+import { getElements } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getInitialParameters } from "@/routes/workflows/editor/utils";
 import { Workspace } from "@/routes/workflows/editor/Workspace";
 import { useDebugSessionBlockOutputsQuery } from "../hooks/useDebugSessionBlockOutputsQuery";
@@ -17,6 +15,7 @@ import { useBlockOutputStore } from "@/store/BlockOutputStore";
 
 function Debugger() {
   const { workflowPermanentId } = useParams();
+  useViaEntryPointCapture();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -66,16 +65,14 @@ function Debugger() {
     return null;
   }
 
-  // Auto-upgrade v1 workflows to v2 by assigning sequential next_block_label values
-  const workflowVersion = workflow.workflow_definition.version ?? 1;
-  const blocksToRender =
-    workflowVersion < 2
-      ? upgradeWorkflowBlocksV1toV2(workflow.workflow_definition.blocks)
-      : workflow.workflow_definition.blocks;
+  // getElements derives display routing (sequential defaulting + validation); the stored blocks are passed through unchanged.
+  const blocksToRender = workflow.workflow_definition.blocks;
 
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
+    pinSavedSessionIp: workflow.pin_saved_session_ip ?? false,
     browserProfileId: workflow.browser_profile_id ?? null,
+    browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
@@ -91,12 +88,14 @@ function Debugger() {
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
+    enableSelfHealing: workflow.enable_self_healing ?? false,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
     finallyBlockLabel:
       workflow.workflow_definition?.finally_block_label ?? null,
     workflowSystemPrompt:
       workflow.workflow_definition?.workflow_system_prompt ?? null,
+    errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
   };
 
   const elements = getElements(blocksToRender, settings, true);

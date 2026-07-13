@@ -32,7 +32,13 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordC
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_secret
+from skyvern.forge.sdk.services.credentials import (
+    AzureVaultConstants,
+    OnePasswordConstants,
+    extract_onepassword_upstream_5xx_status,
+    normalize_totp_config,
+)
+from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -75,14 +81,7 @@ _CREDENTIAL_PARAMETER_TYPES: tuple[type, ...] = (
     OnePasswordCredentialParameter,
 )
 
-# 1Password's Python SDK forwards generic 5xx upstream failures as plain Exceptions
-# whose stringified message embeds the HTTP status.
-_ONEPASSWORD_5XX_PATTERN = re.compile(
-    r"(?i)"
-    r"(?:\b(?:HTTP|status(?:\s+code)?|code|response)\s*[:=]?\s*(5\d{2})\b)"
-    r"|"
-    r"(?:\b(5\d{2})\s+(?:service\s+unavailable|bad\s+gateway|gateway\s+timeout|internal\s+server\s+error)\b)"
-)
+_SECRET_FIELD_KEY_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 
 
 class WorkflowRunContext:
@@ -236,6 +235,7 @@ class WorkflowRunContext:
         self.browser_session_id: str | None = None
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
+        self.resolved_credential_parameter_ids: dict[str, str] = {}
 
     def set_workflow(self, workflow: "Workflow") -> None:
         """
@@ -269,6 +269,9 @@ class WorkflowRunContext:
 
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
+
+    def get_resolved_credential_parameter_id(self, key: str) -> str | None:
+        return self.resolved_credential_parameter_ids.get(key)
 
     def update_block_metadata(self, label: str, metadata: BlockMetadata) -> None:
         if label in self.blocks_metadata:
@@ -585,6 +588,16 @@ class WorkflowRunContext:
     def generate_random_secret_id() -> str:
         return f"{RANDOM_SECRET_ID_PREFIX}{generate_random_string(length=4)}"
 
+    def register_secret_value(self, secret_value: str, suffix: str | None = None) -> str:
+        while True:
+            secret_id = self.generate_random_secret_id()
+            if suffix:
+                secret_id = f"{secret_id}_{suffix}"
+            if secret_id not in self.secrets:
+                break
+        self.secrets[secret_id] = secret_value
+        return secret_id
+
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
         Extract vault_id and item_id from the credential_id.
@@ -611,6 +624,15 @@ class WorkflowRunContext:
             " Expected format: vault_id:item_id"
         )
 
+    async def _normalize_totp_config_for_organization(self, totp_secret: str, organization: Organization) -> str:
+        enterprise_totp_secret = await app.AGENT_FUNCTION.parse_enterprise_totp_secret(
+            totp_secret,
+            organization_id=organization.organization_id,
+        )
+        if enterprise_totp_secret is not None:
+            return enterprise_totp_secret
+        return normalize_totp_config(totp_secret)
+
     async def _register_credential_parameter_value(
         self,
         credential_id: str,
@@ -622,6 +644,8 @@ class WorkflowRunContext:
         )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
+
+        self.resolved_credential_parameter_ids[parameter.key] = credential_id
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
@@ -639,24 +663,30 @@ class WorkflowRunContext:
         self.values[parameter.key] = {
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
-        credential_dict: dict[str, str | None] = credential.model_dump()
+        credential_dict: dict[str, Any] = credential.model_dump(exclude_none=True)
+        used_secret_field_keys = set(self.values[parameter.key])
         for key, value in credential_dict.items():
             # totp_type is metadata; totp is registered as a TOTP seed below, not as a plain field.
             if key in ("totp_type", "totp"):
                 continue
             if not value:
                 continue
-            random_secret_id = self.generate_random_secret_id()
-            secret_id = f"{random_secret_id}_{key}"
-            self.secrets[secret_id] = value
-            self.values[parameter.key][key] = secret_id
+            for field_key, field_value in self._flatten_credential_secret_field(key, value):
+                field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                random_secret_id = self.generate_random_secret_id()
+                secret_id = f"{random_secret_id}_{field_key}"
+                self.secrets[secret_id] = field_value
+                self.values[parameter.key][field_key] = secret_id
 
         if isinstance(credential, PasswordCredential) and credential.totp:
             random_secret_id = self.generate_random_secret_id()
             totp_secret_id = f"{random_secret_id}_totp"
             self.secrets[totp_secret_id] = BitwardenConstants.TOTP
             totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-            self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
+            self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                credential.totp,
+                organization,
+            )
             self.values[parameter.key]["totp"] = totp_secret_id
 
     def get_credential_totp_identifier(self, parameter_key: str) -> str | None:
@@ -692,7 +722,9 @@ class WorkflowRunContext:
         LOG.info("Fetching credential parameter value", parameter_key=parameter.key)
 
         credential_id = None
-        if parameter.credential_id:
+        if parameter.credential_ids:
+            credential_id = await self.resolve_credential_parameter_id(parameter, organization.organization_id)
+        elif parameter.credential_id:
             if self.has_parameter(parameter.credential_id) and self.has_value(parameter.credential_id):
                 credential_id = self.values[parameter.credential_id]
             else:
@@ -703,6 +735,28 @@ class WorkflowRunContext:
             raise CredentialParameterNotFoundError(parameter.credential_id)
 
         await self._register_credential_parameter_value(credential_id, parameter, organization)
+
+    async def resolve_credential_parameter_id(
+        self,
+        parameter: CredentialParameter,
+        organization_id: str,
+    ) -> str:
+        cached = self.resolved_credential_parameter_ids.get(parameter.key)
+        if cached:
+            return cached
+        if not parameter.credential_ids:
+            self.resolved_credential_parameter_ids[parameter.key] = parameter.credential_id
+            return parameter.credential_id
+        credential_id = await select_credential_for_run(
+            workflow_run_id=self.workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=self.workflow_permanent_id,
+            parameter_key=parameter.key,
+            credential_ids=parameter.credential_ids,
+            selection_strategy=parameter.selection_strategy,
+        )
+        self.resolved_credential_parameter_ids[parameter.key] = credential_id
+        return credential_id
 
     async def register_aws_secret_parameter_value(
         self,
@@ -770,11 +824,10 @@ class WorkflowRunContext:
             raise OnePasswordSessionExpiredError(f"{str(e)} {lookup_context}") from e
         except Exception as e:
             raw = str(e)
-            match = _ONEPASSWORD_5XX_PATTERN.search(raw)
-            if match:
-                status_digits = match.group(1) or match.group(2)
+            upstream_status = extract_onepassword_upstream_5xx_status(raw)
+            if upstream_status is not None:
                 raise OnePasswordServiceUnavailableError(
-                    status_code=int(status_digits),
+                    status_code=upstream_status,
                     lookup_context=lookup_context,
                 ) from e
             raise OnePasswordGetItemError(f"{raw} {lookup_context}") from e
@@ -804,7 +857,10 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = parse_totp_secret(field.value)
+                self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                    field.value,
+                    organization,
+                )
                 self.values[parameter.key]["totp"] = totp_secret_id
             elif field.title and field.title.lower() in ["expire date", "expiry date", "expiration date"]:
                 parts = [part.strip() for part in field.value.strip().split("/")]
@@ -1036,7 +1092,10 @@ class WorkflowRunContext:
                     totp_secret_id = f"{random_secret_id}_totp"
                     self.secrets[totp_secret_id] = BitwardenConstants.TOTP
                     totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                    self.secrets[totp_secret_value] = secret_credentials[BitwardenConstants.TOTP]
+                    self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                        secret_credentials[BitwardenConstants.TOTP],
+                        organization,
+                    )
                     self.values[parameter.key]["totp"] = totp_secret_id
 
         except BitwardenBaseError as e:
@@ -1090,7 +1149,10 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = AzureVaultConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = parse_totp_secret(totp_secret)
+                self.secrets[totp_secret_value] = await self._normalize_totp_config_for_organization(
+                    totp_secret,
+                    organization,
+                )
                 self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_bitwarden_sensitive_information_parameter_value(
@@ -1235,6 +1297,25 @@ class WorkflowRunContext:
                 secret_id = f"{random_secret_id}_{secret_suffix}"
                 self.secrets[secret_id] = credit_card_data[data_key]
                 parameter_value[secret_suffix] = secret_id
+
+            extra_field_keys = [
+                key
+                for key in credit_card_data
+                if key == "billing_email"
+                or key == "billing_phone"
+                or key.startswith("billing_address_")
+                or key.startswith("metadata_")
+            ]
+            used_secret_field_keys = set(parameter_value)
+            for data_key in extra_field_keys:
+                field_key = self._normalize_secret_field_key(data_key)
+                if not field_key:
+                    continue
+                field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
+                random_secret_id = self.generate_random_secret_id()
+                secret_id = f"{random_secret_id}_{field_key}"
+                self.secrets[secret_id] = credit_card_data[data_key]
+                parameter_value[field_key] = secret_id
 
             self.values[parameter.key] = parameter_value
             self.parameters[parameter.key] = parameter
@@ -1508,6 +1589,39 @@ class WorkflowRunContext:
         self.secrets[secret_id] = value
         self.values[parameter.key][key] = secret_id
 
+    @staticmethod
+    def _normalize_secret_field_key(key: str) -> str:
+        return _SECRET_FIELD_KEY_PATTERN.sub("_", key).strip("_").lower()
+
+    @staticmethod
+    def _dedupe_secret_field_key(field_key: str, used_field_keys: set[str]) -> str:
+        if field_key not in used_field_keys:
+            used_field_keys.add(field_key)
+            return field_key
+
+        index = 2
+        while f"{field_key}_{index}" in used_field_keys:
+            index += 1
+        deduped_field_key = f"{field_key}_{index}"
+        used_field_keys.add(deduped_field_key)
+        return deduped_field_key
+
+    @classmethod
+    def _flatten_credential_secret_field(cls, key: str, value: Any) -> list[tuple[str, str]]:
+        if isinstance(value, str):
+            field_key = cls._normalize_secret_field_key(key)
+            return [(field_key, value)] if field_key else []
+        if isinstance(value, dict):
+            fields: list[tuple[str, str]] = []
+            for nested_key, nested_value in value.items():
+                if not nested_value:
+                    continue
+                field_key = cls._normalize_secret_field_key(f"{key}_{nested_key}")
+                if field_key:
+                    fields.append((field_key, str(nested_value)))
+            return fields
+        return []
+
 
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
@@ -1570,6 +1684,9 @@ class WorkflowContextManager:
     def get_workflow_run_context(self, workflow_run_id: str) -> WorkflowRunContext:
         self._validate_workflow_run_context(workflow_run_id)
         return self.workflow_run_contexts[workflow_run_id]
+
+    def remove_workflow_run_context(self, workflow_run_id: str) -> None:
+        self.workflow_run_contexts.pop(workflow_run_id, None)
 
     async def register_block_parameters_for_workflow_run(
         self,

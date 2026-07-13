@@ -206,7 +206,16 @@ def encode_by_type(o: Any) -> Any:
 
 def update_forward_refs(model: Type["Model"], **localns: Any) -> None:
     if IS_PYDANTIC_V2:
-        model.model_rebuild(raise_errors=False)  # type: ignore[attr-defined]
+        try:
+            model.model_rebuild(raise_errors=False)  # type: ignore[attr-defined]
+        except KeyError as exc:
+            # Manual patch (reapplied by scripts/patch_generated_client.py):
+            # Pydantic v2 can still raise internal schema-gathering KeyErrors
+            # for Fern-generated recursive unions even with raise_errors=False.
+            # Match on the "definitions" key rather than the exact args tuple so a
+            # Pydantic format change that adds context can't reintroduce the crash.
+            if "definitions" not in exc.args:
+                raise
     else:
         model.update_forward_refs(**localns)
 

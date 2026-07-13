@@ -10,6 +10,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useQuery } from "@tanstack/react-query";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import { hasExtraHttpHeaders } from "@/util/extraHttpHeaders";
 
 function TaskParameters() {
   const taskId = useFirstParam("taskId", "runId");
@@ -37,6 +38,10 @@ function TaskParameters() {
   if (taskIsError || !task) {
     return <div>Error loading inputs</div>;
   }
+
+  const showExtraHttpHeaders = hasExtraHttpHeaders(
+    task.request.extra_http_headers,
+  );
 
   return (
     <section className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
@@ -117,25 +122,23 @@ function TaskParameters() {
           maxHeight="500px"
         />
       </div>
-      <div className="flex gap-16">
-        <div className="w-72">
-          <h1 className="text-lg">Extra HTTP Headers</h1>
-          <h2 className="text-base text-slate-400">
-            Specify some self-defined HTTP requests headers
-          </h2>
+      {showExtraHttpHeaders ? (
+        <div className="flex gap-16">
+          <div className="w-72">
+            <h1 className="text-lg">Extra HTTP Headers</h1>
+            <h2 className="text-base text-slate-400">
+              Specify some self-defined HTTP requests headers
+            </h2>
+          </div>
+          <div className="w-full">
+            <KeyValueInput
+              value={JSON.stringify(task.request.extra_http_headers)}
+              readOnly={true}
+              onChange={() => {}}
+            />
+          </div>
         </div>
-        <div className="w-full">
-          <KeyValueInput
-            value={
-              task.request.extra_http_headers
-                ? JSON.stringify(task.request.extra_http_headers)
-                : null
-            }
-            readOnly={true}
-            onChange={() => {}}
-          />
-        </div>
-      </div>
+      ) : null}
       <div className="flex gap-16">
         <div className="w-72">
           <h1 className="text-lg">Webhook Callback URL</h1>

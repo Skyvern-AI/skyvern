@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from typing import Awaitable, Callable, Literal, Protocol
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
@@ -18,6 +18,8 @@ class BrowserState(Protocol):
     browser_cleanup: BrowserCleanupFunc
     pw: Playwright
 
+    def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
+
     async def check_and_fix_state(
         self,
         url: str | None = None,
@@ -26,6 +28,20 @@ class BrowserState(Protocol):
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
         script_id: str | None = None,
+        organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
+        browser_profile_id: str | None = None,
+    ) -> None: ...
+
+    def is_connected(self) -> bool: ...
+
+    async def reconnect(
+        self,
+        proxy_location: ProxyLocationInput = None,
+        workflow_run_id: str | None = None,
+        workflow_permanent_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
@@ -76,7 +92,7 @@ class BrowserState(Protocol):
 
     async def reload_page(self, degradation: bool = False) -> None: ...
 
-    async def close(self, close_browser_on_completion: bool = True) -> None: ...
+    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None: ...
 
     async def take_fullpage_screenshot(self, file_path: str | None = None) -> bytes: ...
 
@@ -90,7 +106,10 @@ class BrowserState(Protocol):
         max_retries: int = settings.MAX_SCRAPING_RETRIES,
         scrape_exclude: ScrapeExcludeFunc | None = None,
         take_screenshots: bool = True,
-        draw_boxes: bool = True,
+        # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+        # The parameter is retained for backwards compatibility and is scheduled for removal.
+        # New call sites must not pass ``draw_boxes=True``.
+        draw_boxes: bool = False,
         max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
         support_empty_page: bool = False,

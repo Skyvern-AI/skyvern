@@ -24,6 +24,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_SCREENSHOT_BYTES
 from skyvern.forge.sdk.routes.streaming.registries import get_vnc_channel
+from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
@@ -279,7 +280,7 @@ class LocalExecutionChannel(ExecutionChannel):
         # which LocalExecutionChannel intentionally leaves None.
         if not self.page:
             raise RuntimeError(f"{self.class_name} evaluate_js: no page available.")
-        return await self.page.evaluate(expression, arg)
+        return await evaluate_in_main_world(self.page, expression, arg)
 
     async def close(self) -> None:
         # We don't own the page or context; do not close.

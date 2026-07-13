@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.secret_headers import mask_header_values
@@ -103,10 +104,12 @@ class TaskV2(BaseModel):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key(organization_id=self.organization_id)
                 llm_key = mapping.get(model_name, {}).get("llm_key")
                 if llm_key:
                     return llm_key
+                if is_custom_llm_model_name(model_name):
+                    raise ValueError("Custom LLM model not found for organization")
 
         return None
 
@@ -212,9 +215,11 @@ class TaskV2Request(BaseModel):
     totp_identifier: str | None = None
     proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
+    generate_script: bool | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
+    model: dict[str, Any] | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None

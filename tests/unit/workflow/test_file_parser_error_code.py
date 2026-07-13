@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.workflow.exceptions import InvalidFileType
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
@@ -132,7 +133,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     side_effect=Exception("Download failed"),
                 ):
                     result = await block.execute(
@@ -152,7 +153,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/bad.csv",
                 ):
                     with patch.object(
@@ -175,7 +176,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test_file",
                 ):
                     with patch.object(FileParserBlock, "_detect_file_type_from_url", return_value="unsupported_type"):
@@ -191,6 +192,68 @@ class TestFileParserBlockExecuteErrorCodes:
         assert "unsupported" in result.failure_reason.lower()
 
     @pytest.mark.asyncio
+    async def test_parse_invalid_file_type_returns_error_codes(self) -> None:
+        """SKY-11131: a file that passes validation but fails parsing (e.g. a non-PDF
+        that pypdf opens but cannot extract) must surface a graceful failure, not raise."""
+        block = _make_file_parser_block(file_url="https://example.com/statement.pdf", file_type=FileType.PDF)
+        mock_ctx = _mock_workflow_run_context()
+
+        with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
+            with patch.object(FileParserBlock, "format_potential_template_parameters"):
+                with patch(
+                    "skyvern.forge.sdk.api.files.download_file",
+                    return_value="/tmp/statement.pdf",
+                ):
+                    with patch.object(FileParserBlock, "validate_file_type"):
+                        with patch.object(
+                            FileParserBlock,
+                            "_parse_pdf_file",
+                            side_effect=InvalidFileType(
+                                file_url="https://example.com/statement.pdf",
+                                file_type=FileType.PDF,
+                                error="both parsers failed",
+                            ),
+                        ):
+                            result = await block.execute(
+                                workflow_run_id="wr_test",
+                                workflow_run_block_id="wrb_test",
+                                organization_id="org_test",
+                            )
+
+        assert result.success is False
+        assert result.error_codes == ["FILE_PARSER_ERROR"]
+        assert "parse" in result.failure_reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_parse_unexpected_exception_returns_error_codes(self) -> None:
+        """SKY-11131: a raw exception from the parse stage (e.g. the vision-LLM PDF
+        fallback) must be caught and surfaced as a graceful failure."""
+        block = _make_file_parser_block(file_url="https://example.com/statement.pdf", file_type=FileType.PDF)
+        mock_ctx = _mock_workflow_run_context()
+
+        with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
+            with patch.object(FileParserBlock, "format_potential_template_parameters"):
+                with patch(
+                    "skyvern.forge.sdk.api.files.download_file",
+                    return_value="/tmp/statement.pdf",
+                ):
+                    with patch.object(FileParserBlock, "validate_file_type"):
+                        with patch.object(
+                            FileParserBlock,
+                            "_parse_pdf_file",
+                            side_effect=Exception("No /Root object! - Is this really a PDF?"),
+                        ):
+                            result = await block.execute(
+                                workflow_run_id="wr_test",
+                                workflow_run_block_id="wrb_test",
+                                organization_id="org_test",
+                            )
+
+        assert result.success is False
+        assert result.error_codes == ["FILE_PARSER_ERROR"]
+        assert "parse" in result.failure_reason.lower()
+
+    @pytest.mark.asyncio
     async def test_ai_extraction_failure_returns_error_codes(self) -> None:
         block = _make_file_parser_block(file_url="https://example.com/file.csv")
         block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -199,7 +262,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test.csv",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -223,7 +286,7 @@ class TestFileParserBlockExecuteErrorCodes:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test.csv",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):
@@ -349,7 +412,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     side_effect=Exception("Download failed"),
                 ):
                     with patch.object(
@@ -374,7 +437,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test_file",
                 ):
                     with patch.object(FileParserBlock, "_detect_file_type_from_url", return_value="unsupported_type"):
@@ -394,6 +457,37 @@ class TestFileParserBlockRecordsOutputOnFailure:
         assert result.output_parameter_value == recorded
 
     @pytest.mark.asyncio
+    async def test_parse_failure_records_failed_output(self) -> None:
+        block = _make_file_parser_block(file_url="https://example.com/statement.pdf", file_type=FileType.PDF)
+        mock_ctx = _mock_workflow_run_context()
+
+        with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
+            with patch.object(FileParserBlock, "format_potential_template_parameters"):
+                with patch(
+                    "skyvern.forge.sdk.api.files.download_file",
+                    return_value="/tmp/statement.pdf",
+                ):
+                    with patch.object(FileParserBlock, "validate_file_type"):
+                        with patch.object(
+                            FileParserBlock,
+                            "_parse_pdf_file",
+                            side_effect=Exception("No /Root object! - Is this really a PDF?"),
+                        ):
+                            with patch.object(
+                                FileParserBlock, "record_output_parameter_value", new_callable=AsyncMock
+                            ) as mock_record:
+                                result = await block.execute(
+                                    workflow_run_id="wr_test",
+                                    workflow_run_block_id="wrb_test",
+                                    organization_id="org_test",
+                                )
+
+        assert result.success is False
+        recorded = self._recorded_value(mock_record)
+        self._assert_failure_output_shape(recorded, "parse")
+        assert result.output_parameter_value == recorded
+
+    @pytest.mark.asyncio
     async def test_ai_extraction_failure_records_failed_output(self) -> None:
         block = _make_file_parser_block(file_url="https://example.com/file.csv")
         block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -402,7 +496,7 @@ class TestFileParserBlockRecordsOutputOnFailure:
         with patch.object(FileParserBlock, "get_workflow_run_context", return_value=mock_ctx):
             with patch.object(FileParserBlock, "format_potential_template_parameters"):
                 with patch(
-                    "skyvern.forge.sdk.workflow.models.block.download_file",
+                    "skyvern.forge.sdk.api.files.download_file",
                     return_value="/tmp/test.csv",
                 ):
                     with patch.object(FileParserBlock, "validate_file_type"):

@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml as _process_workflow_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _process_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
@@ -175,6 +175,7 @@ from .guardrails import (
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
+from .mcp_hooks import _click_pre_hook as _click_pre_hook
 from .mcp_hooks import (
     _code_only_pre_run_results_error,
 )
@@ -223,6 +224,7 @@ from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
+from .scouting import _capture_scout_role_name as _capture_scout_role_name
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
 from .scouting import (
@@ -232,6 +234,7 @@ from .scouting import _consume_scout_source_url as _consume_scout_source_url
 from .scouting import _mark_page_inspected as _mark_page_inspected
 from .scouting import _mark_pending_browser_interaction_observation as _mark_pending_browser_interaction_observation
 from .scouting import _mark_post_run_page_observed as _mark_post_run_page_observed
+from .scouting import _prenav_role_name_for_selector as _prenav_role_name_for_selector
 from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
@@ -240,11 +243,18 @@ from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
 from .workflow_update import _code_block_safety_errors as _code_block_safety_errors
+from .workflow_update import (
+    _impose_output_contract_envelope_after_steering as _impose_output_contract_envelope_after_steering,
+)
+from .workflow_update import _metadata_contract_run_preflight_reject as _metadata_contract_run_preflight_reject
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
-from .workflow_update import _pre_run_workflow_coverage_error as _pre_run_workflow_coverage_error
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
 from .workflow_update import _record_workflow_update_result as _record_workflow_update_result
+from .workflow_update import _scaffold_metadata_contract_for_update as _scaffold_metadata_contract_for_update
 from .workflow_update import _update_workflow as _update_workflow
+from .workflow_update import (
+    consume_output_contract_advisory_grant_for_run_result as consume_output_contract_advisory_grant_for_run_result,
+)
 
 LOG = structlog.get_logger()
 
@@ -281,7 +291,7 @@ async def update_workflow_tool(
     refs, observation refs, and terminal verifier expectations.
     """
     copilot_ctx = ctx.context
-    serialized_code_artifact_metadata = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
+    serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
     arguments = {
         "workflow_yaml": workflow_yaml,
@@ -352,6 +362,12 @@ async def update_workflow_tool(
         )
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+        if result.get("ok") is False:
+            _record_diagnosis_repair_contract(
+                copilot_ctx,
+                source_tool="update_workflow",
+                result=result,
+            )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -469,6 +485,7 @@ async def run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
+        consume_output_contract_advisory_grant_for_run_result(copilot_ctx, result)
         completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         tool_visible_result = _tool_visible_result_after_completion_verification(
             copilot_ctx,
@@ -588,7 +605,7 @@ async def update_and_run_blocks_tool(
     copilot_ctx = ctx.context
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
-    serialized_code_artifact_metadata = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
+    serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
     arguments = {
         "workflow_yaml": workflow_yaml,
@@ -598,6 +615,12 @@ async def update_and_run_blocks_tool(
         "parameters": parameters or {},
     }
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
+    # Cleared unconditionally up front and only set True at the actual skip
+    # branch below — reflects "we skipped a run", not "the policy would have
+    # allowed a skip if we got that far". A stale True from an earlier call, or
+    # a premature True from a policy check ahead of an unrelated update_workflow
+    # failure, would misreport an authoring error as a credential ask.
+    copilot_ctx.last_run_skipped_unbound_credentials = False
     authority_error = _authority_tool_error(
         copilot_ctx,
         "update_and_run_blocks",
@@ -605,6 +628,45 @@ async def update_and_run_blocks_tool(
     )
     if authority_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", authority_error)
+
+    workflow_yaml, imposed_code_artifact_metadata, envelope_imposed = _impose_output_contract_envelope_after_steering(
+        copilot_ctx,
+        workflow_yaml,
+        serialized_code_artifact_metadata,
+    )
+    if envelope_imposed:
+        serialized_code_artifact_metadata = imposed_code_artifact_metadata
+        arguments["workflow_yaml"] = workflow_yaml
+        arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
+
+    scaffolded_code_artifact_metadata, scaffold_applied = _scaffold_metadata_contract_for_update(
+        copilot_ctx,
+        workflow_yaml,
+        serialized_code_artifact_metadata,
+    )
+    if scaffold_applied:
+        serialized_code_artifact_metadata = scaffolded_code_artifact_metadata
+        arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
+
+    metadata_contract_preflight_reject = _metadata_contract_run_preflight_reject(
+        copilot_ctx,
+        workflow_yaml,
+        serialized_code_artifact_metadata,
+    )
+    if metadata_contract_preflight_reject is not None:
+        record_tool_step_result_for_ctx(
+            copilot_ctx,
+            "update_and_run_blocks",
+            arguments,
+            metadata_contract_preflight_reject,
+        )
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=metadata_contract_preflight_reject,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", metadata_contract_preflight_reject)
+        return json.dumps(sanitized)
 
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
@@ -642,10 +704,15 @@ async def update_and_run_blocks_tool(
                 "block_observation_refs": normalized_block_observation_refs,
                 "raw_block_observation_refs": block_observation_refs,
                 "code_artifact_metadata": serialized_code_artifact_metadata,
-                "raw_code_artifact_metadata": code_artifact_metadata,
+                "raw_code_artifact_metadata": serialized_code_artifact_metadata
+                if scaffold_applied or envelope_imposed
+                else code_artifact_metadata,
+                "block_labels": block_labels,
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
+            allow_static_output_uncertainty=True,
+            formation_prepared=True,
         )
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
 
@@ -659,35 +726,8 @@ async def update_and_run_blocks_tool(
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
-    coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
-    if coverage_error:
-        user_facing_summary = (
-            "Workflow draft saved; I still need to add the remaining requested actions before testing it."
-        )
-        result = {
-            "ok": False,
-            "error": coverage_error,
-            "data": {
-                "block_count": copilot_ctx.last_update_block_count,
-                "workflow_updated": True,
-                "workflow_run_skipped": True,
-                "control_signal": {
-                    "kind": "intermediate_success",
-                    "user_facing_summary": user_facing_summary,
-                },
-                "user_facing_summary": user_facing_summary,
-            },
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
-        _record_diagnosis_repair_contract(
-            copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=result,
-            workflow_updated=True,
-        )
-        return json.dumps(result)
-
     if skip_run_after_update:
+        copilot_ctx.last_run_skipped_unbound_credentials = True
         skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
             "ok": True,
@@ -752,6 +792,7 @@ async def update_and_run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
+        consume_output_contract_advisory_grant_for_run_result(copilot_ctx, run_result)
         completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         tool_visible_result = _tool_visible_result_after_completion_verification(
             copilot_ctx,
@@ -784,8 +825,9 @@ async def discover_workflow_entrypoint_tool(
     Use this BEFORE writing blocks when the user named a website (with a URL,
     a bare domain, or a single brand word) but no specific page. Accepts:
     a URL with or without scheme (``example.com/login`` is fine), a bare
-    domain (``example.com``), or a single brand word (resolved as
-    ``https://www.<word>.com``). English phrases ("the X website") return
+    domain (``example.com``), or a single brand word. Configured aliases resolve
+    first; other single brand words resolve as ``https://www.<word>.com``.
+    English phrases ("the X website") return
     ``failure_reason=could_not_resolve_site_name`` — ASK_QUESTION for a URL.
 
     Returns ``candidate_url`` plus a short ``evidence_trail`` and any
@@ -848,20 +890,23 @@ async def fill_credential_field_tool(
     The secret value is resolved server-side from the stored credential and never
     enters the conversation; the result reports only `typed_length`. Use this
     instead of `type_text` whenever a login form field should receive a saved
-    credential's username, password, or one-time TOTP code — `type_text` cannot
-    type secrets and you never have the values.
+    credential's username, password, or authenticator-app one-time code. Email/SMS
+    OTP credentials are not filled during scouting because scouting has no
+    workflow run/task context for safe polling.
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id` must be a credential from the request policy's
-    `resolved_credentials`. `field` is one of `username`, `password`, `totp`
-    (`totp` generates a fresh code at call time).
+    `resolved_credentials`. `field` is one of `username`, `password`, `totp`.
 
     This tool only fills; it never clicks or submits. Each successful fill is
     recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind
-    the credential as a `credential_id` workflow parameter and reference it as
-    `<parameter_key>.username` / `.password` / `.totp` — keep that attribute
-    form when persisting code blocks.
+    the credential as a `credential_id` workflow parameter and reference
+    username/password as `<parameter_key>.username` / `.password`.
+
+    In synthesized code blocks, one-time codes must use
+    `await <parameter_key>.otp()` so authenticator, email, and SMS OTP sources
+    all resolve at runtime.
     """
     result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))

@@ -4,6 +4,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Label } from "@/components/ui/label";
+import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import {
   Select,
   SelectContent,
@@ -11,6 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { helpTooltips } from "../../helpContent";
 import { type FileUploadNode, type FileUploadNodeData } from "./types";
@@ -38,6 +40,7 @@ function FileUploadEditorBody({
     editable,
     storageType,
     path,
+    prompt,
     s3Bucket,
     awsAccessKeyId,
     awsSecretAccessKey,
@@ -45,6 +48,16 @@ function FileUploadEditorBody({
     azureStorageAccountName,
     azureStorageAccountKey,
     azureBlobContainerName,
+    googleCredentialId,
+    googleDriveFolderId,
+    sftpHost,
+    sftpPort,
+    sftpUsername,
+    sftpPassword,
+    sftpPrivateKey,
+    sftpPrivateKeyPassphrase,
+    sftpRemotePath,
+    sftpHostKey,
   } = data;
   const update = useUpdate<FileUploadNodeData>({ id: blockId, editable });
 
@@ -58,7 +71,10 @@ function FileUploadEditorBody({
         <Select
           value={storageType}
           onValueChange={(value) =>
-            value && update({ storageType: value as "s3" | "azure" })
+            value &&
+            update({
+              storageType: value as "s3" | "azure" | "google_drive" | "sftp",
+            })
           }
           disabled={!editable}
         >
@@ -68,8 +84,29 @@ function FileUploadEditorBody({
           <SelectContent>
             <SelectItem value="s3">Amazon S3</SelectItem>
             <SelectItem value="azure">Azure Blob Storage</SelectItem>
+            <SelectItem value="google_drive">Google Drive</SelectItem>
+            <SelectItem value="sftp">SFTP</SelectItem>
           </SelectContent>
         </Select>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label className="text-sm text-slate-400">Prompt</Label>
+          <HelpTooltip content={helpTooltips["fileUpload"]["prompt"]} />
+        </div>
+        <WorkflowBlockInputTextarea
+          nodeId={blockId}
+          onChange={(value) => update({ prompt: value })}
+          value={prompt ?? ""}
+          placeholder={
+            'e.g. Only upload the PDF files whose names contain "invoice"'
+          }
+          className="nopan text-xs"
+        />
+        <p className="text-xs text-slate-400">
+          Optional. Leave empty to upload all downloaded files.
+        </p>
       </div>
 
       {storageType === "s3" && (
@@ -218,6 +255,148 @@ function FileUploadEditorBody({
               nodeId={blockId}
               onChange={(value) => update({ path: value })}
               value={path as string}
+              className="nopan text-xs"
+            />
+          </div>
+        </>
+      )}
+
+      {storageType === "google_drive" && (
+        <>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Google Account</Label>
+              <HelpTooltip content="The connected Google account used for Drive uploads." />
+            </div>
+            <GoogleOAuthCredentialSelector
+              nodeId={blockId}
+              value={googleCredentialId ?? ""}
+              onChange={(value) => update({ googleCredentialId: value })}
+              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                Google Drive Folder ID (Required)
+              </Label>
+              <HelpTooltip content="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ googleDriveFolderId: value })}
+              value={googleDriveFolderId ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+        </>
+      )}
+
+      {storageType === "sftp" && (
+        <>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">SFTP Host</Label>
+              <HelpTooltip content="The SFTP host to upload files to." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpHost: value })}
+              value={sftpHost ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Port</Label>
+              <HelpTooltip content="Numeric only — template values are not supported. Defaults to 22 if left blank." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) =>
+                update({ sftpPort: value.replace(/[^0-9]/g, "") })
+              }
+              value={sftpPort ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Username</Label>
+              <HelpTooltip content="The SFTP username." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpUsername: value })}
+              value={sftpUsername ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Password</Label>
+              <HelpTooltip content="Password auth. Leave blank if using a private key. Reference a secret parameter for security." />
+            </div>
+            <WorkflowBlockInput
+              nodeId={blockId}
+              type="password"
+              onChange={(value) => update({ sftpPassword: value })}
+              value={sftpPassword ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">Private Key</Label>
+              <HelpTooltip content="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpPrivateKey: value })}
+              value={sftpPrivateKey ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                Private Key Passphrase (Optional)
+              </Label>
+              <HelpTooltip content="Optional passphrase for the private key." />
+            </div>
+            <WorkflowBlockInput
+              nodeId={blockId}
+              type="password"
+              onChange={(value) => update({ sftpPrivateKeyPassphrase: value })}
+              value={sftpPrivateKeyPassphrase ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                (Optional) Remote Directory
+              </Label>
+              <HelpTooltip content="Remote directory to upload into. Created if it does not exist. Defaults to the login directory." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpRemotePath: value })}
+              value={sftpRemotePath ?? ""}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm text-slate-400">
+                (Optional) Host Key
+              </Label>
+              <HelpTooltip content="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks." />
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ sftpHostKey: value })}
+              value={sftpHostKey ?? ""}
               className="nopan text-xs"
             />
           </div>

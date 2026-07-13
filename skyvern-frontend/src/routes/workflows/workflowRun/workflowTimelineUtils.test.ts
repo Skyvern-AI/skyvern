@@ -16,6 +16,7 @@ import {
   findBlockSurroundingThought,
   findLastExecutedBlock,
   findRunningBlock,
+  findTimelineBlock,
   flattenTimelineChronologically,
   resolveScreenshotBlockId,
 } from "./workflowTimelineUtils";
@@ -660,6 +661,10 @@ describe("classifyUnexecutedDefinedBlocks", () => {
       next_block_label: string | null;
       branch_conditions: Array<{
         id: string;
+        criteria?: {
+          description?: string | null;
+        } | null;
+        description?: string | null;
         next_block_label: string | null;
         is_default: boolean;
       }>;
@@ -686,7 +691,13 @@ describe("classifyUnexecutedDefinedBlocks", () => {
         block_type: "conditional",
         branch_conditions: [
           { id: "br_a", next_block_label: "block_a", is_default: false },
-          { id: "br_b", next_block_label: "block_b", is_default: true },
+          {
+            id: "br_b",
+            description: "Try fallback path",
+            criteria: { description: "Fallback path needed" },
+            next_block_label: "block_b",
+            is_default: false,
+          },
         ],
       }),
       buildDefinedBlock({ label: "block_a", next_block_label: null }),
@@ -699,8 +710,30 @@ describe("classifyUnexecutedDefinedBlocks", () => {
       label: "cond",
       output: {
         evaluations: [
-          { is_matched: true, next_block_label: "block_a" },
-          { is_matched: false, next_block_label: "block_b" },
+          {
+            branch_id: "br_a",
+            branch_index: 0,
+            criteria_type: "jinja2_template",
+            original_expression: "{{ found }}",
+            rendered_expression: "true",
+            result: true,
+            is_matched: true,
+            is_default: false,
+            next_block_label: "block_a",
+            error: null,
+          },
+          {
+            branch_id: "br_b",
+            branch_index: 1,
+            criteria_type: "jinja2_template",
+            original_expression: "{{ use_fallback }}",
+            rendered_expression: "false",
+            result: false,
+            is_matched: false,
+            is_default: false,
+            next_block_label: "block_b",
+            error: null,
+          },
         ],
       } as WorkflowRunBlock["output"],
     });
@@ -717,6 +750,111 @@ describe("classifyUnexecutedDefinedBlocks", () => {
     expect(reasonsByLabel(result)).toEqual({
       block_b: "branch_not_taken",
       block_b2: "branch_not_taken",
+    });
+    expect(
+      result.map((item) => [
+        item.block.label,
+        item.skippedByWorkflowRunBlockId,
+      ]),
+    ).toEqual([
+      ["block_b", "wrb_cond"],
+      ["block_b2", "wrb_cond"],
+    ]);
+    expect(result[0]?.skippedBranch).toMatchObject({
+      key: "br_b",
+      nextBlockLabel: "block_b",
+      description: "Try fallback path",
+      criteriaDescription: "Fallback path needed",
+      expression: "{{ use_fallback }}",
+      renderedExpression: "false",
+      result: false,
+      isDefault: false,
+      branchIndex: 1,
+      wasEvaluated: true,
+    });
+  });
+
+  test("labels definition branches omitted after a matched runtime evaluation as branch_not_taken", () => {
+    const defined = [
+      buildDefinedBlock({
+        label: "cond",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+          {
+            id: "br_b",
+            description: "Try the alternate path",
+            next_block_label: "block_b",
+            is_default: false,
+          },
+          {
+            id: "br_default",
+            description: "Use default fallback",
+            next_block_label: "block_default",
+            is_default: true,
+          },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: null }),
+      buildDefinedBlock({ label: "block_b", next_block_label: null }),
+      buildDefinedBlock({ label: "block_default", next_block_label: null }),
+    ];
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "cond",
+      output: {
+        evaluations: [
+          {
+            branch_id: "br_a",
+            branch_index: 0,
+            criteria_type: "jinja2_template",
+            original_expression: "{{ found }}",
+            rendered_expression: "true",
+            result: true,
+            is_matched: true,
+            is_default: false,
+            next_block_label: "block_a",
+            error: null,
+          },
+        ],
+      } as WorkflowRunBlock["output"],
+    });
+    const taken = buildBlock({
+      workflow_run_block_id: "wrb_a",
+      label: "block_a",
+      parent_workflow_run_block_id: "wrb_cond",
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(conditional, [buildBlockItem(taken)]),
+    ]);
+
+    expect(reasonsByLabel(result)).toEqual({
+      block_b: "branch_not_taken",
+      block_default: "branch_not_taken",
+    });
+    expect(result.map((item) => item.skippedByWorkflowRunBlockId)).toEqual([
+      "wrb_cond",
+      "wrb_cond",
+    ]);
+    expect(result[0]?.skippedBranch).toMatchObject({
+      key: "br_b",
+      nextBlockLabel: "block_b",
+      description: "Try the alternate path",
+      result: null,
+      isDefault: false,
+      branchIndex: 1,
+      wasEvaluated: false,
+    });
+    expect(result[1]?.skippedBranch).toMatchObject({
+      key: "br_default",
+      nextBlockLabel: "block_default",
+      description: "Use default fallback",
+      result: null,
+      isDefault: true,
+      branchIndex: 2,
+      wasEvaluated: false,
     });
   });
 
@@ -761,6 +899,14 @@ describe("classifyUnexecutedDefinedBlocks", () => {
       block_a2: "not_reached",
       block_b: "branch_not_taken",
     });
+    expect(
+      result.find((item) => item.block.label === "block_a2")
+        ?.skippedByWorkflowRunBlockId,
+    ).toBeUndefined();
+    expect(
+      result.find((item) => item.block.label === "block_b")
+        ?.skippedByWorkflowRunBlockId,
+    ).toBe("wrb_cond");
   });
 
   test("labels everything not_reached when the conditional itself never executed", () => {
@@ -903,6 +1049,28 @@ describe("classifyUnexecutedDefinedBlocks", () => {
     ]);
 
     expect(reasonsByLabel(result)).toEqual({ block_b: "not_reached" });
+  });
+});
+
+describe("findTimelineBlock", () => {
+  test("returns a nested leaf block by id so its real type is available", () => {
+    const codeLeaf = buildBlock({
+      workflow_run_block_id: "wrb_code_leaf",
+      block_type: "code",
+    });
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      block_type: "for_loop",
+    });
+    const timeline = [buildBlockItem(loop, [buildBlockItem(codeLeaf)])];
+    expect(findTimelineBlock(timeline, "wrb_code_leaf")?.block_type).toBe(
+      "code",
+    );
+  });
+
+  test("returns null for an unknown id", () => {
+    const leaf = buildBlock({ workflow_run_block_id: "wrb_leaf" });
+    expect(findTimelineBlock([buildBlockItem(leaf)], "wrb_missing")).toBeNull();
   });
 });
 

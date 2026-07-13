@@ -21,6 +21,27 @@ class WorkflowCopilotChat(BaseModel):
     modified_at: datetime = Field(..., description="When the chat was last modified")
 
 
+class WorkflowCopilotCompletionCriteriaSet(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    completion_criteria_set_id: str
+    organization_id: str
+    workflow_copilot_chat_id: str
+    goal_epoch: int
+    status: str
+    criteria: list[dict]
+    source_turn_id: str | None = None
+    source_goal_text: str | None = None
+    consecutive_all_no_evidence: int = 0
+    tripwire_fired: bool = False
+    last_fully_satisfied_workflow_yaml: str | None = None
+    superseded_by_set_id: str | None = None
+    superseded_at: datetime | None = None
+    supersede_reason: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+
 class WorkflowCopilotChatSender(StrEnum):
     USER = "user"
     AI = "ai"
@@ -87,10 +108,49 @@ class WorkflowCopilotChatRequest(BaseModel):
             "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
         ),
     )
+    target_block_label: str | None = Field(
+        None,
+        description=(
+            "When set, the copilot regenerates only this code block from its goal and leaves every "
+            "other block unchanged. Used by the block-level Generate action."
+        ),
+    )
+    fix_origin: bool = Field(
+        False,
+        description=(
+            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Routes the "
+            "run-grounded turn to diagnose-first (DIAGNOSE, no write authority) instead of a direct rewrite. "
+            "Only takes effect when a run signal (workflow_run_id or prior run context) is present; "
+            "otherwise it is a no-op."
+        ),
+    )
+    supports_credential_pause: bool = Field(
+        False,
+        description=(
+            "True when the client can render the credential_required frame. Older clients default to False "
+            "and silently drop unknown frame types, so the backend must not pause for them even if the "
+            "server-side flag is on."
+        ),
+    )
+    keep_pending_proposal: bool = Field(
+        False,
+        description=(
+            "When true, a pending proposed_workflow from an earlier turn survives turns that end without "
+            "a new proposal, so the client can keep rendering an actionable review gate."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
     cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
+
+
+class WorkflowCopilotCredentialResponseRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+    action: Literal["connected", "skip"] = Field(..., description="The user's response to the credential card")
+    credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
@@ -125,6 +185,17 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
 
 
+class WorkflowCopilotChatSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
+    workflow_permanent_id: str = Field(..., description="Workflow permanent ID the chat belongs to")
+    workflow_title: str | None = Field(None, description="Title of the workflow the chat belongs to")
+    title: str = Field(..., description="Single-line preview derived from the chat's first message")
+    created_at: datetime = Field(..., description="When the chat was created")
+    modified_at: datetime = Field(..., description="When the chat was last modified")
+
+
 class WorkflowCopilotAudioUploadResponse(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="Chat ID the audio artifact is associated with")
     audio_artifact_id: str = Field(..., description="Stored audio artifact ID")
@@ -144,6 +215,8 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     DESIGN_START = "design_start"
     DESIGN_END = "design_end"
     WORKFLOW_DRAFT = "workflow_draft"
+    CREDENTIAL_REQUIRED = "credential_required"
+    CODEGEN_PROGRESS = "codegen_progress"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -170,6 +243,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
+    )
+    workflow_applied: bool = Field(
+        False,
+        description="True when the backend already committed this terminal workflow proposal.",
     )
     cancelled: bool = Field(
         False,
@@ -234,6 +311,14 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         description=(
             "Longer-cap sanitized failure text for tooltip display. None on success. "
             "Distinct from `summary`, which is capped tighter for the visible bullet."
+        ),
+    )
+    workflow_run_id: str | None = Field(
+        None,
+        description=(
+            "The workflow run a block-running tool created, when this result came from one "
+            "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
+            "passed or failed; None for non-run tools."
         ),
     )
 
@@ -336,6 +421,42 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
+
+
+class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
+    )
+    turn_id: str = Field(..., description="UUID for the paused turn; correlates with credential-response POSTs")
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+    resume_token: str = Field(..., description="One-time token the credential-response POST must echo back to resume")
+    reason: Literal[
+        "workflow_credential_inputs_unbound",
+        "missing_credential_run_failure",
+        "credential_deferred_draft",
+    ] = Field(..., description="Typed signal that triggered the pause")
+    message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
+    login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
+    credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
+    timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
+    expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotCodegenProgressUpdate(BaseModel):
+    """Live-only drafting progress while the LLM streams authoring-tool arguments. Not persisted; the
+    workflow_draft frame supersedes it."""
+
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.CODEGEN_PROGRESS, description="Message type"
+    )
+    tool_name: str = Field(..., description="Authoring tool whose arguments are being streamed")
+    blocks_drafted: list[str] = Field(
+        default_factory=list, description="Cumulative ordered unique block labels seen so far in this call"
+    )
+    chars_streamed: int = Field(..., description="Cumulative argument characters streamed so far in this call")
+    iteration: int = Field(..., description="Agent loop iteration number; matches the TOOL_CALL frame that follows")
+    timestamp: datetime = Field(..., description="Server timestamp")
 
 
 class WorkflowYAMLConversionRequest(BaseModel):

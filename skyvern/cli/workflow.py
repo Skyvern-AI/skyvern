@@ -10,8 +10,9 @@ from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.utils.env_paths import EnvIntent
 
 from .commands._output import resolve_inline_or_file, run_tool
+from .lazy import SkyvernTyperGroup
 
-workflow_app = typer.Typer(help="Manage Skyvern workflows.", no_args_is_help=True)
+workflow_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage Skyvern workflows.", no_args_is_help=True)
 
 
 async def tool_workflow_list(**kwargs: Any) -> dict[str, Any]:
@@ -96,6 +97,7 @@ def workflow_list(
     search: str | None = typer.Option(
         None,
         "--search",
+        "--query",
         help="Search across workflow titles, folder names, and parameter metadata.",
     ),
     page: int = typer.Option(1, "--page", min=1, help="Page number (1-based)."),

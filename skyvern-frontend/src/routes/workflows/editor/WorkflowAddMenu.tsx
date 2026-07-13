@@ -89,8 +89,10 @@ function WorkflowAddMenu({
     isUploadingSOP,
   ]);
 
-  // Show menu in debug mode regardless of browser state
-  if (!debugStore.isDebugMode) {
+  // The studio editor (/studio, blockRunsEnabled) surfaces these actions too;
+  // gating on blockRunsEnabled avoids flipping isDebugMode, which would lock the
+  // canvas zoom/pan. Mirrors NodeHeader's block-run gate.
+  if (!debugStore.isDebugMode && !debugStore.blockRunsEnabled) {
     return <>{children}</>;
   }
 

@@ -10,7 +10,7 @@ from .workflow_run_request_output_proxy_location import WorkflowRunRequestOutput
 class WorkflowRunRequestOutput(UniversalBaseModel):
     workflow_id: str = pydantic.Field()
     """
-    ID of the workflow to run. Workflow ID starts with `wpid_`.
+    ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.
     """
 
     parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
@@ -96,7 +96,7 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
 
     max_elapsed_time_minutes: typing.Optional[int] = pydantic.Field(default=None)
     """
-    Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+    Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
     """
 
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)

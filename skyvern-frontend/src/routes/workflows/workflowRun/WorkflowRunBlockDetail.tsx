@@ -1,6 +1,7 @@
 import type { ActionsApiResponse } from "@/api/types";
-import { useState } from "react";
-import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
+import { useMemo } from "react";
+import { FileIcon } from "@radix-ui/react-icons";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
   isObserverThought,
@@ -9,6 +10,10 @@ import {
   type WorkflowRunBlock,
   type WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
+import {
+  getBlockDownloadedFileUrls,
+  pickDownloadedFileFilename,
+} from "./blockDownloadedFiles";
 import type { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 import {
   findBlockSurroundingAction,
@@ -37,10 +42,8 @@ type Props = {
   activeIteration?: number | null;
   timeline: Array<WorkflowRunTimelineItem>;
   timelineReady?: boolean;
-  onActionSelect?: (payload: {
-    block: WorkflowRunBlock;
-    action: ActionsApiResponse;
-  }) => void;
+  showDownloadedFiles?: boolean;
+  workflowRunId?: string;
   onThoughtSelect?: (thought: ObserverThought) => void;
 };
 
@@ -48,52 +51,67 @@ function isLoopBlock(block: WorkflowRunBlock): boolean {
   return block.block_type === "for_loop" || block.block_type === "while_loop";
 }
 
-function SelectedActionHeader({
-  action,
+function BlockDownloadedFiles({
   block,
-  index,
-  onActionSelect,
+  workflowRunId,
 }: {
-  action: ActionsApiResponse;
   block: WorkflowRunBlock;
-  index: number;
-  onActionSelect?: Props["onActionSelect"];
+  workflowRunId?: string;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    workflowRunId ? { workflowRunId } : undefined,
+  );
+  const files = useMemo(() => {
+    const freshUrls = workflowRun?.downloaded_file_urls ?? [];
+    const urls = getBlockDownloadedFileUrls(block.output, freshUrls);
+    if (urls.length === 0) {
+      return [];
+    }
+    const filenameByUrl = new Map<string, string>();
+    for (const file of workflowRun?.downloaded_files ?? []) {
+      if (file.filename) {
+        filenameByUrl.set(file.url, file.filename);
+      }
+    }
+    return urls.map((url) => ({
+      url,
+      filename: pickDownloadedFileFilename(url, filenameByUrl),
+    }));
+  }, [block.output, workflowRun]);
+
+  if (files.length === 0) {
+    return null;
+  }
 
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-2 duration-200 animate-in fade-in slide-in-from-top-1">
-      <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500">
-        Selected action
+    <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-3">
+      <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        Downloaded files
       </div>
-      <ActionCardCompact
-        action={action}
-        active
-        index={index}
-        expanded={expanded}
-        onToggleExpanded={() => setExpanded((prev) => !prev)}
-        onSelect={() => onActionSelect?.({ block, action })}
-        cardClassName="bg-slate-800/70"
-      />
+      <div className="flex flex-col gap-2">
+        {files.map((file) => (
+          <div
+            key={file.url}
+            title={file.url}
+            className="flex items-center gap-2 text-sm"
+          >
+            <FileIcon className="size-4 shrink-0 text-slate-400" />
+            <a
+              href={file.url}
+              className="truncate underline underline-offset-4"
+            >
+              {file.filename}
+            </a>
+          </div>
+        ))}
+      </div>
     </div>
   );
-}
-
-function getActionDisplayIndex(
-  block: WorkflowRunBlock,
-  action: ActionsApiResponse,
-): number {
-  const actionsTopDown = [...(block.actions ?? [])].reverse();
-  const index = actionsTopDown.findIndex(
-    (item) => item.action_id === action.action_id,
-  );
-  return index === -1 ? 1 : index + 1;
 }
 
 function renderBodyForBlock(
   block: WorkflowRunBlock,
   activeItem: WorkflowRunOverviewActiveElement,
-  onActionSelect: Props["onActionSelect"],
   onThoughtSelect: Props["onThoughtSelect"],
   activeIteration: number | null,
   timeline: Array<WorkflowRunTimelineItem>,
@@ -107,11 +125,11 @@ function renderBodyForBlock(
     case "login":
     case "validation":
     case "extraction":
+    case "file_download":
       return (
         <BlockDetailTask
           block={block}
           activeItem={activeItem}
-          onActionSelect={onActionSelect}
           onThoughtSelect={onThoughtSelect}
           thoughts={thoughts}
         />
@@ -137,7 +155,8 @@ function WorkflowRunBlockDetail({
   activeIteration = null,
   timeline,
   timelineReady = true,
-  onActionSelect,
+  showDownloadedFiles = false,
+  workflowRunId,
   onThoughtSelect,
 }: Props) {
   // activeIteration is a URL hint scoped to a specific selection. In
@@ -169,7 +188,6 @@ function WorkflowRunBlockDetail({
   // they bypass the block header and render only as the body slot.
   let resolvedBlock: WorkflowRunBlock | null = null;
   let selectedAction: ActionsApiResponse | null = null;
-  let selectedActionIndex = 1;
   let body: React.ReactNode;
 
   if (activeItem === null || activeItem === "stream") {
@@ -183,7 +201,6 @@ function WorkflowRunBlockDetail({
       body = renderBodyForBlock(
         target,
         activeItem,
-        onActionSelect,
         onThoughtSelect,
         effectiveIteration,
         timeline,
@@ -199,11 +216,9 @@ function WorkflowRunBlockDetail({
     if (parentBlock) {
       resolvedBlock = parentBlock;
       selectedAction = activeItem;
-      selectedActionIndex = getActionDisplayIndex(parentBlock, activeItem);
       body = renderBodyForBlock(
         parentBlock,
         activeItem,
-        onActionSelect,
         onThoughtSelect,
         effectiveIteration,
         timeline,
@@ -220,7 +235,6 @@ function WorkflowRunBlockDetail({
     body = renderBodyForBlock(
       activeItem,
       activeItem,
-      onActionSelect,
       onThoughtSelect,
       effectiveIteration,
       timeline,
@@ -247,15 +261,15 @@ function WorkflowRunBlockDetail({
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div>
-          {resolvedBlock && selectedAction && (
-            <SelectedActionHeader
-              action={selectedAction}
+          {resolvedBlock && (
+            <BlockInspector block={resolvedBlock} action={selectedAction} />
+          )}
+          {resolvedBlock && showDownloadedFiles && (
+            <BlockDownloadedFiles
               block={resolvedBlock}
-              index={selectedActionIndex}
-              onActionSelect={onActionSelect}
+              workflowRunId={workflowRunId}
             />
           )}
-          {resolvedBlock && <BlockInspector block={resolvedBlock} />}
           {body}
         </div>
       </div>

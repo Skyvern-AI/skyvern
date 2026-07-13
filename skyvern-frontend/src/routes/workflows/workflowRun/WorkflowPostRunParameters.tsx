@@ -26,6 +26,7 @@ import { HumanInteractionBlockParameters } from "./blockInfo/HumanInteractionBlo
 import { ConditionalBlockParameters } from "./blockInfo/ConditionalBlockParameters";
 import { Taskv2BlockParameters } from "./blockInfo/Taskv2BlockParameters";
 import { WhileLoopPostRunFields } from "../components/WhileLoopPostRunFields";
+import { hasExtraHttpHeaders } from "@/util/extraHttpHeaders";
 
 function WorkflowPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -75,6 +76,7 @@ function WorkflowPostRunParameters() {
   const extraHttpHeaders = isTaskV2
     ? (workflowRun?.task_v2?.extra_http_headers ?? null)
     : (workflowRun?.extra_http_headers ?? null);
+  const showExtraHttpHeaders = hasExtraHttpHeaders(extraHttpHeaders);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return <div>Loading workflow inputs...</div>;
@@ -176,6 +178,11 @@ function WorkflowPostRunParameters() {
             <CodeBlockParameters
               code={definitionBlock.code}
               parameters={definitionBlock.parameters}
+              prompt={definitionBlock.prompt}
+              steps={definitionBlock.steps}
+              blockStatus={activeBlock.status}
+              failureReason={activeBlock.failure_reason}
+              actions={activeBlock.actions}
             />
           </div>
         </div>
@@ -397,20 +404,20 @@ function WorkflowPostRunParameters() {
               }}
             />
           </div>
-          <div className="flex gap-16">
-            <div className="w-80">
-              <h1 className="text-lg">Extra HTTP Headers</h1>
+          {showExtraHttpHeaders ? (
+            <div className="flex gap-16">
+              <div className="w-80">
+                <h1 className="text-lg">Extra HTTP Headers</h1>
+              </div>
+              <div className="w-full">
+                <KeyValueInput
+                  value={JSON.stringify(extraHttpHeaders)}
+                  readOnly={true}
+                  onChange={() => {}}
+                />
+              </div>
             </div>
-            <div className="w-full">
-              <KeyValueInput
-                value={
-                  extraHttpHeaders ? JSON.stringify(extraHttpHeaders) : null
-                }
-                readOnly={true}
-                onChange={() => {}}
-              />
-            </div>
-          </div>
+          ) : null}
           {workflowRun.browser_session_id ? (
             <div className="flex gap-16">
               <div className="w-80">

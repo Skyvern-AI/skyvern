@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.41"
+version = "1.0.46"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -31,10 +31,10 @@ local = [
     "yutori>=0.5.0",
     "sqlalchemy>=2.0.29,<3",
     "aiohttp>=3.13.4,<4",
-    "python-multipart>=0.0.27,<1",
+    "python-multipart>=0.0.30,<1",
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
-    "litellm==1.83.14",
+    "litellm>=1.84.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
@@ -43,8 +43,9 @@ local = [
     "starlette-context>=0.3.6,<0.6",
     "fastapi>=0.136.1,<0.137",
     "alembic>=1.12.1,<2",
-    "PyJWT[crypto]>=2.12.0,<3",
+    "PyJWT[crypto]>=2.13.0,<3",
     "aioboto3>=14.3.0,<15",
+    "asyncssh>=2.14.2,<3",
     "asyncache>=0.3.1,<0.4",
     "filetype>=1.2.0,<2",
     "fuzzysearch>=0.8,<1",
@@ -56,7 +57,7 @@ local = [
     "pyotp>=2.9.0,<3",
     "json5>=0.13.0,<1",
     "json-repair>=0.59.5,<0.60",
-    "pypdf>=6.7.5,<7",
+    "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
@@ -82,7 +83,9 @@ local = [
     "croniter>=1.3.8,<4",
     "authlib>=1.7.1",
     "pyasn1>=0.6.3",
-    "tornado>=6.5.5",
+    "tornado>=6.5.6",
+    "cryptography>=48.0.1",
+    "starlette>=1.3.1",
     "aiosqlite>=0.21.0,<0.23",
 ]
 # Server is intentionally a superset of local. Keep shared runtime deps in sync
@@ -99,11 +102,11 @@ server = [
     "python-dotenv==1.2.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
     "aiohttp>=3.13.4,<4",
-    "python-multipart>=0.0.27,<1",
+    "python-multipart>=0.0.30,<1",
     "toml>=0.10.2,<0.11",
     "jinja2>=3.1.2,<4",
     "uvicorn[standard]>=0.44.0",
-    "litellm==1.83.14",
+    "litellm>=1.84.0",
     "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
     "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
     "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
@@ -114,8 +117,9 @@ server = [
     "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
     "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
     "alembic>=1.12.1,<2",
-    "PyJWT[crypto]>=2.12.0,<3",
+    "PyJWT[crypto]>=2.13.0,<3",
     "aioboto3>=14.3.0,<15",
+    "asyncssh>=2.14.2,<3",
     "asyncache>=0.3.1,<0.4",
     "types-toml>=0.10.8.7,<0.11",
     "filetype>=1.2.0,<2",
@@ -131,9 +135,11 @@ server = [
     "asyncpg>=0.30.0,<0.32",
     "json5>=0.13.0,<1",
     "json-repair>=0.59.5,<0.60",
-    "pypdf>=6.7.5,<7",
+    "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
-    "fastmcp>=3.2.0,<4",
+    # <3.4: 3.4.3 enables HostOriginGuardMiddleware by default (421 on public hosts, SKY-12003).
+    # cloud_app passes allowed_hosts/allowed_origins when supported; validate against 3.4.x before raising.
+    "fastmcp>=3.2.0,<3.4",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
     "anthropic>=0.97.0,<0.98",
@@ -159,12 +165,17 @@ server = [
     "croniter>=1.3.8,<4",
     "authlib>=1.7.1",
     "pyasn1>=0.6.3",
-    "tornado>=6.5.5",
+    "tornado>=6.5.6",
+    "cryptography>=48.0.1",
+    "starlette>=1.3.1",
     "aiosqlite>=0.21.0,<0.23",
 ]
 
 [dependency-groups]
 cloud = [
+    # Remote-browser vendor SDKs used only by cloud-side factories.
+    "browser-use-sdk>=3.8,<4",
+    "anchorbrowser>=0.11,<0.12",
     # Keep workflow-copilot on the newer Agents SDK for cloud/source installs.
     # uv's override-dependencies below relax LiteLLM's exact transitive pins,
     # but those overrides do not ship in public wheel metadata.
@@ -260,17 +271,28 @@ override-dependencies = [
     "openai>=2.24.0",
     # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
     "httpx[socks]>=0.26.0",
+    # litellm exact-pins aiohttp; relax so the security-patched
+    # 3.14.x resolves for cloud/source installs (plain pip keeps litellm's pin).
+    "aiohttp>=3.14.0",
+    # A remote-browser vendor SDK declares playwright>=1.55, but the local/server
+    # groups pin playwright==1.46.0 on python<3.12 for binary-compat. Skyvern
+    # connects to the remote session via its own playwright, so the SDK's
+    # playwright dep is unused at runtime. Relax it to match.
+    "playwright>=1.46.0",
 ]
 constraint-dependencies = [
     "authlib>=1.7.1",
+    "cryptography>=48.0.1",
     "flask>=3.1.3",
     "idna>=3.15",
-    "joserfc>=1.6.3",
-    "jupyter-server>=2.18.0",
+    "joserfc>=1.6.8",
+    "jupyter-server>=2.20.0",
     "mako>=1.3.12",
     "mistune>=3.2.1",
+    "msgpack>=1.2.1",
     "pyasn1>=0.6.3",
-    "tornado>=6.5.5",
+    "starlette>=1.3.1",
+    "tornado>=6.5.6",
     "werkzeug>=3.1.6",
 ]
 

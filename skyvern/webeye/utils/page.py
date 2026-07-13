@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import time
+import urllib.parse
 from enum import StrEnum
 from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -18,8 +21,48 @@ from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
+
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+
+
+async def _safe_tab_title(page: Page) -> str:
+    try:
+        return await asyncio.wait_for(page.title(), timeout=1.0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("tab_title_fetch_failed", url=page.url)
+        return ""
+
+
+async def build_open_tabs_context(
+    browser_state: BrowserState,
+    working_page: Page | None,
+) -> str | None:
+    if working_page is None:
+        return None
+    pages = await browser_state.list_valid_pages()
+    if len(pages) <= 1:
+        return None
+    # Fetch titles concurrently so a few slow tabs don't add N×timeout latency to every iteration.
+    titles = await asyncio.gather(*(_safe_tab_title(p) for p in pages))
+    lines: list[str] = []
+    for i, (p, title) in enumerate(zip(pages, titles)):
+        marker = " [current]" if p == working_page else ""
+        url = p.url
+        if len(url) > 120:
+            url = url[:117] + "..."
+        if len(title) > 80:
+            title = title[:77] + "..."
+        entry = f"Tab {i}{marker}: {url}"
+        if title:
+            entry += f" ({title})"
+        lines.append(entry)
+    return "\n".join(lines)
 
 
 def load_js_script() -> str:
@@ -47,6 +90,29 @@ def _is_navigation_context_lost(error_msg: str) -> bool:
     return "ReferenceError" in error_msg and "is not defined" in error_msg
 
 
+def _is_json_inlinable(arg: Any) -> bool:
+    # ElementHandle / JSHandle aren't JSON-serialisable; those must keep
+    # Playwright's own marshalling instead of being inlined into Runtime.evaluate.
+    try:
+        json.dumps(arg)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | None) -> Any:
+    # Page + prefix + JSON-safe arg → main-world hook (preserves the marker).
+    # Iframe Frames and non-JSON args fall back to per-frame evaluate so iframe
+    # contexts and Playwright handle-marshalling keep working.
+    if not isinstance(frame, Page):
+        return await frame.evaluate(expression=expression, arg=arg)
+    if get_main_world_prefix(frame.context) is None:
+        return await frame.evaluate(expression=expression, arg=arg)
+    if arg is not None and not _is_json_inlinable(arg):
+        return await frame.evaluate(expression=expression, arg=arg)
+    return await evaluate_in_main_world(frame, expression, arg)
+
+
 async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) -> None:
     if timeout_ms <= 0:
         return
@@ -54,6 +120,19 @@ async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) ->
         await frame.wait_for_load_state("networkidle", timeout=timeout_ms)
     except PlaywrightError:
         return
+
+
+async def _wait_for_screenshot_load_state(page: Page, timeout_ms: float) -> None:
+    # Best-effort readiness guard before capturing. 'domcontentloaded' fires far
+    # earlier than 'load'; pages with streaming/long-polling/SSE/websockets or a
+    # persistent spinner may never fire 'load', so a timeout here must be
+    # non-fatal — the capture has its own (separate) timeout budget.
+    if timeout_ms <= 0:
+        return
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except (PlaywrightError, TimeoutError):
+        LOG.warning("Page did not reach domcontentloaded before screenshot; capturing current state anyway")
 
 
 def _load_cursor_overlay_js() -> str:
@@ -126,8 +205,9 @@ async def _current_viewpoint_screenshot_helper(
 
     try:
         if mode == ScreenshotMode.DETAILED:
-            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
-            LOG.debug("Page is fully loaded, agent is about to take screenshots")
+            await _wait_for_screenshot_load_state(
+                page, timeout_ms=SettingsManager.get_settings().BROWSER_SCREENSHOT_LOAD_STATE_TIMEOUT_MS
+            )
         start_time = time.time()
         screenshot: bytes = b""
         if file_path:
@@ -178,8 +258,10 @@ async def _scrolling_screenshots_helper(
     frame = "main.frame"
     frame_index = 0
 
-    # when mode is lite, we don't draw bounding boxes
-    # since draw_boxes impacts the performance of processing
+    # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+    # ``draw_boxes`` is False by default for all scrape callers; the ``if draw_boxes:``
+    # branches below are retained briefly for backwards compatibility and are
+    # scheduled for removal. The LITE-mode override is kept as a defensive guard.
     if mode == ScreenshotMode.LITE:
         draw_boxes = False
 
@@ -278,6 +360,95 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
     return merged_img
 
 
+# FileReader keeps the payload binary-safe without arrayBuffer/Uint8Array
+# transcoding back across CDP.
+_BLOB_FETCH_JS = """
+async (args) => {
+    try {
+        const { blobUrl, maxSizeBytes } = args;
+        const response = await fetch(blobUrl);
+        if (!response.ok) {
+            return { ok: false, status: response.status };
+        }
+        const blob = await response.blob();
+        // Reject oversized blobs before serializing them to a data URL, so a huge
+        // client-side blob can't be read fully into memory / base64-transcoded.
+        if (maxSizeBytes != null && blob.size > maxSizeBytes) {
+            return { ok: false, error: 'too_large', size: blob.size };
+        }
+        return await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const result = reader.result || '';
+                const comma = result.indexOf(',');
+                if (comma === -1) {
+                    resolve({ ok: false, error: 'no_data_url_payload' });
+                    return;
+                }
+                resolve({ ok: true, base64: result.substring(comma + 1) });
+            };
+            reader.onerror = () => resolve({ ok: false, error: 'file_reader_error' });
+            reader.readAsDataURL(blob);
+        });
+    } catch (err) {
+        return { ok: false, error: String(err) };
+    }
+}
+"""
+
+
+def _blob_url_origin(blob_url: str) -> str | None:
+    if not blob_url.startswith("blob:"):
+        return None
+    parsed = urllib.parse.urlparse(blob_url[len("blob:") :])
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _frame_origin(frame_url: str | None) -> str | None:
+    if not frame_url:
+        return None
+    if frame_url.startswith("blob:"):
+        return _blob_url_origin(frame_url)
+    parsed = urllib.parse.urlparse(frame_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _frames_for_blob_origin(page: Page, blob_origin: str) -> list[Frame]:
+    """Return frames whose origin matches the blob's origin, main frame first."""
+    seen: set[int] = set()
+    matches: list[Frame] = []
+    candidates: list[Frame] = [page.main_frame, *page.frames]
+    for frame in candidates:
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        try:
+            frame_url = frame.url
+        except Exception:
+            continue
+        if _frame_origin(frame_url) == blob_origin:
+            matches.append(frame)
+    return matches
+
+
+def _all_page_frames(page: Page) -> list[Frame]:
+    """All frames on the page, main frame first, deduped."""
+    seen: set[int] = set()
+    frames: list[Frame] = []
+    for frame in [page.main_frame, *page.frames]:
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        frames.append(frame)
+    return frames
+
+
 class SkyvernFrame:
     @staticmethod
     async def evaluate(
@@ -288,7 +459,7 @@ class SkyvernFrame:
     ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
-                return await frame.evaluate(expression=expression, arg=arg)
+                return await _dispatch_evaluate(frame, expression, arg)
         except PlaywrightError as e:
             error_msg = str(e)
             if not _is_navigation_context_lost(error_msg):
@@ -300,8 +471,23 @@ class SkyvernFrame:
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
             )
+        except RuntimeError as e:
+            # `evaluate_in_main_world` raises RuntimeError on Runtime.evaluate
+            # exception payloads; only navigation-context-lost text recovers here.
+            error_msg = str(e)
+            if not _is_navigation_context_lost(error_msg):
+                raise
+            return await SkyvernFrame._evaluate_with_navigation_recovery(
+                frame=frame,
+                expression=expression,
+                arg=arg,
+                timeout_ms=timeout_ms,
+                initial_error=error_msg,
+            )
         except asyncio.TimeoutError:
-            LOG.exception("Skyvern timed out trying to analyze the page", expression=expression)
+            # Re-raised and handled by the caller (scrape retries / failure classification),
+            # so this is not the failure boundary; log without a traceback at warning.
+            LOG.warning("Skyvern timed out trying to analyze the page", expression=expression)
             raise TimeoutError("Skyvern timed out trying to analyze the page")
 
     @staticmethod
@@ -327,7 +513,7 @@ class SkyvernFrame:
         last_error_msg = initial_error
         for attempt in range(1, _NAVIGATION_RECOVERY_MAX_ATTEMPTS + 1):
             if _remaining_seconds() <= 0:
-                LOG.error(
+                LOG.warning(
                     "Skyvern timed out trying to analyze the page after navigation recovery",
                     expression=expression,
                 )
@@ -351,14 +537,16 @@ class SkyvernFrame:
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(inject_budget):
-                    await frame.evaluate(expression=JS_FUNCTION_DEFS)
+                    # Same dispatch helper so a prefixed Page re-injects
+                    # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
+                    await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
             except asyncio.TimeoutError:
                 LOG.exception(
                     "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
                     expression=expression,
                 )
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
-            except PlaywrightError as inject_err:
+            except (PlaywrightError, RuntimeError) as inject_err:
                 last_error_msg = str(inject_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
                     LOG.warning(
@@ -377,11 +565,11 @@ class SkyvernFrame:
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    return await frame.evaluate(expression=expression, arg=arg)
+                    return await _dispatch_evaluate(frame, expression, arg)
             except asyncio.TimeoutError:
                 LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
                 raise TimeoutError("Skyvern timed out trying to analyze the page")
-            except PlaywrightError as retry_err:
+            except (PlaywrightError, RuntimeError) as retry_err:
                 last_error_msg = str(retry_err)
                 if attempt == _NAVIGATION_RECOVERY_MAX_ATTEMPTS or not _is_navigation_context_lost(last_error_msg):
                     raise
@@ -392,6 +580,92 @@ class SkyvernFrame:
     @staticmethod
     async def get_url(frame: Page | Frame) -> str:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
+
+    @staticmethod
+    async def read_blob_url_bytes(
+        page: Page,
+        blob_url: str,
+        workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        probe: bool = False,
+    ) -> bytes | None:
+        # probe=True is for best-effort multi-page fallback where the caller tries every open
+        # page; expected misses on non-owning pages shouldn't spam ERROR/WARN logs, so downgrade
+        # give-up/retry logging to debug. The final failure signal stays with the caller.
+        give_up_log = LOG.debug if probe else LOG.error
+        retry_log = LOG.debug if probe else LOG.warning
+
+        blob_origin = _blob_url_origin(blob_url)
+        if blob_origin is not None:
+            frames = _frames_for_blob_origin(page, blob_origin)
+        elif blob_url.startswith("blob:"):
+            # Opaque-origin blobs (blob:null/...) from sandboxed iframes or data: documents have
+            # no matchable origin — probe every frame since we can't identify the owner by origin.
+            frames = _all_page_frames(page)
+        else:
+            give_up_log("blob URL read aborted: not a blob URL", workflow_run_id=workflow_run_id)
+            return None
+
+        if not frames:
+            give_up_log("blob URL read found no candidate frame", workflow_run_id=workflow_run_id)
+            return None
+
+        # blob.size is checked in-page against this before the payload is serialized.
+        blob_arg = {"blobUrl": blob_url, "maxSizeBytes": max_size_bytes}
+        main_frame = page.main_frame
+        for frame in frames:
+            try:
+                # Main-frame routes through evaluate_in_main_world so any
+                # context-level main-world prefix stays attached; sub-frames use
+                # frame.evaluate (main-world prefixes are page-scoped).
+                if frame is main_frame:
+                    result = await evaluate_in_main_world(page, _BLOB_FETCH_JS, blob_arg)
+                else:
+                    result = await frame.evaluate(_BLOB_FETCH_JS, blob_arg)
+            except Exception:
+                retry_log(
+                    "blob URL in-frame fetch raised; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(result, dict) and result.get("error") == "too_large":
+                LOG.warning(
+                    "blob URL exceeds max size; not reading",
+                    workflow_run_id=workflow_run_id,
+                    size=result.get("size"),
+                    max_size_bytes=max_size_bytes,
+                )
+                return None
+            if not isinstance(result, dict) or not result.get("ok"):
+                retry_log(
+                    "blob URL in-frame fetch returned not-ok; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    result=result if isinstance(result, dict) else None,
+                )
+                continue
+            b64_payload = result.get("base64")
+            if not isinstance(b64_payload, str):
+                retry_log(
+                    "blob URL in-frame fetch returned non-string payload; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                )
+                continue
+            try:
+                return base64.b64decode(b64_payload, validate=True)
+            except Exception:
+                retry_log(
+                    "blob URL in-frame fetch payload was not valid base64; trying next frame if any",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                continue
+
+        give_up_log(
+            "blob URL read could not retrieve bytes from any matching frame",
+            workflow_run_id=workflow_run_id,
+        )
+        return None
 
     # -- cursor overlay helpers ------------------------------------------------
 
@@ -682,6 +956,34 @@ class SkyvernFrame:
         js_script = "(element) => element.click()"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
+    async def read_autocomplete_option_identity(self, element: ElementHandle) -> dict[str, Any] | None:
+        js_script = r"""
+        (node) => {
+            const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
+            const attrs = node.getAttributeNames
+                ? Object.fromEntries(node.getAttributeNames().map((name) => [name, node.getAttribute(name)]))
+                : {};
+            const label = normalize(
+                node.textContent ||
+                attrs["aria-label"] ||
+                attrs.title ||
+                attrs["data-value"] ||
+                attrs.value
+            );
+            const parent = node.parentElement;
+            const optionNodes = parent
+                ? Array.from(parent.children).filter((element) => {
+                    const role = (element.getAttribute("role") || "").toLowerCase();
+                    const tag = element.tagName.toLowerCase();
+                    return role === "option" || tag === "li" || element.hasAttribute("data-value");
+                })
+                : [];
+            return { index: optionNodes.indexOf(node), label };
+        }
+        """
+        identity = await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+        return identity if isinstance(identity, dict) else None
+
     async def remove_target_attr(self, element: ElementHandle) -> None:
         js_script = "(element) => element.removeAttribute('target')"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
@@ -821,7 +1123,7 @@ class SkyvernFrame:
                 await self._wait_for_loading_indicators_gone(timeout_ms=loading_indicator_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 loading_indicator_result = "timeout"
-                LOG.warning("Loading indicator timeout - some indicators may still be present, proceeding")
+                LOG.info("Loading indicator timeout - some indicators may still be present, proceeding", sampling=True)
             except Exception:
                 loading_indicator_result = "error"
                 LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
@@ -837,7 +1139,10 @@ class SkyvernFrame:
                 await self.frame.wait_for_load_state("networkidle", timeout=network_idle_timeout_ms)
             except (TimeoutError, asyncio.TimeoutError):
                 network_idle_result = "timeout"
-                LOG.warning("Network idle timeout - page may have constant activity, proceeding")
+                LOG.info("Network idle timeout - page may have constant activity, proceeding", sampling=True)
+            except Exception:
+                network_idle_result = "error"
+                LOG.warning("Failed to check network idle, proceeding", exc_info=True)
             finally:
                 _ni_span.set_attribute("result", network_idle_result)
 

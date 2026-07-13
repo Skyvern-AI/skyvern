@@ -16,13 +16,16 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
+from skyvern.forge.sdk.api.gcp import GcpClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
+from skyvern.forge.sdk.api.real_gcp import RealGcpClientFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.factory import CacheFactory
@@ -37,6 +40,8 @@ from skyvern.forge.sdk.services.credential.azure_credential_vault_service import
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
+from skyvern.forge.sdk.services.credential.gcp_credential_vault_service import GcpCredentialVaultService
+from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -69,6 +74,7 @@ class ForgeApp:
     UI_TARS_CLIENT: AsyncOpenAI | None
     YUTORI_CLIENT: AsyncYutoriClient | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
+    GCP_CLIENT_FACTORY: GcpClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
     SELECT_AGENT_LLM_API_HANDLER: LLMAPIHandler
     NORMAL_SELECT_AGENT_LLM_API_HANDLER: LLMAPIHandler
@@ -83,15 +89,19 @@ class ForgeApp:
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
     SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
     ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER: LLMAPIHandler
     WORKFLOW_COPILOT_FAST_LLM_API_HANDLER: LLMAPIHandler
+    WORKFLOW_COPILOT_LITE_LLM_API_HANDLER: LLMAPIHandler | None
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
+    SKYVERN_CREDENTIAL_VAULT_SERVICE: SkyvernCredentialVaultService | None
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
+    GCP_CREDENTIAL_VAULT_SERVICE: GcpCredentialVaultService | None
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
     scrape_exclude: ScrapeExcludeFunc | None
@@ -122,6 +132,8 @@ def create_forge_app() -> ForgeApp:
         StorageFactory.set_storage(S3Storage())
     elif settings.SKYVERN_STORAGE_TYPE == "azureblob":
         StorageFactory.set_storage(AzureStorage())
+    elif settings.SKYVERN_STORAGE_TYPE == "gcs":
+        StorageFactory.set_storage(GcsStorage())
     app.STORAGE = StorageFactory.get_storage()
     app.CACHE = CacheFactory.get_cache()
 
@@ -248,15 +260,25 @@ def create_forge_app() -> ForgeApp:
         if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
         else app.LLM_API_HANDLER
     )
+    app.WORKFLOW_COPILOT_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_LLM_KEY
+        else app.LLM_API_HANDLER
+    )
     app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER = (
         LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_AGENT_LLM_KEY)
         if settings.WORKFLOW_COPILOT_AGENT_LLM_KEY
-        else app.LLM_API_HANDLER
+        else app.WORKFLOW_COPILOT_LLM_API_HANDLER
     )
     app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER = (
         LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_FAST_LLM_KEY)
         if settings.WORKFLOW_COPILOT_FAST_LLM_KEY
         else app.SECONDARY_LLM_API_HANDLER
+    )
+    app.WORKFLOW_COPILOT_LITE_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_LITE_LLM_KEY)
+        if settings.WORKFLOW_COPILOT_LITE_LLM_KEY
+        else None
     )
 
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
@@ -274,6 +296,10 @@ def create_forge_app() -> ForgeApp:
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
+    app.GCP_CLIENT_FACTORY = RealGcpClientFactory()
+    app.SKYVERN_CREDENTIAL_VAULT_SERVICE = (
+        SkyvernCredentialVaultService() if settings.is_local_credential_vault_enabled() else None
+    )
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
 
     # Azure Credential Vault Service
@@ -300,6 +326,15 @@ def create_forge_app() -> ForgeApp:
         )
     else:
         app.AZURE_CREDENTIAL_VAULT_SERVICE = None
+
+    if settings.GCP_CREDENTIAL_VAULT_PROJECT_ID:
+        app.GCP_CREDENTIAL_VAULT_SERVICE = GcpCredentialVaultService(
+            app.GCP_CLIENT_FACTORY.create_secret_manager_client(),
+            project_id=settings.GCP_CREDENTIAL_VAULT_PROJECT_ID,
+        )
+    else:
+        app.GCP_CREDENTIAL_VAULT_SERVICE = None
+
     app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
         CustomCredentialVaultService(
             CustomCredentialAPIClient(
@@ -311,8 +346,10 @@ def create_forge_app() -> ForgeApp:
         else CustomCredentialVaultService()  # Create service without client for organization-based configuration
     )
     app.CREDENTIAL_VAULT_SERVICES = {
+        CredentialVaultType.SKYVERN: app.SKYVERN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
     }
 

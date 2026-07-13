@@ -1,13 +1,11 @@
-import { useState } from "react";
 import {
   CheckCircledIcon,
   CrossCircledIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { Status, type ActionsApiResponse } from "@/api/types";
+import { Status } from "@/api/types";
 import { CopyButton } from "@/components/CopyButton";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
 import {
   Tooltip,
   TooltipContent,
@@ -19,7 +17,6 @@ import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
 import { WorkflowBlockIcon } from "@/routes/workflows/editor/nodes/WorkflowBlockIcon";
 import { cn } from "@/util/utils";
 import {
-  isAction,
   type ObserverThought,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
@@ -141,33 +138,17 @@ function BlockDetailHeader({
 
   return (
     <div className="border-b border-slate-700 bg-slate-elevation1">
-      <div className="flex items-center gap-2 px-3 py-2 text-xs">
+      <div
+        data-slot="block-detail-header-primary"
+        className="flex items-center gap-2 px-3 py-2"
+      >
         <WorkflowBlockIcon
           workflowBlockType={block.block_type}
-          className="size-3.5 shrink-0 text-slate-300"
+          className="size-4 shrink-0 text-slate-300"
         />
-        <span className="font-medium text-slate-200">
+        <span className="min-w-0 truncate text-sm font-semibold text-slate-100">
           {workflowBlockTitle[block.block_type]}
         </span>
-        {block.label && (
-          <>
-            <span className="shrink-0 text-slate-400">·</span>
-            <TruncatedWithTooltip
-              full={block.label}
-              className="text-slate-400"
-            />
-          </>
-        )}
-        <span className="shrink-0 text-slate-500">·</span>
-        <TruncatedWithTooltip
-          full={block.workflow_run_block_id}
-          className="max-w-[9rem] font-mono text-[10px] text-slate-500"
-        />
-        {iterationLabel && (
-          <span className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
-            {iterationLabel}
-          </span>
-        )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
           {duration && (
             <span className="text-[10px] tabular-nums text-slate-500">
@@ -176,6 +157,29 @@ function BlockDetailHeader({
           )}
           <StatusPill status={block.status} />
         </span>
+      </div>
+      <div
+        data-slot="block-detail-header-meta"
+        className="flex min-w-0 items-center gap-1.5 px-3 pb-2 text-[11px] text-slate-500"
+      >
+        {block.label && (
+          <>
+            <TruncatedWithTooltip
+              full={block.label}
+              className="max-w-[12rem] text-slate-400"
+            />
+            <span className="shrink-0 text-slate-600">·</span>
+          </>
+        )}
+        <TruncatedWithTooltip
+          full={block.workflow_run_block_id}
+          className="max-w-[11rem] font-mono text-[10px] text-slate-500"
+        />
+        {iterationLabel && (
+          <span className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+            {iterationLabel}
+          </span>
+        )}
       </div>
       {currentValuePreview && (
         <div className="flex min-w-0 items-center gap-2 border-t border-slate-700/50 px-3 py-1.5 text-[11px] duration-200 animate-in fade-in slide-in-from-top-1">
@@ -209,15 +213,17 @@ function BlockDetailHeader({
 function BlockDetailHeaderSkeleton() {
   return (
     <div className="border-b border-slate-700 bg-slate-elevation1">
-      <div className="flex items-center gap-2 px-3 py-2 text-xs">
-        <Skeleton className="size-3.5 shrink-0 rounded" />
-        <Skeleton className="h-3.5 w-16 rounded" />
-        <span className="shrink-0 text-slate-400">·</span>
-        <Skeleton className="h-3.5 w-24 rounded" />
+      <div className="flex items-center gap-2 px-3 py-2">
+        <Skeleton className="size-4 shrink-0 rounded" />
+        <Skeleton className="h-4 w-24 rounded" />
         <span className="ml-auto flex shrink-0 items-center gap-2">
           <Skeleton className="h-3 w-10 rounded" />
           <Skeleton className="h-5 w-20 rounded" />
         </span>
+      </div>
+      <div className="flex items-center gap-1.5 px-3 pb-2">
+        <Skeleton className="h-3 w-16 rounded" />
+        <Skeleton className="h-3 w-28 rounded" />
       </div>
     </div>
   );
@@ -311,51 +317,6 @@ function GoalText({ text }: { text: string | null | undefined }) {
   );
 }
 
-function BlockActionList({
-  block,
-  activeItem,
-  onActionSelect,
-}: {
-  block: WorkflowRunBlock;
-  activeItem: WorkflowRunOverviewActiveElement;
-  onActionSelect?: (payload: {
-    block: WorkflowRunBlock;
-    action: ActionsApiResponse;
-  }) => void;
-}) {
-  const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
-  const actions = block.actions ?? [];
-  const actionsTopDown = [...actions].reverse();
-  if (actions.length === 0) return null;
-  return (
-    <Section title={`Actions (${actions.length})`}>
-      <div className="space-y-2">
-        {actionsTopDown.map((action, index) => {
-          const isActive =
-            isAction(activeItem) && activeItem.action_id === action.action_id;
-          return (
-            <ActionCardCompact
-              key={action.action_id}
-              action={action}
-              active={isActive}
-              index={index + 1}
-              expanded={expandedActionId === action.action_id}
-              onToggleExpanded={() => {
-                setExpandedActionId((prev) =>
-                  prev === action.action_id ? null : action.action_id,
-                );
-              }}
-              onSelect={() => {
-                onActionSelect?.({ block, action });
-              }}
-            />
-          );
-        })}
-      </div>
-    </Section>
-  );
-}
-
 function BlockThoughtList({
   thoughts,
   activeItem,
@@ -391,7 +352,6 @@ function BlockThoughtList({
 }
 
 export {
-  BlockActionList,
   BlockDetailFailure,
   BlockDetailHeader,
   BlockDetailHeaderSkeleton,

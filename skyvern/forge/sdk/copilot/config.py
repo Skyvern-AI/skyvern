@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation
 
 
 class BlockAuthoringPolicy(StrEnum):
@@ -28,9 +29,14 @@ def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringP
     return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
 
 
+def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:
+    return normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 35
 DEFAULT_TOKEN_BUDGET = 90_000
+SYNTHESIZED_OFFER_REFRESH_STEP_THRESHOLD = 3
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
@@ -119,24 +125,6 @@ POST_SUSPICIOUS_SUCCESS_NUDGE = (
     "browser actually sees — do NOT just retry extraction with a different prompt.\n"
     "4. Fix the root cause — do NOT declare the workflow working based on "
     "status alone. Verify the actual extracted data answers the user's question."
-)
-
-POST_REPEATED_NULL_DATA_NUDGE = (
-    "STOP — you have now produced multiple consecutive test runs where "
-    "extraction/text_prompt blocks returned all-null or empty data. "
-    "Re-prompting the extractor is not working — the problem is almost "
-    "certainly NOT how the extraction goal is worded.\n"
-    "You MUST now do ONE of the following before another update_workflow call:\n"
-    "1. Call get_browser_screenshot on the workflow's browser session to see "
-    "exactly what page the workflow is actually loading (it may differ from "
-    "what you expect — e.g. a 'no results' fallback, cookie wall, or bot block).\n"
-    "2. Call evaluate with JavaScript that searches for the expected content "
-    "on the workflow's browser — confirm whether the data is even present.\n"
-    "3. If the page the workflow loads genuinely does not contain the data, "
-    "pivot to a different URL or source entirely — do NOT keep retrying "
-    "extraction against the same failing page.\n"
-    "Do NOT call update_and_run_blocks again until you have concrete evidence "
-    "about what the workflow browser is actually seeing."
 )
 
 POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE = (
@@ -344,7 +332,6 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_failed_test_inspect_first": POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     "post_explore_without_workflow": POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
     "post_suspicious_success": POST_SUSPICIOUS_SUCCESS_NUDGE,
-    "post_repeated_null_data": POST_REPEATED_NULL_DATA_NUDGE,
     "post_repeated_frontier_failure_warn": POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
     "post_repeated_frontier_failure_stop": POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     "post_parameter_binding_warn": POST_PARAMETER_BINDING_WARN_NUDGE,
@@ -370,6 +357,14 @@ def _default_fallback_llm_key() -> str | None:
     return settings.SECONDARY_LLM_KEY
 
 
+def _default_credential_pause_enabled() -> bool:
+    return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED
+
+
+def _default_credential_pause_timeout_seconds() -> int:
+    return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
+
+
 @dataclass(slots=True)
 class CopilotConfig:
     prompt_template: str = DEFAULT_PROMPT_TEMPLATE
@@ -380,6 +375,10 @@ class CopilotConfig:
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     impose_synthesized_code_block: bool = False
+    requested_output_path_aliases: dict[str, str] = field(default_factory=dict)
+    requested_output_shape_expectations: dict[str, ShapeExpectation] = field(default_factory=dict)
+    credential_pause_enabled: bool = field(default_factory=_default_credential_pause_enabled)
+    credential_pause_timeout_seconds: int = field(default_factory=_default_credential_pause_timeout_seconds)
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

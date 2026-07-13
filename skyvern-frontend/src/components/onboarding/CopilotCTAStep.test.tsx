@@ -10,9 +10,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { mockPost, mockNavigate } = vi.hoisted(() => ({
+const { mockPost, mockNavigate, studioState } = vi.hoisted(() => ({
   mockPost: vi.fn(),
   mockNavigate: vi.fn(),
+  studioState: { enabled: true },
+}));
+
+vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
+  useWorkflowStudioEnabled: () => studioState.enabled,
 }));
 
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -77,6 +82,7 @@ function setup(onBusyChange?: (busy: boolean) => void) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  studioState.enabled = true;
 });
 
 describe("CopilotCTAStep", () => {
@@ -98,7 +104,7 @@ describe("CopilotCTAStep", () => {
     );
   });
 
-  it("hands the prompt off to /build with it in location state", async () => {
+  it("hands the prompt off to /edit with it in location state", async () => {
     mockPost.mockResolvedValue({
       data: { workflow_permanent_id: "wpid_x" },
     });
@@ -110,7 +116,26 @@ describe("CopilotCTAStep", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create with AI" }));
 
     await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith("/workflows/wpid_x/build", {
+      expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_x/studio", {
+        state: { copilotMessage: "fill out my form" },
+      }),
+    );
+  });
+
+  it("hands the prompt off to /build when the studio preview is off", async () => {
+    studioState.enabled = false;
+    mockPost.mockResolvedValue({
+      data: { workflow_permanent_id: "wpid_x" },
+    });
+    setup();
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "fill out my form" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create with AI" }));
+
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_x/build", {
         state: { copilotMessage: "fill out my form" },
       }),
     );

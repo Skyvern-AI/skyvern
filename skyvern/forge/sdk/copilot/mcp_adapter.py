@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import AsyncExitStack
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -27,6 +28,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+from skyvern.forge.sdk.copilot.enforcement import (
+    register_no_progress_interaction_click,
+    synthesized_block_persistence_signal,
+    terminal_challenge_blocker_signal_from_current_page_evidence,
+)
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -42,9 +48,64 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
+
+_POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
+    "flow_evidence",
+    "composition_page_evidence",
+    "workflow_verification_evidence",
+    "pending_browser_interaction_observation",
+    "scouted_interactions",
+    "scout_trajectory",
+    "pending_scout_source_url",
+    "pending_scout_typed_value",
+    "pending_scout_role_name",
+    "post_budget_page_inspection_required",
+    "post_budget_page_inspection_url",
+    "post_budget_page_inspection_run_id",
+    "post_run_page_observation_tool",
+    "post_run_page_observation_url",
+    "post_run_page_observation_workflow_run_id",
+    "code_only_target_page_evidence_seen",
+    "last_evaluate_actionable_signature",
+    "last_evaluate_actionable_url",
+    "last_scout_observation_trajectory_index",
+    "last_scout_observation_has_password_control",
+    "latest_evaluate_result_composition_steer",
+    "latest_evaluate_result_composition_signature",
+    "last_auto_acted_signature",
+    "reached_download_target",
+    "synthesized_block_offered",
+    "synthesized_block_offered_trajectory_len",
+    "synthesized_block_offered_goal_complete",
+    "scouted_output_covered_paths",
+    "scout_observation_contract",
+    "requested_output_extraction_candidate",
+    "synthesized_block_reopened_for_output_coverage",
+    "uncovered_output_rescout_context_key",
+    "uncovered_output_rescout_steer_key",
+    "consecutive_no_progress_interaction_count",
+)
+
+
+@dataclass(frozen=True)
+class _PostHookContextSnapshot:
+    values: dict[str, Any]
+
+
+def _snapshot_post_hook_context(ctx: AgentContext) -> _PostHookContextSnapshot:
+    ctx_vars = vars(ctx)
+    return _PostHookContextSnapshot(
+        {field: deepcopy(ctx_vars[field]) for field in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS if field in ctx_vars}
+    )
+
+
+def _restore_post_hook_context(ctx: AgentContext, snapshot: _PostHookContextSnapshot) -> None:
+    for field_name, value in snapshot.values.items():
+        setattr(ctx, field_name, deepcopy(value))
 
 
 @dataclass
@@ -64,12 +125,37 @@ class SchemaOverlay:
 
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
+_CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS = frozenset(
+    {
+        "click",
+        "evaluate",
+        "get_browser_screenshot",
+        "navigate_browser",
+        "press_key",
+        "scroll",
+        "select_option",
+        "type_text",
+    }
+)
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
+    return payload
+
+
+def _stash_and_emit_current_page_terminal_challenge_blocker(ctx: Any, tool_name: str) -> str | None:
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
+        ctx,
+        blocked_tool=tool_name,
+        evidence_source="mcp_page_evidence",
+    )
+    if signal is None:
+        return None
+    payload = emit_blocker_signal_payload(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_current_page_terminal_challenge")
     return payload
 
 
@@ -228,6 +314,34 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         refresh_held_loop_blocker_evidence(copilot_ctx)
+        if tool_name in _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS:
+            terminal_challenge_payload = _stash_and_emit_current_page_terminal_challenge_blocker(
+                copilot_ctx,
+                tool_name,
+            )
+            if terminal_challenge_payload is not None:
+                LOG.warning(
+                    "Current page terminal challenge detected, skipping MCP browser tool",
+                    tool_name=tool_name,
+                )
+                return _copilot_to_call_tool_result({"ok": False, "error": terminal_challenge_payload})
+
+        persistence_signal = synthesized_block_persistence_signal(copilot_ctx, tool_name)
+        if persistence_signal is not None:
+            LOG.warning(
+                "Synthesized block persistence required before MCP tool",
+                tool_name=tool_name,
+                synthesized_block_offered_trajectory_len=getattr(
+                    copilot_ctx,
+                    "synthesized_block_offered_trajectory_len",
+                    None,
+                ),
+            )
+            payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
+            result = {"ok": False, "error": payload}
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
+            return _copilot_to_call_tool_result(result)
+
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(
@@ -238,7 +352,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
-        loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
+        loop_error = detect_tool_loop(tracker, tool_name, arguments) if isinstance(tracker, list) else None
         if loop_error:
             LOG.warning(
                 "Tool loop detected, skipping execution",
@@ -277,6 +391,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 exc_info=True,
             )
             err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
+            if tool_name == "click":
+                register_no_progress_interaction_click(copilot_ctx, outcome="click_failed")
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 
@@ -296,7 +412,20 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_result = mcp_to_copilot(raw_mcp)
 
         if overlay.post_hook:
-            copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+            base_copilot_result = deepcopy(copilot_result)
+            ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+            try:
+                copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+            except Exception as e:
+                # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                LOG.warning(
+                    "MCP post-hook failed; returning base tool result",
+                    tool=tool_name,
+                    error=str(e),
+                    exc_info=True,
+                )
+                copilot_result = base_copilot_result
 
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
         enqueue_screenshot_from_result(copilot_ctx, copilot_result)

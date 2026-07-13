@@ -7,8 +7,22 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from agents.items import RunItem
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
+from openai.types.responses import (
+    ResponseCreatedEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+)
+from openai.types.responses.response import Response
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 
-from skyvern.forge.sdk.copilot.streaming_adapter import _sanitize_input, stream_to_sse
+from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.streaming_adapter import _sanitize_input, _update_enforcement_from_tool, stream_to_sse
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 
 
 def test_strips_workflow_yaml() -> None:
@@ -84,6 +98,91 @@ async def _stream_events_from(*events: Any) -> Any:
         yield event
 
 
+def _minimal_response() -> Response:
+    return Response(
+        id="resp_1",
+        created_at=0.0,
+        model="gpt-4o",
+        object="response",
+        output=[],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+    )
+
+
+def _response_created_event() -> RawResponsesStreamEvent:
+    return RawResponsesStreamEvent(
+        data=ResponseCreatedEvent(response=_minimal_response(), sequence_number=1, type="response.created")
+    )
+
+
+def _item_added_event(output_index: int, name: str, call_id: str = "__fake_responses_id__") -> RawResponsesStreamEvent:
+    item = ResponseFunctionToolCall(arguments="", call_id=call_id, name=name, type="function_call")
+    return RawResponsesStreamEvent(
+        data=ResponseOutputItemAddedEvent(
+            item=item, output_index=output_index, sequence_number=1, type="response.output_item.added"
+        )
+    )
+
+
+def _args_delta_event(output_index: int, delta: str, item_id: str = "__fake_responses_id__") -> RawResponsesStreamEvent:
+    return RawResponsesStreamEvent(
+        data=ResponseFunctionCallArgumentsDeltaEvent(
+            delta=delta,
+            item_id=item_id,
+            output_index=output_index,
+            sequence_number=1,
+            type="response.function_call_arguments.delta",
+        )
+    )
+
+
+def _args_done_event(
+    output_index: int, arguments: str, name: str, item_id: str = "__fake_responses_id__"
+) -> RawResponsesStreamEvent:
+    return RawResponsesStreamEvent(
+        data=ResponseFunctionCallArgumentsDoneEvent(
+            arguments=arguments,
+            item_id=item_id,
+            name=name,
+            output_index=output_index,
+            sequence_number=1,
+            type="response.function_call_arguments.done",
+        )
+    )
+
+
+def _item_done_event(output_index: int, name: str, arguments: str, item_id: str = "__fake_responses_id__") -> Any:
+    item = ResponseFunctionToolCall(arguments=arguments, call_id=item_id, name=name, type="function_call")
+    return RawResponsesStreamEvent(
+        data=ResponseOutputItemDoneEvent(
+            item=item, output_index=output_index, sequence_number=1, type="response.output_item.done"
+        )
+    )
+
+
+def _tool_called_event(call_id: str, name: str, arguments: str = "{}") -> RunItemStreamEvent:
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": call_id, "name": name, "arguments": arguments}
+    return RunItemStreamEvent(name="tool_called", item=call_item)
+
+
+def _tool_output_event(call_id: str, ok: bool = True, block_count: int = 2) -> RunItemStreamEvent:
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": call_id}
+    out_item.output = [{"type": "text", "text": json.dumps({"ok": ok, "data": {"block_count": block_count}})}]
+    return RunItemStreamEvent(name="tool_output", item=out_item)
+
+
+def _new_ctx() -> SimpleNamespace:
+    return SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        design_start_emitted=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
     """SKY-8986 regression: a dropped SSE client must NOT cancel the agent run.
@@ -115,7 +214,13 @@ async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
     stream.is_disconnected = AsyncMock(return_value=True)
     stream.send = AsyncMock(return_value=True)
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -147,7 +252,13 @@ async def test_tool_call_sse_uses_product_safe_activity_label() -> None:
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -185,7 +296,13 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     with pytest.raises(asyncio.CancelledError):
         await stream_to_sse(result, stream, ctx)
@@ -323,7 +440,13 @@ async def test_tool_result_sse_summary_translates_loop_detected_failure() -> Non
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -381,7 +504,17 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
-    ctx = SimpleNamespace(latest_tool_blocker_signal=signal, tool_blocker_signals=[signal])
+    ctx = SimpleNamespace(
+        latest_tool_blocker_signal=signal,
+        tool_blocker_signals=[signal],
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -390,12 +523,80 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
     assert tool_results[0].summary == signal.user_facing_reason
     assert tool_results[0].detail == signal.user_facing_reason
     assert "Do NOT" not in tool_results[0].summary
+    # tool_error blocker signals are genuine failures (something ran out of budget/broke,
+    # not a precondition redirect) and must keep their failure affect.
+    assert tool_results[0].success is False
 
     activity = ctx.narrator_state.design_activity
     assert len(activity) == 2
     assert activity[-1]["kind"] == "tool_result"
     assert activity[-1]["text"] == signal.user_facing_reason
     assert "Do NOT" not in activity[-1]["text"]
+    assert activity[-1]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_tool_result_sse_success_true_for_phase_gated_precondition() -> None:
+    """A precondition redirect (agent tried a tool before its build phase allowed it)
+    was never a real failure — it must not render with error affect."""
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="phase_gated",
+        agent_steering_text=(
+            "Direct browser tools are not callable before composition. "
+            "Call discover_workflow_entrypoint to resolve the entrypoint URL."
+        ),
+        user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
+        recovery_hint="ask_user_clarifying",
+        cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
+        internal_reason_code="build_phase_browser_blocked_pre_compose",
+        blocked_tool="evaluate",
+    )
+
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": "evaluate", "arguments": "{}"}
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": "evaluate"}
+    out_item.output = [{"type": "text", "text": json.dumps({"ok": False, "error": signal.agent_steering_text})}]
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace(
+        latest_tool_blocker_signal=signal,
+        tool_blocker_signals=[signal],
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    assert tool_results[0].summary == signal.user_facing_reason
+    assert tool_results[0].success is True
+
+    activity = ctx.narrator_state.design_activity
+    assert activity[-1]["kind"] == "tool_result"
+    assert activity[-1]["success"] is True
 
 
 @pytest.mark.asyncio
@@ -443,7 +644,17 @@ async def test_stream_to_sse_cancels_and_stops_on_terminal_turn_halt() -> None:
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
-    ctx = SimpleNamespace(latest_tool_blocker_signal=signal, tool_blocker_signals=[signal])
+    ctx = SimpleNamespace(
+        latest_tool_blocker_signal=signal,
+        tool_blocker_signals=[signal],
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+        output_contract_actuation_by_signature={},
+        output_contract_actuation_count_by_signature={},
+    )
 
     with pytest.raises(CopilotTurnHalt):
         await stream_to_sse(result, stream, ctx)
@@ -478,7 +689,13 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = AsyncMock(return_value=True)
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     with pytest.raises(CopilotUnrecoverableToolError):
         await stream_to_sse(result, stream, ctx)
@@ -522,7 +739,13 @@ async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None
     stream.is_disconnected = AsyncMock(return_value=False)
     stream.send = _send
 
-    ctx = SimpleNamespace()
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        turn_ownership=None,
+        blocker_signal_claimant=None,
+        gate_precedence_conflict_events=[],
+    )
 
     await stream_to_sse(result, stream, ctx)
 
@@ -630,6 +853,7 @@ class TestEnforcementStateUpdates:
         ctx.post_update_nudge_count = 0
         ctx.navigate_called = False
         ctx.observation_after_navigate = False
+        ctx.synthesized_block_reopened_after_failed_run = False
         return ctx
 
     def test_update_workflow_sets_flags(self) -> None:
@@ -668,6 +892,16 @@ class TestEnforcementStateUpdates:
         assert ctx.update_workflow_called is True
         assert ctx.test_after_update_done is True
 
+    def test_persisted_blocks_clear_reopened_synthesized_offer_latch(self) -> None:
+        ctx = self._make_ctx()
+        ctx.synthesized_block_reopened_after_failed_run = True
+        _update_enforcement_from_tool(
+            ctx,
+            "update_and_run_blocks",
+            {"ok": False, "data": {"block_count": 2}},
+        )
+        assert ctx.synthesized_block_reopened_after_failed_run is False
+
     def test_navigate_sets_flags(self) -> None:
         from skyvern.forge.sdk.copilot.streaming_adapter import _update_enforcement_from_tool
 
@@ -697,3 +931,703 @@ class TestEnforcementStateUpdates:
             },
         )
         assert ctx.update_workflow_called is False
+
+
+def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
+    from skyvern.forge.sdk.copilot.streaming_adapter import _tool_result_workflow_run_id
+
+    payload = {"ok": True, "data": {"workflow_run_id": "wr_42"}}
+    # Block-running tools created the run -> surface it (pass or fail).
+    assert _tool_result_workflow_run_id("update_and_run_blocks", payload) == "wr_42"
+    assert _tool_result_workflow_run_id("run_blocks_and_collect_debug", payload) == "wr_42"
+    # get_run_results echoes a prior run id; attributing it to this turn would grade a stale run.
+    assert _tool_result_workflow_run_id("get_run_results", payload) is None
+    assert _tool_result_workflow_run_id("update_workflow", payload) is None
+    # Malformed / missing data payloads yield None rather than raising.
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {}) is None
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": "string"}) is None
+    assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
+
+
+class TestFlushGoalSatisfiedToolResult:
+    @staticmethod
+    def _ctx(**overrides: Any) -> SimpleNamespace:
+        from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
+
+        defaults: dict[str, Any] = dict(
+            in_flight_stream_tool_call=InFlightStreamToolCall(
+                call_id="c9", tool_name="update_and_run_blocks", iteration=3
+            ),
+            goal_satisfied_tool_name="update_and_run_blocks",
+            goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_1"}},
+            narrator_state=None,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    @staticmethod
+    def _stream(sent: list[Any], *, disconnected: bool = False) -> MagicMock:
+        async def _send(payload: Any) -> bool:
+            sent.append(payload)
+            return True
+
+        stream = MagicMock()
+        stream.is_disconnected = AsyncMock(return_value=disconnected)
+        stream.send = _send
+        return stream
+
+    @pytest.mark.asyncio
+    async def test_emits_tool_result_for_goal_satisfying_call(self) -> None:
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+        from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+        sent: list[Any] = []
+        ctx = self._ctx()
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert len(sent) == 1
+        frame = sent[0]
+        assert frame.type == WorkflowCopilotStreamMessageType.TOOL_RESULT
+        assert frame.tool_call_id == "c9"
+        assert frame.tool_name == "update_and_run_blocks"
+        assert frame.success is True
+        assert frame.iteration == 3
+        assert ctx.in_flight_stream_tool_call is None
+        assert ctx.goal_satisfied_tool_output is None
+        assert ctx.goal_satisfied_tool_name is None
+
+    @pytest.mark.asyncio
+    async def test_noops_when_no_call_is_pending(self) -> None:
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+
+        sent: list[Any] = []
+        ctx = self._ctx(in_flight_stream_tool_call=None)
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_noops_when_pending_call_is_a_different_tool(self) -> None:
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+
+        sent: list[Any] = []
+        ctx = self._ctx(goal_satisfied_tool_name="get_run_results")
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert sent == []
+        assert ctx.in_flight_stream_tool_call is None
+
+    @pytest.mark.asyncio
+    async def test_records_narrator_activity_but_skips_send_when_disconnected(self) -> None:
+        from skyvern.forge.sdk.copilot.narration import NarratorState
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+
+        sent: list[Any] = []
+        narrator_state = NarratorState()
+        ctx = self._ctx(narrator_state=narrator_state)
+
+        await flush_goal_satisfied_tool_result(self._stream(sent, disconnected=True), ctx)
+
+        assert sent == []
+        assert narrator_state.design_activity
+        assert narrator_state.design_activity[-1]["kind"] == "tool_result"
+
+
+_PROGRESS_TEXT = "Refining the workflow's code"
+
+
+def _code_repair_reject_payload() -> list[dict[str, str]]:
+    body = json.dumps(
+        {
+            "ok": False,
+            "error": "Insecure code detected: Not allowed to import modules.",
+            "user_facing_summary": "I need to adjust the workflow's code so it can run safely before testing.",
+            "data": {"surface_kind": "code_repair_progress", "progress_text": _PROGRESS_TEXT},
+        }
+    )
+    return [{"type": "text", "text": body}]
+
+
+def _round_trip_events(call_id: str, tool_name: str, output_payload: Any) -> list[Any]:
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": call_id, "name": tool_name, "arguments": "{}"}
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": call_id, "name": tool_name}
+    out_item.output = output_payload
+    return [
+        RunItemStreamEvent(name="tool_called", item=call_item),
+        RunItemStreamEvent(name="tool_output", item=out_item),
+    ]
+
+
+def _sink_stream(sent: list[Any], *, disconnected: bool = False) -> MagicMock:
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=disconnected)
+    stream.send = _send
+    return stream
+
+
+def _copilot_ctx() -> Any:
+    return CopilotContext(
+        organization_id="org_test",
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid_test",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=None,  # type: ignore[arg-type]
+        api_key=None,
+        user_message="",
+    )
+
+
+class TestGenuineAttemptScoutStamp:
+    def test_run_blocks_scout_stamp_does_not_count_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "run_blocks_and_collect_debug", {"ok": True})
+        assert ctx.test_after_update_done is True
+        assert ctx.has_genuine_workflow_attempt() is False
+
+    def test_failed_run_blocks_scout_stamp_does_not_count_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "run_blocks_and_collect_debug", {"ok": False})
+        assert ctx.test_after_update_done is True
+        assert ctx.has_genuine_workflow_attempt() is False
+
+    def test_persisted_update_counts_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 2}})
+        assert ctx.update_workflow_called is True
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_update_and_run_blocks_counts_as_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_and_run_blocks", {"ok": True, "data": {"block_count": 2}})
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_update_without_blocks_is_not_a_genuine_attempt(self) -> None:
+        ctx = _copilot_ctx()
+        _update_enforcement_from_tool(ctx, "update_workflow", {"ok": True, "data": {"block_count": 0}})
+        assert ctx.update_workflow_called is False
+        assert ctx.has_genuine_workflow_attempt() is False
+
+
+class TestCodeRepairProgressStreaming:
+    @pytest.mark.asyncio
+    async def test_repeated_classified_rejects_collapse_to_one_progress_frame(self) -> None:
+        """Repeated identical classified rejects emit one progress narration and no failure rows."""
+        events: list[Any] = []
+        for idx in range(3):
+            events.extend(_round_trip_events(f"c{idx}", "update_and_run_blocks", _code_repair_reject_payload()))
+
+        result = MagicMock()
+        result.stream_events = lambda: _stream_events_from(*events)
+        result.cancel = MagicMock()
+
+        sent: list[Any] = []
+        ctx = _copilot_ctx()
+
+        await stream_to_sse(result, _sink_stream(sent), ctx)
+
+        tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+        assert tool_results == []
+
+        narrations = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
+        assert len(narrations) == 1
+        assert narrations[0].narration == _PROGRESS_TEXT
+
+        narration_entries = [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"]
+        assert len(narration_entries) == 1
+        assert narration_entries[0]["text"] == _PROGRESS_TEXT
+        assert all(e["kind"] != "tool_result" for e in ctx.narrator_state.design_activity)
+        # De-duplicated rejects still advance the narrator iteration (read by the run-outcome frame).
+        assert ctx.narrator_state.current_iteration == 2
+
+    @pytest.mark.asyncio
+    async def test_classified_progress_text_not_doubled_with_narrator_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the narrator handler enabled, the progress text still emits at most once."""
+
+        async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
+            return "a generic tool-start narration sentence"
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.streaming_adapter.resolve_narrator_handler",
+            AsyncMock(return_value=_handler),
+        )
+
+        events: list[Any] = []
+        for idx in range(3):
+            events.extend(_round_trip_events(f"c{idx}", "update_and_run_blocks", _code_repair_reject_payload()))
+
+        async def _slow_events() -> Any:
+            for event in events:
+                yield event
+                await asyncio.sleep(0)
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+        result = MagicMock()
+        result.stream_events = _slow_events
+        result.cancel = MagicMock()
+
+        sent: list[Any] = []
+        ctx = _copilot_ctx()
+
+        await stream_to_sse(result, _sink_stream(sent), ctx)
+
+        progress_frames = [
+            p
+            for p in sent
+            if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION and p.narration == _PROGRESS_TEXT
+        ]
+        assert len(progress_frames) == 1
+
+        progress_entries = [
+            e for e in ctx.narrator_state.design_activity if e["kind"] == "narration" and e["text"] == _PROGRESS_TEXT
+        ]
+        assert len(progress_entries) == 1
+
+    @pytest.mark.asyncio
+    async def test_classified_reject_persists_one_entry_on_disconnect(self) -> None:
+        """A disconnected client still gets the persisted progress entry; no live frame is sent."""
+        events = _round_trip_events("c1", "update_and_run_blocks", _code_repair_reject_payload())
+
+        result = MagicMock()
+        result.stream_events = lambda: _stream_events_from(*events)
+        result.cancel = MagicMock()
+
+        sent: list[Any] = []
+        ctx = _copilot_ctx()
+
+        await stream_to_sse(result, _sink_stream(sent, disconnected=True), ctx)
+
+        assert sent == []
+        narration_entries = [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"]
+        assert len(narration_entries) == 1
+        assert narration_entries[0]["text"] == _PROGRESS_TEXT
+
+    @pytest.mark.asyncio
+    async def test_classified_reject_still_runs_enforcement_and_increments_iteration(self) -> None:
+        """A classified reject still runs the enforcement update and advances the iteration."""
+        first = _round_trip_events("c1", "update_and_run_blocks", _code_repair_reject_payload())
+        second_call_item = MagicMock()
+        second_call_item.raw_item = {"call_id": "c2", "name": "navigate_browser", "arguments": "{}"}
+        second_call = RunItemStreamEvent(name="tool_called", item=second_call_item)
+
+        result = MagicMock()
+        result.stream_events = lambda: _stream_events_from(*first, second_call)
+        result.cancel = MagicMock()
+
+        sent: list[Any] = []
+        ctx = _copilot_ctx()
+
+        await stream_to_sse(result, _sink_stream(sent), ctx)
+
+        # update_and_run_blocks flips test_after_update_done even on an ok:False reject; skipping
+        # enforcement on the classified path would change agent behavior.
+        assert ctx.test_after_update_done is True
+        tool_calls = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_CALL]
+        assert tool_calls[-1].iteration == 1
+
+    @pytest.mark.asyncio
+    async def test_unclassified_reject_still_renders_failure_tool_result(self) -> None:
+        """An unclassified ok:False reject still emits a success=false TOOL_RESULT and activity row."""
+        payload = [{"type": "text", "text": json.dumps({"ok": False, "error": "plain failure"})}]
+        events = _round_trip_events("c1", "update_workflow", payload)
+
+        result = MagicMock()
+        result.stream_events = lambda: _stream_events_from(*events)
+        result.cancel = MagicMock()
+
+        sent: list[Any] = []
+        ctx = _copilot_ctx()
+
+        await stream_to_sse(result, _sink_stream(sent), ctx)
+
+        tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+        assert len(tool_results) == 1
+        assert tool_results[0].success is False
+        narrations = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
+        assert narrations == []
+
+
+async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) -> Any:
+    """Drive `stream_to_sse` over a single tool round-trip and return the
+    emitted ``WorkflowCopilotToolResultUpdate``."""
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": tool_name, "arguments": "{}"}
+    tool_call = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": tool_name}
+    out_item.output = [{"type": "text", "text": json.dumps(parsed_output)}]
+    tool_output = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    async def _events() -> Any:
+        yield tool_call
+        yield tool_output
+
+    result = MagicMock()
+    result.stream_events = lambda: _events()
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(
+        result,
+        stream,
+        SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None),
+    )
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    return tool_results[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_detail_for_failure() -> None:
+    long_error = "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": False, "error": long_error},
+    )
+    assert payload.success is False
+    assert payload.detail is not None
+    assert len(payload.detail) > 120
+    # `summary` is the visible bullet, capped tighter than `detail` (the
+    # tooltip-grade text) — strictly longer detail is the contract.
+    assert len(payload.detail) > len(payload.summary)
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_generic_detail_for_internal_validation_failure() -> None:
+    """The tooltip-grade detail must not leak raw internal validator text either —
+    only the visible summary was sanitized before this regression test was added."""
+    long_error = "Workflow validation failed: " + (
+        "blocks.0.task expects 'navigation_goal' but the emitted YAML omitted it. " * 4
+    )
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": False, "error": long_error},
+    )
+    assert payload.detail == "Couldn't complete that step."
+    assert "navigation_goal" not in payload.detail
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_no_detail_for_success() -> None:
+    payload = await _capture_tool_result(
+        "update_workflow",
+        {"ok": True, "data": {"block_count": 3}},
+    )
+    assert payload.success is True
+    assert payload.detail is None
+
+
+def _codegen_payloads(sent: list[Any]) -> list[Any]:
+    return [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.CODEGEN_PROGRESS]
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_pins_incremental_label_extraction_on_raw_deltas() -> None:
+    """Regression pin: fails on old code because RawResponsesStreamEvent is dropped at the
+    ``isinstance(event, RunItemStreamEvent)`` skip, so zero CODEGEN_PROGRESS frames are ever sent."""
+    delta1 = '{"workflow_yaml": "blocks:\\n- block_type: navigation\\n  label: open_page\\n'
+    delta2 = "  navigation_goal: Navigate to the page\\n- block_type: task\\n  label: fill_form\\n"
+    delta3 = '  navigation_goal: Fill out the form\\n"'
+    delta4 = ', "block_labels": ["open_page", "fill_form"]}'
+    full_args = delta1 + delta2 + delta3 + delta4
+
+    events = [
+        _item_added_event(0, "update_and_run_blocks"),
+        _args_delta_event(0, delta1),
+        _args_delta_event(0, delta2),
+        _args_delta_event(0, delta3),
+        _args_delta_event(0, delta4),
+        _args_done_event(0, full_args, "update_and_run_blocks"),
+        _item_done_event(0, "update_and_run_blocks", full_args),
+        _tool_called_event("c1", "update_and_run_blocks"),
+        _tool_output_event("c1"),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    assert codegen_payloads, "expected at least one CODEGEN_PROGRESS frame"
+    assert any(p.blocks_drafted == ["open_page", "fill_form"] for p in codegen_payloads)
+    assert codegen_payloads[0].blocks_drafted == []
+    assert codegen_payloads[0].chars_streamed == 0
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_does_not_leak_truncated_label_split_across_deltas() -> None:
+    """A label that happens to end exactly at a delta boundary (real token-by-token
+    streaming can split anywhere) must never surface a truncated fragment like "open_pa"
+    in blocks_drafted -- only the completed "open_page" once the boundary resolves."""
+    events = [
+        _item_added_event(0, "update_and_run_blocks"),
+        _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: open_pa'),
+        _args_delta_event(0, 'ge\\n  navigation_goal: x\\n"}'),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    all_labels = {label for p in codegen_payloads for label in p.blocks_drafted}
+    assert "open_pa" not in all_labels
+    assert any(p.blocks_drafted == ["open_page"] for p in codegen_payloads)
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_throttles_no_new_label_deltas_then_emits_keepalive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+    clock = _FakeClock()
+    monkeypatch.setattr(streaming_adapter_module, "time", clock)
+
+    async def _events() -> Any:
+        yield _item_added_event(0, "update_workflow")
+        yield _args_delta_event(0, "no label content here, ")
+        yield _args_delta_event(0, "still nothing new, ")
+        clock.value = 2.5
+        yield _args_delta_event(0, "and more with no label, ")
+
+    result = MagicMock()
+    result.stream_events = _events
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    # ItemAdded emits immediately; the two in-gap deltas emit nothing; the
+    # post-gap delta emits a throttled keepalive with more chars, no new labels.
+    assert len(codegen_payloads) == 2
+    assert codegen_payloads[0].chars_streamed == 0
+    assert codegen_payloads[1].chars_streamed > codegen_payloads[0].chars_streamed
+    assert codegen_payloads[1].blocks_drafted == []
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_disabled_by_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(streaming_adapter_module.settings, "WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED", False)
+
+    events = [
+        _item_added_event(0, "update_and_run_blocks"),
+        _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: open_page\\n"}'),
+        _tool_called_event("c1", "update_and_run_blocks"),
+        _tool_output_event("c1"),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    assert _codegen_payloads(sent) == []
+    tool_call_payloads = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_CALL]
+    assert len(tool_call_payloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_ignores_non_authoring_tool() -> None:
+    events = [
+        _item_added_event(0, "evaluate"),
+        _args_delta_event(0, "label: should_not_appear\\n"),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    assert _codegen_payloads(sent) == []
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_resets_on_response_created() -> None:
+    events = [
+        _item_added_event(0, "update_and_run_blocks"),
+        _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: block_one\\n"}'),
+        _response_created_event(),
+        _item_added_event(0, "update_and_run_blocks"),
+        _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: block_two\\n"}'),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    await stream_to_sse(result, stream, _new_ctx())
+
+    codegen_payloads = _codegen_payloads(sent)
+    assert any(p.blocks_drafted == ["block_two"] for p in codegen_payloads)
+    assert not any("block_one" in p.blocks_drafted for p in codegen_payloads if p.blocks_drafted == ["block_two"])
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_first_frame_preceded_by_design_start() -> None:
+    events = [
+        _item_added_event(0, "update_and_run_blocks"),
+    ]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    ctx = _new_ctx()
+    assert ctx.design_start_emitted is False
+
+    await stream_to_sse(result, stream, ctx)
+
+    types_in_order = [getattr(p, "type", None) for p in sent]
+    assert WorkflowCopilotStreamMessageType.DESIGN_START in types_in_order
+    design_start_index = types_in_order.index(WorkflowCopilotStreamMessageType.DESIGN_START)
+    codegen_index = types_in_order.index(WorkflowCopilotStreamMessageType.CODEGEN_PROGRESS)
+    assert design_start_index < codegen_index
+    assert ctx.design_start_emitted is True
+
+
+@pytest.mark.asyncio
+async def test_codegen_progress_is_disconnected_bounded_when_client_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SKY-8986-adjacent: many argument deltas with a disconnected client must not call
+    is_disconnected() once per delta -- only at throttled emit attempts. Clock is pinned
+    (not real wall-clock) so the 2s gap deterministically never elapses within the 20 deltas,
+    proving the throttle -- not fast test execution -- bounds the call count."""
+
+    class _FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+    monkeypatch.setattr(streaming_adapter_module, "time", _FakeClock())
+
+    events = [
+        _item_added_event(0, "update_and_run_blocks"),
+    ] + [_args_delta_event(0, "repeated_label_chunk ") for _ in range(20)]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=True)
+    stream.send = AsyncMock(return_value=True)
+
+    # Pre-mark design_start emitted so the unconditional (not disconnect-gated)
+    # design_start send doesn't muddy the codegen-frame-specific assertion below.
+    ctx = _new_ctx()
+    ctx.design_start_emitted = True
+
+    await stream_to_sse(result, stream, ctx)
+
+    stream.send.assert_not_called()
+    # 20 deltas were pumped with a clock that never advances (gap never elapses) and no
+    # new labels; is_disconnected must be checked only at the initial ItemAdded emit.
+    assert stream.is_disconnected.call_count == 1

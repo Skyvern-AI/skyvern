@@ -1,16 +1,28 @@
 """Shared pytest fixtures and setup for unit tests."""
 
 # -- begin speed up unit tests
+import itertools
 import logging
+import shutil
+import sys
+from collections.abc import AsyncGenerator, Callable
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 import structlog
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.db.models import Base
 from tests.unit.force_stub_app import start_forge_stub_app
 
 # Wire structlog through stdlib so caplog can capture log records in tests.
@@ -44,6 +56,46 @@ structlog.configure(
 def setup_forge_stub_app():
     start_forge_stub_app()
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_collapse_xp_assignment_memo():
+    # The collapse umbrella memo is process-global by design; without clearing it,
+    # an assignment memoized by one test leaks into any later test reusing the same task id.
+    def _clear() -> None:
+        handler_module = sys.modules.get("skyvern.webeye.actions.handler")
+        if handler_module is not None:
+            handler_module._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+# -- shared copilot agent-template rendering helper --
+
+_AGENT_TEMPLATE_DEFAULTS = dict(
+    workflow_knowledge_base="test kb",
+    current_datetime="2026-01-01T00:00:00Z",
+    tool_usage_guide="",
+    security_rules="",
+)
+
+
+def render_agent_prompt(**overrides: str) -> str:
+    """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
+    return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
+    return CopilotContext(
+        organization_id="o",
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        workflow_yaml=workflow_yaml,
+        browser_session_id=None,
+        stream=SimpleNamespace(),  # type: ignore[arg-type]
+    )
 
 
 # -- shared helpers for repository unit tests --
@@ -106,3 +158,48 @@ def span_exporter() -> InMemorySpanExporter:
     exporter.clear()
     yield exporter
     exporter.clear()
+
+
+# -- shared in-memory SQLite engine for repository/route unit tests --
+#
+# ``Base.metadata.create_all`` issues DDL for every mapped table (~50) on every
+# call, so re-running it per test dominates the runtime of the repository suites.
+# We build the schema once per session into a template SQLite file and clone that
+# file per test — a byte copy is orders of magnitude cheaper than re-emitting the
+# DDL, and each test still gets its own isolated database.
+
+
+@pytest.fixture(scope="session")
+def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    template_path = tmp_path_factory.mktemp("sqlite_schema") / "schema.db"
+    engine = create_engine(f"sqlite:///{template_path}")
+    try:
+        Base.metadata.create_all(engine)
+    finally:
+        engine.dispose()
+    return template_path
+
+
+@pytest_asyncio.fixture
+async def sqlite_engine_factory(
+    sqlite_schema_template: Path, tmp_path: Path
+) -> AsyncGenerator[Callable[[], AsyncEngine]]:
+    engines: list[AsyncEngine] = []
+    counter = itertools.count()
+
+    def _make() -> AsyncEngine:
+        db_path = tmp_path / f"db_{next(counter)}.db"
+        shutil.copyfile(sqlite_schema_template, db_path)
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engines.append(engine)
+        return engine
+
+    yield _make
+
+    for engine in engines:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
+    return sqlite_engine_factory()

@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import secrets
 import time
+import weakref
 from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -62,6 +63,8 @@ class SessionState:
     active_routes: dict[int, set[str]] = field(default_factory=dict)
     # -- Iframe frame context --
     _working_frame: Frame | None = None
+    _observed_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _observed_refs_generation: int = 0
 
     def get_response_body(self, request_id: int) -> str | None:
         """Public accessor for cached response bodies (keyed by request_id)."""
@@ -76,6 +79,155 @@ _stateless_http_mode = False
 # This bypasses ContextVar propagation issues when FastMCP runs tool handlers
 # in a separate task whose context snapshot predates scoped_session().
 _copilot_sessions: dict[str, SessionState] = {}
+# Ref snapshots and their invalidation generations, FIFO-capped like _body_store.
+# Capacity eviction can drop a live session's refs early; that fails safe (unknown
+# ref → the caller re-observes), which is why the tool contract doesn't mention it.
+# Generation tokens come from one process-wide counter and are allocated on first
+# touch, so an evicted entry re-materializes with a NEVER-seen token — a stale
+# observe holding an old token can't collide with it (no ABA reset to a default).
+_SESSION_REF_STORE_MAX = 64
+_session_ref_maps: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+_session_ref_generations: dict[tuple[str, str, str | None], int] = {}
+_session_ref_generation_counter = itertools.count(1)
+# Identity tokens instead of id(): a GC'd page's id() can be reused by a new
+# page, making a stale snapshot look valid. Tokens are never reissued.
+_page_identity_tokens: weakref.WeakKeyDictionary[Page | Frame, int] = weakref.WeakKeyDictionary()
+
+
+def _identity_token(obj: Page | Frame) -> int:
+    try:
+        token = _page_identity_tokens.get(obj)
+    except TypeError:
+        # Not weak-referenceable (e.g. SimpleNamespace); real page/frame objects
+        # always are, so only they get the no-reuse guarantee.
+        return id(obj)
+    if token is None:
+        token = next(_session_ref_generation_counter)
+        _page_identity_tokens[obj] = token
+    return token
+
+
+def page_ref_key(page: SkyvernBrowserPage) -> tuple[int, int | None, str]:
+    """Identity of the document context a ref snapshot was taken from."""
+    return (
+        _identity_token(page.page),
+        _identity_token(page._working_frame) if page._working_frame is not None else None,
+        page.url,
+    )
+
+
+def _generation_for(key: tuple[str, str, str | None]) -> int:
+    generation = _session_ref_generations.get(key)
+    if generation is None:
+        generation = next(_session_ref_generation_counter)
+        _session_ref_generations[key] = generation
+        while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
+            _session_ref_generations.pop(next(iter(_session_ref_generations)))
+    return generation
+
+
+def _session_ref_key(
+    state: SessionState,
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> tuple[str, str, str | None] | None:
+    context = state.context
+    resolved_session_id = session_id or (context.session_id if context else None)
+    resolved_cdp_url = cdp_url or (context.cdp_url if context else None)
+    # Prefer the hash stored at resolve_browser time — recomputing runs a
+    # deliberately slow PBKDF2 per call, and this sits on the per-ref hot path.
+    api_key_hash = state.api_key_hash or _api_key_hash(get_active_api_key())
+
+    if resolved_session_id:
+        return ("cloud_session", resolved_session_id, api_key_hash)
+    if resolved_cdp_url:
+        return ("cdp", resolved_cdp_url, api_key_hash)
+    return None
+
+
+def session_ref_generation(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> int:
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        return _generation_for(key)
+    if state._observed_refs_generation == 0:
+        state._observed_refs_generation = next(_session_ref_generation_counter)
+    return state._observed_refs_generation
+
+
+def replace_session_ref_map(
+    ref_map: dict[str, dict[str, Any]],
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+    generation: int | None = None,
+    page_key: tuple[int, int | None, str] | None = None,
+) -> bool:
+    """Replace the session's ref snapshot (never merge). Returns False if discarded.
+
+    When ``generation`` is given, the snapshot is discarded if the registry was
+    cleared after that generation was captured — the observe raced a navigation
+    or context switch and describes a replaced document.
+    """
+    state = get_current_session()
+    snapshot: dict[str, Any] = {"page_key": page_key, "refs": dict(ref_map)}
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        if generation is not None and generation != _generation_for(key):
+            return False
+        _session_ref_maps[key] = snapshot
+        while len(_session_ref_maps) > _SESSION_REF_STORE_MAX:
+            _session_ref_maps.pop(next(iter(_session_ref_maps)))
+    else:
+        if generation is not None and generation != state._observed_refs_generation:
+            return False
+        state._observed_refs = snapshot
+    return True
+
+
+def get_session_ref(
+    ref: str,
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+    page_key: tuple[int, int | None, str] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a ref, failing closed when the snapshot was bound to a different
+    page/frame than the one the caller is on (popup steal, external tab close,
+    detached-frame fallback — transitions with no explicit clear hook)."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        snapshot = _session_ref_maps.get(key)
+        if snapshot is not None:
+            # LRU touch: active sessions shouldn't be evicted by unrelated churn
+            _session_ref_maps[key] = _session_ref_maps.pop(key)
+    else:
+        snapshot = state._observed_refs or None
+    if not snapshot:
+        return None
+    if snapshot.get("page_key") != page_key:
+        return None
+    element: dict[str, Any] | None = snapshot["refs"].get(ref)
+    return element
+
+
+def clear_session_ref_map(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> None:
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        _session_ref_maps.pop(key, None)
+        _session_ref_generations[key] = next(_session_ref_generation_counter)
+        while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
+            _session_ref_generations.pop(next(iter(_session_ref_generations)))
+    else:
+        state._observed_refs = {}
+        state._observed_refs_generation = next(_session_ref_generation_counter)
 
 
 def register_copilot_session(session_id: str, state: SessionState) -> None:
@@ -91,6 +243,11 @@ def register_copilot_session(session_id: str, state: SessionState) -> None:
 def unregister_copilot_session(session_id: str) -> None:
     """Remove a copilot browser session from the process-local registry."""
     _copilot_sessions.pop(session_id, None)
+
+
+def active_copilot_session_ids() -> set[str]:
+    """Browser-session IDs currently bound to an active copilot turn."""
+    return set(_copilot_sessions)
 
 
 def _explicit_cloud_session_can_access_localhost() -> bool:
@@ -301,6 +458,7 @@ async def close_current_session() -> None:
         if current.browser is not None:
             await current.browser.close()
     finally:
+        clear_session_ref_map()
         if current.context and current.context.session_id:
             unregister_copilot_session(current.context.session_id)
         set_current_session(SessionState())
@@ -441,6 +599,7 @@ async def browser_session(
             await browser.close()
         except Exception:
             pass  # Best effort cleanup
+        clear_session_ref_map()
         set_current_session(SessionState())
 
 

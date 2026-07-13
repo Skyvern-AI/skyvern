@@ -12,17 +12,16 @@ Two layers:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
-from skyvern.forge.sdk.db.models import Base, WorkflowModel, WorkflowTagEventModel
+from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowTagEventModel
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -33,12 +32,8 @@ OTHER_ORG_ID = "o_other"
 
 
 @pytest_asyncio.fixture
-async def engine() -> AsyncGenerator[AsyncEngine]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
+async def engine(sqlite_engine: AsyncEngine) -> AsyncEngine:
+    return sqlite_engine
 
 
 @pytest_asyncio.fixture
@@ -288,16 +283,17 @@ def _make_org(org_id: str = ORG_ID) -> Organization:
     )
 
 
-@pytest.fixture
-def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    """Mount the real GET /workflows route with a mocked WORKFLOW_SERVICE.
+@pytest.fixture(scope="module")
+def _route_app() -> tuple[FastAPI, MagicMock, dict[str, object]]:
+    """Mount the real GET /workflows route once per module with a mocked WORKFLOW_SERVICE.
 
     Captures the workflow_tags value the route passes to the service so the
     ?tags= registration + key:value parsing (including 400s) are tested end to
     end. Importing the router module also guards against the route-registration
     failure caught in debate round 1 — a bad param declaration raises at import.
+    ``include_router`` is expensive, so the app is shared; ``route_client`` clears
+    the captured dict and re-applies the ``app`` monkeypatch per test.
     """
-    from skyvern.forge.sdk.routes import agent_protocol as ap
     from skyvern.forge.sdk.routes.routers import base_router
 
     captured: dict[str, object] = {}
@@ -313,11 +309,24 @@ def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock.WORKFLOW_SERVICE = service_mock
     # template=true path: empty global list short-circuits to [] before any service call.
     app_mock.STORAGE.retrieve_global_workflows = AsyncMock(return_value=[])
-    monkeypatch.setattr(ap, "app", app_mock)
+    app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
 
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
     test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org(ORG_ID)
+
+    return test_app, app_mock, captured
+
+
+@pytest.fixture
+def route_client(
+    monkeypatch: pytest.MonkeyPatch, _route_app: tuple[FastAPI, MagicMock, dict[str, object]]
+) -> TestClient:
+    test_app, app_mock, captured = _route_app
+    captured.clear()
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    monkeypatch.setattr(ap, "app", app_mock)
 
     client = TestClient(test_app)
     client.captured = captured  # type: ignore[attr-defined]

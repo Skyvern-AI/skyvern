@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
-import { ArtifactApiResponse, ArtifactType, Status } from "@/api/types";
+import { ArtifactApiResponse, Status } from "@/api/types";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
@@ -11,13 +11,19 @@ import {
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 import { apiPathPrefix } from "@/util/env";
+import { isBlockScreenshot, selectBlockScreenshot } from "./blockScreenshot";
 
 type Props = {
   workflowRunBlockId: string;
+  blockType?: string;
   runStatus?: Status;
 };
 
-function WorkflowRunBlockScreenshot({ workflowRunBlockId, runStatus }: Props) {
+function WorkflowRunBlockScreenshot({
+  workflowRunBlockId,
+  blockType,
+  runStatus,
+}: Props) {
   const credentialGetter = useCredentialGetter();
   const [imageFailed, setImageFailed] = useState(false);
 
@@ -32,22 +38,18 @@ function WorkflowRunBlockScreenshot({ workflowRunBlockId, runStatus }: Props) {
         .then((response) => response.data);
     },
     refetchInterval: (query) => {
-      const data = query.state.data;
-      const screenshot = data?.filter(
-        (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
-      )?.[0];
-      if (!screenshot) {
-        return 5000;
+      // While the run is active, keep polling so the latest screenshot shows (a code block's
+      // action screenshots land after its pre-execution LLM screenshot). Once finalized, stop:
+      // no further screenshots are captured, including for promptless code blocks that never
+      // produce one. Status unknown -> poll until any screenshot appears.
+      if (runStatus !== undefined) {
+        return statusIsNotFinalized({ status: runStatus }) ? 5000 : false;
       }
-      return false;
+      return query.state.data?.some(isBlockScreenshot) ? false : 5000;
     },
   });
 
-  const llmScreenshots = artifacts?.filter(
-    (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
-  );
-
-  const screenshot = llmScreenshots?.[0];
+  const screenshot = selectBlockScreenshot(artifacts, blockType);
 
   useEffect(() => {
     setImageFailed(false);
@@ -112,7 +114,7 @@ function WorkflowRunBlockScreenshot({ workflowRunBlockId, runStatus }: Props) {
     <figure className="mx-auto flex max-w-full flex-col items-center gap-2 overflow-hidden rounded">
       <ZoomableImage
         src={getImageURL(screenshot)}
-        alt="llm-screenshot"
+        alt="block screenshot"
         onError={() => setImageFailed(true)}
       />
     </figure>

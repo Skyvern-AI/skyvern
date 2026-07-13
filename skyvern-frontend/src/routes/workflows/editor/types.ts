@@ -1,4 +1,7 @@
-import { WorkflowParameterValueType } from "../types/workflowTypes";
+import {
+  CredentialSelectionStrategy,
+  WorkflowParameterValueType,
+} from "../types/workflowTypes";
 
 // Keys the Login block auto-generates when a user picks a credential directly
 // (`credentials`, `credentials_1`, …). Used as the provenance signal that tells
@@ -20,6 +23,9 @@ export type SkyvernCredential = {
   description?: string | null;
   parameterType: "credential";
   credentialId: string;
+  credentialIds?: Array<string> | null;
+  selectionStrategy?: CredentialSelectionStrategy | null;
+  dataType?: typeof WorkflowParameterValueType.CredentialId;
 };
 
 export type OnePasswordCredential = {

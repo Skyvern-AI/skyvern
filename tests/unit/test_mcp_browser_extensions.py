@@ -10,6 +10,7 @@ import pytest
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools.browser import _wrap_async_iife
+from tests.unit._mcp_browser_fakes import make_probe_locator
 
 # -- Helpers --
 
@@ -112,7 +113,57 @@ class TestDrag:
         result = await mcp_browser.skyvern_drag(source_selector="#src", target_selector="#tgt")
         assert result["ok"] is True
         assert result["data"]["mode"] == "selector"
-        raw.drag_and_drop.assert_awaited_once_with("#src", "#tgt", timeout=30000)
+        raw.drag_and_drop.assert_awaited_once_with("#src", "#tgt", timeout=5000)
+
+    @pytest.mark.asyncio
+    async def test_selector_drag_timeout_attributes_hidden_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        locators = {"#src": make_probe_locator(), "#tgt": make_probe_locator(visible=False)}
+        raw = MagicMock()
+        raw.drag_and_drop = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
+        raw.locator = MagicMock(side_effect=lambda selector: locators[selector])
+        page = _fake_page(raw)
+        _patch_get_page(monkeypatch, page=page)
+
+        result = await mcp_browser.skyvern_drag(source_selector="#src", target_selector="#tgt")
+
+        assert result["ok"] is False
+        assert result["error"]["details"]["element_state"] == "hidden"
+        assert result["error"]["details"]["selector"] == "#tgt"
+        assert result["error"]["details"]["source_selector"] == "#src"
+
+    @pytest.mark.asyncio
+    async def test_selector_drag_interception_attributes_occluded_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        locators = {"#src": make_probe_locator(), "#tgt": make_probe_locator()}
+        raw = MagicMock()
+        raw.drag_and_drop = AsyncMock(
+            side_effect=mcp_browser.PlaywrightTimeoutError("<div class='overlay'></div> intercepts pointer events")
+        )
+        raw.locator = MagicMock(side_effect=lambda selector: locators[selector])
+        page = _fake_page(raw)
+        _patch_get_page(monkeypatch, page=page)
+
+        result = await mcp_browser.skyvern_drag(source_selector="#src", target_selector="#tgt")
+
+        assert result["ok"] is False
+        assert result["error"]["details"]["element_state"] == "occluded"
+        assert result["error"]["details"]["selector"] == "#tgt"
+        assert result["error"]["details"]["source_selector"] == "#src"
+
+    @pytest.mark.asyncio
+    async def test_selector_drag_timeout_attributes_missing_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        locators = {"#src": make_probe_locator(count=0), "#tgt": make_probe_locator()}
+        raw = MagicMock()
+        raw.drag_and_drop = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
+        raw.locator = MagicMock(side_effect=lambda selector: locators[selector])
+        page = _fake_page(raw)
+        _patch_get_page(monkeypatch, page=page)
+
+        result = await mcp_browser.skyvern_drag(source_selector="#src", target_selector="#tgt")
+
+        assert result["ok"] is False
+        assert result["error"]["details"]["element_state"] == "not_found"
+        assert result["error"]["details"]["selector"] == "#src"
+        assert "source_selector" not in result["error"]["details"]
 
     @pytest.mark.asyncio
     async def test_intent_mode_calls_do_act(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,7 +225,7 @@ class TestFileUpload:
         assert result["data"]["files_count"] == 1
         raw.locator.assert_called_once_with("input[type=file]")
         # set_input_files receives a list with the single file
-        mock_locator.set_input_files.assert_awaited_once_with(["/tmp/test.txt"], timeout=30000)
+        mock_locator.set_input_files.assert_awaited_once_with(["/tmp/test.txt"], timeout=5000)
 
     @pytest.mark.asyncio
     async def test_intent_only_local_file_uses_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -206,7 +257,7 @@ class TestFileUpload:
         page.upload_file.assert_awaited_once_with(
             selector="input[type=file]",
             files="https://example.com/file.pdf",
-            timeout=30000,
+            timeout=5000,
         )
 
     @pytest.mark.asyncio
@@ -227,7 +278,7 @@ class TestFileUpload:
         assert result["ok"] is True
         assert result["data"]["files_count"] == 2
         # Single call with both files, not two separate calls
-        mock_locator.set_input_files.assert_awaited_once_with(["/tmp/a.txt", "/tmp/b.txt"], timeout=30000)
+        mock_locator.set_input_files.assert_awaited_once_with(["/tmp/a.txt", "/tmp/b.txt"], timeout=5000)
 
     @pytest.mark.asyncio
     async def test_multi_url_returns_error(self) -> None:

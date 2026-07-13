@@ -1,4 +1,5 @@
 import logging
+import random
 import re
 import sys
 from pathlib import Path
@@ -26,6 +27,35 @@ LOGGING_LEVEL_MAP: dict[str, int] = {
 
 # Resolved once at setup time and injected into every log event.
 _entrypoint: str = "unknown"
+
+_DRIVER_PIPE_CLOSED_ERROR = "Connection closed while reading from the driver"
+_TARGET_CLOSED_ERROR = "Target page, context or browser has been closed"
+_ORPHANED_FUTURE_MESSAGE = "Future exception was never retrieved"
+_TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
+
+
+class _DriverPipeNoiseFilter(logging.Filter):
+    """Drop asyncio's orphaned-future noise from a torn-down Playwright driver/target.
+
+    Benign teardown race: a fire-and-forget driver op left a future behind, then the
+    target closed before it resolved, so asyncio logs the un-retrieved exception at
+    ERROR. Two variants are suppressed: the driver-pipe close (matched by its
+    distinctive message) and patchright's TargetClosedError. The latter is matched by
+    exception *type*, not text — the same "...has been closed" message can also come
+    from a crashed/killed browser, so a type check keeps real failures visible.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if _ORPHANED_FUTURE_MESSAGE not in message:
+            return True
+        exc = record.exc_info[1] if record.exc_info and len(record.exc_info) > 1 else None
+        if _DRIVER_PIPE_CLOSED_ERROR in message or (exc is not None and _DRIVER_PIPE_CLOSED_ERROR in str(exc)):
+            return False
+        if exc is not None:
+            return type(exc).__name__ != _TARGET_CLOSED_ERROR_TYPE
+        # No exception object to type-check (message-only record) — fall back to the text.
+        return _TARGET_CLOSED_ERROR not in message
 
 
 def _get_entrypoint() -> str:
@@ -115,7 +145,7 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     msg_field = event_dict.get("msg", "")
 
     # Add key-value pairs
-    kv_pairs = {k: v for k, v in event_dict.items() if k not in ["msg", "timestamp", "level"]}
+    kv_pairs = {k: v for k, v in event_dict.items() if k not in ["msg", "timestamp", "level", "sampling"]}
     if kv_pairs:
         additional_info = ", ".join(f"{k}={v}" for k, v in kv_pairs.items())
         msg_field += f" | {additional_info}"
@@ -182,6 +212,29 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
         context.log.append(log_entry)
 
     return event_dict
+
+
+def sample_logs_processor(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Probabilistically drop INFO call sites marked ``sampling=True`` for configured orgs.
+
+    Placed after ``skyvern_logs_processor`` so the full line is still captured in
+    ``context.log`` (persisted to the per-run S3 log artifact); only the stdout /
+    Datadog stream is thinned. The ``sampling`` marker never ships downstream, and
+    WARN/ERROR are never dropped even when marked.
+    """
+    if not event_dict.pop("sampling", False):
+        return event_dict
+    if method_name != "info":
+        return event_dict
+
+    context = skyvern_context.current()
+    organization_id = context.organization_id if context else None
+    if organization_id not in settings.LOG_SAMPLING_ORG_IDS:
+        return event_dict
+
+    if random.random() < settings.LOG_SAMPLING_RATE:
+        return event_dict
+    raise structlog.DropEvent
 
 
 def add_filename_section(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -414,18 +467,22 @@ def setup_logger() -> None:
             structlog.processors.format_exc_info,
         ]
         + additional_processors
-        + [skyvern_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+        + [skyvern_logs_processor, sample_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
     )
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=[
+                add_error_processor,
+                structlog.processors.format_exc_info,
+            ],
             processors=[
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
                 renderer,
-            ]
+            ],
         )
     )
     root_logger = logging.getLogger()
@@ -452,3 +509,18 @@ def setup_logger() -> None:
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
     logging.getLogger("websockets.legacy").setLevel(logging.WARNING)
     logging.getLogger("websockets.legacy.server").setLevel(logging.WARNING)
+
+    # Anthropic Bedrock SDK emits high-volume WARN noise; keep only its errors.
+    logging.getLogger("anthropic").setLevel(logging.ERROR)
+
+    # Mute LiteLLM's high-volume library logs; our own LLM handler already logs calls/errors.
+    logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
+    logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
+    logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
+
+    # Drop asyncio's orphaned-future noise from torn-down Playwright driver pipes (logged at
+    # ERROR but non-actionable). setup_logger may run more than once (uvicorn reload), so keep
+    # exactly one instance instead of stacking duplicates.
+    asyncio_logger = logging.getLogger("asyncio")
+    asyncio_logger.filters = [f for f in asyncio_logger.filters if not isinstance(f, _DriverPipeNoiseFilter)]
+    asyncio_logger.addFilter(_DriverPipeNoiseFilter())

@@ -48,6 +48,13 @@ class SkyvernException(Exception):
         self.message = message
         super().__init__(message)
 
+    @property
+    def user_facing_type_name(self) -> str:
+        # Class name safe to render in a user-facing message. Subclasses whose real class
+        # name carries sensitive info (e.g. a remote-browser vendor identity) override this
+        # so the concrete name stays in logs/monitoring but never reaches end users.
+        return type(self).__name__
+
 
 class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
@@ -128,6 +135,16 @@ def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
 
 
+# A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
+# ws/wss endpoint URL, which can carry the remote-browser vendor host, a session-bearing
+# path/query, or credentials embedded as user:pass@host. Redact it before it reaches a user.
+_CDP_WS_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+
+
+def _redact_cdp_endpoint_urls(message: str) -> str:
+    return _CDP_WS_URL_RE.sub("[remote browser endpoint]", message)
+
+
 def get_user_facing_exception_message(exception: Exception) -> str:
     if isinstance(exception, SkyvernException):
         return exception.message or str(exception)
@@ -159,6 +176,26 @@ class RateLimitExceeded(SkyvernHTTPException):
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
+
+
+class PhoneNumberInputMismatch(SkyvernException):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        self.expected_digit_count = expected_digit_count
+        self.actual_digit_count = actual_digit_count
+        super().__init__(
+            "Phone input read-back mismatch: "
+            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
+
+
+class CardNumberInputMismatch(SkyvernException):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        self.expected_digit_count = expected_digit_count
+        self.actual_digit_count = actual_digit_count
+        super().__init__(
+            "Card number input read-back mismatch: "
+            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+        )
 
 
 class ConditionalBranchEvaluationError(SkyvernException):
@@ -268,7 +305,16 @@ class MissingWorkflowRunBrowserState(SkyvernException):
         super().__init__(f"Browser state for workflow run {workflow_run_id} and task {task_id} is missing.")
 
 
-class CaptchaNotSolvedInTime(SkyvernException):
+class CaptchaSolveError(SkyvernException):
+    """Base for captcha-solve failures.
+
+    Shared marker so the action handler can catch captcha-solve failures with a
+    dedicated typed arm (logged as a handled failure) instead of the generic
+    "Unhandled exception" arm. Cloud captcha-solve exceptions subclass this too.
+    """
+
+
+class CaptchaNotSolvedInTime(CaptchaSolveError):
     def __init__(self, task_id: str, final_state: str) -> None:
         super().__init__(f"Captcha not solved in time for task {task_id}. Final state: {final_state}")
 
@@ -444,16 +490,23 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
     SUPPORT_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
 
     def __init__(self, browser_type: str, exception: Exception) -> None:
-        exception_type = type(exception).__name__
+        # browser_type can be a concrete remote-browser vendor identity (settings.BROWSER_TYPE);
+        # keep it on the exception for structured logs but never surface it in the user message.
+        self.browser_type = browser_type
+        # A SkyvernException may redact its own class name (e.g. a vendor-named rate-limit
+        # error whose real name is kept for logs/monitoring but must not reach end users).
+        exception_type = (
+            exception.user_facing_type_name if isinstance(exception, SkyvernException) else type(exception).__name__
+        )
         detail = self._get_detail(exception)
-        super().__init__(f"Failed to create browser context for {browser_type} ({exception_type}). {detail}")
+        super().__init__(f"Failed to create browser context ({exception_type}). {detail}")
 
     @staticmethod
     def _get_detail(exception: Exception) -> str:
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
-        raw_message = str(exception).strip()
+        raw_message = _redact_cdp_endpoint_urls(str(exception).strip())
         raw_lower = raw_message.lower()
 
         # Browser launch environment errors: worker cannot initialize the
@@ -779,9 +832,19 @@ class UnsupportedActionType(SkyvernException):
         super().__init__(f"Unsupport action type: {action_type}")
 
 
+_INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT = (
+    " The element appears to be a non-input segment of a custom date widget. "
+    "Look for a calendar icon, date picker trigger, or stepper button near this "
+    "element and click that instead of typing into the segment."
+)
+
+
 class InvalidElementForTextInput(SkyvernException):
-    def __init__(self, element_id: str, tag_name: str):
-        super().__init__(f"The {tag_name} element with id={element_id} doesn't support text input.")
+    def __init__(self, element_id: str, tag_name: str, *, is_date_related: bool = False):
+        message = f"The {tag_name} element with id={element_id} doesn't support text input."
+        if is_date_related:
+            message += _INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT
+        super().__init__(message)
 
 
 class ElementIsNotLabel(SkyvernException):
@@ -915,8 +978,31 @@ class NoIncrementalElementFoundForCustomSelection(SkyvernException):
 
 
 class NoAvailableOptionFoundForCustomSelection(SkyvernException):
-    def __init__(self, reason: str | None) -> None:
-        super().__init__(f"No available option to select. reason: {reason}.")
+    """Raised when the dropdown was populated but no option matched the requested target."""
+
+    def __init__(
+        self,
+        reason: str | None,
+        target_value: str | None = None,
+        observed_options: list[str] | None = None,
+    ) -> None:
+        observed_excerpt = observed_options[:5] if observed_options else []
+        observed_count = len(observed_options) if observed_options is not None else 0
+        parts = ["No available option to select.", "code=OPTION_NOT_AVAILABLE"]
+        if target_value:
+            parts.append(f"target_value={target_value!r}")
+        if observed_options is not None:
+            parts.append(f"observed_options_count={observed_count}")
+        if observed_excerpt:
+            parts.append(f"observed_options_excerpt={observed_excerpt}")
+        if reason:
+            parts.append(f"reason={reason!r}")
+        super().__init__(" ".join(parts))
+        self.code = "OPTION_NOT_AVAILABLE"
+        self.target_value = target_value
+        self.observed_options_count = observed_count
+        self.observed_options_excerpt = observed_excerpt
+        self.reason = reason
 
 
 class NoElementMatchedForTargetOption(SkyvernException):
@@ -1269,3 +1355,11 @@ class ImaginarySecretValue(SkyvernException):
         super().__init__(
             f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )
+
+
+class CodeBlockRunnerSelectionError(SkyvernException):
+    """Raised when the secure CodeBlock runner selection policy cannot be evaluated safely.
+
+    The block-execution call site catches this and fails the block closed instead of
+    silently falling back to in-process execution.
+    """

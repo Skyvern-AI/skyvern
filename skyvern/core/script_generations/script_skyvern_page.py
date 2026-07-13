@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pydantic
-import pyotp
 import structlog
 from cachetools import TTLCache
 from playwright.async_api import Page
@@ -30,6 +29,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
+from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
@@ -146,7 +146,10 @@ class ScriptSkyvernPage(SkyvernPage):
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
             scrape_exclude=app.scrape_exclude,
             max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
-            draw_boxes=True,
+            # DEPRECATED: visual bounding box overlays are no longer rendered during scraping.
+            # ``draw_boxes`` is wired through the scrape pipeline as False; the overlay helpers
+            # are retained briefly for backwards compatibility and scheduled for removal.
+            draw_boxes=False,
             scroll=True,
             support_empty_page=True,
         )
@@ -910,7 +913,7 @@ class ScriptSkyvernPage(SkyvernPage):
                             totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
                             if totp_secret:
                                 try:
-                                    totp_code = pyotp.TOTP(totp_secret).now()
+                                    totp_code = generate_totp_code(totp_secret)
                                     # Cache the code for subsequent digit requests in this sequence
                                     self._totp_sequence_cache[cache_key] = totp_code
                                     LOG.info(

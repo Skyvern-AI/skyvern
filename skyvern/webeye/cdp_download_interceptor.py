@@ -32,6 +32,8 @@ from urllib.parse import unquote, urlparse
 import structlog
 from playwright.async_api import Browser, BrowserContext, CDPSession, Page
 
+from skyvern.webeye.utils.page import SkyvernFrame
+
 LOG = structlog.get_logger()
 
 # Chunk size for IO.read streaming
@@ -99,8 +101,25 @@ DOWNLOAD_MIME_TYPES = frozenset(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.ms-excel",
         "application/msword",
+        "text/csv",
+        "application/csv",
     }
 )
+
+# Literal Content-Type strings that some misconfigured servers send verbatim for
+# file bytes (e.g. the literal "application/*"). Matched by exact string equality,
+# NOT wildcard/prefix semantics. Only eligible for XHR/Fetch responses with
+# Content-Length >= MIN_XHR_DOWNLOAD_BYTES; non-XHR responses must rely on stronger
+# signals (attachment header or known download MIME).
+GENERIC_DOWNLOAD_CONTENT_TYPE_LITERALS = frozenset(
+    {
+        "application/*",
+    }
+)
+
+# Minimum response size (bytes) for XHR/Fetch responses with generic binary MIME to be
+# treated as downloads, even without Content-Disposition: attachment.
+MIN_XHR_DOWNLOAD_BYTES = 1024  # 1 KB
 
 DOWNLOAD_EXTENSION_BY_MIME_TYPE = {
     "application/pdf": ".pdf",
@@ -109,6 +128,23 @@ DOWNLOAD_EXTENSION_BY_MIME_TYPE = {
 _FILENAME_PATH_SEPARATOR_RE = re.compile(r"[\\/]+")
 _FILENAME_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+# Substrings that identify a CDP interception which was already resolved/cancelled, or whose
+# target/frame detached, before our async handler could respond — a benign race between
+# Fetch.requestPaused firing and us sending continue/fulfill (common for telemetry requests
+# cancelled by navigation). Retrying is futile; these must not surface as error-level failures.
+# Matched case-insensitively against the raised error message.
+_STALE_INTERCEPTION_ERROR_SUBSTRINGS = (
+    "invalid interceptionid",
+    "target closed",
+    "session closed",
+    "has been closed",
+)
+
+
+def _is_stale_interception_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(substr in message for substr in _STALE_INTERCEPTION_ERROR_SUBSTRINGS)
 
 
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
@@ -166,6 +202,24 @@ def normalize_download_filename(filename: str, content_type: str = "") -> str:
     return filename
 
 
+def download_filename_from_suffix(download_suffix: str, source_extension: str, existing_names: set[str]) -> str:
+    """Filename for a download whose block configured ``download_suffix``"""
+    existing_names = {Path(n).name for n in existing_names}  # contract: dedup on basenames, never full paths
+    name = Path(download_suffix).name  # defensive: never let a suffix escape the dir
+    suffix_ext = Path(name).suffix
+    if suffix_ext:
+        stem, ext = name[: -len(suffix_ext)], suffix_ext
+    else:
+        stem, ext = name, source_extension or ""
+    stem = stem or "download"
+    candidate = f"{stem}{ext}"
+    counter = 1
+    while candidate in existing_names:
+        candidate = f"{stem}_{counter}{ext}"
+        counter += 1
+    return candidate
+
+
 def is_download_response(headers: dict[str, str], status_code: int, resource_type: str = "") -> bool:
     """
     Determine if a response is a file download.
@@ -176,6 +230,9 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     2. Skip API content types (application/json, etc.)
     3. For XHR/Fetch: require BOTH attachment header AND download MIME type
        (prevents false positives like Google's text/plain + attachment XHR responses)
+       Exception: generic binary MIME types (like application/*) where the server
+       does not set a specific Content-Type but the response carries meaningful
+       bytes (Content-Length >= MIN_XHR_DOWNLOAD_BYTES).
     4. Content-Disposition contains "attachment"
     5. Content-Type is a known download MIME type
     """
@@ -193,11 +250,21 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
 
     is_attachment = "attachment" in content_disposition.lower()
     is_download_mime = content_type in DOWNLOAD_MIME_TYPES
+    is_generic_binary = content_type in GENERIC_DOWNLOAD_CONTENT_TYPE_LITERALS
 
     # XHR/Fetch require both signals to avoid false positives
     # (e.g. Google async requests: text/plain + attachment; filename="f.txt")
     if resource_type in XHR_FETCH_RESOURCE_TYPES:
-        return is_attachment and is_download_mime
+        # Primary path: attachment header + known download MIME
+        if is_attachment and is_download_mime:
+            return True
+        # Secondary path: generic binary MIME with evidence of actual file content.
+        # Some sites (e.g. report exports) return XHR file responses with
+        # Content-Type: application/* and no Content-Disposition header.
+        content_length = _parse_content_length(headers)
+        if is_generic_binary and content_length is not None and content_length >= MIN_XHR_DOWNLOAD_BYTES:
+            return True
+        return False
 
     if is_attachment:
         return True
@@ -281,6 +348,11 @@ class CDPDownloadInterceptor:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         LOG.info("CDP download interceptor download dir set", download_dir=download_dir)
 
+    def is_monitoring_browser_downloads(self) -> bool:
+        """True while the monitor owns the context's setDownloadBehavior binding ({deny, eventsEnabled:True},
+        saving over HTTP), so re-sending allow/downloadPath would disable it on remote CDP."""
+        return self._browser_session is not None
+
     def _resolve_save_path(self, filename: str = "", content_type: str = "") -> tuple[Path, str]:
         """Generate a unique save path under _output_dir.
 
@@ -298,6 +370,9 @@ class CDPDownloadInterceptor:
         if not filename:
             filename = f"download_{uuid.uuid4().hex[:8]}{_download_extension_for_content_type(content_type)}"
 
+        # download_suffix is NOT applied here: this runs inside CDP callbacks that don't carry the
+        # step's SkyvernContext, so the suffix could be stale. Run-dir files are renamed to
+        # download_suffix by _finalize_downloaded_files_for_task instead.
         save_path = self._output_dir / filename
         # TODO: implement proper filename dedup (e.g., content hash or UUID suffix)
         if save_path.exists():
@@ -399,22 +474,21 @@ class CDPDownloadInterceptor:
                 LOG.warning("Empty download URL, skipping")
                 return
 
-            # Skip if already downloaded via CDP Fetch interception.
-            # Fetch always fires before Browser.downloadWillBegin (Fetch intercepts at
-            # response stage, browser download manager fires after fulfillRequest), so
-            # this check is purely one-directional: only _handle_download writes the set.
+            # Skip if this exact URL was already captured. Both the Fetch path
+            # (_handle_download) and the blob path (_download_blob_url, after a successful save)
+            # record URLs here. We record only AFTER a successful save — not before the read — so
+            # a transient failure can't block a later retry of the same URL; a rare duplicate
+            # downloadWillBegin for the same blob URL is a benign re-save/overwrite.
             if url in self._downloaded_urls:
                 LOG.debug("URL already captured via Fetch, skipping direct download", url=url)
                 return
 
             if url.startswith("blob:"):
-                # blob: URLs are in-memory browser references — not fetchable over HTTP.
-                # They are already handled by the Fetch path which intercepts the resolved blob.
-                # TODO: handle the edge case where Fetch doesn't catch a blob download.
-                LOG.warning(
-                    "blob: URL download not yet supported, skipping", url=url, suggested_filename=suggested_filename
-                )
-                return
+                # blob: URLs are in-memory browser references — not fetchable over HTTP. When the
+                # page builds the file client-side (e.g. Blob + createObjectURL), the CDP Fetch
+                # path never sees a network response, so read the bytes back from a same-origin
+                # page instead of dropping the download.
+                await self._download_blob_url(url, suggested_filename)
             elif url.startswith("http"):
                 await self._download_url_directly(url, suggested_filename)
             else:
@@ -498,6 +572,57 @@ class CDPDownloadInterceptor:
             save_path=str(save_path),
             download_index=self._download_index,
             method=method,
+        )
+
+    async def _download_blob_url(self, url: str, suggested_filename: str) -> None:
+        """Save a blob: URL download by reading its bytes back from a same-origin page.
+
+        blob: URLs are in-memory references owned by the document that created them, so they
+        can't be fetched over HTTP. ``SkyvernFrame.read_blob_url_bytes`` runs the shared blob
+        read-back script inside a same-origin frame. Best-effort: a page may revoke the object
+        URL before we read it.
+        """
+        if not self._output_dir or self._browser_context is None:
+            LOG.warning("Cannot read blob download: no output dir or browser context", url=url)
+            return
+
+        # probe=True: this fans out over every open page as a best-effort fallback, so the
+        # shared reader must not emit ERROR logs for pages that don't own the blob's origin.
+        data: bytes | None = None
+        for page in list(self._browser_context.pages):
+            data = await SkyvernFrame.read_blob_url_bytes(
+                page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True
+            )
+            if data is not None:
+                break
+
+        if data is None:
+            LOG.warning(
+                "Could not read blob download from any page",
+                url=url,
+                suggested_filename=suggested_filename,
+            )
+            return
+        # Defense-in-depth: read_blob_url_bytes already rejects oversized blobs in-page before
+        # serialization, but guard again in case a caller passes no limit.
+        if len(data) > MAX_FILE_SIZE_BYTES:
+            LOG.warning(
+                "Blob download exceeds size limit, discarding",
+                url=url,
+                size=len(data),
+                max_size=MAX_FILE_SIZE_BYTES,
+            )
+            return
+        save_path, filename = self._resolve_save_path(suggested_filename)
+        with open(save_path, "wb") as f:
+            f.write(data)
+        self._downloaded_urls.add(url)
+        LOG.info(
+            "CDP download saved (blob)",
+            filename=filename,
+            size=len(data),
+            save_path=str(save_path),
+            download_index=self._download_index,
         )
 
     async def disable(self) -> None:
@@ -647,6 +772,18 @@ class CDPDownloadInterceptor:
             else:
                 await self._continue_response(cdp_session, request_id)
         except Exception as e:
+            if _is_stale_interception_error(e):
+                # The interception was resolved/cancelled or its target detached before we
+                # responded (SKY-11964). Retrying continue/fulfill would fail identically, so
+                # drop it quietly — real download flows aren't stalled by a request that no
+                # longer exists.
+                LOG.debug(
+                    "CDP interception went stale before response (benign race)",
+                    request_id=request_id,
+                    url=url,
+                    error=str(e),
+                )
+                return
             LOG.error(
                 "Error handling CDP request",
                 request_id=request_id,
@@ -767,8 +904,17 @@ class CDPDownloadInterceptor:
         try:
             await self._fulfill_with_body(cdp_session, request_id, response_status, raw_response_headers, data)
         except Exception as e:
-            LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
-            # Can't continue response after body extraction, just log the error
+            # The file is already saved to disk at this point; only the browser-side replay failed.
+            # A stale interception here (target navigated/closed) is a benign race, not an error.
+            if _is_stale_interception_error(e):
+                LOG.debug(
+                    "fulfillRequest hit stale interception after download (benign race)",
+                    filename=filename,
+                    url=url,
+                    error=str(e),
+                )
+            else:
+                LOG.warning("fulfillRequest failed after download", filename=filename, url=url, error=str(e))
 
     async def _fulfill_with_body(
         self,

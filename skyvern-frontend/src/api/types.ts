@@ -31,6 +31,7 @@ export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];
 
 export const TriggerType = {
   Manual: "manual",
+  Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
 } as const;
@@ -89,6 +90,9 @@ export type GeoTarget = {
 };
 
 export type ProxyLocation = LegacyProxyLocation | GeoTarget | null;
+
+export const PINNED_RESIDENTIAL_ISP_PROXY_LOCATION =
+  "RESIDENTIAL_ISP" satisfies LegacyProxyLocation;
 
 export type ArtifactApiResponse = {
   created_at: string;
@@ -163,8 +167,6 @@ export type FailureCategory = {
   confidence_float: number;
   reasoning: string;
 };
-
-export type WebhookDeliveryStatus = "pending" | "failed";
 
 export type TaskApiResponse = {
   request: CreateTaskRequest;
@@ -249,6 +251,33 @@ export type OnePasswordTokenApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordItemApiResponse = {
+  item_id: string;
+  title: string;
+  vault_id: string;
+  vault_name: string;
+  category: string;
+  url?: string | null;
+};
+
+export type OnePasswordItemsApiResponse = {
+  configured: boolean;
+  items: Array<OnePasswordItemApiResponse>;
+};
+
+export type BitwardenItemApiResponse = {
+  item_id: string;
+  title: string;
+  collection_id?: string | null;
+  credential_type: "password" | "credit_card" | "secret";
+  url?: string | null;
+};
+
+export type BitwardenItemsApiResponse = {
+  configured: boolean;
+  items: Array<BitwardenItemApiResponse>;
+};
+
 export type CreateOnePasswordTokenRequest = {
   token: string;
 };
@@ -259,6 +288,47 @@ export type CreateOnePasswordTokenResponse = {
 
 export type ClearOrganizationAuthTokenResponse = {
   success: boolean;
+};
+
+export type CustomLLMProvider = "openai_compatible" | "ollama" | "openrouter";
+
+export type CustomLLMConfig = {
+  display_name: string;
+  provider: CustomLLMProvider;
+  model_name: string;
+  api_base?: string | null;
+  api_key?: string | null;
+  api_version?: string | null;
+  supports_vision: boolean;
+  add_assistant_prefix: boolean;
+  max_completion_tokens?: number | null;
+  temperature?: number | null;
+  reasoning_effort?: string | null;
+};
+
+export type CustomLLM = {
+  id: string;
+  organization_id: string;
+  config: CustomLLMConfig;
+  created_at: string;
+  modified_at: string;
+  valid: boolean;
+};
+
+export type CustomLLMListResponse = {
+  custom_llms: Array<CustomLLM>;
+};
+
+export type CustomLLMResponse = {
+  custom_llm: CustomLLM;
+};
+
+export type CustomLLMCreateRequest = {
+  config: CustomLLMConfig;
+};
+
+export type CustomLLMUpdateRequest = {
+  config: CustomLLMConfig;
 };
 
 export interface AzureClientSecretCredential {
@@ -289,8 +359,12 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
-  scopes: string | null;
-  valid: boolean;
+  provider?: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
   created_at: string;
   modified_at: string;
 }
@@ -304,9 +378,31 @@ export interface GoogleOAuthCredentialListResponse {
   credentials: GoogleOAuthCredential[];
 }
 
+export interface GoogleOAuthClientConfigSafe {
+  client_id: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+  client_secret_configured: boolean;
+  configured: boolean;
+  source: string;
+  encryption_enabled: boolean;
+}
+
+export interface GoogleOAuthClientConfigResponse {
+  config: GoogleOAuthClientConfigSafe;
+}
+
+export interface UpdateGoogleOAuthClientConfigRequest {
+  client_id: string;
+  client_secret?: string | null;
+  redirect_hosts: string[];
+  app_origins: string[];
+}
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
+  scope_profile?: string;
   app_origin?: string;
 }
 
@@ -316,6 +412,45 @@ export interface GoogleOAuthAuthorizeResponse {
 }
 
 export interface CreateGoogleOAuthCallbackRequest {
+  code: string;
+  state: string;
+}
+
+export interface MicrosoftOAuthCredential {
+  id: string;
+  organization_id: string;
+  credential_name: string;
+  state?: string;
+  scopes_requested?: string[] | string | null;
+  scopes_granted?: string[] | string | null;
+  scopes?: string[] | string | null;
+  valid?: boolean | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface MicrosoftOAuthCredentialResponse {
+  credential: MicrosoftOAuthCredential;
+  app_origin?: string | null;
+}
+
+export interface MicrosoftOAuthCredentialListResponse {
+  credentials: MicrosoftOAuthCredential[];
+}
+
+export interface CreateMicrosoftOAuthAuthorizeRequest {
+  redirect_uri: string;
+  credential_name?: string;
+  scope_profile?: "outlook_mail";
+  app_origin?: string;
+}
+
+export interface MicrosoftOAuthAuthorizeResponse {
+  authorize_url: string;
+  state: string;
+}
+
+export interface CreateMicrosoftOAuthCallbackRequest {
   code: string;
   state: string;
 }
@@ -447,6 +582,7 @@ export const ActionTypes = {
   LeftMouse: "left_mouse",
   GotoUrl: "goto_url",
   ClosePage: "close_page",
+  ExecuteJs: "execute_js",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -475,7 +611,36 @@ export const ReadableActionTypes: {
   left_mouse: "Left Mouse",
   goto_url: "Goto URL",
   close_page: "Close Page",
+  execute_js: "Execute JS",
 };
+
+type GetReadableActionTypeOptions = {
+  nullActionLabel?: string;
+};
+
+// Recorded code-block actions can carry an action_type the readable map doesn't
+// list yet (the runtime recorder maps more Playwright calls than the UI enumerates).
+// Humanize unknown types instead of rendering a blank badge.
+export function getReadableActionType(
+  actionType: string,
+  options: GetReadableActionTypeOptions = {},
+): string {
+  if (actionType === ActionTypes.NullAction && options.nullActionLabel) {
+    return options.nullActionLabel;
+  }
+  const known = ReadableActionTypes[actionType as ActionType];
+  if (known) {
+    return known;
+  }
+  if (!actionType) {
+    return "Step";
+  }
+  return actionType
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
 
 export type Option = {
   label: string;
@@ -537,6 +702,12 @@ export type DebugSessionApiResponse = {
   created_at: string;
   modified_at: string;
   vnc_streaming_supported: boolean | null;
+  pbs_browser_profile_id: string | null;
+};
+
+export type DebugLoginBlockCompatibilityResponse = {
+  compatible: boolean;
+  reason: "pbs_no_profile" | "pbs_different_profile" | null;
 };
 
 export type WorkflowRunApiResponse = {
@@ -585,6 +756,7 @@ export type TaskRunListItem = {
   workflow_permanent_id: string | null;
   workflow_deleted: boolean;
   script_run: boolean;
+  trigger_type?: TriggerType | null;
   searchable_text: string | null;
 };
 
@@ -607,10 +779,10 @@ export type WorkflowRunStatusApiResponse = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
+  errors: Array<Record<string, unknown>> | null;
   total_steps: number | null;
   total_cost: number | null;
   credits_used: number;
@@ -645,10 +817,10 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
-  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
+  errors: Array<Record<string, unknown>> | null;
   total_steps: number | null;
   total_cost: number | null;
   credits_used: number;
@@ -690,6 +862,11 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  // Code block recorded actions carry code_line and duration_ms here.
+  output?:
+    | { code_line?: number | null; duration_ms?: number | null }
+    | Record<string, unknown>
+    | null;
 };
 
 export type TaskV2 = {
@@ -725,6 +902,10 @@ export type BrowserProfileApiResponse = {
   name: string;
   description: string | null;
   source_browser_type: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
+  is_managed?: boolean;
+  workflow_permanent_id?: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -734,6 +915,11 @@ export type PasswordCredentialApiResponse = {
   username: string;
   totp_type: "authenticator" | "email" | "text" | "none";
   totp_identifier?: string | null;
+};
+
+export type CredentialTotpCodeResponse = {
+  code: string;
+  seconds_remaining: number;
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -758,6 +944,8 @@ export type CredentialApiResponse = {
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   folder_id?: string | null;
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
 };
 
 export function isPasswordCredential(
@@ -792,6 +980,9 @@ export type CreateCredentialRequest = {
   credential_type: "password" | "credit_card" | "secret";
   credential: PasswordCredential | CreditCardCredential | SecretCredential;
   vault_type?: "custom";
+  proxy_location?: ProxyLocation | null;
+  proxy_session_id?: string | null;
+  rotate_proxy_session_id?: boolean;
 };
 
 export type PasswordCredential = {
@@ -809,6 +1000,21 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+  billing_address?: CreditCardBillingAddress | null;
+  billing_email?: string | null;
+  billing_phone?: string | null;
+  metadata?: Record<string, string> | null;
+};
+
+export type CreditCardBillingAddress = {
+  line1?: string | null;
+  line2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  state_code?: string | null;
+  postal_code?: string | null;
+  country?: string | null;
+  country_code?: string | null;
 };
 
 export type SecretCredential = {

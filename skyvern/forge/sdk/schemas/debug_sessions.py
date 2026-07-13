@@ -22,6 +22,9 @@ class DebugSession(BaseModel):
     browser_session_id: str
     vnc_streaming_supported: bool | None = None
     workflow_permanent_id: str | None = None
+    # Mirrors the visible PBS's saved profile so the UI can warn before a debug
+    # run with a credential profile diverges from the user's stream.
+    pbs_browser_profile_id: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -56,3 +59,15 @@ class DebugSessionRuns(BaseModel):
 
     debug_session: DebugSession
     runs: list[DebugSessionRun]
+
+
+# Backend-authoritative verdict for a single LoginBlock in a debug session.
+# The FE pre-check works off a bounded credentials window; this endpoint
+# resolves the credential through the org-scoped lookup the run path uses
+# so a Play retry can recover even when pagination would miss the credential.
+DebugLoginBlockCompatibilityReason = t.Literal["pbs_no_profile", "pbs_different_profile"]
+
+
+class DebugLoginBlockCompatibility(BaseModel):
+    compatible: bool
+    reason: DebugLoginBlockCompatibilityReason | None = None

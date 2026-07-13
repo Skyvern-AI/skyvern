@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import re
+
+# Matches the activity/heartbeat timeout tokens the worker persists when a Temporal-activity
+# timeout finalizes a run. Word-anchored so "inactivity timeout" (a distinct page-level reason)
+# is NOT caught and correctly stays PAGE_LOAD_TIMEOUT.
+_INFRA_TIMEOUT_RE = re.compile(r"\b(?:activity|heartbeat) timeout\b")
+
 
 def classify_from_failure_reason(
     failure_reason: str | None,
@@ -61,14 +68,17 @@ def classify_from_failure_reason(
                 "category": "ANTI_BOT_DETECTION",
                 "confidence_float": 0.7,
                 "reasoning": "Keywords matched in failure reason",
+                # Provenance marker: a keyword match is not positive challenge
+                # evidence, so evidence-gated consumers must not assert on it.
+                "evidence_source": "keyword_only",
             }
         )
 
     # Proxy errors — check before browser errors so proxy failures don't fall into BROWSER_ERROR.
     # The exception name may contain "Browser" (e.g. UnknownErrorWhileCreatingBrowserContext) but the
-    # root cause is proxy pool exhaustion.
-    _proxy_exc_keywords = ["NoProxy", "ProxyError"]
-    _proxy_reason_keywords = ["no proxy available", "proxy unavailable"]
+    # root cause is proxy pool exhaustion or proxy connectivity failure.
+    _proxy_exc_keywords = ["NoProxy", "ProxyError", "GetOutboundIP"]
+    _proxy_reason_keywords = ["no proxy available", "proxy unavailable", "failed to get outbound ip"]
     if any(kw in exc_name for kw in _proxy_exc_keywords) or any(kw in reason for kw in _proxy_reason_keywords):
         categories.append(
             {
@@ -102,8 +112,21 @@ def classify_from_failure_reason(
             }
         )
 
+    # Infrastructure timeout — a Temporal activity / heartbeat timeout finalizes the run from
+    # the worker layer (a stalled activity or worker interruption), not a site/page-load issue.
+    # Classify before PAGE_LOAD_TIMEOUT so these don't masquerade as site slowness.
+    _is_infra_timeout = bool(_INFRA_TIMEOUT_RE.search(reason))
+    if _is_infra_timeout:
+        categories.append(
+            {
+                "category": "INFRASTRUCTURE_ERROR",
+                "confidence_float": 0.9,
+                "reasoning": "Activity/heartbeat timeout finalized the run",
+            }
+        )
+
     # Page load timeout
-    if "Timeout" in exc_name or "timeout" in reason:
+    if ("Timeout" in exc_name or "timeout" in reason) and not _is_infra_timeout:
         categories.append(
             {
                 "category": "PAGE_LOAD_TIMEOUT",

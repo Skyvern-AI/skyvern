@@ -8,6 +8,7 @@ from typing import Any
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.enforcement import PROBABLE_SITE_BLOCK_STREAK_STOP_AT
+from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -176,6 +177,15 @@ def _render_block_policy_detail(block_type: str, policy: CopilotBlockPolicy) -> 
     return f"`{block_type}` is {policy.status.value} and requires {policy.required_capability}. {policy.guidance}"
 
 
+def _record_code_native_pending_capability(ctx: AgentContext | None, policy: CopilotBlockPolicy) -> None:
+    if (
+        ctx is not None
+        and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
+        and ctx.code_native_pending_capability is None
+    ):
+        ctx.code_native_pending_capability = policy.required_capability
+
+
 def _code_only_browser_unavailable_types() -> list[str]:
     return sorted(
         block_type
@@ -216,7 +226,7 @@ def _code_only_browser_schema_guidance() -> list[str]:
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
-        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username, <key>.password, and <key>.totp (a fresh one-time code generated when the block starts). Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
     ]
 
 
@@ -239,14 +249,26 @@ Code-native capabilities still pending plumbing:
 
 Runtime facts:
 - `code` is async Python with a Playwright `page` object and workflow parameters by key.
+- The runtime pre-injects its helper namespaces; do not write `import` statements and do
+  not access dunder (`__name__`) names or attributes.
 - Valid Python identifier parameter keys are local variables; normalize before page inputs.
 - Use deterministic, bounded Playwright calls: `goto`, `click`, `fill`, `press`,
-  `wait_for_load_state`, and `evaluate`.
+  `wait_for_load_state`, `locator`, `get_by_role`, and locator text/count APIs.
+- For browser reads, prefer visible anchors, locator text, block outputs, and
+  MCP/scout evidence gathered before authoring.
 - A `credential_id` workflow parameter resolves to a credential object with
-  `<key>.username`, `<key>.password`, and fresh `<key>.totp`; scout fields with
+  `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
   `fill_credential_field`, never embed literal secrets.
+- Credentialed login code must be idempotent. After `goto`, wait for either the
+  login form or an already-authenticated page anchor; only fill username/password
+  when the login fields are visible, and after submit wait for a logged-in page
+  anchor instead of relying only on `networkidle`.
 - Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
+- For an extraction-intent `code` block, propose a typed `extraction_schema` (named
+  fields with types) from the goal and the scouted page, ASK_QUESTION to confirm or
+  adjust which fields to grab, then carry the confirmed JSON Schema as
+  `extraction_schema` on `code_artifact_metadata` and conform the block's `return` to it.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 
@@ -273,6 +295,7 @@ def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext
         if policy_entry is None:
             continue
         _normalized, policy = policy_entry
+        _record_code_native_pending_capability(ctx, policy)
         type_labels = ", ".join(sorted(grouped[block_type]))
         details.append(f"{block_type} [{type_labels}]: {_render_block_policy_detail(block_type, policy)}")
     details_part = " ".join(details)
@@ -325,6 +348,30 @@ def _collect_banned_block_items(
         if isinstance(loop_blocks, list):
             items.extend(_collect_banned_block_items(loop_blocks, active_banned_types))
     return items
+
+
+def _blocks_with_default_labels(blocks: list[Any]) -> list[Any]:
+    normalized_blocks: list[Any] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            normalized_blocks.append(block)
+            continue
+        normalized = dict(block)
+        if not isinstance(normalized.get("label"), str):
+            normalized["label"] = "(unlabeled)"
+        loop_blocks = normalized.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            normalized["loop_blocks"] = _blocks_with_default_labels(loop_blocks)
+        normalized_blocks.append(normalized)
+    return normalized_blocks
+
+
+def collect_code_only_banned_items(blocks: list[Any]) -> list[tuple[str, str]]:
+    """Banned (label, block_type) pairs under code-only browser mode; unlabeled blocks included."""
+    return _collect_banned_block_items(
+        _blocks_with_default_labels(blocks),
+        _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
+    )
 
 
 def _detect_new_banned_blocks(
@@ -444,7 +491,7 @@ def _challenge_http_request_reject_message(
         return None
     labels_text = ", ".join(sorted(set(labels)))
     return (
-        "Workflow validation failed: raw http_request blocks are not allowed for a page with observed "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}raw http_request blocks are not allowed for a page with observed "
         "anti-bot or human-verification challenge evidence. "
         f"Offending labels: [{labels_text}]. "
         "Use browser workflow blocks grounded in the observed page, include challenge handling only when visible, "
@@ -460,7 +507,7 @@ def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | N
         return None
     labels_text = ", ".join(sorted(set(labels)))
     return (
-        "Workflow validation failed: timing-only challenge wait blocks are not allowed after confirmed "
+        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}timing-only challenge wait blocks are not allowed after confirmed "
         "anti-bot/WAF or repeated site-block evidence. "
         f"Offending labels: [{labels_text}]. "
         "Do not add wait/delay-only blocks for this blocker; use a conditional challenge check that takes a "

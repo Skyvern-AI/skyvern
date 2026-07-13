@@ -64,18 +64,18 @@ export function UrlValidator({ url }: { url: string }) {
   return (
     <div
       className={cn(
-        "flex items-center gap-1 text-xs",
+        "flex min-w-0 items-start gap-1 text-xs",
         validation.valid
           ? "text-green-600 dark:text-green-400"
           : "text-red-600 dark:text-red-400",
       )}
     >
       {validation.valid ? (
-        <CheckCircledIcon className="h-3 w-3" />
+        <CheckCircledIcon className="h-3 w-3 shrink-0" />
       ) : (
-        <ExclamationTriangleIcon className="h-3 w-3" />
+        <ExclamationTriangleIcon className="h-3 w-3 shrink-0" />
       )}
-      <span>{validation.message}</span>
+      <span className="min-w-0 break-words">{validation.message}</span>
     </div>
   );
 }
@@ -89,18 +89,18 @@ export function JsonValidator({ value }: { value: string }) {
   return (
     <div
       className={cn(
-        "flex items-center gap-1 text-xs",
+        "flex min-w-0 items-start gap-1 text-xs",
         validation.valid
           ? "text-green-600 dark:text-green-400"
           : "text-red-600 dark:text-red-400",
       )}
     >
       {validation.valid ? (
-        <CheckCircledIcon className="h-3 w-3" />
+        <CheckCircledIcon className="h-3 w-3 shrink-0" />
       ) : (
-        <ExclamationTriangleIcon className="h-3 w-3" />
+        <ExclamationTriangleIcon className="h-3 w-3 shrink-0" />
       )}
-      <span>{validation.message}</span>
+      <span className="min-w-0 break-words">{validation.message}</span>
     </div>
   );
 }

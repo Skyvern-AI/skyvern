@@ -4,11 +4,17 @@ import { describe, expect, test } from "vitest";
 import { ProxyLocation } from "@/api/types";
 
 import type { AppNode } from "../nodes";
-import { getElements, getWorkflowBlocks } from "../workflowEditorUtils";
+import {
+  getElements,
+  getWorkflowBlocks,
+  getWorkflowSettings,
+} from "../workflowEditorUtils";
 import {
   type CodeBlock,
+  type EmailInboxBlock,
   type OutputParameter,
   type WorkflowBlock,
+  type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
 import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
@@ -39,7 +45,9 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
   persistBrowserSession: false,
+  pinSavedSessionIp: false,
   browserProfileId: null,
+  browserProfileKey: null,
   model: null,
   maxScreenshotScrolls: null,
   maxElapsedTimeMinutes: null,
@@ -49,10 +57,12 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
+  enableSelfHealing: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
+  errorCodeMapping: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {
@@ -62,6 +72,21 @@ function makeOutputParameter(label: string): OutputParameter {
     description: null,
     output_parameter_id: `op-${label}`,
     workflow_id: "wf-fixture",
+    created_at: "2026-04-20T00:00:00Z",
+    modified_at: "2026-04-20T00:00:00Z",
+    deleted_at: null,
+  };
+}
+
+function makeWorkflowParameter(key: string): WorkflowParameter {
+  return {
+    parameter_type: "workflow",
+    key,
+    description: null,
+    workflow_id: "wf-fixture",
+    workflow_parameter_id: `wp-${key}`,
+    workflow_parameter_type: "string",
+    default_value: "",
     created_at: "2026-04-20T00:00:00Z",
     modified_at: "2026-04-20T00:00:00Z",
     deleted_at: null,
@@ -81,6 +106,30 @@ function makeCodeBlock(
     output_parameter: makeOutputParameter(label),
     code: `# ${label}`,
     parameters: [],
+  };
+}
+
+function makeEmailInboxBlock(
+  label: string,
+  parameters: Array<WorkflowParameter>,
+): EmailInboxBlock {
+  return {
+    label,
+    block_type: "email_inbox",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: null,
+    output_parameter: makeOutputParameter(label),
+    email_client: "outlook",
+    credential_id: "{{ microsoft_credential_id }}",
+    folder: "Inbox",
+    prompt: "",
+    sender: null,
+    subject: null,
+    newer_than_days: null,
+    max_results: 25,
+    include_body: true,
+    parameters,
   };
 }
 
@@ -212,6 +261,29 @@ function reloadFromSavedYaml(
 }
 
 describe("round-trip reorder → save → reload (M1 top-level)", () => {
+  test("email inbox preserves parameter keys across load and save", () => {
+    const credentialParameter = makeWorkflowParameter(
+      "microsoft_credential_id",
+    );
+    const initialBlocks: Array<WorkflowBlock> = [
+      makeEmailInboxBlock("Read Inbox", [credentialParameter]),
+    ];
+
+    const { nodes, edges } = getElements(initialBlocks, DEFAULT_SETTINGS, true);
+
+    const emailNode = nodes.find((node) => node.type === "emailInbox");
+    expect(emailNode?.data).toMatchObject({
+      parameterKeys: ["microsoft_credential_id"],
+    });
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      block_type: "email_inbox",
+      parameter_keys: ["microsoft_credential_id"],
+    });
+  });
+
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {
     // 1. Load the workflow: YAML-like blocks → nodes + edges via getElements.
     const initialBlocks = buildFiveBlockFixture();
@@ -446,5 +518,39 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     ];
     const { validationError } = getElements(malformed, DEFAULT_SETTINGS, false);
     expect(validationError).toBeNull();
+  });
+
+  // error_code_mapping is not editable in YAML, but it must still ride on the
+  // start node so it's preserved (not cleared) across a load -> save round-trip.
+  test("workflow-level error_code_mapping rides on the start node so it survives a save", () => {
+    const settings: WorkflowSettings = {
+      ...DEFAULT_SETTINGS,
+      errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
+    };
+    const { nodes } = getElements(buildFiveBlockFixture(), settings, true);
+    const startNode = nodes.find((node) => node.type === "start");
+    expect(
+      (startNode?.data as { errorCodeMapping?: unknown } | undefined)
+        ?.errorCodeMapping,
+    ).toEqual({ OUT_OF_STOCK: "item unavailable" });
+  });
+
+  // The full recovery leg the save path relies on: workflow-level settings ride
+  // load -> start node -> getWorkflowSettings with zero field loss, so a YAML
+  // commit (which reattaches settings from this readback) cannot drop them.
+  test("workflow-level settings survive the getElements -> getWorkflowSettings round-trip", () => {
+    const settings: WorkflowSettings = {
+      ...DEFAULT_SETTINGS,
+      errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
+      finallyBlockLabel: "B5",
+      workflowSystemPrompt: "always double-check totals",
+    };
+    const { nodes } = getElements(buildFiveBlockFixture(), settings, true);
+    const recovered = getWorkflowSettings(nodes);
+    expect(recovered.errorCodeMapping).toEqual({
+      OUT_OF_STOCK: "item unavailable",
+    });
+    expect(recovered.finallyBlockLabel).toBe("B5");
+    expect(recovered.workflowSystemPrompt).toBe("always double-check totals");
   });
 });

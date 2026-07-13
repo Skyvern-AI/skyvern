@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import json
 import typing as t
 import weakref
@@ -68,11 +67,17 @@ def _make_channel(on_event: MagicMock | None = None) -> tuple[ExfiltrationChanne
 def restore_exfiltration_channel_class_state() -> t.Iterator[None]:
     active_binding_channels = weakref.WeakKeyDictionary(ExfiltrationChannel._active_binding_channels)
     binding_registered_pages = weakref.WeakSet(ExfiltrationChannel._binding_registered_pages)
+    adorn_init_script_pages = weakref.WeakSet(ExfiltrationChannel._adorn_init_script_pages)
+    rearm_in_flight_pages = weakref.WeakKeyDictionary(ExfiltrationChannel._rearm_in_flight_pages)
+    rearm_pending_full_nav_pages = weakref.WeakSet(ExfiltrationChannel._rearm_pending_full_nav_pages)
 
     yield
 
     ExfiltrationChannel._active_binding_channels = active_binding_channels
     ExfiltrationChannel._binding_registered_pages = binding_registered_pages
+    ExfiltrationChannel._adorn_init_script_pages = adorn_init_script_pages
+    ExfiltrationChannel._rearm_in_flight_pages = rearm_in_flight_pages
+    ExfiltrationChannel._rearm_pending_full_nav_pages = rearm_pending_full_nav_pages
 
 
 class TestExfiltrationChannelEvents:
@@ -93,7 +98,15 @@ class TestExfiltrationChannelEvents:
 
     def test_page_tracking_releases_collected_pages(self) -> None:
         channel, _ = _make_channel()
-        page = _make_page()
+
+        # A real MagicMock page carries internal reference cycles, forcing a
+        # full-heap gc.collect() to reclaim it (seconds late in the suite). A
+        # cycle-free stand-in is reclaimed by refcounting the moment the last
+        # strong reference drops, so the weak trackers clear without a collect.
+        class _Page:
+            pass
+
+        page = _Page()
         page_ref = weakref.ref(page)
 
         ExfiltrationChannel._active_binding_channels[page] = channel
@@ -101,7 +114,6 @@ class TestExfiltrationChannelEvents:
         channel._page_console_captures[page] = PageConsoleCapture(console_listener=MagicMock())
 
         del page
-        gc.collect()
 
         assert page_ref() is None
         assert not ExfiltrationChannel._active_binding_channels
@@ -117,7 +129,7 @@ class TestExfiltrationChannelEvents:
         message.args = []
         message.text = f"[EXFIL] {json.dumps(event_data)}"
 
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 0)
 
         on_event.assert_called_once()
         assert on_event.call_args.args[0][0].params == event_data
@@ -128,7 +140,7 @@ class TestExfiltrationChannelEvents:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def handle_console_event(_: object) -> None:
+        async def handle_console_event(_: object, __: int) -> None:
             started.set()
             await release.wait()
 
@@ -157,7 +169,7 @@ class TestExfiltrationChannelEvents:
         message.args = [marker, payload]
         message.text = "[EXFIL] JSHandle@object"
 
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 0)
 
         on_event.assert_called_once()
         assert on_event.call_args.args[0][0].params == event_data
@@ -174,14 +186,15 @@ class TestExfiltrationChannelEvents:
         message.text = f"[EXFIL] {json.dumps(event_data)}"
 
         channel._handle_binding_event({"page": page}, event_data)
-        await channel._handle_console_event_async(message)
+        await channel._handle_console_event_async(message, 1)
         await channel._handle_runtime_console_event_async(
             {
                 "args": [
                     {"type": "string", "value": "[EXFIL]"},
                     {"type": "string", "value": json.dumps(event_data)},
                 ]
-            }
+            },
+            2,
         )
 
         on_event.assert_called_once()
@@ -286,3 +299,174 @@ class TestExfiltrationChannelEvents:
         page.on.assert_not_called()
         page.add_init_script.assert_not_awaited()
         assert page.evaluate.await_count == 2
+
+    def test_console_fingerprint_ignores_volatile_timestamp(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        jittered = {**_make_event_data(), "timestamp": 1002.0}
+
+        assert channel._console_fingerprint(first) == channel._console_fingerprint(jittered)
+
+    def test_should_emit_console_event_dedupes_across_ms_jitter(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        jittered = {**_make_event_data(), "timestamp": 1002.0}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(jittered) is False
+
+    def test_should_emit_console_event_keeps_distinct_interactions(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "timestamp": 1000.0}
+        distinct_target = {
+            **_make_event_data(),
+            "timestamp": 1002.0,
+            "target": {"tagName": "BUTTON", "id": "cancel", "skyId": "sky-2", "text": ["Cancel"]},
+        }
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(distinct_target) is True
+
+    def test_reconnect_recapture_with_jitter_emits_single_interaction(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        ExfiltrationChannel._active_binding_channels[page] = channel
+
+        # A reconnect re-injects the exfiltrate script, re-emitting the same DOM
+        # interaction with an advanced browser clock; the stable fingerprint dedupes
+        # it even though the channel instance (and its cache) survived the reconnect.
+        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1000.0})
+        channel._handle_binding_event({"page": page}, {**_make_event_data(), "timestamp": 1002.0})
+
+        on_event.assert_called_once()
+
+    def test_fingerprint_treats_none_and_absent_keys_as_equal(self) -> None:
+        # The binding transport serializes JS undefined to None while the console
+        # transports drop those keys entirely (JSON.stringify). Both shapes must
+        # dedup as one event or every interaction is delivered 2-3x.
+        channel, _ = _make_channel()
+        via_binding = {
+            **_make_event_data(),
+            "inputValue": None,
+            "mousePosition": {"xa": 10, "ya": 20, "xp": None, "yp": None},
+        }
+        via_console = {
+            **_make_event_data(),
+            "mousePosition": {"xa": 10, "ya": 20},
+        }
+
+        assert channel._console_fingerprint(via_binding) == channel._console_fingerprint(via_console)
+
+    def test_should_emit_console_event_dedupes_none_vs_absent_duplicates(self) -> None:
+        channel, _ = _make_channel()
+        via_binding = {**_make_event_data(), "inputValue": None}
+        via_console = _make_event_data()
+
+        assert channel._should_emit_console_event(via_binding) is True
+        assert channel._should_emit_console_event(via_console) is False
+
+    def test_should_emit_console_event_keeps_distinct_values_over_none(self) -> None:
+        channel, _ = _make_channel()
+        first = {**_make_event_data(), "inputValue": None}
+        distinct = {**_make_event_data(), "inputValue": "hello"}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(distinct) is True
+
+
+class TestNavigationReExfiltration:
+    @pytest.mark.asyncio
+    async def test_frame_navigated_waits_for_load_before_rearm(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page("https://example.com/next")
+        page.wait_for_load_state = AsyncMock()
+        channel.page = page
+
+        channel._ensure_binding = AsyncMock()
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+
+        channel._handle_cdp_event("nav:frame_navigated", {"frame": {"url": "https://example.com/next"}})
+
+        on_event.assert_called_once()
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=10_000)
+        channel._ensure_binding.assert_awaited_once_with(page)
+        channel.exfiltrate.assert_awaited_once_with(page)
+        channel.adorn.assert_awaited_once_with(page)
+
+    @pytest.mark.asyncio
+    async def test_navigated_within_document_rearms_without_load_wait(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page("https://example.com/app#section")
+        page.wait_for_load_state = AsyncMock()
+        channel.page = page
+        channel._ensure_binding = AsyncMock()
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+
+        channel._handle_cdp_event("nav:navigated_within_document", {"url": "https://example.com/app#section"})
+
+        on_event.assert_called_once()
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.wait_for_load_state.assert_not_awaited()
+        channel._ensure_binding.assert_awaited_once_with(page)
+        channel.exfiltrate.assert_awaited_once_with(page)
+        channel.adorn.assert_awaited_once_with(page)
+
+    @pytest.mark.asyncio
+    async def test_frame_navigated_queues_full_rearm_when_same_document_rearm_in_flight(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page("https://example.com/app")
+        channel.page = page
+        channel._rearm_in_flight_pages[page] = False
+
+        channel._handle_cdp_event("nav:frame_navigated", {"frame": {"url": "https://example.com/next"}})
+
+        on_event.assert_called_once()
+        assert page in channel._rearm_pending_full_nav_pages
+        assert not channel._pending_event_tasks
+
+    @pytest.mark.asyncio
+    async def test_pending_full_nav_rearm_runs_after_same_document_rearm_finishes(self) -> None:
+        channel, _on_event = _make_channel()
+        page = _make_page("https://example.com/next")
+        page.wait_for_load_state = AsyncMock()
+        channel._ensure_binding = AsyncMock()
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+        channel._rearm_pending_full_nav_pages.add(page)
+
+        await channel._rearm_page_after_navigation(
+            page,
+            event_name="nav:navigated_within_document",
+            wait_for_load=False,
+        )
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.wait_for_load_state.assert_awaited_once_with("domcontentloaded", timeout=10_000)
+        channel._ensure_binding.assert_awaited()
+        assert channel._ensure_binding.await_count == 2
+        assert channel.exfiltrate.await_count == 2
+        assert channel.adorn.await_count == 2
+
+    def test_non_navigation_cdp_event_does_not_rearm(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        browser_context = MagicMock()
+        browser_context.pages = [page]
+        channel.browser_context = browser_context
+
+        channel.exfiltrate = AsyncMock(return_value=channel)
+        channel.adorn = AsyncMock(return_value=channel)
+
+        channel._handle_cdp_event("nav:frame_started_navigating", {"url": "https://example.com/next"})
+
+        on_event.assert_called_once()
+        channel.exfiltrate.assert_not_called()
+        channel.adorn.assert_not_called()

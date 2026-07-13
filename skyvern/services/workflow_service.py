@@ -9,6 +9,7 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
+from skyvern.forge.sdk.workflow.models.tags import TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
 from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
 
@@ -31,9 +32,14 @@ async def prepare_workflow(
     workflow_run_id: str | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     copilot_session_id: str | None = None,
+    resolved_workflow_id: str | None = None,
+    tag_write_context: TagWriteContext | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
+
+    ``resolved_workflow_id`` pins the exact workflow version row; when None, resolve by
+    permanent id + version.
     """
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
@@ -55,13 +61,21 @@ async def prepare_workflow(
         workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         copilot_session_id=copilot_session_id,
+        resolved_workflow_id=resolved_workflow_id,
+        tag_write_context=tag_write_context,
     )
 
-    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-        workflow_permanent_id=workflow_id,
-        organization_id=None if template else organization.organization_id,
-        version=version,
-    )
+    if resolved_workflow_id is not None:
+        workflow = await app.WORKFLOW_SERVICE.get_workflow(
+            workflow_id=resolved_workflow_id,
+            organization_id=None if template else organization.organization_id,
+        )
+    else:
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_id,
+            organization_id=None if template else organization.organization_id,
+            version=version,
+        )
 
     await app.DATABASE.tasks.create_task_run(
         task_run_type=RunType.workflow_run,
@@ -97,6 +111,7 @@ async def run_workflow(
     trigger_type: WorkflowRunTriggerType | None = None,
     workflow_schedule_id: str | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
+    tag_write_context: TagWriteContext | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -110,6 +125,7 @@ async def run_workflow(
         trigger_type=trigger_type,
         workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
+        tag_write_context=tag_write_context,
     )
 
     await AsyncExecutorFactory.get_executor().execute_workflow(

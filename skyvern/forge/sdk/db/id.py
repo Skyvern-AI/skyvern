@@ -46,6 +46,7 @@ DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
 GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
+MICROSOFT_OAUTH_CREDENTIAL_PREFIX = "moac"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -74,10 +75,16 @@ WORKFLOW_TEMPLATE_PREFIX = "wt"
 ORGANIZATION_BILLING_PREFIX = "ob"
 WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
+WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX = "wccs"
+WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX = "wrcs"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
+HEAL_EPISODE_PREFIX = "he"
+HEAL_PROPOSAL_PREFIX = "hp"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
 TAG_EVENT_PREFIX = "tge"
+RUN_TAG_EVENT_PREFIX = "rtge"
 TAG_KEY_PREFIX = "tkey"
+TAG_VALUE_PREFIX = "tval"
 
 
 def generate_workflow_id() -> str:
@@ -260,14 +267,29 @@ def generate_tag_event_id() -> str:
     return f"{TAG_EVENT_PREFIX}_{int_id}"
 
 
+def generate_run_tag_event_id() -> str:
+    int_id = generate_id()
+    return f"{RUN_TAG_EVENT_PREFIX}_{int_id}"
+
+
 def generate_tag_key_id() -> str:
     int_id = generate_id()
     return f"{TAG_KEY_PREFIX}_{int_id}"
 
 
+def generate_tag_value_id() -> str:
+    int_id = generate_id()
+    return f"{TAG_VALUE_PREFIX}_{int_id}"
+
+
 def generate_google_oauth_credential_id() -> str:
     int_id = generate_id()
     return f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
+
+
+def generate_microsoft_oauth_credential_id() -> str:
+    int_id = generate_id()
+    return f"{MICROSOFT_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:
@@ -310,9 +332,29 @@ def generate_workflow_copilot_chat_message_id() -> str:
     return f"{WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX}_{int_id}"
 
 
+def generate_workflow_copilot_completion_criteria_set_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_COPILOT_COMPLETION_CRITERIA_SET_PREFIX}_{int_id}"
+
+
+def generate_workflow_run_credential_selection_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_RUN_CREDENTIAL_SELECTION_PREFIX}_{int_id}"
+
+
 def generate_script_fallback_episode_id() -> str:
     int_id = generate_id()
     return f"{SCRIPT_FALLBACK_EPISODE_PREFIX}_{int_id}"
+
+
+def generate_heal_episode_id() -> str:
+    int_id = generate_id()
+    return f"{HEAL_EPISODE_PREFIX}_{int_id}"
+
+
+def generate_heal_proposal_id() -> str:
+    int_id = generate_id()
+    return f"{HEAL_PROPOSAL_PREFIX}_{int_id}"
 
 
 def generate_workflow_schedule_id() -> str:

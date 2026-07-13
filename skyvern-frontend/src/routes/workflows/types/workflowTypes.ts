@@ -85,11 +85,15 @@ export type AzureVaultCredentialParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type CredentialSelectionStrategy = "round_robin" | "random";
+
 export type CredentialParameter = WorkflowParameterBase & {
   parameter_type: "credential";
   workflow_id: string;
   credential_parameter_id: string;
   credential_id: string;
+  credential_ids?: Array<string> | null;
+  selection_strategy?: CredentialSelectionStrategy | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -215,8 +219,11 @@ export type WorkflowBlock =
   | HttpRequestBlock
   | PrintPageBlock
   | WorkflowTriggerBlock
+  | EmailInboxBlock
   | GoogleSheetsReadBlock
-  | GoogleSheetsWriteBlock;
+  | GoogleSheetsWriteBlock
+  | PdfFillBlock
+  | SplitPdfBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -244,8 +251,11 @@ export const WorkflowBlockTypes = {
   HttpRequest: "http_request",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
+  EmailInbox: "email_inbox",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
+  PDFFill: "pdf_fill",
+  SplitPDF: "split_pdf",
 } as const;
 
 // all of them
@@ -377,10 +387,20 @@ export type WhileLoopBlock = WorkflowBlockBase & {
   condition: BranchCriteria;
 };
 
+export type CodeBlockStep = {
+  title?: string | null;
+  description?: string | null;
+  action_type: string;
+  line_start?: number | null;
+  line_end?: number | null;
+};
+
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
   parameters: Array<WorkflowParameter>;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -404,7 +424,8 @@ export type UploadToS3Block = WorkflowBlockBase & {
 export type FileUploadBlock = WorkflowBlockBase & {
   block_type: "file_upload";
   path: string;
-  storage_type: "s3" | "azure";
+  prompt: string | null;
+  storage_type: "s3" | "azure" | "google_drive" | "sftp";
   s3_bucket: string | null;
   region_name: string | null;
   aws_access_key_id: string | null;
@@ -412,6 +433,16 @@ export type FileUploadBlock = WorkflowBlockBase & {
   azure_storage_account_name: string | null;
   azure_storage_account_key: string | null;
   azure_blob_container_name: string | null;
+  google_credential_id: string | null;
+  google_drive_folder_id: string | null;
+  sftp_host: string | null;
+  sftp_port: number | null;
+  sftp_username: string | null;
+  sftp_password: string | null;
+  sftp_private_key: string | null;
+  sftp_private_key_passphrase: string | null;
+  sftp_remote_path: string | null;
+  sftp_host_key: string | null;
 };
 
 export type SendEmailBlock = WorkflowBlockBase & {
@@ -430,7 +461,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx";
+  file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema: Record<string, unknown> | null;
 };
 
@@ -569,6 +600,7 @@ export type HttpRequestBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   download_filename: string | null;
   save_response_as_file: boolean;
+  secret_response_paths: Array<string> | null;
 };
 
 export type PrintPageBlock = WorkflowBlockBase & {
@@ -588,6 +620,20 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   wait_for_completion: boolean;
   browser_session_id: string | null;
   use_parent_browser_session: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type EmailInboxBlock = WorkflowBlockBase & {
+  block_type: "email_inbox";
+  email_client: "gmail" | "outlook";
+  credential_id: string | null;
+  folder: string;
+  prompt: string;
+  sender: string | null;
+  subject: string | null;
+  newer_than_days: number | null;
+  max_results: number;
+  include_body: boolean;
   parameters: Array<WorkflowParameter>;
 };
 
@@ -614,12 +660,30 @@ export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type PdfFillBlock = WorkflowBlockBase & {
+  block_type: "pdf_fill";
+  file_url: string;
+  prompt: string;
+  payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type SplitPdfBlock = WorkflowBlockBase & {
+  block_type: "split_pdf";
+  file_url: string;
+  prompt: string;
+  llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowDefinition = {
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
   finally_block_label?: string | null;
   workflow_system_prompt?: string | null;
+  error_code_mapping?: Record<string, string> | null;
 };
 
 export type WorkflowApiResponse = {
@@ -637,7 +701,9 @@ export type WorkflowApiResponse = {
   extra_http_headers: Record<string, string> | null;
   cdp_connect_headers: Record<string, string> | null;
   persist_browser_session: boolean;
+  pin_saved_session_ip: boolean;
   browser_profile_id?: string | null;
+  browser_profile_key?: string | null;
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
@@ -650,19 +716,25 @@ export type WorkflowApiResponse = {
   run_with: string; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
+  enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
   code_version: number | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
   import_error: string | null;
+  created_by?: string | null;
+  edited_by?: string | null;
+  copilot_authored?: boolean | null;
 };
 
 export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
+  pinSavedSessionIp: boolean;
   browserProfileId: string | null;
+  browserProfileKey: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   maxElapsedTimeMinutes: number | null;
@@ -672,10 +744,12 @@ export type WorkflowSettings = {
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
+  enableSelfHealing: boolean | null;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;
   workflowSystemPrompt: string | null;
+  errorCodeMapping: Record<string, string> | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

@@ -52,10 +52,16 @@ import { PrintPageNode } from "./PrintPageNode/types";
 import { PrintPageNode as PrintPageNodeComponent } from "./PrintPageNode/PrintPageNode";
 import { WorkflowTriggerNode } from "./WorkflowTriggerNode/types";
 import { WorkflowTriggerNode as WorkflowTriggerNodeComponent } from "./WorkflowTriggerNode/WorkflowTriggerNode";
+import { EmailInboxNode } from "./EmailInboxNode/types";
+import { EmailInboxNode as EmailInboxNodeComponent } from "./EmailInboxNode/EmailInboxNode";
 import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
 import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
 import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
 import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
+import { PdfFillNode } from "./PdfFillNode/types";
+import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
+import { SplitPdfNode } from "./SplitPdfNode/types";
+import { SplitPdfNode as SplitPdfNodeComponent } from "./SplitPdfNode/SplitPdfNode";
 import { withSortableBlock } from "../sortable/withSortableBlock";
 import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
@@ -87,8 +93,11 @@ export type WorkflowBlockNode =
   | HttpRequestNode
   | PrintPageNode
   | WorkflowTriggerNode
+  | EmailInboxNode
   | GoogleSheetsReadNode
-  | GoogleSheetsWriteNode;
+  | GoogleSheetsWriteNode
+  | PdfFillNode
+  | SplitPdfNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -148,6 +157,9 @@ export const nodeTypes = {
   http_request: wrapBlock(HttpRequestNodeComponent),
   printPage: wrapBlock(PrintPageNodeComponent),
   workflowTrigger: wrapBlock(WorkflowTriggerNodeComponent),
+  emailInbox: wrapBlock(EmailInboxNodeComponent),
   googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
   googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
+  pdfFill: wrapBlock(PdfFillNodeComponent),
+  splitPdf: wrapBlock(SplitPdfNodeComponent),
 } as const;

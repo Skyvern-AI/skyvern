@@ -9,7 +9,7 @@ import {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
-import { WorkflowBlock } from "../types/workflowTypes";
+import { BranchCondition, WorkflowBlock } from "../types/workflowTypes";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 
 const containerBlockTypes = new Set(["for_loop", "while_loop", "conditional"]);
@@ -66,6 +66,32 @@ type UnexecutedBlockReason = "branch_not_taken" | "not_reached";
 type UnexecutedDefinedBlock = {
   block: WorkflowBlock;
   reason: UnexecutedBlockReason;
+  skippedByWorkflowRunBlockId?: string;
+  skippedBranch?: SkippedBranchMetadata;
+};
+
+type SkippedBranchMetadata = {
+  key: string;
+  nextBlockLabel: string;
+  description: string | null;
+  criteriaDescription: string | null;
+  expression: string | null;
+  renderedExpression: string | null;
+  result: boolean | null;
+  error: string | null;
+  isDefault: boolean;
+  branchIndex: number | null;
+  wasEvaluated: boolean;
+};
+
+type DefinedBranch = {
+  branch: BranchCondition;
+  index: number;
+};
+
+type BranchOutcome = {
+  takenTargets: Array<SkippedBranchMetadata>;
+  notTakenTargets: Array<SkippedBranchMetadata>;
 };
 
 function collectExecutedConditionals(
@@ -93,16 +119,125 @@ function collectExecutedConditionals(
 function getBranchOutcome(
   runtimeBlock: WorkflowRunBlock,
   definedBlock: WorkflowBlock | undefined,
-): { takenTargets: Array<string>; notTakenTargets: Array<string> } | null {
+): BranchOutcome | null {
+  const branchesById = new Map<string, DefinedBranch>();
+  const branchesByTarget = new Map<string, DefinedBranch>();
+  if (definedBlock?.block_type === "conditional") {
+    definedBlock.branch_conditions.forEach((branch, index) => {
+      const definedBranch = { branch, index };
+      branchesById.set(branch.id, definedBranch);
+      if (branch.next_block_label) {
+        branchesByTarget.set(branch.next_block_label, definedBranch);
+      }
+    });
+  }
+
+  const toBranchTarget = ({
+    branch,
+    fallbackKey,
+    nextBlockLabel,
+    branchIndex = null,
+    wasEvaluated = false,
+  }: {
+    branch: DefinedBranch | undefined;
+    fallbackKey: string;
+    nextBlockLabel: string;
+    branchIndex?: number | null;
+    wasEvaluated?: boolean;
+  }): SkippedBranchMetadata => ({
+    key: branch?.branch.id ?? fallbackKey,
+    nextBlockLabel,
+    description: branch?.branch.description ?? null,
+    criteriaDescription: branch?.branch.criteria?.description ?? null,
+    expression: null,
+    renderedExpression: null,
+    result: null,
+    error: null,
+    isDefault: branch?.branch.is_default ?? false,
+    branchIndex: branchIndex ?? branch?.index ?? null,
+    wasEvaluated,
+  });
+
   if (hasEvaluations(runtimeBlock.output)) {
     const evaluations = runtimeBlock.output.evaluations ?? [];
+    const takenTargets = evaluations
+      .filter((e) => e.is_matched && e.next_block_label)
+      .map((evaluation) => {
+        const nextBlockLabel = evaluation.next_block_label!;
+        const branch =
+          branchesById.get(evaluation.branch_id) ??
+          branchesByTarget.get(nextBlockLabel);
+        return {
+          ...toBranchTarget({
+            branch,
+            fallbackKey: evaluation.branch_id ?? nextBlockLabel,
+            nextBlockLabel,
+            branchIndex: evaluation.branch_index ?? branch?.index ?? null,
+            wasEvaluated: true,
+          }),
+          expression: evaluation.original_expression ?? null,
+          renderedExpression: evaluation.rendered_expression ?? null,
+          result: evaluation.result ?? null,
+          error: evaluation.error ?? null,
+          isDefault:
+            evaluation.is_default ?? branch?.branch.is_default ?? false,
+        };
+      });
+    const notTakenTargets = evaluations
+      .filter((e) => !e.is_matched && e.next_block_label)
+      .map((evaluation) => {
+        const nextBlockLabel = evaluation.next_block_label!;
+        const branch =
+          branchesById.get(evaluation.branch_id) ??
+          branchesByTarget.get(nextBlockLabel);
+        return {
+          ...toBranchTarget({
+            branch,
+            fallbackKey: evaluation.branch_id ?? nextBlockLabel,
+            nextBlockLabel,
+            branchIndex: evaluation.branch_index ?? branch?.index ?? null,
+            wasEvaluated: true,
+          }),
+          expression: evaluation.original_expression ?? null,
+          renderedExpression: evaluation.rendered_expression ?? null,
+          result: evaluation.result ?? null,
+          error: evaluation.error ?? null,
+          isDefault:
+            evaluation.is_default ?? branch?.branch.is_default ?? false,
+        };
+      });
+    if (definedBlock?.block_type === "conditional") {
+      const takenKeys = new Set(takenTargets.map((target) => target.key));
+      const takenLabels = new Set(
+        takenTargets.map((target) => target.nextBlockLabel),
+      );
+      const notTakenKeys = new Set(notTakenTargets.map((target) => target.key));
+      const notTakenLabels = new Set(
+        notTakenTargets.map((target) => target.nextBlockLabel),
+      );
+      definedBlock.branch_conditions.forEach((branch, index) => {
+        if (!branch.next_block_label) return;
+        const branchKey = branch.id ?? branch.next_block_label;
+        if (
+          takenKeys.has(branchKey) ||
+          takenLabels.has(branch.next_block_label!) ||
+          notTakenKeys.has(branchKey) ||
+          notTakenLabels.has(branch.next_block_label!)
+        ) {
+          return;
+        }
+        notTakenTargets.push(
+          toBranchTarget({
+            branch: { branch, index },
+            fallbackKey: branchKey,
+            nextBlockLabel: branch.next_block_label,
+          }),
+        );
+      });
+    }
     return {
-      takenTargets: evaluations
-        .filter((e) => e.is_matched && e.next_block_label)
-        .map((e) => e.next_block_label!),
-      notTakenTargets: evaluations
-        .filter((e) => !e.is_matched && e.next_block_label)
-        .map((e) => e.next_block_label!),
+      takenTargets,
+      notTakenTargets,
     };
   }
   const taken = runtimeBlock.executed_branch_next_block;
@@ -110,10 +245,25 @@ function getBranchOutcome(
     return null;
   }
   return {
-    takenTargets: [taken],
+    takenTargets: [
+      toBranchTarget({
+        branch: branchesByTarget.get(taken),
+        fallbackKey: taken,
+        nextBlockLabel: taken,
+      }),
+    ],
     notTakenTargets: definedBlock.branch_conditions
-      .map((branch) => branch.next_block_label)
-      .filter((label): label is string => !!label && label !== taken),
+      .filter(
+        (branch) =>
+          branch.next_block_label && branch.next_block_label !== taken,
+      )
+      .map((branch, index) =>
+        toBranchTarget({
+          branch: { branch, index },
+          fallbackKey: branch.next_block_label!,
+          nextBlockLabel: branch.next_block_label!,
+        }),
+      ),
   };
 }
 
@@ -170,6 +320,8 @@ function classifyUnexecutedDefinedBlocks(
   );
 
   const skipped = new Set<string>();
+  const skippedByWorkflowRunBlockId = new Map<string, string>();
+  const skippedBranchByLabel = new Map<string, SkippedBranchMetadata>();
   const onTakenPath = new Set<string>();
   for (const conditional of collectExecutedConditionals(timelineItems)) {
     const definedBlock = conditional.label
@@ -178,20 +330,50 @@ function classifyUnexecutedDefinedBlocks(
     const outcome = getBranchOutcome(conditional, definedBlock);
     if (!outcome) continue;
     for (const target of outcome.notTakenTargets) {
-      traceDefinitionChain(target, blocksByLabel, executedLabels, skipped);
+      const branchSkipped = new Set<string>();
+      traceDefinitionChain(
+        target.nextBlockLabel,
+        blocksByLabel,
+        executedLabels,
+        branchSkipped,
+      );
+      for (const label of branchSkipped) {
+        skipped.add(label);
+        if (!skippedByWorkflowRunBlockId.has(label)) {
+          skippedByWorkflowRunBlockId.set(
+            label,
+            conditional.workflow_run_block_id,
+          );
+        }
+        if (!skippedBranchByLabel.has(label)) {
+          skippedBranchByLabel.set(label, target);
+        }
+      }
     }
     for (const target of outcome.takenTargets) {
-      traceDefinitionChain(target, blocksByLabel, executedLabels, onTakenPath);
+      traceDefinitionChain(
+        target.nextBlockLabel,
+        blocksByLabel,
+        executedLabels,
+        onTakenPath,
+      );
     }
   }
 
-  return unexecuted.map((block) => ({
-    block,
-    reason:
-      skipped.has(block.label) && !onTakenPath.has(block.label)
-        ? "branch_not_taken"
-        : "not_reached",
-  }));
+  return unexecuted.map((block) => {
+    const isBranchNotTaken =
+      skipped.has(block.label) && !onTakenPath.has(block.label);
+    return {
+      block,
+      reason: isBranchNotTaken ? "branch_not_taken" : "not_reached",
+      skippedByWorkflowRunBlockId: isBranchNotTaken
+        ? skippedByWorkflowRunBlockId.get(block.label)
+        : undefined,
+      skippedBranch: isBranchNotTaken
+        ? skippedBranchByLabel.get(block.label)
+        : undefined,
+    };
+  });
 }
 
 function findBlockSurroundingAction(
@@ -430,6 +612,14 @@ function findTimelineBlockItem(
   return null;
 }
 
+function findTimelineBlock(
+  items: Array<WorkflowRunTimelineItem>,
+  blockId: string,
+): WorkflowRunBlock | null {
+  const item = findTimelineBlockItem(items, blockId);
+  return item && isBlockItem(item) ? item.block : null;
+}
+
 function findFirstLeafBlockId(
   items: Array<WorkflowRunTimelineItem>,
 ): string | null {
@@ -617,8 +807,13 @@ export {
   findLastExecutedBlock,
   findRunningBlock,
   findThoughtsForBlock,
+  findTimelineBlock,
   flattenTimelineChronologically,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
 };
-export type { UnexecutedBlockReason, UnexecutedDefinedBlock };
+export type {
+  SkippedBranchMetadata,
+  UnexecutedBlockReason,
+  UnexecutedDefinedBlock,
+};

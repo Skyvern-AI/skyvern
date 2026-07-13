@@ -12,10 +12,22 @@ describe("blockTypeFromNode", () => {
     );
   });
 
+  it("maps emailInbox to email_inbox", () => {
+    expect(blockTypeFromNode({ type: "emailInbox" })).toBe("email_inbox");
+  });
+
   it("maps googleSheetsWrite to google_sheets_write", () => {
     expect(blockTypeFromNode({ type: "googleSheetsWrite" })).toBe(
       "google_sheets_write",
     );
+  });
+
+  it("maps pdfFill to pdf_fill", () => {
+    expect(blockTypeFromNode({ type: "pdfFill" })).toBe("pdf_fill");
+  });
+
+  it("maps splitPdf to split_pdf", () => {
+    expect(blockTypeFromNode({ type: "splitPdf" })).toBe("split_pdf");
   });
 
   it("maps url to goto_url", () => {

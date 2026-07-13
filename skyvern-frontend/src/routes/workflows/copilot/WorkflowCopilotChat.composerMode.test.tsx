@@ -81,8 +81,16 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowPermanentId: "wpid_1",
       workflowRunId: undefined,
     }),
+    useSearchParams: () => [new URLSearchParams(), vi.fn()],
   };
 });
+
+// This suite exercises the legacy (copilot_ux_v1 off) default-mode logic; no
+// test here touches copilot_ux_v1-gated behavior, so pin it off rather than
+// the stray `true` this file previously carried over from SKY-11973's mock.
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => false,
+}));
 
 const saveData = {
   title: "Test WF",
@@ -98,7 +106,9 @@ const saveData = {
     proxyLocation: null,
     webhookCallbackUrl: null,
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
+    browserProfileKey: null,
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
@@ -116,6 +126,12 @@ const saveData = {
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
+}));
+
+// Unrelated to this file's tests; the real hook needs a QueryClientProvider
+// this harness doesn't set up.
+vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
@@ -159,16 +175,16 @@ async function submit(value: string) {
   });
 }
 
-async function switchToBuild() {
+async function selectMode(label: "Ask" | "Build" | "Build workflow as code") {
   await act(async () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
       button: 0,
       ctrlKey: false,
     });
   });
-  const buildItem = await screen.findByRole("menuitem", { name: /Build/ });
+  const item = await screen.findByRole("menuitem", { name: label });
   await act(async () => {
-    fireEvent.click(buildItem);
+    fireEvent.click(item);
   });
 }
 
@@ -191,13 +207,13 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat — composer default mode variant", () => {
-  it("defaults to Build with code OFF when the variant is unset (new baseline)", async () => {
+  it("leaves code_block unset for backend fallback when the default variant is unset", async () => {
     await renderChat({ copilotV2: true, codeBlockMode: true });
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
+    expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
   it("sends code_block=true for the build_code override variant", async () => {
@@ -252,18 +268,32 @@ describe("WorkflowCopilotChat — composer default mode variant", () => {
     expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
-  it("lands on code ON when ask_code switches to Build", async () => {
+  it("lands on code ON when selecting Build workflow as code", async () => {
     await renderChat({
       copilotV2: true,
       codeBlockMode: true,
       defaultMode: "ask_code",
     });
-    await switchToBuild();
+    await selectMode("Build workflow as code");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
     expect(streamCalls[0]?.body.code_block).toBe(true);
+  });
+
+  it("turns code OFF when selecting plain Build from a code default", async () => {
+    await renderChat({
+      copilotV2: true,
+      codeBlockMode: true,
+      defaultMode: "build_code",
+    });
+    await selectMode("Build");
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.mode).toBe("build");
+    expect(streamCalls[0]?.body.code_block).toBe(false);
   });
 
   it("sends code_block=null when the code-block flag is off, ignoring the variant", async () => {

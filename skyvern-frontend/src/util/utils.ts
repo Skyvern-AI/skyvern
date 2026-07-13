@@ -5,6 +5,17 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function formatElapsedSeconds(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 const clampToZero = (n: number) => Math.max(n, 0);
 
 export const formatMs = (elapsed: number) => {

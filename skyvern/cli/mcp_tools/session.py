@@ -8,13 +8,21 @@ from pydantic import Field
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.session_manager import is_stateless_http_mode
-from skyvern.cli.core.session_ops import coerce_proxy_location, do_session_close, do_session_create, do_session_list
+from skyvern.cli.core.session_ops import (
+    coerce_proxy_location,
+    do_session_arm_generate_browser_profile,
+    do_session_close,
+    do_session_create,
+    do_session_list,
+)
 from skyvern.client.types.extensions import Extensions
 from skyvern.schemas.runs import proxy_location_to_request
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
 from ._session import (
     SessionState,
+    clear_session_ref_map,
+    close_current_session,
     get_current_session,
     get_skyvern,
     resolve_browser,
@@ -38,6 +46,22 @@ def _should_default_to_cdp() -> tuple[bool, str | None]:
     return False, None
 
 
+def _session_create_data(
+    session_id: str | None,
+    timeout_minutes: int | None,
+    generate_browser_profile: bool,
+    app_url: str | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    if app_url is not None:
+        data["app_url"] = app_url
+    data["session_id"] = session_id
+    data["timeout_minutes"] = timeout_minutes
+    if generate_browser_profile:
+        data["generate_browser_profile"] = True
+    return data
+
+
 async def skyvern_browser_session_create(
     timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
     proxy_location: Annotated[
@@ -53,10 +77,35 @@ async def skyvern_browser_session_create(
         list[Extensions] | None,
         Field(description='Browser extensions to install, for example ["captcha-solver"].'),
     ] = None,
+    browser_profile_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Browser profile ID to load into the cloud session, restoring persisted cookies, localStorage, "
+                "and other profile state. Browser profile IDs start with bp_."
+            )
+        ),
+    ] = None,
+    generate_browser_profile: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true, this session opts into exporting its browser profile when it closes. To turn that "
+                "export into a reusable profile, call skyvern_browser_profile_create(name=..., browser_session_id=...) "
+                "after the session closes. Sessions that don't load a profile and don't set this flag normally skip "
+                "the export."
+            )
+        ),
+    ] = False,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
 ) -> dict[str, Any]:
-    """Create a new browser session to start interacting with websites. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
+    """Create a new browser session to start interacting with websites. Cloud session results include app_url to watch the run live. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
+
+    This tool CREATES a new session and returns its id; it takes no session_id, url, steps, or selector.
+    To load a URL, run a sequence of steps, or act on an EXISTING session, first create the session, then
+    call skyvern_navigate(url=..., session_id=...), skyvern_execute(steps=[...], session_id=...), or the
+    click/type tools with that session_id.
 
     Use local=true for a local Chromium instance.
     The session persists across tool calls until explicitly closed.
@@ -66,6 +115,16 @@ async def skyvern_browser_session_create(
     # internally, so we don't need to call it again here.
     use_cdp, cdp_url = _should_default_to_cdp()
     if use_cdp and not local and cdp_url:
+        if browser_profile_id is not None or generate_browser_profile:
+            return make_result(
+                "skyvern_browser_session_create",
+                ok=False,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    "browser_profile_id and generate_browser_profile require a cloud session",
+                    "Unset BROWSER_TYPE=cdp-connect, or drop the browser profile options.",
+                ),
+            )
         with Timer() as timer:
             try:
                 _browser, ctx = await resolve_browser(cdp_url=cdp_url)
@@ -102,13 +161,28 @@ async def skyvern_browser_session_create(
                     ),
                 )
 
+            if local and (browser_profile_id is not None or generate_browser_profile):
+                return make_result(
+                    "skyvern_browser_session_create",
+                    ok=False,
+                    error=make_error(
+                        ErrorCode.INVALID_INPUT,
+                        "browser_profile_id and generate_browser_profile require a cloud session",
+                        "Remove local=true, or drop the browser profile options.",
+                    ),
+                )
+
             skyvern = get_skyvern()
             if is_stateless_http_mode():
                 proxy = proxy_location_to_request(coerce_proxy_location(proxy_location))
                 create_kwargs: dict[str, Any] = {"timeout": timeout or 60, "proxy_location": proxy}
                 if extensions is not None:
                     create_kwargs["extensions"] = extensions
+                if browser_profile_id is not None:
+                    create_kwargs["browser_profile_id"] = browser_profile_id
                 session = await skyvern.create_browser_session(**create_kwargs)
+                if generate_browser_profile:
+                    await do_session_arm_generate_browser_profile(skyvern, session.browser_session_id)
                 timer.mark("sdk")
                 ctx = BrowserContext(
                     mode="cloud_session",
@@ -118,10 +192,12 @@ async def skyvern_browser_session_create(
                 return make_result(
                     "skyvern_browser_session_create",
                     browser_context=ctx,
-                    data={
-                        "session_id": session.browser_session_id,
-                        "timeout_minutes": timeout or 60,
-                    },
+                    data=_session_create_data(
+                        session.browser_session_id,
+                        timeout or 60,
+                        generate_browser_profile,
+                        app_url=session.app_url,
+                    ),
                     timing_ms=timer.timing_ms,
                 )
 
@@ -130,6 +206,8 @@ async def skyvern_browser_session_create(
                 timeout=timeout or 60,
                 proxy_location=coerce_proxy_location(proxy_location),
                 extensions=extensions,
+                browser_profile_id=browser_profile_id,
+                generate_browser_profile=generate_browser_profile,
                 local=local,
                 headless=headless,
             )
@@ -144,6 +222,8 @@ async def skyvern_browser_session_create(
                     can_access_localhost=False,
                 )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
+
+            app_url = browser.app_url
 
         except ValueError as e:
             return make_result(
@@ -175,12 +255,46 @@ async def skyvern_browser_session_create(
     return make_result(
         "skyvern_browser_session_create",
         browser_context=ctx,
-        data={
-            "session_id": result.session_id,
-            "timeout_minutes": result.timeout_minutes,
-        },
+        data=_session_create_data(
+            result.session_id,
+            result.timeout_minutes,
+            generate_browser_profile,
+            app_url=app_url,
+        ),
         timing_ms=timer.timing_ms,
     )
+
+
+async def _fetch_session_recording_data(skyvern: Any, sid: str | None) -> dict[str, Any]:
+    """Best-effort fetch of recording data from a closed session."""
+    if not sid:
+        return {}
+    try:
+        session = await skyvern.get_browser_session(sid)
+        recordings = [{"url": r.url, "filename": r.filename} for r in (session.recordings or [])]
+        downloaded_files = [{"url": f.url, "filename": f.filename} for f in (session.downloaded_files or [])]
+        return {
+            "app_url": session.app_url,
+            "recordings": recordings,
+            "downloaded_files": downloaded_files,
+        }
+    except Exception:
+        return {}
+
+
+def _session_close_data(session_id: str | None, closed: bool, recording_data: dict[str, Any]) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    if "app_url" in recording_data:
+        data["app_url"] = recording_data["app_url"]
+    data["session_id"] = session_id
+    data["closed"] = closed
+    if "recordings" in recording_data:
+        recordings = recording_data["recordings"]
+        data["recordings"] = recordings
+        data["recording_url"] = recordings[0]["url"] if recordings else None
+    if "downloaded_files" in recording_data:
+        data["downloaded_files"] = recording_data["downloaded_files"]
+    return data
 
 
 async def skyvern_browser_session_close(
@@ -188,6 +302,7 @@ async def skyvern_browser_session_close(
 ) -> dict[str, Any]:
     """Close a browser session when you're done. Frees cloud resources.
 
+    Returns session_id and closed status, plus app_url for the live view and recording_url alongside the recordings list.
     Closes the specified session or the current active session.
     """
     current = get_current_session()
@@ -206,6 +321,7 @@ async def skyvern_browser_session_close(
                 close_error: Exception | None = None
                 try:
                     result = await do_session_close(skyvern, session_id)
+                    clear_session_ref_map(session_id=session_id)
                 except Exception as e:
                     close_error = e
 
@@ -230,9 +346,10 @@ async def skyvern_browser_session_close(
                     raise RuntimeError("Expected session close result after successful close operation")
 
                 timer.mark("sdk")
+                recording_data = await _fetch_session_recording_data(skyvern, session_id)
                 return make_result(
                     "skyvern_browser_session_close",
-                    data={"session_id": result.session_id, "closed": result.closed},
+                    data=_session_close_data(result.session_id, result.closed, recording_data),
                     timing_ms=timer.timing_ms,
                 )
 
@@ -248,8 +365,7 @@ async def skyvern_browser_session_close(
                 )
 
             closed_id = current.context.session_id if current.context else None
-            await current.browser.close()
-            set_current_session(SessionState())
+            await close_current_session()
             timer.mark("sdk")
 
         except Exception as e:
@@ -260,15 +376,18 @@ async def skyvern_browser_session_close(
                 error=make_error(ErrorCode.SDK_ERROR, str(e), "Failed to close session"),
             )
 
+    skyvern = get_skyvern()
+    recording_data = await _fetch_session_recording_data(skyvern, closed_id)
     return make_result(
         "skyvern_browser_session_close",
-        data={"session_id": closed_id, "closed": True},
+        data=_session_close_data(closed_id, True, recording_data),
         timing_ms=timer.timing_ms,
     )
 
 
 async def skyvern_browser_session_list() -> dict[str, Any]:
-    """List all active browser sessions. Use to find available sessions to connect to."""
+    """List all active browser sessions. Use to find available sessions to connect to. Returns every
+    active session in one call — it takes no arguments and does not paginate (no page/page_size)."""
     with Timer() as timer:
         try:
             skyvern = get_skyvern()
@@ -323,7 +442,10 @@ async def skyvern_browser_session_list() -> dict[str, Any]:
 async def skyvern_browser_session_get(
     session_id: Annotated[str, "Browser session ID to get details for"],
 ) -> dict[str, Any]:
-    """Get details about a specific browser session -- status, timeout, availability."""
+    """Get details about a specific browser session -- status, timeout, availability.
+
+    The result includes app_url for the live view and recording_url for the first recording.
+    """
     with Timer() as timer:
         try:
             skyvern = get_skyvern()
@@ -340,10 +462,15 @@ async def skyvern_browser_session_get(
     current = get_current_session()
     is_current = current.context and current.context.session_id == session_id
 
+    recordings = [{"url": r.url, "filename": r.filename} for r in (session.recordings or [])]
+    downloaded_files = [{"url": f.url, "filename": f.filename} for f in (session.downloaded_files or [])]
+
+    recording_url = recordings[0]["url"] if recordings else None
     return make_result(
         "skyvern_browser_session_get",
         browser_context=BrowserContext(mode="cloud_session", session_id=session_id) if is_current else None,
         data={
+            "app_url": session.app_url,
             "session_id": session.browser_session_id,
             "status": session.status,
             "started_at": session.started_at.isoformat() if session.started_at else None,
@@ -351,6 +478,9 @@ async def skyvern_browser_session_get(
             "timeout": session.timeout,
             "runnable_id": session.runnable_id,
             "is_current": is_current,
+            "recordings": recordings,
+            "recording_url": recording_url,
+            "downloaded_files": downloaded_files,
         },
         timing_ms=timer.timing_ms,
     )

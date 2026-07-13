@@ -331,6 +331,37 @@ async def test_max_retries_with_error_detection(agent, mock_browser_state):
 
 
 @pytest.mark.asyncio
+async def test_max_retries_blank_reasoning_surfaces_meaningful_failure_reason(agent, mock_browser_state):
+    """When the summary returns an empty reasoning, the failure_reason must not have a dangling
+    'Possible failure reasons: ' tail — it must surface a meaningful message (SKY-11547)."""
+    now = datetime.now()
+    organization = make_organization(now).model_copy(update={"max_retries_per_step": 3})
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="step-3", status=StepStatus.failed, order=1, retry_index=3, output=None)
+
+    async def mock_summary(*args, **kwargs):
+        return MaxStepsReasonResponse(page_info="", reasoning="", errors=[])
+
+    captured = {}
+
+    async def mock_update_task(_self, task, status, failure_reason=None, **kwargs):
+        captured["failure_reason"] = failure_reason
+        return task
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = mock_browser_state
+        with patch.object(ForgeAgent, "summary_failure_reason_for_max_retries", mock_summary):
+            with patch.object(ForgeAgent, "update_task", mock_update_task):
+                result = await agent.handle_failed_step(organization, task, step)
+
+    assert result is None
+    failure_reason = captured["failure_reason"]
+    assert "Max retries per step (3) exceeded" in failure_reason
+    assert not failure_reason.rstrip().endswith(":")
+    assert ReachMaxRetriesError().reasoning in failure_reason
+
+
+@pytest.mark.asyncio
 async def test_scraping_failure_with_error_detection(agent, mock_browser_state):
     """Test error detection when page scraping fails."""
     now = datetime.now()

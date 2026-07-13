@@ -28,6 +28,14 @@ USER WORKFLOW CHANGES SINCE LAST COPILOT TURN:
 ```
 {% endif %}
 
+{% if runnable_draft_summary is defined and runnable_draft_summary %}
+RUNNABLE UNCOMMITTED DRAFT (not on the canvas):
+
+```
+{{ runnable_draft_summary }}
+```
+{% endif %}
+
 PREVIOUS CONTEXT:
 
 {% if chat_history %}
@@ -43,6 +51,14 @@ Overall goal (long-term memory):
 
 ```
 {{ global_llm_context }}
+```
+{% endif %}
+
+{% if loaded_result_context is defined and loaded_result_context %}
+LOADED RESULT EXTRACTION TARGETS:
+
+```
+{{ loaded_result_context }}
 ```
 {% endif %}
 

@@ -6,22 +6,30 @@ from pathlib import Path
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
+    CompletionCriterion,
+    JudgmentTruthCondition,
+    _classifier_fallback_policy,
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
+    _render_active_criteria_for_prompt,
     contains_email_password_pair,
+    is_fallback_floor_criterion,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from tests.unit.copilot_test_helpers import make_raw_loaded_result_context
 
 
 def _render(**overrides: str) -> str:
+    active_completion_criteria = overrides.get("active_completion_criteria", "")
     return prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=overrides.get("user_message", ""),
@@ -31,6 +39,8 @@ def _render(**overrides: str) -> str:
         latest_assistant_turn=overrides.get("latest_assistant_turn", "(none)"),
         retained_history=overrides.get("retained_history", "(none)"),
         global_llm_context=overrides.get("global_llm_context", ""),
+        raw_secret_present=overrides.get("raw_secret_present", "false"),
+        active_completion_criteria=active_completion_criteria,
     )
 
 
@@ -76,38 +86,179 @@ class TestRequestPolicyPromptStructure:
         assert "verbatim substring of the LATEST user message" in rendered
         assert "Do not cite a token that appears only in prior turns" in rendered
 
+    def test_completion_criteria_schema_includes_typed_terminal_action_fields(self) -> None:
+        rendered = _render()
+        assert (
+            "{outcome, contingent_on, contingent_antecedent_output_path, "
+            "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
+            "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
+            "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
+        ) in rendered
+        assert "never hide it in outcome prose" in rendered
+        assert (
+            "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, "
+            "goal_judgment_boolean" in rendered
+        )
+        assert "goal_judgment_boolean declares that the field is an artifact-computed true/false judgment" in rendered
+        assert "kind=outcome|terminal_action|validation_classification" in rendered
+        assert "terminal_action_family=request|application|form|order|null" in rendered
+        assert (
+            "requested_output_evidence_source: "
+            "runtime_output|independent_run_evidence|registered_output_parameter|registered_artifact_content"
+        ) in rendered
+        assert "classification_output_key=login_only and expected_classification=true" in rendered
+        assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_completion_criteria_schema_exposes_judgment_truth_condition_fields(self) -> None:
+        rendered = _render()
+        assert "judgment_predicate: null unless expected_output_shape=goal_judgment_boolean" in rendered
+        assert "Use only the closed-vocabulary value login_gate_blocks_target" in rendered
+        assert "judgment_polarity_when_holds: null unless judgment_predicate is non-null" in rendered
+        assert "kind=outcome" in rendered
+        assert "output_path=output.login_gate_blocks_target" in rendered
+        assert "judgment_predicate=login_gate_blocks_target" in rendered
+        assert "judgment_polarity_when_holds=true" in rendered
+        assert "Do not use kind=validation_classification for this returned field" in rendered
+
+    def test_priority_requested_output_evidence_source_guidance_is_present(self) -> None:
+        rendered = _render()
+        assert (
+            "selection, priority, ranking, or superlative criterion governs a returned requested-output field"
+            in rendered
+        )
+        assert "selected or highest-priority document name" in rendered
+        assert "output_path=output.document_name" in rendered
+        assert "requested_output_evidence_source=independent_run_evidence" in rendered
+        assert "the selected value cannot prove its own correctness" in rendered
+
+    def test_active_completion_criteria_render_typed_terminal_action_fields(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="a commercial water service request is started",
+                    expected_output_value="WTR-1842-DEMO",
+                    expected_output_shape="reference_code",
+                    kind="terminal_action",
+                    terminal_action_family="request",
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"kind": "terminal_action"' in rendered
+        assert '"terminal_action_family": "request"' in rendered
+        assert '"expected_output_value": "WTR-1842-DEMO"' in rendered
+        assert '"expected_output_shape": "reference_code"' in rendered
+
+    def test_active_completion_criteria_render_judgment_truth_condition(self) -> None:
+        active = _render_active_criteria_for_prompt(
+            [
+                CompletionCriterion(
+                    id="c0",
+                    outcome="the returned record reports whether the login gate blocks the target",
+                    output_path="output.login_gate_blocks_target",
+                    expected_output_value=True,
+                    expected_output_shape="goal_judgment_boolean",
+                    requested_output_evidence_source="independent_run_evidence",
+                    judgment_truth_condition=JudgmentTruthCondition(
+                        predicate="login_gate_blocks_target", polarity_when_holds=True
+                    ),
+                )
+            ]
+        )
+
+        rendered = _render(active_completion_criteria=active)
+
+        assert '"judgment_predicate": "login_gate_blocks_target"' in rendered
+        assert '"judgment_polarity_when_holds": true' in rendered
+
 
 class TestRawSecretBackstop:
-    def test_keyvault_handle_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass") is False
-        assert _raw_secret_detected("customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-user") is False
-
-    def test_azure_keyvault_url_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("https://example-vault.vault.azure.net/secrets/my-secret") is False
-
-    def test_workflow_behavior_question_does_not_trip_backstop(self) -> None:
-        message = (
-            "trigger_login appears to have worked as anticipated but next_step "
-            "is not receiving an active browser session to work with."
-        )
-        assert _raw_secret_detected(message) is False
-
-    def test_actual_raw_password_still_trips_backstop(self) -> None:
-        assert _raw_secret_detected("Use this password: hunter2 to sign in.") is True
-
-    def test_colon_delimited_email_password_pair_trips_backstop(self) -> None:
-        assert _raw_secret_detected("Use qa.user@example.test:FakePass123! to sign in.") is True
-        assert contains_email_password_pair("Use qa.user@example.test:FakePass123! to sign in.") is True
-
-    def test_bulk_colon_delimited_email_password_pairs_trip_backstop(self) -> None:
-        message = """
+    @pytest.mark.parametrize(
+        ("message", "detected", "email_pair_expected"),
+        [
+            pytest.param(
+                "customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass",
+                False,
+                None,
+                id="keyvault-handle-pass",
+            ),
+            pytest.param(
+                "customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-user",
+                False,
+                None,
+                id="keyvault-handle-user",
+            ),
+            pytest.param(
+                "https://example-vault.vault.azure.net/secrets/my-secret",
+                False,
+                None,
+                id="azure-keyvault-url",
+            ),
+            pytest.param(
+                "trigger_login appears to have worked as anticipated but next_step "
+                "is not receiving an active browser session to work with.",
+                False,
+                None,
+                id="workflow-behavior-question",
+            ),
+            pytest.param(
+                "Use this password: hunter2 to sign in.",
+                True,
+                None,
+                id="actual-raw-password",
+            ),
+            pytest.param(
+                "Use qa.user@example.test:FakePass123! to sign in.",
+                True,
+                True,
+                id="colon-delimited-email-password-pair",
+            ),
+            pytest.param(
+                """
         Use these accounts:
         alpha@example.test:FakePass123!
         beta@example.test:AnotherFakePass456!
         gamma@example.test:ThirdFakePass789!
-        """
-        assert _raw_secret_detected(message) is True
-        assert contains_email_password_pair(message) is True
+        """,
+                True,
+                True,
+                id="bulk-colon-delimited-email-password-pairs",
+            ),
+            pytest.param(
+                "Email: qa.user@example.test",
+                False,
+                None,
+                id="plain-email-label",
+            ),
+            pytest.param(
+                "Clone git@github.com:skyvern-ai/skyvern.git before running tests.",
+                False,
+                False,
+                id="scp-style-repo-path",
+            ),
+            pytest.param(
+                "Use https://qa.user@example.test:8080?org=1 for local testing.",
+                False,
+                False,
+                id="url-port-with-query",
+            ),
+            pytest.param(
+                "The api_key = sk-abcdefghijklmnopqrstuvwxyz1234567890.",
+                True,
+                None,
+                id="actual-api-key",
+            ),
+        ],
+    )
+    def test_raw_secret_backstop_detection(
+        self, message: str, detected: bool, email_pair_expected: bool | None
+    ) -> None:
+        assert _raw_secret_detected(message) is detected
+        if email_pair_expected is not None:
+            assert contains_email_password_pair(message) is email_pair_expected
 
     def test_bulk_colon_delimited_email_password_pairs_are_redacted(self) -> None:
         redacted = redact_raw_secrets_for_prompt(
@@ -117,22 +268,6 @@ class TestRawSecretBackstop:
         assert "FakePass123" not in redacted
         assert "AnotherFakePass456" not in redacted
         assert redacted.count("[REDACTED_SECRET]") == 2
-
-    def test_plain_email_label_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("Email: qa.user@example.test") is False
-
-    def test_scp_style_repository_path_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("Clone git@github.com:skyvern-ai/skyvern.git before running tests.") is False
-        assert (
-            contains_email_password_pair("Clone git@github.com:skyvern-ai/skyvern.git before running tests.") is False
-        )
-
-    def test_url_port_with_query_does_not_trip_backstop(self) -> None:
-        assert _raw_secret_detected("Use https://qa.user@example.test:8080?org=1 for local testing.") is False
-        assert contains_email_password_pair("Use https://qa.user@example.test:8080?org=1 for local testing.") is False
-
-    def test_actual_api_key_still_trips_backstop(self) -> None:
-        assert _raw_secret_detected("The api_key = sk-abcdefghijklmnopqrstuvwxyz1234567890.") is True
 
 
 class TestRawSecretRefusalSentinelConsistency:
@@ -324,3 +459,175 @@ class TestMalformedCredentialIdExtraction:
             reason="none",
         )
         assert policy.credential_input_kind == "credential_id"
+
+
+def _capture_handler(captured: dict[str, str]):
+    async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        captured["prompt"] = prompt
+        return {"testing_intent": "unspecified", "credential_input_kind": "none"}
+
+    return handler
+
+
+class TestActiveCriteriaPromptAnchor:
+    @pytest.mark.asyncio
+    async def test_active_criteria_render_verbatim(self) -> None:
+        captured: dict[str, str] = {}
+        await _classify_request(
+            user_message="run it again to make sure it still works",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=_capture_handler(captured),
+            active_criteria=[
+                CompletionCriterion(id="c0", outcome="The main heading from https://example.com is extracted"),
+            ],
+        )
+        assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" in captured["prompt"]
+        assert "The main heading from https://example.com is extracted" in captured["prompt"]
+        assert "COPIED VERBATIM" in captured["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_no_active_criteria_omits_anchor_section(self) -> None:
+        captured: dict[str, str] = {}
+        await _classify_request(
+            user_message="build a workflow",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=_capture_handler(captured),
+        )
+        assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]
+
+
+class TestLoadedResultContextPromptSanitization:
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_sanitizes_loaded_result_context_before_prompt(self) -> None:
+        captured: dict[str, str] = {}
+        raw_context = make_raw_loaded_result_context()
+
+        await _classify_request(
+            user_message="build from the loaded results",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=raw_context,
+            handler=_capture_handler(captured),
+        )
+
+        prompt = captured["prompt"]
+        for value in (
+            "Jane",
+            "Customer",
+            "123456",
+            "987654321",
+            "legacy-selector-derived-sig",
+        ):
+            assert value not in prompt
+        assert '"row_count": 2' in prompt
+
+
+class TestClassifierFallbackCompletionCriteria:
+    @pytest.mark.parametrize(
+        ("user_message", "expected_status", "expected_output_paths"),
+        [
+            (
+                (
+                    "I want to build a reusable workflow that checks record status. "
+                    "Capture the identifier and the list of practice items with each location's status, "
+                    "and the result should come out as a record with the entity name, identifier, items, "
+                    "and an overall status."
+                ),
+                "present",
+                {"output.identifier", "output.location_status", "output.name", "output.overall_status"},
+            ),
+            (
+                (
+                    "Build a reusable fixture directory lookup workflow for Jordan Example. Return a record with "
+                    "the entity name, identifier 1234567890, items, per-location status, overall status, and "
+                    "no-results behavior."
+                ),
+                "present",
+                {"output.name", "output.identifier", "output.per_location_status", "output.overall_status"},
+            ),
+            (
+                "Extract the user's name, id, address, and status from the portal.",
+                "present",
+                {"output.user_name", "output.id", "output.address", "output.status"},
+            ),
+            ("Open https://example.com and click the pricing link.", "present", set()),
+            # Substring matches ("read" in "already", "name" in "filename", "id" in "decided")
+            # must not satisfy the whole-word gate.
+            ("I already decided the filename and reviewed the status of locations.", "present", set()),
+            # Generic structural group term ("entries") satisfies the group gate.
+            (
+                "Return a record with the entity name, identifier 1234567890, status, and the grouped entries.",
+                "present",
+                {"output.name", "output.identifier", "output.status"},
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_classifier_fallback_structured_record_criteria(
+        self, user_message: str, expected_status: str, expected_output_paths: set[str]
+    ) -> None:
+        policy = await _classify_request(
+            user_message=user_message,
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=None,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.completion_contract_status == expected_status
+        if expected_status == "unknown":
+            assert policy.completion_criteria
+            assert all(is_fallback_floor_criterion(criterion) for criterion in policy.completion_criteria)
+            return
+
+        assert {
+            criterion.output_path for criterion in policy.completion_criteria if criterion.output_path
+        } == expected_output_paths
+        assert policy.graded_completion_criteria()
+        assert policy.requires_user_clarification is False
+        assert policy.user_response_policy == "proceed"
+        assert all(
+            criterion.implicit for criterion in policy.completion_criteria if criterion.id.startswith("fallback_")
+        )
+        assert all(criterion.level == "run" for criterion in policy.completion_criteria)
+
+    def test_classifier_fallback_logs_synthesized_structured_record_criteria(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeLogger:
+            def info(self, event: str, **kwargs: object) -> None:
+                calls.append((event, kwargs))
+
+        monkeypatch.setattr(request_policy_module, "LOG", FakeLogger())
+
+        policy = _classifier_fallback_policy(
+            [],
+            raw_secret_present=False,
+            failure_kind="missing_handler",
+            user_message=(
+                "Return a record with the entity name, identifier, items, per-location status, and overall status."
+            ),
+        )
+
+        assert policy.completion_contract_status == "present"
+        assert calls == [
+            (
+                "copilot request policy synthesized fallback structured-record criteria",
+                {
+                    "classifier_failure_kind": "missing_handler",
+                    "completion_criterion_ids": [
+                        "fallback_record_identity",
+                        "fallback_record_identifier",
+                        "fallback_record_groups",
+                        "fallback_record_status",
+                    ],
+                },
+            )
+        ]

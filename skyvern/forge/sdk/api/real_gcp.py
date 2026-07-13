@@ -332,3 +332,13 @@ class RealGcpClientFactory(GcpClientFactory):
 
     def create_secret_manager_client(self) -> AsyncGcpSecretManagerClient:
         return RealAsyncGcpSecretManagerClient()
+
+
+_gcs_client: RealAsyncGcsStorageClient | None = None
+
+
+def get_gcs_client() -> RealAsyncGcsStorageClient:
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = RealAsyncGcsStorageClient(project_id=settings.GCS_PROJECT_ID)
+    return _gcs_client
