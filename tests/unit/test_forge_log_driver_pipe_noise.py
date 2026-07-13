@@ -8,9 +8,18 @@ import pytest
 from skyvern.forge.sdk.forge_log import _DriverPipeNoiseFilter, setup_logger
 
 
+class TargetClosedError(Exception):
+    """Stand-in for patchright's TargetClosedError (the filter matches by type name)."""
+
+
 def _orphaned_future_record(exc_text: str) -> logging.LogRecord:
-    exc = Exception(exc_text)
-    message = f"Future exception was never retrieved\nfuture: <Future finished exception=Exception('{exc_text}')>"
+    return _orphaned_future_record_for(Exception(exc_text))
+
+
+def _orphaned_future_record_for(exc: Exception, *, include_repr: bool = True) -> logging.LogRecord:
+    message = "Future exception was never retrieved"
+    if include_repr:
+        message = f"{message}\nfuture: <Future finished exception={exc!r}>"
     return logging.LogRecord(
         name="asyncio",
         level=logging.ERROR,
@@ -39,6 +48,59 @@ def test_filter_matches_via_exc_info_when_message_lacks_repr() -> None:
         exc_info=(type(exc), exc, None),
     )
     assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_drops_target_closed_future_noise() -> None:
+    record = _orphaned_future_record_for(TargetClosedError("Target page, context or browser has been closed"))
+    assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_drops_target_closed_via_exc_info_when_message_lacks_repr() -> None:
+    record = _orphaned_future_record_for(
+        TargetClosedError("Target page, context or browser has been closed"), include_repr=False
+    )
+    assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_drops_target_closed_message_only_without_exc_info() -> None:
+    record = logging.LogRecord(
+        name="asyncio",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="Future exception was never retrieved\nfuture: <Future finished exception=Target page, context or browser has been closed>",
+        args=(),
+        exc_info=None,
+    )
+    assert _DriverPipeNoiseFilter().filter(record) is False
+
+
+def test_filter_keeps_target_closed_lookalike_with_wrong_type() -> None:
+    # Same "...has been closed" text but NOT a TargetClosedError (e.g. a crashed browser
+    # surfacing the message on a plain exception) must stay visible — SKY-11962 codex review.
+    record = _orphaned_future_record_for(Exception("Target page, context or browser has been closed"))
+    assert _DriverPipeNoiseFilter().filter(record) is True
+
+
+def test_filter_keeps_target_closed_error_from_awaited_path() -> None:
+    # A run-affecting crash surfaces its actionable TargetClosedError through an AWAITED
+    # driver call, logged on an app logger with a normal message — NOT asyncio's
+    # "Future exception was never retrieved" record. The filter only ever touches the
+    # orphaned-future artifact (message must contain that marker), so the crash signal is
+    # never suppressed even though the fire-and-forget orphaned future carrying the same
+    # TargetClosedError is dropped. Proves the codex P1 "this hides genuine crashes" does
+    # not hold: the crash's actionable signal travels the awaited path this filter ignores.
+    exc = TargetClosedError("Target page, context or browser has been closed")
+    record = logging.LogRecord(
+        name="skyvern.webeye.actions.handler",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="Unhandled exception in action handler",
+        args=(),
+        exc_info=(type(exc), exc, None),
+    )
+    assert _DriverPipeNoiseFilter().filter(record) is True
 
 
 def test_filter_keeps_other_orphaned_future_exceptions() -> None:
