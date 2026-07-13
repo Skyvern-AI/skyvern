@@ -3590,144 +3590,13 @@ class WorkflowService:
             )
 
             if block.block_type == BlockType.LOGIN:
-                await self._apply_login_block_credential_proxy_pin(
+                workflow_run = await self._prepare_login_block_browser_profile(
                     block=block,
                     workflow_run=workflow_run,
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
-                resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
-                    block=block,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_run.workflow_permanent_id,
-                )
-                # Save the original navigation goal before any mutation so
-                # retries don't stack the browser-session prefix repeatedly.
-                original_navigation_goal = block.navigation_goal
-                if resolved_browser_profile_id:
-                    decision = await self._evaluate_debug_session_profile_decision(
-                        workflow_run=workflow_run,
-                        browser_session_id=browser_session_id,
-                        resolved_browser_profile_id=resolved_browser_profile_id,
-                        organization_id=organization_id,
-                    )
-
-                    if decision.incompatible_reason is not None:
-                        # Debug session whose visible PBS is profile-incompatible.
-                        # Stream fidelity wins: attach the visible PBS so the user
-                        # can watch the action, but DO NOT write
-                        # workflow_run.browser_profile_id, DO NOT rewrite the
-                        # navigation_goal, and DO NOT emit "skipping login agent".
-                        # Fall through to ordinary LoginBlock execution below.
-                        LOG.warning(
-                            "Debug session profile incompatible with LoginBlock credential",
-                            code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
-                            reason=decision.incompatible_reason,
-                            workflow_run_id=workflow_run_id,
-                            block_label=block.label,
-                            debug_session_id=workflow_run.debug_session_id,
-                            browser_session_id=browser_session_id,
-                            credential_browser_profile_id=resolved_browser_profile_id,
-                        )
-                        if decision.attach_browser_session_id and block.url:
-                            try:
-                                await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                                    workflow_run=workflow_run,
-                                    url=block.url,
-                                    browser_session_id=decision.attach_browser_session_id,
-                                )
-                            except Exception:
-                                LOG.warning(
-                                    "PBS attach failed for debug incompatible profile; continuing",
-                                    workflow_run_id=workflow_run_id,
-                                    block_label=block.label,
-                                    browser_session_id=decision.attach_browser_session_id,
-                                    exc_info=True,
-                                )
-                    else:
-                        LOG.info(
-                            "LoginBlock has credential with browser profile — skipping login agent",
-                            workflow_run_id=workflow_run_id,
-                            block_label=block.label,
-                            browser_profile_id=resolved_browser_profile_id,
-                            url=block.url,
-                        )
-                        # Persist the browser_profile_id on the workflow_run so
-                        # subsequent blocks create / reuse a browser with the
-                        # saved profile (cookies, localStorage, etc.).
-                        await app.DATABASE.workflow_runs.update_workflow_run(
-                            workflow_run_id=workflow_run_id,
-                            browser_profile_id=resolved_browser_profile_id,
-                        )
-                        workflow_run = (
-                            await app.DATABASE.workflow_runs.get_workflow_run(
-                                workflow_run_id=workflow_run_id,
-                                organization_id=organization_id,
-                            )
-                            or workflow_run
-                        )
-
-                        # Create the browser with the saved profile and navigate
-                        # to the login block's URL.  When a saved-profile credential
-                        # is selected, the user is guided to enter the post-login
-                        # target URL (e.g. homepage/dashboard) rather than the
-                        # login page.  The saved cookies will authenticate the
-                        # session once the page loads.
-                        profile_loaded = bool(block.url)
-                        if block.url:
-                            try:
-                                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                                    workflow_run=workflow_run,
-                                    url=block.url,
-                                    browser_profile_id=resolved_browser_profile_id,
-                                    browser_session_id=decision.attach_browser_session_id,
-                                )
-                                working_page = await browser_state.get_working_page()
-                                if working_page and working_page.url == "about:blank":
-                                    await browser_state.navigate_to_url(page=working_page, url=block.url)
-                                # Wait for the page to settle so cookies/redirects complete
-                                if working_page:
-                                    try:
-                                        await working_page.wait_for_load_state("networkidle", timeout=10000)
-                                    except Exception:
-                                        LOG.debug(
-                                            "networkidle timeout after browser profile navigation (non-fatal)",
-                                            workflow_run_id=workflow_run_id,
-                                        )
-                            except Exception:
-                                LOG.warning(
-                                    "Saved browser profile failed to load, falling back to normal login",
-                                    workflow_run_id=workflow_run_id,
-                                    block_label=block.label,
-                                    browser_profile_id=resolved_browser_profile_id,
-                                    exc_info=True,
-                                )
-                                profile_loaded = False
-                                # Clear the profile so the normal login path doesn't reuse it
-                                await app.DATABASE.workflow_runs.update_workflow_run(
-                                    workflow_run_id=workflow_run_id,
-                                    browser_profile_id=None,
-                                )
-
-                        if not profile_loaded:
-                            # Fall through to normal block execution below
-                            pass
-                        else:
-                            # Browser profile loaded — the session may still be
-                            # valid or may have expired (common with bank sites).
-                            # Instead of skipping the login block, modify the
-                            # navigation goal so the AI checks whether the user is
-                            # already logged in and only performs login if needed.
-                            if original_navigation_goal:
-                                block.navigation_goal = (
-                                    "A saved browser session has been loaded. "
-                                    "Check if the user is already logged in. "
-                                    "If already logged in, complete this task immediately without taking any action. "
-                                    "If not logged in (e.g. the session expired), "
-                                    "proceed to log in with the provided credentials.\n\n"
-                                    f"Original goal: {original_navigation_goal}"
-                                )
 
             valid_to_run_code = (
                 is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
@@ -4258,6 +4127,155 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id, failure_reason=failure_reason
             )
             return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
+
+    async def _prepare_login_block_browser_profile(
+        self,
+        *,
+        block: BlockTypeVar,
+        workflow_run: WorkflowRun,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str | None,
+    ) -> WorkflowRun:
+        await self._apply_login_block_credential_proxy_pin(
+            block=block,
+            workflow_run=workflow_run,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        resolved_browser_profile_id = await self._resolve_login_block_browser_profile_id(
+            block=block,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id,
+        )
+        # Save the original navigation goal before any mutation so
+        # retries don't stack the browser-session prefix repeatedly.
+        original_navigation_goal = block.navigation_goal
+        if resolved_browser_profile_id:
+            decision = await self._evaluate_debug_session_profile_decision(
+                workflow_run=workflow_run,
+                browser_session_id=browser_session_id,
+                resolved_browser_profile_id=resolved_browser_profile_id,
+                organization_id=organization_id,
+            )
+
+            if decision.incompatible_reason is not None:
+                # Debug session whose visible PBS is profile-incompatible.
+                # Stream fidelity wins: attach the visible PBS so the user
+                # can watch the action, but DO NOT write
+                # workflow_run.browser_profile_id, DO NOT rewrite the
+                # navigation_goal, and DO NOT emit "skipping login agent".
+                # Fall through to ordinary LoginBlock execution below.
+                LOG.warning(
+                    "Debug session profile incompatible with LoginBlock credential",
+                    code=DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE,
+                    reason=decision.incompatible_reason,
+                    workflow_run_id=workflow_run_id,
+                    block_label=block.label,
+                    debug_session_id=workflow_run.debug_session_id,
+                    browser_session_id=browser_session_id,
+                    credential_browser_profile_id=resolved_browser_profile_id,
+                )
+                if decision.attach_browser_session_id and block.url:
+                    try:
+                        await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                            workflow_run=workflow_run,
+                            url=block.url,
+                            browser_session_id=decision.attach_browser_session_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "PBS attach failed for debug incompatible profile; continuing",
+                            workflow_run_id=workflow_run_id,
+                            block_label=block.label,
+                            browser_session_id=decision.attach_browser_session_id,
+                            exc_info=True,
+                        )
+            else:
+                LOG.info(
+                    "LoginBlock has credential with browser profile — skipping login agent",
+                    workflow_run_id=workflow_run_id,
+                    block_label=block.label,
+                    browser_profile_id=resolved_browser_profile_id,
+                    url=block.url,
+                )
+                # Persist the browser_profile_id on the workflow_run so
+                # subsequent blocks create / reuse a browser with the
+                # saved profile (cookies, localStorage, etc.).
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run_id,
+                    browser_profile_id=resolved_browser_profile_id,
+                )
+                workflow_run = (
+                    await app.DATABASE.workflow_runs.get_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
+                    or workflow_run
+                )
+
+                # Create the browser with the saved profile and navigate
+                # to the login block's URL.  When a saved-profile credential
+                # is selected, the user is guided to enter the post-login
+                # target URL (e.g. homepage/dashboard) rather than the
+                # login page.  The saved cookies will authenticate the
+                # session once the page loads.
+                profile_loaded = bool(block.url)
+                if block.url:
+                    try:
+                        browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                            workflow_run=workflow_run,
+                            url=block.url,
+                            browser_profile_id=resolved_browser_profile_id,
+                            browser_session_id=decision.attach_browser_session_id,
+                        )
+                        working_page = await browser_state.get_working_page()
+                        if working_page and working_page.url == "about:blank":
+                            await browser_state.navigate_to_url(page=working_page, url=block.url)
+                        # Wait for the page to settle so cookies/redirects complete
+                        if working_page:
+                            try:
+                                await working_page.wait_for_load_state("networkidle", timeout=10000)
+                            except Exception:
+                                LOG.debug(
+                                    "networkidle timeout after browser profile navigation (non-fatal)",
+                                    workflow_run_id=workflow_run_id,
+                                )
+                    except Exception:
+                        LOG.warning(
+                            "Saved browser profile failed to load, falling back to normal login",
+                            workflow_run_id=workflow_run_id,
+                            block_label=block.label,
+                            browser_profile_id=resolved_browser_profile_id,
+                            exc_info=True,
+                        )
+                        profile_loaded = False
+                        # Clear the profile so the normal login path doesn't reuse it
+                        await app.DATABASE.workflow_runs.update_workflow_run(
+                            workflow_run_id=workflow_run_id,
+                            browser_profile_id=None,
+                        )
+
+                if not profile_loaded:
+                    # Fall through to normal block execution below
+                    pass
+                else:
+                    # Browser profile loaded — the session may still be
+                    # valid or may have expired (common with bank sites).
+                    # Instead of skipping the login block, modify the
+                    # navigation goal so the AI checks whether the user is
+                    # already logged in and only performs login if needed.
+                    if original_navigation_goal:
+                        block.navigation_goal = (
+                            "A saved browser session has been loaded. "
+                            "Check if the user is already logged in. "
+                            "If already logged in, complete this task immediately without taking any action. "
+                            "If not logged in (e.g. the session expired), "
+                            "proceed to log in with the provided credentials.\n\n"
+                            f"Original goal: {original_navigation_goal}"
+                        )
+        return workflow_run
 
     async def resolve_login_block_browser_profile_id_pre_run(
         self,
