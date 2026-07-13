@@ -124,6 +124,13 @@ class WorkflowCopilotChatRequest(BaseModel):
             "otherwise it is a no-op."
         ),
     )
+    keep_pending_proposal: bool = Field(
+        False,
+        description=(
+            "When true, a pending proposed_workflow from an earlier turn survives turns that end without "
+            "a new proposal, so the client can keep rendering an actionable review gate."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
