@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -11,12 +12,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
+import aiofiles
 import httpx
 
 from skyvern.config import settings
 
 DRIVE_UPLOAD_API_BASE = "https://www.googleapis.com/upload/drive/v3"
 DRIVE_MULTIPART_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+# Reserve headroom for JSON metadata and MIME boundaries below the 5 MiB multipart request cap.
+DRIVE_MULTIPART_FILE_MAX_BYTES = DRIVE_MULTIPART_UPLOAD_MAX_BYTES - 10 * 1024
+DRIVE_RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
 
@@ -40,6 +45,20 @@ class GoogleDriveMultipartUploadRequest:
     target_url: str
     headers: dict[str, str]
     content: bytes
+
+
+@dataclass(frozen=True)
+class GoogleDriveResumableInitiateRequest:
+    target_url: str
+    headers: dict[str, str]
+    content: bytes
+
+
+@dataclass(frozen=True)
+class GoogleDriveResumableUploadRequest:
+    target_url: str
+    headers: dict[str, str]
+    file_path: str
 
 
 def _compute_backoff(attempt: int, retry_after: str | None) -> float:
@@ -110,18 +129,14 @@ def _assert_multipart_upload_size(file_path: str, body_size: int | None = None) 
         raise GoogleDriveAPIError(
             status=413,
             code="file_too_large",
-            message=(
-                "Google Drive multipart uploads are limited to 5 MB. "
-                "Use a smaller file or wait for resumable Drive upload support."
-            ),
+            message="Google Drive multipart uploads are limited to 5 MB; larger files use resumable upload.",
         )
     if body_size is not None and body_size > DRIVE_MULTIPART_UPLOAD_MAX_BYTES:
         raise GoogleDriveAPIError(
             status=413,
             code="multipart_body_too_large",
             message=(
-                "Google Drive multipart uploads are limited to 5 MB including metadata. "
-                "Use a smaller file or wait for resumable Drive upload support."
+                "Google Drive multipart uploads are limited to 5 MB including metadata; larger files use resumable upload."
             ),
         )
 
@@ -180,6 +195,76 @@ def build_multipart_upload_request(
     )
 
 
+def should_use_resumable_upload(file_path: str) -> bool:
+    return Path(file_path).stat().st_size > DRIVE_MULTIPART_FILE_MAX_BYTES
+
+
+def build_resumable_initiate_request(
+    *,
+    access_token: str,
+    file_path: str,
+    folder_id: str,
+) -> GoogleDriveResumableInitiateRequest:
+    path = Path(file_path)
+    file_size = path.stat().st_size
+    content_type = guess_type(file_path)[0] or "application/octet-stream"
+    metadata = {"name": path.name, "parents": [folder_id]}
+    query = urlencode({"uploadType": "resumable", "fields": "id,name,webViewLink", "supportsAllDrives": "true"})
+    return GoogleDriveResumableInitiateRequest(
+        target_url=f"{DRIVE_UPLOAD_API_BASE}/files?{query}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": content_type,
+            "X-Upload-Content-Length": str(file_size),
+        },
+        content=json.dumps(metadata, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def extract_resumable_session_uri(headers: Mapping[str, str]) -> str:
+    for name, value in headers.items():
+        if name.lower() == "location" and value.strip():
+            session_uri = value.strip()
+            parsed = urlparse(session_uri)
+            hostname = parsed.hostname or ""
+            try:
+                port = parsed.port
+            except ValueError:
+                port = -1
+            if (
+                parsed.scheme != "https"
+                or parsed.username is not None
+                or parsed.password is not None
+                or port not in {None, 443}
+                or not (hostname == "googleapis.com" or hostname.endswith(".googleapis.com"))
+            ):
+                raise GoogleDriveAPIError(
+                    status=502,
+                    code="invalid_resumable_session",
+                    message="Google Drive resumable session URI is not a googleapis.com https URL",
+                )
+            return session_uri
+    raise GoogleDriveAPIError(
+        status=502,
+        code="missing_resumable_session",
+        message="Google Drive resumable upload did not return a session URI",
+    )
+
+
+def build_resumable_upload_request(*, file_path: str, session_uri: str) -> GoogleDriveResumableUploadRequest:
+    file_size = Path(file_path).stat().st_size
+    content_type = guess_type(file_path)[0] or "application/octet-stream"
+    return GoogleDriveResumableUploadRequest(
+        target_url=session_uri,
+        headers={
+            "Content-Type": content_type,
+            "Content-Length": str(file_size),
+        },
+        file_path=file_path,
+    )
+
+
 def uploaded_file_from_payload(payload: Any) -> UploadedDriveFile:
     if not isinstance(payload, dict):
         raise GoogleDriveAPIError(status=500, code="malformed_response", message="Malformed Drive upload response")
@@ -231,12 +316,103 @@ async def _post_multipart_with_retry(
     raise AssertionError("Drive upload retry loop exited without a response")
 
 
+async def _post_resumable_initiate_with_retry(
+    client: httpx.AsyncClient,
+    request: GoogleDriveResumableInitiateRequest,
+) -> httpx.Response:
+    max_attempts = max(1, settings.GOOGLE_DRIVE_API_MAX_RETRIES)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await client.post(
+                request.target_url,
+                headers=request.headers,
+                content=request.content,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            if attempt == max_attempts:
+                raise GoogleDriveAPIError(
+                    status=503,
+                    code="upstream_unavailable",
+                    message=f"Google Drive resumable upload connection failure: {exc}",
+                ) from exc
+            await asyncio.sleep(_compute_backoff(attempt, None))
+            continue
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            raise GoogleDriveAPIError(
+                status=503,
+                code="ambiguous_upload_status",
+                message="Google Drive resumable upload initiation status is unknown after a transport failure.",
+            ) from exc
+    raise AssertionError("Drive resumable upload retry loop exited without a response")
+
+
+async def _iter_file_chunks(file_path: str) -> AsyncIterator[bytes]:
+    async with aiofiles.open(file_path, "rb") as file:
+        while chunk := await file.read(DRIVE_RESUMABLE_UPLOAD_CHUNK_BYTES):
+            yield chunk
+
+
+async def _upload_file_resumable(
+    *,
+    access_token: str,
+    file_path: str,
+    folder_id: str,
+) -> UploadedDriveFile:
+    initiate_request = build_resumable_initiate_request(
+        access_token=access_token,
+        file_path=file_path,
+        folder_id=folder_id,
+    )
+
+    async with httpx.AsyncClient(timeout=settings.GOOGLE_DRIVE_API_TIMEOUT_SECONDS) as client:
+        initiate_response = await _post_resumable_initiate_with_retry(client, initiate_request)
+        _raise_for_error(initiate_response)
+        session_uri = extract_resumable_session_uri(initiate_response.headers)
+        upload_request = build_resumable_upload_request(file_path=file_path, session_uri=session_uri)
+        try:
+            upload_response = await client.put(
+                upload_request.target_url,
+                headers=upload_request.headers,
+                content=_iter_file_chunks(upload_request.file_path),
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise GoogleDriveAPIError(
+                status=503,
+                code="upstream_unavailable",
+                message=f"Google Drive resumable upload connection failure: {exc}",
+            ) from exc
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            raise GoogleDriveAPIError(
+                status=503,
+                code="ambiguous_upload_status",
+                message="Google Drive upload status is unknown after a transport failure.",
+            ) from exc
+
+    _raise_for_error(upload_response)
+    try:
+        payload = upload_response.json() or {}
+    except ValueError as exc:
+        raise GoogleDriveAPIError(
+            status=500,
+            code="malformed_response",
+            message="Drive response was not valid JSON",
+        ) from exc
+    return uploaded_file_from_payload(payload)
+
+
 async def upload_file(
     *,
     access_token: str,
     file_path: str,
     folder_id: str,
 ) -> UploadedDriveFile:
+    if should_use_resumable_upload(file_path):
+        return await _upload_file_resumable(
+            access_token=access_token,
+            file_path=file_path,
+            folder_id=folder_id,
+        )
+
     request = build_multipart_upload_request(
         access_token=access_token,
         file_path=file_path,
