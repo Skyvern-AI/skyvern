@@ -709,6 +709,9 @@ class AgentFunction:
     workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the API process should run the built-in local scheduler loop."""
 
+    def is_wait_time_optimization_enabled(self) -> bool:
+        return False
+
     def build_proxy_session_extra_http_headers(self, proxy_session_id: str | None) -> dict[str, str] | None:
         return None
 

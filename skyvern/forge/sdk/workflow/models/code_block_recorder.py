@@ -458,3 +458,23 @@ class RecordingPage:
             )
 
         return recorded
+
+
+def json_safe_recorder_output(value: Any) -> Any:
+    """Recursively replace leaked recorder proxies with a JSON-safe marker before a code block's
+    output is registered. A raw RecordingLocator/RecordingKeyboard/RecordingPage reaching JSON
+    serialization raises TypeError at the output-registration boundary, which drops the whole
+    output payload and starves downstream evidence consumers.
+
+    A leaked proxy is a generated-code defect with no meaningful serializable value, so it collapses
+    to a type marker rather than its selector: a selector is only a lossy display fragment and can
+    embed a resolved credential, which mask_secrets_in_data does not scrub out of a dict key."""
+    if isinstance(value, (RecordingLocator, RecordingKeyboard, RecordingPage)):
+        return f"<{type(value).__name__}>"
+    if isinstance(value, dict):
+        # Normalize keys too: json.dumps rejects a non-primitive key outright (it never consults
+        # default=), so a proxy used as a mapping key would crash serialization all the same.
+        return {json_safe_recorder_output(key): json_safe_recorder_output(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_recorder_output(item) for item in value]
+    return value
