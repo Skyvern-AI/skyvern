@@ -11,6 +11,11 @@ from skyvern.cli.core.artifacts import get_artifact_dir, save_artifact
 from skyvern.cli.core.result import Artifact, BrowserContext, ErrorCode, Timer, make_error, make_result
 from skyvern.client.errors import NotFoundError
 
+DIRECT_TARGET_DESCRIPTION = "Direct target: deterministic, 0 LLM calls."
+AI_FALLBACK_DESCRIPTION = (
+    "AI fallback: costs Skyvern LLM calls, slower and nondeterministic — prefer selector/ref when known."
+)
+
 
 async def raw_http_get(path: str, params: dict[str, Any] | None = None) -> Any:
     """GET request to Skyvern API for endpoints without SDK methods.
@@ -63,8 +68,10 @@ async def _raw_http_request(
 
 
 __all__ = [
+    "AI_FALLBACK_DESCRIPTION",
     "Artifact",
     "BrowserContext",
+    "DIRECT_TARGET_DESCRIPTION",
     "ErrorCode",
     "Timer",
     "get_artifact_dir",

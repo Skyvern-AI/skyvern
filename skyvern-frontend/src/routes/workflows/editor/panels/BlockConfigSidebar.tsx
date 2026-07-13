@@ -48,6 +48,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   task: "task",
   textPrompt: "text_prompt",
   sendEmail: "send_email",
+  emailInbox: "email_inbox",
   codeBlock: "code",
   fileParser: "file_url_parser",
   upload: "upload_to_s3",
@@ -70,6 +71,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
   pdfFill: "pdf_fill",
+  splitPdf: "split_pdf",
 };
 
 function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {

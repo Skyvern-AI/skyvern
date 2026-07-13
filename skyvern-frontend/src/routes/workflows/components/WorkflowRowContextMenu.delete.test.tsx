@@ -35,14 +35,15 @@ vi.mock("@/components/ui/context-menu", () => {
     ContextMenuLabel: Pass,
     ContextMenuSeparator: () => null,
     ContextMenuSub: Pass,
-    ContextMenuSubTrigger: () => null,
-    ContextMenuSubContent: () => null,
+    ContextMenuSubTrigger: Pass,
+    ContextMenuSubContent: Pass,
   };
 });
 
 const deleteWorkflow = vi.fn((opts?: { onSuccess?: () => void }) =>
   opts?.onSuccess?.(),
 );
+const applyWorkflowTags = vi.fn();
 vi.mock("../hooks/useWorkflowRowActions", () => ({
   useWorkflowRowActions: () => ({
     clone: vi.fn(),
@@ -60,7 +61,33 @@ vi.mock("../hooks/useFolderMutations", () => ({
   useUpdateWorkflowFolderMutation: () => ({ mutateAsync: vi.fn() }),
 }));
 vi.mock("../hooks/useWorkflowTagMutations", () => ({
-  useApplyWorkflowTagsMutation: () => ({ mutate: vi.fn() }),
+  useApplyWorkflowTagsMutation: () => ({
+    mutate: applyWorkflowTags,
+    isPending: false,
+  }),
+}));
+vi.mock("./FolderPickerCommand", () => ({
+  FolderPickerCommand: () => null,
+}));
+vi.mock("./tagging/TagPickerCommand", () => ({
+  TagPickerCommand: ({
+    currentTags = [],
+    onRemove,
+  }: {
+    currentTags?: Array<{ key: string | null; value: string }>;
+    onRemove?: (tag: { key: string | null; value: string }) => void;
+  }) => (
+    <div data-testid="tag-picker">
+      {currentTags.map((tag) => (
+        <button
+          key={`${tag.key ?? "label"}:${tag.value}`}
+          onClick={() => onRemove?.(tag)}
+        >
+          {tag.key !== null ? `${tag.key}: ${tag.value}` : tag.value}
+        </button>
+      ))}
+    </div>
+  ),
 }));
 
 import { WorkflowRowContextMenu } from "./WorkflowRowContextMenu";
@@ -78,6 +105,7 @@ function buildWorkflow(): WorkflowApiResponse {
 function renderMenu(props?: {
   selectedCount?: number;
   onDeleted?: (id: string) => void;
+  currentTags?: Array<{ key: string | null; value: string }>;
 }) {
   return render(
     <MemoryRouter>
@@ -86,6 +114,7 @@ function renderMenu(props?: {
         tagKeys={[]}
         labelSuggestions={[]}
         valueSuggestionsByKey={new Map()}
+        currentTags={props?.currentTags}
         onNavigate={() => {}}
         selectedCount={props?.selectedCount ?? 1}
         onDeleted={props?.onDeleted}
@@ -96,7 +125,11 @@ function renderMenu(props?: {
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  deleteWorkflow.mockClear();
+  applyWorkflowTags.mockClear();
+});
 
 describe("WorkflowRowContextMenu single-row delete", () => {
   it("notifies onDeleted with the workflow id after a successful delete", () => {
@@ -108,5 +141,34 @@ describe("WorkflowRowContextMenu single-row delete", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /delete/i }));
 
     expect(onDeleted).toHaveBeenCalledWith("wpid_1");
+  });
+
+  it("removes current tags through the apply mutation tags_to_delete payload", () => {
+    renderMenu({
+      currentTags: [
+        { key: "env", value: "prod" },
+        { key: null, value: "urgent" },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "env: prod" }));
+    fireEvent.click(screen.getByRole("button", { name: "urgent" }));
+
+    expect(applyWorkflowTags).toHaveBeenNthCalledWith(
+      1,
+      {
+        workflowPermanentId: "wpid_1",
+        data: { tags_to_delete: [{ key: "env" }] },
+      },
+      expect.any(Object),
+    );
+    expect(applyWorkflowTags).toHaveBeenNthCalledWith(
+      2,
+      {
+        workflowPermanentId: "wpid_1",
+        data: { tags_to_delete: [{ value: "urgent" }] },
+      },
+      expect.any(Object),
+    );
   });
 });

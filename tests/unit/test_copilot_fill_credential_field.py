@@ -55,6 +55,7 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         pending_browser_interaction_observation=None,
         discovery_mcp_server=None,
         secret_scrub_values=[],
+        scouted_credential_field_inventory_by_credential_id={},
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -133,6 +134,33 @@ class TestResolveCredentialFillValue:
 
         value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "password")
         assert (value, error) == (_FAKE_PASSWORD, None)
+
+    @pytest.mark.asyncio
+    async def test_resolve_records_live_scout_field_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=None))
+        ctx = _ctx()
+        _, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "username")
+        assert error is None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+
+    @pytest.mark.asyncio
+    async def test_resolve_inventory_excludes_empty_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password="", totp=None))
+        ctx = _ctx()
+        _, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "username")
+        assert error is None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {"cred_123": frozenset({"username"})}
+
+    @pytest.mark.asyncio
+    async def test_resolve_error_records_no_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password="", totp=None))
+        ctx = _ctx()
+        value, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "password")
+        assert value is None
+        assert error is not None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {}
 
     @pytest.mark.asyncio
     async def test_totp_mints_fresh_code_not_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:

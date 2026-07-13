@@ -19,6 +19,10 @@ const triggerTypeDropdownItems: Array<TriggerTypeDropdownItem> = [
     value: TriggerType.Manual,
   },
   {
+    label: "MCP",
+    value: TriggerType.Mcp,
+  },
+  {
     label: "API",
     value: TriggerType.Api,
   },

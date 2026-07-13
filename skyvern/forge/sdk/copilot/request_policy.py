@@ -36,6 +36,8 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 LOG = structlog.get_logger()
 PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
+_AUTHORING_INTENTS = {"author_now", "defer_authoring"}
+DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
 _RAW_SECRET_HANDLINGS = {"none", "block", "redacted_draft"}
 _CLASSIFIER_FAILURE_KINDS = {
@@ -48,6 +50,7 @@ _CLASSIFIER_FAILURE_KINDS = {
 }
 _CLASSIFICATION_RESPONSE_FIELDS = {
     "testing_intent",
+    "authoring_intent",
     "credential_input_kind",
     "credential_refs",
     "login_page_urls",
@@ -153,6 +156,7 @@ _NAMED_CREDENTIAL_TOKEN_RE = re.compile(
     r"\b(?:saved\s+credential|credential)\s+(?:named|called)\s+([A-Za-z0-9_.@:-]{2,100})\b",
     re.I,
 )
+_CREDENTIAL_QUOTE_CONTEXT_RE = re.compile(r"\b(?:credentials?|log[\s-]?in)\b", re.I)
 _CODE_BLOCK_AUTHORING_MARKERS = ("code block", "code-block", "codeblock")
 _LOGIN_BLOCK_BAN_MARKERS = ("do not create a login block", "don't create a login block", "no login block")
 _CREDENTIAL_CODE_MARKERS = ("saved credential", "login_credentials", ".otp()", "one-time-code")
@@ -203,6 +207,10 @@ RequestedOutputEvidenceSource = Literal[
     "registered_output_parameter",
     "registered_artifact_content",
 ]
+JudgmentPredicate = Literal["login_gate_blocks_target"]
+_JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
+MintDegrade = Literal["turn_unsatisfiable_fallback", "contingent_missing_antecedent"]
+MINT_DEGRADE_VALUES: frozenset[str] = frozenset(get_args(MintDegrade))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
@@ -230,8 +238,11 @@ _OUTPUT_NEGATED_INTENT_PREFIX_RE = re.compile(
 )
 _OUTPUT_EXPLICIT_FIELD_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OUTPUT_NAMED_FIELD_RE = re.compile(
-    r"\b(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+"
-    r"(?:named|called)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+    r"\b(?:"
+    r"(?:(?:requested[-\s]+output|output|return(?:ed)?|final|structured)\s+)?fields?\s+(?:named|called)"
+    r"|(?:requested[-\s]+)?output\s+(?:named|called)"
+    r"|named\s+(?:requested[-\s]+)?output"
+    r")\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
     re.I,
 )
 _OUTPUT_ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,10}\b")
@@ -255,12 +266,24 @@ _OUTPUT_OUTCOME_WORDS = frozenset(
 
 
 @dataclass(frozen=True)
+class JudgmentTruthCondition:
+    """Per-polarity page-evidence predicate a judgment boolean is decidable by. ``polarity_when_holds``
+    is the emitted boolean value that corresponds to the predicate holding on the independent packet."""
+
+    predicate: JudgmentPredicate
+    polarity_when_holds: bool
+
+
+@dataclass(frozen=True)
 class CompletionCriterion:
     id: str
     outcome: str
     contingent_on: str | None = None
     contingent_antecedent_output_path: str | None = None
     deliverable_kind: Literal["registered_download"] | None = None
+    # Author-time seam signal only: unlike ``deliverable_kind`` it survives canonicalization onto
+    # non-canonical output paths, so it is never rendered to the completion verifier.
+    declared_deliverable_kind: Literal["registered_download"] | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -275,12 +298,16 @@ class CompletionCriterion:
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
-    mint_degrade: Literal["turn_unsatisfiable_fallback"] | None = None
+    mint_degrade: MintDegrade | None = None
+    judgment_truth_condition: JudgmentTruthCondition | None = None
+    requested_output_floor_rekeyed: bool = False
+    floor_rekeyed_from_path: str | None = None
 
 
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
+    authoring_intent: str = "author_now"
     credential_input_kind: str = "none"
     credential_refs: list[str] = field(default_factory=list)
     login_page_urls: list[str] = field(default_factory=list)
@@ -320,6 +347,7 @@ class RequestPolicy:
     def to_trace_data(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "testing_intent": self.testing_intent,
+            "authoring_intent": self.authoring_intent,
             "credential_input_kind": self.credential_input_kind,
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
@@ -368,11 +396,20 @@ class RequestPolicy:
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
+        mint_degraded_criteria = [
+            criterion for criterion in self.completion_criteria if criterion.mint_degrade is not None
+        ]
+        data["mint_degraded_criterion_count"] = len(mint_degraded_criteria)
+        for index, criterion in enumerate(mint_degraded_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
+            prefix = f"mint_degraded_criterion_{index}"
+            data[f"{prefix}_id"] = criterion.id
+            data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
         return data
 
     def prompt_summary(self) -> str:
         lines = [
             f"testing_intent: {self.testing_intent}",
+            f"authoring_intent: {self.authoring_intent}",
             f"credential_input_kind: {self.credential_input_kind}",
             f"clarification_reason: {self.clarification_reason}",
             f"allow_update_workflow: {self.allow_update_workflow}",
@@ -418,6 +455,21 @@ def request_policy_has_present_completion_contract(request_policy: RequestPolicy
     return request_policy.completion_contract_status == "present" or bool(request_policy.completion_criteria)
 
 
+def is_defer_authoring_durable_fill_criterion(criterion: CompletionCriterion) -> bool:
+    return criterion.id == DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID
+
+
+def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
+    return CompletionCriterion(
+        id=DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID,
+        outcome="the live form is filled on the page this turn",
+        kind="terminal_action",
+        terminal_action_family="form",
+        method_mandated=True,
+        level="run",
+    )
+
+
 def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
     # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
     # allow_missing_credentials_in_draft alone also covers the generic skip_test
@@ -445,6 +497,12 @@ def typed_expected_output_value_key(value: ExpectedOutputValue | None) -> str:
     if isinstance(value, str):
         return f"str:{value}"
     return ""
+
+
+def judgment_truth_condition_key(condition: JudgmentTruthCondition | None) -> str:
+    if condition is None:
+        return ""
+    return f"{condition.predicate}:{'t' if condition.polarity_when_holds else 'f'}"
 
 
 def _criterion_grounding_mode(
@@ -684,6 +742,14 @@ def _coerce_expected_output_shape(value: Any) -> ExpectedOutputShape | None:
     return None
 
 
+def _coerce_judgment_truth_condition(predicate: Any, polarity: Any) -> JudgmentTruthCondition | None:
+    if not isinstance(predicate, str) or predicate not in _JUDGMENT_PREDICATES:
+        return None
+    if not isinstance(polarity, bool):
+        return None
+    return JudgmentTruthCondition(predicate=cast(JudgmentPredicate, predicate), polarity_when_holds=polarity)
+
+
 def _coerce_requested_output_evidence_source(value: Any) -> RequestedOutputEvidenceSource:
     if isinstance(value, str) and value in _REQUESTED_OUTPUT_EVIDENCE_SOURCES:
         return cast(RequestedOutputEvidenceSource, value)
@@ -721,6 +787,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     if raw is None:
         return RequestPolicy()
     testing_intent = raw.get("testing_intent")
+    authoring_intent = raw.get("authoring_intent")
     credential_input_kind = raw.get("credential_input_kind")
     completion_contract_raw = raw.get("completion_contract")
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
@@ -728,6 +795,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
+        authoring_intent=authoring_intent if authoring_intent in _AUTHORING_INTENTS else "author_now",
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
         credential_refs=_clean_list(raw.get("credential_refs") or []),
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
@@ -805,6 +873,9 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             coerced_judgment_bool = _canonical_bool_string(expected_output_value)
             if coerced_judgment_bool is not None:
                 expected_output_value = coerced_judgment_bool
+        judgment_truth_condition = _coerce_judgment_truth_condition(
+            item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
+        )
         contingent_on_raw = item.get("contingent_on")
         contingent_on = (
             " ".join(contingent_on_raw.split())[:_COMPLETION_CRITERION_CONTINGENT_ON_MAX_CHARS].strip()
@@ -844,6 +915,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             typed_expected_output_value_key(expected_output_value),
             expected_output_shape or "",
             requested_output_evidence_source,
+            judgment_truth_condition_key(judgment_truth_condition),
         )
         if key in seen:
             continue
@@ -856,6 +928,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
                 deliverable_kind=deliverable_kind,
+                declared_deliverable_kind=deliverable_kind,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
                 level=cast(CriterionLevel, level_raw)
@@ -869,8 +942,17 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
+                judgment_truth_condition=judgment_truth_condition,
             )
         )
+        if judgment_truth_condition is not None:
+            LOG.info(
+                "copilot_judgment_truth_condition_minted",
+                mint_source="classifier",
+                predicate=judgment_truth_condition.predicate,
+                polarity_when_holds=judgment_truth_condition.polarity_when_holds,
+                criterion_id=criteria[-1].id,
+            )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
             break
     return criteria
@@ -978,6 +1060,7 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not candidate:
         return None
 
+    candidate = _normalize_named_output_field_delimiter(candidate)
     named_field = _OUTPUT_NAMED_FIELD_RE.search(candidate)
     if named_field is not None:
         return named_field.group(1)
@@ -1049,6 +1132,27 @@ def _clean_requested_output_candidate(segment: str, aliases: dict[str, str] | No
     if not phrase_words:
         return None
     return " ".join(phrase_words)
+
+
+def _normalize_named_output_field_delimiter(candidate: str) -> str:
+    lowered = candidate.casefold()
+    for anchor in (" named", " called"):
+        token_start = lowered.find(anchor)
+        if token_start == -1:
+            continue
+        token_start += len(anchor)
+        while token_start < len(candidate) and candidate[token_start].isspace():
+            token_start += 1
+        if token_start >= len(candidate) or candidate[token_start] not in "'\"`":
+            continue
+        quote = candidate[token_start]
+        token_end = candidate.find(quote, token_start + 1)
+        if token_end == -1:
+            continue
+        field_name = candidate[token_start + 1 : token_end]
+        if _OUTPUT_EXPLICIT_FIELD_KEY_RE.fullmatch(field_name):
+            return f"{candidate[:token_start]}{field_name}{candidate[token_end + 1 :]}"
+    return candidate
 
 
 def _matched_alias_phrase(candidate: str, alias_key: str) -> str | None:
@@ -1208,6 +1312,23 @@ def _requested_output_evidence_sources_from_criteria(
     return sources
 
 
+def _requested_output_judgment_conditions_from_criteria(
+    criteria: list[CompletionCriterion],
+    requested_specs: list[tuple[str, str, str]],
+) -> dict[str, JudgmentTruthCondition]:
+    conditions: dict[str, JudgmentTruthCondition] = {}
+    for criterion in criteria:
+        if criterion.level == "definition" or criterion.method_mandated or criterion.judgment_truth_condition is None:
+            continue
+        for field_name, output_path, _field_label in requested_specs:
+            if criterion.output_path != output_path and not _criterion_text_covers_requested_output(
+                criterion, field_name
+            ):
+                continue
+            conditions.setdefault(output_path, criterion.judgment_truth_condition)
+    return conditions
+
+
 def _requested_output_criterion_id(output_path: str) -> str:
     slug = "_".join(_word_tokens(output_path)) or "field"
     return f"{_REQUESTED_OUTPUT_CRITERION_ID_PREFIX}{slug}"
@@ -1293,6 +1414,15 @@ def _non_requested_output_run_corroborator(criterion: CompletionCriterion) -> bo
         and criterion.kind == "outcome"
         and not criterion.method_mandated
         and criterion.output_path is None
+    )
+
+
+def is_presence_only_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    return (
+        criterion.expected_output_value is None
+        and criterion.expected_output_shape is None
+        and criterion.deliverable_kind is None
+        and criterion.mint_degrade is None
     )
 
 
@@ -1429,8 +1559,12 @@ def _apply_requested_output_completion_criteria(
     source_by_output_path = _requested_output_evidence_sources_from_criteria(
         policy.completion_criteria, requested_specs
     )
+    judgment_condition_by_output_path = _requested_output_judgment_conditions_from_criteria(
+        policy.completion_criteria, requested_specs
+    )
 
     metadata_by_output_path: dict[str, tuple[str | None, str | None, Literal["registered_download"] | None]] = {}
+    declared_kind_by_output_path: dict[str, Literal["registered_download"]] = {}
     for criterion in policy.completion_criteria:
         if criterion.level == "definition" or criterion.method_mandated:
             continue
@@ -1438,6 +1572,7 @@ def _apply_requested_output_completion_criteria(
             not criterion.contingent_on
             and not criterion.contingent_antecedent_output_path
             and not criterion.deliverable_kind
+            and not criterion.declared_deliverable_kind
         ):
             continue
         for field_name, output_path, _field_label in requested_specs:
@@ -1445,6 +1580,8 @@ def _apply_requested_output_completion_criteria(
                 deliverable_kind = (
                     criterion.deliverable_kind if output_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS else None
                 )
+                if criterion.output_path == output_path and criterion.declared_deliverable_kind:
+                    declared_kind_by_output_path.setdefault(output_path, criterion.declared_deliverable_kind)
                 metadata_by_output_path.setdefault(
                     output_path,
                     (
@@ -1477,6 +1614,8 @@ def _apply_requested_output_completion_criteria(
             contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
             contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
             deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+            declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
+            judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
         )
         for _field_name, output_path, field_label in requested_specs
     ]
@@ -1528,6 +1667,7 @@ def _apply_validation_classification_completion_criteria(policy: RequestPolicy) 
                 expected_output_shape=None,
                 requested_output_evidence_source="runtime_output",
                 deliverable_kind=None,
+                declared_deliverable_kind=None,
                 terminal_action_family=None,
                 classification_output_key=output_key,
                 expected_classification=expected,
@@ -1571,6 +1711,9 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["expected_output_shape"] = criterion.expected_output_shape
         if criterion.requested_output_evidence_source != "runtime_output":
             item["requested_output_evidence_source"] = criterion.requested_output_evidence_source
+        if criterion.judgment_truth_condition is not None:
+            item["judgment_predicate"] = criterion.judgment_truth_condition.predicate
+            item["judgment_polarity_when_holds"] = criterion.judgment_truth_condition.polarity_when_holds
         if criterion.classification_output_key:
             item["classification_output_key"] = criterion.classification_output_key
         if criterion.expected_classification is not None:
@@ -1591,6 +1734,22 @@ def is_fallback_floor_base_criterion(criterion: CompletionCriterion) -> bool:
 
 def is_turn_unsatisfiable_fallback_degraded(criterion: CompletionCriterion) -> bool:
     return criterion.mint_degrade == "turn_unsatisfiable_fallback"
+
+
+def is_contingent_missing_antecedent_degraded(criterion: CompletionCriterion) -> bool:
+    return criterion.mint_degrade == "contingent_missing_antecedent"
+
+
+def resolve_mint_degrade(
+    stored_value: object,
+    contingent_on: str | None,
+    contingent_antecedent_output_path: str | None,
+) -> MintDegrade | None:
+    if isinstance(stored_value, str) and stored_value in MINT_DEGRADE_VALUES:
+        return cast(MintDegrade, stored_value)
+    if contingent_on and contingent_antecedent_output_path is None:
+        return "contingent_missing_antecedent"
+    return None
 
 
 _FALLBACK_LITERAL_MIN_CHARS = 4
@@ -1671,6 +1830,26 @@ def _mark_turn_unsatisfiable_fallback_criteria(policy: RequestPolicy) -> None:
     policy.completion_criteria = marked
 
 
+def _degrade_pathless_contingent_criteria(policy: RequestPolicy) -> None:
+    swept: list[CompletionCriterion] = []
+    degraded_ids: list[str] = []
+    for criterion in policy.completion_criteria:
+        resolved = resolve_mint_degrade(
+            criterion.mint_degrade, criterion.contingent_on, criterion.contingent_antecedent_output_path
+        )
+        if resolved != criterion.mint_degrade:
+            criterion = replace(criterion, mint_degrade=resolved)
+            degraded_ids.append(criterion.id)
+        swept.append(criterion)
+    policy.completion_criteria = swept
+    if degraded_ids:
+        LOG.info(
+            "copilot_contingent_criterion_mint_degraded",
+            criterion_ids=degraded_ids,
+            mint_degrade="contingent_missing_antecedent",
+        )
+
+
 def build_classifier_fallback_floor(ids: list[str]) -> list[CompletionCriterion]:
     floor = [
         CompletionCriterion(
@@ -1738,6 +1917,7 @@ def _classifier_fallback_policy(
     )
     _apply_classifier_typed_requested_output_corroborators(policy)
     _mark_turn_unsatisfiable_fallback_criteria(policy)
+    _degrade_pathless_contingent_criteria(policy)
     if policy.graded_completion_criteria():
         policy.completion_contract_status = "present"
     return policy
@@ -1989,6 +2169,7 @@ async def _classify_request(
     _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
     _apply_validation_classification_completion_criteria(policy)
     _apply_classifier_typed_requested_output_corroborators(policy)
+    _degrade_pathless_contingent_criteria(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )
@@ -2006,33 +2187,52 @@ async def _load_credentials(organization_id: str) -> list[Credential]:
         page += 1
 
 
-def _fallback_credential_name_candidates(user_message: str) -> list[str]:
+def _quote_in_credential_context(user_message: str, quote_start: int) -> bool:
+    return bool(_CREDENTIAL_QUOTE_CONTEXT_RE.search(user_message[max(0, quote_start - 48) : quote_start]))
+
+
+def _exact_credential_name_candidates(user_message: str) -> list[str]:
+    text = user_message or ""
     candidates: list[str] = []
-    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(user_message or ""):
-        value = next((group for group in match.groups() if group), "")
-        if value.strip():
-            candidates.append(value.strip())
-    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(user_message or ""):
+    for match in _QUOTED_CREDENTIAL_NAME_RE.finditer(text):
+        value = next((group for group in match.groups() if group), "").strip()
+        if value and _quote_in_credential_context(text, match.start()):
+            candidates.append(value)
+    for match in _NAMED_CREDENTIAL_TOKEN_RE.finditer(text):
         value = match.group(1).strip()
         if value:
             candidates.append(value)
     return _clean_list(candidates)
 
 
-async def _apply_fallback_credential_name_scope(
+def _exact_credential_name_scan_eligible(policy: RequestPolicy) -> bool:
+    if policy.raw_secret_detected:
+        return False
+    if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+        return False
+    if policy.credential_input_kind == "credential_name" and policy.credential_refs:
+        return False
+    return policy.credential_input_kind in ("none", "credential_name", "website_stored_credential")
+
+
+async def _apply_exact_credential_name_scope(
     policy: RequestPolicy,
     *,
     user_message: str,
     organization_id: str,
 ) -> None:
-    if policy.classifier_status != "fallback":
+    if not _exact_credential_name_scan_eligible(policy):
         return
-    if policy.raw_secret_detected or policy.credential_input_kind not in ("none", "credential_name"):
-        return
-    candidates = _fallback_credential_name_candidates(user_message)
+    candidates = _exact_credential_name_candidates(user_message)
     if not candidates:
         return
     credentials = await _load_credentials(organization_id)
+    if (
+        policy.credential_input_kind == "website_stored_credential"
+        and policy.login_page_urls
+        and _match_by_url(credentials, policy.login_page_urls)
+    ):
+        return
     matched_names = _clean_list(
         [candidate for candidate in candidates if any(credential.name == candidate for credential in credentials)]
     )
@@ -2479,14 +2679,14 @@ async def build_request_policy(
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
     try:
-        await _apply_fallback_credential_name_scope(
+        await _apply_exact_credential_name_scope(
             policy,
             user_message=user_message,
             organization_id=organization_id,
         )
     except Exception:
         LOG.warning(
-            "request-policy fallback credential-name extraction failed",
+            "request-policy exact credential-name extraction failed",
             organization_id=organization_id,
             exc_info=True,
         )
@@ -2586,6 +2786,12 @@ async def build_request_policy(
                 policy,
                 "I could not verify the requested credential metadata for this organization. Please provide a valid saved credential by exact name or a credential ID beginning with cred_.",
             )
+
+    if policy.authoring_intent == "defer_authoring":
+        policy.allow_update_workflow = False
+        policy.allow_run_blocks = False
+        if not any(is_defer_authoring_durable_fill_criterion(criterion) for criterion in policy.completion_criteria):
+            policy.completion_criteria = list(policy.completion_criteria) + [_defer_authoring_durable_fill_criterion()]
 
     trace_data = policy.to_trace_data()
     if policy.classifier_status == "fallback":

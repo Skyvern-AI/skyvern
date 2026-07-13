@@ -21,7 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
@@ -40,6 +42,7 @@ from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
+from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
@@ -55,6 +58,34 @@ from skyvern.services.workflow_schedule_service import (
 )
 
 LOG = structlog.get_logger()
+
+
+SECURITY_HEADERS = {
+    # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI (not BaseHTTPMiddleware) so streaming/SSE responses pass through unwrapped."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for key, value in SECURITY_HEADERS.items():
+                    headers[key] = value
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
@@ -369,6 +400,8 @@ def create_api_app() -> FastAPI:
     # the frontend, not by SDK users.
     fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
     fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
+    fastapi_app.include_router(microsoft_oauth_router, prefix="/v1/microsoft", include_in_schema=False)
+    fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
 
@@ -419,8 +452,14 @@ def create_api_app() -> FastAPI:
     @fastapi_app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
         LOG.exception("Unexpected error in agent server.", exc_info=exc)
+        # Base-Exception handlers run inside Starlette's ServerErrorMiddleware, which sits
+        # outside SecurityHeadersMiddleware, so stamp the framing headers here too.
         # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
-        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {type(exc).__name__}"})
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Unexpected error: {type(exc).__name__}"},
+            headers=SECURITY_HEADERS,
+        )
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -442,5 +481,9 @@ def create_api_app() -> FastAPI:
 
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Added last so it is outermost: stamps every response, including CORS
+    # preflights short-circuited by the cloud middleware registered above.
+    fastapi_app.add_middleware(SecurityHeadersMiddleware)
 
     return fastapi_app

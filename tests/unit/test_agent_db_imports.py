@@ -26,7 +26,7 @@ def test_agent_db_exports_agent_db_class() -> None:
 
 
 def test_all_repositories_on_agent_db() -> None:
-    """All 14 domain repositories must be present as typed attributes on AgentDB.
+    """All domain repositories must be present as typed attributes on AgentDB.
 
     After the mixin-to-repository refactor, AgentDB uses composition instead
     of inheritance. This test verifies every domain repository is wired up
@@ -43,6 +43,7 @@ def test_all_repositories_on_agent_db() -> None:
         "artifacts",
         "browser_sessions",
         "scripts",
+        "self_heal",
         "otp",
         "credentials",
         "folders",

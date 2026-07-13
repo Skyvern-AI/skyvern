@@ -54,7 +54,10 @@ def test_truncate_dict_preserves_top_level_keys_and_caps_values() -> None:
     from skyvern.utils.prompt_truncation import truncate_previous_extracted_information
     from skyvern.utils.token_counter import count_tokens
 
-    value = {"a": "x" * 50_000, "b": "y" * 50_000}
+    # Each value only needs to overshoot the per-key budget (200 // 2 = 100 tokens)
+    # to exercise cropping; a handful of hundred tokens does that without paying to
+    # tokenize 100KB of filler.
+    value = {"a": "x" * 2_000, "b": "y" * 2_000}
     result = truncate_previous_extracted_information(value, max_tokens=200)
     assert isinstance(result, dict)
     assert set(result.keys()) == {"a", "b"}

@@ -16,6 +16,7 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import BlockResult, BlockStatus, BlockType, CodeBlock, CodeBlockStep
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.schemas.self_heal import HealSkipReason
 from skyvern.webeye.actions.actions import Action
 
 SECRET_VALUE = "hunter2-super-secret"
@@ -31,7 +33,11 @@ DEFAULT_PROMPT = "Log in and download the report"
 ExtractedInformation = list[Any] | dict[str, Any] | str | None
 
 
-def _make_code_block(steps: list[CodeBlockStep] | None = None, prompt: str | None = DEFAULT_PROMPT) -> CodeBlock:
+def _make_code_block(
+    steps: list[CodeBlockStep] | None = None,
+    prompt: str | None = DEFAULT_PROMPT,
+    code: str = "await page.click('#missing')",
+) -> CodeBlock:
     now = datetime.now(timezone.utc)
     output_parameter = OutputParameter(
         parameter_type=ParameterType.OUTPUT,
@@ -44,7 +50,7 @@ def _make_code_block(steps: list[CodeBlockStep] | None = None, prompt: str | Non
     )
     return CodeBlock(
         label="code_1",
-        code="await page.click('#missing')",
+        code=code,
         prompt=prompt,
         steps=steps,
         output_parameter=output_parameter,
@@ -116,6 +122,7 @@ def _install_db_fakes(
         "created_actions": [],
         "recovery_block_kwargs": None,
         "recovery_block_updates": [],
+        "workflow_run_block_updates": [],
     }
 
     async def _create_task(**kwargs: object) -> _FakeTask:
@@ -168,7 +175,9 @@ def _install_db_fakes(
         return SimpleNamespace(workflow_run_block_id="wrb_recovery")
 
     async def _update_workflow_run_block(**kwargs: object) -> None:
-        state["recovery_block_updates"].append(kwargs)
+        state["workflow_run_block_updates"].append(kwargs)
+        if kwargs.get("workflow_run_block_id") == "wrb_recovery":
+            state["recovery_block_updates"].append(kwargs)
 
     monkeypatch.setattr(
         app.DATABASE.observer, "create_workflow_run_block", AsyncMock(side_effect=_create_workflow_run_block)
@@ -183,10 +192,53 @@ def _install_db_fakes(
     return state
 
 
-def _recording_page(exception: Exception | None) -> MagicMock:
+def _recording_page(exception: Exception | None, *, url: object = "http://example.test/home") -> MagicMock:
     page = MagicMock()
     page.last_recorded_exception = MagicMock(return_value=exception)
+    page.url = url
     return page
+
+
+def _browser_state() -> MagicMock:
+    browser_state = MagicMock()
+    browser_state.navigate_to_url = AsyncMock(return_value=None)
+    return browser_state
+
+
+class FakeRecorder:
+    instances: list[FakeRecorder] = []
+    _next_last_exception: Exception | None = None
+
+    @classmethod
+    def reset(cls, *, last_recorded_exception: Exception | None = None) -> None:
+        cls.instances = []
+        cls._next_last_exception = last_recorded_exception
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.recording_page = MagicMock()
+        self.recording_page.last_recorded_exception = MagicMock(return_value=self._next_last_exception)
+        self._actions: list[Any] = []
+        self.finalized_success: bool | None = None
+        self.__class__.instances.append(self)
+
+    async def create_task_and_step(self) -> None:
+        return None
+
+    async def link_block(self) -> None:
+        return None
+
+    def recorded_actions(self) -> list[Any]:
+        return list(self._actions)
+
+    def last_recorded_exception(self) -> Exception | None:
+        return self._next_last_exception
+
+    async def persist(self, actions: list[Any]) -> None:
+        return None
+
+    async def finalize(self, success: bool) -> None:
+        if self.finalized_success is None:
+            self.finalized_success = success
 
 
 async def _heal(
@@ -196,6 +248,8 @@ async def _heal(
     recording_page: MagicMock,
     *,
     failing_line: int | None = 1,
+    browser_state: MagicMock | None = None,
+    page: MagicMock | None = None,
 ) -> BlockResult | None:
     with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
         return await block._attempt_self_heal(
@@ -207,7 +261,39 @@ async def _heal(
             workflow_run_block_id="wrb_test",
             organization_id="o_test",
             browser_session_id=None,
+            browser_state=browser_state if browser_state is not None else _browser_state(),
+            page=page if page is not None else MagicMock(),
         )
+
+
+def _statuses_for_block(
+    state: dict[str, Any],
+    workflow_run_block_id: str,
+) -> list[BlockStatus]:
+    statuses: list[BlockStatus] = []
+    for update in state["workflow_run_block_updates"]:
+        if update.get("workflow_run_block_id") != workflow_run_block_id:
+            continue
+        status = update.get("status")
+        if isinstance(status, BlockStatus):
+            statuses.append(status)
+    return statuses
+
+
+def _patch_execute_chokepoint_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    context: WorkflowRunContext,
+    fake_browser_state: object,
+    use_codeblock_runner: bool,
+) -> None:
+    monkeypatch.setattr(CodeBlock, "get_workflow_run_context", MagicMock(return_value=context))
+    monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=fake_browser_state))
+    monkeypatch.setattr(CodeBlock, "_ensure_run_recording_artifact", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "format_potential_template_parameters", MagicMock(return_value=None))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "validate_code_block", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "should_use_codeblock_runner", AsyncMock(return_value=use_codeblock_runner))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=fake_browser_state))
 
 
 @pytest.mark.asyncio
@@ -365,6 +451,313 @@ async def test_matched_step_narrows_the_goal(monkeypatch: pytest.MonkeyPatch) ->
     assert goal != DEFAULT_PROMPT
     assert "click the export button" in goal
     assert DEFAULT_PROMPT in goal
+
+
+@pytest.mark.asyncio
+async def test_failing_static_goto_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_with_variable_keeps_empty_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code="""
+target = "https://dead-nav.example.com/login"
+await page.goto(target)
+""".strip()
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_with_keyword_url_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto(url="{target_url}")')
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_failing_goto_with_dynamic_keyword_url_keeps_empty_escalation_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        code="""
+target = "https://dead-nav.example.com/login"
+await page.goto(url=target)
+""".strip()
+    )
+    exc = RuntimeError("navigation failed")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc), failing_line=2)
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_element_rot_failure_never_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code="await page.click('#download')")
+    exc = RuntimeError("click failed")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="https://app.example.com/dashboard"),
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_uses_first_static_goto_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f"""
+await page.goto("{target_url}")
+await page.click("#download")
+""".strip()
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=2,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_skips_dynamic_goto_to_reach_later_static_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(
+        code=f"""
+target = build_url()
+await page.goto(target)
+await page.click("#step1")
+await page.goto("{target_url}")
+await page.click("#download")
+""".strip()
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=5,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == target_url
+
+
+@pytest.mark.asyncio
+async def test_error_page_seat_uses_nearest_preceding_goto_not_first_in_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-navigation block must seat recovery on the page the failure actually landed on
+    (the nearest preceding goto), not the first static goto anywhere in the block — an earlier
+    stale goto and a not-yet-executed later goto are both wrong answers here."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    stale_url = "https://stale-first.example.com/old"
+    correct_url = "https://correct-recovery.example.com/target"
+    never_executed_url = "https://never-executed.example.com/later"
+    block = _make_code_block(
+        code=f"""
+await page.goto("{stale_url}")
+await page.click("#step1")
+await page.goto("{correct_url}")
+await page.click("#step2")
+await page.goto("{never_executed_url}")
+""".strip()
+    )
+    exc = RuntimeError("click failed after dead nav")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="chrome-error://chromewebdata/"),
+        failing_line=4,
+    )
+
+    assert result is not None and result.success is True
+    assert state["create_task_kwargs"]["url"] == correct_url
+
+
+@pytest.mark.asyncio
+async def test_dead_nav_seat_navigates_live_page_before_escalation_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """escalation_task.url alone does not reliably trigger navigation (BrowserManager can early-return
+    a cached browser state without reading it), so the heal must drive the live browser_state/page
+    directly for a dead-nav seat."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+    browser_state = _browser_state()
+    live_page = MagicMock(name="live_page")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc),
+        browser_state=browser_state,
+        page=live_page,
+    )
+
+    assert result is not None and result.success is True
+    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url=target_url)
+
+
+@pytest.mark.asyncio
+async def test_dead_host_goto_recovers_url_from_goal_not_the_rotted_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The canonical dead-nav rot: the block's own goto url is the dead host, and the real
+    destination lives in the goal (prompt/steps). The heal must navigate to the goal's URL, not
+    re-navigate to the code's dead goto (gauntlet H7 — otherwise it just hits the dead host again)."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    real_url = "http://localhost:8900/telco_billing/northwind/"
+    block = _make_code_block(
+        code='await page.goto("http://localhost:65531/")',
+        prompt=f"Open the billing portal at {real_url} and sign in",
+    )
+    exc = RuntimeError("net::ERR_CONNECTION_REFUSED")
+    browser_state = _browser_state()
+    live_page = MagicMock(name="live_page")
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc),
+        browser_state=browser_state,
+        page=live_page,
+    )
+
+    assert result is not None and result.success is True
+    browser_state.navigate_to_url.assert_awaited_once_with(page=live_page, url=real_url)
+
+
+@pytest.mark.asyncio
+async def test_element_rot_seat_never_navigates_live_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Element-rot heals must preserve same-session SPA state (gauntlet H8 invariant); the direct
+    navigate call added for dead-nav seats must not fire when no recovery URL was derived."""
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(code="await page.click('#download')")
+    exc = RuntimeError("click failed")
+    browser_state = _browser_state()
+
+    result = await _heal(
+        block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="https://app.example.com/dashboard"),
+        browser_state=browser_state,
+    )
+
+    assert result is not None and result.success is True
+    browser_state.navigate_to_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_derived_escalation_url_is_not_added_to_goal_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    target_url = "https://dead-nav.example.com/login"
+    block = _make_code_block(code=f'await page.goto("{target_url}")')
+    exc = RuntimeError("navigation failed")
+
+    state_with_url = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    result_with_url = await _heal(block, _make_context(), exc, _recording_page(exc))
+    goal_with_url = state_with_url["create_task_kwargs"]["navigation_goal"]
+
+    assert result_with_url is not None and result_with_url.success is True
+    assert target_url not in goal_with_url
+
+    element_rot_block = _make_code_block(code="await page.click('#missing')")
+    state_no_url = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    result_no_url = await _heal(
+        element_rot_block,
+        _make_context(),
+        exc,
+        _recording_page(exc, url="https://app.example.com/dashboard"),
+    )
+
+    assert result_no_url is not None and result_no_url.success is True
+    assert state_no_url["create_task_kwargs"]["url"] == ""
+    assert goal_with_url == state_no_url["create_task_kwargs"]["navigation_goal"]
+
+
+@pytest.mark.asyncio
+async def test_goto_inside_comment_or_string_never_sets_escalation_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    for code in (
+        'await page.click("#download")  # retry via .goto("https://evil.example.com")',
+        "await page.click('.goto(\"https://evil.example.com\")')",
+    ):
+        block = _make_code_block(code=code)
+        exc = RuntimeError("click failed")
+        state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+
+        result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+        assert result is not None and result.success is True
+        assert state["create_task_kwargs"]["url"] == ""
 
 
 @pytest.mark.asyncio
@@ -866,3 +1259,485 @@ async def test_escalation_task_verifies_with_action_history(
 
     assert result is not None and result.success is True
     assert state["create_task_kwargs"]["include_action_history_in_verification"] is True
+
+
+@pytest.mark.parametrize(
+    ("error_code", "healable", "skip_reason"),
+    [
+        ("unsupported_page_operation", True, None),
+        ("timeout", False, HealSkipReason.timeout_class),
+        ("insecure_code_detected", False, HealSkipReason.insecure_code),
+        ("browser_disconnected", False, HealSkipReason.unclassifiable),
+        ("user_code_error", False, HealSkipReason.unclassifiable),
+        ("busy", False, HealSkipReason.unclassifiable),
+    ],
+)
+def test_secure_runner_degraded_classification_from_error_code(
+    error_code: str, healable: bool, skip_reason: HealSkipReason | None
+) -> None:
+    block = _make_code_block()
+    classification = block._classify_secure_runner_failure(
+        CodeBlockEngineFailure(
+            error_code=error_code,
+            safe_message=None,
+            failure_reason=None,
+            exception_class=None,
+            failing_line=None,
+            healability_hint=None,
+        )
+    )
+    assert classification.healable is healable
+    assert classification.skip_reason == skip_reason
+
+
+def test_secure_runner_classification_uses_playwright_class_when_hint_is_unknown() -> None:
+    block = _make_code_block()
+    classification = block._classify_secure_runner_failure(
+        CodeBlockEngineFailure(
+            error_code="busy",
+            safe_message=None,
+            failure_reason=None,
+            exception_class="playwright._impl._errors.TimeoutError",
+            failing_line=3,
+            healability_hint=None,
+        )
+    )
+    assert classification.healable is True
+    assert classification.skip_reason is None
+
+
+def test_secure_runner_classification_treats_browser_disconnected_as_non_healable() -> None:
+    block = _make_code_block()
+    classification = block._classify_secure_runner_failure(
+        CodeBlockEngineFailure(
+            error_code="browser_disconnected",
+            safe_message=None,
+            failure_reason=None,
+            exception_class="codeblock.page_operation_broker.BrowserDisconnectedError",
+            failing_line=3,
+            healability_hint=None,
+        )
+    )
+    assert classification.healable is False
+    assert classification.skip_reason == HealSkipReason.unclassifiable
+
+
+@pytest.mark.asyncio
+async def test_self_heal_passes_pre_resolved_browser_state_by_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    browser_state = object()
+    exc = RuntimeError("rotted selector")
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block._attempt_self_heal(
+            exception=exc,
+            failing_line=1,
+            recording_page=_recording_page(exc),
+            workflow_run_context=_make_context(enable_self_healing=True),
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+            browser_state=browser_state,
+        )
+
+    assert result is not None
+    assert state["execute_step_kwargs"]["pre_resolved_browser_state"] is browser_state
+
+
+@pytest.mark.asyncio
+async def test_legacy_heal_success_skips_failed_write_and_ends_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+    )
+    raised = RuntimeError("rotted selector")
+    monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", AsyncMock(side_effect=raised))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=raised)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    async def _heal_success(**kwargs: Any) -> BlockResult:
+        return await block.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value={"task_id": "tsk_escalation", "status": "completed"},
+            status=BlockStatus.completed,
+            workflow_run_block_id=kwargs["workflow_run_block_id"],
+            organization_id=kwargs["organization_id"],
+        )
+
+    heal_mock = AsyncMock(side_effect=_heal_success)
+    monkeypatch.setattr(block, "_attempt_self_heal", heal_mock)
+    record_output_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output_mock)
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is True
+    assert heal_mock.await_count == 1
+    assert BlockStatus.failed not in block_statuses
+    assert block_statuses[-1] == BlockStatus.completed
+    assert record_output_mock.await_count == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is True
+
+
+@pytest.mark.asyncio
+async def test_heal_output_write_failure_does_not_finalize_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+    )
+    raised = RuntimeError("rotted selector")
+    monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", AsyncMock(side_effect=raised))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=raised)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    async def _heal_success(**kwargs: Any) -> BlockResult:
+        return await block.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value={"task_id": "tsk_escalation", "status": "completed"},
+            status=BlockStatus.completed,
+            workflow_run_block_id=kwargs["workflow_run_block_id"],
+            organization_id=kwargs["organization_id"],
+        )
+
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(side_effect=_heal_success))
+    write_error = RuntimeError("output parameter write failed")
+    record_output_mock = AsyncMock(side_effect=write_error)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output_mock)
+
+    with pytest.raises(RuntimeError, match="output parameter write failed"):
+        await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    assert record_output_mock.await_count == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is not True
+
+
+@pytest.mark.asyncio
+async def test_secure_heal_success_skips_failed_write_and_ends_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="user_code_error",
+                    safe_message=None,
+                    failure_reason="CodeBlock failed while running user code.",
+                    exception_class="playwright._impl._errors.TimeoutError",
+                    failing_line=2,
+                    healability_hint=True,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    async def _heal_success(**kwargs: Any) -> BlockResult:
+        return await block.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value={"task_id": "tsk_escalation", "status": "completed"},
+            status=BlockStatus.completed,
+            workflow_run_block_id=kwargs["workflow_run_block_id"],
+            organization_id=kwargs["organization_id"],
+        )
+
+    heal_mock = AsyncMock(side_effect=_heal_success)
+    monkeypatch.setattr(block, "_attempt_self_heal", heal_mock)
+    record_output_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output_mock)
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is True
+    assert heal_mock.await_count == 1
+    assert heal_mock.await_args.kwargs["page"] is fake_page
+    assert heal_mock.await_args.kwargs["browser_state"] is fake_browser_state
+    assert BlockStatus.failed not in block_statuses
+    assert block_statuses[-1] == BlockStatus.completed
+    assert record_output_mock.await_count == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_heal_declined_writes_failed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+    )
+    raised = RuntimeError("rotted selector")
+    monkeypatch.setattr(CodeBlock, "execute_user_function_with_timeout", AsyncMock(side_effect=raised))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=raised)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is False
+    assert block_statuses.count(BlockStatus.failed) == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is False
+
+
+@pytest.mark.asyncio
+async def test_secure_heal_declined_writes_failed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="user_code_error",
+                    safe_message=None,
+                    failure_reason="CodeBlock failed while running user code.",
+                    exception_class="playwright._impl._errors.TimeoutError",
+                    failing_line=2,
+                    healability_hint=True,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is False
+    assert block_statuses.count(BlockStatus.failed) == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is False
+
+
+@pytest.mark.asyncio
+async def test_secure_unhealable_failure_without_result_builds_failed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=False)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="timeout",
+                    safe_message="CodeBlock execution timed out.",
+                    failure_reason="CodeBlock execution timed out.",
+                    exception_class=None,
+                    failing_line=None,
+                    healability_hint=False,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    heal_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(block, "_attempt_self_heal", heal_mock)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is False
+    assert heal_mock.await_count == 0
+    assert block_statuses.count(BlockStatus.failed) == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is False
+
+
+@pytest.mark.asyncio
+async def test_secure_runner_missing_block_result_returns_generic_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(return_value=CodeBlockEngineResult(block_result=None, failure=None)),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is False
+    assert result.failure_reason == "Secure code block runner returned no result"
+    assert block_statuses.count(BlockStatus.failed) == 1
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is False
+
+
+@pytest.mark.asyncio
+async def test_secure_infra_failure_without_metadata_finalizes_failed_and_records_no_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", False, raising=False)
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context(enable_self_healing=True)
+    fake_page = MagicMock()
+    fake_browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=fake_page))
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    failed_result = await block.build_block_result(
+        success=False,
+        failure_reason="infra failure",
+        output_parameter_value={"raw": "not-recorded"},
+        status=BlockStatus.failed,
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(return_value=CodeBlockEngineResult(block_result=failed_result, failure=None)),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    heal_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(block, "_attempt_self_heal", heal_mock)
+    record_output_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output_mock)
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    block_statuses = _statuses_for_block(state, "wrb_test")
+    assert result.success is False
+    assert len(FakeRecorder.instances) == 1
+    assert FakeRecorder.instances[0].finalized_success is False
+    assert record_output_mock.await_count == 0
+    assert BlockStatus.completed not in block_statuses
+    heal_mock.assert_not_awaited()

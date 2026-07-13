@@ -10,37 +10,58 @@ and wait() (accepts both seconds= and timeout_ms= parameter styles).
 import inspect
 import re
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import IllegitCompleteScriptTermination, ScriptTerminationException
 
 
-def create_mock_page():
-    """Create a mock Playwright Page object with required attributes."""
-    page = MagicMock()
-    page.url = "https://example.com"
-    # Required for Playwright Page base class
-    page._loop = MagicMock()
-    page._impl_obj = page
-    return page
+class _KeyboardStub:
+    async def press(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+class _PageStub:
+    def __init__(self) -> None:
+        self.url = "https://example.com"
+        self.keyboard = _KeyboardStub()
+
+    async def evaluate(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def create_mock_page() -> _PageStub:
+    return _PageStub()
+
+
+class _AiStub:
+    pass
+
+
+class _ScrapedPageStub:
+    def __init__(self) -> None:
+        self._browser_state = SimpleNamespace()
+
+
+@pytest.fixture(autouse=True)
+def no_cached_action_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "CACHED_ACTION_DELAY_SECONDS", 0)
 
 
 @pytest.fixture
 def mock_scraped_page():
-    """Create a mock ScrapedPage object."""
-    scraped_page = MagicMock()
-    scraped_page._browser_state = MagicMock()
-    return scraped_page
+    return _ScrapedPageStub()
 
 
 @pytest.fixture
 def mock_ai():
-    """Create a mock SkyvernPageAi object."""
-    return MagicMock()
+    return _AiStub()
 
 
 @pytest.mark.asyncio
@@ -241,8 +262,7 @@ async def test_ensure_element_ids_skips_when_ids_exist(mock_scraped_page, mock_a
     should NOT be called (fast path).
     """
     mock_page = create_mock_page()
-    # SkyvernPage.__getattribute__ delegates self.page to mock_page.page
-    mock_page.page.evaluate = AsyncMock(return_value=True)  # unique_ids exist
+    mock_page.evaluate = AsyncMock(return_value=True)  # unique_ids exist
 
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
@@ -271,9 +291,7 @@ async def test_ensure_element_ids_injects_when_ids_missing(mock_scraped_page, mo
     domUtils.js and call buildTreeFromBody to set them.
     """
     mock_page = create_mock_page()
-    # SkyvernPage.__getattribute__ delegates self.page to mock_page.page,
-    # so set evaluate on the delegated object
-    mock_page.page.evaluate = AsyncMock(return_value=False)  # no unique_ids
+    mock_page.evaluate = AsyncMock(return_value=False)  # no unique_ids
 
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
@@ -339,8 +357,7 @@ async def test_ensure_element_ids_catches_exceptions(mock_scraped_page, mock_ai)
     action execution.
     """
     mock_page = create_mock_page()
-    # SkyvernPage.__getattribute__ delegates self.page to mock_page.page
-    mock_page.page.evaluate = AsyncMock(side_effect=Exception("Page crashed"))
+    mock_page.evaluate = AsyncMock(side_effect=Exception("Page crashed"))
 
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
@@ -1582,12 +1599,30 @@ class _RecordingLocator:
     keys on `change`.
     """
 
-    def __init__(self, *, dispatch_error: Exception | None = None, gate_on_change: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        click_error: Exception | None = None,
+        dispatch_error: Exception | None = None,
+        gate_on_change: bool = False,
+    ) -> None:
         self.calls: list[tuple[str, str | None]] = []
         self.first = self
+        self._click_error = click_error
         self._dispatch_error = dispatch_error
         self._gate_on_change = gate_on_change
         self.enabled = False
+
+    async def wait_for(self, *, state: str, **kwargs: object) -> None:
+        self.calls.append(("wait_for", state))
+
+    async def scroll_into_view_if_needed(self, **kwargs: object) -> None:
+        self.calls.append(("scroll_into_view_if_needed", None))
+
+    async def click(self, **kwargs: object) -> None:
+        self.calls.append(("click", None))
+        if self._click_error is not None:
+            raise self._click_error
 
     async def fill(self, value: str, **kwargs: object) -> None:
         self.calls.append(("fill", value))
@@ -1620,6 +1655,20 @@ def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) ->
         )
     script_page._working_frame = _RecordingLocatorScope(locator)
     return script_page
+
+
+def _skyvern_page_with_locator(mock_ai, locator: _RecordingLocator) -> SkyvernPage:
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.Page.__init__",
+        return_value=None,
+    ):
+        raw_page = create_mock_page()
+        skyvern_page = SkyvernPage(
+            page=raw_page,
+            ai=mock_ai,
+        )
+    skyvern_page._working_frame = _RecordingLocatorScope(locator)
+    return skyvern_page
 
 
 @pytest.mark.asyncio
@@ -1676,3 +1725,79 @@ async def test_direct_fill_dispatch_failure_does_not_regress_fill(mock_scraped_p
     result = await script_page.fill("#password", "hunter2", mode="direct")
 
     assert result == "hunter2"
+
+
+# =============================================================================
+# Tests for selector fallback prep opt-out — SKY-12096
+# =============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["click", "fill", "type"])
+async def test_selector_fallback_default_runs_element_prep(mock_scraped_page, mock_ai, action: str):
+    locator = _RecordingLocator()
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        if action == "click":
+            result = await skyvern_page.click("#target")
+        elif action == "fill":
+            result = await skyvern_page.fill("#target", "Noor")
+        else:
+            result = await skyvern_page.type("#target", "Noor")
+
+    assert result in ("#target", "Noor")
+    assert ("wait_for", "attached") in locator.calls
+    assert ("wait_for", "visible") in locator.calls
+    assert ("scroll_into_view_if_needed", None) in locator.calls
+    assert sleep.await_args is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["click", "fill", "type"])
+async def test_selector_fallback_prep_opt_out_uses_playwright_actionability(
+    mock_scraped_page,
+    mock_ai,
+    action: str,
+):
+    locator = _RecordingLocator()
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        if action == "click":
+            result = await skyvern_page.click("#target", _skip_element_prep=True)
+        elif action == "fill":
+            result = await skyvern_page.fill("#target", "Noor", _skip_element_prep=True)
+        else:
+            result = await skyvern_page.type("#target", "Noor", _skip_element_prep=True)
+
+    assert result in ("#target", "Noor")
+    assert not any(call[0] == "wait_for" for call in locator.calls)
+    assert ("scroll_into_view_if_needed", None) not in locator.calls
+    assert sleep.await_args is None
+
+
+@pytest.mark.asyncio
+async def test_selector_click_prep_opt_out_preserves_direct_timeout_failure(mock_ai):
+    locator = _RecordingLocator(click_error=PlaywrightTimeoutError("Timeout 5000ms exceeded."))
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with pytest.raises(PlaywrightTimeoutError):
+            await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert sleep.await_args is None
+
+
+@pytest.mark.asyncio
+async def test_selector_click_prep_opt_out_keeps_escape_retry_for_interception(mock_ai):
+    locator = _RecordingLocator(
+        click_error=PlaywrightTimeoutError("<div class='overlay'></div> intercepts pointer events")
+    )
+    skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with pytest.raises(PlaywrightTimeoutError):
+            await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
+
+    assert sleep.await_args is not None

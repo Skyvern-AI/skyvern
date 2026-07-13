@@ -2638,6 +2638,9 @@ function Workspace({
                         <GlobeIcon /> Live Browser
                         <StreamModeBadge mode="cdp" />
                       </div>
+                      {showBreakoutButton && (
+                        <BreakoutButton onClick={() => breakout()} />
+                      )}
                       <div
                         className={cn("ml-auto flex items-center gap-2", {
                           "mr-16": !blockLabel,

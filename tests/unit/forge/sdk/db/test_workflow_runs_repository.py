@@ -366,6 +366,48 @@ async def test_get_all_runs_v2_status_filter_uses_coalesced_effective_status() -
 
 
 @pytest.mark.asyncio
+async def test_get_all_runs_v2_run_type_filter_applies_task_run_type_predicate() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", run_type=["task_v1", "task_v2"])
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "task_runs.task_run_type IN ('task_v1', 'task_v2')" in where_clause
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_run_type_filter_gates_workflow_run_search_fallback() -> None:
+    """The search fallback query only ever yields workflow_run rows, so it must be
+    skipped when the run_type filter excludes workflow_run and kept when it doesn't."""
+    captured_queries: list[Any] = []
+
+    async def _execute(query):
+        captured_queries.append(query)
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="wr_abc123", run_type=["task_v1"])
+    assert len(captured_queries) == 1
+
+    captured_queries.clear()
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="wr_abc123", run_type=["task_v1", "workflow_run"])
+    assert len(captured_queries) == 2
+
+
+@pytest.mark.asyncio
 async def test_get_all_runs_v2_excludes_copilot_session_workflow_runs() -> None:
     captured: dict[str, Any] = {}
 

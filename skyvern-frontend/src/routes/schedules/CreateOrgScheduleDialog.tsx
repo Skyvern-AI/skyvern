@@ -26,6 +26,7 @@ import {
   getNextRuns,
   getTimezones,
   isValidCron,
+  meetsMinCronInterval,
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import { cn } from "@/util/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
@@ -134,6 +135,8 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
   }, [timezoneFilter, allTimezones]);
 
   const valid = isValidCron(cronExpression);
+  const intervalTooShort = valid && !meetsMinCronInterval(cronExpression);
+  const cronAccepted = valid && !intervalTooShort;
   const humanReadable = valid ? cronToHumanReadable(cronExpression) : null;
   const nextRuns = valid ? getNextRuns(cronExpression, timezone, 5) : [];
 
@@ -152,7 +155,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
   function handleSubmit() {
     if (!selectedWorkflow || !workflowDetailLoaded) return;
     const parametersValid = validateParameters();
-    if (!valid || !parametersValid) return;
+    if (!cronAccepted || !parametersValid) return;
     const payload = buildScheduleParametersPayload(
       parameters,
       workflowParameters,
@@ -300,7 +303,9 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
               value={cronExpression}
               onChange={(e) => setCronExpression(e.target.value)}
               placeholder="* * * * *"
-              className={cn(!valid && cronExpression && "border-destructive")}
+              className={cn(
+                cronExpression && !cronAccepted && "border-destructive",
+              )}
             />
             {humanReadable && (
               <p className="text-sm text-slate-400">{humanReadable}</p>
@@ -308,6 +313,11 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
             {!valid && cronExpression && (
               <p className="text-sm text-destructive">
                 Invalid cron expression
+              </p>
+            )}
+            {intervalTooShort && (
+              <p className="text-sm text-destructive">
+                Schedule runs must be at least 5 minutes apart.
               </p>
             )}
           </div>
@@ -383,7 +393,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
           </Button>
           <Button
             disabled={
-              !valid || !workflowDetailLoaded || createMutation.isPending
+              !cronAccepted || !workflowDetailLoaded || createMutation.isPending
             }
             onClick={handleSubmit}
           >

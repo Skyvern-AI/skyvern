@@ -4,6 +4,17 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.fixture
+def small_prompt_ceiling(monkeypatch: pytest.MonkeyPatch) -> int:
+    from skyvern.utils import prompt_engine
+
+    ceiling = 500
+    monkeypatch.setattr(prompt_engine, "PROMPT_HARD_CEILING_TOKENS", ceiling)
+    return ceiling
+
 
 def test_prompt_hard_ceiling_is_below_gpt5_mini_cap() -> None:
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
@@ -41,8 +52,7 @@ def test_load_prompt_with_elements_drops_previous_info_when_over_ceiling() -> No
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements
     from skyvern.utils.token_counter import count_tokens
 
-    # List of distinct English-ish words well over the 180k token ceiling.
-    oversized_prev = [{"iter": i, "marker": f"UNIQUE_BLOCK_{i}_" + ("lorem ipsum " * 200)} for i in range(3000)]
+    oversized_prev = [{"iter": 0, "marker": "UNIQUE_BLOCK_0_" + ("lorem " * 185_000)}]
 
     rendered = load_prompt_with_elements(
         element_tree_builder=_make_element_tree_builder(),
@@ -62,12 +72,12 @@ def test_load_prompt_with_elements_drops_previous_info_when_over_ceiling() -> No
     assert "UNIQUE_BLOCK_0_" not in rendered
 
 
-def test_enforce_prompt_ceiling_drops_fallback_keys_without_elements() -> None:
+def test_enforce_prompt_ceiling_drops_fallback_keys_without_elements(small_prompt_ceiling: int) -> None:
     from skyvern.forge.prompts import prompt_engine as engine_module
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, enforce_prompt_ceiling
     from skyvern.utils.token_counter import count_tokens
 
-    giant_schema = {"type": "object", "_blob": "lorem " * 300_000}
+    giant_schema = {"type": "object", "_blob": "lorem " * (small_prompt_ceiling + 100)}
     kwargs = {
         "data_extraction_goal": "Extract",
         "data_extraction_schema": giant_schema,
@@ -109,12 +119,14 @@ def test_load_prompt_with_elements_respects_ceiling_for_small_prompts() -> None:
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
 
 
-def test_load_prompt_with_elements_tracked_drops_extracted_text_as_last_resort() -> None:
+def test_load_prompt_with_elements_tracked_drops_extracted_text_as_last_resort(
+    small_prompt_ceiling: int,
+) -> None:
     from skyvern.forge.prompts import prompt_engine as engine_module
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements_tracked
     from skyvern.utils.token_counter import count_tokens
 
-    oversized_extracted_text = "UNIQUE_EXTRACTED_TEXT " * 300_000
+    oversized_extracted_text = "UNIQUE_EXTRACTED_TEXT " + ("lorem " * (small_prompt_ceiling + 100))
 
     rendered, post_kwargs = load_prompt_with_elements_tracked(
         element_tree_builder=_make_element_tree_builder(),
@@ -135,12 +147,12 @@ def test_load_prompt_with_elements_tracked_drops_extracted_text_as_last_resort()
     assert post_kwargs["extracted_text"] is None
 
 
-def test_enforce_prompt_ceiling_tracked_reports_dropped_keys() -> None:
+def test_enforce_prompt_ceiling_tracked_reports_dropped_keys(small_prompt_ceiling: int) -> None:
     from skyvern.forge.prompts import prompt_engine as engine_module
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, enforce_prompt_ceiling_tracked
     from skyvern.utils.token_counter import count_tokens
 
-    giant_schema = {"type": "object", "_blob": "lorem " * 300_000}
+    giant_schema = {"type": "object", "_blob": "lorem " * (small_prompt_ceiling + 100)}
     kwargs = {
         "data_extraction_goal": "Extract",
         "data_extraction_schema": giant_schema,
@@ -184,12 +196,12 @@ def test_enforce_prompt_ceiling_tracked_noop_under_ceiling() -> None:
     assert post_kwargs["data_extraction_schema"] == {"type": "object"}
 
 
-def test_load_prompt_with_elements_tracked_reports_dropped_keys() -> None:
+def test_load_prompt_with_elements_tracked_reports_dropped_keys(small_prompt_ceiling: int) -> None:
     from skyvern.forge.prompts import prompt_engine as engine_module
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements_tracked
     from skyvern.utils.token_counter import count_tokens
 
-    oversized_prev = [{"iter": i, "marker": f"UNIQUE_BLOCK_{i}_" + ("lorem ipsum " * 200)} for i in range(3000)]
+    oversized_prev = [{"iter": 0, "marker": "UNIQUE_BLOCK_0_" + ("lorem " * (small_prompt_ceiling + 100))}]
 
     rendered, post_kwargs = load_prompt_with_elements_tracked(
         element_tree_builder=_make_element_tree_builder(),

@@ -134,6 +134,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         tagKeys={tagKeys}
         labelSuggestions={labelSuggestions}
         valueSuggestionsByKey={valueSuggestionsByKey}
+        currentTags={workflowTags ?? []}
         selectedCount={selectedCount}
         taggingEnabled={taggingEnabled}
         onNavigate={(path) => navigate(path)}

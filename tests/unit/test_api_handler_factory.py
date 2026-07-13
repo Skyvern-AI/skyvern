@@ -16,6 +16,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMAPIHandlerFactory,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import FakeLLMResponse
@@ -578,7 +579,9 @@ class TestGemini3ReasoningEffortExperiment:
 # values), and the fallbacks list expands into per-hop entries.
 
 
-def _make_three_tier_router_config(*, fallback_groups: list[str]) -> LLMRouterConfig:
+def _make_three_tier_router_config(
+    *, fallback_groups: list[str], redis_max_connections: int | None = None
+) -> LLMRouterConfig:
     """Synthetic 3+ tier router config that doesn't depend on the cloud
     `LLMConfigRegistry` registration that's conditional on prod env vars."""
     deployments = [
@@ -596,6 +599,7 @@ def _make_three_tier_router_config(*, fallback_groups: list[str]) -> LLMRouterCo
         redis_host="localhost",
         redis_port=6379,
         redis_password="",
+        redis_max_connections=redis_max_connections,
         main_model_group="primary-group",
         fallback_model_group=fallback_groups,
         routing_strategy="simple-shuffle",
@@ -646,6 +650,31 @@ def test_router_constructor_receives_default_timeout(monkeypatch: pytest.MonkeyP
     assert captured.get("timeout") == api_handler_factory.settings.LLM_CONFIG_TIMEOUT, (
         f"Router must be constructed with timeout=settings.LLM_CONFIG_TIMEOUT; got timeout={captured.get('timeout')!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("redis_max_connections", "expected_cache_kwargs"),
+    [(10, {"max_connections": 10}), (None, {})],
+)
+def test_router_constructor_receives_redis_connection_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_max_connections: int | None,
+    expected_cache_kwargs: dict[str, int],
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["fallback"], redis_max_connections=redis_max_connections)
+    _stub_for_router_test(monkeypatch, llm_key="TEST_REDIS_CONNECTION_POOL", config=config)
+
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_REDIS_CONNECTION_POOL")
+
+    assert captured["cache_kwargs"] == expected_cache_kwargs
 
 
 def test_router_fallbacks_payload_expands_per_hop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -868,6 +897,294 @@ async def test_router_does_not_retry_content_filter_for_non_gemini_model(monkeyp
         await handler(prompt='{"actions": []}', prompt_name="extract-actions")
 
     assert calls == ["primary-group"], f"non-Gemini content_filter must not trigger Gemini fallback; got calls={calls}"
+
+
+class _FakeExperimentationProvider:
+    def __init__(self, variant: Any = None, error: Exception | None = None) -> None:
+        self.variant = variant
+        self.error = error
+        self.calls: list[tuple[str, str, dict | None]] = []
+
+    async def get_value_cached(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> Any:
+        self.calls.append((feature_name, distinct_id, properties))
+        if self.error is not None:
+            raise self.error
+        return self.variant
+
+
+def _stub_content_filter_rescue(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    llm_key: str,
+    variant: Any,
+    provider_error: Exception | None = None,
+    rescue_handler: Any = None,
+    factory_error: Exception | None = None,
+    variant_registered: bool = True,
+) -> tuple[_FakeExperimentationProvider, list[str]]:
+    """Wire a Gemini router that always content-filters, plus the rescue flag plumbing."""
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    calls: list[str] = []
+
+    class _FilterThenSucceedRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            calls.append(model)
+            if model == "primary-group":
+                return FakeLLMResponse("gemini-3.1-flash-lite-preview", content=None, finish_reason="content_filter")
+            return FakeLLMResponse("gpt-5-fallback", content='{"actions": ["non-gemini-fallback"]}')
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _FilterThenSucceedRouter)
+    config = _make_three_tier_router_config(fallback_groups=["vertex-gemini-standard-fallback", "gpt-5-fallback"])
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
+
+    ctx = SkyvernContext(organization_id="o_test", workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: ctx)
+
+    provider = _FakeExperimentationProvider(variant=variant, error=provider_error)
+    monkeypatch.setattr(api_handler_factory.app, "EXPERIMENTATION_PROVIDER", provider)
+    monkeypatch.setattr(api_handler_factory, "_content_filter_rescue_handler_cache", {})
+    monkeypatch.setattr(api_handler_factory, "_content_filter_rescue_logged", set())
+    monkeypatch.setattr(
+        api_handler_factory.LLMConfigRegistry,
+        "is_registered",
+        classmethod(lambda cls, llm_key: variant_registered),
+    )
+
+    def fake_factory(variant_key: str) -> Any:
+        if factory_error is not None:
+            raise factory_error
+        assert rescue_handler is not None, f"unexpected handler init for variant {variant_key}"
+        return rescue_handler
+
+    monkeypatch.setattr(LLMAPIHandlerFactory, "get_llm_api_handler", staticmethod(fake_factory))
+    return provider, calls
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_flag_routes_to_configured_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With CONTENT_FILTER_RESCUE_LLM_NAME set, a Gemini content_filter block must be retried on
+    the configured llm_key's handler instead of the hardcoded first non-Gemini fallback group,
+    and the flag must be evaluated with run-level distinct_id + org/wpid properties (SKY-11766)."""
+    captured: dict[str, Any] = {}
+
+    async def fake_rescue_handler(*, prompt: str, prompt_name: str, **kwargs: Any) -> dict[str, Any]:
+        captured["prompt"] = prompt
+        captured["prompt_name"] = prompt_name
+        captured.update(kwargs)
+        return {"actions": ["rescued"]}
+
+    provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch, llm_key="TEST_RESCUE_FLAG_SET", variant="RESCUE_KEY", rescue_handler=fake_rescue_handler
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_FLAG_SET")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["rescued"]}
+    assert captured["prompt"] == '{"actions": []}'
+    assert captured["prompt_name"] == "check-user-goal"
+    assert "parameters" not in captured or captured["parameters"] is None, (
+        "rescue handler must derive parameters from its own llm_config, not inherit Gemini's"
+    )
+    assert router_calls == ["primary-group"], (
+        f"rescue must replace the in-router non-Gemini retry; got router calls={router_calls}"
+    )
+    assert provider.calls, "rescue flag was never evaluated"
+    feature_name, distinct_id, properties = provider.calls[0]
+    assert feature_name == "CONTENT_FILTER_RESCUE_LLM_NAME"
+    assert distinct_id == "wr_test"
+    assert properties == {"organization_id": "o_test", "workflow_permanent_id": "wpid_test"}
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_flag_unset_keeps_non_gemini_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flag disabled (provider returns None) → exact pre-flag behavior: retry on the first
+    non-Gemini fallback group in the same router."""
+    _provider, router_calls = _stub_content_filter_rescue(monkeypatch, llm_key="TEST_RESCUE_FLAG_UNSET", variant=None)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_FLAG_UNSET")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_variant_matching_blocked_key_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Variant pointing at the llm_key that just got blocked would recurse forever — it must be
+    ignored in favor of the default non-Gemini retry."""
+    _provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch, llm_key="TEST_RESCUE_SELF_KEY", variant="TEST_RESCUE_SELF_KEY"
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_SELF_KEY")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_provider_failure_keeps_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flag resolution failing (PostHog down) must not change behavior."""
+    _provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch,
+        llm_key="TEST_RESCUE_PROVIDER_DOWN",
+        variant="RESCUE_KEY",
+        provider_error=RuntimeError("posthog down"),
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_PROVIDER_DOWN")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_unregistered_variant_never_builds_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_config synthesizes a config for unknown keys (the typo'd variant would reach litellm
+    as a model name), so an unregistered variant must be rejected before any handler is built."""
+    _provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch,
+        llm_key="TEST_RESCUE_TYPO_VARIANT",
+        variant="GEMINI_2_5_FLASH_LITE_WITH_FALBACK",
+        variant_registered=False,
+    )
+    factory_calls: list[str] = []
+
+    def recording_factory(variant_key: str) -> Any:
+        factory_calls.append(variant_key)
+        raise AssertionError("handler must not be constructed for an unregistered variant")
+
+    monkeypatch.setattr(LLMAPIHandlerFactory, "get_llm_api_handler", staticmethod(recording_factory))
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_TYPO_VARIANT")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
+    assert factory_calls == [], "unregistered variant must fail closed at resolve time, not call time"
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_custom_llm_variant_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Custom LLMs are org-owned BYO endpoints registered under global CUSTOM_LLM_* keys with no
+    ownership check on this path — a variant naming one must be rejected even though it IS a
+    registered llm_key, before any handler is constructed or cached."""
+    _provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch,
+        llm_key="TEST_RESCUE_CUSTOM_VARIANT",
+        variant="CUSTOM_LLM_cllm_123",
+        variant_registered=True,
+    )
+    factory_calls: list[str] = []
+
+    def recording_factory(variant_key: str) -> Any:
+        factory_calls.append(variant_key)
+        raise AssertionError("handler must not be constructed for a custom-LLM variant")
+
+    monkeypatch.setattr(LLMAPIHandlerFactory, "get_llm_api_handler", staticmethod(recording_factory))
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_CUSTOM_VARIANT")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
+    assert factory_calls == [], "custom-LLM variant must never reach handler construction"
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_persists_blocked_response_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rescued early return must pair the blocked content_filter response with the
+    already-recorded request instead of orphaning it — the blocked response is the debugging
+    evidence for why the rescue fired."""
+
+    async def fake_rescue_handler(*, prompt: str, prompt_name: str, **kwargs: Any) -> dict[str, Any]:
+        return {"actions": ["rescued"]}
+
+    _provider, _router_calls = _stub_content_filter_rescue(
+        monkeypatch, llm_key="TEST_RESCUE_ARTIFACTS", variant="RESCUE_KEY", rescue_handler=fake_rescue_handler
+    )
+    artifact_manager = MagicMock()
+    artifact_manager.prepare_llm_artifact = AsyncMock(return_value=None)
+    artifact_manager.bulk_create_artifacts = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.app.ARTIFACT_MANAGER", artifact_manager)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.app.DATABASE.tasks.update_step",
+        AsyncMock(return_value=MagicMock()),
+    )
+
+    now = datetime.now()
+    step = Step(
+        created_at=now,
+        modified_at=now,
+        task_id="tsk_test",
+        step_id="stp_test",
+        status=StepStatus.running,
+        order=0,
+        is_last=False,
+        retry_index=0,
+        organization_id="o_test",
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_ARTIFACTS")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal", step=step)
+
+    assert result == {"actions": ["rescued"]}
+    persisted_types = [
+        call.kwargs.get("artifact_type") for call in artifact_manager.prepare_llm_artifact.await_args_list
+    ]
+    assert ArtifactType.LLM_RESPONSE in persisted_types, (
+        "blocked content_filter response must be persisted on the rescued path"
+    )
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_handler_init_failure_keeps_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A registered variant whose handler construction fails (e.g. missing provider env vars)
+    must fall back to default behavior, not crash."""
+    _provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch,
+        llm_key="TEST_RESCUE_BAD_VARIANT",
+        variant="RESCUE_KEY_BAD_CONFIG",
+        factory_error=KeyError("RESCUE_KEY_BAD_CONFIG"),
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_BAD_VARIANT")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
+
+
+@pytest.mark.asyncio
+async def test_content_filter_rescue_handler_failure_falls_back_to_non_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the rescue call itself fails, degrade to the default non-Gemini retry instead of
+    failing the whole LLM call."""
+
+    async def broken_rescue_handler(*, prompt: str, prompt_name: str, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("rescue provider outage")
+
+    _provider, router_calls = _stub_content_filter_rescue(
+        monkeypatch, llm_key="TEST_RESCUE_HANDLER_DOWN", variant="RESCUE_KEY", rescue_handler=broken_rescue_handler
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_HANDLER_DOWN")
+    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert result == {"actions": ["non-gemini-fallback"]}
+    assert router_calls == ["primary-group", "gpt-5-fallback"]
 
 
 def test_router_fallback_chain_no_duplicate_keys_or_overlapping_chains(monkeypatch: pytest.MonkeyPatch) -> None:

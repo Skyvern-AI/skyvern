@@ -39,6 +39,7 @@ class PendingConsentContext:
     consent_redirect_uri: str | None
     consent_code_verifier: str | None
     consent_app_origin: str | None = None
+    client_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class ActiveCredentialCiphertext:
     encrypted_refresh_token: str
     encrypted_method: EncryptMethod
     scopes_granted: list[str]
+    client_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class GoogleOAuthRepository(BaseRepository):
         consent_expires_at: datetime.datetime,
         consent_code_verifier: str,
         consent_app_origin: str | None = None,
+        client_id: str | None = None,
     ) -> GoogleOAuthCredentialBase:
         async with self.Session() as session:
             model = GoogleOAuthCredentialModel(
@@ -85,6 +88,7 @@ class GoogleOAuthRepository(BaseRepository):
                 consent_expires_at=consent_expires_at,
                 consent_app_origin=consent_app_origin,
                 consent_code_verifier=consent_code_verifier,
+                client_id=client_id,
             )
             session.add(model)
             await session.flush()
@@ -109,6 +113,7 @@ class GoogleOAuthRepository(BaseRepository):
                 GoogleOAuthCredentialModel.consent_redirect_uri,
                 GoogleOAuthCredentialModel.consent_code_verifier,
                 GoogleOAuthCredentialModel.consent_app_origin,
+                GoogleOAuthCredentialModel.client_id,
             ).where(
                 GoogleOAuthCredentialModel.consent_nonce == nonce,
                 GoogleOAuthCredentialModel.organization_id == organization_id,
@@ -123,7 +128,35 @@ class GoogleOAuthRepository(BaseRepository):
                 consent_redirect_uri=row[1],
                 consent_code_verifier=row[2],
                 consent_app_origin=row[3],
+                client_id=row[4],
             )
+
+    @db_operation("mark_active_mismatched_client_as_error")
+    async def mark_active_mismatched_client_as_error(
+        self,
+        organization_id: str,
+        new_client_id: str | None,
+        now: datetime.datetime,
+    ) -> int:
+        async with self.Session() as session:
+            filters = [
+                GoogleOAuthCredentialModel.organization_id == organization_id,
+                GoogleOAuthCredentialModel.state == STATE_ACTIVE,
+                GoogleOAuthCredentialModel.client_id.is_not(None),
+            ]
+            if new_client_id is not None:
+                filters.append(GoogleOAuthCredentialModel.client_id != new_client_id)
+            stmt = (
+                update(GoogleOAuthCredentialModel)
+                .where(*filters)
+                .values(
+                    state=STATE_ERROR,
+                    modified_at=now,
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
 
     @db_operation("promote_pending_to_active")
     async def promote_pending_to_active(
@@ -198,6 +231,20 @@ class GoogleOAuthRepository(BaseRepository):
             rows = (await session.execute(stmt)).scalars().all()
             return [GoogleOAuthCredentialBase.model_validate(r, from_attributes=True) for r in rows]
 
+    @db_operation("list_visible_for_org")
+    async def list_visible_for_org(self, organization_id: str) -> list[GoogleOAuthCredentialBase]:
+        async with self.Session() as session:
+            stmt = (
+                select(GoogleOAuthCredentialModel)
+                .where(
+                    GoogleOAuthCredentialModel.organization_id == organization_id,
+                    GoogleOAuthCredentialModel.state.in_([STATE_ACTIVE, STATE_ERROR]),
+                )
+                .order_by(GoogleOAuthCredentialModel.created_at.desc())
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [GoogleOAuthCredentialBase.model_validate(r, from_attributes=True) for r in rows]
+
     @db_operation("load_active_ciphertext")
     async def load_active_ciphertext(
         self,
@@ -209,6 +256,7 @@ class GoogleOAuthRepository(BaseRepository):
                 GoogleOAuthCredentialModel.encrypted_refresh_token,
                 GoogleOAuthCredentialModel.encrypted_method,
                 GoogleOAuthCredentialModel.scopes_granted,
+                GoogleOAuthCredentialModel.client_id,
             ).where(
                 GoogleOAuthCredentialModel.id == credential_id,
                 GoogleOAuthCredentialModel.organization_id == organization_id,
@@ -217,13 +265,14 @@ class GoogleOAuthRepository(BaseRepository):
             row = (await session.execute(stmt)).one_or_none()
             if row is None:
                 return None
-            ciphertext, method, scopes = row
+            ciphertext, method, scopes, client_id = row
             if not ciphertext or not method:
                 return None
             return ActiveCredentialCiphertext(
                 encrypted_refresh_token=ciphertext,
                 encrypted_method=EncryptMethod(method),
                 scopes_granted=list(scopes or []),
+                client_id=client_id,
             )
 
     @db_operation("load_ciphertext_for_revoke")

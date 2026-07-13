@@ -13,6 +13,7 @@ from skyvern.forge.sdk.copilot.loop_detection import (
     record_consecutive_tool_result_boundary_for_ctx,
     record_tool_step_result,
     record_tool_step_result_for_ctx,
+    tool_step_identity,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import _diagnosis_repair_tool_error
 
@@ -21,7 +22,7 @@ def test_returns_none_below_threshold() -> None:
     tracker: list[str] = []
     assert detect_tool_loop(tracker, "click") is None
     assert detect_tool_loop(tracker, "click") is None
-    assert tracker == ["click", "click"]
+    assert tracker == [tool_step_identity("click"), tool_step_identity("click")]
 
 
 def test_fires_at_threshold_and_clears_tracker() -> None:
@@ -41,7 +42,7 @@ def test_tool_switch_resets_tracker() -> None:
     detect_tool_loop(tracker, "click")
     detect_tool_loop(tracker, "click")
     assert detect_tool_loop(tracker, "type_text") is None
-    assert tracker == ["type_text"]
+    assert tracker == [tool_step_identity("type_text")]
 
 
 def test_requires_full_fresh_threshold_after_warning() -> None:
@@ -55,24 +56,61 @@ def test_requires_full_fresh_threshold_after_warning() -> None:
     assert detect_tool_loop(tracker, "click") is not None
 
 
+def test_distinct_argument_identities_never_fire_over_repeated_same_tool() -> None:
+    tracker: list[str] = []
+    for index in range(5):
+        assert detect_tool_loop(tracker, "type_text", {"selector": f"#field-{index}", "text": f"v{index}"}) is None
+    assert tracker == [tool_step_identity("type_text", {"selector": "#field-4", "text": "v4"})]
+
+
+def test_third_identical_identity_fires_and_clears() -> None:
+    tracker: list[str] = []
+    args = {"selector": "#name", "text": "Ada"}
+    assert detect_tool_loop(tracker, "type_text", args) is None
+    assert detect_tool_loop(tracker, "type_text", args) is None
+    msg = detect_tool_loop(tracker, "type_text", args)
+    assert msg is not None
+    assert "LOOP DETECTED" in msg
+    assert "type_text" in msg
+    assert tracker == []
+
+
 def test_same_tool_result_boundary_does_not_double_count_dispatch() -> None:
-    tracker = ["update_workflow"]
+    tracker = [tool_step_identity("update_workflow")]
 
     record_consecutive_tool_result_boundary(tracker, "update_workflow")
 
-    assert tracker == ["update_workflow"]
+    assert tracker == [tool_step_identity("update_workflow")]
+
+
+def test_same_tool_result_boundary_no_op_even_when_identity_differs() -> None:
+    tracker = [tool_step_identity("type_text", {"selector": "#a"})]
+
+    record_consecutive_tool_result_boundary(tracker, "type_text", {"selector": "#b"})
+
+    assert tracker == [tool_step_identity("type_text", {"selector": "#a"})]
 
 
 def test_different_tool_result_boundary_resets_to_new_tool() -> None:
-    tracker = ["update_workflow", "update_workflow"]
+    tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
 
     record_consecutive_tool_result_boundary(tracker, "inspect_page_for_composition")
 
-    assert tracker == ["inspect_page_for_composition"]
+    assert tracker == [tool_step_identity("inspect_page_for_composition")]
+
+
+def test_cross_name_result_boundary_seeds_full_argument_identity() -> None:
+    tracker = [tool_step_identity("update_workflow")]
+
+    record_consecutive_tool_result_boundary(tracker, "type_text", {"selector": "#c"})
+
+    assert tracker == [tool_step_identity("type_text", {"selector": "#c"})]
 
 
 def test_result_recording_makes_normal_tool_body_boundaries_visible() -> None:
-    ctx = SimpleNamespace(consecutive_tool_tracker=["update_workflow", "update_workflow"])
+    ctx = SimpleNamespace(
+        consecutive_tool_tracker=[tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
+    )
 
     record_tool_step_result_for_ctx(
         ctx,
@@ -81,7 +119,37 @@ def test_result_recording_makes_normal_tool_body_boundaries_visible() -> None:
         {"ok": True, "data": {"summary": "observed"}},
     )
 
-    assert ctx.consecutive_tool_tracker == ["inspect_page_for_composition"]
+    assert ctx.consecutive_tool_tracker == [
+        tool_step_identity("inspect_page_for_composition", {"target_url": "current_page"})
+    ]
+
+
+def test_adversarial_same_name_interleave_is_completion_order_insensitive() -> None:
+    tracker: list[str] = []
+    args_x = {"selector": "#x"}
+    args_y = {"selector": "#y"}
+
+    assert detect_tool_loop(tracker, "type_text", args_x) is None
+    assert detect_tool_loop(tracker, "type_text", args_y) is None
+    record_consecutive_tool_result_boundary(tracker, "type_text", args_x)
+    assert detect_tool_loop(tracker, "type_text", args_x) is None
+    assert detect_tool_loop(tracker, "type_text", args_x) is None
+
+    assert tracker == [tool_step_identity("type_text", args_x), tool_step_identity("type_text", args_x)]
+
+
+def test_interleaved_same_name_completions_still_fire_at_third_admission() -> None:
+    tracker: list[str] = []
+    args = {"selector": "#stuck"}
+
+    assert detect_tool_loop(tracker, "type_text", args) is None
+    record_consecutive_tool_result_boundary(tracker, "type_text", args)
+    assert detect_tool_loop(tracker, "type_text", args) is None
+    record_consecutive_tool_result_boundary(tracker, "type_text", args)
+    msg = detect_tool_loop(tracker, "type_text", args)
+
+    assert msg is not None
+    assert "LOOP DETECTED" in msg
 
 
 def test_workflow_progress_result_boundary_clears_tracker() -> None:
@@ -100,7 +168,9 @@ def test_workflow_progress_result_boundary_clears_tracker() -> None:
 
 
 def test_get_run_results_workflow_run_id_is_not_run_creation_progress() -> None:
-    ctx = SimpleNamespace(consecutive_tool_tracker=["update_workflow", "update_workflow"])
+    ctx = SimpleNamespace(
+        consecutive_tool_tracker=[tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
+    )
 
     record_consecutive_tool_result_boundary_for_ctx(
         ctx,
@@ -108,7 +178,7 @@ def test_get_run_results_workflow_run_id_is_not_run_creation_progress() -> None:
         {"ok": True, "data": {"workflow_run_id": "wr_123"}},
     )
 
-    assert ctx.consecutive_tool_tracker == ["get_run_results"]
+    assert ctx.consecutive_tool_tracker == [tool_step_identity("get_run_results")]
 
 
 def test_telco_mixed_dispatch_stream_does_not_trigger_consecutive_update_halt() -> None:
@@ -141,14 +211,14 @@ def test_telco_mixed_dispatch_stream_does_not_trigger_consecutive_update_halt() 
         "update_and_run_blocks",
         {"ok": False, "error": "guardrail blocked the run"},
     )
-    assert ctx.consecutive_tool_tracker == ["update_and_run_blocks"]
+    assert ctx.consecutive_tool_tracker == [tool_step_identity("update_and_run_blocks")]
 
     record_consecutive_tool_result_boundary_for_ctx(
         ctx,
         "inspect_page_for_composition",
         {"ok": True, "data": {"observation_step": 4}},
     )
-    assert ctx.consecutive_tool_tracker == ["inspect_page_for_composition"]
+    assert ctx.consecutive_tool_tracker == [tool_step_identity("inspect_page_for_composition")]
 
     assert detect_tool_loop(ctx.consecutive_tool_tracker, "update_workflow") is None
 
@@ -177,13 +247,13 @@ def test_diagnosis_repair_tool_error_records_consecutive_boundary_only() -> None
         browser_session_id=None,
         stream=MagicMock(),
     )
-    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
+    ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
     ctx.failed_tool_step_tracker = {"sentinel": 2}
 
     payload = json.loads(_diagnosis_repair_tool_error(ctx, "run_blocks_and_collect_debug", "blocked"))
 
     assert payload == {"ok": False, "error": "blocked"}
-    assert ctx.consecutive_tool_tracker == ["run_blocks_and_collect_debug"]
+    assert ctx.consecutive_tool_tracker == [tool_step_identity("run_blocks_and_collect_debug")]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
 

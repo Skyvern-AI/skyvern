@@ -5,12 +5,22 @@ served in a real scout because the agent acts between inspects.)
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
+
+
+class _AsyncioSleepProxy:
+    def __init__(self, sleep: AsyncMock) -> None:
+        self.sleep = sleep
+
+    def __getattr__(self, name: str):
+        return getattr(asyncio, name)
 
 
 def test_normalized_inspect_url_preserves_distinguishing_parts() -> None:
@@ -61,6 +71,8 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
     )
+    settle_sleep = AsyncMock()
+    monkeypatch.setattr(tools.composition_capture, "asyncio", _AsyncioSleepProxy(settle_sleep))
 
     evidence, html_error = await tools._capture_composition_evidence(
         SimpleNamespace(), inspected_url="https://example.com/s", current_url="https://example.com/s"
@@ -71,3 +83,4 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
     assert tools.has_bounded_page_schema(evidence)
     # First iteration's raw read is cap-dropped; the settle retry skips it entirely.
     assert raw_calls["n"] == 1
+    settle_sleep.assert_awaited_once_with(tools.composition_capture._COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)

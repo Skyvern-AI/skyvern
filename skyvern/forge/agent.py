@@ -108,6 +108,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
@@ -764,6 +765,7 @@ class ForgeAgent:
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
         download_baseline_files: list[str] | None = None,
+        pre_resolved_browser_state: BrowserState | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
@@ -887,7 +889,13 @@ class ForgeAgent:
                 step,
                 browser_state,
                 detailed_output,
-            ) = await self.initialize_execution_state(task, step, workflow_run, browser_session_id)
+            ) = await self.initialize_execution_state(
+                task,
+                step,
+                workflow_run,
+                browser_session_id,
+                pre_resolved_browser_state=pre_resolved_browser_state,
+            )
 
             # mark step as completed and mark task as completed
             if (
@@ -1473,8 +1481,6 @@ class ForgeAgent:
         )
         prefetched_summary_task: asyncio.Task[dict[str, Any]] | None = None
         current_artifact_task: asyncio.Task | None = None
-        pdf_auto_download_src: str | None = None
-        pdf_auto_download_used_bytes: bool = False
 
         async def await_background_artifact_task() -> None:
             nonlocal current_artifact_task
@@ -1559,231 +1565,27 @@ class ForgeAgent:
 
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
-            actions: list[Action]
-
-            # If prepare_step_execution injected actions (e.g. proactive captcha solving),
-            # skip LLM entirely and use the injected actions directly.
-            if injected_actions is not None:
-                LOG.info(
-                    "Using injected actions from prepare_step_execution, skipping LLM",
-                    step_id=step.step_id,
-                    num_actions=len(injected_actions),
-                    action_types=[a.action_type for a in injected_actions],
-                )
-                actions = injected_actions
-            elif engine == RunEngine.openai_cua:
-                actions, new_cua_response = await self._generate_cua_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    previous_response=cua_response,
-                    engine=engine,
-                )
-                detailed_agent_step_output.cua_response = new_cua_response
-            elif engine == RunEngine.anthropic_cua:
-                assert llm_caller is not None
-                actions = await self._generate_anthropic_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    llm_caller=llm_caller,
-                )
-            elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "DISABLE_UI_TARS_CUA",
-                task.workflow_run_id or task.task_id,
-                properties={"organization_id": task.organization_id},
-            ):
-                assert llm_caller is not None
-                actions = await self._generate_ui_tars_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    llm_caller=llm_caller,
-                )
-            elif engine == RunEngine.yutori_navigator:
-                assert llm_caller is not None
-                actions = await self._generate_yutori_navigator_actions(
-                    task=task,
-                    step=step,
-                    scraped_page=scraped_page,
-                    llm_caller=llm_caller,
-                )
-
-            else:
-                if is_extraction_task:
-                    actions = [
-                        await self.create_extract_action(
-                            task,
-                            step,
-                            scraped_page,
-                            prefetched_summary_task=prefetched_summary_task,
-                        )
-                    ]
-                else:
-                    llm_key_override = task.llm_key
-                    # FIXME: Redundant engine check?
-                    if engine in CUA_ENGINES:
-                        self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
-                        llm_key_override = None
-
-                    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                        llm_key_override, default=app.LLM_API_HANDLER
-                    )
-                    # Add caching flag to context for monitoring
-                    if use_caching:
-                        context = skyvern_context.current()
-                        if context:
-                            context.use_prompt_caching = True
-
-                    if not reuse_speculative_llm_response:
-                        json_response = await llm_api_handler(
-                            prompt=extract_action_prompt,
-                            prompt_name=prompt_name,
-                            step=step,
-                            screenshots=[] if without_page_information else scraped_page.screenshots,
-                            system_prompt=task.workflow_system_prompt,
-                        )
-                    else:
-                        LOG.debug(
-                            "Using speculative extract-actions response",
-                            step_id=step.step_id,
-                        )
-                    if json_response is None:
-                        raise MissingExtractActionsResponse()
-                    try:
-                        # Check for PDF viewer: either <embed type="application/pdf"> or
-                        # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
-                        pdf_src = scraped_page.check_pdf_viewer_embed()
-                        if not pdf_src:
-                            pdf_src = await scraped_page.check_pdf_iframe()
-                        if pdf_src and not should_auto_download_pdf(pdf_src):
-                            LOG.info(
-                                "PDF source already downloaded, skipping auto-download",
-                                step_id=step.step_id,
-                            )
-                            pdf_src = None
-                        if pdf_src:
-                            LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
-                            pdf_bytes: bytes | None = None
-                            download_url: str | None = None
-
-                            # Check if the src is a data URI with base64 encoded PDF
-                            # Format: data:application/pdf[;charset=...];base64,<base64_data>
-                            if pdf_src.startswith("data:application/pdf"):
-                                # Use more precise regex to extract base64 data after the base64, prefix
-                                # This pattern matches: data:application/pdf[;optional_params];base64,<data>
-                                m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
-                                if not m:
-                                    raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_src,
-                                        reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
-                                    )
-
-                                base64_data = m.group(1)
-                                LOG.info(
-                                    "Found base64 data in PDF src",
-                                    step_id=step.step_id,
-                                    base64_data_length=len(base64_data),
-                                )
-
-                                # Decode base64 data with error handling
-                                try:
-                                    pdf_bytes = base64.b64decode(base64_data, validate=True)
-                                except Exception as e:
-                                    raise PDFEmbedBase64DecodeError(
-                                        pdf_embed_src=pdf_src,
-                                        reason=f"Failed to decode base64 data: {str(e)}",
-                                    ) from e
-                            else:
-                                # If not a data URI, treat it as a URL
-                                LOG.info(
-                                    "Found PDF src as URL (not base64 data)",
-                                    step_id=step.step_id,
-                                    download_url=pdf_src,
-                                )
-                                download_url = pdf_src
-
-                            actions = [
-                                DownloadFileAction(
-                                    reasoning="Downloading the file from the PDF viewer.",
-                                    organization_id=task.organization_id,
-                                    workflow_run_id=task.workflow_run_id,
-                                    task_id=task.task_id,
-                                    step_id=step.step_id,
-                                    step_order=step.order,
-                                    action_order=0,
-                                    file_name=f"{uuid.uuid4()}.pdf",
-                                    byte=pdf_bytes,
-                                    download_url=download_url,
-                                    download=True,
-                                )
-                            ]
-                            pdf_auto_download_src = pdf_src
-                            pdf_auto_download_used_bytes = pdf_bytes is not None
-                        else:
-                            otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
-                                task, step, scraped_page, browser_state, json_response
-                            )
-                            if otp_actions:
-                                detailed_agent_step_output.llm_response = otp_json_response
-                                actions = otp_actions
-                            else:
-                                actions = parse_actions(
-                                    task, step.step_id, step.order, scraped_page, json_response["actions"]
-                                )
-
-                        if context:
-                            context.pop_totp_code(task.task_id)
-                    except NoTOTPVerificationCodeFound:
-                        # Surface only the source poll_otp_value actually queried so
-                        # the failure_reason tells the customer which delivery endpoint
-                        # went silent.
-                        timeout_reasoning = _build_totp_timeout_reasoning(task)
-                        LOG.warning(
-                            "TOTP polling timed out — terminating task",
-                            task_id=task.task_id,
-                            workflow_run_id=task.workflow_run_id,
-                            totp_verification_url=strip_query_params(task.totp_verification_url)
-                            if task.totp_verification_url
-                            else None,
-                            totp_identifier=task.totp_identifier,
-                            organization_id=task.organization_id,
-                        )
-                        actions = [
-                            TerminateAction(
-                                organization_id=task.organization_id,
-                                workflow_run_id=task.workflow_run_id,
-                                task_id=task.task_id,
-                                step_id=step.step_id,
-                                step_order=step.order,
-                                action_order=0,
-                                reasoning=timeout_reasoning,
-                                intention=timeout_reasoning,
-                                errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
-                            )
-                        ]
-                    except FailedToGetTOTPVerificationCode as e:
-                        actions = [
-                            TerminateAction(
-                                reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
-                                intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
-                                organization_id=task.organization_id,
-                                workflow_run_id=task.workflow_run_id,
-                                task_id=task.task_id,
-                                step_id=step.step_id,
-                                step_order=step.order,
-                                action_order=0,
-                                errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
-                            )
-                        ]
-
-                    if reuse_speculative_llm_response and speculative_llm_metadata:
-                        await self._persist_speculative_llm_metadata(
-                            step,
-                            speculative_llm_metadata,
-                            screenshots=scraped_page.screenshots,
-                        )
-                        speculative_llm_metadata = None
+            actions, pdf_auto_download_src, pdf_auto_download_used_bytes = await self._generate_step_actions(
+                task=task,
+                step=step,
+                browser_state=browser_state,
+                engine=engine,
+                scraped_page=scraped_page,
+                detailed_agent_step_output=detailed_agent_step_output,
+                injected_actions=injected_actions,
+                is_extraction_task=is_extraction_task,
+                prefetched_summary_task=prefetched_summary_task,
+                cua_response=cua_response,
+                llm_caller=llm_caller,
+                extract_action_prompt=extract_action_prompt,
+                prompt_name=prompt_name,
+                use_caching=use_caching,
+                without_page_information=without_page_information,
+                json_response=json_response,
+                reuse_speculative_llm_response=reuse_speculative_llm_response,
+                speculative_llm_metadata=speculative_llm_metadata,
+                context=context,
+            )
 
             detailed_agent_step_output.actions = actions
             record_validation_span_attrs(_step_span, task, actions)
@@ -2251,6 +2053,257 @@ class ForgeAgent:
         finally:
             await _cancel_pending_prefetch_task(prefetched_summary_task)
             await await_background_artifact_task()
+
+    async def _generate_step_actions(
+        self,
+        *,
+        task: Task,
+        step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+        scraped_page: ScrapedPage,
+        detailed_agent_step_output: DetailedAgentStepOutput,
+        injected_actions: list[Action] | None,
+        is_extraction_task: bool,
+        prefetched_summary_task: asyncio.Task[dict[str, Any]] | None,
+        cua_response: OpenAIResponse | None,
+        llm_caller: LLMCaller | None,
+        extract_action_prompt: str,
+        prompt_name: str,
+        use_caching: bool,
+        without_page_information: bool,
+        json_response: dict[str, Any] | None,
+        reuse_speculative_llm_response: bool,
+        speculative_llm_metadata: SpeculativeLLMMetadata | None,
+        context: SkyvernContext | None,
+    ) -> tuple[list[Action], str | None, bool]:
+        pdf_auto_download_src: str | None = None
+        pdf_auto_download_used_bytes = False
+        actions: list[Action]
+        # If prepare_step_execution injected actions (e.g. proactive captcha solving),
+        # skip LLM entirely and use the injected actions directly.
+        if injected_actions is not None:
+            LOG.info(
+                "Using injected actions from prepare_step_execution, skipping LLM",
+                step_id=step.step_id,
+                num_actions=len(injected_actions),
+                action_types=[a.action_type for a in injected_actions],
+            )
+            actions = injected_actions
+        elif engine == RunEngine.openai_cua:
+            actions, new_cua_response = await self._generate_cua_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                previous_response=cua_response,
+                engine=engine,
+            )
+            detailed_agent_step_output.cua_response = new_cua_response
+        elif engine == RunEngine.anthropic_cua:
+            assert llm_caller is not None
+            actions = await self._generate_anthropic_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                llm_caller=llm_caller,
+            )
+        elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "DISABLE_UI_TARS_CUA",
+            task.workflow_run_id or task.task_id,
+            properties={"organization_id": task.organization_id},
+        ):
+            assert llm_caller is not None
+            actions = await self._generate_ui_tars_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                llm_caller=llm_caller,
+            )
+        elif engine == RunEngine.yutori_navigator:
+            assert llm_caller is not None
+            actions = await self._generate_yutori_navigator_actions(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                llm_caller=llm_caller,
+            )
+
+        else:
+            if is_extraction_task:
+                actions = [
+                    await self.create_extract_action(
+                        task,
+                        step,
+                        scraped_page,
+                        prefetched_summary_task=prefetched_summary_task,
+                    )
+                ]
+            else:
+                llm_key_override = task.llm_key
+                # FIXME: Redundant engine check?
+                if engine in CUA_ENGINES:
+                    self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
+                    llm_key_override = None
+
+                llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                    llm_key_override, default=app.LLM_API_HANDLER
+                )
+                # Add caching flag to context for monitoring
+                if use_caching:
+                    context = skyvern_context.current()
+                    if context:
+                        context.use_prompt_caching = True
+
+                if not reuse_speculative_llm_response:
+                    json_response = await llm_api_handler(
+                        prompt=extract_action_prompt,
+                        prompt_name=prompt_name,
+                        step=step,
+                        screenshots=[] if without_page_information else scraped_page.screenshots,
+                        system_prompt=task.workflow_system_prompt,
+                    )
+                else:
+                    LOG.debug(
+                        "Using speculative extract-actions response",
+                        step_id=step.step_id,
+                    )
+                if json_response is None:
+                    raise MissingExtractActionsResponse()
+                try:
+                    # Check for PDF viewer: either <embed type="application/pdf"> or
+                    # Edge's PDF interstitial <iframe src="data:application/pdf;base64,...">
+                    pdf_src = scraped_page.check_pdf_viewer_embed()
+                    if not pdf_src:
+                        pdf_src = await scraped_page.check_pdf_iframe()
+                    if pdf_src and not should_auto_download_pdf(pdf_src):
+                        LOG.info(
+                            "PDF source already downloaded, skipping auto-download",
+                            step_id=step.step_id,
+                        )
+                        pdf_src = None
+                    if pdf_src:
+                        LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
+                        pdf_bytes: bytes | None = None
+                        download_url: str | None = None
+
+                        # Check if the src is a data URI with base64 encoded PDF
+                        # Format: data:application/pdf[;charset=...];base64,<base64_data>
+                        if pdf_src.startswith("data:application/pdf"):
+                            # Use more precise regex to extract base64 data after the base64, prefix
+                            # This pattern matches: data:application/pdf[;optional_params];base64,<data>
+                            m = re.search(r"data:application/pdf[^;]*;base64,(.+)", pdf_src, re.S)
+                            if not m:
+                                raise PDFEmbedBase64DecodeError(
+                                    pdf_embed_src=pdf_src,
+                                    reason="Failed to extract base64 data from PDF embed src. Expected format: data:application/pdf[;charset=...];base64,<data>",
+                                )
+
+                            base64_data = m.group(1)
+                            LOG.info(
+                                "Found base64 data in PDF src",
+                                step_id=step.step_id,
+                                base64_data_length=len(base64_data),
+                            )
+
+                            # Decode base64 data with error handling
+                            try:
+                                pdf_bytes = base64.b64decode(base64_data, validate=True)
+                            except Exception as e:
+                                raise PDFEmbedBase64DecodeError(
+                                    pdf_embed_src=pdf_src,
+                                    reason=f"Failed to decode base64 data: {str(e)}",
+                                ) from e
+                        else:
+                            # If not a data URI, treat it as a URL
+                            LOG.info(
+                                "Found PDF src as URL (not base64 data)",
+                                step_id=step.step_id,
+                                download_url=pdf_src,
+                            )
+                            download_url = pdf_src
+
+                        actions = [
+                            DownloadFileAction(
+                                reasoning="Downloading the file from the PDF viewer.",
+                                organization_id=task.organization_id,
+                                workflow_run_id=task.workflow_run_id,
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                action_order=0,
+                                file_name=f"{uuid.uuid4()}.pdf",
+                                byte=pdf_bytes,
+                                download_url=download_url,
+                                download=True,
+                            )
+                        ]
+                        pdf_auto_download_src = pdf_src
+                        pdf_auto_download_used_bytes = pdf_bytes is not None
+                    else:
+                        otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
+                            task, step, scraped_page, browser_state, json_response
+                        )
+                        if otp_actions:
+                            detailed_agent_step_output.llm_response = otp_json_response
+                            actions = otp_actions
+                        else:
+                            actions = parse_actions(
+                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                            )
+
+                    if context:
+                        context.pop_totp_code(task.task_id)
+                except NoTOTPVerificationCodeFound:
+                    # Surface only the source poll_otp_value actually queried so
+                    # the failure_reason tells the customer which delivery endpoint
+                    # went silent.
+                    timeout_reasoning = _build_totp_timeout_reasoning(task)
+                    LOG.warning(
+                        "TOTP polling timed out — terminating task",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        totp_verification_url=strip_query_params(task.totp_verification_url)
+                        if task.totp_verification_url
+                        else None,
+                        totp_identifier=task.totp_identifier,
+                        organization_id=task.organization_id,
+                    )
+                    actions = [
+                        TerminateAction(
+                            organization_id=task.organization_id,
+                            workflow_run_id=task.workflow_run_id,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=0,
+                            reasoning=timeout_reasoning,
+                            intention=timeout_reasoning,
+                            errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
+                        )
+                    ]
+                except FailedToGetTOTPVerificationCode as e:
+                    actions = [
+                        TerminateAction(
+                            reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                            intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                            organization_id=task.organization_id,
+                            workflow_run_id=task.workflow_run_id,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            step_order=step.order,
+                            action_order=0,
+                            errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
+                        )
+                    ]
+
+                if reuse_speculative_llm_response and speculative_llm_metadata:
+                    await self._persist_speculative_llm_metadata(
+                        step,
+                        speculative_llm_metadata,
+                        screenshots=scraped_page.screenshots,
+                    )
+                    speculative_llm_metadata = None
+        return actions, pdf_auto_download_src, pdf_auto_download_used_bytes
 
     async def _generate_cua_actions(
         self,
@@ -3346,8 +3399,11 @@ class ForgeAgent:
         step: Step,
         workflow_run: WorkflowRun | None = None,
         browser_session_id: str | None = None,
+        pre_resolved_browser_state: BrowserState | None = None,
     ) -> tuple[Step, BrowserState, DetailedAgentStepOutput]:
-        if workflow_run:
+        if pre_resolved_browser_state is not None:
+            browser_state = pre_resolved_browser_state
+        elif workflow_run:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                 workflow_run=workflow_run,
                 url=task.url,
@@ -3964,7 +4020,9 @@ class ForgeAgent:
                 error_code_mapping_str=error_code_mapping_str,
                 local_datetime=local_datetime,
             )
-            without_page_information = router_result.effective_without_page_information
+            without_page_information = (
+                router_result.effective_without_page_information or context.validation_without_page_information
+            )
 
             _prompt_build_span = otel_trace.get_current_span()
             _prompt_build_span.set_attribute("validation.router.mode", str(router_result.mode))
@@ -4994,6 +5052,14 @@ class ForgeAgent:
             _use_bundling = _ctx.use_artifact_bundling if _ctx else False
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
+                submission_shadow.schedule_submission_signal_shadow(
+                    har_data=har_data,
+                    browser_state=browser_state,
+                    last_step=last_step,
+                    task=task,
+                    browser_session_id=browser_session_id,
+                )
             LOG.debug("Uploading har data", har_size=len(har_data))
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
@@ -5523,10 +5589,16 @@ class ForgeAgent:
                     error_codes=[e.error_code for e in failure_response.errors],
                 )
 
-            failure_reason = (
-                f"Max retries per step ({max_retries_per_step}) exceeded."
-                f" Possible failure reasons: {failure_response.reasoning}"
-            )
+            summary_reasoning = (failure_response.reasoning or "").strip()
+            if summary_reasoning:
+                failure_reason = (
+                    f"Max retries per step ({max_retries_per_step}) exceeded."
+                    f" Possible failure reasons: {summary_reasoning}"
+                )
+            else:
+                failure_reason = (
+                    f"Max retries per step ({max_retries_per_step}) exceeded. {ReachMaxRetriesError().reasoning}"
+                )
             failure_category = failure_response.failure_categories or classify_from_failure_reason(
                 failure_reason, fallback_to_unknown=True
             )

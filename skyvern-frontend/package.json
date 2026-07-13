@@ -109,7 +109,7 @@
     "prettier-plugin-tailwindcss": "^0.8.0",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.5.3",
-    "vite": "^6.4.2",
+    "vite": "^6.4.3",
     "vitest": "^4.1.0"
   },
   "lint-staged": {
@@ -129,6 +129,7 @@
     },
     "@types/node": "$@types/node",
     "protobufjs": ">=7.5.8",
-    "qs": ">=6.15.2"
+    "qs": ">=6.15.2",
+    "undici": "^7.28.0"
   }
 }
