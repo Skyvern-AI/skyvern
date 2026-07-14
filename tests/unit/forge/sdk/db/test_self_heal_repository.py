@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from skyvern.forge.sdk.db.models import Base, HealEpisodeModel, WorkflowHealProposalModel
+from skyvern.forge.sdk.db.models import Base, HealEpisodeModel, WorkflowHealProposalModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
 
 ORG_A = "o_aaaaaaaaaaaaaaa"
@@ -48,6 +48,31 @@ def _heal_episode_model(
     return HealEpisodeModel(**model_kwargs)
 
 
+def _workflow_run_model(
+    *,
+    workflow_run_id: str,
+    created_at: datetime,
+    organization_id: str = ORG_A,
+    workflow_permanent_id: str = "wpid_1",
+    status: str = "completed",
+    parent_workflow_run_id: str | None = None,
+    copilot_session_id: str | None = None,
+    debug_session_id: str | None = None,
+) -> WorkflowRunModel:
+    return WorkflowRunModel(
+        workflow_run_id=workflow_run_id,
+        workflow_id="wf_1",
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+        status=status,
+        created_at=created_at,
+        modified_at=created_at,
+        parent_workflow_run_id=parent_workflow_run_id,
+        copilot_session_id=copilot_session_id,
+        debug_session_id=debug_session_id,
+    )
+
+
 @pytest_asyncio.fixture
 async def repo_and_session() -> tuple:
     engine = create_async_engine("sqlite+aiosqlite://")
@@ -55,7 +80,7 @@ async def repo_and_session() -> tuple:
         await conn.run_sync(
             lambda sync_conn: Base.metadata.create_all(
                 sync_conn,
-                tables=[HealEpisodeModel.__table__, WorkflowHealProposalModel.__table__],
+                tables=[HealEpisodeModel.__table__, WorkflowHealProposalModel.__table__, WorkflowRunModel.__table__],
             )
         )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -320,3 +345,135 @@ async def test_get_heal_episodes_for_run_uses_heal_episode_id_tiebreaker(repo_an
 
     episodes = await repo.get_heal_episodes_for_run(organization_id=ORG_A, workflow_run_id="wr_tie")
     assert [episode.heal_episode_id for episode in episodes] == ["he_001", "he_002", "he_003"]
+
+
+@pytest.mark.asyncio
+async def test_get_recent_terminal_workflow_run_ids_filters_orders_and_limits(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 5, 1, 0, 0, 0)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _workflow_run_model(workflow_run_id="wr_old_completed", status="completed", created_at=now),
+                _workflow_run_model(
+                    workflow_run_id="wr_mid_terminated",
+                    status="terminated",
+                    created_at=now + timedelta(minutes=2),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_new_failed", status="failed", created_at=now + timedelta(minutes=3)
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_newest_timed_out",
+                    status="timed_out",
+                    created_at=now + timedelta(minutes=4),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_running", status="running", created_at=now + timedelta(minutes=5)
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_other_org",
+                    organization_id=ORG_B,
+                    status="failed",
+                    created_at=now + timedelta(minutes=6),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_other_workflow",
+                    workflow_permanent_id="wpid_other",
+                    status="failed",
+                    created_at=now + timedelta(minutes=7),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_child",
+                    status="completed",
+                    created_at=now + timedelta(minutes=8),
+                    parent_workflow_run_id="wr_old_completed",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_copilot",
+                    status="completed",
+                    created_at=now + timedelta(minutes=9),
+                    copilot_session_id="cs_1",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_debug",
+                    status="completed",
+                    created_at=now + timedelta(minutes=10),
+                    debug_session_id="ds_1",
+                ),
+            ]
+        )
+        await session.commit()
+
+    real_runs = await repo.get_recent_terminal_workflow_run_ids(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        limit=50,
+    )
+    assert real_runs == ["wr_newest_timed_out", "wr_new_failed", "wr_mid_terminated", "wr_old_completed"]
+
+    run_ids = await repo.get_recent_terminal_workflow_run_ids(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        limit=3,
+    )
+    assert run_ids == ["wr_newest_timed_out", "wr_new_failed", "wr_mid_terminated"]
+
+    bounded = await repo.get_recent_terminal_workflow_run_ids(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        limit=0,
+    )
+    assert bounded == ["wr_newest_timed_out"]
+
+
+@pytest.mark.asyncio
+async def test_get_heal_episodes_for_runs_batches_and_scopes_to_org(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 6, 1, 0, 0, 0)
+
+    assert await repo.get_heal_episodes_for_runs(organization_id=ORG_A, workflow_run_ids=[]) == []
+
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _heal_episode_model(
+                    heal_episode_id="he_1",
+                    workflow_run_id="wr_a",
+                    workflow_run_block_id="wrb_a",
+                    created_at=now + timedelta(minutes=2),
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_2",
+                    workflow_run_id="wr_b",
+                    workflow_run_block_id="wrb_b",
+                    created_at=now + timedelta(minutes=3),
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_0",
+                    workflow_run_id="wr_a",
+                    workflow_run_block_id="wrb_c",
+                    created_at=now + timedelta(minutes=1),
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_other_org",
+                    organization_id=ORG_B,
+                    workflow_run_id="wr_a",
+                    workflow_run_block_id="wrb_other",
+                    created_at=now + timedelta(minutes=4),
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_other_run",
+                    workflow_run_id="wr_c",
+                    workflow_run_block_id="wrb_other_run",
+                    created_at=now + timedelta(minutes=5),
+                ),
+            ]
+        )
+        await session.commit()
+
+    episodes = await repo.get_heal_episodes_for_runs(
+        organization_id=ORG_A,
+        workflow_run_ids=["wr_b", "wr_a"],
+    )
+    assert [episode.heal_episode_id for episode in episodes] == ["he_0", "he_1", "he_2"]

@@ -15,6 +15,10 @@ from skyvern.schemas.self_heal import (
     HealEpisodeView,
     HealStatus,
     OutputObligation,
+    ReliabilityState,
+    RunHealGroup,
+    compute_workflow_reliability,
+    reliability_state_transition,
     resolve_block_outcome,
     summarize_run_heals,
 )
@@ -82,6 +86,35 @@ def _episode(
     )
 
 
+def _run(workflow_run_id: str, episodes: list[HealEpisode]) -> RunHealGroup:
+    return RunHealGroup(workflow_run_id=workflow_run_id, episodes=episodes)
+
+
+def _episode_for_run(
+    *,
+    workflow_run_id: str,
+    block_label: str,
+    status: HealStatus,
+    output_obligation: OutputObligation | None = None,
+    engine: str = "code",
+) -> HealEpisode:
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    return HealEpisode(
+        heal_episode_id=f"he_{workflow_run_id}_{block_label}",
+        organization_id="o_1",
+        workflow_permanent_id="wpid_1",
+        workflow_id="w_1",
+        workflow_run_id=workflow_run_id,
+        workflow_run_block_id=f"wrb_{workflow_run_id}_{block_label}",
+        block_label=block_label,
+        engine=engine,
+        status=status,
+        output_obligation=output_obligation,
+        created_at=now,
+        modified_at=now,
+    )
+
+
 @pytest.mark.parametrize(
     ("episodes", "expected"),
     [
@@ -136,3 +169,189 @@ def test_heal_episode_detail_exposes_only_sanitized_free_text_fields() -> None:
     assert "block_code" not in fields
     assert "block_prompt" not in fields
     assert "failure_message" not in fields
+
+
+def test_compute_workflow_reliability_below_min_runs_is_unscored_healthy() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(9)]
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.scored is False
+    assert reliability.state == ReliabilityState.healthy
+    assert reliability.window_runs == 9
+    assert reliability.healed_runs == 0
+    assert reliability.heal_rate == 0.0
+    assert reliability.consecutive_healed_runs == 0
+    assert reliability.floor_runs == 0
+    assert reliability.outcome_risk is False
+    assert reliability.outcome_risk_runs == 0
+
+
+def test_compute_workflow_reliability_watch_when_two_healed_in_window() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(20)]
+    runs[5] = _run(
+        "wr_5",
+        [_episode_for_run(workflow_run_id="wr_5", block_label="block_5", status=HealStatus.fired_failed)],
+    )
+    runs[12] = _run(
+        "wr_12",
+        [_episode_for_run(workflow_run_id="wr_12", block_label="block_12", status=HealStatus.fired_completed)],
+    )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.scored is True
+    assert reliability.state == ReliabilityState.watch
+    assert reliability.healed_runs == 2
+    assert reliability.consecutive_healed_runs == 0
+    assert reliability.heal_rate == 0.1
+
+
+def test_compute_workflow_reliability_watch_when_two_consecutive_recent_healed() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(20)]
+    runs[0] = _run(
+        "wr_0",
+        [_episode_for_run(workflow_run_id="wr_0", block_label="block_0", status=HealStatus.fired_unverified)],
+    )
+    runs[1] = _run(
+        "wr_1",
+        [_episode_for_run(workflow_run_id="wr_1", block_label="block_1", status=HealStatus.fired_failed)],
+    )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.state == ReliabilityState.watch
+    assert reliability.healed_runs == 2
+    assert reliability.consecutive_healed_runs == 2
+
+
+def test_compute_workflow_reliability_action_needed_when_three_recent_healed() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(20)]
+    runs[0] = _run(
+        "wr_0",
+        [_episode_for_run(workflow_run_id="wr_0", block_label="block_0", status=HealStatus.fired_failed)],
+    )
+    runs[3] = _run(
+        "wr_3",
+        [_episode_for_run(workflow_run_id="wr_3", block_label="block_3", status=HealStatus.fired_completed)],
+    )
+    runs[7] = _run(
+        "wr_7",
+        [_episode_for_run(workflow_run_id="wr_7", block_label="block_7", status=HealStatus.fired_unverified)],
+    )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.state == ReliabilityState.action_needed
+    assert reliability.healed_runs == 3
+    assert reliability.heal_rate == 0.15
+
+
+def test_compute_workflow_reliability_action_needed_when_heal_rate_reaches_threshold() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(20)]
+    for idx in (0, 5, 12, 18):
+        runs[idx] = _run(
+            f"wr_{idx}",
+            [_episode_for_run(workflow_run_id=f"wr_{idx}", block_label=f"block_{idx}", status=HealStatus.fired_failed)],
+        )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.state == ReliabilityState.action_needed
+    assert reliability.healed_runs == 4
+    assert reliability.heal_rate == 0.2
+
+
+def test_compute_workflow_reliability_action_needed_when_floor_runs_reach_threshold() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(20)]
+    runs[2] = _run(
+        "wr_2",
+        [
+            _episode_for_run(
+                workflow_run_id="wr_2",
+                block_label="block_2",
+                status=HealStatus.skipped,
+                engine="floor",
+            )
+        ],
+    )
+    runs[13] = _run(
+        "wr_13",
+        [
+            _episode_for_run(
+                workflow_run_id="wr_13",
+                block_label="block_13",
+                status=HealStatus.skipped,
+                engine="floor",
+            )
+        ],
+    )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.state == ReliabilityState.action_needed
+    assert reliability.floor_runs == 2
+    assert reliability.healed_runs == 0
+
+
+def test_compute_workflow_reliability_sets_outcome_risk_from_recent_runs() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(10)]
+    runs[0] = _run(
+        "wr_0",
+        [
+            _episode_for_run(
+                workflow_run_id="wr_0",
+                block_label="invoice_submit",
+                status=HealStatus.fired_unverified,
+                output_obligation=OutputObligation.observed,
+            )
+        ],
+    )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.outcome_risk is True
+    assert reliability.outcome_risk_runs == 1
+    assert reliability.state == ReliabilityState.healthy
+
+
+def test_compute_workflow_reliability_consecutive_streak_stops_at_first_unhealed() -> None:
+    runs = [_run(f"wr_{idx}", []) for idx in range(20)]
+    runs[0] = _run(
+        "wr_0",
+        [_episode_for_run(workflow_run_id="wr_0", block_label="block_0", status=HealStatus.fired_completed)],
+    )
+    runs[1] = _run(
+        "wr_1",
+        [_episode_for_run(workflow_run_id="wr_1", block_label="block_1", status=HealStatus.fired_failed)],
+    )
+    runs[3] = _run(
+        "wr_3",
+        [_episode_for_run(workflow_run_id="wr_3", block_label="block_3", status=HealStatus.fired_failed)],
+    )
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.consecutive_healed_runs == 2
+    assert reliability.healed_runs == 3
+    assert reliability.state == ReliabilityState.action_needed
+
+
+def test_compute_workflow_reliability_heal_rate_math() -> None:
+    runs = [
+        _run("wr_0", [_episode_for_run(workflow_run_id="wr_0", block_label="block_0", status=HealStatus.fired_failed)]),
+        _run("wr_1", []),
+        _run("wr_2", []),
+    ]
+
+    reliability = compute_workflow_reliability(runs)
+
+    assert reliability.healed_runs == 1
+    assert reliability.window_runs == 3
+    assert reliability.heal_rate == pytest.approx(1 / 3)
+
+
+def test_reliability_state_transition() -> None:
+    assert reliability_state_transition(None, ReliabilityState.healthy) is True
+    assert reliability_state_transition(ReliabilityState.watch, ReliabilityState.watch) is False
+    assert reliability_state_transition(ReliabilityState.watch, ReliabilityState.action_needed) is True
