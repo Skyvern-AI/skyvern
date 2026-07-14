@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import hashlib
 import json
 import time
 import warnings
@@ -71,6 +72,12 @@ LOG = structlog.get_logger()
 # standard; we halve it at the cost sites (flex = 50% of standard, Google Vertex SKU).
 _VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
 _VERTEX_FLEX_COST_MULTIPLIER = 0.5
+
+# OpenAI recommends keeping traffic for a prompt_cache_key near 15 requests/minute.
+# Sixteen deterministic shards preserve cache affinity within a workflow while allowing
+# roughly 240 requests/minute per prompt family before additional partitioning is useful.
+_OPENAI_PROMPT_CACHE_KEY_SHARDS = 16
+_OPENAI_MODEL_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
 
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
@@ -379,6 +386,41 @@ def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) ->
         "prompt_schema_variant": effective_prompt_schema_variant(assigned, prompt_name),
         "prompt_schema_variant_assigned": assigned,
     }
+
+
+def _openai_prompt_cache_key(
+    model_name: str,
+    prompt_name: str | None,
+    context: SkyvernContext | None,
+) -> str | None:
+    """Build a stable, sharded cache-routing key for direct OpenAI requests."""
+    if not model_name.startswith(_OPENAI_MODEL_PREFIXES) or not prompt_name or context is None:
+        return None
+
+    scope_id = next(
+        (
+            value
+            for value in (
+                context.root_workflow_run_id,
+                context.workflow_run_id,
+                context.task_v2_id,
+                context.task_id,
+                context.run_id,
+                context.request_id,
+            )
+            if isinstance(value, str) and value
+        ),
+        None,
+    )
+    if scope_id is None:
+        return None
+
+    scope_digest = hashlib.sha256(scope_id.encode("utf-8")).digest()
+    shard = int.from_bytes(scope_digest[:4], byteorder="big") % _OPENAI_PROMPT_CACHE_KEY_SHARDS
+    model_digest = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:8]
+    prompt_slug = "".join(character if character.isalnum() or character in "-_" else "-" for character in prompt_name)
+    prompt_slug = prompt_slug.strip("-")[:32] or "prompt"
+    return f"skyvern:v1:{model_digest}:{prompt_slug}:{shard:02d}"
 
 
 @runtime_checkable
@@ -1957,6 +1999,11 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            if "prompt_cache_key" not in active_parameters:
+                prompt_cache_key = _openai_prompt_cache_key(llm_config.model_name, prompt_name, context)
+                if prompt_cache_key is not None:
+                    # Rebind instead of mutating a caller-owned base_parameters dictionary.
+                    active_parameters = {**active_parameters, "prompt_cache_key": prompt_cache_key}
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
