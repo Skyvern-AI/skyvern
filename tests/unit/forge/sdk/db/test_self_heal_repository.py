@@ -6,6 +6,8 @@ a Postgres error in production (see scripts.py/tasks.py's use of the same
 sanitize_postgres_text helper) rather than being caught here.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -14,6 +16,36 @@ from skyvern.forge.sdk.db.models import Base, HealEpisodeModel, WorkflowHealProp
 from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
 
 ORG_A = "o_aaaaaaaaaaaaaaa"
+ORG_B = "o_bbbbbbbbbbbbbbb"
+
+
+def _heal_episode_model(
+    *,
+    heal_episode_id: str | None = None,
+    organization_id: str = ORG_A,
+    workflow_permanent_id: str = "wpid_1",
+    workflow_id: str = "w_1",
+    workflow_run_id: str = "wr_1",
+    workflow_run_block_id: str = "wrb_1",
+    block_label: str = "block_1",
+    status: str = "fired_failed",
+    created_at: datetime,
+) -> HealEpisodeModel:
+    model_kwargs: dict[str, str | datetime] = {
+        "organization_id": organization_id,
+        "workflow_permanent_id": workflow_permanent_id,
+        "workflow_id": workflow_id,
+        "workflow_run_id": workflow_run_id,
+        "workflow_run_block_id": workflow_run_block_id,
+        "block_label": block_label,
+        "engine": "code",
+        "status": status,
+        "created_at": created_at,
+        "modified_at": created_at,
+    }
+    if heal_episode_id is not None:
+        model_kwargs["heal_episode_id"] = heal_episode_id
+    return HealEpisodeModel(**model_kwargs)
 
 
 @pytest_asyncio.fixture
@@ -103,3 +135,188 @@ async def test_update_heal_proposal_status_compare_and_set(repo_and_session) -> 
     )
     assert adopted is not None
     assert adopted.status == "adopted"
+
+
+@pytest.mark.asyncio
+async def test_get_heal_episodes_for_workflow_filters_and_paginates(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _heal_episode_model(
+                    workflow_run_id="wr_target",
+                    workflow_run_block_id="wrb_a",
+                    block_label="block_x",
+                    status="fired_failed",
+                    created_at=now,
+                ),
+                _heal_episode_model(
+                    workflow_run_id="wr_target",
+                    workflow_run_block_id="wrb_b",
+                    block_label="block_x",
+                    status="fired_completed",
+                    created_at=now + timedelta(minutes=1),
+                ),
+                _heal_episode_model(
+                    workflow_run_id="wr_target",
+                    workflow_run_block_id="wrb_c",
+                    block_label="block_y",
+                    status="fired_failed",
+                    created_at=now + timedelta(minutes=2),
+                ),
+                _heal_episode_model(
+                    workflow_permanent_id="wpid_other",
+                    workflow_run_id="wr_target",
+                    workflow_run_block_id="wrb_d",
+                    block_label="block_x",
+                    status="fired_failed",
+                    created_at=now + timedelta(minutes=3),
+                ),
+                _heal_episode_model(
+                    organization_id=ORG_B,
+                    workflow_run_id="wr_target",
+                    workflow_run_block_id="wrb_e",
+                    block_label="block_x",
+                    status="fired_failed",
+                    created_at=now + timedelta(minutes=4),
+                ),
+            ]
+        )
+        await session.commit()
+
+    all_for_workflow = await repo.get_heal_episodes_for_workflow(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+    )
+    assert [episode.workflow_run_block_id for episode in all_for_workflow] == ["wrb_c", "wrb_b", "wrb_a"]
+
+    block_filtered = await repo.get_heal_episodes_for_workflow(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        block_label="block_x",
+    )
+    assert [episode.workflow_run_block_id for episode in block_filtered] == ["wrb_b", "wrb_a"]
+
+    status_filtered = await repo.get_heal_episodes_for_workflow(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        status="fired_failed",
+    )
+    assert [episode.workflow_run_block_id for episode in status_filtered] == ["wrb_c", "wrb_a"]
+
+    paginated = await repo.get_heal_episodes_for_workflow(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        limit=2,
+        offset=1,
+    )
+    assert [episode.workflow_run_block_id for episode in paginated] == ["wrb_b", "wrb_a"]
+
+    clamped = await repo.get_heal_episodes_for_workflow(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+        limit=-5,
+    )
+    assert [episode.workflow_run_block_id for episode in clamped] == ["wrb_c"]
+
+
+@pytest.mark.asyncio
+async def test_get_heal_episodes_for_run_returns_created_at_ascending(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 2, 1, 0, 0, 0)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _heal_episode_model(
+                    workflow_run_id="wr_ordered",
+                    workflow_run_block_id="wrb_late",
+                    created_at=now + timedelta(minutes=2),
+                ),
+                _heal_episode_model(
+                    workflow_run_id="wr_ordered",
+                    workflow_run_block_id="wrb_early",
+                    created_at=now,
+                ),
+                _heal_episode_model(
+                    workflow_run_id="wr_ordered",
+                    workflow_run_block_id="wrb_middle",
+                    created_at=now + timedelta(minutes=1),
+                ),
+                _heal_episode_model(
+                    workflow_run_id="wr_other",
+                    workflow_run_block_id="wrb_other",
+                    created_at=now + timedelta(minutes=3),
+                ),
+            ]
+        )
+        await session.commit()
+
+    episodes = await repo.get_heal_episodes_for_run(organization_id=ORG_A, workflow_run_id="wr_ordered")
+    assert [episode.workflow_run_block_id for episode in episodes] == ["wrb_early", "wrb_middle", "wrb_late"]
+
+
+@pytest.mark.asyncio
+async def test_get_heal_episodes_for_workflow_uses_heal_episode_id_tiebreaker(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 3, 1, 0, 0, 0)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _heal_episode_model(
+                    heal_episode_id="he_001",
+                    workflow_run_block_id="wrb_1",
+                    created_at=now,
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_003",
+                    workflow_run_block_id="wrb_3",
+                    created_at=now,
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_002",
+                    workflow_run_block_id="wrb_2",
+                    created_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+    episodes = await repo.get_heal_episodes_for_workflow(
+        organization_id=ORG_A,
+        workflow_permanent_id="wpid_1",
+    )
+    assert [episode.heal_episode_id for episode in episodes] == ["he_003", "he_002", "he_001"]
+
+
+@pytest.mark.asyncio
+async def test_get_heal_episodes_for_run_uses_heal_episode_id_tiebreaker(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 4, 1, 0, 0, 0)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _heal_episode_model(
+                    heal_episode_id="he_003",
+                    workflow_run_id="wr_tie",
+                    workflow_run_block_id="wrb_3",
+                    created_at=now,
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_001",
+                    workflow_run_id="wr_tie",
+                    workflow_run_block_id="wrb_1",
+                    created_at=now,
+                ),
+                _heal_episode_model(
+                    heal_episode_id="he_002",
+                    workflow_run_id="wr_tie",
+                    workflow_run_block_id="wrb_2",
+                    created_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+    episodes = await repo.get_heal_episodes_for_run(organization_id=ORG_A, workflow_run_id="wr_tie")
+    assert [episode.heal_episode_id for episode in episodes] == ["he_001", "he_002", "he_003"]
