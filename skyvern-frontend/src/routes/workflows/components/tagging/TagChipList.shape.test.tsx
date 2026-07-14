@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Tag } from "../../types/tagTypes";
 import { buildTagColorMap } from "../../types/tagColors";
@@ -95,5 +95,27 @@ describe("TagChipList colors", () => {
     const html = container.innerHTML;
     expect(html).toContain("bg-green-500");
     expect(screen.getByText("standalone")).toBeTruthy();
+  });
+
+  it("only offers removal for user-editable tags", () => {
+    const onRemove = vi.fn();
+    render(
+      <TagChipList
+        tags={[
+          { key: "env", value: "prod" },
+          { key: "skyvern.platform", value: "browser" },
+        ]}
+        onRemove={onRemove}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove env: prod" }));
+
+    expect(onRemove).toHaveBeenCalledWith({ key: "env", value: "prod" });
+    expect(
+      screen.queryByRole("button", {
+        name: "Remove skyvern.platform: browser",
+      }),
+    ).toBeNull();
   });
 });
