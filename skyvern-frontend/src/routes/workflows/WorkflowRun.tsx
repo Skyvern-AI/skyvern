@@ -81,6 +81,7 @@ import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecove
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isFirstFailedRunRecoveryEligible } from "@/util/onboarding/rolloutGating";
+import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
 
 function WorkflowRunRightColumn({
   activeItem,
@@ -570,6 +571,9 @@ function WorkflowRun() {
             <h2 className="text-2xl text-neutral-600 dark:text-slate-400">
               {workflowRunId}
             </h2>
+            {workflowRunId ? (
+              <RunTagsEditor workflowRunId={workflowRunId} />
+            ) : null}
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||

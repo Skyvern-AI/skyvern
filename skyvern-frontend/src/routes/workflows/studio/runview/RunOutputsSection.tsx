@@ -14,6 +14,7 @@ export type RunOutputError = Record<string, unknown>;
 type RunOutputsSectionProps = {
   workflowRunId: string;
   workflowTitle?: string | null;
+  outputs: Record<string, unknown> | null;
   extractedInformation: Record<string, unknown> | null;
   files: RunOutputFile[];
   errors: RunOutputError[];
@@ -158,6 +159,7 @@ function RunErrorsPanel({ errors }: { errors: RunOutputError[] }) {
 export function RunOutputsSection({
   workflowRunId,
   workflowTitle,
+  outputs,
   extractedInformation,
   files,
   errors,
@@ -180,7 +182,8 @@ export function RunOutputsSection({
     return null;
   }
 
-  const extractedJson = JSON.stringify(extractedInformation ?? {});
+  const hasAgentRunOutputs =
+    outputs !== null && Object.keys(outputs).length > 0;
 
   return (
     <div className="flex flex-col gap-5">
@@ -208,13 +211,25 @@ export function RunOutputsSection({
       ) : null}
       {hasExtracted ? (
         <div className="flex flex-col gap-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            Extracted information
+          </span>
+          <OverviewCodeBlock
+            value={JSON.stringify(extractedInformation, null, 2)}
+            maxHeight="320px"
+          />
+        </div>
+      ) : null}
+      {hasAgentRunOutputs ? (
+        <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-muted-foreground">
-              Extracted information
+              Agent run outputs
             </span>
             <SummarizeOutput
+              key={`run:${workflowRunId}`}
               contextKey={`run:${workflowRunId}`}
-              outputJson={extractedJson}
+              outputJson={JSON.stringify(outputs)}
               workflowTitle={workflowTitle}
               hasSummary={summary !== null}
               onSummary={onSummary}
@@ -230,7 +245,7 @@ export function RunOutputsSection({
             </div>
           ) : null}
           <OverviewCodeBlock
-            value={JSON.stringify(extractedInformation, null, 2)}
+            value={JSON.stringify(outputs, null, 2)}
             maxHeight="320px"
           />
         </div>
