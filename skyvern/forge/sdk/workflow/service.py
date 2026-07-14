@@ -2629,6 +2629,7 @@ class WorkflowService:
         both sync and async (Temporal-dispatched) trigger modes.
         """
         organization_id = organization.organization_id
+        uses_default_vnc_session_manager = self._uses_default_vnc_session_manager()
         caller_supplied_browser_session = bool(browser_session_id)
 
         LOG.info(
@@ -2640,18 +2641,19 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        persisted_browser_session_id = workflow_run.browser_session_id
-        if not browser_session_id:
-            browser_session_id = persisted_browser_session_id
-        elif persisted_browser_session_id and browser_session_id != persisted_browser_session_id:
-            LOG.warning(
-                "Workflow execution browser session differs from persisted workflow-run session; "
-                "keeping caller session.",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                caller_browser_session_id=browser_session_id,
-                persisted_browser_session_id=persisted_browser_session_id,
-            )
+        if uses_default_vnc_session_manager:
+            persisted_browser_session_id = workflow_run.browser_session_id
+            if not browser_session_id:
+                browser_session_id = persisted_browser_session_id
+            elif persisted_browser_session_id and browser_session_id != persisted_browser_session_id:
+                LOG.warning(
+                    "Workflow execution browser session differs from persisted workflow-run session; "
+                    "keeping caller session.",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    caller_browser_session_id=browser_session_id,
+                    persisted_browser_session_id=persisted_browser_session_id,
+                )
 
         # Guard: if the run was canceled while queued (before Temporal picked it up), don't
         # overwrite the canceled status with running. Checked BEFORE workflow resolution so a run
@@ -2671,7 +2673,9 @@ class WorkflowService:
         workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
-        close_browser_on_completion = not caller_supplied_browser_session and not workflow_run.browser_address
+        close_browser_on_completion = (
+            not caller_supplied_browser_session if uses_default_vnc_session_manager else browser_session_id is None
+        ) and not workflow_run.browser_address
 
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
         if enterprise_gated_features:
@@ -2794,7 +2798,7 @@ class WorkflowService:
             return workflow_run
 
         renewal_task: asyncio.Task[None] | None = None
-        if self._uses_default_vnc_session_manager():
+        if uses_default_vnc_session_manager:
             setup_state = WorkflowVncSessionSetupState(effective_browser_session_id=browser_session_id)
             try:
                 await await_to_terminal_state(
@@ -7450,7 +7454,11 @@ class WorkflowService:
                 tasks.extend(child_tasks)
 
         all_workflow_task_ids = [task.task_id for task in tasks]
-        close_browser_on_completion = close_browser_on_completion and not workflow_run.browser_address
+        close_browser_on_completion = (
+            close_browser_on_completion
+            and not workflow_run.browser_address
+            and (self._uses_default_vnc_session_manager() or browser_session_id is None)
+        )
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,

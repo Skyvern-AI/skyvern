@@ -241,16 +241,36 @@ async def test_default_vnc_creation_error_does_not_fall_through_to_code_gate(
     code_gate.assert_not_awaited()
 
 
-@pytest.mark.parametrize("mode", ["vnc", "cdp"])
 @pytest.mark.parametrize(
-    ("caller_session_id", "row_session_id", "expected_session_id", "expected_close", "expects_warning"),
+    (
+        "mode",
+        "caller_session_id",
+        "row_session_id",
+        "expected_session_id",
+        "expected_begin",
+        "expected_close",
+        "expects_warning",
+    ),
     [
-        (None, "pbs_forced", "pbs_forced", True, False),
-        ("", "pbs_forced", "pbs_forced", True, False),
-        ("pbs_caller", "pbs_forced", "pbs_caller", False, True),
-        ("pbs_caller", "", "pbs_caller", False, False),
+        ("vnc", None, "pbs_forced", "pbs_forced", True, True, False),
+        ("vnc", "", "pbs_forced", "pbs_forced", True, True, False),
+        ("vnc", "pbs_caller", "pbs_forced", "pbs_caller", True, False, True),
+        ("vnc", "pbs_caller", "", "pbs_caller", True, False, False),
+        ("cdp", None, "pbs_forced", None, False, True, False),
+        ("cdp", "", "pbs_forced", "", False, False, False),
+        ("cdp", "pbs_caller", "pbs_forced", "pbs_caller", True, False, False),
+        ("cdp", "pbs_caller", "", "pbs_caller", True, False, False),
     ],
-    ids=["W7-adopt-forced", "W7-empty-adopts-forced", "W8-caller-wins", "W8-empty-row-no-warning"],
+    ids=[
+        "vnc-adopt-forced",
+        "vnc-empty-adopts-forced",
+        "vnc-caller-wins",
+        "vnc-empty-row-no-warning",
+        "cdp-none-ignores-forced",
+        "cdp-empty-ignores-forced",
+        "cdp-caller-ignores-forced",
+        "cdp-caller-empty-row",
+    ],
 )
 @pytest.mark.asyncio
 async def test_execute_workflow_adopts_persisted_session_and_preserves_original_ownership(
@@ -258,7 +278,8 @@ async def test_execute_workflow_adopts_persisted_session_and_preserves_original_
     mode: str,
     caller_session_id: str | None,
     row_session_id: str,
-    expected_session_id: str,
+    expected_session_id: str | None,
+    expected_begin: bool,
     expected_close: bool,
     expects_warning: bool,
 ) -> None:
@@ -314,12 +335,15 @@ async def test_execute_workflow_adopts_persisted_session_and_preserves_original_
     assert result is completed_run
     assert create_session.await_count == 0
     assert context.browser_session_id == expected_session_id
-    begin_session.assert_awaited_once_with(
-        browser_session_id=expected_session_id,
-        runnable_type="workflow_run",
-        runnable_id="wr_test",
-        organization_id="o_test",
-    )
+    if expected_begin:
+        begin_session.assert_awaited_once_with(
+            browser_session_id=expected_session_id,
+            runnable_type="workflow_run",
+            runnable_id="wr_test",
+            organization_id="o_test",
+        )
+    else:
+        begin_session.assert_not_awaited()
     clean_up_browser.assert_awaited_once()
     assert clean_up_browser.await_args.kwargs["browser_session_id"] == expected_session_id
     assert clean_up_browser.await_args.kwargs["close_browser_on_completion"] is expected_close
@@ -339,18 +363,24 @@ async def test_execute_workflow_adopts_persisted_session_and_preserves_original_
 
 
 @pytest.mark.parametrize(
-    ("browser_address", "expected_close"),
+    ("mode", "browser_address", "expected_close"),
     [
-        (None, True),
-        ("wss://remote.example/devtools/browser/id", False),
+        ("vnc", None, True),
+        ("vnc", "wss://remote.example/devtools/browser/id", False),
+        ("cdp", None, False),
+        ("cdp", "wss://remote.example/devtools/browser/id", False),
     ],
+    ids=["vnc-session", "vnc-address", "cdp-session", "cdp-address"],
 )
 @pytest.mark.asyncio
 async def test_cleanup_preserves_session_ownership_unless_browser_is_remote(
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
     browser_address: str | None,
     expected_close: bool,
 ) -> None:
+    monkeypatch.setattr(service_module.settings, "BROWSER_STREAMING_MODE", mode)
+    _install_manager(monkeypatch, use_default=True)
     service = WorkflowService()
     monkeypatch.setattr(service, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
     get_children = AsyncMock(return_value=[])
