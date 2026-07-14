@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import case, desc, or_, select
+from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.config import settings
@@ -332,6 +332,27 @@ class BrowserSessionsRepository(BaseRepository):
             )
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
+
+    @db_operation("get_persistent_browser_sessions_history_count")
+    async def get_persistent_browser_sessions_history_count(
+        self,
+        organization_id: str,
+        lookback_hours: int = 24 * 7,
+    ) -> int:
+        """Count persistent browser sessions in an organization's history window.
+
+        Mirrors the filters of :meth:`get_persistent_browser_sessions_history` so the
+        total matches what the paginated read returns.
+        """
+        async with self.Session() as session:
+            count_query = (
+                select(func.count())
+                .select_from(PersistentBrowserSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
+            )
+            return (await session.execute(count_query)).scalar_one()
 
     @read_retry()
     @db_operation("get_persistent_browser_session_by_runnable_id", log_errors=False)
