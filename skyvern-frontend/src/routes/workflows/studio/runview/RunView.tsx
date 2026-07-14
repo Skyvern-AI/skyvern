@@ -14,6 +14,7 @@ import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { isRecord } from "@/util/utils";
+import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
@@ -338,6 +339,10 @@ export function RunView({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden p-3">
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
+        />
+        <RunTagsEditor
+          workflowRunId={workflowRun.workflow_run_id}
+          className="shrink-0"
         />
 
         {provisioning ? (
