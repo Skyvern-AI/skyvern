@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.services import task_v2_optimizations
 from skyvern.services.task_v2_optimizations import (
     FLAG_NAME_BY_FIELD,

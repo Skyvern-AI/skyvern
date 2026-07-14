@@ -1602,10 +1602,14 @@ async def _generate_loop_task(
             )
             raise RuntimeError("Loop-value extraction failed")
         try:
-            parameter_value = extraction_block_result.output_parameter_value  # type: ignore[assignment]
-            output_value_obj = parameter_value.get("extracted_information")
-            if not output_value_obj or not isinstance(output_value_obj, dict):
+            extracted_parameter_value = extraction_block_result.output_parameter_value
+            if not isinstance(extracted_parameter_value, dict):
                 raise ValueError("Invalid output parameter of the extraction block for the loop task")
+            parameter_value = extracted_parameter_value
+            extracted_information = parameter_value.get("extracted_information")
+            if not extracted_information or not isinstance(extracted_information, dict):
+                raise ValueError("Invalid output parameter of the extraction block for the loop task")
+            output_value_obj = extracted_information
             if loop_values_key not in output_value_obj:
                 raise ValueError("loop_values_key not found in the output parameter of the extraction block")
             if "is_loop_value_link" not in output_value_obj:
@@ -1621,8 +1625,10 @@ async def _generate_loop_task(
             requested_limit=requested_loop_limit,
             apply_guardrail=optimization_flags.loop_guardrails,
         )
-    else:
+    elif isinstance(raw_loop_values, list):
         loop_values = raw_loop_values
+    else:
+        raise ValueError("Task V2 loop values must be a list")
     if not loop_values:
         raise ValueError("Task V2 generated an empty loop-value list")
     output_value_obj[loop_values_key] = loop_values
@@ -1851,7 +1857,7 @@ async def _generate_extraction_task(
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 
     # create OutputParameter for the data_extraction block
-    data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
+    resolved_data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
     label = f"data_extraction_{generate_random_string()}"
     url: str | None = None
     if not task_history:
@@ -1860,7 +1866,7 @@ async def _generate_extraction_task(
     extraction_block_yaml = ExtractionBlockYAML(
         label=label,
         data_extraction_goal=data_extraction_goal,
-        data_schema=data_schema,
+        data_schema=resolved_data_schema,
         url=url,
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
@@ -1873,7 +1879,7 @@ async def _generate_extraction_task(
             label=label,
             url=url,
             data_extraction_goal=data_extraction_goal,
-            data_schema=data_schema,
+            data_schema=resolved_data_schema,
             output_parameter=output_parameter,
         ),
         [extraction_block_yaml],
