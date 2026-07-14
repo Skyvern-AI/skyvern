@@ -12,6 +12,7 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
@@ -42,6 +43,7 @@ import {
 } from "./RunOutputsSection";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunSummaryStrip } from "./RunSummaryStrip";
+import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -406,6 +408,19 @@ export function RunView({
                     }}
                     onBlockItemSelected={(block) => {
                       pinFrame(block.workflow_run_block_id);
+                      const handle =
+                        useWorkflowBlockSearchStore.getState().handle;
+                      if (!handle) {
+                        return;
+                      }
+                      const nodeId = resolveTimelineBlockJumpNodeId({
+                        editorOpen: studioPanes.includes("editor"),
+                        targets: handle.getTargets(),
+                        label: block.label,
+                      });
+                      if (nodeId) {
+                        handle.focusBlock(nodeId);
+                      }
                     }}
                     onThoughtItemSelected={(thought) => {
                       pinFrame(thought.thought_id);
