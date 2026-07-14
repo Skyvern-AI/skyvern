@@ -99,7 +99,7 @@ function FileDownloadEditorBody({
       <div className="space-y-4">
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">URL</Label>
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
             <HelpTooltip content={urlTooltip} />
           </div>
           <WorkflowBlockInputTextarea
@@ -112,7 +112,9 @@ function FileDownloadEditorBody({
         </div>
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Download Goal</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Download Goal
+            </Label>
             <HelpTooltip content={navigationGoalTooltip} />
           </div>
           <WorkflowBlockInputTextarea
@@ -126,7 +128,7 @@ function FileDownloadEditorBody({
         </div>
         <div className="space-y-2">
           <div className="flex items-center gap-2">
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               Download Timeout (sec)
             </Label>
             <HelpTooltip
@@ -156,7 +158,7 @@ function FileDownloadEditorBody({
           </div>
         </div>
         {!hasInteracted && (
-          <div className="workflow-editor-tip rounded-md bg-slate-800 p-2 text-xs text-slate-400">
+          <div className="workflow-editor-tip rounded-md bg-muted p-2 text-xs text-muted-foreground">
             Once the file is downloaded, this block will complete.
           </div>
         )}
@@ -183,7 +185,7 @@ function FileDownloadEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Engine
                   </Label>
                 </div>
@@ -195,7 +197,7 @@ function FileDownloadEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Max Steps Override
                   </Label>
                   <HelpTooltip
@@ -220,7 +222,7 @@ function FileDownloadEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip
@@ -285,7 +287,7 @@ function FileDownloadEditorBody({
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     File Name
                   </Label>
                   <HelpTooltip
@@ -303,7 +305,7 @@ function FileDownloadEditorBody({
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Identifier
                   </Label>
                   <HelpTooltip
@@ -322,14 +324,14 @@ function FileDownloadEditorBody({
                   className="nopan text-xs"
                 />
                 {!totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-muted-foreground dark:text-slate-500">
                     Leave empty to use the credential's value.
                   </p>
                 ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Verification URL
                   </Label>
                   <HelpTooltip

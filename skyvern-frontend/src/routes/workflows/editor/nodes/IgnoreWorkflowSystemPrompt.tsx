@@ -14,7 +14,7 @@ function IgnoreWorkflowSystemPrompt({
   return (
     <div className="flex items-center justify-between gap-2">
       <div className="flex min-w-0 items-center gap-2">
-        <Label className="truncate text-xs font-normal text-slate-300">
+        <Label className="truncate text-xs font-normal text-tertiary-foreground">
           Ignore System Prompt
         </Label>
         <HelpTooltip content="When checked, this block ignores the agent-level system prompt. Only relevant when the agent has an agent system prompt set." />

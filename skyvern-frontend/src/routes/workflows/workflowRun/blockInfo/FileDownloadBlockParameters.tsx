@@ -28,7 +28,7 @@ function FileDownloadBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Prompt</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               Instructions followed to download the file
             </h2>
           </div>
@@ -39,7 +39,7 @@ function FileDownloadBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Download Suffix</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               Expected suffix or filename for the downloaded file
             </h2>
           </div>
@@ -50,7 +50,7 @@ function FileDownloadBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Download Timeout</h1>
-            <h2 className="text-base text-slate-400">In seconds</h2>
+            <h2 className="text-base text-muted-foreground">In seconds</h2>
           </div>
           <Input value={downloadTimeout.toString()} readOnly />
         </div>
@@ -84,7 +84,7 @@ function FileDownloadBlockParameters({
       typeof maxRetries !== "number" &&
       typeof maxStepsPerRun !== "number" &&
       !formattedErrorCodeMapping ? (
-        <div className="text-sm text-slate-400">
+        <div className="text-sm text-muted-foreground">
           No additional download-specific metadata configured for this block.
         </div>
       ) : null}

@@ -26,7 +26,7 @@ function RenderedExpression({ value }: { value: string }) {
     return <JsonExplorer value={parsedJson} rootLabel="rendered" />;
   }
   return (
-    <code className="break-all rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-slate-200">
+    <code className="break-all rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-foreground dark:text-slate-200">
       {value}
     </code>
   );
@@ -55,11 +55,11 @@ function BlockDetailConditional({ block }: Props) {
                   "space-y-1.5 rounded border px-2.5 py-2 text-xs",
                   evaluation.is_matched
                     ? "border-success/50 bg-success/10"
-                    : "border-slate-600 bg-slate-elevation3",
+                    : "border-border bg-slate-elevation3 dark:border-slate-600",
                 )}
               >
                 {evaluation.is_default ? (
-                  <div className="text-slate-300">
+                  <div className="text-tertiary-foreground">
                     <span className="font-medium">Default branch</span>
                     {evaluation.is_matched && (
                       <span className="ml-2 text-success">✓ Matched</span>
@@ -67,12 +67,12 @@ function BlockDetailConditional({ block }: Props) {
                   </div>
                 ) : (
                   <div className="space-y-1.5">
-                    <div className="text-slate-400">
-                      <span className="text-[10px] uppercase tracking-wide text-slate-500">
+                    <div className="text-muted-foreground">
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground dark:text-slate-500">
                         Expression
                       </span>
                       <div className="mt-0.5">
-                        <code className="break-all rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-slate-200">
+                        <code className="break-all rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-foreground dark:text-slate-200">
                           {evaluation.original_expression}
                         </code>
                       </div>
@@ -80,8 +80,8 @@ function BlockDetailConditional({ block }: Props) {
                     {evaluation.rendered_expression &&
                       evaluation.rendered_expression !==
                         evaluation.original_expression && (
-                        <div className="text-slate-400">
-                          <span className="text-[10px] uppercase tracking-wide text-slate-500">
+                        <div className="text-muted-foreground">
+                          <span className="text-[10px] uppercase tracking-wide text-muted-foreground dark:text-slate-500">
                             Rendered
                           </span>
                           <div className="mt-0.5">
@@ -92,11 +92,15 @@ function BlockDetailConditional({ block }: Props) {
                         </div>
                       )}
                     <div className="flex items-center gap-2">
-                      <span className="text-slate-500">Result:</span>
+                      <span className="text-muted-foreground dark:text-slate-500">
+                        Result:
+                      </span>
                       <span
                         className={cn(
                           "font-medium",
-                          evaluation.result ? "text-success" : "text-red-400",
+                          evaluation.result
+                            ? "text-success"
+                            : "text-red-700 dark:text-red-400",
                         )}
                       >
                         {evaluation.result ? "True" : "False"}
@@ -108,9 +112,9 @@ function BlockDetailConditional({ block }: Props) {
                   </div>
                 )}
                 {evaluation.is_matched && evaluation.next_block_label && (
-                  <div className="border-t border-slate-600 pt-1.5 text-slate-400">
+                  <div className="border-t border-border pt-1.5 text-muted-foreground dark:border-slate-600">
                     → Next:{" "}
-                    <span className="font-medium text-slate-200">
+                    <span className="font-medium text-foreground dark:text-slate-200">
                       {evaluation.next_block_label}
                     </span>
                   </div>
@@ -122,21 +126,25 @@ function BlockDetailConditional({ block }: Props) {
       ) : hasExecutedBranch ? (
         <Section title="Evaluation">
           {block.executed_branch_expression ? (
-            <div className="space-y-1.5 text-sm text-slate-300">
+            <div className="space-y-1.5 text-sm text-tertiary-foreground">
               <div>
-                <span className="text-slate-500">Expression: </span>
+                <span className="text-muted-foreground dark:text-slate-500">
+                  Expression:{" "}
+                </span>
                 <CodeBlock className="mt-1">
                   {block.executed_branch_expression}
                 </CodeBlock>
               </div>
               <div>
-                <span className="text-slate-500">Result: </span>
+                <span className="text-muted-foreground dark:text-slate-500">
+                  Result:{" "}
+                </span>
                 <span
                   className={cn(
                     "font-medium",
                     block.executed_branch_result
                       ? "text-success"
-                      : "text-red-400",
+                      : "text-red-700 dark:text-red-400",
                   )}
                 >
                   {block.executed_branch_result ? "True" : "False"}
@@ -144,7 +152,7 @@ function BlockDetailConditional({ block }: Props) {
               </div>
             </div>
           ) : (
-            <div className="text-sm text-slate-400">
+            <div className="text-sm text-muted-foreground">
               No conditions matched — executed default branch.
             </div>
           )}

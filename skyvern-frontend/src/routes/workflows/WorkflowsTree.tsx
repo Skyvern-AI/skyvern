@@ -824,7 +824,7 @@ function WorkflowsTree() {
       return (
         <TableMessageRow colSpan={columnCount}>
           <div className="flex flex-col items-center gap-3 py-6">
-            <FolderIcon className="h-8 w-8 text-blue-400 opacity-50" />
+            <FolderIcon className="h-8 w-8 text-blue-700 opacity-50 dark:text-blue-400" />
             <p className="text-sm text-muted-foreground">
               No folders or agents yet. Create a folder to organize your work,
               or create your first agent.

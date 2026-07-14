@@ -56,7 +56,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
             <DialogTrigger asChild>
               <button
                 onClick={(e) => e.stopPropagation()}
-                className="rounded p-1.5 text-red-400 transition-colors hover:bg-red-500/20 hover:text-red-300"
+                className="rounded p-1.5 text-red-700 transition-colors hover:bg-red-500/20 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
                 aria-label="Delete folder"
               >
                 <GarbageIcon className="h-4 w-4" />

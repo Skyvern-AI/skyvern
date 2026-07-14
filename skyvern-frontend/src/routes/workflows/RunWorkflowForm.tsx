@@ -674,7 +674,7 @@ function RunWorkflowForm({
             <h1 className="text-3xl">
               Inputs{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
-            <h2 className="text-lg text-slate-400">
+            <h2 className="text-lg text-muted-foreground">
               Fill the placeholder values that you have linked throughout your
               agent.
             </h2>
@@ -792,15 +792,15 @@ function RunWorkflowForm({
                     render={({ field }) => (
                       <FormItem>
                         <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
+                          <FormLabel className="!text-foreground">
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
                                 {title}
-                                <span className="text-sm text-slate-400">
+                                <span className="text-sm text-muted-foreground">
                                   credential
                                 </span>
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 {description}
                               </h2>
                             </div>
@@ -928,17 +928,17 @@ function RunWorkflowForm({
                     return (
                       <FormItem>
                         <div className="flex gap-16">
-                          <FormLabel className="!text-slate-50">
+                          <FormLabel className="!text-foreground">
                             <div className="w-72">
                               <div className="flex items-center gap-2 text-lg">
                                 {parameter.key}
-                                <span className="text-sm text-slate-400">
+                                <span className="text-sm text-muted-foreground">
                                   {getLabelForWorkflowParameterType(
                                     parameter.workflow_parameter_type,
                                   )}
                                 </span>
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 {parameter.description}
                               </h2>
                             </div>
@@ -1019,7 +1019,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Webhook Callback URL
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           The URL of a webhook endpoint to send the details of
                           the agent result.
                         </h2>
@@ -1079,7 +1079,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Proxy Location
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           Route Skyvern through one of our available proxies.
                         </h2>
                       </div>
@@ -1129,7 +1129,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Run With
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           {descriptions[field.value] ?? descriptions.agent}
                         </h2>
                       </div>
@@ -1170,7 +1170,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           AI Fallback (cached scripts)
                         </div>
-                        <h2 className="text-sm text-slate-400">
+                        <h2 className="text-sm text-muted-foreground">
                           If the run fails when running with code, keep this on
                           to have AI attempt to fix the issue and regenerate the
                           code.
@@ -1216,7 +1216,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Session ID
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Use a persistent browser session to maintain
                                   state and enable browser interaction.
                                 </h2>
@@ -1253,7 +1253,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Profile
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Load a saved browser profile to reuse cookies,
                                   storage, and signed-in state for this run.
                                 </h2>
@@ -1286,7 +1286,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Address
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   The address of the Browser server to use for
                                   the agent run.
                                 </h2>
@@ -1324,7 +1324,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Extra HTTP Headers
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Specify some self defined HTTP requests
                                   headers in Dict format
                                 </h2>
@@ -1358,7 +1358,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   CDP Connect Headers
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   Headers attached only to the CDP WebSocket
                                   handshake when connecting to a remote browser
                                   (e.g. auth for the CDP endpoint). Not
@@ -1394,7 +1394,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Max Screenshot Scrolls
                                 </div>
-                                <h2 className="text-sm text-slate-400">
+                                <h2 className="text-sm text-muted-foreground">
                                   {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                                 </h2>
                               </div>

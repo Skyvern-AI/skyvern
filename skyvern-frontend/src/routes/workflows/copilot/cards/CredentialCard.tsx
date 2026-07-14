@@ -161,7 +161,7 @@ function useCountdown(expiresAt: string, active: boolean) {
 function CredentialSystemRow({ text }: { text: string }) {
   return (
     <div className="flex items-center gap-2 px-1 py-1 text-xs text-muted-foreground">
-      <span className="h-1 w-1 flex-none rounded-full bg-slate-600" />
+      <span className="h-1 w-1 flex-none rounded-full bg-muted-foreground dark:bg-slate-600" />
       {text}
     </div>
   );
@@ -271,7 +271,7 @@ export function CredentialCard({
             aria-label="Skip for now"
             onClick={() => onSkip()}
             disabled={disabled}
-            className="flex h-5 w-5 flex-none items-center justify-center rounded-md text-slate-500 hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+            className="flex h-5 w-5 flex-none items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500"
           >
             <Cross2Icon className="h-3 w-3" />
           </button>
