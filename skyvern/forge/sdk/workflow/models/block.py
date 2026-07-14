@@ -1888,6 +1888,8 @@ class ForLoopBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
+    max_loop_items: int | None = None
+    task_v2_loop_replay: bool = False
 
     loop_blocks: list[BlockTypeVar]
     loop_over: PARAMETER_TYPE | None = None
@@ -2399,22 +2401,29 @@ class ForLoopBlock(Block):
         block_outputs: list[BlockResult] = []
         current_block: BlockTypeVar | None = None
 
+        replay_context = skyvern_context.current()
+        if replay_context and self.task_v2_loop_replay:
+            replay_context.task_v2_loop_replay_active = False
+            replay_context.task_v2_loop_replay_source_task_id = None
+            replay_context.task_v2_loop_replay_current_value = None
+
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
 
+        effective_max_loop_items = self.max_loop_items or DEFAULT_MAX_LOOP_ITERATIONS
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
-            if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
+            if loop_idx >= effective_max_loop_items:
                 LOG.info(
-                    f"ForLoopBlock Reached max_iterations limit ({DEFAULT_MAX_LOOP_ITERATIONS}), stopping loop",
+                    f"ForLoopBlock Reached max_iterations limit ({effective_max_loop_items}), stopping loop",
                     workflow_run_id=workflow_run_id,
                     loop_idx=loop_idx,
-                    max_iterations=DEFAULT_MAX_LOOP_ITERATIONS,
+                    max_iterations=effective_max_loop_items,
                 )
                 failure_block_result = await self.build_block_result(
                     success=False,
                     status=BlockStatus.failed,
-                    failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
+                    failure_reason=f"Reached max_loop_iterations limit of {effective_max_loop_items}",
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                     is_synthetic_loop_failure=True,
@@ -2529,14 +2538,45 @@ class ForLoopBlock(Block):
                     if cond_label in conditional_wrb_ids:
                         parent_wrb_id = conditional_wrb_ids[cond_label]
 
-                block_output = await loop_block.execute_safe(
-                    workflow_run_id=workflow_run_id,
-                    parent_workflow_run_block_id=parent_wrb_id,
-                    organization_id=organization_id,
-                    browser_session_id=browser_session_id,
-                    current_value=str(loop_over_value),
-                    current_index=loop_idx,
-                )
+                replay_context = skyvern_context.current()
+                if replay_context:
+                    replay_context.task_v2_loop_replay_active = bool(
+                        self.task_v2_loop_replay and loop_idx > 0 and replay_context.task_v2_loop_replay_source_task_id
+                    )
+                    replay_context.task_v2_loop_replay_current_value = loop_over_value
+                try:
+                    block_output = await loop_block.execute_safe(
+                        workflow_run_id=workflow_run_id,
+                        parent_workflow_run_block_id=parent_wrb_id,
+                        organization_id=organization_id,
+                        browser_session_id=browser_session_id,
+                        current_value=str(loop_over_value),
+                        current_index=loop_idx,
+                    )
+                finally:
+                    if replay_context:
+                        replay_context.task_v2_loop_replay_active = False
+                        replay_context.task_v2_loop_replay_current_value = None
+
+                if (
+                    self.task_v2_loop_replay
+                    and loop_idx == 0
+                    and block_output.success
+                    and block_output.workflow_run_block_id
+                    and replay_context
+                ):
+                    try:
+                        source_block = await app.DATABASE.observer.get_workflow_run_block(
+                            block_output.workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                        replay_context.task_v2_loop_replay_source_task_id = source_block.task_id
+                    except Exception:
+                        LOG.warning(
+                            "Unable to capture Task V2 loop replay source; later items will use AI",
+                            workflow_run_block_id=block_output.workflow_run_block_id,
+                            exc_info=True,
+                        )
 
                 # Track conditional workflow_run_block_ids so branch targets
                 # can be parented to them.

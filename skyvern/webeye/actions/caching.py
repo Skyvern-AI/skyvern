@@ -3,6 +3,7 @@ import structlog
 from skyvern.exceptions import CachedActionPlanError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.webeye.actions.action_types import ActionType
@@ -183,6 +184,15 @@ async def personalize_actions(
 async def get_user_detail_answers(
     task: Task, step: Step, scraped_page: ScrapedPage, queries_and_answers: dict[str, str | None]
 ) -> dict[str, str]:
+    context = skyvern_context.current()
+    if (
+        context
+        and context.task_v2_loop_replay_active
+        and context.task_v2_loop_replay_current_value is not None
+        and len(queries_and_answers) == 1
+    ):
+        query = next(iter(queries_and_answers))
+        return {query: str(context.task_v2_loop_replay_current_value)}
     try:
         question_answering_prompt = prompt_engine.load_prompt(
             "answer-user-detail-questions",
