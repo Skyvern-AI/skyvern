@@ -264,6 +264,7 @@ class LocalExecutionChannel(ExecutionChannel):
         self.page = page
         self.pw = None
         self.url = None
+        self._closing = False
 
     @property
     def identity(self) -> dict[str, t.Any]:
