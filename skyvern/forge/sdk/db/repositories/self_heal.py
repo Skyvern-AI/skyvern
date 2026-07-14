@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.models import HealEpisodeModel, WorkflowHealProposalModel
+from skyvern.forge.sdk.db.models import HealEpisodeModel, WorkflowHealProposalModel, WorkflowRunModel
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus, OutputObligation, WorkflowHealProposal
 
@@ -98,6 +98,86 @@ class SelfHealRepository(BaseRepository):
 
             order = HealEpisodeModel.created_at.asc() if ascending else HealEpisodeModel.created_at.desc()
             episodes = (await session.scalars(query.order_by(order).limit(limit))).all()
+            return [HealEpisode.model_validate(episode) for episode in episodes]
+
+    @db_operation("get_heal_episodes_for_workflow")
+    async def get_heal_episodes_for_workflow(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        block_label: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[HealEpisode]:
+        async with self.Session() as session:
+            query = select(HealEpisodeModel).where(
+                HealEpisodeModel.organization_id == organization_id,
+                HealEpisodeModel.workflow_permanent_id == workflow_permanent_id,
+            )
+            if block_label is not None:
+                query = query.where(HealEpisodeModel.block_label == block_label)
+            if status is not None:
+                query = query.where(HealEpisodeModel.status == status)
+
+            episodes = (
+                await session.scalars(
+                    query.order_by(HealEpisodeModel.created_at.desc(), HealEpisodeModel.heal_episode_id.desc())
+                    .limit(max(1, min(limit, 200)))
+                    .offset(max(offset, 0))
+                )
+            ).all()
+            return [HealEpisode.model_validate(episode) for episode in episodes]
+
+    @db_operation("get_heal_episodes_for_run")
+    async def get_heal_episodes_for_run(self, organization_id: str, workflow_run_id: str) -> list[HealEpisode]:
+        async with self.Session() as session:
+            query = select(HealEpisodeModel).where(
+                HealEpisodeModel.organization_id == organization_id,
+                HealEpisodeModel.workflow_run_id == workflow_run_id,
+            )
+            episodes = (
+                await session.scalars(
+                    query.order_by(HealEpisodeModel.created_at.asc(), HealEpisodeModel.heal_episode_id.asc())
+                )
+            ).all()
+            return [HealEpisode.model_validate(episode) for episode in episodes]
+
+    @db_operation("get_recent_terminal_workflow_run_ids")
+    async def get_recent_terminal_workflow_run_ids(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        limit: int = 20,
+    ) -> list[str]:
+        terminal_statuses = ("completed", "failed", "terminated", "timed_out")
+        bounded_limit = max(1, min(limit, 100))
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel.workflow_run_id)
+                .where(
+                    WorkflowRunModel.organization_id == organization_id,
+                    WorkflowRunModel.workflow_permanent_id == workflow_permanent_id,
+                    WorkflowRunModel.status.in_(terminal_statuses),
+                    WorkflowRunModel.parent_workflow_run_id.is_(None),
+                    WorkflowRunModel.copilot_session_id.is_(None),
+                    WorkflowRunModel.debug_session_id.is_(None),
+                )
+                .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+                .limit(bounded_limit)
+            )
+            return list((await session.scalars(query)).all())
+
+    @db_operation("get_heal_episodes_for_runs")
+    async def get_heal_episodes_for_runs(self, organization_id: str, workflow_run_ids: list[str]) -> list[HealEpisode]:
+        if not workflow_run_ids:
+            return []
+        async with self.Session() as session:
+            query = select(HealEpisodeModel).where(
+                HealEpisodeModel.organization_id == organization_id,
+                HealEpisodeModel.workflow_run_id.in_(workflow_run_ids),
+            )
+            episodes = (await session.scalars(query.order_by(HealEpisodeModel.created_at.asc()))).all()
             return [HealEpisode.model_validate(episode) for episode in episodes]
 
     @db_operation("create_heal_proposal")
