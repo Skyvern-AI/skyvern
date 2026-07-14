@@ -3,7 +3,6 @@ Tests for methods in utils.py that use commentjson.loads
 """
 
 import json
-from unittest.mock import Mock
 
 import litellm
 import pytest
@@ -15,13 +14,17 @@ from skyvern.forge.sdk.api.llm.utils import _fix_cutoff_json, _fix_unescaped_quo
 class TestParseApiResponse:
     """Tests for parse_api_response function"""
 
-    def _create_mock_response(self, content: str | None) -> Mock:
-        """Helper method to create a mock LiteLLM response with the given content"""
-        response = Mock(spec=litellm.ModelResponse)
-        response.choices = [Mock()]
-        response.choices[0].message = Mock()
-        response.choices[0].message.content = content
-        return response
+    def _create_mock_response(self, content: str | None) -> litellm.ModelResponse:
+        """Helper method to create a LiteLLM response with the given content.
+
+        Uses a real ModelResponse rather than a Mock so that structlog's
+        exc_info rendering (which iterates the response on parse failures)
+        does not choke on a Mock during the error-path tests.
+        """
+        return litellm.ModelResponse(
+            choices=[litellm.Choices(message=litellm.Message(content=content, role="assistant"))],
+            model="gpt-4o",
+        )
 
     def test_parse_api_response_valid_json(self) -> None:
         """Test parsing a valid JSON response"""
