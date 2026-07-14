@@ -73,6 +73,43 @@ class HealEpisode(BaseModel):
     modified_at: datetime
 
 
+class HealEpisodeView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    heal_episode_id: str
+    organization_id: str
+    workflow_permanent_id: str
+    workflow_id: str
+    workflow_run_id: str
+    workflow_run_block_id: str
+    block_label: str
+    engine: str
+    status: HealStatus
+    skip_reason: HealSkipReason | None = None
+    block_steps: list | dict | None = None
+    snapshot_available: bool = False
+    convergence_eligible: bool = False
+    parameter_binding_keys: list[str] | dict | None = None
+    exception_class: str | None = None
+    failing_line: int | None = None
+    matched_step_index: int | None = None
+    escalation_task_id: str | None = None
+    wall_clock_ms: int | None = None
+    action_count: int | None = None
+    output_obligation: OutputObligation | None = None
+    dom_snapshot_artifact_id: str | None = None
+    scout_transcript_artifact_id: str | None = None
+    screenshot_artifact_id: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+
+class HealEpisodeDetail(HealEpisodeView):
+    sanitized_block_code: str | None = None
+    sanitized_block_prompt: str | None = None
+    sanitized_failure_message: str | None = None
+
+
 class WorkflowHealProposal(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
