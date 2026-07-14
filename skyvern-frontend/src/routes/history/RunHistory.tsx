@@ -186,9 +186,17 @@ function RunHistory() {
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
-  const effectiveSearch = workflowPermanentIdFilter || debouncedSearch;
+  // The /runs search_key requires min 3 chars (trigram index); shorter queries 422.
+  const trimmedSearch = debouncedSearch.trim();
+  const textSearch = trimmedSearch.length >= 3 ? trimmedSearch : "";
+  const effectiveSearch = workflowPermanentIdFilter || textSearch;
 
-  const { data: rawRuns, isFetching } = useRunsQuery({
+  const {
+    data: rawRuns,
+    isFetching,
+    isError,
+    refetch,
+  } = useRunsQuery({
     page,
     pageSize: itemsPerPage,
     statusFilters,
@@ -278,6 +286,26 @@ function RunHistory() {
       ));
     }
 
+    // Failed to load runs
+    if (isError) {
+      return (
+        <TableMessageRow colSpan={6}>
+          <div className="flex items-center justify-center gap-3">
+            <span>Failed to load runs.</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                refetch();
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        </TableMessageRow>
+      );
+    }
+
     // No runs found
     if (runs?.length === 0) {
       return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
@@ -330,7 +358,7 @@ function RunHistory() {
             }}
           >
             <TableCell className="max-w-0 truncate" title={run.run_id}>
-              <HighlightText text={run.run_id} query={debouncedSearch} />
+              <HighlightText text={run.run_id} query={textSearch} />
             </TableCell>
             <TableCell
               className="max-w-0 truncate"
@@ -417,7 +445,7 @@ function RunHistory() {
   const hasActiveFilters =
     statusFilters.length > 0 ||
     runTypeGroups.length > 0 ||
-    !!debouncedSearch ||
+    !!textSearch ||
     !!workflowPermanentIdFilter;
   const showOnboardingEmpty =
     !isFetching &&

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserType,
     is_final_status,
 )
+from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.async_utils import await_to_terminal_state
 from skyvern.webeye.browser_state import BrowserState
@@ -1082,6 +1083,33 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             except Exception:
                 LOG.exception("Browser session reaper pass failed")
 
+    async def _owning_run_is_active(self, runnable_id: str, runnable_type: str | None, organization_id: str) -> bool:
+        """Whether the run occupying a session is still live, so the reaper must leave teardown to it.
+
+        A run that dies before release_browser_session leaves runnable_id set forever; treating a
+        terminal or missing owner as inactive lets the normal timeout+grace gate reclaim the session
+        instead of skipping it forever. Owners we can't authoritatively resolve — an unrecognized
+        runnable type or a lookup failure — are treated as active, so a reap never races a run we
+        can't prove is gone."""
+        if runnable_type != RunType.workflow_run:
+            return True
+        try:
+            workflow_run = await self.database.workflow_runs.get_workflow_run(
+                workflow_run_id=runnable_id,
+                organization_id=organization_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Could not resolve owning run for persistent browser session; leaving it protected",
+                runnable_id=runnable_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return True
+        if workflow_run is None:
+            return False
+        return not workflow_run.status.is_final()
+
     async def reap_expired_sessions(self) -> None:
         """Close the sessions this process holds whose timeout (plus grace) has elapsed via
         close_session, which tears down the context (stopping its ffmpeg recorder), syncs the
@@ -1096,8 +1124,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
             if db_session.persistent_browser_session_id not in self._browser_sessions and not owns_vnc_stack:
                 continue
-            # Leave sessions occupied by a running task/workflow to that run's own teardown.
-            if db_session.runnable_id is not None:
+            # Leave sessions occupied by a still-live run to that run's own teardown. A run that died
+            # before releasing occupancy leaves runnable_id set forever, so resolve the owner and let
+            # an expired session with a terminal/missing owner fall through to the expiry gate below.
+            if db_session.runnable_id is not None and await self._owning_run_is_active(
+                db_session.runnable_id, db_session.runnable_type, db_session.organization_id
+            ):
                 continue
             # Leave sessions an active copilot turn is driving (no runnable_id and not renewed).
             if db_session.persistent_browser_session_id in copilot_session_ids:
