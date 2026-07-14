@@ -11,6 +11,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
@@ -568,6 +569,64 @@ describe("RunView iteration selection", () => {
     expect(scope.queryByText("Iteration 2 value")).toBeNull();
     expect(useRunViewStore.getState().activeIteration).toBeNull();
   }, 20_000);
+});
+
+describe("RunView timeline → editor jump", () => {
+  function seedRunWithBlock(label: string) {
+    mocks.timeline = [
+      buildBlockItem(buildBlock({ workflow_run_block_id: "wrb_jump", label })),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  function registerHandle() {
+    const focusBlock = vi.fn();
+    useWorkflowBlockSearchStore.getState().registerHandle({
+      getTargets: () => [
+        { nodeId: "node-jump", label: "jump-target-block", blockType: null },
+      ],
+      focusBlock,
+    });
+    return focusBlock;
+  }
+
+  function clickBlock(container: HTMLElement) {
+    const [blockButton] = within(container).getAllByText("jump-target-block");
+    if (!blockButton) {
+      throw new Error("timeline block did not render");
+    }
+    fireEvent.click(blockButton);
+  }
+
+  afterEach(() => {
+    useWorkflowBlockSearchStore.getState().registerHandle(null);
+  });
+
+  test("clicking a timeline block jumps the editor when the editor pane is open", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=editor,overview");
+    clickBlock(container);
+
+    expect(focusBlock).toHaveBeenCalledWith("node-jump");
+  });
+
+  test("clicking a timeline block does not jump when the editor pane is closed", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=overview");
+    clickBlock(container);
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
 });
 
 describe("RunView output signals", () => {
