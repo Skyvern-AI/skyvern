@@ -45,6 +45,9 @@ export interface WorkflowCopilotChatRequest {
   target_block_label?: string | null;
   fix_origin?: boolean;
   keep_pending_proposal?: boolean;
+  // Opt-in: only clients that can render the credential_required frame set
+  // this, so the backend never pauses a turn a client would silently drop.
+  supports_credential_pause?: boolean;
 }
 
 export interface WorkflowCopilotCancelRequest {
@@ -107,7 +110,8 @@ export type WorkflowCopilotStreamMessageType =
   | "turn_start"
   | "design_start"
   | "design_end"
-  | "workflow_draft";
+  | "workflow_draft"
+  | "credential_required";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -172,6 +176,23 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   summary: string | null;
   timestamp: string;
   workflow?: WorkflowApiResponse | null;
+}
+
+// Mid-build pause frame: the turn stays open (SSE alive) while the client
+// surfaces a credential card. reason stays a raw string here — CredentialCard
+// tolerates unknown reason tokens, so a newer backend can't break the wiring.
+export interface WorkflowCopilotCredentialRequiredUpdate {
+  type: "credential_required";
+  turn_id: string;
+  workflow_copilot_chat_id: string;
+  resume_token: string;
+  reason: string;
+  message: string;
+  login_page_urls: string[];
+  credential_refs: string[];
+  timeout_seconds: number;
+  expires_at: string;
+  timestamp: string;
 }
 
 export interface WorkflowCopilotToolCallUpdate {
