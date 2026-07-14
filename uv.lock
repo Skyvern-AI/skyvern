@@ -2354,11 +2354,11 @@ wheels = [
 
 [[package]]
 name = "json-repair"
-version = "0.59.5"
+version = "0.60.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b7/67/eba7fad54ff6f5cce6db4e01f596fc68156b5c7e864af0aa07ad48e880a1/json_repair-0.59.5.tar.gz", hash = "sha256:bb886ee054e99066be8a337b67a986b6a50d79be9a5ad37ae81966e698990784", size = 48632, upload-time = "2026-04-24T11:41:38.133Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/a6/d69888cb4ffde30e80db1e6c32caaadd2f984a80067d5ea72c2cb3f61c3f/json_repair-0.60.1.tar.gz", hash = "sha256:841661cdd2df507c9a4e189097f38ca6bc372e06d4b4e36d72e590f68176c290", size = 49451, upload-time = "2026-06-03T17:28:44.451Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3e/aa/0529dee460b745b93f6abc97b56b7527314c5167ba29ab7a5bd5c08de01f/json_repair-0.59.5-py3-none-any.whl", hash = "sha256:6869965bd1cc1aaaa04dc85865c26fbb76d9a2d83a20010f5eae2563b1567827", size = 47282, upload-time = "2026-04-24T11:41:36.653Z" },
+    { url = "https://files.pythonhosted.org/packages/32/1f/2a2b5eea8ef5762a86ad3f8fddddaaba2c0d76dd44e644b9158900868bec/json_repair-0.60.1-py3-none-any.whl", hash = "sha256:ba6ff974f2a8bef2f7768144a7f03f870a816443f03da27a49cdd0ec31a78049", size = 48045, upload-time = "2026-06-03T17:28:43.038Z" },
 ]
 
 [[package]]
@@ -6069,8 +6069,8 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
     { name = "jinja2", marker = "extra == 'local'", specifier = ">=3.1.2,<4" },
     { name = "jinja2", marker = "extra == 'server'", specifier = ">=3.1.2,<4" },
-    { name = "json-repair", marker = "extra == 'local'", specifier = ">=0.59.5,<0.60" },
-    { name = "json-repair", marker = "extra == 'server'", specifier = ">=0.59.5,<0.60" },
+    { name = "json-repair", marker = "extra == 'local'", specifier = ">=0.60.1,<0.61" },
+    { name = "json-repair", marker = "extra == 'server'", specifier = ">=0.60.1,<0.61" },
     { name = "json5", marker = "extra == 'local'", specifier = ">=0.13.0,<1" },
     { name = "json5", marker = "extra == 'server'", specifier = ">=0.13.0,<1" },
     { name = "jsonschema", marker = "extra == 'local'", specifier = ">=4.23.0" },
