@@ -20,6 +20,7 @@ type Props = {
   statusFilters?: Array<Status>;
   runTypeFilters?: Array<TaskRunType>;
   search?: string;
+  tags?: string;
 } & UseQueryOptions;
 
 function useRunsQuery({
@@ -28,6 +29,7 @@ function useRunsQuery({
   statusFilters,
   runTypeFilters,
   search,
+  tags,
   ...queryOptions
 }: Props) {
   const credentialGetter = useCredentialGetter();
@@ -35,7 +37,7 @@ function useRunsQuery({
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   return useQuery<Array<TaskRunListItem>>({
     queryKey: getOrgScopedQueryKey(
-      ["runs", { statusFilters, runTypeFilters }, page, pageSize, search],
+      ["runs", { statusFilters, runTypeFilters, tags }, page, pageSize, search],
       activeOrgQueryKeyScope,
     ),
     queryFn: async ({ signal }) => {
@@ -55,6 +57,9 @@ function useRunsQuery({
       }
       if (search) {
         params.append("search_key", search);
+      }
+      if (tags) {
+        params.append("tags", tags);
       }
       return client.get("/runs", { params, signal }).then((res) => res.data);
     },
