@@ -517,6 +517,8 @@ def block_yaml_to_block(
             loop_blocks=loop_blocks,
             complete_if_empty=block_yaml.complete_if_empty,
             data_schema=block_yaml.data_schema,
+            max_loop_items=block_yaml.max_loop_items,
+            task_v2_loop_replay=block_yaml.task_v2_loop_replay,
         )
     elif block_yaml.block_type == BlockType.WHILE_LOOP:
         loop_blocks = [block_yaml_to_block(loop_block, parameters) for loop_block in block_yaml.loop_blocks]

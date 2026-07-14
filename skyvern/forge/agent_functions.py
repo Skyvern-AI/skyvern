@@ -1042,7 +1042,31 @@ class AgentFunction:
         Returns:
             A list of actions to inject into the step (skipping LLM), or None for normal flow.
         """
-        return None
+        context = skyvern_context.current()
+        if not context or not context.task_v2_loop_replay_active:
+            return None
+        if not context.task_v2_loop_replay_source_task_id:
+            return None
+
+        # Import lazily: caching depends on the global app singleton initialized by forge.
+        from skyvern.webeye.actions.caching import retrieve_action_plan  # noqa: PLC0415
+
+        try:
+            scraped_page = await browser_state.scrape_website(
+                url=task.url,
+                cleanup_element_tree=self.cleanup_element_tree_factory(),
+                scrape_exclude=getattr(app, "scrape_exclude", None),
+            )
+            replay_actions = await retrieve_action_plan(task, step, scraped_page)
+        except Exception:
+            LOG.warning(
+                "Task V2 loop replay preparation failed; falling back to AI",
+                task_id=task.task_id,
+                source_task_id=context.task_v2_loop_replay_source_task_id,
+                exc_info=True,
+            )
+            return None
+        return replay_actions or None
 
     async def post_step_execution(self, task: Task, step: Step) -> None:
         if step.status == StepStatus.completed:

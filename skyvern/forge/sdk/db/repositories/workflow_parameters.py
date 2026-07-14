@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -875,6 +876,19 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("retrieve_action_plan")
     async def retrieve_action_plan(self, task: Task) -> list[Action]:
         async with self.Session() as session:
+            context = skyvern_context.current()
+            replay_source_task_id = (
+                context.task_v2_loop_replay_source_task_id if context and context.task_v2_loop_replay_active else None
+            )
+            if replay_source_task_id:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.task_id == replay_source_task_id)
+                    .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
+                )
+                actions = (await session.scalars(query)).all()
+                return [Action.model_validate(action) for action in actions]
+
             subquery = (
                 select(TaskModel.task_id)
                 .filter(TaskModel.url == task.url)
