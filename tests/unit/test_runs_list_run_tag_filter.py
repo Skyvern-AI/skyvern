@@ -262,6 +262,31 @@ async def test_parse_and_gate_tag_filter_terms_only_gates_nonempty_filters(
     gate.assert_awaited_once_with(organization)
 
 
+@pytest.mark.asyncio
+async def test_parse_tag_filter_terms_dedupes_repeated_terms() -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    assert ap._parse_tag_filter_terms(["env:prod,env:prod", "env:prod", "demo,demo"]) == [
+        ("env", "prod"),
+        (None, "demo"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parse_tag_filter_terms_caps_comma_split_terms() -> None:
+    from fastapi import HTTPException
+
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    at_cap = ",".join(f"k{i}:v" for i in range(ap._MAX_TAG_FILTER_TERMS))
+    assert len(ap._parse_tag_filter_terms([at_cap])) == ap._MAX_TAG_FILTER_TERMS
+
+    over_cap = ",".join(f"k{i}:v" for i in range(ap._MAX_TAG_FILTER_TERMS + 1))
+    with pytest.raises(HTTPException) as exc_info:
+        ap._parse_tag_filter_terms([over_cap])
+    assert exc_info.value.status_code == 400
+
+
 @pytest.fixture
 def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     from skyvern.forge.sdk.routes.routers import base_router
