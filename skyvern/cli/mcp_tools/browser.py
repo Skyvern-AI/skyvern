@@ -129,7 +129,7 @@ def _exception_message(exc: Exception) -> str:
     # get_user_facing_exception_message's "Unexpected error: {exception}" fallback in
     # skyvern/exceptions.py) — never surface them. 4xx bodies are the API's intended
     # client-facing feedback (typed BadRequest/NotFound/UnprocessableEntity errors).
-    surface_body = not (isinstance(status_code, int) and status_code >= 500)
+    surface_body = status_code is None or (isinstance(status_code, int) and 400 <= status_code < 500)
     body_message = _message_from_error_body(getattr(exc, "body", None)) if surface_body else None
     if body_message:
         return f"HTTP {status_code}: {body_message}" if status_code is not None else body_message
@@ -526,8 +526,9 @@ async def skyvern_drag(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SELECTOR_NOT_FOUND,
-                    str(e),
+                    _exception_message(e),
                     "Verify source and target selectors match elements on the page",
+                    details=_exception_details(e),
                 ),
             )
         except Exception as e:
@@ -545,7 +546,12 @@ async def skyvern_drag(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The drag operation failed"),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED,
+                    _exception_message(e),
+                    "The drag operation failed",
+                    details=_exception_details(e),
+                ),
             )
 
     return make_result(
@@ -1301,7 +1307,12 @@ async def skyvern_press_key(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check key name is valid"),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED,
+                    _exception_message(e),
+                    "Check key name is valid",
+                    details=_exception_details(e),
+                ),
             )
 
     if selector and intent:
@@ -1391,7 +1402,11 @@ async def skyvern_wait(
                         break
                     if loop.time() >= deadline:
                         code = ErrorCode.SDK_ERROR if last_error else ErrorCode.TIMEOUT
-                        msg = str(last_error) if last_error else f"Condition not met within {timeout}ms: {intent}"
+                        msg = (
+                            _exception_message(last_error)
+                            if last_error
+                            else f"Condition not met within {timeout}ms: {intent}"
+                        )
                         return make_result(
                             "skyvern_wait",
                             ok=False,
@@ -1401,6 +1416,7 @@ async def skyvern_wait(
                                 code,
                                 msg,
                                 "Increase timeout or check that the condition can be satisfied",
+                                details=_exception_details(last_error) if last_error else None,
                             ),
                         )
                     await page.wait_for_timeout(poll_interval_ms)
@@ -1415,7 +1431,12 @@ async def skyvern_wait(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.TIMEOUT, str(e), "Condition was not met within timeout"),
+                error=make_error(
+                    ErrorCode.TIMEOUT,
+                    _exception_message(e),
+                    "Condition was not met within timeout",
+                    details=_exception_details(e),
+                ),
             )
 
     sdk_eq = ""
