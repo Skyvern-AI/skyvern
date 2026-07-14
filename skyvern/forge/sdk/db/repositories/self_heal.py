@@ -100,6 +100,49 @@ class SelfHealRepository(BaseRepository):
             episodes = (await session.scalars(query.order_by(order).limit(limit))).all()
             return [HealEpisode.model_validate(episode) for episode in episodes]
 
+    @db_operation("get_heal_episodes_for_workflow")
+    async def get_heal_episodes_for_workflow(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        block_label: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[HealEpisode]:
+        async with self.Session() as session:
+            query = select(HealEpisodeModel).where(
+                HealEpisodeModel.organization_id == organization_id,
+                HealEpisodeModel.workflow_permanent_id == workflow_permanent_id,
+            )
+            if block_label is not None:
+                query = query.where(HealEpisodeModel.block_label == block_label)
+            if status is not None:
+                query = query.where(HealEpisodeModel.status == status)
+
+            episodes = (
+                await session.scalars(
+                    query.order_by(HealEpisodeModel.created_at.desc(), HealEpisodeModel.heal_episode_id.desc())
+                    .limit(max(1, min(limit, 200)))
+                    .offset(max(offset, 0))
+                )
+            ).all()
+            return [HealEpisode.model_validate(episode) for episode in episodes]
+
+    @db_operation("get_heal_episodes_for_run")
+    async def get_heal_episodes_for_run(self, organization_id: str, workflow_run_id: str) -> list[HealEpisode]:
+        async with self.Session() as session:
+            query = select(HealEpisodeModel).where(
+                HealEpisodeModel.organization_id == organization_id,
+                HealEpisodeModel.workflow_run_id == workflow_run_id,
+            )
+            episodes = (
+                await session.scalars(
+                    query.order_by(HealEpisodeModel.created_at.asc(), HealEpisodeModel.heal_episode_id.asc())
+                )
+            ).all()
+            return [HealEpisode.model_validate(episode) for episode in episodes]
+
     @db_operation("create_heal_proposal")
     async def create_heal_proposal(
         self,

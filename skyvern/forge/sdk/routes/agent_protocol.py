@@ -3896,12 +3896,19 @@ async def get_runs(
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
+_MAX_TAG_FILTER_TERMS = 20
+
+
 def _parse_tag_filter_terms(tags: list[str] | None) -> list[tuple[str | None, str | None]]:
     """Parse a repeated/comma-separated ``tags`` query param into (key, value) filter terms.
 
     Shared by ``get_runs_v2``, ``get_workflow_runs_by_id``, and ``get_workflows``. Each term is a
     label (``production`` -> ``(None, "production")``), a group wildcard (``env:*`` -> ``("env", None)``),
     or an exact group:label (``env:prod`` -> ``("env", "prod")``); malformed terms raise a 400.
+
+    Terms are deduplicated, then capped at ``_MAX_TAG_FILTER_TERMS`` (400 beyond it): the
+    ``Query(max_length=20)`` on callers only bounds repeated params, not the comma-split
+    expansion, and each distinct term becomes its own AND'd subquery.
     """
     # A lone empty value (?tags= with nothing else) is a no-op for backward
     # compat; any blank segment alongside real ones — comma (env:prod,) or
@@ -3940,7 +3947,13 @@ def _parse_tag_filter_terms(tags: list[str] | None) -> list[tuple[str | None, st
                 )
             else:
                 parsed_tags.append((tag_key, tag_value))
-    return parsed_tags
+    deduped_tags = list(dict.fromkeys(parsed_tags))
+    if len(deduped_tags) > _MAX_TAG_FILTER_TERMS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"Too many tag filter terms; at most {_MAX_TAG_FILTER_TERMS} distinct terms are allowed.",
+        )
+    return deduped_tags
 
 
 async def _parse_and_gate_tag_filter_terms(
