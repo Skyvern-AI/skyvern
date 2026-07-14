@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -21,9 +21,11 @@ DRIVE_UPLOAD_API_BASE = "https://www.googleapis.com/upload/drive/v3"
 DRIVE_MULTIPART_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
 # Reserve headroom for JSON metadata and MIME boundaries below the 5 MiB multipart request cap.
 DRIVE_MULTIPART_FILE_MAX_BYTES = DRIVE_MULTIPART_UPLOAD_MAX_BYTES - 10 * 1024
-DRIVE_RESUMABLE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+# 8 MiB is a multiple of Drive's required 256 KiB unit for non-final chunks.
+DRIVE_RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024
 
 _DEFAULT_BACKOFF_SECONDS = 1.0
+_RATE_LIMIT_403_REASONS = frozenset({"ratelimitexceeded", "userratelimitexceeded"})
 
 
 class GoogleDriveAPIError(RuntimeError):
@@ -32,6 +34,10 @@ class GoogleDriveAPIError(RuntimeError):
         self.status = status
         self.code = code
         self.message = message
+
+
+class GoogleDriveResumableTransportError(Exception):
+    """Retryable transport failure during a resumable chunk PUT — the loop should query offset and resume."""
 
 
 @dataclass(frozen=True)
@@ -55,10 +61,69 @@ class GoogleDriveResumableInitiateRequest:
 
 
 @dataclass(frozen=True)
-class GoogleDriveResumableUploadRequest:
-    target_url: str
-    headers: dict[str, str]
-    file_path: str
+class ResumableChunkResponse:
+    status_code: int
+    range_header: str | None
+    body_text: str | None
+
+
+def build_resumable_chunk_headers(
+    *,
+    content_type: str,
+    start: int,
+    end: int,
+    total: int,
+    chunk_len: int,
+) -> dict[str, str]:
+    return {
+        "Content-Type": content_type,
+        "Content-Length": str(chunk_len),
+        "Content-Range": f"bytes {start}-{end}/{total}",
+    }
+
+
+def build_resumable_status_query_headers(*, total: int) -> dict[str, str]:
+    return {
+        "Content-Range": f"bytes */{total}",
+        "Content-Length": "0",
+    }
+
+
+def parse_resumable_range_offset(range_header: str | None) -> int:
+    if not range_header:
+        return 0
+    try:
+        unit, byte_range = range_header.strip().split("=", 1)
+        start_text, last_byte_text = byte_range.split("-", 1)
+        start = int(start_text.strip())
+        last_byte = int(last_byte_text.strip())
+    except (TypeError, ValueError):
+        return 0
+    if unit.lower() != "bytes" or start != 0 or last_byte < 0:
+        return 0
+    return last_byte + 1
+
+
+def is_retryable_resumable_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code < 600
+
+
+def is_retryable_resumable_response(status_code: int, body_text: str | None) -> bool:
+    if is_retryable_resumable_status(status_code):
+        return True
+    if status_code == 403 and body_text:
+        try:
+            payload = json.loads(body_text)
+        except ValueError:
+            return False
+        error = payload.get("error") if isinstance(payload, dict) else None
+        errors = error.get("errors") if isinstance(error, dict) else None
+        if isinstance(errors, list):
+            return any(
+                isinstance(item, dict) and str(item.get("reason", "")).lower() in _RATE_LIMIT_403_REASONS
+                for item in errors
+            )
+    return False
 
 
 def _compute_backoff(attempt: int, retry_after: str | None) -> float:
@@ -252,19 +317,6 @@ def extract_resumable_session_uri(headers: Mapping[str, str]) -> str:
     )
 
 
-def build_resumable_upload_request(*, file_path: str, session_uri: str) -> GoogleDriveResumableUploadRequest:
-    file_size = Path(file_path).stat().st_size
-    content_type = guess_type(file_path)[0] or "application/octet-stream"
-    return GoogleDriveResumableUploadRequest(
-        target_url=session_uri,
-        headers={
-            "Content-Type": content_type,
-            "Content-Length": str(file_size),
-        },
-        file_path=file_path,
-    )
-
-
 def uploaded_file_from_payload(payload: Any) -> UploadedDriveFile:
     if not isinstance(payload, dict):
         raise GoogleDriveAPIError(status=500, code="malformed_response", message="Malformed Drive upload response")
@@ -275,6 +327,99 @@ def uploaded_file_from_payload(payload: Any) -> UploadedDriveFile:
         id=file_id,
         web_view_link=payload.get("webViewLink"),
     )
+
+
+def _uploaded_file_from_resumable_response(response: ResumableChunkResponse) -> UploadedDriveFile:
+    try:
+        payload = json.loads(response.body_text or "{}")
+    except ValueError as exc:
+        raise GoogleDriveAPIError(
+            status=500,
+            code="malformed_response",
+            message="Drive response was not valid JSON",
+        ) from exc
+    return uploaded_file_from_payload(payload)
+
+
+def _raise_unexpected_resumable_status(status_code: int) -> None:
+    raise GoogleDriveAPIError(
+        status=502,
+        code="resumable_unexpected_status",
+        message=f"Google Drive resumable upload returned unexpected status {status_code}",
+    )
+
+
+async def run_chunked_resumable_upload(
+    *,
+    file_path: str,
+    total: int,
+    send: Callable[[bytes, dict[str, str]], Awaitable[ResumableChunkResponse]],
+    max_attempts: int,
+) -> UploadedDriveFile:
+    content_type = guess_type(file_path)[0] or "application/octet-stream"
+    offset = 0
+    attempts = 0
+    probe_first = False  # after a chunk transport failure, learn Drive's committed offset before re-sending
+
+    async with aiofiles.open(file_path, "rb") as file:
+        while True:
+            if probe_first:
+                try:
+                    response = await send(b"", build_resumable_status_query_headers(total=total))
+                except GoogleDriveResumableTransportError:
+                    attempts += 1
+                    if attempts >= max_attempts:
+                        raise GoogleDriveAPIError(
+                            status=503,
+                            code="resumable_upload_failed",
+                            message="Google Drive resumable upload failed after exhausting resume attempts",
+                        ) from None
+                    await asyncio.sleep(_compute_backoff(attempts, None))
+                    continue
+                probe_first = False
+            else:
+                await file.seek(offset)
+                chunk = await file.read(DRIVE_RESUMABLE_CHUNK_BYTES)
+                if not chunk:
+                    raise GoogleDriveAPIError(
+                        status=500,
+                        code="resumable_incomplete",
+                        message="Google Drive resumable upload could not read the expected file bytes",
+                    )
+                end = offset + len(chunk) - 1
+                headers = build_resumable_chunk_headers(
+                    content_type=content_type,
+                    start=offset,
+                    end=end,
+                    total=total,
+                    chunk_len=len(chunk),
+                )
+                try:
+                    response = await send(chunk, headers)
+                except GoogleDriveResumableTransportError:
+                    # Do not count an attempt here: always reconcile via a status query first, so a lost-but-committed
+                    # chunk is detected instead of re-uploaded into a duplicate.
+                    probe_first = True
+                    continue
+
+            if response.status_code in (200, 201):
+                return _uploaded_file_from_resumable_response(response)
+            if response.status_code == 308:
+                new_offset = parse_resumable_range_offset(response.range_header)
+                if new_offset > offset:
+                    offset = new_offset
+                    attempts = 0
+                else:
+                    attempts += 1
+                    if attempts >= max_attempts:
+                        raise GoogleDriveAPIError(
+                            status=503,
+                            code="resumable_upload_failed",
+                            message="Google Drive resumable upload made no progress after exhausting resume attempts",
+                        ) from None
+                    await asyncio.sleep(_compute_backoff(attempts, None))
+                continue
+            _raise_unexpected_resumable_status(response.status_code)
 
 
 async def _post_multipart_with_retry(
@@ -346,12 +491,6 @@ async def _post_resumable_initiate_with_retry(
     raise AssertionError("Drive resumable upload retry loop exited without a response")
 
 
-async def _iter_file_chunks(file_path: str) -> AsyncIterator[bytes]:
-    async with aiofiles.open(file_path, "rb") as file:
-        while chunk := await file.read(DRIVE_RESUMABLE_UPLOAD_CHUNK_BYTES):
-            yield chunk
-
-
 async def _upload_file_resumable(
     *,
     access_token: str,
@@ -368,36 +507,41 @@ async def _upload_file_resumable(
         initiate_response = await _post_resumable_initiate_with_retry(client, initiate_request)
         _raise_for_error(initiate_response)
         session_uri = extract_resumable_session_uri(initiate_response.headers)
-        upload_request = build_resumable_upload_request(file_path=file_path, session_uri=session_uri)
-        try:
-            upload_response = await client.put(
-                upload_request.target_url,
-                headers=upload_request.headers,
-                content=_iter_file_chunks(upload_request.file_path),
-            )
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
-            raise GoogleDriveAPIError(
-                status=503,
-                code="upstream_unavailable",
-                message=f"Google Drive resumable upload connection failure: {exc}",
-            ) from exc
-        except (httpx.TransportError, httpx.TimeoutException) as exc:
-            raise GoogleDriveAPIError(
-                status=503,
-                code="ambiguous_upload_status",
-                message="Google Drive upload status is unknown after a transport failure.",
-            ) from exc
 
-    _raise_for_error(upload_response)
-    try:
-        payload = upload_response.json() or {}
-    except ValueError as exc:
-        raise GoogleDriveAPIError(
-            status=500,
-            code="malformed_response",
-            message="Drive response was not valid JSON",
-        ) from exc
-    return uploaded_file_from_payload(payload)
+        async def send(body: bytes, headers: dict[str, str]) -> ResumableChunkResponse:
+            try:
+                response = await client.put(session_uri, headers=headers, content=body)
+            except (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.PoolTimeout,
+                httpx.TransportError,
+                httpx.TimeoutException,
+            ) as exc:
+                raise GoogleDriveResumableTransportError(str(exc)) from exc
+            if response.status_code in (200, 201, 308):
+                return ResumableChunkResponse(
+                    status_code=response.status_code,
+                    range_header=response.headers.get("Range"),
+                    body_text=response.text,
+                )
+            if is_retryable_resumable_response(response.status_code, response.text):
+                raise GoogleDriveResumableTransportError(
+                    f"Google Drive returned retryable status {response.status_code}"
+                )
+            _raise_for_error(response)
+            raise GoogleDriveAPIError(
+                status=502,
+                code="resumable_unexpected_status",
+                message=f"Google Drive resumable upload returned unexpected status {response.status_code}",
+            )
+
+        return await run_chunked_resumable_upload(
+            file_path=file_path,
+            total=Path(file_path).stat().st_size,
+            send=send,
+            max_attempts=max(1, settings.GOOGLE_DRIVE_API_MAX_RETRIES),
+        )
 
 
 async def upload_file(

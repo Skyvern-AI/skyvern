@@ -1,8 +1,25 @@
 import { useLocation } from "react-router-dom";
+import {
+  ProxyLocation,
+  type WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 import type { Parameter, WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
+
+export function getRerunNavigationState(
+  workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
+) {
+  return {
+    data: workflowRun.parameters ?? {},
+    proxyLocation: workflowRun.proxy_location ?? ProxyLocation.Residential,
+    webhookCallbackUrl: workflowRun.webhook_callback_url ?? "",
+    maxScreenshotScrolls: workflowRun.max_screenshot_scrolls ?? null,
+    runWith: workflowRun.run_with ?? "agent",
+    browserProfileId: workflowRun.browser_profile_id ?? null,
+  };
+}
 
 /**
  * Keep JSON workflow parameters as editable strings in react-hook-form state.
