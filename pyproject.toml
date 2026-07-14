@@ -56,7 +56,7 @@ local = [
     "aiofiles>=24.1.0,<25",
     "pyotp>=2.9.0,<3",
     "json5>=0.13.0,<1",
-    "json-repair>=0.59.5,<0.60",
+    "json-repair>=0.60.1,<0.61",
     "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     "psutil>=7.0.0",
@@ -134,7 +134,7 @@ server = [
     "pyotp>=2.9.0,<3",
     "asyncpg>=0.30.0,<0.32",
     "json5>=0.13.0,<1",
-    "json-repair>=0.59.5,<0.60",
+    "json-repair>=0.60.1,<0.61",
     "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     # <3.4: 3.4.3 enables HostOriginGuardMiddleware by default (421 on public hosts, SKY-12003).
