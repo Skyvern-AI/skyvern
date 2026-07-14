@@ -1927,7 +1927,7 @@ async def run_task(
             await _handle_script_termination(e, "task block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run task block. Falling back to AI run.")
+            LOG.warning("Failed to run task block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.NAVIGATION,
                 cache_key=cache_key,
@@ -2214,7 +2214,7 @@ async def download(
             await _handle_script_termination(e, "download block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run download block. Falling back to AI run.")
+            LOG.warning("Failed to run download block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.FILE_DOWNLOAD,
                 cache_key=cache_key,
@@ -2304,7 +2304,7 @@ async def action(
             await _handle_script_termination(e, "action block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run action block. Falling back to AI run.")
+            LOG.warning("Failed to run action block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.ACTION,
                 cache_key=cache_key,
