@@ -70,7 +70,10 @@ async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
         locator = page.locator(selector)
         element_id = await locator.get_attribute("unique_id", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
     except Exception:
-        LOG.exception("Failed to get element id by selector", selector=selector)
+        # A selector miss is an expected, handled fallback: callers treat a None return as
+        # a signal to take the heavier AI single-action path (and record a fallback episode),
+        # so warn without a stack trace rather than logging an error on every stale selector.
+        LOG.warning("Failed to get element id by selector", selector=selector)
         return None
     return element_id
 
