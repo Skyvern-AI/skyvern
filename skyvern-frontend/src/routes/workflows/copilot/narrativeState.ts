@@ -200,6 +200,15 @@ export interface TurnNarrativeState {
     displayReason: string | null;
     activitySeqAtVerdict: number;
   } | null;
+  // Terminal-mode credential ask, from the credentialPrompt narrative signal.
+  // reason is kept as a raw string — the card tolerates unknown tokens.
+  credentialPrompt: { reason: string } | null;
+  // Resolved pause outcome, from the credentialPause narrative signal.
+  // "declined" means the pause engaged but never sent a frame, so no card.
+  credentialPause: {
+    outcome: "connected" | "skipped" | "timeout" | "declined";
+    credentialId: string | null;
+  } | null;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -227,6 +236,8 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   authoringCount: 0,
   activitySeq: 0,
   lastRunOutcome: null,
+  credentialPrompt: null,
+  credentialPause: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -254,6 +265,34 @@ export function parseResponseKind(value: unknown): TurnResponseKind | null {
     value === "recover"
     ? value
     : null;
+}
+
+export function parseCredentialPrompt(
+  value: unknown,
+): TurnNarrativeState["credentialPrompt"] {
+  if (!value || typeof value !== "object") return null;
+  const reason = (value as Record<string, unknown>).reason;
+  return typeof reason === "string" && reason.length > 0 ? { reason } : null;
+}
+
+export function parseCredentialPause(
+  value: unknown,
+): TurnNarrativeState["credentialPause"] {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const outcome = o.outcome;
+  if (
+    outcome !== "connected" &&
+    outcome !== "skipped" &&
+    outcome !== "timeout" &&
+    outcome !== "declined"
+  ) {
+    return null;
+  }
+  return {
+    outcome,
+    credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+  };
 }
 
 // Tool calls that write the workflow definition. update_workflow only
@@ -944,6 +983,8 @@ export function hydrateNarrativeFromPayload(
         : null,
     endedAt:
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
+    credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
+    credentialPause: parseCredentialPause(payload.credentialPause),
   };
 }
 

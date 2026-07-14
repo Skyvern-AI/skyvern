@@ -5,8 +5,10 @@ import { python } from "@codemirror/lang-python";
 import { html } from "@codemirror/lang-html";
 import { yaml } from "@codemirror/lang-yaml";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
+import { tokyoNightDay } from "@uiw/codemirror-theme-tokyo-night-day";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
+import { useThemeAsDarkOrLight } from "@/components/useThemeAsDarkOrLight";
 import { useDebouncedCallback } from "use-debounce";
 
 import {
@@ -85,6 +87,7 @@ function CodeEditorImpl({
   // the editor and the oversized-document guard never read `.length` of
   // undefined.
   const safeValue = value ?? "";
+  const themeMode = useThemeAsDarkOrLight();
   const viewRef = useRef<EditorView | null>(null);
   const [internalValue, setInternalValue] = useState(safeValue);
   const latestValueRef = useRef(safeValue);
@@ -277,7 +280,7 @@ function CodeEditorImpl({
       value={internalValue}
       onChange={handleChange}
       extensions={extensions}
-      theme={tokyoNightStorm}
+      theme={themeMode === "dark" ? tokyoNightStorm : tokyoNightDay}
       minHeight={minHeight}
       maxHeight={maxHeight}
       readOnly={readOnly}
