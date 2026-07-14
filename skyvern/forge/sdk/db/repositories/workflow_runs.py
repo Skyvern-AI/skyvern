@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 from typing import cast as typing_cast
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
@@ -584,8 +586,10 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[str] | None = None,
         search_key: str | None = None,
         run_type: list[str] | None = None,
+        run_tags: Sequence[tuple[str | None, str | None]] | None = None,
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
+            run_tag_subqueries = run_tag_run_id_subqueries(run_tags, organization_id)
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
             # task_runs.workflow_permanent_id is unreliable on legacy workflow_run rows; the joined
             # workflow_runs row carries the canonical WPID, so coalesce both before deriving anything.
@@ -632,6 +636,9 @@ class WorkflowRunsRepository(BaseRepository):
 
             if run_type:
                 query = query.filter(TaskRunModel.task_run_type.in_(run_type))
+
+            for subquery in run_tag_subqueries:
+                query = query.filter(TaskRunModel.run_id.in_(subquery))
 
             if search_key:
                 query = query.filter(
@@ -700,6 +707,8 @@ class WorkflowRunsRepository(BaseRepository):
                     fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
                         fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                    for subquery in run_tag_subqueries:
+                        fallback_query = fallback_query.filter(WorkflowRunModel.workflow_run_id.in_(subquery))
                     fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
                     fallback_result = await session.execute(fallback_query)
                     rows.extend(dict(row) for row in fallback_result.mappings().all())
@@ -1200,6 +1209,7 @@ class WorkflowRunsRepository(BaseRepository):
         exclude_child_runs: bool = False,
         created_at_start: datetime | None = None,
         created_at_end: datetime | None = None,
+        run_tags: Sequence[tuple[str | None, str | None]] | None = None,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -1224,6 +1234,8 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter(WorkflowRunModel.created_at >= created_at_start)
             if created_at_end is not None:
                 query = query.filter(WorkflowRunModel.created_at < created_at_end)
+            for subquery in run_tag_run_id_subqueries(run_tags, organization_id):
+                query = query.filter(WorkflowRunModel.workflow_run_id.in_(subquery))
             query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             workflow_runs_and_titles_tuples = (await session.execute(query)).all()
             workflow_runs = [
