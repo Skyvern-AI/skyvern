@@ -6,6 +6,7 @@ import os
 import structlog
 from playwright.async_api import async_playwright
 
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import FailedToNavigateToUrl, MissingBrowserState
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
@@ -197,24 +198,42 @@ class RealBrowserManager(BrowserManager):
         browser_profile_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
-        (
-            browser_context,
-            browser_artifacts,
-            browser_cleanup,
-        ) = await BrowserContextFactory.create_browser_context(
-            pw,
-            proxy_location=proxy_location,
-            url=url,
-            task_id=task_id,
-            workflow_run_id=workflow_run_id,
-            workflow_permanent_id=workflow_permanent_id,
-            script_id=script_id,
-            organization_id=organization_id,
-            extra_http_headers=extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
-            browser_address=browser_address,
-            browser_profile_id=browser_profile_id,
-        )
+        try:
+            (
+                browser_context,
+                browser_artifacts,
+                browser_cleanup,
+            ) = await BrowserContextFactory.create_browser_context(
+                pw,
+                proxy_location=proxy_location,
+                url=url,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
+            )
+        except BaseException:
+            # start() already launched the local Node driver, so a failed context
+            # creation (e.g. a remote-CDP connect_over_cdp error) would leak that driver
+            # per attempt; stop it here, time-bounded like RealBrowserState.close() so a
+            # hung stop() cannot stall the original error. BaseException so a cancellation
+            # also releases the driver; a stop() error/timeout must never mask the original.
+            try:
+                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                    await pw.stop()
+            except Exception:
+                LOG.warning(
+                    "Failed to stop Playwright driver after browser-context creation failure",
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+            raise
         return RealBrowserState(
             pw=pw,
             browser_context=browser_context,
