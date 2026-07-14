@@ -23,7 +23,11 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    AddressablePersistentBrowserSession,
+    PersistentBrowserSession,
+    is_final_status,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 
@@ -36,6 +40,14 @@ LOG = structlog.get_logger()
 
 class Constants:
     POLL_INTERVAL_FOR_VERIFICATION_SECONDS = 5
+
+
+def _is_addressless_local_vnc_session(browser_session: PersistentBrowserSession) -> bool:
+    return (
+        settings.BROWSER_STREAMING_MODE == "vnc"
+        and browser_session.vnc_port is not None
+        and not browser_session.browser_address
+    )
 
 
 async def verify_browser_session(
@@ -80,7 +92,7 @@ async def verify_browser_session(
     browser_address = browser_session.browser_address
 
     if not browser_address:
-        if settings.BROWSER_STREAMING_MODE == "cdp":
+        if settings.BROWSER_STREAMING_MODE == "cdp" or _is_addressless_local_vnc_session(browser_session):
             browser_address = ""
         else:
             LOG.info(
@@ -159,13 +171,16 @@ async def verify_task(
         LOG.info("No browser session found for task.", task_id=task_id, organization_id=organization_id)
         return task, None
 
-    if not browser_session.browser_address:
+    browser_address = browser_session.browser_address
+    if not browser_address and _is_addressless_local_vnc_session(browser_session):
+        browser_address = ""
+    elif not browser_address:
         LOG.info("Browser session address not found for task.", task_id=task_id, organization_id=organization_id)
         return task, None
 
     try:
         addressable_browser_session = AddressablePersistentBrowserSession(
-            **browser_session.model_dump() | {"browser_address": browser_session.browser_address},
+            **browser_session.model_dump() | {"browser_address": browser_address},
         )
     except Exception as e:
         LOG.error("vnc.browser-session-reify-error", task_id=task_id, organization_id=organization_id, error=e)
@@ -232,7 +247,9 @@ async def verify_workflow_run(
 
     browser_address = browser_session.browser_address
 
-    if not browser_address:
+    if not browser_address and _is_addressless_local_vnc_session(browser_session):
+        browser_address = ""
+    elif not browser_address:
         LOG.info(
             "Waiting for browser session address.", workflow_run_id=workflow_run_id, organization_id=organization_id
         )

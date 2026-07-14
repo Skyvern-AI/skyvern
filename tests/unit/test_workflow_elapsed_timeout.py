@@ -38,6 +38,7 @@ def _workflow_run(
         workflow_permanent_id="wp_1",
         organization_id="org_1",
         browser_profile_id="bp_1",
+        browser_session_id=None,
         browser_address=None,
         status=status,
         failure_reason=None,

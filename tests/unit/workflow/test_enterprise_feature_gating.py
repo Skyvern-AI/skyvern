@@ -204,6 +204,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
         workflow_id=workflow.workflow_id,
         workflow_permanent_id=workflow.workflow_permanent_id,
         browser_profile_id=None,
+        browser_session_id=None,
         browser_address=None,
         status=WorkflowRunStatus.created,
     )

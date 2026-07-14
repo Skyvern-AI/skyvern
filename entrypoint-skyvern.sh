@@ -81,35 +81,47 @@ _kill_xvfb_on_term() {
 trap _kill_xvfb_on_term TERM
 
 echo "Starting Xvfb..."
+display_number="${SKYVERN_DEFAULT_DISPLAY:-99}"
+if [[ ! "$display_number" =~ ^[0-9]+$ ]]; then
+  printf 'ERROR: SKYVERN_DEFAULT_DISPLAY must be an unsigned integer; got %q\n' "$display_number" >&2
+  exit 1
+fi
+display_address=":${display_number}"
 # delete the lock file if any
-rm -f /tmp/.X99-lock
+rm -f "/tmp/.X${display_number}-lock"
 # Set display environment variable
-export DISPLAY=:99
+export DISPLAY="$display_address"
 # Start Xvfb
-Xvfb :99 -screen 0 1920x1080x16 &
+Xvfb "$display_address" -screen 0 1920x1080x16 &
 xvfb=$!
 
-DISPLAY=:99 xterm 2>/dev/null &
+DISPLAY="$display_address" xterm 2>/dev/null &
 
 # Wait for Xvfb to be ready before starting x11vnc
 for i in $(seq 1 10); do
-  xdpyinfo -display :99 >/dev/null 2>&1 && break
+  xdpyinfo -display "$display_address" >/dev/null 2>&1 && break
   echo "Waiting for Xvfb to start (attempt $i/10)..."
   sleep 1
 done
-if ! xdpyinfo -display :99 >/dev/null 2>&1; then
-  echo "ERROR: Xvfb failed to start on display :99 after 10 attempts"
+if ! xdpyinfo -display "$display_address" >/dev/null 2>&1; then
+  echo "ERROR: Xvfb failed to start on display $display_address after 10 attempts"
   exit 1
 fi
 
-echo "Starting x11vnc on display :99..."
-# VNC runs without a password (-nopw) because port 5900 is not exposed outside
-# the container. Browser streaming reaches users via websockify on port 6080.
-mkdir -p /data/log
-x11vnc -display :99 -forever -nopw -shared -rfbport 5900 -bg -o /dev/null 2>/data/log/x11vnc.err
+if [ "${BROWSER_STREAMING_MODE:-}" != "vnc" ]; then
+  echo "Starting x11vnc on display $display_address..."
+  # VNC runs without a password (-nopw) because port 5900 is not exposed outside
+  # the container. Browser streaming reaches users via websockify on port 6080.
+  x11vnc_log_dir="${LOG_PATH:-/data/log}"
+  mkdir -p "$x11vnc_log_dir"
+  x11vnc -display "$display_address" -forever -nopw -shared -rfbport 5900 -bg -o /dev/null \
+    2>"$x11vnc_log_dir/x11vnc.err"
 
-echo "Starting websockify on port 6080 -> localhost:5900..."
-websockify 6080 localhost:5900 --daemon
+  echo "Starting websockify on port 6080 -> localhost:5900..."
+  websockify 6080 localhost:5900 --daemon
+else
+  echo "Dynamic VNC mode enabled; per-session VNC ports are started on demand."
+fi
 
 python run_streaming.py > /dev/null &
 

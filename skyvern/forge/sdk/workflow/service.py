@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -186,6 +186,7 @@ from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_w
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
+from skyvern.webeye.async_utils import await_to_terminal_state
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
 
@@ -473,6 +474,15 @@ class WorkflowBrowserCleanupResult:
     browser_session_write_back_attempted: bool = False
 
 
+@dataclass
+class WorkflowVncSessionSetupState:
+    effective_browser_session_id: str | None = None
+    candidate_browser_session_id: str | None = None
+    candidate_installed: bool = False
+    candidate_closed: bool = False
+    begin_attempted: bool = False
+
+
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
     """
     This function dumps the workflow definition and removes the irrelevant data to the definition, like created_at and modified_at fields inside:
@@ -584,6 +594,8 @@ def _build_managed_browser_profile_name(workflow_title: str | None, rendered_key
 class WorkflowService:
     # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
+    # Keep locks for the process lifetime so queued and new callers always share one lock.
+    _vnc_workflow_session_locks: ClassVar[dict[tuple[str, str], asyncio.Lock]] = {}
 
     @staticmethod
     async def _record_workflow_run_metadata_best_effort(
@@ -2106,18 +2118,231 @@ class WorkflowService:
         if human_interaction_blocks:
             timeouts = [getattr(block, "timeout_seconds", 60 * 60) for block in human_interaction_blocks]
             timeout_seconds = sum(timeouts) + 60 * 60
+        elif self._uses_default_vnc_session_manager():
+            timeout_seconds = 60 * 60
+        else:
+            return None
 
-            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                organization_id=organization_id,
-                timeout_minutes=timeout_seconds // 60,
-                browser_profile_id=browser_profile_id,
-                proxy_location=proxy_location,
-                inherit_profile_proxy=True,
+        return await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=organization_id,
+            timeout_minutes=timeout_seconds // 60,
+            browser_profile_id=browser_profile_id,
+            proxy_location=proxy_location,
+            inherit_profile_proxy=True,
+        )
+
+    @staticmethod
+    def _uses_default_vnc_session_manager() -> bool:
+        # Import locally to avoid service -> default manager -> routes -> debug sessions -> service.
+        from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
+
+        return settings.BROWSER_STREAMING_MODE == "vnc" and isinstance(
+            app.PERSISTENT_SESSIONS_MANAGER,
+            DefaultPersistentSessionsManager,
+        )
+
+    @classmethod
+    def _get_vnc_workflow_session_lock(cls, organization_id: str, workflow_run_id: str) -> asyncio.Lock:
+        key = (organization_id, workflow_run_id)
+        lock = cls._vnc_workflow_session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._vnc_workflow_session_locks[key] = lock
+        return lock
+
+    @staticmethod
+    async def _close_vnc_workflow_session_candidate(
+        *,
+        organization_id: str,
+        state: WorkflowVncSessionSetupState,
+    ) -> None:
+        candidate_browser_session_id = state.candidate_browser_session_id
+        if not candidate_browser_session_id or state.candidate_closed:
+            return
+        await await_to_terminal_state(
+            app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                organization_id,
+                candidate_browser_session_id,
             )
+        )
+        state.candidate_closed = True
 
-            return browser_session
+    async def _reconcile_vnc_workflow_session_claim_error(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        state: WorkflowVncSessionSetupState,
+        claim_error: BaseException,
+    ) -> None:
+        candidate_browser_session_id = state.candidate_browser_session_id
+        if not candidate_browser_session_id:
+            raise claim_error
 
-        return None
+        try:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+        except BaseException as reconciliation_error:
+            try:
+                await self._close_vnc_workflow_session_candidate(
+                    organization_id=organization_id,
+                    state=state,
+                )
+            except BaseException as cleanup_error:
+                claim_error.add_note(f"VNC candidate cleanup error after claim failure: {cleanup_error!r}")
+            claim_error.add_note(f"Workflow session claim reconciliation error: {reconciliation_error!r}")
+            raise claim_error from reconciliation_error
+
+        persisted_browser_session_id = workflow_run.browser_session_id if workflow_run else None
+        if persisted_browser_session_id == candidate_browser_session_id:
+            state.candidate_installed = True
+            state.effective_browser_session_id = candidate_browser_session_id
+            if not isinstance(claim_error, Exception):
+                raise claim_error
+            return
+
+        try:
+            await self._close_vnc_workflow_session_candidate(
+                organization_id=organization_id,
+                state=state,
+            )
+        except BaseException as cleanup_error:
+            claim_error.add_note(f"VNC candidate cleanup error after claim failure: {cleanup_error!r}")
+            raise claim_error from cleanup_error
+
+        if persisted_browser_session_id:
+            state.effective_browser_session_id = persisted_browser_session_id
+            if not isinstance(claim_error, Exception):
+                raise claim_error
+            return
+        raise claim_error
+
+    async def _claim_vnc_workflow_browser_session(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        state: WorkflowVncSessionSetupState,
+    ) -> None:
+        candidate_browser_session_id = state.candidate_browser_session_id
+        if not candidate_browser_session_id:
+            raise RuntimeError("Cannot claim a workflow browser session without a candidate")
+
+        try:
+            claim = await app.DATABASE.workflow_runs.claim_workflow_run_browser_session(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                candidate_browser_session_id=candidate_browser_session_id,
+            )
+        except BaseException as claim_error:
+            await self._reconcile_vnc_workflow_session_claim_error(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                state=state,
+                claim_error=claim_error,
+            )
+            return
+
+        if claim.installed:
+            if claim.browser_session_id != candidate_browser_session_id:
+                raise RuntimeError("Workflow browser-session claim installed an unexpected candidate")
+            state.candidate_installed = True
+            state.effective_browser_session_id = candidate_browser_session_id
+            return
+
+        await self._close_vnc_workflow_session_candidate(
+            organization_id=organization_id,
+            state=state,
+        )
+        state.effective_browser_session_id = claim.browser_session_id
+
+    async def _set_up_default_vnc_workflow_browser_session(
+        self,
+        *,
+        organization_id: str,
+        workflow: Workflow,
+        workflow_run_id: str,
+        caller_supplied_browser_session: bool,
+        browser_profile_id: str | None,
+        proxy_location: ProxyLocationInput,
+        state: WorkflowVncSessionSetupState,
+    ) -> None:
+        async with self._get_vnc_workflow_session_lock(organization_id, workflow_run_id):
+            if not caller_supplied_browser_session:
+                refreshed_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                if refreshed_workflow_run is None:
+                    raise WorkflowRunNotFound(workflow_run_id)
+                state.effective_browser_session_id = refreshed_workflow_run.browser_session_id or None
+
+            if not state.effective_browser_session_id:
+                candidate = await self._auto_create_workflow_browser_session_if_needed(
+                    organization_id=organization_id,
+                    workflow=workflow,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=None,
+                    browser_profile_id=browser_profile_id,
+                    proxy_location=proxy_location,
+                )
+                if candidate is None:
+                    raise RuntimeError("Default VNC workflow setup did not create a browser session")
+                state.candidate_browser_session_id = candidate.persistent_browser_session_id
+                await self._claim_vnc_workflow_browser_session(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    state=state,
+                )
+
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+            workflow_run_context.browser_session_id = state.effective_browser_session_id
+
+            if state.effective_browser_session_id:
+                state.begin_attempted = True
+                await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                    browser_session_id=state.effective_browser_session_id,
+                    runnable_type="workflow_run",
+                    runnable_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+
+    async def _roll_back_default_vnc_workflow_session_setup(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        state: WorkflowVncSessionSetupState,
+    ) -> None:
+        try:
+            # A successful CAS publishes the candidate as the workflow row's durable
+            # session. Another delivery can adopt it as soon as setup releases the
+            # per-run lock, so an abort must never close an installed candidate.
+            # Only candidates that never installed (including CAS losers) remain
+            # exclusively owned by this setup invocation and are safe to close.
+            if not state.candidate_installed:
+                await self._close_vnc_workflow_session_candidate(
+                    organization_id=organization_id,
+                    state=state,
+                )
+            if (
+                state.begin_attempted
+                and state.effective_browser_session_id
+                and (
+                    state.candidate_installed
+                    or state.effective_browser_session_id != state.candidate_browser_session_id
+                )
+            ):
+                await await_to_terminal_state(
+                    app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                        state.effective_browser_session_id,
+                        organization_id,
+                    )
+                )
+        finally:
+            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run_id)
 
     async def _browser_profile_is_managed(self, *, organization_id: str, browser_profile_id: str | None) -> bool:
         if not browser_profile_id:
@@ -2190,6 +2415,51 @@ class WorkflowService:
             browser_session_id=browser_session.persistent_browser_session_id,
         )
         return browser_session
+
+    async def _auto_create_workflow_browser_session_if_needed(
+        self,
+        *,
+        organization_id: str,
+        workflow: Workflow,
+        workflow_run_id: str,
+        browser_session_id: str | None,
+        browser_profile_id: str | None,
+        proxy_location: ProxyLocationInput,
+    ) -> PersistentBrowserSession | None:
+        if browser_session_id:
+            return None
+
+        browser_session: PersistentBrowserSession | None = None
+        if self._uses_default_vnc_session_manager():
+            browser_session = await self.auto_create_browser_session_if_needed(
+                organization_id,
+                workflow,
+                browser_profile_id=browser_profile_id,
+                proxy_location=proxy_location,
+            )
+        else:
+            using_managed_browser_profile = await self._browser_profile_is_managed(
+                organization_id=organization_id,
+                browser_profile_id=browser_profile_id,
+            )
+            if not browser_profile_id or using_managed_browser_profile:
+                browser_session = await self.auto_create_browser_session_if_needed(
+                    organization_id,
+                    workflow,
+                    browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
+                    proxy_location=proxy_location,
+                )
+
+        if browser_session is not None:
+            return browser_session
+
+        return await self.auto_create_browser_session_for_code_block_if_needed(
+            organization_id,
+            workflow,
+            workflow_run_id=workflow_run_id,
+            browser_profile_id=browser_profile_id,
+            proxy_location=proxy_location,
+        )
 
     async def _collect_inherited_workflow_system_prompt(
         self,
@@ -2363,6 +2633,7 @@ class WorkflowService:
         both sync and async (Temporal-dispatched) trigger modes.
         """
         organization_id = organization.organization_id
+        caller_supplied_browser_session = bool(browser_session_id)
 
         LOG.info(
             "Executing workflow",
@@ -2373,6 +2644,18 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+        persisted_browser_session_id = workflow_run.browser_session_id
+        if not browser_session_id:
+            browser_session_id = persisted_browser_session_id
+        elif persisted_browser_session_id and browser_session_id != persisted_browser_session_id:
+            LOG.warning(
+                "Workflow execution browser session differs from persisted workflow-run session; "
+                "keeping caller session.",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                caller_browser_session_id=browser_session_id,
+                persisted_browser_session_id=persisted_browser_session_id,
+            )
 
         # Guard: if the run was canceled while queued (before Temporal picked it up), don't
         # overwrite the canceled status with running. Checked BEFORE workflow resolution so a run
@@ -2392,7 +2675,7 @@ class WorkflowService:
         workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
-        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
+        close_browser_on_completion = not caller_supplied_browser_session and not workflow_run.browser_address
 
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
         if enterprise_gated_features:
@@ -2514,65 +2797,50 @@ class WorkflowService:
             )
             return workflow_run
 
-        browser_session = None
-        using_managed_browser_profile = await self._browser_profile_is_managed(
-            organization_id=organization.organization_id,
-            browser_profile_id=browser_profile_id,
-        )
-        if not browser_profile_id or using_managed_browser_profile:
-            browser_session = await self.auto_create_browser_session_if_needed(
-                organization.organization_id,
-                workflow,
-                browser_session_id=browser_session_id,
-                browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
-                proxy_location=workflow_run.proxy_location,
-            )
-
-        # The CodeBlock auto-PBS path is intentionally NOT gated on browser_profile_id: a
-        # profile-backed CodeBlock workflow still needs a session for the secure runner, so the
-        # profile is loaded into the auto-created session instead of skipping it.
-        if browser_session is None and browser_session_id is None:
-            browser_session = await self.auto_create_browser_session_for_code_block_if_needed(
-                organization.organization_id,
-                workflow,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-                browser_profile_id=browser_profile_id,
-                proxy_location=workflow_run.proxy_location,
-            )
-
-        if browser_session:
-            browser_session_id = browser_session.persistent_browser_session_id
-            close_browser_on_completion = True
-            await app.DATABASE.workflow_runs.update_workflow_run(
-                workflow_run_id=workflow_run.workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
-
-        # Make browser_session_id available in Jinja templates via {{ browser_session_id }}.
-        # IMPORTANT: This must happen before _execute_workflow_blocks, which is where
-        # template rendering occurs. If this assignment moves after block execution,
-        # browser_session_id will silently resolve to empty string in templates.
-        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-        workflow_run_context.browser_session_id = browser_session_id
-
         renewal_task: asyncio.Task[None] | None = None
-        if browser_session_id:
+        if self._uses_default_vnc_session_manager():
+            setup_state = WorkflowVncSessionSetupState(effective_browser_session_id=browser_session_id)
             try:
-                await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-                    browser_session_id=browser_session_id,
-                    runnable_type="workflow_run",
-                    runnable_id=workflow_run_id,
-                    organization_id=organization.organization_id,
+                await await_to_terminal_state(
+                    self._set_up_default_vnc_workflow_browser_session(
+                        organization_id=organization.organization_id,
+                        workflow=workflow,
+                        workflow_run_id=workflow_run_id,
+                        caller_supplied_browser_session=caller_supplied_browser_session,
+                        browser_profile_id=browser_profile_id,
+                        proxy_location=workflow_run.proxy_location,
+                        state=setup_state,
+                    )
                 )
-            except Exception as e:
+            except BaseException as setup_error:
+                try:
+                    await await_to_terminal_state(
+                        self._roll_back_default_vnc_workflow_session_setup(
+                            organization_id=organization.organization_id,
+                            workflow_run_id=workflow_run_id,
+                            state=setup_state,
+                        )
+                    )
+                except BaseException as rollback_error:
+                    LOG.warning(
+                        "Failed to roll back default VNC workflow browser-session setup",
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization.organization_id,
+                        exc_info=True,
+                    )
+                    setup_error.add_note(f"VNC workflow session rollback error: {rollback_error!r}")
+
+                if not isinstance(setup_error, Exception) or not setup_state.begin_attempted:
+                    raise
+
                 LOG.exception(
                     "Failed to begin browser session for workflow run",
-                    browser_session_id=browser_session_id,
+                    browser_session_id=setup_state.effective_browser_session_id,
                     workflow_run_id=workflow_run_id,
                 )
                 failure_reason = (
-                    f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
+                    "Failed to begin browser session for workflow run: "
+                    f"{get_user_facing_exception_message(setup_error)}"
                 )
                 workflow_run = await self.mark_workflow_run_as_failed(
                     workflow_run_id=workflow_run_id,
@@ -2582,12 +2850,70 @@ class WorkflowService:
                     workflow=workflow,
                     workflow_run=workflow_run,
                     api_key=api_key,
-                    browser_session_id=browser_session_id,
+                    browser_session_id=None,
                     close_browser_on_completion=close_browser_on_completion,
                     need_call_webhook=need_call_webhook,
                 )
                 return workflow_run
-            # Start background task to periodically renew the browser session
+
+            browser_session_id = setup_state.effective_browser_session_id
+        else:
+            browser_session = await self._auto_create_workflow_browser_session_if_needed(
+                organization_id=organization.organization_id,
+                workflow=workflow,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
+                proxy_location=workflow_run.proxy_location,
+            )
+
+            if browser_session:
+                browser_session_id = browser_session.persistent_browser_session_id
+                close_browser_on_completion = True
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+
+            # Make browser_session_id available in Jinja templates via {{ browser_session_id }}.
+            # IMPORTANT: This must happen before _execute_workflow_blocks, which is where
+            # template rendering occurs. If this assignment moves after block execution,
+            # browser_session_id will silently resolve to empty string in templates.
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+            workflow_run_context.browser_session_id = browser_session_id
+
+            if browser_session_id:
+                try:
+                    await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                        browser_session_id=browser_session_id,
+                        runnable_type="workflow_run",
+                        runnable_id=workflow_run_id,
+                        organization_id=organization.organization_id,
+                    )
+                except Exception as e:
+                    LOG.exception(
+                        "Failed to begin browser session for workflow run",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+                    failure_reason = (
+                        f"Failed to begin browser session for workflow run: {get_user_facing_exception_message(e)}"
+                    )
+                    workflow_run = await self.mark_workflow_run_as_failed(
+                        workflow_run_id=workflow_run_id,
+                        failure_reason=failure_reason,
+                    )
+                    await self.clean_up_workflow(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        api_key=api_key,
+                        browser_session_id=browser_session_id,
+                        close_browser_on_completion=close_browser_on_completion,
+                        need_call_webhook=need_call_webhook,
+                    )
+                    return workflow_run
+
+        if browser_session_id:
             renewal_task = asyncio.create_task(
                 self._renew_browser_session_loop(browser_session_id, organization.organization_id),
                 name=f"browser_session_renewal_{workflow_run_id}",
@@ -7128,9 +7454,7 @@ class WorkflowService:
                 tasks.extend(child_tasks)
 
         all_workflow_task_ids = [task.task_id for task in tasks]
-        close_browser_on_completion = (
-            close_browser_on_completion and browser_session_id is None and not workflow_run.browser_address
-        )
+        close_browser_on_completion = close_browser_on_completion and not workflow_run.browser_address
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,

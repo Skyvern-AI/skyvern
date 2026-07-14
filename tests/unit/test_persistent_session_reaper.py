@@ -117,7 +117,7 @@ async def test_start_reaper_is_noop_when_no_in_process_browsers() -> None:
     # Neither trigger for an in-process browser launch: nothing to reap, so don't start the loop.
     manager = _make_manager([])
     with patch(f"{MODULE}.settings") as mock_settings:
-        mock_settings.BROWSER_STREAMING_MODE = "vnc"
+        mock_settings.BROWSER_STREAMING_MODE = "other"
         mock_settings.BROWSER_TYPE = "chromium-headful"
         mock_settings.PERSISTENT_SESSIONS_REAPER_INTERVAL_SECONDS = 60
         manager.start_reaper()
@@ -140,6 +140,7 @@ async def test_start_reaper_is_noop_when_interval_disabled() -> None:
     "streaming_mode, browser_type",
     [
         ("cdp", "chromium-headful"),  # cdp streaming launches in-process browsers
+        ("vnc", "chromium-headful"),  # vnc streaming owns Chromium plus its VNC process stack
         ("vnc", "cdp-connect"),  # cdp-connect launches even without cdp streaming
     ],
 )
@@ -160,3 +161,34 @@ async def test_start_reaper_starts_once_when_in_process_browsers_launch(streamin
         await first_task
     except BaseException:
         pass
+
+
+@pytest.mark.asyncio
+async def test_reaper_treats_vnc_stack_as_process_local_ownership() -> None:
+    sessions = [_session("pbs_vnc_only", started_minutes_ago=30, timeout_minutes=20)]
+    manager = _make_manager(sessions, owned_ids=[])
+    manager.close_session = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.settings.BROWSER_STREAMING_MODE", "vnc"),
+        patch(f"{MODULE}.VncManager.has_session", return_value=True),
+    ):
+        await manager.reap_expired_sessions()
+
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_vnc_only")
+
+
+@pytest.mark.asyncio
+async def test_cdp_reaper_does_not_consult_vnc_ownership() -> None:
+    sessions = [_session("pbs_cdp_other", started_minutes_ago=30, timeout_minutes=20)]
+    manager = _make_manager(sessions, owned_ids=[])
+    manager.close_session = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.settings.BROWSER_STREAMING_MODE", "cdp"),
+        patch(f"{MODULE}.VncManager.has_session", return_value=True) as has_vnc_session,
+    ):
+        await manager.reap_expired_sessions()
+
+    has_vnc_session.assert_not_called()
+    manager.close_session.assert_not_awaited()

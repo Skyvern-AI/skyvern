@@ -451,6 +451,9 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str | None = None,
         completed_at: datetime | None = None,
         started_at: datetime | None = None,
+        display_number: int | None = None,
+        vnc_port: int | None = None,
+        interactor: str | None = None,
         generate_browser_profile: bool | None = None,
         browser_profile_loaded: bool | None = None,
     ) -> PersistentBrowserSession:
@@ -474,6 +477,12 @@ class BrowserSessionsRepository(BaseRepository):
                 persistent_browser_session.completed_at = to_naive_utc(completed_at)
             if started_at:
                 persistent_browser_session.started_at = to_naive_utc(started_at)
+            if display_number is not None:
+                persistent_browser_session.display_number = display_number
+            if vnc_port is not None:
+                persistent_browser_session.vnc_port = vnc_port
+            if interactor is not None:
+                persistent_browser_session.interactor = interactor
             if generate_browser_profile is not None:
                 persistent_browser_session.generate_browser_profile = generate_browser_profile
             if browser_profile_loaded is not None:

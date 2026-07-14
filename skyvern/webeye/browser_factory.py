@@ -715,6 +715,12 @@ def _is_chrome_running() -> bool:
     return False
 
 
+def _apply_display_env(browser_args: dict[str, Any], display_number: int | None) -> None:
+    """Set DISPLAY for one Chromium child without mutating the service environment."""
+    if display_number is not None:
+        browser_args["env"] = {**os.environ, "DISPLAY": f":{display_number}"}
+
+
 async def _create_headless_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocationInput = None,
@@ -775,6 +781,7 @@ async def _create_headless_chromium(
             "downloads_path": download_dir,
         }
     )
+    _apply_display_env(browser_args, cast(int | None, kwargs.get("display_number")))
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
@@ -867,6 +874,7 @@ async def _create_headful_chromium(
             "headless": False,
         }
     )
+    _apply_display_env(browser_args, cast(int | None, kwargs.get("display_number")))
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,

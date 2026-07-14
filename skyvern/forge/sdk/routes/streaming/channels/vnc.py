@@ -30,6 +30,7 @@ from starlette.websockets import WebSocketState
 from websockets import ConnectionClosedError, ConnectionClosedOK, Data
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
 from skyvern.forge.sdk.routes.streaming.registries import (
@@ -172,7 +173,21 @@ class VncChannel:
     workflow_run: WorkflowRun | None = None
 
     def __post_init__(self, initial_interactor: Interactor) -> None:
-        self.interactor = initial_interactor
+        browser_session = self.browser_session
+        persisted_interactor = browser_session.interactor if browser_session else None
+        if persisted_interactor in ("agent", "user"):
+            self._interactor = t.cast(Interactor, persisted_interactor)
+        else:
+            self._interactor = initial_interactor
+            if persisted_interactor is not None and browser_session is not None:
+                LOG.warning(
+                    f"{self.class_name} Invalid persisted interactor; using requested initial interactor.",
+                    persisted_interactor=persisted_interactor,
+                    organization_id=self.organization_id,
+                    browser_session_id=browser_session.persistent_browser_session_id,
+                )
+
+        LOG.info(f"{self.class_name} Setting interactor to {self._interactor}", **self.identity)
         add_vnc_channel(self)
 
     @property
@@ -201,6 +216,31 @@ class VncChannel:
         self._interactor = value
 
         LOG.info(f"{self.class_name} Setting interactor to {value}", **self.identity)
+
+    async def set_interactor_and_persist(self, value: Interactor) -> None:
+        self.interactor = value
+
+        browser_session = self.browser_session
+        if not browser_session:
+            LOG.warning(
+                f"{self.class_name} Cannot persist interactor without a browser session.",
+                interactor=value,
+                **self.identity,
+            )
+            return
+
+        try:
+            await app.DATABASE.browser_sessions.update_persistent_browser_session(
+                browser_session.persistent_browser_session_id,
+                organization_id=self.organization_id,
+                interactor=value,
+            )
+        except Exception:
+            LOG.exception(
+                f"{self.class_name} Failed to persist interactor; retaining in-memory state.",
+                interactor=value,
+                **self.identity,
+            )
 
     @property
     def is_open(self) -> bool:
@@ -332,6 +372,26 @@ def _build_vnc_url_from_browser_address(browser_address: str) -> str | None:
     return f"{scheme}://{domain}/vnc/{session_id}/{token}"
 
 
+def _resolve_vnc_url(browser_session: AddressablePersistentBrowserSession, global_vnc_port: int) -> str:
+    routed_vnc_url = _build_vnc_url_from_browser_address(browser_session.browser_address)
+    if routed_vnc_url:
+        return routed_vnc_url
+
+    if browser_session.ip_address:
+        ip = browser_session.ip_address.split(":", maxsplit=1)[0]
+        return f"ws://{ip}:{global_vnc_port}"
+
+    if (
+        settings.BROWSER_STREAMING_MODE == "vnc"
+        and not browser_session.browser_address
+        and browser_session.vnc_port is not None
+    ):
+        return f"ws://127.0.0.1:{browser_session.vnc_port}"
+
+    parsed_browser_address = urlparse(browser_session.browser_address)
+    return f"ws://{parsed_browser_address.hostname}:{global_vnc_port}"
+
+
 async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     """
     Actually stream the VNC data between a frontend and a browser.
@@ -339,32 +399,13 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     Loops until the task is cleared or the websocket is closed.
     """
 
-    vnc_url: str = ""
     browser_session = vnc_channel.browser_session
     class_name = vnc_channel.class_name
 
     if not browser_session:
         raise Exception(f"{class_name} No browser session associated with vnc channel.")
 
-    # First, check if this is a V2 K8s routed session by examining browser_address
-    # V2 sessions have browser_address like: wss://{domain}/{session_id}/{token}/devtools/...
-    # For these, we need to route VNC through the same nginx proxy
-    routed_vnc_url = _build_vnc_url_from_browser_address(browser_session.browser_address)
-    if routed_vnc_url:
-        vnc_url = routed_vnc_url
-    elif browser_session.ip_address:
-        # V1 ECS sessions: Direct IP connection (ip_address is a public/reachable IP)
-        if ":" in browser_session.ip_address:
-            ip, _ = browser_session.ip_address.split(":")
-            vnc_url = f"ws://{ip}:{vnc_channel.vnc_port}"
-        else:
-            vnc_url = f"ws://{browser_session.ip_address}:{vnc_channel.vnc_port}"
-    else:
-        # Last resort: parse browser_address hostname
-        browser_address = browser_session.browser_address
-        parsed_browser_address = urlparse(browser_address)
-        host = parsed_browser_address.hostname
-        vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
+    vnc_url = _resolve_vnc_url(browser_session, vnc_channel.vnc_port)
 
     LOG.debug(
         f"{class_name} Connecting to vnc url.",

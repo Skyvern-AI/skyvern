@@ -60,6 +60,7 @@ class RealBrowserState(BrowserState):
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
         release_driver_on_close: bool = False,
+        display_number: int | None = None,
     ):
         self.__page = page
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
@@ -78,6 +79,10 @@ class RealBrowserState(BrowserState):
         # this state and must be released on close even when the remote
         # browser is left running.
         self.release_driver_on_close = release_driver_on_close
+        # Retain the session-specific X display for every local context
+        # recreation. Remote/CDP states leave this unset and preserve the
+        # original BrowserContextFactory call shape.
+        self.display_number = display_number
         # One-shot callbacks fired first inside ``close()``. Cleared after
         # firing so re-entry into ``close()`` is safe.
         self._on_close_callbacks: list[Callable[[], Awaitable[None]]] = []
@@ -162,24 +167,45 @@ class RealBrowserState(BrowserState):
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
-            (
-                browser_context,
-                browser_artifacts,
-                browser_cleanup,
-            ) = await BrowserContextFactory.create_browser_context(
-                self.pw,
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-            )
+            if self.display_number is None:
+                (
+                    browser_context,
+                    browser_artifacts,
+                    browser_cleanup,
+                ) = await BrowserContextFactory.create_browser_context(
+                    self.pw,
+                    url=url,
+                    proxy_location=proxy_location,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_profile_id=browser_profile_id,
+                )
+            else:
+                (
+                    browser_context,
+                    browser_artifacts,
+                    browser_cleanup,
+                ) = await BrowserContextFactory.create_browser_context(
+                    self.pw,
+                    url=url,
+                    proxy_location=proxy_location,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_profile_id=browser_profile_id,
+                    display_number=self.display_number,
+                )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
             self.browser_cleanup = browser_cleanup

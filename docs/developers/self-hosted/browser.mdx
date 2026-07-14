@@ -75,7 +75,7 @@ Connect to an existing Chrome instance running with remote debugging enabled. Us
 <Note>
 Docker Compose self-host installs default `BROWSER_STREAMING_MODE` to `cdp`.
 Existing installs that already set this variable in `.env` keep their value.
-To opt out of CDP livestreaming, set `BROWSER_STREAMING_MODE=vnc` in `.env`.
+To use per-session VNC livestreaming, follow [Multi-session VNC streaming](#multi-session-vnc-streaming).
 </Note>
 
 ---
@@ -286,6 +286,66 @@ CDP mode exposes Chrome to network access. The examples use
 `--remote-debugging-address=0.0.0.0` so Docker can reach Chrome on the host.
 Only use this in trusted environments. If Skyvern runs on the same host outside
 Docker, bind to `127.0.0.1` instead.
+</Warning>
+
+---
+
+## Multi-session VNC streaming
+
+VNC streaming gives each local browser session its own display and streaming
+stack. Configure a headful Chromium browser and select VNC streaming:
+
+```bash .env
+BROWSER_TYPE=chromium-headful
+BROWSER_STREAMING_MODE=vnc
+SKYVERN_DEFAULT_DISPLAY=99
+```
+
+`SKYVERN_DEFAULT_DISPLAY` is the base display. Skyvern searches for available
+session displays starting at the next number, so the default configuration
+begins at `:100` and advances past occupied displays or ports. For each
+session, Skyvern dynamically reserves a display plus available RFB and
+WebSocket ports, then starts dedicated Xvfb, x11vnc, and websockify processes.
+
+x11vnc runs without a VNC password (`-nopw`), so both its RFB service and the
+websockify service bind only to `127.0.0.1`. Do not expose either per-session
+port directly. Browser clients connect to the authenticated Skyvern WebSocket
+endpoint, which proxies the live view to the session's loopback-only
+websockify port.
+
+**Take Control** sets the session interactor to the user, while **Cede Control**
+returns interaction to the agent. Skyvern persists that interactor state on
+the browser-session row so a later live-view connection for the same session
+uses the current selection.
+
+When a session closes, Skyvern disconnects websockify clients first, then stops
+x11vnc, and finally stops Xvfb. This reverse startup order keeps the display
+alive until its consumers have stopped. The persistent-session reaper uses the
+same close path for expired sessions, and API shutdown closes active sessions
+and stops any remaining VNC stacks owned by that API process.
+
+### Runtime dependencies
+
+The Skyvern Docker image already includes Xvfb, x11vnc, websockify, the X11
+utilities, and Netpbm tools used for streaming screenshots. For a native Linux
+installation, install the equivalent system packages and Python utility. For
+example, on Debian or Ubuntu:
+
+```bash
+sudo apt-get install xvfb x11vnc x11-apps netpbm
+python -m pip install websockify
+```
+
+On macOS and Windows, use the Docker deployment for VNC mode rather than
+trying to install the Linux X11 process stack natively.
+
+<Warning>
+VNC process handles are tracked in API-process memory and are not restored from
+Postgres after an API restart. Persistent browser-session rows retain their
+metadata, but the current release does not reconcile or restart the associated
+Xvfb, x11vnc, and websockify processes automatically. Create a new browser
+session after an API restart instead of reconnecting to a VNC session created
+by the previous API process.
 </Warning>
 
 ---
