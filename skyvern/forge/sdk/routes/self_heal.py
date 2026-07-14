@@ -6,7 +6,14 @@ from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.self_heal import HealEpisodeView, HealStatus, RunHealSummary, summarize_run_heals
+from skyvern.schemas.self_heal import (
+    HealEpisodeView,
+    HealStatus,
+    RunHealSummary,
+    WorkflowReliability,
+    summarize_run_heals,
+)
+from skyvern.services.self_heal_reliability_service import get_workflow_reliability
 
 LOG = structlog.get_logger()
 
@@ -57,3 +64,15 @@ async def get_run_heal_episodes(
         episodes=[HealEpisodeView.from_episode(episode) for episode in episodes],
         summary=summarize_run_heals(episodes),
     )
+
+
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/reliability",
+    response_model=WorkflowReliability,
+    include_in_schema=False,
+)
+async def get_workflow_reliability_route(
+    workflow_permanent_id: str,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowReliability:
+    return await get_workflow_reliability(organization.organization_id, workflow_permanent_id)

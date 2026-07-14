@@ -7,11 +7,18 @@ from unittest.mock import AsyncMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import skyvern.forge.sdk.routes.self_heal  # noqa: F401
+import skyvern.forge.sdk.routes.self_heal as self_heal_routes
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.self_heal import HealEpisode, HealEpisodeView, HealStatus, OutputObligation
+from skyvern.schemas.self_heal import (
+    HealEpisode,
+    HealEpisodeView,
+    HealStatus,
+    OutputObligation,
+    ReliabilityState,
+    WorkflowReliability,
+)
 
 ORG_ID = "org_self_heal"
 
@@ -43,23 +50,25 @@ def _episode(
     )
 
 
-def _build_client(monkeypatch) -> tuple[TestClient, AsyncMock, AsyncMock]:
+def _build_client(monkeypatch) -> tuple[TestClient, AsyncMock, AsyncMock, AsyncMock]:
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id=ORG_ID)
 
     get_for_workflow = AsyncMock()
     get_for_run = AsyncMock()
+    get_reliability = AsyncMock()
     monkeypatch.setattr(forge_app.DATABASE.self_heal, "get_heal_episodes_for_workflow", get_for_workflow)
     monkeypatch.setattr(forge_app.DATABASE.self_heal, "get_heal_episodes_for_run", get_for_run)
+    monkeypatch.setattr(self_heal_routes, "get_workflow_reliability", get_reliability)
 
     fastapi_app = FastAPI()
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
     fastapi_app.include_router(routers_module.base_router, prefix="/v1")
-    return TestClient(fastapi_app), get_for_workflow, get_for_run
+    return TestClient(fastapi_app), get_for_workflow, get_for_run, get_reliability
 
 
 def test_get_workflow_heal_episodes_filters_to_caller_org_and_view_shape(monkeypatch) -> None:
-    client, get_for_workflow, _ = _build_client(monkeypatch)
+    client, get_for_workflow, _, _ = _build_client(monkeypatch)
 
     async def _repo_call(**kwargs):
         assert kwargs["organization_id"] == ORG_ID
@@ -99,7 +108,7 @@ def test_get_workflow_heal_episodes_filters_to_caller_org_and_view_shape(monkeyp
 
 
 def test_get_workflow_heal_episodes_invalid_status_returns_422(monkeypatch) -> None:
-    client, get_for_workflow, _ = _build_client(monkeypatch)
+    client, get_for_workflow, _, _ = _build_client(monkeypatch)
 
     response = client.get("/v1/workflows/wpid_target/heal_episodes", params={"status": "invalid_status"})
 
@@ -108,7 +117,7 @@ def test_get_workflow_heal_episodes_invalid_status_returns_422(monkeypatch) -> N
 
 
 def test_get_run_heal_episodes_returns_episodes_and_summary(monkeypatch) -> None:
-    client, _, get_for_run = _build_client(monkeypatch)
+    client, _, get_for_run, _ = _build_client(monkeypatch)
     get_for_run.return_value = [
         _episode(
             heal_episode_id="he_1",
@@ -141,3 +150,35 @@ def test_get_run_heal_episodes_returns_episodes_and_summary(monkeypatch) -> None
     assert body["summary"]["blocks_healed"] == 1
     assert body["summary"]["blocks_with_heal_attempt"] == 2
     assert body["summary"]["blocks_outcome_risk"] == ["block_b"]
+
+
+def test_get_workflow_reliability_is_org_scoped(monkeypatch) -> None:
+    client, _, _, get_reliability = _build_client(monkeypatch)
+    get_reliability.return_value = WorkflowReliability(
+        state=ReliabilityState.watch,
+        outcome_risk=True,
+        scored=True,
+        window_runs=20,
+        healed_runs=2,
+        heal_rate=0.1,
+        consecutive_healed_runs=1,
+        floor_runs=0,
+        outcome_risk_runs=1,
+    )
+
+    response = client.get("/v1/workflows/wpid_target/reliability")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "state": "watch",
+        "outcome_risk": True,
+        "scored": True,
+        "window_runs": 20,
+        "healed_runs": 2,
+        "heal_rate": 0.1,
+        "consecutive_healed_runs": 1,
+        "floor_runs": 0,
+        "outcome_risk_runs": 1,
+    }
+    get_reliability.assert_awaited_once_with(ORG_ID, "wpid_target")
