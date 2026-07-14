@@ -2029,7 +2029,7 @@ function FlowRenderer({
         onMouseDownCapture={() => onMouseDownCapture?.()}
       >
         {layoutPhase === "pre-layout" && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950">
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-background">
             <div className="animate-pulse">
               <LogoMinimized />
             </div>
@@ -2349,7 +2349,7 @@ function FlowRenderer({
                     : null;
                 if (!activeDragLabel) return null;
                 return (
-                  <div className="rounded border border-slate-500 bg-slate-elevation3 px-3 py-2 text-sm text-slate-100 opacity-90 shadow-lg">
+                  <div className="rounded border border-border bg-slate-elevation3 px-3 py-2 text-sm text-foreground opacity-90 shadow-lg dark:border-slate-500">
                     {activeDragLabel}
                   </div>
                 );

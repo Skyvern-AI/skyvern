@@ -82,11 +82,11 @@ function ActionEditorBody({
       <div className="space-y-2">
         <div className="flex justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">URL</Label>
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
             <HelpTooltip content={urlTooltip} />
           </div>
           {isFirstWorkflowBlock ? (
-            <div className="flex justify-end text-xs text-slate-400">
+            <div className="flex justify-end text-xs text-muted-foreground">
               Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
@@ -101,7 +101,9 @@ function ActionEditorBody({
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Action Instruction</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            Action Instruction
+          </Label>
           <HelpTooltip content={navigationGoalTooltip} />
         </div>
         <WorkflowBlockInputTextarea
@@ -114,8 +116,8 @@ function ActionEditorBody({
         />
       </div>
       {!hasInteracted && (
-        <div className="workflow-editor-tip rounded-md bg-slate-800 p-2">
-          <div className="space-y-1 text-xs text-slate-400">
+        <div className="workflow-editor-tip rounded-md bg-muted p-2">
+          <div className="space-y-1 text-xs text-muted-foreground">
             Tip: While executing the action block, Skyvern will only take one
             action.
           </div>
@@ -145,7 +147,7 @@ function ActionEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Engine
                   </Label>
                   <HelpTooltip content={helpTooltips["action"]["engine"]} />
@@ -159,7 +161,7 @@ function ActionEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip
@@ -226,7 +228,7 @@ function ActionEditorBody({
               <Separator />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Complete on Download
                   </Label>
                   <HelpTooltip
@@ -247,7 +249,7 @@ function ActionEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     File Name
                   </Label>
                   <HelpTooltip content={helpTooltips["action"]["fileSuffix"]} />
@@ -264,7 +266,7 @@ function ActionEditorBody({
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Identifier
                   </Label>
                   <HelpTooltip
@@ -283,14 +285,14 @@ function ActionEditorBody({
                   className="nopan text-xs"
                 />
                 {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-muted-foreground dark:text-slate-500">
                     Leave empty to use the credential's value.
                   </p>
                 ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Verification URL
                   </Label>
                   <HelpTooltip

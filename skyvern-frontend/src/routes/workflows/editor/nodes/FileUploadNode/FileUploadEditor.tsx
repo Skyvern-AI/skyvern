@@ -65,7 +65,7 @@ function FileUploadEditorBody({
     <div data-testid="file-upload-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <Label className="text-sm text-slate-400">Storage Type</Label>
+          <Label className="text-sm text-muted-foreground">Storage Type</Label>
           <HelpTooltip content={helpTooltips["fileUpload"]["storage_type"]} />
         </div>
         <Select
@@ -92,7 +92,7 @@ function FileUploadEditorBody({
 
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <Label className="text-sm text-slate-400">Prompt</Label>
+          <Label className="text-sm text-muted-foreground">Prompt</Label>
           <HelpTooltip content={helpTooltips["fileUpload"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
@@ -104,7 +104,7 @@ function FileUploadEditorBody({
           }
           className="nopan text-xs"
         />
-        <p className="text-xs text-slate-400">
+        <p className="text-xs text-muted-foreground">
           Optional. Leave empty to upload all downloaded files.
         </p>
       </div>
@@ -113,7 +113,7 @@ function FileUploadEditorBody({
         <>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 AWS Access Key ID
               </Label>
               <HelpTooltip
@@ -129,7 +129,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 AWS Secret Access Key
               </Label>
               <HelpTooltip
@@ -146,7 +146,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">S3 Bucket</Label>
+              <Label className="text-sm text-muted-foreground">S3 Bucket</Label>
               <HelpTooltip content={helpTooltips["fileUpload"]["s3_bucket"]} />
             </div>
             <WorkflowBlockInputTextarea
@@ -158,7 +158,9 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">Region Name</Label>
+              <Label className="text-sm text-muted-foreground">
+                Region Name
+              </Label>
               <HelpTooltip
                 content={helpTooltips["fileUpload"]["region_name"]}
               />
@@ -172,7 +174,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 (Optional) Folder Path
               </Label>
               <HelpTooltip content={helpTooltips["fileUpload"]["path"]} />
@@ -191,7 +193,7 @@ function FileUploadEditorBody({
         <>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 Storage Account Name
               </Label>
               <HelpTooltip
@@ -209,7 +211,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 Storage Account Key
               </Label>
               <HelpTooltip
@@ -228,7 +230,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 Blob Container Name
               </Label>
               <HelpTooltip
@@ -246,7 +248,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 (Optional) Folder Path
               </Label>
               <HelpTooltip content="Optional folder path within the blob container. Defaults to {{ workflow_run_id }} if not specified." />
@@ -265,7 +267,9 @@ function FileUploadEditorBody({
         <>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">Google Account</Label>
+              <Label className="text-sm text-muted-foreground">
+                Google Account
+              </Label>
               <HelpTooltip content="The connected Google account used for Drive uploads." />
             </div>
             <GoogleOAuthCredentialSelector
@@ -277,7 +281,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 Google Drive Folder ID (Required)
               </Label>
               <HelpTooltip content="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID." />
@@ -296,7 +300,7 @@ function FileUploadEditorBody({
         <>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">SFTP Host</Label>
+              <Label className="text-sm text-muted-foreground">SFTP Host</Label>
               <HelpTooltip content="The SFTP host to upload files to." />
             </div>
             <WorkflowBlockInputTextarea
@@ -308,7 +312,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">Port</Label>
+              <Label className="text-sm text-muted-foreground">Port</Label>
               <HelpTooltip content="Numeric only — template values are not supported. Defaults to 22 if left blank." />
             </div>
             <WorkflowBlockInputTextarea
@@ -322,7 +326,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">Username</Label>
+              <Label className="text-sm text-muted-foreground">Username</Label>
               <HelpTooltip content="The SFTP username." />
             </div>
             <WorkflowBlockInputTextarea
@@ -334,7 +338,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">Password</Label>
+              <Label className="text-sm text-muted-foreground">Password</Label>
               <HelpTooltip content="Password auth. Leave blank if using a private key. Reference a secret parameter for security." />
             </div>
             <WorkflowBlockInput
@@ -347,7 +351,9 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">Private Key</Label>
+              <Label className="text-sm text-muted-foreground">
+                Private Key
+              </Label>
               <HelpTooltip content="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security." />
             </div>
             <WorkflowBlockInputTextarea
@@ -359,7 +365,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 Private Key Passphrase (Optional)
               </Label>
               <HelpTooltip content="Optional passphrase for the private key." />
@@ -374,7 +380,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 (Optional) Remote Directory
               </Label>
               <HelpTooltip content="Remote directory to upload into. Created if it does not exist. Defaults to the login directory." />
@@ -388,7 +394,7 @@ function FileUploadEditorBody({
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">
+              <Label className="text-sm text-muted-foreground">
                 (Optional) Host Key
               </Label>
               <HelpTooltip content="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks." />

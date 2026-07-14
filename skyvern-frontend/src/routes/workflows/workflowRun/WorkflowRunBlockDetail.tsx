@@ -84,8 +84,8 @@ function BlockDownloadedFiles({
   }
 
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-3">
-      <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+    <div className="border-b border-border bg-slate-elevation1 px-3 py-3">
+      <div className="mb-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground dark:text-slate-500">
         Downloaded files
       </div>
       <div className="flex flex-col gap-2">
@@ -95,7 +95,7 @@ function BlockDownloadedFiles({
             title={file.url}
             className="flex items-center gap-2 text-sm"
           >
-            <FileIcon className="size-4 shrink-0 text-slate-400" />
+            <FileIcon className="size-4 shrink-0 text-muted-foreground" />
             <a
               href={file.url}
               className="truncate underline underline-offset-4"

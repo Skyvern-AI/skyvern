@@ -99,7 +99,7 @@ function CodeBlockEditorBody({
   const goalField = (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <Label className="text-xs text-slate-300">Goal</Label>
+        <Label className="text-xs text-tertiary-foreground">Goal</Label>
         <button
           type="button"
           disabled={!canGenerate}
@@ -108,7 +108,7 @@ function CodeBlockEditorBody({
             requestBuild({ blockLabel: data.label, prompt: data.prompt ?? "" })
           }
           className={cn(
-            "nodrag nopan flex items-center gap-1 rounded-md border border-slate-700 bg-slate-elevation1 px-2 py-0.5 text-xs text-slate-200",
+            "nodrag nopan flex items-center gap-1 rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground dark:text-slate-200",
             canGenerate
               ? "hover:bg-slate-elevation2"
               : "cursor-not-allowed opacity-50",
@@ -148,7 +148,7 @@ function CodeBlockEditorBody({
 
   const inputsField = (
     <div className="space-y-2">
-      <Label className="text-xs text-slate-300">Inputs</Label>
+      <Label className="text-xs text-tertiary-foreground">Inputs</Label>
       <WorkflowBlockInputSet
         nodeId={blockId}
         onChange={(parameterKeys) => {
@@ -170,7 +170,7 @@ function CodeBlockEditorBody({
         <button
           type="button"
           aria-expanded={stepsOpen}
-          className="flex w-full items-center justify-between text-xs text-slate-300"
+          className="flex w-full items-center justify-between text-xs text-tertiary-foreground"
           onClick={() => setStepsOpen((open) => !open)}
         >
           <span>Steps ({steps.length})</span>
@@ -204,17 +204,17 @@ function CodeBlockEditorBody({
                       !hasLines && "cursor-default",
                     )}
                   >
-                    <span className="w-5 shrink-0 tabular-nums text-slate-500">
+                    <span className="w-5 shrink-0 tabular-nums text-muted-foreground dark:text-slate-500">
                       {index + 1}.
                     </span>
-                    <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-400">
+                    <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
                       {getStepLabel(step.action_type)}
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-slate-300">
+                    <span className="min-w-0 flex-1 truncate text-tertiary-foreground">
                       {getCodeStepPlainText(step)}
                     </span>
                     {hasLines && (
-                      <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                         {formatStepLines(step)}
                       </span>
                     )}
@@ -232,7 +232,7 @@ function CodeBlockEditorBody({
       <div data-testid="code-block-block-form" className="space-y-4">
         {inputsField}
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Code Input</Label>
+          <Label className="text-xs text-tertiary-foreground">Code Input</Label>
           {codeEditorElement}
         </div>
       </div>
@@ -242,7 +242,7 @@ function CodeBlockEditorBody({
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
       <div className="flex items-center justify-between gap-2">
-        <Label className="text-xs text-slate-300">View</Label>
+        <Label className="text-xs text-tertiary-foreground">View</Label>
         <CodeBlockViewToggle value={view} onChange={setView} />
       </div>
       {view === "plain" ? (
@@ -259,7 +259,9 @@ function CodeBlockEditorBody({
           {stepLineList}
           {inputsField}
           <div className="space-y-2">
-            <Label className="text-xs text-slate-300">Code Input</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Code Input
+            </Label>
             {codeEditorElement}
           </div>
         </>

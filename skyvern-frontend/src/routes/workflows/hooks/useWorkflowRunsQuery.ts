@@ -25,6 +25,7 @@ type Props = {
   enabled?: boolean;
   createdAtStart?: string;
   createdAtEnd?: string;
+  tags?: string;
 } & UseQueryOptions;
 
 function useWorkflowRunsQuery({
@@ -36,6 +37,7 @@ function useWorkflowRunsQuery({
   enabled,
   createdAtStart,
   createdAtEnd,
+  tags,
   ...queryOptions
 }: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
@@ -47,7 +49,7 @@ function useWorkflowRunsQuery({
     queryKey: getOrgScopedQueryKey(
       [
         "workflowRuns",
-        { statusFilters },
+        { statusFilters, tags },
         workflowPermanentId,
         page,
         pageSize,
@@ -58,6 +60,8 @@ function useWorkflowRunsQuery({
       activeOrgQueryKeyScope,
     ),
     queryFn: async ({ signal }) => {
+      // The default legacy route supports ?tags= and keeps child workflow
+      // runs visible; the /v1 route excludes them, so don't switch on filter.
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       const isGlobalWorkflow = globalWorkflows?.some(
@@ -83,6 +87,9 @@ function useWorkflowRunsQuery({
       }
       if (createdAtEnd) {
         params.append("created_at_end", createdAtEnd);
+      }
+      if (tags) {
+        params.append("tags", tags);
       }
 
       return client

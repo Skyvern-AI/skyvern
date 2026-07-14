@@ -117,11 +117,11 @@ function LoginEditorBody({
       <div className="space-y-2">
         <div className="flex justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">URL</Label>
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
             <HelpTooltip content={helpTooltips["login"]["url"]} />
           </div>
           {isFirstWorkflowBlock ? (
-            <div className="flex justify-end text-xs text-slate-400">
+            <div className="flex justify-end text-xs text-muted-foreground">
               Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
@@ -136,7 +136,7 @@ function LoginEditorBody({
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Login Goal</Label>
+          <Label className="text-xs text-tertiary-foreground">Login Goal</Label>
           <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
         </div>
         <WorkflowBlockInputTextarea
@@ -148,11 +148,13 @@ function LoginEditorBody({
           className="nopan text-xs"
         />
       </div>
-      <div className="space-y-3 rounded-md border border-slate-700/50 bg-slate-900/30 p-3">
-        <p className="text-xs font-medium text-slate-300">Authentication</p>
+      <div className="space-y-3 rounded-md border border-border/50 bg-slate-elevation1/30 p-3">
+        <p className="text-xs font-medium text-tertiary-foreground">
+          Authentication
+        </p>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Credential</Label>
-          <p className="text-[0.7rem] text-slate-400">
+          <Label className="text-xs text-tertiary-foreground">Credential</Label>
+          <p className="text-[0.7rem] text-muted-foreground">
             Credentials are encrypted server-side; secret values never echo back
             into the editor.
           </p>
@@ -185,7 +187,7 @@ function LoginEditorBody({
         {showTwoFactorFields ? (
           <div className="space-y-3">
             {credentialIsRotating && hasTotpValues ? (
-              <p className="flex items-start gap-1.5 text-xs text-amber-400">
+              <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
                 <ExclamationTriangleIcon className="mt-0.5 size-3 shrink-0" />
                 <span>
                   Block-level 2FA overrides every rotated account with a single
@@ -196,7 +198,9 @@ function LoginEditorBody({
             ) : null}
             <div className="space-y-2">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">2FA Identifier</Label>
+                <Label className="text-xs text-tertiary-foreground">
+                  2FA Identifier
+                </Label>
                 <HelpTooltip
                   content={helpTooltips["login"]["totpIdentifier"]}
                 />
@@ -213,14 +217,14 @@ function LoginEditorBody({
                 className="nopan text-xs"
               />
               {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                <p className="text-xs text-slate-500">
+                <p className="text-xs text-muted-foreground dark:text-slate-500">
                   Leave empty to use the credential's value.
                 </p>
               ) : null}
             </div>
             <div className="space-y-2">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
+                <Label className="text-xs text-tertiary-foreground">
                   2FA Verification URL
                 </Label>
                 <HelpTooltip
@@ -239,14 +243,14 @@ function LoginEditorBody({
               <button
                 type="button"
                 onClick={() => setTwoFactorRequested(false)}
-                className="text-xs text-slate-400 transition-colors hover:text-slate-200"
+                className="text-xs text-muted-foreground transition-colors hover:text-foreground dark:hover:text-slate-200"
               >
                 Cancel
               </button>
             ) : null}
           </div>
         ) : credentialIsRotating ? (
-          <p className="text-xs text-slate-400">
+          <p className="text-xs text-muted-foreground">
             2FA is handled per account — each rotated credential uses its own
             verification settings.
           </p>
@@ -256,10 +260,10 @@ function LoginEditorBody({
               href="/credentials?tab=twoFactor"
               target="_blank"
               rel="noopener noreferrer"
-              className="min-w-0 break-words text-xs text-slate-400 transition-colors hover:text-slate-200"
+              className="min-w-0 break-words text-xs text-muted-foreground transition-colors hover:text-foreground dark:hover:text-slate-200"
             >
               Skyvern is waiting for 2FA codes with this identifier:{" "}
-              <span className="font-mono text-slate-300">
+              <span className="font-mono text-tertiary-foreground">
                 {credentialTotpIdentifier}
               </span>
               <ArrowTopRightIcon className="ml-0.5 inline size-3 align-text-bottom" />
@@ -312,7 +316,9 @@ function LoginEditorBody({
                 />
               </div>
               <div className="space-y-2">
-                <Label className="text-xs text-slate-300">Complete if...</Label>
+                <Label className="text-xs text-tertiary-foreground">
+                  Complete if...
+                </Label>
                 <WorkflowBlockInputTextarea
                   aiImprove={AI_IMPROVE_CONFIGS.login.completeCriterion}
                   nodeId={blockId}
@@ -324,7 +330,7 @@ function LoginEditorBody({
               <Separator />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Engine
                   </Label>
                 </div>
@@ -336,7 +342,7 @@ function LoginEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Max Steps Override
                   </Label>
                   <HelpTooltip
@@ -361,7 +367,7 @@ function LoginEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip

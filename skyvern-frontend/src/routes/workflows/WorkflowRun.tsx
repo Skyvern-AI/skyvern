@@ -127,7 +127,7 @@ function WorkflowRunRightColumn({
         </div>
       }
       bottom={
-        <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
+        <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
           <WorkflowRunBlockDetail
             activeItem={activeItem}
             activeIteration={activeIteration}
@@ -391,7 +391,7 @@ function WorkflowRun() {
         />
       )}
       {shouldShowFinallyNote && (
-        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-200">
+        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-700 dark:text-amber-200">
           <span className="font-medium">Note:</span>
           <span>
             "Execute on any outcome" block ({finallyBlockLabel}){" "}

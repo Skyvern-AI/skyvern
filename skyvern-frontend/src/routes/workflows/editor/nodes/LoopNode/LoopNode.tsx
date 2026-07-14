@@ -162,7 +162,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
             {
               "pointer-events-none": thisBlockIsPlaying,
-              "bg-slate-950 outline outline-2 outline-slate-300":
+              "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
             data.comparisonColor,
@@ -200,7 +200,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
         className="opacity-0"
       />
       <div
-        className="rounded-xl border-2 border-dashed border-slate-600 p-2"
+        className="rounded-xl border-2 border-dashed border-border p-2 dark:border-slate-600"
         style={{
           width: loopNodeWidth,
           height: childrenHeightExtent,
@@ -214,7 +214,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               open ? "shadow-md" : "shadow-sm",
               {
                 "pointer-events-none": thisBlockIsPlaying,
-                "bg-slate-950 outline outline-2 outline-slate-300":
+                "bg-background outline outline-2 outline-ring":
                   thisBlockIsTargetted,
               },
               data.comparisonColor,

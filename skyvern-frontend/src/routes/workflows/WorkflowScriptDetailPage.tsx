@@ -182,7 +182,7 @@ function WorkflowScriptDetailPage() {
                   size="sm"
                   className={
                     isPinned
-                      ? "gap-2 border-amber-500/30 text-amber-500 hover:text-amber-400"
+                      ? "gap-2 border-amber-500/30 text-amber-500 hover:text-amber-700 dark:hover:text-amber-400"
                       : "gap-2"
                   }
                   disabled={pinMutation.isPending}
@@ -344,7 +344,7 @@ function WorkflowScriptDetailPage() {
             Revision #{activeVersion} created on run{" "}
             <Link
               to={`/agents/${workflowPermanentId}/${activeVersionInfo.run_id}/code`}
-              className="font-mono text-blue-400 hover:underline"
+              className="font-mono text-blue-700 hover:underline dark:text-blue-400"
             >
               {activeVersionInfo.run_id}
             </Link>
@@ -405,7 +405,7 @@ function WorkflowScriptDetailPage() {
                     <TableCell>
                       <Link
                         to={`/agents/${workflowPermanentId}/${run.workflow_run_id}/overview`}
-                        className="font-mono text-sm text-blue-400 hover:underline"
+                        className="font-mono text-sm text-blue-700 hover:underline dark:text-blue-400"
                       >
                         {run.workflow_run_id}
                       </Link>

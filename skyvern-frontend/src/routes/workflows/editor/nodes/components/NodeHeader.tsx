@@ -977,7 +977,7 @@ function NodeHeader({
             ) : (
               gripHandle
             ))}
-          <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+          <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
             {/* Without shrink-0, a long label or subtitle in the sibling
             column steals width from this box before its own min-content. */}
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
@@ -997,7 +997,7 @@ function NodeHeader({
             <div className="flex items-center gap-2">
               {transmutations && transmutations.others.length ? (
                 <div className="flex items-center gap-1">
-                  <span className="text-xs text-slate-400">
+                  <span className="text-xs text-muted-foreground">
                     {transmutations.blockTitle}
                   </span>
                   <NoticeMe trigger="viewport">
@@ -1023,14 +1023,14 @@ function NodeHeader({
                 </div>
               ) : (
                 <span
-                  className="min-w-0 flex-1 truncate text-xs text-slate-400"
+                  className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
                   title={blockTitle}
                 >
                   {blockTitle}
                 </span>
               )}
               {workflowSettingsStore.finallyBlockLabel === blockLabel && (
-                <span className="rounded bg-amber-600/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+                <span className="rounded bg-amber-600/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
                   Runs on any outcome
                 </span>
               )}
@@ -1068,7 +1068,7 @@ function NodeHeader({
                 ) : (
                   <PlayIcon
                     className={cn("size-6", {
-                      "pointer-events-none fill-gray-500 text-gray-500":
+                      "pointer-events-none fill-gray-500 text-muted-foreground dark:text-gray-500":
                         workflowRunIsRunningOrQueued ||
                         !workflowPermanentId ||
                         debugSession === undefined ||

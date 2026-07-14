@@ -138,7 +138,7 @@ function WorkflowEditor() {
       {elements.validationError ? (
         <div
           role="alert"
-          className="z-10 border-b border-amber-700/40 bg-amber-950/50 px-4 py-2 text-sm text-amber-200"
+          className="z-10 border-b border-amber-300 bg-amber-100 px-4 py-2 text-sm text-amber-700 dark:border-amber-700/40 dark:bg-amber-950/50 dark:text-amber-200"
         >
           <strong className="font-semibold">
             Workflow validation warning:

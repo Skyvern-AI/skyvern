@@ -18,7 +18,10 @@ function HighlightText({ text, query }: HighlightTextProps) {
     <>
       {parts.map((part, i) =>
         part.toLowerCase() === lowerQ ? (
-          <span key={i} className="rounded bg-blue-500/30 text-blue-400">
+          <span
+            key={i}
+            className="rounded bg-blue-500/30 text-blue-700 dark:text-blue-400"
+          >
             {part}
           </span>
         ) : (

@@ -60,7 +60,7 @@ function ParametersMultiSelect({
   return (
     <div className="space-y-2">
       <header className="flex gap-2">
-        <h1 className="text-xs text-slate-300">Inputs</h1>
+        <h1 className="text-xs text-tertiary-foreground">Inputs</h1>
         <HelpTooltip content={helpTooltips["task"]["parameters"]} />
       </header>
       <MultiSelect
