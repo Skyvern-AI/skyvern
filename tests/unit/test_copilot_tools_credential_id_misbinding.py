@@ -393,6 +393,7 @@ def test_error_message_steers_delete_not_relocate() -> None:
 def _ctx() -> MagicMock:
     ctx = MagicMock(spec=AgentContext)
     ctx.workflow_yaml = ""
+    ctx.scout_trajectory = []
     ctx.last_workflow_yaml = None
     ctx.workflow_id = "w_test"
     ctx.workflow_permanent_id = "wpid_test"

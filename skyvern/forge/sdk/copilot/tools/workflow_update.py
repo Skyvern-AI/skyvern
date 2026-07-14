@@ -57,6 +57,8 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    INPUT_TEMPLATED_PROVENANCE_SOURCE,
+    LOCATOR_WITNESS_PARAM_SOURCE,
     SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
     SCOUTED_SPINE_TRUNCATED_REASON_CODE,
     SCOUTED_SPINE_UNDER_BUILD_REASON_CODE,
@@ -73,8 +75,10 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _selector_refines,
     artifact_dependency_id,
     artifact_observation_ref_id,
+    build_input_templated_locator,
     credential_scout_gap,
     freeze_requested_output_extraction_candidate,
+    input_correspondences_for_interaction,
     locator_selector_literals,
     missing_rung_text,
     normalized_locator_expr,
@@ -5967,6 +5971,19 @@ def _locator_provenance_is_self_validating(provenance: Mapping[str, Any]) -> boo
         role = str(provenance.get("role") or "")
         name = str(provenance.get("name") or "")
         return bool(role) and bool(name) and _get_by_role_expr_strict(role, name) == provenance.get("emitted_literal")
+    if source == INPUT_TEMPLATED_PROVENANCE_SOURCE:
+        surface = str(provenance.get("surface") or "")
+        holes = provenance.get("holes")
+        if not isinstance(holes, list) or not holes:
+            return False
+        recomputed = build_input_templated_locator(
+            surface=surface,
+            selector=str(provenance.get("selector") or ""),
+            role=str(provenance.get("role") or ""),
+            name=str(provenance.get("name") or ""),
+            holes=holes,
+        )
+        return recomputed is not None and recomputed == provenance.get("emitted_literal")
     return False
 
 
@@ -7466,7 +7483,7 @@ def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContex
 
     defaults_by_value: dict[str, list[str]] = {}
     for parameter in synthesized.parameters:
-        if parameter.get("credential_id"):
+        if parameter.get("credential_id") or parameter.get("source") == LOCATOR_WITNESS_PARAM_SOURCE:
             continue
         key = str(parameter.get("key") or "").strip()
         default_value = str(parameter.get("default_value") or "").strip()
@@ -7744,7 +7761,9 @@ def _scout_interaction_for_synthesized_parameter(
     non_credential_keys = [
         str(parameter.get("key") or "").strip()
         for parameter in synthesized_parameters
-        if str(parameter.get("key") or "").strip() and not parameter.get("credential_id")
+        if str(parameter.get("key") or "").strip()
+        and not parameter.get("credential_id")
+        and parameter.get("source") != LOCATOR_WITNESS_PARAM_SOURCE
     ]
     typed_interactions = [
         interaction for interaction in scout_trajectory if str(interaction.get("tool_name") or "") == "type_text"
@@ -7788,7 +7807,11 @@ def _reconcile_synthesized_parameters(
     aliases: dict[str, str] = {}
     used_selector_join_aliases: set[str] = set()
     repair_context: CodeAuthoringRepairContext | None = None
-    non_credential_synthesized = [param for param in synthesized_parameters if not param.get("credential_id")]
+    non_credential_synthesized = [
+        param
+        for param in synthesized_parameters
+        if not param.get("credential_id") and param.get("source") != LOCATOR_WITNESS_PARAM_SOURCE
+    ]
     typed_lengths = [
         int(interaction.get("typed_length") or 0)
         for interaction in scout_trajectory
@@ -7972,8 +7995,16 @@ def _synthesized_durable_stage_codes(synthesized: SynthesizedCodeBlock, *, sourc
         ranges.append((start, end))
     if ranges != sorted(ranges):
         return []
-    stage_codes = ["\n".join(lines[start - 1 : end]).strip() for start, end in ranges]
-    return [code for code in stage_codes if code]
+    # The witness prelude (runtime charset guards + month helper) sits above the first step range, so the
+    # slice would drop it; each separated stage is an independent CodeBlock that must carry its own guards.
+    prelude = "\n".join(lines[: ranges[0][0] - 1]).strip()
+    stage_codes: list[str] = []
+    for start, end in ranges:
+        body = "\n".join(lines[start - 1 : end]).strip()
+        if not body:
+            continue
+        stage_codes.append(f"{prelude}\n{body}" if prelude else body)
+    return stage_codes
 
 
 def _top_level_block_list_for_selected_code_block(
@@ -9517,6 +9548,49 @@ def _reject_schema_incompatibility(
     )
 
 
+def _declared_string_parameter_values(workflow_yaml: str) -> dict[str, str]:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return {}
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return {}
+    parameters = workflow_definition.get("parameters")
+    if not isinstance(parameters, list):
+        return {}
+    values: dict[str, str] = {}
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if not key:
+            continue
+        default_value = _string_parameter_default_value(parameter)
+        if isinstance(default_value, str) and default_value:
+            values[key] = default_value
+    return values
+
+
+def _enrich_scout_trajectory_input_correspondences(workflow_yaml: str, ctx: AgentContext) -> None:
+    """Match the submitted workflow's declared string-parameter values against each scout click's captured
+    literals and stamp the correspondence onto the trajectory once, so every synthesize_code_block call reads
+    it. Idempotent; empty declared params clears prior stamps."""
+    scout_trajectory = ctx.scout_trajectory
+    if not scout_trajectory:
+        return
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return
+    declared_params = _declared_string_parameter_values(workflow_yaml)
+    for interaction in scout_trajectory:
+        if not isinstance(interaction, dict):
+            continue
+        correspondences = input_correspondences_for_interaction(interaction, declared_params) if declared_params else []
+        if correspondences:
+            interaction["input_correspondences"] = correspondences
+        else:
+            interaction.pop("input_correspondences", None)
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -9564,6 +9638,7 @@ async def _update_workflow(
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
+    _enrich_scout_trajectory_input_correspondences(workflow_yaml, ctx)
     imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
     # Consume the one-shot credential-scout reopen before the gate below so a fresh reject can re-arm it.
     ctx.synthesized_block_reopened_for_credential_scout = False
