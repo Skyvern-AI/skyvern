@@ -1759,8 +1759,9 @@ class HealEpisodeModel(Base):
     __tablename__ = "heal_episodes"
     __table_args__ = (
         Index("he_org_wpid_index", "organization_id", "workflow_permanent_id", "created_at"),
+        Index("he_org_wpid_block_label_index", "organization_id", "workflow_permanent_id", "block_label", "created_at"),
         Index("he_org_created_at_index", "organization_id", "created_at"),
-        Index("he_org_wrid_index", "organization_id", "workflow_run_id"),
+        Index("he_org_wrid_created_at_index", "organization_id", "workflow_run_id", "created_at"),
     )
 
     heal_episode_id = Column(String, primary_key=True, default=generate_heal_episode_id)

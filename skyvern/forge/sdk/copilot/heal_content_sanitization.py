@@ -72,7 +72,9 @@ def _sanitize_string_leaves(node: Any) -> Any:
 
 def build_heal_episode_detail(episode: HealEpisode) -> HealEpisodeDetail:
     return HealEpisodeDetail(
-        **episode.model_dump(exclude={"block_code", "block_prompt", "failure_message", "block_steps"}),
+        **episode.model_dump(
+            exclude={"organization_id", "block_code", "block_prompt", "failure_message", "block_steps"}
+        ),
         sanitized_block_code=sanitize_heal_content(episode.block_code),
         sanitized_block_prompt=sanitize_heal_content(episode.block_prompt),
         sanitized_failure_message=sanitize_heal_content(episode.failure_message),
