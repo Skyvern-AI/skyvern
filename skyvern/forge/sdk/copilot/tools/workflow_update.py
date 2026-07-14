@@ -10,6 +10,7 @@ import re
 import textwrap
 import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _CODE_SUBMIT_ACTION_RE,
+    _CREDENTIAL_FIELDS,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
@@ -6129,6 +6131,32 @@ def _direct_locator_receiver_signature(node: ast.AST) -> str | None:
     return None
 
 
+# page.get_by_label(...) is a durable locator factory strict synthesis never emits, so it is scanned
+# as a durable mutation receiver only to route it through the admissibility contract, never to admit it.
+_DURABLE_NON_SYNTHESIZED_FACTORY_METHODS = frozenset({"get_by_label"})
+
+
+def _durable_non_synthesized_receiver_signature(node: ast.AST) -> str | None:
+    receiver = _locator_receiver_for_signature(node)
+    if (
+        isinstance(receiver, ast.Call)
+        and isinstance(receiver.func, ast.Attribute)
+        and receiver.func.attr in _DURABLE_NON_SYNTHESIZED_FACTORY_METHODS
+        and isinstance(receiver.func.value, ast.Name)
+        and receiver.func.value.id == "page"
+    ):
+        return _call_name(receiver)
+    return None
+
+
+def _receiver_is_durable_non_synthesized_factory(receiver: str) -> bool:
+    try:
+        node = ast.parse(receiver, mode="eval").body
+    except SyntaxError:
+        return False
+    return _durable_non_synthesized_receiver_signature(node) is not None
+
+
 def _direct_page_method_signature(node: ast.AST) -> str | None:
     if not isinstance(node, ast.Name) or node.id != "page":
         return None
@@ -6149,7 +6177,9 @@ def _browser_mutation_signature_for_call(node: ast.Call) -> _BrowserMutationSign
     if not isinstance(func, ast.Attribute):
         return None
     if func.attr in _LOCATOR_MUTATION_METHODS:
-        receiver = _direct_locator_receiver_signature(func.value)
+        receiver = _direct_locator_receiver_signature(func.value) or _durable_non_synthesized_receiver_signature(
+            func.value
+        )
         if receiver is not None:
             return _BrowserMutationSignature(func.attr, receiver, ast.dump(node, include_attributes=False))
         return None
@@ -6275,6 +6305,8 @@ def _browser_expression_kind(node: ast.AST, bindings: _BrowserBindings) -> _Brow
     if isinstance(node, ast.Name) and node.id in bindings.locator_aliases and node.id in _INTERNAL_SCOUT_VARS:
         return _BrowserExpressionKind.LOCATOR
     if _direct_locator_receiver_signature(node) is not None:
+        return _BrowserExpressionKind.LOCATOR
+    if _durable_non_synthesized_receiver_signature(node) is not None:
         return _BrowserExpressionKind.LOCATOR
     if isinstance(node, ast.Attribute) and node.attr in {"first", "last"}:
         if _browser_expression_kind(node.value, bindings) == _BrowserExpressionKind.LOCATOR:
@@ -6591,11 +6623,18 @@ def _whole_trajectory_browser_surface_violations(
     synthesized_code: str,
     prior_yaml: str | None = None,
     synthesized_diagnostics: SynthesisDiagnostics | None = None,
+    admit_on_receiver: bool = False,
+    restrict_to_durable_factory: bool = False,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
     provenance: list[_BrowserSurfaceRejectionProvenance] = []
     scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
     scouted_signatures = set(scouted_mutations)
+    # Freehand admission is selector-resolvability, so a block that replays a scouted locator with a
+    # different literal argument stays admissible; imposition siblings keep the stricter full-call match.
+    admitted_receivers = {
+        (mutation.method, normalized_locator_expr(mutation.receiver)) for mutation in scouted_mutations
+    }
     for block in code_blocks:
         if block is selected_code_block:
             continue
@@ -6604,7 +6643,21 @@ def _whole_trajectory_browser_surface_violations(
         label = _code_block_label(block)
         block_code = str(block.get("code") or "")
         block_mutations, _, block_ambiguous = _browser_surface_for_code(block_code)
-        unscouted_mutations = [mutation for mutation in block_mutations if mutation not in scouted_signatures]
+        if admit_on_receiver:
+            unscouted_mutations = [
+                mutation
+                for mutation in block_mutations
+                if mutation.receiver != "page"
+                and (mutation.method, normalized_locator_expr(mutation.receiver)) not in admitted_receivers
+            ]
+        else:
+            unscouted_mutations = [mutation for mutation in block_mutations if mutation not in scouted_signatures]
+        if restrict_to_durable_factory:
+            unscouted_mutations = [
+                mutation
+                for mutation in unscouted_mutations
+                if _receiver_is_durable_non_synthesized_factory(mutation.receiver)
+            ]
         if unscouted_mutations:
             action_text = ", ".join(
                 f"{mutation.receiver}.{mutation.method}" for mutation in sorted(unscouted_mutations)
@@ -6624,7 +6677,7 @@ def _whole_trajectory_browser_surface_violations(
                 f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): "
                 f"{action_text}.{_provenance_suffix_text(block_provenance)}"
             )
-        if block_ambiguous:
+        if block_ambiguous and not restrict_to_durable_factory:
             ambiguous_provenance = [
                 _ambiguous_browser_action_provenance(action, site="whole_trajectory", block_label=label)
                 for action in block_ambiguous
@@ -6868,6 +6921,197 @@ def _persist_seam_spine_under_build_result(
         block_label=", ".join(_code_block_label(block) for block in code_blocks) or _SYNTHESIZED_BLOCK_LABEL,
         site="persist_seam",
     )
+
+
+_FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE = "freehand_unresolvable_selector"
+_FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE = "freehand_unguarded_credential_fill"
+
+
+def _workflow_credential_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
+    workflow_definition = parsed.get("workflow_definition")
+    parameters = workflow_definition.get("parameters") if isinstance(workflow_definition, dict) else None
+    if not isinstance(parameters, list):
+        return set()
+    keys: set[str] = set()
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping) or not _is_credential_parameter(parameter):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _credential_field_fill_argument(arg: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if (
+        isinstance(arg, ast.Attribute)
+        and arg.attr in _CREDENTIAL_FIELDS
+        and isinstance(arg.value, ast.Name)
+        and arg.value.id in credential_parameter_keys
+    ):
+        return True
+    target = arg.value if isinstance(arg, ast.Await) else arg
+    return (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Attribute)
+        and target.func.attr == "otp"
+        and isinstance(target.func.value, ast.Name)
+        and target.func.value.id in credential_parameter_keys
+    )
+
+
+def _is_credential_field_fill_call(node: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fill"
+        and bool(node.args)
+        and _credential_field_fill_argument(node.args[0], credential_parameter_keys)
+    )
+
+
+def _is_presence_guard_test(test: ast.AST) -> bool:
+    for node in ast.walk(test):
+        if isinstance(node, ast.Attribute) and node.attr in {"count", "is_visible"}:
+            return True
+        if isinstance(node, ast.Name) and node.id in _INTERNAL_SCOUT_VARS:
+            return True
+    return False
+
+
+def _credential_fill_is_presence_guarded(node: ast.AST, parents: Mapping[int, ast.AST]) -> bool:
+    current: ast.AST = node
+    while id(current) in parents:
+        parent = parents[id(current)]
+        if (
+            isinstance(parent, ast.If)
+            and any(current is stmt for stmt in parent.body)
+            and _is_presence_guard_test(parent.test)
+        ):
+            return True
+        current = parent
+    return False
+
+
+def _block_has_unguarded_credential_fill(code: str, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if not credential_parameter_keys:
+        return False
+    tree = _wrapped_code_ast(code)
+    if tree is None:
+        return False
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return any(
+        _is_credential_field_fill_call(node, credential_parameter_keys)
+        and not _credential_fill_is_presence_guarded(node, parents)
+        for node in ast.walk(tree)
+    )
+
+
+def _freehand_surface_reject(
+    workflow_yaml: str, code_blocks: list[dict[str, Any]], validation: _BrowserSurfaceValidation
+) -> _SynthesizedCodeImpositionResult:
+    first = validation.provenance[0] if validation.provenance else None
+    repair_context = CodeAuthoringRepairContext(
+        block_label=first.block_label if first is not None else _code_block_label(code_blocks[0]),
+        reason_code=_FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE,
+        selector=first.nearest_selector if first is not None else None,
+    )
+    return _SynthesizedCodeImpositionResult(
+        workflow_yaml=workflow_yaml,
+        violations=validation.violations,
+        repair_context=repair_context,
+    )
+
+
+def _persist_seam_freehand_surface_result(
+    workflow_yaml: str, ctx: AgentContext
+) -> _SynthesizedCodeImpositionResult | None:
+    # Imposition validates only the spine it rewrites; this leg closes the persist lanes where a changed
+    # freehand browser block never reached that surface gate, applying the same admissibility to siblings.
+    if not ctx.impose_synthesized_code_block:
+        return None
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    scout_trajectory = ctx.scout_trajectory
+    if not scout_trajectory:
+        return None
+    if not str(scout_trajectory[0].get("source_url") or "").strip():
+        return None
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return None
+    code_blocks = _workflow_code_blocks(parsed)
+    if not code_blocks:
+        return None
+    _, prior_yaml = _prior_yaml_source(ctx)
+    carrier_label = ctx.spine_imposition_carrier_label
+    exempt_block = (
+        next((block for block in code_blocks if _code_block_label(block) == carrier_label), None)
+        if carrier_label
+        else None
+    )
+    credential_parameter_keys = _workflow_credential_parameter_keys(parsed)
+    for block in code_blocks:
+        if block is exempt_block:
+            continue
+        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
+            continue
+        if not _block_has_unguarded_credential_fill(str(block.get("code") or ""), credential_parameter_keys):
+            continue
+        label = _code_block_label(block)
+        LOG.info("copilot_freehand_unguarded_credential_fill", block_label=label)
+        violation = (
+            f"Unable to persist code block: `{label}` fills a credential field without a presence guard, so it "
+            "re-fills and times out when the workflow replays on an already-authenticated page. Reuse the "
+            "synthesized entry rung, which fills only when the login form is still present."
+        )
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=[violation],
+            repair_context=CodeAuthoringRepairContext(
+                block_label=label, reason_code=_FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE
+            ),
+        )
+    synthesized = synthesize_code_block(
+        scout_trajectory, strict_selectors=True, reached_download_target=ctx.reached_download_target
+    )
+    synthesized_code = "" if synthesized is None else (synthesized.interaction_code or synthesized.code)
+    synthesized_diagnostics = None if synthesized is None else synthesized.diagnostics
+    sentinel_selected: dict[str, Any] = {}
+    selected_code_block = exempt_block if exempt_block is not None else sentinel_selected
+    # get_by_label is never a synthesized selector, so an unresolvable one is rejected regardless of whether
+    # the scout reached its goal; a fragment scout still fails this class closed to the scout-the-step route.
+    factory_validation = _whole_trajectory_browser_surface_violations(
+        code_blocks=code_blocks,
+        selected_code_block=selected_code_block,
+        submitted_selected_code="",
+        synthesized_code=synthesized_code,
+        prior_yaml=prior_yaml,
+        synthesized_diagnostics=synthesized_diagnostics,
+        admit_on_receiver=True,
+        restrict_to_durable_factory=True,
+    )
+    if factory_validation.violations:
+        return _freehand_surface_reject(workflow_yaml, code_blocks, factory_validation)
+    # The full synthesized spine is an authoritative admissibility reference only when the scout captured a
+    # durable entry through a commit; a fragment scout would false-reject legitimate multi-block authoring.
+    if synthesized is None or not synthesized_trajectory_reaches_goal(ctx):
+        return None
+    validation = _whole_trajectory_browser_surface_violations(
+        code_blocks=code_blocks,
+        selected_code_block=selected_code_block,
+        submitted_selected_code="",
+        synthesized_code=synthesized_code,
+        prior_yaml=prior_yaml,
+        synthesized_diagnostics=synthesized_diagnostics,
+        admit_on_receiver=True,
+    )
+    if not validation.violations:
+        return None
+    return _freehand_surface_reject(workflow_yaml, code_blocks, validation)
 
 
 def _workflow_yaml_browser_call_pairs(workflow_yaml: str) -> list[tuple[str, str]]:
@@ -8076,6 +8320,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     ctx.pending_goal_complete_landing = False
     ctx.pending_requested_output_extraction_candidate = None
     ctx.spine_imposition_owned_attempt = False
+    ctx.spine_imposition_carrier_label = None
     if not getattr(ctx, "impose_synthesized_code_block", False):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
@@ -8114,6 +8359,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             LOG.info("copilot_spine_imposition_no_carrier", code_block_count=len(code_blocks))
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     submitted_code = str(code_block.get("code") or "")
+    ctx.spine_imposition_carrier_label = _code_block_label(code_block)
 
     owns_spine = reaches_goal
     ctx.spine_imposition_owned_attempt = owns_spine
@@ -9683,6 +9929,17 @@ async def _update_workflow(
                 user_facing_summary=_compiled_authoring_user_summary(),
                 data=_code_repair_progress_data(seam_under_build.repair_context),
                 repair_context=seam_under_build.repair_context,
+                record_repair_context_outcome=False,
+            )
+        freehand_surface = _persist_seam_freehand_surface_result(workflow_yaml, ctx)
+        if freehand_surface is not None:
+            _set_code_authoring_repair_context(ctx, freehand_surface.repair_context)
+            _record_code_authoring_guardrail_reject(ctx)
+            return reject(
+                error="\n".join(freehand_surface.violations),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data=_code_repair_progress_data(freehand_surface.repair_context),
+                repair_context=freehand_surface.repair_context,
                 record_repair_context_outcome=False,
             )
     stripped_sandbox_imports: list[str] = []
