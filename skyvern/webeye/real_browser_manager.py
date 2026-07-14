@@ -852,6 +852,12 @@ class RealBrowserManager(BrowserManager):
     ) -> BrowserState | None:
         LOG.info("Cleaning up for workflow run", sampling=True)
         browser_state_to_close = self.pages.get(workflow_run_id)
+        session_manager_owns_close = (
+            close_browser_on_completion
+            and browser_session_id is not None
+            and organization_id is not None
+            and _manager_requires_local_vnc_display()
+        )
 
         # Pop child workflow_run entries first — these are orphaned because child
         # workflows skip clean_up_workflow. Must happen before the shared check
@@ -895,7 +901,13 @@ class RealBrowserManager(BrowserManager):
                 await browser_state_to_close.browser_context.tracing.stop(path=trace_path)
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
-            if streams_active:
+            if session_manager_owns_close:
+                # The default persistent-sessions manager owns the cached
+                # BrowserState and its VNC stack. Let close_session tear down
+                # both exactly once after all workflow/task aliases are
+                # detached below.
+                await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
+            elif streams_active:
                 # Defer close until the last stream disconnects. Persist session cookies first: the
                 # deferred close() runs after store_browser_session archives the dir, too late for it.
                 await persist_session_cookies(
@@ -920,11 +932,11 @@ class RealBrowserManager(BrowserManager):
                     release_driver=False if (shared or browser_session_id) else None,
                 )
 
-        if not streams_active:
+        if session_manager_owns_close or not streams_active:
             self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
             task_browser_state = self.pages.pop(task_id, None)
-            if task_browser_state is None or streams_active:
+            if task_browser_state is None or session_manager_owns_close or streams_active:
                 continue
             # Same shared-state check for task-level entries
             shared = any(bs is task_browser_state for bs in self.pages.values())
@@ -952,10 +964,14 @@ class RealBrowserManager(BrowserManager):
 
         if browser_session_id:
             if organization_id:
-                await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
-                    browser_session_id, organization_id=organization_id
-                )
-                LOG.info("Released browser session", browser_session_id=browser_session_id)
+                if session_manager_owns_close:
+                    await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, browser_session_id)
+                    LOG.info("Closed workflow-owned browser session", browser_session_id=browser_session_id)
+                else:
+                    await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                        browser_session_id, organization_id=organization_id
+                    )
+                    LOG.info("Released browser session", browser_session_id=browser_session_id)
             else:
                 LOG.warning(
                     "Organization ID not specified, cannot release browser session", workflow_run_id=workflow_run_id
@@ -993,16 +1009,17 @@ class RealBrowserManager(BrowserManager):
                 page = await browser_state.get_working_page()
                 if not page:
                     LOG.warning("Browser state has no page to run the script", script_id=script_id)
-        proxy_location = ProxyLocation.RESIDENTIAL
+        proxy_location: ProxyLocationInput = ProxyLocation.RESIDENTIAL
         if not browser_state:
             display_number: int | None = None
             if browser_session_id and requires_display:
                 if organization_id is None:
                     _require_session_display(browser_session_id, organization_id, None)
-                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, organization_id)
-                display_number = _require_session_display(browser_session_id, organization_id, session)
-                if session is not None and session.proxy_location is not None:
-                    proxy_location = session.proxy_location
+                else:
+                    session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, organization_id)
+                    display_number = _require_session_display(browser_session_id, organization_id, session)
+                    if session is not None and session.proxy_location is not None:
+                        proxy_location = session.proxy_location
             if display_number is None:
                 browser_state = await self._create_browser_state(
                     proxy_location=proxy_location,

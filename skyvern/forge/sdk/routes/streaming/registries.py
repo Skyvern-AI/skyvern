@@ -45,6 +45,22 @@ def get_vnc_channel(client_id: str) -> VncChannel | None:
     return vnc_channels.get(client_id)
 
 
+def get_vnc_channels_for_browser_session(
+    *,
+    organization_id: str,
+    browser_session_id: str,
+) -> tuple[VncChannel, ...]:
+    """Return the process-local VNC viewers attached to one browser session."""
+    return tuple(
+        channel
+        for channel in vnc_channels.values()
+        if channel.organization_id == organization_id
+        and channel.browser_session is not None
+        and channel.browser_session.organization_id == organization_id
+        and channel.browser_session.persistent_browser_session_id == browser_session_id
+    )
+
+
 def del_vnc_channel(client_id: str, *, expected: VncChannel | None = None) -> None:
     candidate = vnc_channels.get(client_id)
 

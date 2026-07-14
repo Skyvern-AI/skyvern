@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,6 +9,8 @@ import pytest
 from fastapi import WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
+from skyvern.forge.sdk.routes.streaming import registries
+from skyvern.forge.sdk.routes.streaming import verify as verify_module
 from skyvern.forge.sdk.routes.streaming.channels import message as message_module
 from skyvern.forge.sdk.routes.streaming.channels import vnc as vnc_module
 from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel, MessageKind, loop_stream_messages
@@ -15,11 +18,16 @@ from skyvern.forge.sdk.routes.streaming.channels.vnc import Interactor, VncChann
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
 
 
-def _browser_session(interactor: str | None) -> AddressablePersistentBrowserSession:
+def _browser_session(
+    interactor: str | None,
+    *,
+    browser_session_id: str = "pbs_test",
+    organization_id: str = "org_test",
+) -> AddressablePersistentBrowserSession:
     now = datetime.now(timezone.utc)
     return AddressablePersistentBrowserSession(
-        persistent_browser_session_id="pbs_test",
-        organization_id="org_test",
+        persistent_browser_session_id=browser_session_id,
+        organization_id=organization_id,
         status="running",
         browser_address="",
         vnc_port=6087,
@@ -57,6 +65,29 @@ def _vnc_channel(
         browser_session=_browser_session(stored_interactor),
     )
     return channel, update, log
+
+
+def _registered_vnc_channel(
+    *,
+    client_id: str,
+    organization_id: str,
+    browser_session_id: str,
+    initial_interactor: Interactor = "agent",
+    stored_interactor: str | None = None,
+) -> VncChannel:
+    return VncChannel(
+        client_id=client_id,
+        organization_id=organization_id,
+        vnc_port=6080,
+        x_api_key="",
+        websocket=SimpleNamespace(client_state=WebSocketState.CONNECTED),
+        initial_interactor=initial_interactor,
+        browser_session=_browser_session(
+            stored_interactor,
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -190,3 +221,91 @@ async def test_persistence_failure_does_not_break_later_control_messages(monkeyp
     assert update.await_count == 2
     assert websocket.receive_json.await_count == 3
     assert log.exception.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_interactor_change_broadcasts_to_registered_viewers_of_same_session_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, update = _app_with_repository()
+    monkeypatch.setattr(vnc_module, "app", app, raising=False)
+    monkeypatch.setattr(vnc_module, "LOG", MagicMock())
+    monkeypatch.setattr(registries, "vnc_channels", {})
+
+    initiating_channel = _registered_vnc_channel(
+        client_id="client_initiator",
+        organization_id="org_shared",
+        browser_session_id="pbs_shared",
+    )
+    peer_channel = _registered_vnc_channel(
+        client_id="client_peer",
+        organization_id="org_shared",
+        browser_session_id="pbs_shared",
+    )
+    different_session = _registered_vnc_channel(
+        client_id="client_other_session",
+        organization_id="org_shared",
+        browser_session_id="pbs_other",
+    )
+    different_organization = _registered_vnc_channel(
+        client_id="client_other_org",
+        organization_id="org_other",
+        browser_session_id="pbs_shared",
+    )
+
+    await initiating_channel.set_interactor_and_persist("user")
+
+    assert initiating_channel.interactor == "user"
+    assert peer_channel.interactor == "user"
+    assert different_session.interactor == "agent"
+    assert different_organization.interactor == "agent"
+    update.assert_awaited_once_with(
+        "pbs_shared",
+        organization_id="org_shared",
+        interactor="user",
+    )
+
+
+@pytest.mark.parametrize(
+    ("persisted_interactor", "expected_interactor"),
+    [
+        ("user", "user"),
+        (None, "agent"),
+        ("operator", "agent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_verification_refreshes_only_valid_persisted_interactor(
+    monkeypatch: pytest.MonkeyPatch,
+    persisted_interactor: str | None,
+    expected_interactor: Interactor,
+) -> None:
+    app, _ = _app_with_repository()
+    monkeypatch.setattr(vnc_module, "app", app, raising=False)
+    monkeypatch.setattr(vnc_module, "LOG", MagicMock())
+    monkeypatch.setattr(registries, "vnc_channels", {})
+    channel = _registered_vnc_channel(
+        client_id="client_verify",
+        organization_id="org_verify",
+        browser_session_id="pbs_verify",
+    )
+    refreshed_session = _browser_session(
+        persisted_interactor,
+        browser_session_id="pbs_verify",
+        organization_id="org_verify",
+    )
+    monkeypatch.setattr(
+        verify_module,
+        "verify_browser_session",
+        AsyncMock(return_value=refreshed_session),
+    )
+    monkeypatch.setattr(
+        verify_module.asyncio,
+        "sleep",
+        AsyncMock(side_effect=asyncio.CancelledError),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await verify_module.loop_verify_browser_session(channel)
+
+    assert channel.interactor == expected_interactor

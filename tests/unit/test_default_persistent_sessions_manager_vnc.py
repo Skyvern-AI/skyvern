@@ -45,6 +45,45 @@ def session_row(session_id: str = "pbs_1", **overrides: object) -> SimpleNamespa
     return SimpleNamespace(**values)
 
 
+def test_local_vnc_ownership_capability_requires_exact_ready_stack(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    with (
+        patch.object(manager_module.settings, "BROWSER_STREAMING_MODE", "vnc"),
+        patch.object(VncManager, "owns_ready_stack", return_value=True) as owns_ready_stack,
+    ):
+        assert manager.owns_local_vnc_stack(
+            session_id="pbs_1",
+            organization_id="org_1",
+            display_number=100,
+            vnc_port=6080,
+        )
+
+    owns_ready_stack.assert_called_once_with(
+        "pbs_1",
+        organization_id="org_1",
+        display_number=100,
+        vnc_port=6080,
+    )
+
+
+def test_local_vnc_ownership_capability_is_disabled_outside_vnc_mode(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    with (
+        patch.object(manager_module.settings, "BROWSER_STREAMING_MODE", "cdp"),
+        patch.object(VncManager, "owns_ready_stack") as owns_ready_stack,
+    ):
+        assert not manager.owns_local_vnc_stack(
+            session_id="pbs_1",
+            organization_id="org_1",
+            display_number=100,
+            vnc_port=6080,
+        )
+
+    owns_ready_stack.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_create_vnc_session_starts_and_persists_stack_for_runnable_session(
     manager: DefaultPersistentSessionsManager,

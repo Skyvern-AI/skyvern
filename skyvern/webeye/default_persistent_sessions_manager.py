@@ -224,6 +224,23 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         return settings.BROWSER_STREAMING_MODE == "vnc"
 
+    def owns_local_vnc_stack(
+        self,
+        *,
+        session_id: str,
+        organization_id: str,
+        display_number: int,
+        vnc_port: int,
+    ) -> bool:
+        """Return whether this OSS process owns the session's exact ready VNC stack."""
+
+        return self.requires_local_vnc_display() and VncManager.owns_ready_stack(
+            session_id,
+            organization_id=organization_id,
+            display_number=display_number,
+            vnc_port=vnc_port,
+        )
+
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         # Locks intentionally live for the manager lifetime so waiters can never
         # retain a different lock for the same session.

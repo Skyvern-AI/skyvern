@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,6 +32,7 @@ async def _capture_upstream_connection(
     browser_address: str,
     ip_address: str | None = None,
     persisted_vnc_port: int | None = None,
+    persisted_display_number: int | None = None,
     global_vnc_port: int = 6080,
     x_api_key: str = "secret",
 ) -> dict[str, Any]:
@@ -42,8 +44,11 @@ async def _capture_upstream_connection(
     monkeypatch.setattr(vnc_module.websockets, "connect", connect)
     channel = SimpleNamespace(
         browser_session=SimpleNamespace(
+            persistent_browser_session_id="pbs_test",
+            organization_id="org_test",
             browser_address=browser_address,
             ip_address=ip_address,
+            display_number=persisted_display_number,
             vnc_port=persisted_vnc_port,
         ),
         class_name="VncChannel",
@@ -89,13 +94,39 @@ async def test_v1_ip_wins_over_persisted_local_port_and_uses_global_port(
 @pytest.mark.asyncio
 async def test_addressless_local_session_uses_persisted_vnc_port(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(vnc_module.settings, "BROWSER_STREAMING_MODE", "vnc")
+    manager = MagicMock()
+    manager.owns_local_vnc_stack.return_value = True
+    monkeypatch.setattr(vnc_module.app, "PERSISTENT_SESSIONS_MANAGER", manager)
     capture = await _capture_upstream_connection(
         monkeypatch,
         browser_address="",
+        persisted_display_number=100,
         persisted_vnc_port=6087,
     )
 
     assert capture == {"url": "ws://127.0.0.1:6087", "additional_headers": {}}
+    manager.owns_local_vnc_stack.assert_called_once_with(
+        session_id="pbs_test",
+        organization_id="org_test",
+        display_number=100,
+        vnc_port=6087,
+    )
+
+
+@pytest.mark.asyncio
+async def test_addressless_local_session_refuses_unowned_persisted_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vnc_module.settings, "BROWSER_STREAMING_MODE", "vnc")
+    manager = MagicMock()
+    manager.owns_local_vnc_stack.return_value = False
+    monkeypatch.setattr(vnc_module.app, "PERSISTENT_SESSIONS_MANAGER", manager)
+
+    with pytest.raises(vnc_module.VncRoutingError, match="not owned"):
+        await _capture_upstream_connection(
+            monkeypatch,
+            browser_address="",
+            persisted_display_number=100,
+            persisted_vnc_port=6087,
+        )
 
 
 @pytest.mark.asyncio

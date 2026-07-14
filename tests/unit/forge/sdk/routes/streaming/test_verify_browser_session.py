@@ -21,6 +21,7 @@ def _make_session(
     *,
     browser_address: str | None,
     status: PersistentBrowserSessionStatus,
+    display_number: int | None = None,
     vnc_port: int | None = None,
 ) -> PersistentBrowserSession:
     now = datetime.now(timezone.utc)
@@ -29,6 +30,7 @@ def _make_session(
         organization_id="o_test",
         status=status,
         browser_address=browser_address,
+        display_number=display_number,
         vnc_port=vnc_port,
         created_at=now,
         modified_at=now,
@@ -70,6 +72,7 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         session = _make_session(
             browser_address=None,
             status=PersistentBrowserSessionStatus.running,
+            display_number=100,
             vnc_port=6087,
         )
 
@@ -81,6 +84,7 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         manager.get_browser_address = AsyncMock(
             side_effect=AssertionError("must not wait for an address for a local VNC session"),
         )
+        manager.owns_local_vnc_stack = MagicMock(return_value=True)
 
         with (
             patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
@@ -94,6 +98,43 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         assert result is not None
         assert result.browser_address == ""
         assert result.vnc_port == 6087
+        manager.get_browser_address_if_ready.assert_not_awaited()
+        manager.get_browser_address.assert_not_awaited()
+        manager.owns_local_vnc_stack.assert_called_once_with(
+            session_id="bs_test",
+            organization_id="o_test",
+            display_number=100,
+            vnc_port=6087,
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejects_unowned_addressless_local_vnc_session_without_address_wait(self) -> None:
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+            display_number=100,
+            vnc_port=6087,
+        )
+        manager = MagicMock()
+        manager.get_session = AsyncMock(return_value=session)
+        manager.get_browser_address_if_ready = AsyncMock(
+            side_effect=AssertionError("must not look up an address for stale local VNC metadata"),
+        )
+        manager.get_browser_address = AsyncMock(
+            side_effect=AssertionError("must not wait for an address for stale local VNC metadata"),
+        )
+        manager.owns_local_vnc_stack = MagicMock(return_value=False)
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            settings_mock.ENV = "local"
+            result = await verify_browser_session("bs_test", "o_test")
+
+        assert result is None
         manager.get_browser_address_if_ready.assert_not_awaited()
         manager.get_browser_address.assert_not_awaited()
 
@@ -127,6 +168,37 @@ class TestVerifyBrowserSessionLocalShortCircuit:
             organization_id="o_test",
         )
         manager.get_browser_address.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_manager_without_local_vnc_capability_keeps_address_readiness_path(self) -> None:
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+            display_number=100,
+            vnc_port=6087,
+        )
+        manager = SimpleNamespace(
+            get_session=AsyncMock(return_value=session),
+            get_browser_address_if_ready=AsyncMock(return_value="ws://remote:9222"),
+            get_browser_address=AsyncMock(),
+        )
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            settings_mock.ENV = "local"
+            result = await verify_browser_session("bs_test", "o_test")
+
+        assert result is not None
+        assert result.browser_address == "ws://remote:9222"
+        manager.get_browser_address_if_ready.assert_awaited_once_with(
+            session_id="bs_test",
+            organization_id="o_test",
+        )
+        manager.get_browser_address.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_blocks_until_address_ready_in_non_local_non_cdp_mode(self) -> None:
@@ -167,10 +239,12 @@ class TestVerifyRunnableLocalVncSession:
         session = _make_session(
             browser_address=None,
             status=PersistentBrowserSessionStatus.running,
+            display_number=100,
             vnc_port=6087,
         )
         manager = MagicMock()
         manager.get_session_by_runnable_id = AsyncMock(return_value=session)
+        manager.owns_local_vnc_stack = MagicMock(return_value=True)
 
         with (
             patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
@@ -187,15 +261,42 @@ class TestVerifyRunnableLocalVncSession:
         assert verified_session.vnc_port == 6087
 
     @pytest.mark.asyncio
+    async def test_task_rejects_unowned_addressless_local_vnc_session(self) -> None:
+        task = SimpleNamespace(task_id="task_test", status=TaskStatus.running)
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+            display_number=100,
+            vnc_port=6087,
+        )
+        manager = MagicMock()
+        manager.get_session_by_runnable_id = AsyncMock(return_value=session)
+        manager.owns_local_vnc_stack = MagicMock(return_value=False)
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            verified_task, verified_session = await verify_task("task_test", "o_test")
+
+        assert verified_task is task
+        assert verified_session is None
+
+    @pytest.mark.asyncio
     async def test_task_preserves_addressless_rejection_outside_local_vnc(self) -> None:
         task = SimpleNamespace(task_id="task_test", status=TaskStatus.running)
         session = _make_session(
             browser_address=None,
             status=PersistentBrowserSessionStatus.running,
+            display_number=100,
             vnc_port=6087,
         )
         manager = MagicMock()
         manager.get_session_by_runnable_id = AsyncMock(return_value=session)
+        manager.owns_local_vnc_stack = MagicMock(return_value=True)
 
         with (
             patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
@@ -218,6 +319,7 @@ class TestVerifyRunnableLocalVncSession:
         session = _make_session(
             browser_address=None,
             status=PersistentBrowserSessionStatus.running,
+            display_number=100,
             vnc_port=6087,
         )
         manager = MagicMock()
@@ -225,6 +327,7 @@ class TestVerifyRunnableLocalVncSession:
         manager.get_browser_address = AsyncMock(
             side_effect=AssertionError("must not wait for an address for a local VNC session"),
         )
+        manager.owns_local_vnc_stack = MagicMock(return_value=True)
 
         with (
             patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
@@ -239,6 +342,38 @@ class TestVerifyRunnableLocalVncSession:
         assert verified_session is not None
         assert verified_session.browser_address == ""
         assert verified_session.vnc_port == 6087
+        manager.get_browser_address.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workflow_rejects_unowned_addressless_local_vnc_session_without_waiting(self) -> None:
+        workflow_run = SimpleNamespace(
+            workflow_run_id="wr_test",
+            status=WorkflowRunStatus.running,
+        )
+        session = _make_session(
+            browser_address=None,
+            status=PersistentBrowserSessionStatus.running,
+            display_number=100,
+            vnc_port=6087,
+        )
+        manager = MagicMock()
+        manager.get_session_by_runnable_id = AsyncMock(return_value=session)
+        manager.get_browser_address = AsyncMock(
+            side_effect=AssertionError("must not wait for an address for stale local VNC metadata"),
+        )
+        manager.owns_local_vnc_stack = MagicMock(return_value=False)
+
+        with (
+            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
+            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
+        ):
+            app_mock.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=workflow_run)
+            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
+            verified_run, verified_session = await verify_workflow_run("wr_test", "o_test")
+
+        assert verified_run is workflow_run
+        assert verified_session is None
         manager.get_browser_address.assert_not_awaited()
 
     @pytest.mark.asyncio

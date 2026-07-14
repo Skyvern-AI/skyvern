@@ -62,24 +62,23 @@ async def run() -> None:
             )
             continue
 
-        try:
-            browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
-                runnable_id=runnable_id,
-                organization_id=organization_id,
-            )
-        except Exception:
-            LOG.exception(
-                "Failed to get browser session while taking streaming screenshot in worker",
-                runnable_id=runnable_id,
-                organization_id=organization_id,
-            )
-            continue
+        display_number = settings.SKYVERN_DEFAULT_DISPLAY
+        if settings.BROWSER_STREAMING_MODE == "vnc":
+            try:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+                    runnable_id=runnable_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to get browser session while taking streaming screenshot in worker",
+                    runnable_id=runnable_id,
+                    organization_id=organization_id,
+                )
+                continue
 
-        display_number = (
-            browser_session.display_number
-            if browser_session is not None and browser_session.display_number is not None
-            else settings.SKYVERN_DEFAULT_DISPLAY
-        )
+            if browser_session is not None and browser_session.display_number is not None:
+                display_number = browser_session.display_number
 
         # create f"{get_skyvern_temp_dir()}/{organization_id}" directory if it does not exists
         os.makedirs(f"{get_skyvern_temp_dir()}/{organization_id}", exist_ok=True)

@@ -57,7 +57,7 @@ class VncProcess:
     xvfb_process: subprocess.Popen[bytes] | None = None
     x11vnc_process: subprocess.Popen[bytes] | None = None
     websockify_process: subprocess.Popen[bytes] | None = None
-    state: Literal["starting", "ready", "cleanup_failed"] = "starting"
+    state: Literal["starting", "ready", "stopping", "cleanup_failed"] = "starting"
 
     def children(self) -> list[subprocess.Popen[bytes]]:
         return [
@@ -328,6 +328,7 @@ class VncManager:
 
     @classmethod
     async def _cleanup_instance_to_completion(cls, session_id: str, instance: VncProcess) -> None:
+        instance.state = "stopping"
         cleanup_error: BaseException | None = None
         try:
             await cls._terminate_processes_to_completion(session_id, instance.children())
@@ -428,6 +429,31 @@ class VncManager:
     @classmethod
     def has_session(cls, session_id: str) -> bool:
         return session_id in cls._instances
+
+    @classmethod
+    def owns_ready_stack(
+        cls,
+        session_id: str,
+        *,
+        organization_id: str | None,
+        display_number: int,
+        vnc_port: int,
+    ) -> bool:
+        """Return whether this process owns the exact healthy VNC stack described.
+
+        Persisted display and port assignments are routing metadata, not proof that
+        the process which created them is still alive.  Callers must use this exact
+        match before routing an addressless session to localhost.
+        """
+
+        instance = cls._instances.get(session_id)
+        return bool(
+            instance is not None
+            and instance.organization_id == organization_id
+            and instance.display_number == display_number
+            and instance.vnc_port == vnc_port
+            and cls._instance_is_healthy(instance)
+        )
 
     @classmethod
     async def stop_all(cls) -> None:

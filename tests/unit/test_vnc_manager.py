@@ -94,6 +94,30 @@ async def test_successful_start_is_idempotent_and_tears_down_in_reverse_order(
     assert duplicate == assigned
     assert len(process_factory.processes) == 3
     assert os.environ.get("DISPLAY") is None
+    assert VncManager.owns_ready_stack(
+        "pbs_1",
+        organization_id="org_1",
+        display_number=100,
+        vnc_port=6080,
+    )
+    assert not VncManager.owns_ready_stack(
+        "pbs_1",
+        organization_id="org_other",
+        display_number=100,
+        vnc_port=6080,
+    )
+    assert not VncManager.owns_ready_stack(
+        "pbs_1",
+        organization_id="org_1",
+        display_number=101,
+        vnc_port=6080,
+    )
+    assert not VncManager.owns_ready_stack(
+        "pbs_1",
+        organization_id="org_1",
+        display_number=100,
+        vnc_port=6081,
+    )
 
     xvfb, x11vnc, websockify = process_factory.processes
     assert xvfb.command[:2] == ["Xvfb", ":100"]
@@ -109,6 +133,30 @@ async def test_successful_start_is_idempotent_and_tears_down_in_reverse_order(
     assert not VncManager.has_session("pbs_1")
     assert VncManager._used_displays == set()
     assert VncManager._used_ports == set()
+
+
+@pytest.mark.asyncio
+async def test_ownership_requires_a_healthy_ready_stack(monkeypatch: pytest.MonkeyPatch) -> None:
+    process_factory = ProcessFactory()
+    monkeypatch.setattr(vnc_manager_module.subprocess, "Popen", process_factory)
+    await VncManager.start_vnc_for_session("pbs_owned", organization_id="org_1")
+
+    process_factory.processes[2].returncode = 1
+
+    assert not VncManager.owns_ready_stack(
+        "pbs_owned",
+        organization_id="org_1",
+        display_number=100,
+        vnc_port=6080,
+    )
+    assert not VncManager.owns_ready_stack(
+        "pbs_missing",
+        organization_id="org_1",
+        display_number=100,
+        vnc_port=6080,
+    )
+
+    await VncManager.stop_all()
 
 
 @pytest.mark.asyncio

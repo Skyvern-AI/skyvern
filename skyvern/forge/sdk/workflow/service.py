@@ -2317,12 +2317,11 @@ class WorkflowService:
         state: WorkflowVncSessionSetupState,
     ) -> None:
         try:
-            # A successful CAS publishes the candidate as the workflow row's durable
-            # session. Another delivery can adopt it as soon as setup releases the
-            # per-run lock, so an abort must never close an installed candidate.
-            # Only candidates that never installed (including CAS losers) remain
-            # exclusively owned by this setup invocation and are safe to close.
-            if not state.candidate_installed:
+            # This setup invocation owns every candidate it creates until setup
+            # completes. If setup is cancelled, fully tear down that candidate even
+            # when its CAS claim was installed; releasing it would leave its VNC
+            # children running after the owning worker has gone away.
+            if state.candidate_browser_session_id:
                 await self._close_vnc_workflow_session_candidate(
                     organization_id=organization_id,
                     state=state,
@@ -2330,10 +2329,7 @@ class WorkflowService:
             if (
                 state.begin_attempted
                 and state.effective_browser_session_id
-                and (
-                    state.candidate_installed
-                    or state.effective_browser_session_id != state.candidate_browser_session_id
-                )
+                and state.effective_browser_session_id != state.candidate_browser_session_id
             ):
                 await await_to_terminal_state(
                     app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(

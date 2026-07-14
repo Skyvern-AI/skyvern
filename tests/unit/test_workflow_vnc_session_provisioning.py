@@ -458,7 +458,7 @@ async def test_default_vnc_process_lock_serializes_concurrent_workflow_provision
 
 
 @pytest.mark.asyncio
-async def test_default_vnc_cancelled_installer_does_not_close_session_adopted_by_queued_delivery(
+async def test_default_vnc_cancelled_installer_closes_owned_candidate_even_with_queued_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(service_module.settings, "BROWSER_STREAMING_MODE", "vnc")
@@ -570,8 +570,8 @@ async def test_default_vnc_cancelled_installer_does_not_close_session_adopted_by
     assert begin_count == 2
     create_session.assert_awaited_once()
     claim.assert_awaited_once()
-    close_session.assert_not_awaited()
-    release_browser_session.assert_awaited_once_with("pbs_created", "org_test")
+    close_session.assert_awaited_once_with("org_test", "pbs_created")
+    release_browser_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio

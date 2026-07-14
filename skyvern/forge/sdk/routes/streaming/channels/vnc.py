@@ -38,11 +38,14 @@ from skyvern.forge.sdk.routes.streaming.registries import (
     del_vnc_channel,
     get_message_channel,
     get_vnc_channel,
+    get_vnc_channels_for_browser_session,
 )
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
     loop_verify_task,
     loop_verify_workflow_run,
+    manager_has_local_vnc_ownership_capability,
+    manager_owns_local_vnc_session,
     verify_browser_session,
     verify_task,
     verify_workflow_run,
@@ -64,6 +67,10 @@ alter this state of affairs - and some "agent" could operate the browser
 automatically. In any case, if the interactor is not a "user", we assume
 it is an "agent".
 """
+
+
+class VncRoutingError(RuntimeError):
+    """Raised when persisted local VNC metadata is not owned by this process."""
 
 
 Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
@@ -217,6 +224,16 @@ class VncChannel:
 
         LOG.info(f"{self.class_name} Setting interactor to {value}", **self.identity)
 
+    def refresh_interactor_from_browser_session(self) -> None:
+        """Refresh this channel from valid persisted state loaded by verification."""
+        browser_session = self.browser_session
+        if browser_session is None or browser_session.organization_id != self.organization_id:
+            return
+
+        persisted_interactor = browser_session.interactor
+        if persisted_interactor in ("agent", "user") and persisted_interactor != self._interactor:
+            self.interactor = t.cast(Interactor, persisted_interactor)
+
     async def set_interactor_and_persist(self, value: Interactor) -> None:
         self.interactor = value
 
@@ -228,6 +245,13 @@ class VncChannel:
                 **self.identity,
             )
             return
+
+        for channel in get_vnc_channels_for_browser_session(
+            organization_id=self.organization_id,
+            browser_session_id=browser_session.persistent_browser_session_id,
+        ):
+            if channel is not self:
+                channel.interactor = value
 
         try:
             await app.DATABASE.browser_sessions.update_persistent_browser_session(
@@ -383,9 +407,14 @@ def _resolve_vnc_url(browser_session: AddressablePersistentBrowserSession, globa
 
     if (
         settings.BROWSER_STREAMING_MODE == "vnc"
+        and manager_has_local_vnc_ownership_capability()
         and not browser_session.browser_address
         and browser_session.vnc_port is not None
     ):
+        if not manager_owns_local_vnc_session(browser_session, browser_session.organization_id):
+            raise VncRoutingError(
+                f"Local VNC stack for {browser_session.persistent_browser_session_id} is not owned by this process"
+            )
         return f"ws://127.0.0.1:{browser_session.vnc_port}"
 
     parsed_browser_address = urlparse(browser_session.browser_address)

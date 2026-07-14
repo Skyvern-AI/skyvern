@@ -19,6 +19,7 @@ async def _run_one_iteration(
     *,
     browser_session: object | None = None,
     browser_session_error: Exception | None = None,
+    streaming_mode: str = "vnc",
     use_workflow_run: bool = False,
 ) -> tuple[SimpleNamespace, AsyncMock, MagicMock, MagicMock]:
     sleep_calls = 0
@@ -64,7 +65,12 @@ async def _run_one_iteration(
     monkeypatch.setattr(run_streaming.subprocess, "run", run_subprocess)
     monkeypatch.setattr(run_streaming.app, "DATABASE", database)
     monkeypatch.setattr(run_streaming.app, "STORAGE", storage)
-    monkeypatch.setattr(run_streaming, "settings", SimpleNamespace(SKYVERN_DEFAULT_DISPLAY=123), raising=False)
+    monkeypatch.setattr(
+        run_streaming,
+        "settings",
+        SimpleNamespace(BROWSER_STREAMING_MODE=streaming_mode, SKYVERN_DEFAULT_DISPLAY=123),
+        raising=False,
+    )
     monkeypatch.setattr(run_streaming, "LOG", log)
 
     with pytest.raises(_StopAfterOneIteration):
@@ -125,6 +131,24 @@ async def test_screenshot_falls_back_to_configured_default_display(
         organization_id="org-1",
     )
     assert run_subprocess.call_args.kwargs["env"]["DISPLAY"] == ":123"
+
+
+@pytest.mark.asyncio
+async def test_cdp_screenshot_skips_browser_session_lookup_and_uses_default_display(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database, save_streaming_file, run_subprocess, _log = await _run_one_iteration(
+        monkeypatch,
+        tmp_path,
+        browser_session_error=RuntimeError("database unavailable"),
+        streaming_mode="cdp",
+    )
+
+    database.browser_sessions.get_persistent_browser_session_by_runnable_id.assert_not_awaited()
+    run_subprocess.assert_called_once()
+    assert run_subprocess.call_args.kwargs["env"]["DISPLAY"] == ":123"
+    save_streaming_file.assert_awaited_once_with("org-1", "task-1.png")
 
 
 @pytest.mark.asyncio

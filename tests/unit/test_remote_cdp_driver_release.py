@@ -279,3 +279,108 @@ async def test_cleanup_for_workflow_run_final_close_lets_state_decide() -> None:
     assert final_call.kwargs["release_driver"] is None
     assert "wr_1" not in manager.pages
     assert "tsk_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_workflow_run_owned_vnc_session_has_one_teardown_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_1"] = state
+
+    sessions_manager = MagicMock()
+    sessions_manager.requires_local_vnc_display.return_value = True
+    sessions_manager.close_session = AsyncMock()
+    sessions_manager.release_browser_session = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.app.PERSISTENT_SESSIONS_MANAGER",
+        sessions_manager,
+    )
+
+    await manager.cleanup_for_workflow_run(
+        "wr_1",
+        ["tsk_1"],
+        close_browser_on_completion=True,
+        browser_session_id="session_1",
+        organization_id="org_1",
+    )
+
+    sessions_manager.close_session.assert_awaited_once_with("org_1", "session_1")
+    sessions_manager.release_browser_session.assert_not_awaited()
+    state.close.assert_not_awaited()
+    assert "wr_1" not in manager.pages
+    assert "tsk_1" not in manager.pages
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_workflow_run_caller_supplied_vnc_session_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_1"] = state
+
+    sessions_manager = MagicMock()
+    sessions_manager.requires_local_vnc_display.return_value = True
+    sessions_manager.close_session = AsyncMock()
+    sessions_manager.release_browser_session = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.app.PERSISTENT_SESSIONS_MANAGER",
+        sessions_manager,
+    )
+
+    await manager.cleanup_for_workflow_run(
+        "wr_1",
+        ["tsk_1"],
+        close_browser_on_completion=False,
+        browser_session_id="session_1",
+        organization_id="org_1",
+    )
+
+    sessions_manager.close_session.assert_not_awaited()
+    sessions_manager.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    assert state.close.await_args_list[0].kwargs == {
+        "close_browser_on_completion": False,
+        "release_driver": False,
+    }
+    assert state.close.await_args_list[-1].kwargs == {
+        "close_browser_on_completion": False,
+        "release_driver": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cleanup_for_workflow_run_cdp_persistent_session_call_shapes_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = RealBrowserManager()
+    state = _fake_browser_state()
+    manager.pages["wr_1"] = state
+    manager.pages["tsk_1"] = state
+
+    sessions_manager = MagicMock()
+    sessions_manager.requires_local_vnc_display.return_value = False
+    sessions_manager.close_session = AsyncMock()
+    sessions_manager.release_browser_session = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.app.PERSISTENT_SESSIONS_MANAGER",
+        sessions_manager,
+    )
+
+    await manager.cleanup_for_workflow_run(
+        "wr_1",
+        ["tsk_1"],
+        close_browser_on_completion=True,
+        browser_session_id="session_1",
+        organization_id="org_1",
+    )
+
+    sessions_manager.close_session.assert_not_awaited()
+    sessions_manager.release_browser_session.assert_awaited_once_with("session_1", organization_id="org_1")
+    assert [call.kwargs for call in state.close.await_args_list] == [
+        {"close_browser_on_completion": False, "release_driver": False},
+        {"close_browser_on_completion": True, "release_driver": False},
+    ]
