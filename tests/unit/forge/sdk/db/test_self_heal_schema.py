@@ -7,6 +7,7 @@ import pytest
 
 from skyvern.forge.sdk.db.id import generate_heal_episode_id, generate_heal_proposal_id
 from skyvern.forge.sdk.db.models import HealEpisodeModel, WorkflowHealProposalModel
+from skyvern.schemas.self_heal import HealEpisodeDetail
 
 
 def test_heal_episode_and_heal_proposal_id_prefixes() -> None:
@@ -46,3 +47,13 @@ def test_heal_migration_chains_from_current_head() -> None:
     ]
 
     assert down_revisions == ["5a7c9d1e2f34"]
+
+
+def test_heal_episode_detail_exposes_only_sanitized_free_text_fields() -> None:
+    fields = HealEpisodeDetail.model_fields
+    assert "sanitized_block_code" in fields
+    assert "sanitized_block_prompt" in fields
+    assert "sanitized_failure_message" in fields
+    assert "block_code" not in fields
+    assert "block_prompt" not in fields
+    assert "failure_message" not in fields
