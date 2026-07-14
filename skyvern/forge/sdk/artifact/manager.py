@@ -1728,9 +1728,13 @@ class ArtifactManager:
                 f"Timeout (30s) while waiting for upload aio tasks for primary_keys={primary_keys}",
                 primary_keys=primary_keys,
             )
-
-        for primary_key in primary_keys:
-            del self.upload_aiotasks_map[primary_key]
+        finally:
+            # Release tracking refs on every exit path — including caller cancellation and
+            # non-timeout gather errors — so an orphaned entry can't pin a completed upload Task
+            # and the artifact bytes its traceback retains. pop() keeps overlapping waits on the
+            # same key idempotent (no KeyError).
+            for primary_key in primary_keys:
+                self.upload_aiotasks_map.pop(primary_key, None)
 
         # Flush any accumulated step archives for the given task IDs
         primary_key_set = set(primary_keys)

@@ -176,11 +176,23 @@ class AuthorTimeGateAblationEvent:
     payload: AuthorTimeGateAblationPayload = field(default_factory=dict)
 
 
+class ScoutedInputCorrespondence(TypedDict):
+    input_key: str
+    matched_literal: str
+    parameter_value: str
+    surface: str
+    transform: str
+    position: int
+
+
 class ScoutedInteraction(TypedDict):
     tool_name: str
     selector: NotRequired[str]
     source_url: NotRequired[str]
     value: NotRequired[str]
+    # Grounded value-containment witnesses computed at the update_workflow confluence; drive
+    # generator-owned templated locators. Empty/absent => literal replay.
+    input_correspondences: NotRequired[list[ScoutedInputCorrespondence]]
     typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]

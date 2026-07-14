@@ -12,6 +12,7 @@ browsers shared across parent/child runs) must NOT have their driver stopped.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -80,6 +81,107 @@ async def test_close_true_still_stops_driver_and_context() -> None:
 
     pw.stop.assert_awaited_once()
     context.close.assert_awaited_once()
+
+
+def _patch_create_browser_state(
+    monkeypatch: pytest.MonkeyPatch,
+    pw: MagicMock,
+    *,
+    context_result: tuple | None = None,
+    raises: BaseException | None = None,
+) -> AsyncMock:
+    """Point ``_create_browser_state`` at a stub driver and a context factory that
+    either returns a context tuple or raises (e.g. a connect_over_cdp failure)."""
+    playwright_launcher = MagicMock()
+    playwright_launcher.return_value.start = AsyncMock(return_value=pw)
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.async_playwright", playwright_launcher)
+
+    if raises is not None:
+        create_browser_context = AsyncMock(side_effect=raises)
+    else:
+        create_browser_context = AsyncMock(return_value=context_result or (_context_stub(), BrowserArtifacts(), None))
+    monkeypatch.setattr(
+        "skyvern.webeye.real_browser_manager.BrowserContextFactory.create_browser_context",
+        create_browser_context,
+    )
+    return create_browser_context
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_stops_driver_when_context_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A started local driver must be stopped if create_browser_context (e.g. a
+    remote-CDP connect) fails, and the original failure must propagate."""
+    pw = _pw_stub()
+    _patch_create_browser_state(monkeypatch, pw, raises=RuntimeError("connect_over_cdp failed"))
+
+    with pytest.raises(RuntimeError, match="connect_over_cdp failed"):
+        await RealBrowserManager._create_browser_state(browser_address="http://192.0.2.10:9222")
+
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_cleanup_failure_does_not_mask_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If stopping the driver also fails, the original creation error still surfaces."""
+    pw = _pw_stub()
+    pw.stop = AsyncMock(side_effect=RuntimeError("driver stop boom"))
+    _patch_create_browser_state(monkeypatch, pw, raises=ValueError("original create failure"))
+
+    with pytest.raises(ValueError, match="original create failure"):
+        await RealBrowserManager._create_browser_state()
+
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_success_retains_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The happy path keeps the driver on the state and must not stop it early."""
+    pw = _pw_stub()
+    context = _context_stub()
+    _patch_create_browser_state(monkeypatch, pw, context_result=(context, BrowserArtifacts(), None))
+
+    created = await RealBrowserManager._create_browser_state()
+
+    pw.stop.assert_not_awaited()
+    assert created.pw is pw
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_stops_driver_on_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation during context creation must still release the started driver
+    (CancelledError is BaseException, not caught by ``except Exception``)."""
+    pw = _pw_stub()
+    _patch_create_browser_state(monkeypatch, pw, raises=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await RealBrowserManager._create_browser_state()
+
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_browser_state_hung_stop_does_not_block_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung driver stop() on the failure path must be time-bounded so it cannot
+    stall the original creation error forever; the original error is re-raised."""
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.BROWSER_CLOSE_TIMEOUT", 0.05, raising=False)
+    pw = _pw_stub()
+
+    async def _hang(*_args: object, **_kwargs: object) -> None:
+        await asyncio.sleep(30)
+
+    pw.stop = AsyncMock(side_effect=_hang)
+    _patch_create_browser_state(monkeypatch, pw, raises=ValueError("original create failure"))
+
+    with pytest.raises(ValueError, match="original create failure"):
+        await asyncio.wait_for(RealBrowserManager._create_browser_state(), timeout=2)
+
+    pw.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio
