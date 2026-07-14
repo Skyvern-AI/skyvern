@@ -12,7 +12,7 @@ from skyvern.cli.core.result import BrowserContext, set_concise_responses
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
-from tests.unit._mcp_browser_fakes import make_probe_locator
+from tests.unit._mcp_browser_fakes import make_probe_locator, make_real_wait_for_timeout
 
 
 @pytest.mark.asyncio
@@ -538,6 +538,26 @@ async def test_skyvern_press_key_intent_keeps_30s_default_timeout(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_skyvern_press_key_intent_error_does_not_leak_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    press = AsyncMock(
+        side_effect=InternalServerError(
+            body={"error": "Unexpected error: sk-BODY-SECRET"},
+            headers={"authorization": "Bearer sk-SECRET"},
+        )
+    )
+    _action_page(monkeypatch, locator=MagicMock(return_value=SimpleNamespace(press=press)))
+
+    result = await mcp_browser.skyvern_press_key(key="Enter", intent="the search box")
+
+    assert result["ok"] is False
+    message = result["error"]["message"]
+    assert message == "HTTP 500: InternalServerError"
+    assert result["error"]["details"] == {"exception_type": "InternalServerError", "status_code": 500}
+    for leaked in ("authorization", "bearer", "sk-secret", "sk-body-secret", "headers", "body"):
+        assert leaked not in message.lower()
+
+
+@pytest.mark.asyncio
 async def test_skyvern_press_key_direct_failure_reports_element_state(monkeypatch: pytest.MonkeyPatch) -> None:
     probe_locator = make_probe_locator(count=1, visible=False)
     raw_page = MagicMock()
@@ -791,6 +811,16 @@ async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch
     assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", index=3)'
 
 
+def test_exception_message_suppresses_body_outside_4xx() -> None:
+    class NonErrorStatusException(Exception):
+        status_code = 200
+        body = {"detail": "should not be surfaced"}
+
+    message = mcp_browser._exception_message(NonErrorStatusException())
+
+    assert "should not be surfaced" not in message
+
+
 @pytest.mark.asyncio
 async def test_skyvern_type_ai_error_surfaces_http_status_and_body(monkeypatch: pytest.MonkeyPatch) -> None:
     # 4xx bodies are the API's intended client-facing feedback — surfaced for self-correction.
@@ -884,6 +914,58 @@ async def test_skyvern_act_sdk_error_does_not_leak_headers(monkeypatch: pytest.M
     message = result["error"]["message"]
     assert message == "HTTP 500: InternalServerError"
     for leaked in ("authorization", "bearer", "sk-secret", "headers"):
+        assert leaked not in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_drag_ai_error_does_not_leak_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    _action_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_act",
+        AsyncMock(
+            side_effect=InternalServerError(
+                body={"error": "Unexpected error: sk-BODY-SECRET"},
+                headers={"authorization": "Bearer sk-SECRET"},
+            )
+        ),
+    )
+
+    result = await mcp_browser.skyvern_drag(source_intent="the card", target_intent="the trash bin")
+
+    assert result["ok"] is False
+    message = result["error"]["message"]
+    assert message == "HTTP 500: InternalServerError"
+    assert result["error"]["details"] == {"exception_type": "InternalServerError", "status_code": 500}
+    for leaked in ("authorization", "bearer", "sk-secret", "sk-body-secret", "headers", "body"):
+        assert leaked not in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_wait_intent_error_does_not_leak_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    _action_page(
+        monkeypatch,
+        validate=AsyncMock(
+            side_effect=InternalServerError(
+                body={"error": "Unexpected error: sk-BODY-SECRET"},
+                headers={"authorization": "Bearer sk-SECRET"},
+            )
+        ),
+        wait_for_timeout=make_real_wait_for_timeout(),
+    )
+
+    result = await mcp_browser.skyvern_wait(
+        intent="the spinner disappears",
+        timeout=1000,
+        poll_interval_ms=500,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SDK_ERROR
+    message = result["error"]["message"]
+    assert message == "HTTP 500: InternalServerError"
+    assert result["error"]["details"] == {"exception_type": "InternalServerError", "status_code": 500}
+    for leaked in ("authorization", "bearer", "sk-secret", "sk-body-secret", "headers", "body"):
         assert leaked not in message.lower()
 
 
