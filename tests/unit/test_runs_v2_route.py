@@ -65,6 +65,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
         status=None,
         search_key="abc",
         run_type=["workflow_run", "task_v1"],
+        run_tags=None,
     )
     assert orjson.loads(response.body) == [
         {
@@ -147,6 +148,7 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         exclude_child_runs=expected_exclude_child_runs,
         created_at_start=None,
         created_at_end=None,
+        run_tags=None,
     )
 
 
