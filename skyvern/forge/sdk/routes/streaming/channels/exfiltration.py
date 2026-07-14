@@ -486,6 +486,9 @@ class ExfiltrationChannel(CdpChannel):
         # from skyvern.config import settings
         # await super().connect(cdp_url or settings.BROWSER_REMOTE_DEBUGGING_URL)
 
+        if self._closing:
+            return self
+
         page = self.page
 
         if not page:
@@ -665,67 +668,76 @@ class ExfiltrationChannel(CdpChannel):
     async def stop(self) -> t.Self:
         LOG.info(f"{self.class_name} stopping.")
 
-        if self._refresh_task:
-            self._refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._refresh_task
-            self._refresh_task = None
+        try:
+            if self._refresh_task:
+                self._refresh_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._refresh_task
+                self._refresh_task = None
 
-        if self._network_activity_flush_task and not self._network_activity_flush_task.done():
-            self._network_activity_flush_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._network_activity_flush_task
-            self._network_activity_flush_task = None
+            if self._network_activity_flush_task and not self._network_activity_flush_task.done():
+                self._network_activity_flush_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._network_activity_flush_task
+                self._network_activity_flush_task = None
 
-        pending_event_tasks = list(self._pending_event_tasks)
-        for task in pending_event_tasks:
-            task.cancel()
-        if pending_event_tasks:
-            await asyncio.gather(*pending_event_tasks, return_exceptions=True)
-        self._pending_event_tasks.clear()
+            pending_event_tasks = list(self._pending_event_tasks)
+            for task in pending_event_tasks:
+                task.cancel()
+            if pending_event_tasks:
+                await asyncio.gather(*pending_event_tasks, return_exceptions=True)
+            self._pending_event_tasks.clear()
 
-        if self.cdp_session:
-            try:
-                await self.cdp_session.detach()
-            except Exception:
-                pass
-
-        self.cdp_session = None
-
-        captures = list(self._page_console_captures.items())
-        self._page_console_captures.clear()
-        pages = [page for page, _ in captures]
-
-        if self.browser_context:
-            for page in self.browser_context.pages:
-                if all(existing is not page for existing in pages):
-                    pages.append(page)
-
-        for page, capture in captures:
-            try:
-                page.remove_listener("console", capture.console_listener)
-            except KeyError:
-                pass
-
-            if capture.cdp_session:
+            if self.cdp_session:
                 try:
-                    await capture.cdp_session.detach()
+                    await self.cdp_session.detach()
                 except Exception:
                     pass
 
-        for page in pages:
-            if self._active_binding_channels.get(page) is self:
-                self._active_binding_channels.pop(page, None)
-            self._binding_registered_pages.discard(page)
+            self.cdp_session = None
 
-            try:
-                await page.evaluate("window.__skyvern_exfiltration_binding_name = null;")
-            except Exception:
-                LOG.debug(f"{self.class_name} failed to clear exfiltration binding name", url=page.url, exc_info=True)
+            captures = list(self._page_console_captures.items())
+            self._page_console_captures.clear()
+            pages = [page for page, _ in captures]
 
-            await self.undecorate(page)
+            if self.browser_context:
+                for page in self.browser_context.pages:
+                    if all(existing is not page for existing in pages):
+                        pages.append(page)
 
-        self._recent_console_event_fingerprints.clear()
+            for page, capture in captures:
+                try:
+                    page.remove_listener("console", capture.console_listener)
+                except KeyError:
+                    pass
+
+                if capture.cdp_session:
+                    try:
+                        await capture.cdp_session.detach()
+                    except Exception:
+                        pass
+
+            for page in pages:
+                if self._active_binding_channels.get(page) is self:
+                    self._active_binding_channels.pop(page, None)
+                self._binding_registered_pages.discard(page)
+
+                try:
+                    await page.evaluate("window.__skyvern_exfiltration_binding_name = null;")
+                except Exception:
+                    LOG.debug(
+                        f"{self.class_name} failed to clear exfiltration binding name", url=page.url, exc_info=True
+                    )
+
+                await self.undecorate(page)
+
+            self._recent_console_event_fingerprints.clear()
+        finally:
+            # Release the dedicated Playwright driver + browser graph even if page-level
+            # cleanup above raised on an already-dead page. _closing keeps this close()
+            # from tripping the browser "disconnected" callback into a reconnect.
+            self._closing = True
+            await self.close()
 
         LOG.info(f"{self.class_name} stopped.")
 
