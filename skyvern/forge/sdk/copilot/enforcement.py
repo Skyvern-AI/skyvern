@@ -2610,12 +2610,85 @@ def _request_expects_unreached_download(ctx: AgentContext) -> bool:
     return any(criterion.deliverable_kind == "registered_download" for criterion in _active_completion_criteria(ctx))
 
 
+def _last_scout_credential_fill_index(trajectory: list[Any]) -> int | None:
+    # Boundary past the ENTIRE credential flow, including a runtime-only OTP/MFA fill. Keying only on
+    # username/password let an MFA step (fill totp -> verify-click) form a durable entry->commit past
+    # the boundary and falsely release the terminal-action gate on a login-only trajectory.
+    last_index: int | None = None
+    for index, item in enumerate(trajectory):
+        if isinstance(item, dict) and str(item.get("tool_name") or "").strip() == CREDENTIAL_FILL_TOOL_NAME:
+            last_index = index
+    return last_index
+
+
+def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
+    """Deterministic floor for the terminal-action release: the scout captured a durable entry followed by a
+    commit that both sit past the last live credential fill, so a bare login prefix (whose only commit is the
+    login submit) never satisfies it while a business spine continued past login does."""
+    trajectory = ctx.scout_trajectory
+    if not trajectory:
+        return False
+    credential_index = _last_scout_credential_fill_index(trajectory)
+    start = 0 if credential_index is None else credential_index + 1
+    last_entry_index: int | None = None
+    for index in range(start, len(trajectory)):
+        item = trajectory[index]
+        if isinstance(item, dict) and is_durable_fallback_entry_target(item):
+            last_entry_index = index
+    if last_entry_index is None:
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+        and not is_generic_entry_opener_click(item)
+        for item in trajectory[last_entry_index + 1 :]
+    )
+
+
+def reached_terminal_action_criterion_ids(ctx: AgentContext) -> set[str]:
+    """Active, non-method-mandated terminal_action criterion ids the scout has structurally reached: empty
+    until the trajectory shows a durable entry->commit past the credential flow. The method_mandated synthetic
+    durable-fill criterion is excluded so a login-only turn never self-releases through it."""
+    if not _trajectory_reaches_post_credential_commit(ctx):
+        return set()
+    return {
+        criterion.id
+        for criterion in _active_completion_criteria(ctx)
+        if criterion.kind == "terminal_action" and not criterion.method_mandated
+    }
+
+
+def record_reached_terminal_action_observation(ctx: AgentContext) -> None:
+    reached = reached_terminal_action_criterion_ids(ctx)
+    if not reached:
+        return
+    newly_observed = reached - ctx.scout_observed_terminal_criterion_ids
+    if not newly_observed:
+        return
+    ctx.scout_observed_terminal_criterion_ids.update(newly_observed)
+    LOG.info("copilot_reached_terminal_action_observed", criterion_ids=sorted(newly_observed))
+
+
+def _request_expects_unreached_terminal_action(ctx: AgentContext) -> bool:
+    # A terminal_action criterion is reached only once the scout observes its downstream page, which no
+    # pre-run page scalar evidences; a goal-reaching login prefix would otherwise read goal-complete before
+    # the scout crosses into the business spine and land the latch on a login-only trajectory.
+    for criterion in _active_completion_criteria(ctx):
+        if criterion.kind != "terminal_action" or criterion.method_mandated:
+            continue
+        if criterion.id not in ctx.scout_observed_terminal_criterion_ids:
+            return True
+    return False
+
+
 def synthesized_trajectory_is_goal_complete(ctx: AgentContext) -> bool:
     """A goal-reaching trajectory with no requested-output path left uncovered; an empty requested-output set falls
     through to the reach shape byte-identically, so an entry ``synthesize_code_block`` would drop never counts."""
     if uncovered_requested_output_paths(ctx):
         return False
     if _request_expects_unreached_download(ctx):
+        return False
+    if _request_expects_unreached_terminal_action(ctx):
         return False
     scalar_paths = _requested_output_paths_for_ctx(ctx) - download_satisfied_requested_output_paths(ctx)
     if scalar_paths:
