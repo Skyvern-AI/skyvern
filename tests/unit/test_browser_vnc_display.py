@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye import browser_factory, real_browser_manager
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import (
@@ -309,7 +310,7 @@ async def test_script_cache_miss_threads_org_and_display(monkeypatch: pytest.Mon
     monkeypatch.setattr(
         real_browser_manager.skyvern_context,
         "current",
-        MagicMock(return_value=SimpleNamespace(organization_id="org_1")),
+        MagicMock(return_value=SkyvernContext(organization_id="org_1")),
     )
     create = AsyncMock(return_value=candidate)
     monkeypatch.setattr(manager, "_create_browser_state", create)
@@ -341,7 +342,7 @@ async def test_script_local_vnc_fails_closed_without_display(monkeypatch: pytest
     monkeypatch.setattr(
         real_browser_manager.skyvern_context,
         "current",
-        MagicMock(return_value=SimpleNamespace(organization_id="org_1")),
+        MagicMock(return_value=SkyvernContext(organization_id="org_1")),
     )
     create = AsyncMock(return_value=fake_browser_state())
     monkeypatch.setattr(manager, "_create_browser_state", create)
