@@ -59,6 +59,22 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
 
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => true,
+}));
+
+vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
+  useRunTagsBatchQuery: () => ({ data: {} }),
+}));
+
+vi.mock("@/routes/workflows/hooks/useTagKeysQuery", () => ({
+  useTagKeysQuery: () => ({ data: [] }),
+}));
+
+vi.mock("@/routes/workflows/hooks/useTagValuesQuery", () => ({
+  useTagValuesQuery: () => ({ data: new Map() }),
+}));
+
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
   useGlobalWorkflowsQuery: () => ({ data: [] }),
 }));

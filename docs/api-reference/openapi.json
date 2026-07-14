@@ -2499,6 +2499,59 @@
         "x-fern-sdk-method-name": "batch_get_run_tags_post"
       }
     },
+    "/v1/run-tag-suggestions": {
+      "get": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "List run tag suggestions",
+        "description": "List distinct (key, value) pairs ever set on a run for the organization, sourced from the run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys (which are never registered) so pickers can offer them alongside user-defined tags.",
+        "operationId": "get_run_tag_suggestions_v1_run_tag_suggestions_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run tag suggestions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTagSuggestionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_tag_suggestions"
+      }
+    },
     "/v1/artifacts/{artifact_id}/content": {
       "get": {
         "tags": [
@@ -2930,6 +2983,53 @@
               "title": "Search Key"
             },
             "description": "Case-insensitive substring search (min 3 chars for trigram index)."
+          },
+          {
+            "name": "run_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunType"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Type"
+            }
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
           },
           {
             "name": "x-api-key",
@@ -6372,6 +6472,34 @@
             "description": "Only include runs created strictly before this UTC timestamp (ISO 8601)."
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only.",
+              "examples": [
+                "env:prod",
+                "production",
+                "env:*",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -9260,7 +9388,8 @@
           "google_sheets_read",
           "google_sheets_write",
           "pdf_fill",
-          "split_pdf"
+          "split_pdf",
+          "email_inbox"
         ],
         "title": "BlockType"
       },
@@ -9915,7 +10044,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -12051,6 +12180,375 @@
         ],
         "title": "DownloadToS3BlockYAML"
       },
+      "EmailInboxBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "email_inbox",
+            "title": "Block Type",
+            "default": "email_inbox"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "email_client": {
+            "type": "string",
+            "enum": [
+              "gmail",
+              "outlook"
+            ],
+            "title": "Email Client"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "folder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "sender": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sender"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          },
+          "newer_than_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Newer Than Days"
+          },
+          "max_results": {
+            "type": "integer",
+            "title": "Max Results",
+            "default": 25
+          },
+          "include_body": {
+            "type": "boolean",
+            "title": "Include Body",
+            "default": true
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "email_client"
+        ],
+        "title": "EmailInboxBlock"
+      },
+      "EmailInboxBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "email_inbox",
+            "title": "Block Type",
+            "default": "email_inbox"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "email_client": {
+            "type": "string",
+            "enum": [
+              "gmail",
+              "outlook"
+            ],
+            "title": "Email Client"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "folder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "sender": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sender"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          },
+          "newer_than_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Newer Than Days"
+          },
+          "max_results": {
+            "type": "integer",
+            "title": "Max Results",
+            "default": 25
+          },
+          "include_body": {
+            "type": "boolean",
+            "title": "Include Body",
+            "default": true
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "email_client"
+        ],
+        "title": "EmailInboxBlockYAML"
+      },
       "Extensions": {
         "type": "string",
         "enum": [
@@ -13398,7 +13896,8 @@
         "enum": [
           "s3",
           "azure",
-          "google_drive"
+          "google_drive",
+          "sftp"
         ],
         "title": "FileStorageType"
       },
@@ -13577,6 +14076,106 @@
               }
             ],
             "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language control over which downloaded files are uploaded; empty means upload all."
           },
           "path": {
             "anyOf": [
@@ -13768,6 +14367,106 @@
               }
             ],
             "title": "Google Drive Folder Id"
+          },
+          "sftp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host"
+          },
+          "sftp_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Port"
+          },
+          "sftp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Username"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "sftp_private_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key"
+          },
+          "sftp_private_key_passphrase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Private Key Passphrase"
+          },
+          "sftp_remote_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Remote Path"
+          },
+          "sftp_host_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Host Key"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Optional natural-language control over which downloaded files are uploaded; empty means upload all."
           },
           "path": {
             "anyOf": [
@@ -14048,6 +14747,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsReadBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/EmailInboxBlock"
+                },
+                {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
@@ -14064,6 +14766,7 @@
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
+                  "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
                   "file_upload": "#/components/schemas/FileUploadBlock",
@@ -14334,6 +15037,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsReadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/EmailInboxBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
@@ -16110,7 +16816,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -19057,6 +19763,40 @@
         ],
         "title": "RunTagHistoryResponse"
       },
+      "RunTagSuggestionsResponse": {
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Keys",
+            "description": "Distinct grouped tag keys seen on runs."
+          },
+          "values_by_key": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object",
+            "title": "Values By Key",
+            "description": "Values seen for each grouped key."
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Labels",
+            "description": "Distinct standalone (keyless) labels seen on runs."
+          }
+        },
+        "type": "object",
+        "title": "RunTagSuggestionsResponse",
+        "description": "Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs\never set on a run for the org, sourced from the event log rather than the\ntag-key/tag-value registry so reserved ``skyvern.*`` system keys (never\nregistered) reach the pickers too."
+      },
       "RunTagsBatchRequest": {
         "properties": {
           "workflow_run_ids": {
@@ -19113,6 +19853,19 @@
         ],
         "title": "RunTagsResponse",
         "description": "Current tags for a workflow run."
+      },
+      "RunType": {
+        "type": "string",
+        "enum": [
+          "task_v1",
+          "task_v2",
+          "workflow_run",
+          "openai_cua",
+          "anthropic_cua",
+          "ui_tars",
+          "yutori_navigator"
+        ],
+        "title": "RunType"
       },
       "RunWebhookReplayResponse": {
         "properties": {
@@ -19515,7 +20268,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -23236,7 +23989,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -24652,6 +25405,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsReadBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/EmailInboxBlock"
+                },
+                {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
@@ -24668,6 +25424,7 @@
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
+                  "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
                   "file_upload": "#/components/schemas/FileUploadBlock",
@@ -24866,6 +25623,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsReadBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/EmailInboxBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
@@ -25656,6 +26416,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsReadBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/EmailInboxBlock"
+                },
+                {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
@@ -25672,6 +26435,7 @@
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
                   "download_to_s3": "#/components/schemas/DownloadToS3Block",
+                  "email_inbox": "#/components/schemas/EmailInboxBlock",
                   "extraction": "#/components/schemas/ExtractionBlock",
                   "file_download": "#/components/schemas/FileDownloadBlock",
                   "file_upload": "#/components/schemas/FileUploadBlock",
@@ -25901,6 +26665,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsReadBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/EmailInboxBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
                 }
               ],
@@ -25911,6 +26678,7 @@
                   "code": "#/components/schemas/CodeBlockYAML",
                   "conditional": "#/components/schemas/ConditionalBlockYAML",
                   "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
+                  "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
                   "extraction": "#/components/schemas/ExtractionBlockYAML",
                   "file_download": "#/components/schemas/FileDownloadBlockYAML",
                   "file_upload": "#/components/schemas/FileUploadBlockYAML",

@@ -368,3 +368,17 @@ class RunTagsBatchResponse(BaseModel):
     Runs outside the caller's org are silently absent (no leakage)."""
 
     run_tags: dict[str, list[TagItem]]
+
+
+class RunTagSuggestionsResponse(BaseModel):
+    """Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs
+    ever set on a run for the org, sourced from the event log rather than the
+    tag-key/tag-value registry so reserved ``skyvern.*`` system keys (never
+    registered) reach the pickers too."""
+
+    keys: list[str] = Field(default_factory=list, description="Distinct grouped tag keys seen on runs.")
+    values_by_key: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Values seen for each grouped key.",
+    )
+    labels: list[str] = Field(default_factory=list, description="Distinct standalone (keyless) labels seen on runs.")
