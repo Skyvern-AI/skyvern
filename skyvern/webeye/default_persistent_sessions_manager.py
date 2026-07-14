@@ -1165,6 +1165,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         LOG.info("Closing PersistentSessionsManager")
         try:
             if cls.instance:
+                # Deployment boundary: multi-worker VNC is unsupported. This DB-wide
+                # shutdown can finalize a peer worker's row, while VncManager can stop
+                # only stacks tracked by this process; cross-worker enforcement is deferred.
                 active_sessions = (
                     await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
                 )

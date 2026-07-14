@@ -506,7 +506,7 @@ async def test_default_vnc_process_lock_serializes_concurrent_workflow_provision
 
 
 @pytest.mark.asyncio
-async def test_default_vnc_cancelled_installer_closes_owned_candidate_even_with_queued_delivery(
+async def test_default_vnc_cancelled_installer_keeps_installed_candidate_live_for_queued_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(service_module.settings, "BROWSER_STREAMING_MODE", "vnc")
@@ -517,13 +517,20 @@ async def test_default_vnc_cancelled_installer_closes_owned_candidate_even_with_
     first_begin_started = asyncio.Event()
     finish_first_begin = asyncio.Event()
     begin_count = 0
+    session_is_open = True
 
     async def begin_session(**_kwargs: str) -> None:
         nonlocal begin_count
+        if not session_is_open:
+            raise RuntimeError("attempted to adopt a closed workflow browser session")
         begin_count += 1
         if begin_count == 1:
             first_begin_started.set()
             await finish_first_begin.wait()
+
+    async def close_session_impl(_organization_id: str, _browser_session_id: str) -> None:
+        nonlocal session_is_open
+        session_is_open = False
 
     async def get_workflow_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(browser_session_id=row_session_id)
@@ -535,7 +542,7 @@ async def test_default_vnc_cancelled_installer_closes_owned_candidate_even_with_
         row_session_id = kwargs["candidate_browser_session_id"]
         return SimpleNamespace(browser_session_id=row_session_id, installed=True)
 
-    close_session = AsyncMock()
+    close_session = AsyncMock(side_effect=close_session_impl)
     release_browser_session = AsyncMock()
     monkeypatch.setattr(manager, "begin_session", AsyncMock(side_effect=begin_session))
     monkeypatch.setattr(manager, "close_session", close_session)
@@ -612,13 +619,27 @@ async def test_default_vnc_cancelled_installer_closes_owned_candidate_even_with_
     with pytest.raises(asyncio.CancelledError):
         await installer
 
+    later_adopter_state = WorkflowVncSessionSetupState()
+    await service._set_up_default_vnc_workflow_browser_session(
+        organization_id="org_test",
+        workflow=_workflow(()),
+        workflow_run_id="wr_test",
+        caller_supplied_browser_session=False,
+        browser_profile_id=None,
+        proxy_location=None,
+        state=later_adopter_state,
+    )
+
     assert installer_state.candidate_installed is True
     assert adopter_state.effective_browser_session_id == "pbs_created"
+    assert later_adopter_state.effective_browser_session_id == "pbs_created"
+    assert row_session_id == "pbs_created"
+    assert session_is_open is True
     assert context.browser_session_id == "pbs_created"
-    assert begin_count == 2
+    assert begin_count == 3
     create_session.assert_awaited_once()
     claim.assert_awaited_once()
-    close_session.assert_awaited_once_with("org_test", "pbs_created")
+    close_session.assert_not_awaited()
     release_browser_session.assert_not_awaited()
 
 
@@ -899,30 +920,24 @@ async def test_default_vnc_claim_reconciliation_failure_closes_candidate_and_pro
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_outer_cancellation_after_candidate_allocation_waits_for_close(
+async def test_execute_workflow_outer_cancellation_after_candidate_allocation_preserves_installed_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(service_module.settings, "BROWSER_STREAMING_MODE", "vnc")
     manager, create_session = _install_manager(monkeypatch, use_default=True)
     candidate_allocated = asyncio.Event()
     finish_create = asyncio.Event()
-    close_started = asyncio.Event()
-    finish_close = asyncio.Event()
 
     async def create_candidate(**_kwargs: object) -> SimpleNamespace:
         candidate_allocated.set()
         await finish_create.wait()
         return SimpleNamespace(persistent_browser_session_id="pbs_created")
 
-    async def close_session(_organization_id: str, _browser_session_id: str) -> None:
-        close_started.set()
-        await finish_close.wait()
-
     create_session.side_effect = create_candidate
     claim = AsyncMock(return_value=SimpleNamespace(browser_session_id="pbs_created", installed=True))
     begin_session = AsyncMock()
     monkeypatch.setattr(manager, "begin_session", begin_session)
-    monkeypatch.setattr(manager, "close_session", AsyncMock(side_effect=close_session))
+    monkeypatch.setattr(manager, "close_session", AsyncMock())
     monkeypatch.setattr(manager, "release_browser_session", AsyncMock())
     monkeypatch.setattr(WorkflowService, "_vnc_workflow_session_locks", {})
 
@@ -968,41 +983,31 @@ async def test_execute_workflow_outer_cancellation_after_candidate_allocation_wa
     assert not execute_task.done()
 
     finish_create.set()
-    await close_started.wait()
-    assert not execute_task.done()
-    finish_close.set()
-
     with pytest.raises(asyncio.CancelledError):
         await execute_task
 
     claim.assert_awaited_once()
     begin_session.assert_awaited_once()
-    manager.close_session.assert_awaited_once_with("o_test", "pbs_created")
+    manager.close_session.assert_not_awaited()
     manager.release_browser_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_outer_cancellation_during_claim_waits_for_owned_candidate_close(
+async def test_execute_workflow_outer_cancellation_during_claim_preserves_installed_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(service_module.settings, "BROWSER_STREAMING_MODE", "vnc")
     manager, _create_session = _install_manager(monkeypatch, use_default=True)
     claim_started = asyncio.Event()
     finish_claim = asyncio.Event()
-    close_started = asyncio.Event()
-    finish_close = asyncio.Event()
 
     async def claim_workflow_run_browser_session(**_kwargs: str) -> SimpleNamespace:
         claim_started.set()
         await finish_claim.wait()
         return SimpleNamespace(browser_session_id="pbs_created", installed=True)
 
-    async def close_session(_organization_id: str, _browser_session_id: str) -> None:
-        close_started.set()
-        await finish_close.wait()
-
     monkeypatch.setattr(manager, "begin_session", AsyncMock())
-    monkeypatch.setattr(manager, "close_session", AsyncMock(side_effect=close_session))
+    monkeypatch.setattr(manager, "close_session", AsyncMock())
     monkeypatch.setattr(manager, "release_browser_session", AsyncMock())
     monkeypatch.setattr(WorkflowService, "_vnc_workflow_session_locks", {})
 
@@ -1048,39 +1053,29 @@ async def test_execute_workflow_outer_cancellation_during_claim_waits_for_owned_
     assert not execute_task.done()
 
     finish_claim.set()
-    await close_started.wait()
-    assert not execute_task.done()
-    finish_close.set()
-
     with pytest.raises(asyncio.CancelledError):
         await execute_task
 
-    manager.close_session.assert_awaited_once_with("o_test", "pbs_created")
+    manager.close_session.assert_not_awaited()
     manager.release_browser_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_cancellation_after_fresh_candidate_occupation_closes_candidate(
+async def test_execute_workflow_cancellation_after_fresh_candidate_occupation_preserves_installed_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(service_module.settings, "BROWSER_STREAMING_MODE", "vnc")
     manager, create_session = _install_manager(monkeypatch, use_default=True)
     occupied = asyncio.Event()
     finish_begin = asyncio.Event()
-    close_started = asyncio.Event()
-    finish_close = asyncio.Event()
 
     async def begin_then_wait(**_kwargs: str) -> None:
         occupied.set()
         await finish_begin.wait()
 
-    async def close_then_wait(_organization_id: str, _browser_session_id: str) -> None:
-        close_started.set()
-        await finish_close.wait()
-
     claim = AsyncMock(return_value=SimpleNamespace(browser_session_id="pbs_created", installed=True))
     begin_session = AsyncMock(side_effect=begin_then_wait)
-    close_session = AsyncMock(side_effect=close_then_wait)
+    close_session = AsyncMock()
     release_browser_session = AsyncMock()
     monkeypatch.setattr(manager, "begin_session", begin_session)
     monkeypatch.setattr(manager, "close_session", close_session)
@@ -1135,10 +1130,6 @@ async def test_execute_workflow_cancellation_after_fresh_candidate_occupation_cl
     assert not execute_task.done()
 
     finish_begin.set()
-    await close_started.wait()
-    assert not execute_task.done()
-    finish_close.set()
-
     with pytest.raises(asyncio.CancelledError):
         await execute_task
 
@@ -1154,7 +1145,7 @@ async def test_execute_workflow_cancellation_after_fresh_candidate_occupation_cl
         runnable_id="wr_test",
         organization_id="o_test",
     )
-    close_session.assert_awaited_once_with("o_test", "pbs_created")
+    close_session.assert_not_awaited()
     release_browser_session.assert_not_awaited()
     remove_context.assert_called_once_with("wr_test")
 

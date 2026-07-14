@@ -2317,11 +2317,11 @@ class WorkflowService:
         state: WorkflowVncSessionSetupState,
     ) -> None:
         try:
-            # This setup invocation owns every candidate it creates until setup
-            # completes. If setup is cancelled, fully tear down that candidate even
-            # when its CAS claim was installed; releasing it would leave its VNC
-            # children running after the owning worker has gone away.
-            if state.candidate_browser_session_id:
+            # A successful CAS transfers candidate ownership to the workflow row.
+            # Keeping that installed session alive makes the persisted row safe for
+            # an overlapping or retried delivery to adopt after this setup is
+            # cancelled. Candidates that never won the CAS remain invocation-owned.
+            if state.candidate_browser_session_id and not state.candidate_installed:
                 await self._close_vnc_workflow_session_candidate(
                     organization_id=organization_id,
                     state=state,

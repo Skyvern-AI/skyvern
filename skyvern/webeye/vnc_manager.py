@@ -103,6 +103,9 @@ def _process_name(process: subprocess.Popen[bytes]) -> str:
 class VncManager:
     """Own one Xvfb -> x11vnc -> websockify stack per local browser session."""
 
+    # Deployment boundary: multi-worker VNC is unsupported; run one VNC-owning
+    # Skyvern process per host. These reservations and their lock are process-local,
+    # so availability probes cannot make cross-process allocation atomic.
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _instances: ClassVar[dict[str, VncProcess]] = {}
     _used_displays: ClassVar[set[int]] = set()
