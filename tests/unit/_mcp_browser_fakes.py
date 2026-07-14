@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -8,6 +9,15 @@ import pytest
 
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
+
+
+def make_real_wait_for_timeout() -> AsyncMock:
+    """A `page.wait_for_timeout` fake that actually sleeps, for tests driving real deadline loops."""
+
+    async def _wait(delay_ms: int) -> None:
+        await asyncio.sleep(delay_ms / 1000)
+
+    return AsyncMock(side_effect=_wait)
 
 
 def make_session_state(**overrides: Any) -> SessionState:
