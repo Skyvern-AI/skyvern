@@ -92,6 +92,16 @@ CASES = [
         browser_profile_id="bp_user",
         code_gate=True,
     ),
+    ProvisioningCase(
+        "W7-vnc-empty-session-code",
+        "vnc",
+        True,
+        ("code",),
+        browser_session_id="",
+        code_gate=True,
+        expected_creations=1,
+        expected_timeout_minutes=60,
+    ),
     ProvisioningCase("W9", "vnc", False, ()),
     ProvisioningCase(
         "W10",
@@ -130,6 +140,14 @@ CASES = [
         expected_code_gate_calls=1,
     ),
     ProvisioningCase("W14", "cdp", True, ()),
+    ProvisioningCase(
+        "W15-cdp-empty-session-code",
+        "cdp",
+        True,
+        ("code",),
+        browser_session_id="",
+        code_gate=True,
+    ),
 ]
 
 
@@ -273,7 +291,7 @@ async def test_default_vnc_creation_error_does_not_fall_through_to_code_gate(
     ],
 )
 @pytest.mark.asyncio
-async def test_execute_workflow_adopts_persisted_session_and_preserves_original_ownership(
+async def test_execute_workflow_uses_mode_specific_session_and_ownership_semantics(
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     caller_session_id: str | None,
@@ -373,7 +391,7 @@ async def test_execute_workflow_adopts_persisted_session_and_preserves_original_
     ids=["vnc-session", "vnc-address", "cdp-session", "cdp-address"],
 )
 @pytest.mark.asyncio
-async def test_cleanup_preserves_session_ownership_unless_browser_is_remote(
+async def test_cleanup_uses_mode_specific_session_ownership_and_never_closes_remote_browser(
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     browser_address: str | None,

@@ -2422,11 +2422,12 @@ class WorkflowService:
         browser_profile_id: str | None,
         proxy_location: ProxyLocationInput,
     ) -> PersistentBrowserSession | None:
-        if browser_session_id:
+        uses_default_vnc_session_manager = self._uses_default_vnc_session_manager()
+        if browser_session_id is not None and (not uses_default_vnc_session_manager or browser_session_id != ""):
             return None
 
         browser_session: PersistentBrowserSession | None = None
-        if self._uses_default_vnc_session_manager():
+        if uses_default_vnc_session_manager:
             browser_session = await self.auto_create_browser_session_if_needed(
                 organization_id,
                 workflow,
