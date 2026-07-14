@@ -12,8 +12,10 @@ export type DownloadedFileInfo = {
 export const ArtifactType = {
   Recording: "recording",
   SessionReplay: "session_replay",
+  Screenshot: "screenshot",
   ActionScreenshot: "screenshot_action",
   LLMScreenshot: "screenshot_llm",
+  EvalScore: "eval_score",
   LLMResponseRaw: "llm_response",
   LLMResponseParsed: "llm_response_parsed",
   VisibleElementsTree: "visible_elements_tree",
@@ -671,7 +673,7 @@ export type Action = {
   screenshotArtifactId?: string | null;
 };
 
-export type EvalKind = "workflow" | "task";
+export type EvalKind = "workflow" | "task" | "browser_session";
 
 export interface Eval {
   kind: EvalKind;
@@ -693,7 +695,19 @@ export interface EvalTask extends Eval {
   url: string | null;
 }
 
-export type EvalApiResponse = EvalWorkflow[] | EvalTask[];
+export interface EvalBrowserSession extends Eval {
+  kind: "browser_session";
+  session_id: string;
+  arm?: string | null;
+  model?: string | null;
+  task_id?: string | null;
+  perfect?: boolean | null;
+  rubric_avg?: number | null;
+}
+
+export type EvalApiResponse = Array<
+  EvalWorkflow | EvalTask | EvalBrowserSession
+>;
 
 export type DebugSessionApiResponse = {
   debug_session_id: string;
