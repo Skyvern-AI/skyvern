@@ -28,6 +28,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { statusIsFinalized } from "@/routes/tasks/types";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 
@@ -38,6 +39,7 @@ import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
+import { getRerunNavigationState } from "../utils";
 import { runOutcomeFromStatus } from "./runProjections";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
@@ -151,6 +153,16 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   // ?bl= marks the URL run as a block run; a full run can start alongside it
   // (they execute concurrently), so Run stays available next to Stop.
   const isBlockRun = searchParams.has("bl");
+  const rerunEligible = Boolean(
+    workflowRun &&
+    // keepPreviousData can surface a prior run after the focused run clears/changes;
+    // only treat it as the focused run when its id matches the URL.
+    workflowRun.workflow_run_id === runId &&
+    statusIsFinalized(workflowRun) &&
+    workflowRun.task_v2 === null &&
+    !isBlockRun &&
+    !workflowRun.workflow?.deleted_at,
+  );
 
   const cancelRun = useMutation({
     mutationFn: async () => {
@@ -182,12 +194,14 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
 
   // ?panes= rides through the run form so the post-start navigate restores
   // this exact layout (plus the run surfaces appended) instead of remapping.
-  const startFullRun = () =>
-    navigate(
-      // The post-start navigate resets the layout to the run mapping, so the
-      // form round-trip carries nothing.
-      `/agents/${workflowPermanentId}/run`,
-    );
+  const startFullRun = () => {
+    const path = `/agents/${workflowPermanentId}/run`;
+    if (rerunEligible && workflowRun) {
+      navigate(path, { state: getRerunNavigationState(workflowRun) });
+      return;
+    }
+    navigate(path);
+  };
 
   if (running && activeRunId) {
     const stopDialog = (
@@ -276,7 +290,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
       disabled={isRecording}
       onClick={startFullRun}
     >
-      <PlayIcon className="mr-2 size-4" /> Run agent
+      <PlayIcon className="mr-2 size-4" />
+      {rerunEligible ? "Re-run agent" : "Run agent"}
     </Button>
   );
 }
