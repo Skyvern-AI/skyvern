@@ -24,7 +24,8 @@ from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import scoped_session
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
-from tests.unit._mcp_browser_fakes import make_session_state
+from skyvern.client.errors import InternalServerError
+from tests.unit._mcp_browser_fakes import make_real_wait_for_timeout, make_session_state
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1471,6 +1472,40 @@ class TestSkyvernExecuteMCP:
         assert step_error["code"] == mcp_browser.ErrorCode.ACTION_FAILED
         assert step_error["details"]["element_state"] == "hidden"
         assert step_error["details"]["selector"] == "#field"
+
+    @pytest.mark.asyncio
+    async def test_execute_wait_error_does_not_leak_headers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _make_page()
+        page.validate = AsyncMock(
+            side_effect=InternalServerError(
+                body={"error": "Unexpected error: sk-BODY-SECRET"},
+                headers={"authorization": "Bearer sk-SECRET"},
+            )
+        )
+        page.wait_for_timeout = make_real_wait_for_timeout()
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        result = await mcp_browser.skyvern_execute(
+            steps=[
+                {
+                    "tool": "wait",
+                    "params": {
+                        "intent": "the spinner disappears",
+                        "timeout": 1000,
+                        "poll_interval_ms": 500,
+                    },
+                }
+            ]
+        )
+
+        assert result["ok"] is False
+        step_error = result["data"]["results"][0]["error"]
+        assert step_error["message"] == "HTTP 500: InternalServerError"
+        assert step_error["details"] == {"exception_type": "InternalServerError", "status_code": 500}
+        message = step_error["message"].lower()
+        for leaked in ("authorization", "bearer", "sk-secret", "sk-body-secret", "headers", "body"):
+            assert leaked not in message
 
     @pytest.mark.asyncio
     async def test_execute_ref_to_unnamed_duplicate_uses_nth(self, monkeypatch: pytest.MonkeyPatch) -> None:
