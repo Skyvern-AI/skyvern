@@ -127,6 +127,9 @@ export interface ActivityEntry {
   success?: boolean;
   // Stable per-event id used as React key.
   id: string;
+  // Consecutive same-tool retries folded into this row by
+  // condenseActivityEntries. Unset outside that transform.
+  attempts?: number;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -200,6 +203,15 @@ export interface TurnNarrativeState {
     displayReason: string | null;
     activitySeqAtVerdict: number;
   } | null;
+  // Terminal-mode credential ask, from the credentialPrompt narrative signal.
+  // reason is kept as a raw string — the card tolerates unknown tokens.
+  credentialPrompt: { reason: string } | null;
+  // Resolved pause outcome, from the credentialPause narrative signal.
+  // "declined" means the pause engaged but never sent a frame, so no card.
+  credentialPause: {
+    outcome: "connected" | "skipped" | "timeout" | "declined";
+    credentialId: string | null;
+  } | null;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -227,6 +239,8 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   authoringCount: 0,
   activitySeq: 0,
   lastRunOutcome: null,
+  credentialPrompt: null,
+  credentialPause: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -254,6 +268,34 @@ export function parseResponseKind(value: unknown): TurnResponseKind | null {
     value === "recover"
     ? value
     : null;
+}
+
+export function parseCredentialPrompt(
+  value: unknown,
+): TurnNarrativeState["credentialPrompt"] {
+  if (!value || typeof value !== "object") return null;
+  const reason = (value as Record<string, unknown>).reason;
+  return typeof reason === "string" && reason.length > 0 ? { reason } : null;
+}
+
+export function parseCredentialPause(
+  value: unknown,
+): TurnNarrativeState["credentialPause"] {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const outcome = o.outcome;
+  if (
+    outcome !== "connected" &&
+    outcome !== "skipped" &&
+    outcome !== "timeout" &&
+    outcome !== "declined"
+  ) {
+    return null;
+  }
+  return {
+    outcome,
+    credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+  };
 }
 
 // Tool calls that write the workflow definition. update_workflow only
@@ -343,6 +385,129 @@ function buildActivityFromNarration(
     iteration: event.iteration,
     id: `n-${event.iteration}-${event.timestamp}`,
   };
+}
+
+// Shared "tc-<tool_call_id>" / "tr-<tool_call_id>" id-parsing convention —
+// also used by copilotPhases.ts's hasPendingToolCall.
+export function toolCallIdOf(entry: ActivityEntry): string | undefined {
+  return entry.kind === "tool_call" || entry.kind === "tool_result"
+    ? entry.id.slice(3)
+    : undefined;
+}
+
+// Folds each tool_call/tool_result pair into one row (pending while
+// unresolved, replaced by its result once it lands) so a single tool
+// invocation never renders as two chatter lines, then folds a run of
+// same-tool retries into the last attempt's row with an attempt count —
+// only the terminal outcome of a retry chain ever shows red, intermediate
+// failed attempts stay quiet.
+//
+// Chronology, not just row count: a call is only replaced IN PLACE when
+// nothing else streamed while it was pending. If a narration arrived first
+// (the narrator can emit mid-flight progress on a slow call), replacing in
+// place would render the result ahead of a narration that genuinely came
+// earlier — so the stale pending row is dropped instead and the result
+// lands at its own later, true position.
+//
+// The retry fold below deliberately ignores narration rows entirely for
+// adjacency (tracks the last TOOL row, not literal array adjacency).
+// Array position alone can't reliably tell "narration mid-flight during
+// this attempt" from "narration genuinely between two attempts" once a
+// retry's own narration is involved — a mid-flight narration during
+// attempt 2 lands in the exact same ordered position as one that arrived
+// between attempt 1 and attempt 2. Since there's no per-entry signal to
+// disambiguate the two, narration never breaks a retry fold, full stop.
+// Folding itself follows the same drop-and-reinsert rule as pairing above:
+// the earlier attempt's row is removed rather than overwritten in place,
+// so a narration that streamed before the later attempt's result still
+// reads as arriving before it, not after.
+//
+// Known tradeoff: toolName is the only correlation signal available here
+// (no argument/target identity on the wire), so two independent same-tool
+// calls where only the first fails will also fold into one falsely-labeled
+// "retry" row. Accepted for this content-classification pass.
+//
+// A tool without a dedicated backend summary falls back to a bare "OK"
+// (summarize_tool_result in output_utils.py). That used to sit right below
+// its own "<tool name> · calling…" row, so the tool name was still visible
+// above it; condensing removes that row, leaving an unlabeled "OK" with no
+// context. Substitute the humanized tool name only for that exact literal
+// — a real backend summary always passes through untouched.
+const UNMAPPED_TOOL_RESULT_FALLBACK = "OK";
+
+function withHumanizedFallback(entry: ActivityEntry): ActivityEntry {
+  if (
+    entry.kind !== "tool_result" ||
+    entry.text !== UNMAPPED_TOOL_RESULT_FALLBACK
+  ) {
+    return entry;
+  }
+  return {
+    ...entry,
+    text: entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName),
+  };
+}
+
+export function condenseActivityEntries(
+  entries: ActivityEntry[],
+): ActivityEntry[] {
+  const callIndexById = new Map<string, number>();
+  const paired: (ActivityEntry | null)[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "tool_call") {
+      const id = toolCallIdOf(entry);
+      const idx = paired.push(entry) - 1;
+      if (id !== undefined) callIndexById.set(id, idx);
+      continue;
+    }
+    if (entry.kind === "tool_result") {
+      const id = toolCallIdOf(entry);
+      const idx = id !== undefined ? callIndexById.get(id) : undefined;
+      if (idx !== undefined) {
+        callIndexById.delete(id!);
+        if (idx === paired.length - 1) {
+          paired[idx] = entry;
+        } else {
+          paired[idx] = null;
+          paired.push(entry);
+        }
+      } else {
+        // Its tool_call was evicted past the activity cap — keep the
+        // result visible rather than silently dropping it.
+        paired.push(entry);
+      }
+      continue;
+    }
+    paired.push(entry);
+  }
+  const ordered = paired.filter((e): e is ActivityEntry => e !== null);
+
+  const condensed: (ActivityEntry | null)[] = [];
+  let lastToolIdx = -1;
+  for (const entry of ordered) {
+    const prevTool = lastToolIdx >= 0 ? condensed[lastToolIdx] : undefined;
+    if (
+      prevTool &&
+      entry.toolName !== undefined &&
+      prevTool.toolName === entry.toolName &&
+      prevTool.success === false
+    ) {
+      condensed[lastToolIdx] = null;
+      lastToolIdx =
+        condensed.push({
+          ...entry,
+          attempts: (prevTool.attempts ?? 1) + 1,
+        }) - 1;
+      continue;
+    }
+    const idx = condensed.push(entry) - 1;
+    if (entry.toolName !== undefined) {
+      lastToolIdx = idx;
+    }
+  }
+  return condensed
+    .filter((e): e is ActivityEntry => e !== null)
+    .map(withHumanizedFallback);
 }
 
 function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
@@ -944,6 +1109,8 @@ export function hydrateNarrativeFromPayload(
         : null,
     endedAt:
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
+    credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
+    credentialPause: parseCredentialPause(payload.credentialPause),
   };
 }
 

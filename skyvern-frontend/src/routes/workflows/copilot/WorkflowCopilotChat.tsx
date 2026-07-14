@@ -8,8 +8,15 @@ import {
   memo,
 } from "react";
 import { getClient } from "@/api/AxiosClient";
-import { ActionsApiResponse, getReadableActionType } from "@/api/types";
+import {
+  ActionsApiResponse,
+  CredentialApiResponse,
+  getReadableActionType,
+} from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
+import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
+import { getHostname } from "@/util/getHostname";
 import { useParams } from "react-router-dom";
 import {
   ReloadIcon,
@@ -49,6 +56,7 @@ import {
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
+  WorkflowCopilotCredentialRequiredUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotChatSummary,
@@ -71,6 +79,13 @@ import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
 import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
+import {
+  CredentialCard,
+  type CredentialRequiredFrame,
+  type CredentialRequiredReason,
+  type CredentialPauseHistorical,
+  type MatchingCredential,
+} from "./cards/CredentialCard";
 import {
   CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
@@ -377,7 +392,74 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotTurnStartUpdate
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
-  | WorkflowCopilotWorkflowDraftUpdate;
+  | WorkflowCopilotWorkflowDraftUpdate
+  | WorkflowCopilotCredentialRequiredUpdate;
+
+// The live pause frame is a structural superset of the card's frame; only
+// reason needs narrowing (the card tolerates unknown tokens either way).
+function liveFrameToCardFrame(
+  frame: WorkflowCopilotCredentialRequiredUpdate,
+): CredentialRequiredFrame {
+  return { ...frame, reason: frame.reason as CredentialRequiredReason };
+}
+
+// Terminal-mode synthetic frame from the sparse narrative_payload signals.
+// credentialPause wins over credentialPrompt so a paused-then-resolved turn
+// shows one resolved card, not a receipt stacked with a fresh actionable
+// prompt (the timeout/dedup case). "declined" → no card was ever shown.
+function credentialCardFrameFor(
+  turn: TurnNarrativeState,
+): CredentialRequiredFrame | null {
+  if (turn.credentialPause) {
+    if (turn.credentialPause.outcome === "declined") return null;
+    return {
+      type: "credential_required",
+      reason: (turn.credentialPrompt?.reason ??
+        "workflow_credential_inputs_unbound") as CredentialRequiredReason,
+    };
+  }
+  if (turn.credentialPrompt) {
+    return {
+      type: "credential_required",
+      reason: turn.credentialPrompt.reason as CredentialRequiredReason,
+    };
+  }
+  return null;
+}
+
+function historicalCredentialOutcome(
+  turn: TurnNarrativeState,
+): CredentialPauseHistorical | undefined {
+  const pause = turn.credentialPause;
+  if (!pause || pause.outcome === "declined") return undefined;
+  return {
+    outcome: pause.outcome,
+    credentialId: pause.credentialId ?? undefined,
+  };
+}
+
+type CredentialResolution = CredentialPauseHistorical & { name?: string };
+
+// Append a resolution keyed by turn, capping the map with oldest-eviction like
+// the sibling per-turn maps (turnSnapshots/turnOwnedRunIds). delete-then-set
+// re-inserts an existing turn as newest so an active turn isn't evicted.
+function withCappedResolution(
+  prev: Record<string, CredentialResolution>,
+  turnId: string,
+  value: CredentialResolution,
+): Record<string, CredentialResolution> {
+  const next = { ...prev };
+  delete next[turnId];
+  next[turnId] = value;
+  const keys = Object.keys(next);
+  for (const key of keys.slice(
+    0,
+    Math.max(0, keys.length - MAX_TURN_SNAPSHOTS),
+  )) {
+    delete next[key];
+  }
+  return next;
+}
 
 const formatChatTimestamp = (value: string) => {
   let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
@@ -694,6 +776,33 @@ export function WorkflowCopilotChat({
     [],
   );
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  // Active mid-build credential pause frame for the in-flight turn. Cleared at
+  // turn_start and at every terminal so a dead resume_token can never render.
+  const [livePauseFrame, setLivePauseFrame] =
+    useState<WorkflowCopilotCredentialRequiredUpdate | null>(null);
+  // Local credential-card resolutions keyed by turn_id: live pauses after a
+  // successful resume POST, and terminal-mode connect/skip (which never POST).
+  // name is captured at connect so the receipt keeps showing it after the turn
+  // goes terminal and the live frame (and its matching list) is gone.
+  const [credentialResolutions, setCredentialResolutions] = useState<
+    Record<string, CredentialResolution>
+  >({});
+  const [credentialModalOpen, setCredentialModalOpen] = useState(false);
+  // Credentials list for matching a live pause against stored credentials.
+  // Fetched lazily (only once a pause frame arrives — the only path carrying
+  // login_page_urls to match against), so a chat with no pause never fetches.
+  const [credentialsList, setCredentialsList] = useState<
+    CredentialApiResponse[] | null
+  >(null);
+  const credentialsFetchInFlight = useRef(false);
+  // Routes the add-credential modal's onCredentialCreated back to the card that
+  // opened it: a live frame (POST resume) or a terminal turn (local resolve).
+  const pendingCredentialConnect = useRef<{
+    frame: WorkflowCopilotCredentialRequiredUpdate | null;
+    turnId: string;
+  } | null>(null);
+  // Single-flight guard for the resume POST against a double-click.
+  const credentialResponseInFlight = useRef(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   // Synchronous in-flight gate. State (isLoading) lags a render behind, so a
   // rapid double-submit would run a stale closure and start a second stream;
@@ -857,6 +966,141 @@ export function WorkflowCopilotChat({
       credentialGetter,
       workflowPermanentId,
     ],
+  );
+  // Fetch the stored credentials once a pause is live. ponytail: page_size 100,
+  // no pagination — a >100-credential org may miss a match and fall back to the
+  // Connect CTA. Add pagination if that shows up. Setting credentialsList back
+  // to null (after a modal create) re-runs this to pick up the new credential.
+  useEffect(() => {
+    if (
+      !copilotUxV1Enabled ||
+      !livePauseFrame ||
+      credentialsList !== null ||
+      credentialsFetchInFlight.current
+    ) {
+      return;
+    }
+    credentialsFetchInFlight.current = true;
+    void (async () => {
+      try {
+        const client = await getClient(credentialGetter);
+        const res = await client.get<CredentialApiResponse[]>("/credentials", {
+          params: { page: 1, page_size: 100 },
+        });
+        setCredentialsList(Array.isArray(res.data) ? res.data : []);
+      } catch (error) {
+        // Leave credentialsList null so a later pause frame retries; caching []
+        // here would disable matching for the whole mounted session.
+        console.error("Failed to load credentials:", error);
+      } finally {
+        credentialsFetchInFlight.current = false;
+      }
+    })();
+  }, [copilotUxV1Enabled, livePauseFrame, credentialsList, credentialGetter]);
+  const liveMatchingCredentials = useMemo<MatchingCredential[]>(() => {
+    if (!livePauseFrame) return [];
+    const hosts = livePauseFrame.login_page_urls
+      .map(getHostname)
+      .filter((host): host is string => host !== null);
+    if (hosts.length === 0) return [];
+    return (credentialsList ?? [])
+      .filter((credential) => {
+        const host = credential.tested_url
+          ? getHostname(credential.tested_url)
+          : null;
+        return host !== null && hosts.includes(host);
+      })
+      .map((credential) => ({
+        credentialId: credential.credential_id,
+        name: credential.name,
+      }));
+  }, [livePauseFrame, credentialsList]);
+  const respondToCredentialPause = useCallback(
+    async (
+      frame: WorkflowCopilotCredentialRequiredUpdate,
+      action: "connected" | "skip",
+      credentialId?: string,
+    ) => {
+      if (credentialResponseInFlight.current) return;
+      credentialResponseInFlight.current = true;
+      try {
+        // Copilot routes live on base_router (no /api/v1 prefix), like cancel.
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        await client.post("/workflow/copilot/credential-response", {
+          turn_id: frame.turn_id,
+          workflow_copilot_chat_id: frame.workflow_copilot_chat_id,
+          resume_token: frame.resume_token,
+          action,
+          credential_id: action === "connected" ? credentialId : undefined,
+        });
+        const name = liveMatchingCredentials.find(
+          (candidate) => candidate.credentialId === credentialId,
+        )?.name;
+        setCredentialResolutions((prev) =>
+          withCappedResolution(
+            prev,
+            frame.turn_id,
+            action === "connected"
+              ? { outcome: "connected", credentialId, name }
+              : { outcome: "skipped" },
+          ),
+        );
+      } catch (error) {
+        // Log only the message: the AxiosError serializes config.data, which
+        // carries the one-time resume_token, into the console otherwise.
+        console.error(
+          "Failed to send credential response:",
+          error instanceof Error ? error.message : String(error),
+        );
+        toast({
+          title: "Couldn't send your credential response",
+          description: "Please try again.",
+          variant: "destructive",
+        });
+      } finally {
+        credentialResponseInFlight.current = false;
+      }
+    },
+    [credentialGetter, liveMatchingCredentials],
+  );
+  // Terminal-mode cards have no resume_token — connect/skip is a local UI morph,
+  // no network call.
+  const resolveTerminalCredential = useCallback(
+    (turnId: string, action: "connected" | "skip", credentialId?: string) => {
+      setCredentialResolutions((prev) =>
+        withCappedResolution(
+          prev,
+          turnId,
+          action === "connected"
+            ? { outcome: "connected", credentialId }
+            : { outcome: "skipped" },
+        ),
+      );
+    },
+    [],
+  );
+  const openCredentialModal = useCallback(
+    (frame: WorkflowCopilotCredentialRequiredUpdate | null, turnId: string) => {
+      pendingCredentialConnect.current = { frame, turnId };
+      setCredentialModalOpen(true);
+    },
+    [],
+  );
+  const handleCredentialCreated = useCallback(
+    (credentialId: string) => {
+      const ctx = pendingCredentialConnect.current;
+      pendingCredentialConnect.current = null;
+      setCredentialModalOpen(false);
+      // Re-fetch so the new credential's name resolves in the receipt.
+      setCredentialsList(null);
+      if (!ctx) return;
+      if (ctx.frame) {
+        void respondToCredentialPause(ctx.frame, "connected", credentialId);
+      } else {
+        resolveTerminalCredential(ctx.turnId, "connected", credentialId);
+      }
+    },
+    [respondToCredentialPause, resolveTerminalCredential],
   );
   // Explore/Draft boundary is unobservable (the LLM writes code with no
   // frames emitted); after DRAFTING_GAP_MS of silence with no pending block
@@ -1806,6 +2050,9 @@ export function WorkflowCopilotChat({
         ) => {
           // Stream completed; a Cancel click after this point should no-op.
           pendingCancelToken.current = null;
+          // Turn is terminal — the in-flight pause card (if any) unmounts with
+          // the live bubble; drop its now-dead resume_token too.
+          setLivePauseFrame(null);
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
           // freeze the current narrative state into the AI message
@@ -1890,6 +2137,9 @@ export function WorkflowCopilotChat({
           errorNarrative?: TurnNarrativeState,
         ) => {
           pendingCancelToken.current = null;
+          // A terminal error carries no credentialPause payload, so the dead
+          // frame must be cleared explicitly or its card would stay actionable.
+          setLivePauseFrame(null);
           const liveNarrative = errorNarrative ?? narrativeRef.current;
           const frozenNarrative: TurnNarrativeState | undefined =
             errorNarrative ??
@@ -1945,6 +2195,9 @@ export function WorkflowCopilotChat({
             fix_origin: fixOrigin,
             keep_pending_proposal:
               copilotUxV1Enabled && Boolean(pendingProposalTurnId),
+            // Only opt in behind the flag; flag-off omits the field entirely so
+            // the request stays byte-identical to legacy.
+            ...(copilotUxV1Enabled && { supports_credential_pause: true }),
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -1972,7 +2225,12 @@ export function WorkflowCopilotChat({
                 }
                 maybeFetchRecordedActions(payload);
                 return false;
+              case "credential_required":
+                setLivePauseFrame(payload);
+                return false;
               case "turn_start": {
+                // A new turn can't carry the prior turn's dead resume_token.
+                setLivePauseFrame(null);
                 // Move the pre-submit canvas snapshot into the per-turn
                 // map keyed by the BE-assigned turn_id; cap the map so a
                 // long-running chat does not retain every turn's snapshot.
@@ -2043,6 +2301,7 @@ export function WorkflowCopilotChat({
         // A thrown stream never emits a terminal narrative event, so clear the
         // bubble or its Working/elapsed indicator would tick forever.
         setNarrative(EMPTY_NARRATIVE);
+        setLivePauseFrame(null);
       } finally {
         if (streamingAbortController.current === abortController) {
           streamingAbortController.current = null;
@@ -2829,6 +3088,49 @@ export function WorkflowCopilotChat({
                         }
                       />
                     ) : null}
+                    {(() => {
+                      if (!copilotUxV1Enabled || turnId === null) return null;
+                      const credFrame = credentialCardFrameFor(
+                        message.narrative,
+                      );
+                      if (!credFrame) return null;
+                      // Terminal frames carry no login_page_urls, so there's
+                      // nothing to match against — the only name we can show is
+                      // one captured locally when this turn's pause connected.
+                      const localResolution = credentialResolutions[turnId];
+                      const receiptName =
+                        localResolution?.name && localResolution.credentialId
+                          ? [
+                              {
+                                credentialId: localResolution.credentialId,
+                                name: localResolution.name,
+                              },
+                            ]
+                          : undefined;
+                      return (
+                        <CredentialCard
+                          frame={credFrame}
+                          mode="terminal"
+                          matchingCredentials={receiptName}
+                          resolvedOutcome={
+                            localResolution ??
+                            historicalCredentialOutcome(message.narrative)
+                          }
+                          onConnect={(credentialId) =>
+                            credentialId
+                              ? resolveTerminalCredential(
+                                  turnId,
+                                  "connected",
+                                  credentialId,
+                                )
+                              : openCredentialModal(null, turnId)
+                          }
+                          onSkip={() =>
+                            resolveTerminalCredential(turnId, "skip")
+                          }
+                        />
+                      );
+                    })()}
                   </div>
                 );
               }
@@ -2928,6 +3230,33 @@ export function WorkflowCopilotChat({
                   onBlockSelect={onBlockSelect}
                   uxV1={copilotUxV1Enabled}
                 />
+                {copilotUxV1Enabled &&
+                livePauseFrame &&
+                livePauseFrame.turn_id === narrative.turnId ? (
+                  <CredentialCard
+                    frame={liveFrameToCardFrame(livePauseFrame)}
+                    mode="inline-pause"
+                    matchingCredentials={liveMatchingCredentials}
+                    resolvedOutcome={
+                      credentialResolutions[livePauseFrame.turn_id]
+                    }
+                    onConnect={(credentialId) =>
+                      credentialId
+                        ? void respondToCredentialPause(
+                            livePauseFrame,
+                            "connected",
+                            credentialId,
+                          )
+                        : openCredentialModal(
+                            livePauseFrame,
+                            livePauseFrame.turn_id,
+                          )
+                    }
+                    onSkip={() =>
+                      void respondToCredentialPause(livePauseFrame, "skip")
+                    }
+                  />
+                ) : null}
               </div>
             )}
           </div>
@@ -3035,22 +3364,23 @@ export function WorkflowCopilotChat({
             {inputStatusText}
           </div>
         ) : null}
-        <div className="flex items-end gap-2">
-          <SpeechInputButton
-            isSupported={isSpeechSupported}
-            isListening={isSpeechListening}
-            isHearingSpeech={isSpeechHearing}
-            disabled={inputDisabled}
-            onToggle={toggleSpeech}
-            className={
-              copilotUxV1Enabled && copilotV2Enabled
-                ? "h-8 w-8 rounded-full border-0 bg-transparent"
-                : "h-10 w-10 rounded-lg"
-            }
-            iconClassName={
-              copilotUxV1Enabled && copilotV2Enabled ? "h-3.5 w-3.5" : undefined
-            }
-          />
+        <div
+          className={
+            copilotUxV1Enabled && copilotV2Enabled
+              ? "flex items-end gap-1.5 rounded-lg border border-input bg-slate-elevation2 py-1.5 pl-3 pr-2.5 transition-colors focus-within:border-ring"
+              : "flex items-end gap-2"
+          }
+        >
+          {copilotUxV1Enabled && copilotV2Enabled ? null : (
+            <SpeechInputButton
+              isSupported={isSpeechSupported}
+              isListening={isSpeechListening}
+              isHearingSpeech={isSpeechHearing}
+              disabled={inputDisabled}
+              onToggle={toggleSpeech}
+              className="h-10 w-10 rounded-lg"
+            />
+          )}
           <textarea
             ref={setTextareaRef}
             placeholder={
@@ -3060,7 +3390,9 @@ export function WorkflowCopilotChat({
                   ? "Type a message to send next…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to send when ready..."
-                    : "Message Skyvern Copilot, or paste recorded steps…"
+                    : copilotUxV1Enabled && copilotV2Enabled
+                      ? "Ask Copilot to build or change your workflow…"
+                      : "Message Skyvern Copilot, or paste recorded steps…"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
@@ -3068,13 +3400,28 @@ export function WorkflowCopilotChat({
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className={
+              copilotUxV1Enabled && copilotV2Enabled
+                ? "min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                : "min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            }
             style={{
               minHeight: "40px",
               maxHeight: "150px",
               overflowY: "hidden",
             }}
           />
+          {copilotUxV1Enabled && copilotV2Enabled ? (
+            <SpeechInputButton
+              isSupported={isSpeechSupported}
+              isListening={isSpeechListening}
+              isHearingSpeech={isSpeechHearing}
+              disabled={inputDisabled}
+              onToggle={toggleSpeech}
+              className="h-8 w-8 rounded-full border-0 bg-transparent"
+              iconClassName="h-3.5 w-3.5"
+            />
+          ) : null}
           {copilotUxV1Enabled && copilotV2Enabled ? (
             <TooltipProvider>
               <ControlTooltip
@@ -3252,6 +3599,21 @@ export function WorkflowCopilotChat({
           />
         </>
       )}
+      {/* Mounted only while open: CredentialsModal pulls react-query at mount,
+          so keeping it mounted-but-closed would tax every render for nothing. */}
+      {copilotUxV1Enabled && credentialModalOpen ? (
+        <CredentialsModal
+          isOpen
+          // A sign-in pause always needs a password credential; force the form
+          // so a lingering ?type=credit-card/secret param can't open the wrong one.
+          overrideType={CredentialModalTypes.PASSWORD}
+          onOpenChange={(open) => {
+            setCredentialModalOpen(open);
+            if (!open) pendingCredentialConnect.current = null;
+          }}
+          onCredentialCreated={handleCredentialCreated}
+        />
+      ) : null}
     </div>
   );
 
