@@ -52,9 +52,9 @@ def test_heal_migration_chains_from_current_head() -> None:
     script = ScriptDirectory.from_config(config)
 
     heads = script.get_heads()
-    assert heads == ["2b8e37d98d97"]
+    assert heads == ["3b9d7a4c1e2f"]
 
-    revision = script.get_revision("2b8e37d98d97")
+    revision = script.get_revision("3b9d7a4c1e2f")
     assert revision is not None
     # down_revision is re-pointed to main's head on every rebase (migration-rebase policy);
     # assert the parent resolves to a real revision instead of pinning a specific hash.
