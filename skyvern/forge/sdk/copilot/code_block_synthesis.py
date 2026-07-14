@@ -81,7 +81,15 @@ _CREDENTIAL_FIELD_ACCESS_RE = re.compile(
     r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
 )
 _CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
-_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
+
+
+def _is_submit_interaction(interaction: Mapping[str, Any]) -> bool:
+    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits, so
+    both the synthesis submit boundary and the persist-time credential-scout gate share one definition."""
+    tool_name = str(interaction.get("tool_name") or "").strip()
+    if tool_name == "click":
+        return True
+    return tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter"
 
 
 class CredentialFieldAccess(NamedTuple):
@@ -127,7 +135,7 @@ def first_matched_post_fill_submit_index(
     for index, interaction in enumerate(trajectory):
         if index <= latest_fill_index:
             continue
-        if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+        if not _is_submit_interaction(interaction):
             continue
         source_url = str(interaction.get("source_url") or "").strip()
         if matched_source_urls and source_url not in matched_source_urls:
@@ -819,6 +827,7 @@ def _locator_expr(
     selector = str(interaction.get("selector") or "").strip()
     role = str(interaction.get("role") or "").strip()
     name = str(interaction.get("accessible_name") or "").strip()
+    scout_ambiguous = bool(interaction.get("ambiguous"))
 
     templated = _maybe_input_templated_locator(interaction, diagnostics=diagnostics, trajectory_index=trajectory_index)
     if templated is not None:
@@ -838,7 +847,7 @@ def _locator_expr(
             return ""
         parsed_strict = _parse_role_name(selector)
         ambiguous_role = parsed_strict is not None and not parsed_strict[1]
-        if ambiguous_role or _is_bare_ambiguous_selector(selector):
+        if ambiguous_role or scout_ambiguous or _is_bare_ambiguous_selector(selector):
             if role and name:
                 expr = _get_by_role_expr_strict(role, name)
                 if diagnostics is not None:
@@ -895,6 +904,20 @@ def _locator_expr(
         if _is_positional_selector(selector):
             notes.append(f"low-confidence locator: positional selector {selector!r} with no role/name to anchor on")
             return f"page.locator({_py_str(selector)})"
+        if scout_ambiguous and role and name:
+            return _get_by_role_expr(role, name)
+        if scout_ambiguous:
+            notes.append(f"disambiguated a scout-ambiguous {selector!r} selector to .first from scout document order")
+            if diagnostics is not None:
+                diagnostics.locator_provenance.append(
+                    {
+                        "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                        "selector": selector,
+                        "emitted_literal": selector,
+                        "source": "first_fallback",
+                    }
+                )
+            return f"page.locator({_py_str(selector)}).first"
         if _is_bare_ambiguous_selector(selector):
             if role and name:
                 return _get_by_role_expr(role, name)
@@ -1138,7 +1161,7 @@ def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict
 
     submit_index = -1
     for index in range(last_credential_index + 1, len(trajectory)):
-        if str(trajectory[index].get("tool_name") or "") == "click":
+        if _is_submit_interaction(trajectory[index]):
             submit_index = index
             break
     if submit_index < 0:
@@ -1271,6 +1294,7 @@ def synthesize_code_block(
     entry_replay_condition_active = False
     entry_replay_start_index = 0
     entry_post_auth_resume_index = 0
+    login_only_presence_guard_active = False
     for index, interaction in enumerate(trajectory):
         candidate = str(interaction.get("source_url") or "").strip()
         if candidate:
@@ -1339,6 +1363,22 @@ def synthesize_code_block(
                     entry_recovery_clicks.append((recovery_index, recovery_locator))
             if entry_recovery_clicks:
                 notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
+        login_only_presence_guard_active = bool(
+            entry_target
+            and not entry_replay_condition_active
+            and not entry_post_auth_resume_index
+            and not entry_replay_start_index
+            and not entry_recovery_clicks
+            and any(
+                str(interaction.get("tool_name") or "") == CREDENTIAL_FILL_TOOL_NAME
+                and str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS
+                for interaction in entry_trajectory
+            )
+        )
+        if login_only_presence_guard_active:
+            notes.append(
+                "login rung fills only when the credential form is present, so an authenticated replay skips it"
+            )
         line_start = len(lines) + 1
         if entry_target:
             if entry_replay_condition_active:
@@ -1402,7 +1442,7 @@ def synthesize_code_block(
                         lane="entry_recovery",
                     )
                 lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
-            else:
+            elif not login_only_presence_guard_active:
                 lines.append(f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
         else:
             lines.append(
@@ -1417,6 +1457,8 @@ def synthesize_code_block(
         elif entry_post_auth_resume_index:
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
+        if login_only_presence_guard_active:
+            lines.append(f"{_INDENT}if await {_ENTRY_TARGET_VAR}.count() == 1:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
@@ -1429,6 +1471,8 @@ def synthesize_code_block(
                 return _INDENT * 3
             return _INDENT * 2
         if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
+            return _INDENT * 2
+        if login_only_presence_guard_active:
             return _INDENT * 2
         return _INDENT
 
@@ -1633,6 +1677,9 @@ def synthesize_code_block(
         and (emitted - len(deferred_readonly_assertions)) == 0
         and (not entry_post_auth_resume_index)
     ):
+        lines.append(f"{_INDENT * 2}pass")
+
+    if login_only_presence_guard_active and (emitted - len(deferred_readonly_assertions)) == 0:
         lines.append(f"{_INDENT * 2}pass")
 
     if deferred_readonly_assertions:

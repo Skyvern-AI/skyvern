@@ -15,6 +15,7 @@ import {
   TurnNarrativeState,
   TurnSummary,
   computeTurnSummary,
+  condenseActivityEntries,
   effectiveMode,
   formatElapsed,
   isBlockOk,
@@ -173,6 +174,16 @@ function FSubRow({
   );
 }
 
+function AttemptsBadge({ attempts }: { attempts?: number }) {
+  if (!attempts || attempts <= 1) return null;
+  return (
+    <span className="text-muted-foreground dark:text-slate-500">
+      {" "}
+      · ↻ {attempts} attempts
+    </span>
+  );
+}
+
 function ActivityRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
@@ -196,6 +207,7 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
           {" "}
           · calling…
         </span>
+        <AttemptsBadge attempts={entry.attempts} />
       </FSubRow>
     );
   }
@@ -218,6 +230,7 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
       >
         {entry.text}
       </span>
+      <AttemptsBadge attempts={entry.attempts} />
     </FSubRow>
   );
 }
@@ -733,6 +746,14 @@ function FPhaseChecklist({
   uxV1,
 }: FPhaseChecklistProps) {
   const rows = useMemo(() => derivePhases(turn), [turn]);
+  const condensedBlocks = useMemo(
+    () =>
+      turn.blocks.map((b) => ({
+        ...b,
+        activity: condenseActivityEntries(b.activity),
+      })),
+    [turn.blocks],
+  );
   const [openPhases, setOpenPhases] = useState<Set<CopilotPhaseId>>(
     () => new Set(),
   );
@@ -853,7 +874,7 @@ function FPhaseChecklist({
                     {row.entries.map((entry) => (
                       <ActivityRow key={entry.id} entry={entry} />
                     ))}
-                    {turn.blocks.map((b) => (
+                    {condensedBlocks.map((b) => (
                       <FBlockRun
                         key={b.workflowRunBlockId || b.label}
                         block={b}

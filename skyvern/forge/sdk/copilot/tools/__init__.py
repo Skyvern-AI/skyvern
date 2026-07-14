@@ -224,6 +224,7 @@ from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
+from .scouting import _capture_scout_ambiguity as _capture_scout_ambiguity
 from .scouting import _capture_scout_role_name as _capture_scout_role_name
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
@@ -234,6 +235,7 @@ from .scouting import _consume_scout_source_url as _consume_scout_source_url
 from .scouting import _mark_page_inspected as _mark_page_inspected
 from .scouting import _mark_pending_browser_interaction_observation as _mark_pending_browser_interaction_observation
 from .scouting import _mark_post_run_page_observed as _mark_post_run_page_observed
+from .scouting import _prenav_ambiguity_for_selector as _prenav_ambiguity_for_selector
 from .scouting import _prenav_role_name_for_selector as _prenav_role_name_for_selector
 from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
