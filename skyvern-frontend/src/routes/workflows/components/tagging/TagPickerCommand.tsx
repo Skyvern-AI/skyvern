@@ -169,7 +169,7 @@ function TagPickerCommand({
                 <span>
                   {tag.key !== null ? `${tag.key}: ${tag.value}` : tag.value}
                 </span>
-                <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+                <CheckIcon className="ml-auto h-4 w-4 text-blue-700 dark:text-blue-400" />
               </CommandItem>
             ))}
           </CommandGroup>
@@ -182,7 +182,7 @@ function TagPickerCommand({
               onSelect={() => selectTag(candidate)}
             >
               {candidateIsCurrent ? (
-                <CheckIcon className="mr-2 h-4 w-4 text-blue-400" />
+                <CheckIcon className="mr-2 h-4 w-4 text-blue-700 dark:text-blue-400" />
               ) : (
                 <PlusIcon className="mr-2 h-4 w-4" />
               )}
@@ -206,7 +206,7 @@ function TagPickerCommand({
                 {currentTagByKey.has(
                   tagElementKey({ key: typedKey, value }),
                 ) ? (
-                  <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+                  <CheckIcon className="ml-auto h-4 w-4 text-blue-700 dark:text-blue-400" />
                 ) : null}
               </CommandItem>
             ))}
@@ -237,7 +237,7 @@ function TagPickerCommand({
               >
                 {value}
                 {currentTagByKey.has(tagElementKey({ key: null, value })) ? (
-                  <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+                  <CheckIcon className="ml-auto h-4 w-4 text-blue-700 dark:text-blue-400" />
                 ) : null}
               </CommandItem>
             ))}

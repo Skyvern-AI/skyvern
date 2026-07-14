@@ -1936,7 +1936,7 @@ function Workspace({
           <DialogHeader>
             <DialogTitle>Cycle (Get a new browser)</DialogTitle>
             <DialogDescription>
-              <div className="pb-2 pt-4 text-sm text-slate-400">
+              <div className="pb-2 pt-4 text-sm text-muted-foreground">
                 {cycleBrowser.isPending ? (
                   <>
                     Cooking you up a fresh browser...

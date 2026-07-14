@@ -225,28 +225,30 @@ function WorkflowRunTimeline({
   const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
 
   return (
-    <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
-      <div className="flex shrink-0 items-center gap-2 border-b border-slate-700 px-3 py-2 text-xs">
-        <span className="font-medium text-slate-200">Timeline</span>
+    <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 text-xs">
+        <span className="font-medium text-foreground dark:text-slate-200">
+          Timeline
+        </span>
         {totalBlocks > 0 && (
           <span
-            className="text-slate-500"
+            className="text-muted-foreground dark:text-slate-500"
             title="Top-level blocks completed out of the total defined for this workflow"
           >
             · {completedBlocks}/{totalBlocks} blocks
           </span>
         )}
         {numberOfActions > 0 && (
-          <span className="text-slate-500">
+          <span className="text-muted-foreground dark:text-slate-500">
             · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
           </span>
         )}
-        <span className="text-slate-500">
+        <span className="text-muted-foreground dark:text-slate-500">
           · {workflowRun.total_steps ?? 0}{" "}
           {(workflowRun.total_steps ?? 0) === 1 ? "step" : "steps"}
         </span>
         <span
-          className="text-slate-500"
+          className="text-muted-foreground dark:text-slate-500"
           title="Credits consumed by this run (live + cached)"
         >
           ·{" "}
@@ -277,7 +279,7 @@ function WorkflowRunTimeline({
         <ScrollAreaViewport className="h-full max-h-full [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="p-2">
             {workflowRunIsNotFinalized && workflowRunTimeline.length === 0 && (
-              <div className="flex items-center justify-center py-8 text-sm text-slate-400">
+              <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
                 Formulating actions...
               </div>
             )}

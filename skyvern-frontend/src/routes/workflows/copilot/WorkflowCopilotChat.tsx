@@ -286,7 +286,7 @@ function ConvoAggregatePill({
       : "bg-emerald-400";
   return (
     <div className="flex justify-center pb-1">
-      <span className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/60 px-3 py-0.5 text-[11px] text-slate-300">
+      <span className="inline-flex items-center gap-2 rounded-full border border-border bg-slate-elevation1/60 px-3 py-0.5 text-[11px] text-tertiary-foreground">
         <span
           aria-hidden="true"
           className={`inline-block h-1.5 w-1.5 rounded-full ${dotClass}`}
@@ -406,7 +406,7 @@ const MessageItem = memo(
           <div className="relative max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
             <p className="whitespace-pre-wrap pr-12">{message.content}</p>
             {queuedStatus ? (
-              <div className="mt-2 flex items-center gap-1.5 border-t border-white/10 pt-2 text-[11.5px] text-slate-400">
+              <div className="mt-2 flex items-center gap-1.5 border-t border-white/10 pt-2 text-[11.5px] text-muted-foreground">
                 <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
                 <span className="min-w-0 flex-1 truncate">
                   {queuedStatus.text}
@@ -432,7 +432,7 @@ const MessageItem = memo(
     }
     return (
       <div className="flex flex-col gap-2">
-        <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-slate-200">
+        <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
           {message.content}
         </p>
         {footer ? (
@@ -2519,7 +2519,9 @@ export function WorkflowCopilotChat({
             Answer questions and make quick workflow edits.
           </span>
         </span>
-        {!isBuild ? <CheckIcon className="h-4 w-4 text-sky-400" /> : null}
+        {!isBuild ? (
+          <CheckIcon className="h-4 w-4 text-sky-700 dark:text-sky-400" />
+        ) : null}
       </DropdownMenuItem>
       <DropdownMenuItem
         aria-label="Build"
@@ -2542,7 +2544,7 @@ export function WorkflowCopilotChat({
           </span>
         </span>
         {isBuild && !codeWorkflow ? (
-          <CheckIcon className="h-4 w-4 text-sky-400" />
+          <CheckIcon className="h-4 w-4 text-sky-700 dark:text-sky-400" />
         ) : null}
       </DropdownMenuItem>
       {codeOptionAvailable ? (
@@ -2573,7 +2575,7 @@ export function WorkflowCopilotChat({
             </span>
           </span>
           {isBuild && codeWorkflow ? (
-            <CheckIcon className="h-4 w-4 text-sky-400" />
+            <CheckIcon className="h-4 w-4 text-sky-700 dark:text-sky-400" />
           ) : null}
         </DropdownMenuItem>
       ) : null}

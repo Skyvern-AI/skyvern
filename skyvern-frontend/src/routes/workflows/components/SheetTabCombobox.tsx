@@ -94,7 +94,7 @@ function SheetTabCombobox({
             e.preventDefault();
           }
         }}
-        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-slate-700 bg-slate-900 p-0 shadow-lg"
+        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-border bg-slate-elevation1 p-0 shadow-lg"
       >
         <SheetTabListPanel
           credentialId={credentialId}
@@ -197,14 +197,14 @@ function SheetTabListPanel({
   if (isReconnectRequired(tabsQuery.error)) {
     return (
       <div className="w-full p-3 text-xs">
-        <p className="mb-2 text-slate-200">
+        <p className="mb-2 text-foreground dark:text-slate-200">
           Reconnect this Google account to enable the sheet picker.
         </p>
         <a
           href="/integrations"
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-slate-300 underline hover:text-slate-100"
+          className="inline-flex items-center gap-1 text-tertiary-foreground underline hover:text-foreground"
         >
           Open integrations <ExternalLinkIcon className="size-3" />
         </a>
@@ -224,7 +224,7 @@ function SheetTabListPanel({
   return (
     <>
       {allowCreate ? (
-        <div className="border-b border-slate-700">
+        <div className="border-b border-border">
           <InlineCreateRow
             label="Create new sheet"
             placeholder="Sheet title"
@@ -241,14 +241,16 @@ function SheetTabListPanel({
             ))}
           </div>
         ) : tabs.length === 0 ? (
-          <div className="px-3 py-3 text-xs text-slate-500">No sheets.</div>
+          <div className="px-3 py-3 text-xs text-muted-foreground dark:text-slate-500">
+            No sheets.
+          </div>
         ) : (
           tabs.map((tab, index) => (
             <button
               key={tab.sheet_id}
               type="button"
               onClick={() => onPick(tab.title, index)}
-              className="flex w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-700"
+              className="flex w-full px-3 py-2 text-left text-xs text-foreground hover:bg-muted dark:text-slate-200 dark:hover:bg-slate-700"
             >
               {tab.title}
             </button>

@@ -34,7 +34,7 @@ export function ErrorCodeMappingValidation({
   const strip = (err: string) =>
     err.startsWith(prefix) ? err.slice(prefix.length) : err;
   return (
-    <div className="mb-2 mt-1 flex items-start gap-1 rounded-md border border-red-500/40 bg-red-500/10 p-2 text-xs text-red-400">
+    <div className="mb-2 mt-1 flex items-start gap-1 rounded-md border border-red-500/40 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-400">
       <ExclamationTriangleIcon className="mt-0.5 h-3 w-3 shrink-0" />
       {errors.length === 1 ? (
         <div className="flex-1">{strip(errors[0]!)}</div>

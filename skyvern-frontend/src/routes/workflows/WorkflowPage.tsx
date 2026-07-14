@@ -399,7 +399,7 @@ function WorkflowPage() {
                                         }}
                                         className={cn(
                                           isExpanded
-                                            ? "text-blue-400"
+                                            ? "text-blue-700 dark:text-blue-400"
                                             : "text-muted-foreground hover:text-foreground",
                                         )}
                                       >
@@ -452,7 +452,7 @@ function WorkflowPage() {
               />
               <div className="relative px-3 py-3">
                 <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-                  <span className="text-slate-400">Items per page</span>
+                  <span className="text-muted-foreground">Items per page</span>
                   <Select
                     value={String(pageSize)}
                     onValueChange={(size) => {
@@ -580,7 +580,7 @@ function WorkflowRunParameters({
 
   if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
+      <div className="ml-8 py-4 text-sm text-muted-foreground">
         No inputs for this run
       </div>
     );

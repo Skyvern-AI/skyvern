@@ -52,7 +52,7 @@ function Taskv2EditorBody({
       className="space-y-4"
     >
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">URL</Label>
+        <Label className="text-xs text-tertiary-foreground">URL</Label>
         <WorkflowBlockInputTextarea
           nodeId={blockId}
           onChange={(value) => update({ url: value })}
@@ -62,7 +62,7 @@ function Taskv2EditorBody({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">Prompt</Label>
+        <Label className="text-xs text-tertiary-foreground">Prompt</Label>
         <WorkflowBlockInputTextarea
           aiImprove={AI_IMPROVE_CONFIGS.taskV2.prompt}
           nodeId={blockId}
@@ -87,7 +87,9 @@ function Taskv2EditorBody({
               />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Max Steps</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Max Steps
+                  </Label>
                   <HelpTooltip content={helpTooltips["taskv2"]["maxSteps"]} />
                 </div>
                 <Input
@@ -122,7 +124,7 @@ function Taskv2EditorBody({
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Identifier
                   </Label>
                   <HelpTooltip
@@ -139,7 +141,7 @@ function Taskv2EditorBody({
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Verification URL
                   </Label>
                   <HelpTooltip

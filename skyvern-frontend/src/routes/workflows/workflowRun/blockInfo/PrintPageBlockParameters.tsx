@@ -30,7 +30,7 @@ function PrintPageBlockParameters({
         </div>
         <div className="flex w-full items-center gap-3">
           <Switch checked={landscape} disabled />
-          <span className="text-sm text-slate-400">
+          <span className="text-sm text-muted-foreground">
             {landscape ? "Enabled" : "Disabled"}
           </span>
         </div>
@@ -41,7 +41,7 @@ function PrintPageBlockParameters({
         </div>
         <div className="flex w-full items-center gap-3">
           <Switch checked={printBackground} disabled />
-          <span className="text-sm text-slate-400">
+          <span className="text-sm text-muted-foreground">
             {printBackground ? "Enabled" : "Disabled"}
           </span>
         </div>
@@ -52,7 +52,7 @@ function PrintPageBlockParameters({
         </div>
         <div className="flex w-full items-center gap-3">
           <Switch checked={includeTimestamp} disabled />
-          <span className="text-sm text-slate-400">
+          <span className="text-sm text-muted-foreground">
             {includeTimestamp ? "Enabled" : "Disabled"}
           </span>
         </div>

@@ -34,7 +34,7 @@ function WaitEditorBody({
     <div data-testid="wait-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">
+          <Label className="text-xs text-tertiary-foreground">
             Wait Time (in seconds)
           </Label>
           <HelpTooltip content={helpTooltips["wait"]["waitInSeconds"]} />
