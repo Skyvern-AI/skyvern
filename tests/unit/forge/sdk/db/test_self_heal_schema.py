@@ -48,7 +48,7 @@ def test_heal_migration_chains_from_current_head() -> None:
     script = ScriptDirectory.from_config(config)
 
     heads = script.get_heads()
-    assert heads == ["2b8e37d98d97"]
+    assert heads == ["d4f7a9c2e681"]
 
     revision = script.get_revision("2b8e37d98d97")
     assert revision is not None
