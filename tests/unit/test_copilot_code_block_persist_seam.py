@@ -16097,3 +16097,200 @@ def test_reconcile_scout_interaction_positional_map_skips_witness_rows() -> None
     )
     assert account is not None and account["selector"] == "#account"
     assert period is not None and period["selector"] == "#period"
+
+
+def _goal_reaching_freehand_ctx(*, credential: bool = False) -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    if credential:
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#username",
+                "source_url": "https://example.com/login",
+                "credential_id": "cred_1",
+                "credential_name": "portal",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#signin",
+                "source_url": "https://example.com/login",
+                "role": "button",
+                "accessible_name": "Sign In",
+                "trajectory_index": 1,
+            },
+        ]
+    else:
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/find",
+                "typed_length": 5,
+                "role": "textbox",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "button",
+                "source_url": "https://example.com/find",
+                "role": "button",
+                "accessible_name": "Sign In",
+                "trajectory_index": 1,
+            },
+        ]
+    return ctx
+
+
+def _freehand_block_yaml(code: str, *, label: str = "find_address", parameters: str = "") -> str:
+    indented = "\n".join(f"          {line}" for line in code.splitlines())
+    return (
+        "title: t\n"
+        "workflow_definition:\n"
+        f"{parameters}"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        f"    label: {label}\n"
+        "    code: |\n"
+        f"{indented}\n"
+    )
+
+
+class TestFreehandSurfacePersistSeam:
+    def test_get_by_label_unassociated_shape_rejected_with_scout_route(self) -> None:
+        code = (
+            'await page.locator("#search").fill("x")\n'
+            'await page.get_by_role("button", name="Sign In", exact=True).click()\n'
+            'await page.get_by_label("State").select_option("CA")'
+        )
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code), _goal_reaching_freehand_ctx()
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert "get_by_label" in result.violations[0]
+        assert "never_captured" in result.violations[0]
+
+    def test_attribute_selector_button_shape_rejected(self) -> None:
+        code = (
+            'await page.locator("#search").fill("x")\n'
+            "await page.locator(\"button[data-action='orderDocuments']\").click()"
+        )
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code), _goal_reaching_freehand_ctx()
+        )
+        assert result is not None
+        assert "orderDocuments" in result.violations[0]
+
+    def test_strict_synthesis_parity_rejects_bare_locator_when_emitted_literal_is_role_form(self) -> None:
+        code = 'await page.locator("#search").fill("x")\nawait page.locator("button").click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code), _goal_reaching_freehand_ctx()
+        )
+        assert result is not None
+        assert "page.locator('button')" in result.violations[0]
+
+    def test_receiver_matching_literal_fill_is_admitted(self) -> None:
+        code = (
+            'await page.locator("#search").fill("hardcoded")\n'
+            'await page.get_by_role("button", name="Sign In", exact=True).click()'
+        )
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code), _goal_reaching_freehand_ctx()
+        )
+        assert result is None
+
+    def test_selectorless_navigation_block_is_not_gated(self) -> None:
+        code = 'await page.goto("https://example.com/find")\nawait page.reload()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, label="nav"), _goal_reaching_freehand_ctx()
+        )
+        assert result is None
+
+    def _fragment_scout_ctx(self) -> CopilotContext:
+        ctx = _goal_reaching_freehand_ctx()
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/find",
+                "role": "textbox",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            }
+        ]
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        return ctx
+
+    def test_fragment_scout_rejects_ungrounded_get_by_label(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.get_by_label("State").select_option("CA")'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unresolvable_selector"
+        assert "get_by_label" in result.violations[0]
+
+    def test_fragment_scout_admits_reused_scouted_receiver(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.locator("#search").fill("x")'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is None
+
+    def test_fragment_scout_admits_not_yet_scouted_get_by_role(self) -> None:
+        ctx = self._fragment_scout_ctx()
+        code = 'await page.get_by_role("button", name="Continue", exact=True).click()'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is None
+
+    def test_unguarded_credential_fill_routes_to_guarded_entry_rung(self) -> None:
+        parameters = "  parameters:\n  - {parameter_type: credential, key: portal}\n"
+        code = 'await page.locator("#password").fill(portal.password)'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, parameters=parameters), _goal_reaching_freehand_ctx(credential=True)
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unguarded_credential_fill"
+
+    def test_fragment_scout_rejects_unguarded_credential_fill(self) -> None:
+        ctx = _goal_reaching_freehand_ctx(credential=True)
+        ctx.scout_trajectory = ctx.scout_trajectory[:1]
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        parameters = "  parameters:\n  - {parameter_type: credential, key: portal}\n"
+        code = 'await page.locator("#password").fill(portal.password)'
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, parameters=parameters), ctx
+        )
+        assert result is not None
+        assert result.repair_context is not None
+        assert result.repair_context.reason_code == "freehand_unguarded_credential_fill"
+
+    def test_presence_guarded_credential_fill_is_admitted(self) -> None:
+        parameters = "  parameters:\n  - {parameter_type: credential, key: portal}\n"
+        code = (
+            '_scout_entry_target = page.locator("#username")\n'
+            "if await _scout_entry_target.count() == 1:\n"
+            '    await page.locator("#username").fill(portal.username)'
+        )
+        result = workflow_update_module._persist_seam_freehand_surface_result(
+            _freehand_block_yaml(code, parameters=parameters), _goal_reaching_freehand_ctx(credential=True)
+        )
+        assert result is None
+
+    def test_non_credential_attribute_fill_is_not_flagged_as_credential(self) -> None:
+        parameters = "  parameters:\n  - {parameter_type: credential, key: portal}\n"
+        code = 'await page.locator("#search").fill(profile.email)'
+        assert workflow_update_module._block_has_unguarded_credential_fill(code, {"portal"}) is False
+        _ = parameters
+
+    def test_reaches_goal_gate_off_returns_none_without_imposition(self) -> None:
+        ctx = _goal_reaching_freehand_ctx()
+        ctx.impose_synthesized_code_block = False
+        code = 'await page.get_by_label("State").select_option("CA")'
+        result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
+        assert result is None
