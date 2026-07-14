@@ -15981,3 +15981,119 @@ def test_producer_preserves_the_models_download_descriptor_key() -> None:
     artifact = {"claimed_outcomes": [{"id": "claim", "goal_value_paths": ["output.downloaded_invoice_pdf"]}]}
     assert workflow_update_module._download_return_shape_error("block", artifact, envelope.code) is None
     assert {"output.statement_amount"} <= workflow_update_module._code_block_produced_output_paths(envelope.code)
+
+
+_WITNESS_SELECTOR = "a[href='/statements/100245_2026-05.pdf']"
+
+
+def _input_templated_provenance() -> dict[str, object]:
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": _WITNESS_SELECTOR},
+        {"account_number": "100245", "billing_period": "May 2026"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="selector", selector=_WITNESS_SELECTOR, role="", name="", holes=holes
+    )
+    return {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "selector",
+        "selector": _WITNESS_SELECTOR,
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+
+
+def test_input_templated_provenance_admitted() -> None:
+    assert workflow_update_module._locator_provenance_is_self_validating(_input_templated_provenance())
+
+
+def test_input_templated_accessible_name_shape_admitted() -> None:
+    holes = workflow_update_module.input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": "button", "accessible_name": "Download 100245", "role": "button"},
+        {"account_number": "100245"},
+    )
+    emitted = workflow_update_module.build_input_templated_locator(
+        surface="accessible_name", selector="", role="button", name="Download 100245", holes=holes
+    )
+    record = {
+        "source": workflow_update_module.INPUT_TEMPLATED_PROVENANCE_SOURCE,
+        "surface": "accessible_name",
+        "role": "button",
+        "name": "Download 100245",
+        "emitted_literal": emitted,
+        "holes": [dict(hole) for hole in holes],
+    }
+    assert workflow_update_module._locator_provenance_is_self_validating(record)
+
+
+def test_input_templated_provenance_rejects_tamper() -> None:
+    tampered_literal = _input_templated_provenance()
+    tampered_literal["emitted_literal"] = str(tampered_literal["emitted_literal"]).replace("account_number", "attacker")
+    assert not workflow_update_module._locator_provenance_is_self_validating(tampered_literal)
+
+    reordered = _input_templated_provenance()
+    reordered["holes"] = list(reversed(reordered["holes"]))  # type: ignore[arg-type]
+    assert not workflow_update_module._locator_provenance_is_self_validating(reordered)
+
+    missing_holes = _input_templated_provenance()
+    missing_holes["holes"] = []
+    assert not workflow_update_module._locator_provenance_is_self_validating(missing_holes)
+
+
+def test_confluence_stamps_and_clears_input_correspondences() -> None:
+    ctx = _code_only_ctx()
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": _WITNESS_SELECTOR,
+            "source_url": "https://example.com/s",
+            "trajectory_index": 0,
+        }
+    ]
+    yaml_with_params = textwrap.dedent(
+        """
+        workflow_definition:
+          parameters:
+            - parameter_type: workflow
+              workflow_parameter_type: string
+              key: account_number
+              default_value: "100245"
+            - parameter_type: workflow
+              workflow_parameter_type: string
+              key: billing_period
+              default_value: "May 2026"
+          blocks: []
+        """
+    )
+    workflow_update_module._enrich_scout_trajectory_input_correspondences(yaml_with_params, ctx)
+    stamped = ctx.scout_trajectory[0].get("input_correspondences")
+    assert stamped is not None
+    assert {c["input_key"] for c in stamped} == {"account_number", "billing_period"}
+
+    yaml_without_params = "workflow_definition:\n  parameters: []\n  blocks: []\n"
+    workflow_update_module._enrich_scout_trajectory_input_correspondences(yaml_without_params, ctx)
+    assert "input_correspondences" not in ctx.scout_trajectory[0]
+
+
+def test_reconcile_scout_interaction_positional_map_skips_witness_rows() -> None:
+    scout_trajectory = [
+        {"tool_name": "type_text", "selector": "#account", "typed_length": 6},
+        {"tool_name": "type_text", "selector": "#period", "typed_length": 8},
+    ]
+    synthesized_parameters = [
+        {"key": "account_number", "default_value": "100245", "source": "locator_witness"},
+        {"key": "account_field"},
+        {"key": "period_field"},
+    ]
+    account = workflow_update_module._scout_interaction_for_synthesized_parameter(
+        synthesized_key="account_field",
+        scout_trajectory=scout_trajectory,
+        synthesized_parameters=synthesized_parameters,
+    )
+    period = workflow_update_module._scout_interaction_for_synthesized_parameter(
+        synthesized_key="period_field",
+        scout_trajectory=scout_trajectory,
+        synthesized_parameters=synthesized_parameters,
+    )
+    assert account is not None and account["selector"] == "#account"
+    assert period is not None and period["selector"] == "#period"

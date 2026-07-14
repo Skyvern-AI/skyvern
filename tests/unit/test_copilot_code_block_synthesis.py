@@ -26,6 +26,8 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _READONLY_DEFERRED_VAR,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
+    INPUT_TEMPLATED_PROVENANCE_SOURCE,
+    LOCATOR_WITNESS_PARAM_SOURCE,
     SCOUTED_SPINE_DROPPED_UNFORGIVEN_REASON_CODE,
     SCOUTED_SPINE_TRUNCATED_REASON_CODE,
     TRUNCATED_FINDING,
@@ -35,8 +37,10 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SynthesisDiagnostics,
     _get_by_role_expr,
     _get_by_role_expr_strict,
+    build_input_templated_locator,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
+    input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
     obligation_finding_reason_code,
     produce_covered_static_return_envelope,
@@ -46,6 +50,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_code_block_with_extraction,
     synthesize_extraction_suffix,
     uncovered_required_emitted_interactions,
+    witness_prelude_lines,
 )
 from skyvern.forge.sdk.copilot.context import (
     FillCarry,
@@ -3398,3 +3403,192 @@ class TestDownloadTerminalSequencing:
         assert (
             _with_trajectory_anchor(SimpleNamespace(scout_trajectory=[]), _download_target()).trajectory_anchor is None
         )  # type: ignore[arg-type]
+
+
+_STATEMENT_SELECTOR = "a[href='/statements/100245_2026-05.pdf']"
+_DECLARED = {"account_number": "100245", "billing_period": "May 2026"}
+
+
+def _witnessed_click(*, selector: str = _STATEMENT_SELECTOR, accessible_name: str = "Download May") -> dict[str, Any]:
+    interaction: dict[str, Any] = {
+        "tool_name": "click",
+        "selector": selector,
+        "accessible_name": accessible_name,
+        "role": "link",
+        "source_url": "https://example.com/statements",
+    }
+    correspondences = input_correspondences_for_interaction(interaction, _DECLARED)
+    if correspondences:
+        interaction["input_correspondences"] = correspondences
+    return interaction
+
+
+def test_input_correspondence_selector_identity_and_month() -> None:
+    correspondences = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED
+    )
+    by_key = {c["input_key"]: c for c in correspondences}
+    assert by_key["account_number"] == {
+        "input_key": "account_number",
+        "matched_literal": "100245",
+        "parameter_value": "100245",
+        "surface": "selector",
+        "transform": "identity",
+        "position": 20,
+    }
+    assert by_key["billing_period"]["matched_literal"] == "2026-05"
+    assert by_key["billing_period"]["parameter_value"] == "May 2026"
+    assert by_key["billing_period"]["transform"] == "month_name_to_iso"
+
+
+def test_templated_hole_uses_validated_span_not_earlier_substring() -> None:
+    # "Widget" also occurs as a non-boundary substring inside "Widgetry"; the hole must template the
+    # boundary-validated standalone span, not the first find() hit.
+    selector = 'a[aria-label="Widgetry Widget"]'
+    holes = input_correspondences_for_interaction({"tool_name": "click", "selector": selector}, {"gadget": "Widget"})
+    assert [h["position"] for h in holes] == [23]
+    expr = build_input_templated_locator(surface="selector", selector=selector, role="", name="", holes=holes)
+    assert expr is not None
+    assert "Widgetry {gadget}" in expr
+    assert "{gadget}ry" not in expr
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"account_number": "24"},
+        {"account_number": "10 0245"},
+        {"account_number": "100245 "},
+        {"class": "100245"},
+        {"page": "100245"},
+        {"re": "100245"},
+        {"_scout_month_to_iso": "100245"},
+        {"account_number": "100245'] , [href"},
+    ],
+)
+def test_input_correspondence_rejects_unsafe_or_unnamed(declared: dict[str, str]) -> None:
+    assert (
+        input_correspondences_for_interaction({"tool_name": "click", "selector": _STATEMENT_SELECTOR}, declared) == []
+    )
+
+
+def test_input_correspondence_ignores_non_click() -> None:
+    assert (
+        input_correspondences_for_interaction({"tool_name": "type_text", "selector": _STATEMENT_SELECTOR}, _DECLARED)
+        == []
+    )
+
+
+def test_input_correspondence_requires_quoted_segment() -> None:
+    # `100245` appears only in an unquoted structural position, never inside a quoted attribute value.
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": "div.row-100245 > a"}, {"account_number": "100245"}
+        )
+        == []
+    )
+
+
+def test_input_correspondence_rejects_second_occurrence() -> None:
+    selector = "a[href='/x/100245'][data-id='100245']"
+    assert (
+        input_correspondences_for_interaction(
+            {"tool_name": "click", "selector": selector}, {"account_number": "100245"}
+        )
+        == []
+    )
+
+
+def test_synthesize_templated_selector_identical_across_modes() -> None:
+    trajectory = [_witnessed_click()]
+    non_strict = synthesize_code_block(list(trajectory), strict_selectors=False)
+    strict = synthesize_code_block(list(trajectory), strict_selectors=True)
+    assert non_strict is not None and strict is not None
+    templated = "page.locator(f\"a[href='/statements/{account_number}_{_scout_month_to_iso(billing_period)}.pdf']\")"
+    assert f"await {templated}.click()" in non_strict.code
+    assert f"await {templated}.click()" in strict.code
+
+
+def test_synthesize_mints_one_witness_row_per_key() -> None:
+    trajectory = [_witnessed_click(), _witnessed_click(selector=_STATEMENT_SELECTOR, accessible_name="View May")]
+    synthesized = synthesize_code_block(trajectory)
+    assert synthesized is not None
+    witness_rows = [p for p in synthesized.parameters if p.get("source") == LOCATOR_WITNESS_PARAM_SOURCE]
+    assert sorted((row["key"], row["default_value"]) for row in witness_rows) == [
+        ("account_number", "100245"),
+        ("billing_period", "May 2026"),
+    ]
+
+
+def test_synthesize_prelude_before_entry_and_preflight_clean() -> None:
+    synthesized = synthesize_code_block([_witnessed_click()])
+    assert synthesized is not None
+    code_lines = synthesized.code.splitlines()
+    guard_line = next(i for i, line in enumerate(code_lines) if "invalid value for grounded parameter" in line)
+    entry_line = next(i for i, line in enumerate(code_lines) if "_scout_entry_target =" in line)
+    assert guard_line < entry_line
+    diagnostics = preflight_code_block(synthesized.code, parameter_keys=["account_number", "billing_period"])
+    assert not any(diagnostic.code == "SANDBOX_UNRESOLVED_NAME" for diagnostic in diagnostics)
+
+
+def test_templated_locator_reads_declared_input_at_runtime() -> None:
+    plan_holes = input_correspondences_for_interaction(
+        {"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED
+    )
+    expr = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=plan_holes
+    )
+    assert expr is not None
+
+    class _Page:
+        def locator(self, value: str) -> str:
+            return value
+
+    source_lines = ["def _block(page, account_number, billing_period):"]
+    source_lines.extend(witness_prelude_lines(["account_number", "billing_period"], include_month_helper=True))
+    source_lines.append(f"    return {expr}")
+    namespace: dict[str, Any] = {"Exception": Exception}
+    exec("\n".join(source_lines), namespace)
+    block = namespace["_block"]
+    assert block(_Page(), "100248", "June 2026") == "a[href='/statements/100248_2026-06.pdf']"
+    with pytest.raises(Exception):
+        block(_Page(), "100245'] , x[href='", "May 2026")
+    with pytest.raises(Exception):
+        block(_Page(), "100245", "Notamonth 2026")
+
+
+def test_build_input_templated_locator_recompute_and_tamper() -> None:
+    holes = input_correspondences_for_interaction({"tool_name": "click", "selector": _STATEMENT_SELECTOR}, _DECLARED)
+    expr = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=holes
+    )
+    recomputed = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=holes
+    )
+    assert expr == recomputed
+    reordered = build_input_templated_locator(
+        surface="selector", selector=_STATEMENT_SELECTOR, role="", name="", holes=list(reversed(holes))
+    )
+    assert reordered != expr
+
+
+def test_synthesize_unwitnessed_selector_byte_identical() -> None:
+    plain = {
+        "tool_name": "click",
+        "selector": _STATEMENT_SELECTOR,
+        "accessible_name": "Download",
+        "source_url": "https://example.com/s",
+    }
+    baseline = synthesize_code_block([dict(plain)])
+    assert baseline is not None
+    assert INPUT_TEMPLATED_PROVENANCE_SOURCE not in baseline.code
+    assert all(p.get("source") != LOCATOR_WITNESS_PARAM_SOURCE for p in baseline.parameters)
+    assert "_scout_month_to_iso" not in baseline.code
+
+
+def test_synthesize_input_purity() -> None:
+    trajectory = [_witnessed_click()]
+    snapshot = json.loads(json.dumps(trajectory))
+    synthesize_code_block(list(trajectory), strict_selectors=False)
+    synthesize_code_block(list(trajectory), strict_selectors=True)
+    assert trajectory == snapshot
