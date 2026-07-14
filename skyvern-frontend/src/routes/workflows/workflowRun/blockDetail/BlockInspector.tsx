@@ -335,8 +335,17 @@ function pushField(
   fields.push({ label, value, kind });
 }
 
-function getInputFields(block: WorkflowRunBlock): Array<InspectorField> {
+function getInputFields(
+  block: WorkflowRunBlock,
+  action?: ActionsApiResponse | null,
+): Array<InspectorField> {
   const fields: Array<InspectorField> = [];
+  // Block-level config (Navigation goal, Prompt, ...) doesn't change per
+  // action, so it stays visible instead of being fully replaced by the
+  // selected action's own input.
+  if (action) {
+    pushField(fields, "Input", getActionInputValue(action));
+  }
   pushField(fields, "Description", block.description);
   pushField(fields, "Prompt", block.prompt);
   pushField(fields, "URL", block.url);
@@ -375,19 +384,11 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
 }
 
 function getActionInputValue(action: ActionsApiResponse): string | null {
-  // Mirror ActionCardCompact: script-generated input text lives in response.
+  // Script-generated input text lives in response, not text.
   if (action.action_type === ActionTypes.InputText) {
     return action.text ?? action.response;
   }
   return action.text;
-}
-
-function getActionInputFields(
-  action: ActionsApiResponse,
-): Array<InspectorField> {
-  const fields: Array<InspectorField> = [];
-  pushField(fields, "Input", getActionInputValue(action));
-  return fields;
 }
 
 function getActionSummaryFields(
@@ -517,7 +518,7 @@ function BlockInspector({
   action?: ActionsApiResponse | null;
 }) {
   const inputFields = useMemo(
-    () => (action ? getActionInputFields(action) : getInputFields(block)),
+    () => getInputFields(block, action),
     [action, block],
   );
   const summaryFields = useMemo(

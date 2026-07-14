@@ -7,6 +7,7 @@ import {
   movePaneTo,
   paneFlex,
   paneResizable,
+  paneWidthsKey,
   STUDIO_PANE_DEFAULT_WIDTH,
 } from "./paneLayout";
 import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
@@ -18,28 +19,28 @@ describe("greedyPaneOf", () => {
   });
 
   test("editor takes over when the browser is closed", () => {
-    expect(greedyPaneOf(["copilot", "editor", "timeline"])).toBe("editor");
+    expect(greedyPaneOf(["copilot", "editor", "overview"])).toBe("editor");
   });
 
   test("no greedy pane without browser or editor", () => {
-    expect(greedyPaneOf(["copilot", "timeline"])).toBeUndefined();
+    expect(greedyPaneOf(["copilot", "overview"])).toBeUndefined();
     expect(greedyPaneOf([])).toBeUndefined();
   });
 });
 
 describe("paneResizable", () => {
   test("every pane except the greedy one can hold a pinned width", () => {
-    const panes: StudioPaneId[] = ["copilot", "editor", "browser", "timeline"];
+    const panes: StudioPaneId[] = ["copilot", "editor", "browser", "overview"];
     expect(paneResizable("copilot", panes)).toBe(true);
     expect(paneResizable("editor", panes)).toBe(true);
-    expect(paneResizable("timeline", panes)).toBe(true);
+    expect(paneResizable("overview", panes)).toBe(true);
     expect(paneResizable("browser", panes)).toBe(false);
   });
 
   test("without a greedy pane the last pane flexes instead of pinning", () => {
-    const panes: StudioPaneId[] = ["copilot", "timeline"];
+    const panes: StudioPaneId[] = ["copilot", "overview"];
     expect(paneResizable("copilot", panes)).toBe(true);
-    expect(paneResizable("timeline", panes)).toBe(false);
+    expect(paneResizable("overview", panes)).toBe(false);
   });
 });
 
@@ -58,7 +59,7 @@ describe("paneFlex", () => {
   });
 
   test("editor becomes the greedy pane when the browser is closed", () => {
-    const panes: StudioPaneId[] = ["copilot", "editor", "timeline"];
+    const panes: StudioPaneId[] = ["copilot", "editor", "overview"];
     expect(paneFlex("editor", panes, noWidths)).toBe("1 1 0%");
     expect(paneFlex("copilot", panes, noWidths)).toBe(
       `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
@@ -66,11 +67,11 @@ describe("paneFlex", () => {
   });
 
   test("with neither greedy pane open the remaining panes share equally", () => {
-    const panes: StudioPaneId[] = ["copilot", "timeline"];
+    const panes: StudioPaneId[] = ["copilot", "overview"];
     expect(paneFlex("copilot", panes, noWidths)).toBe(
       `1 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
     );
-    expect(paneFlex("timeline", panes, noWidths)).toBe(
+    expect(paneFlex("overview", panes, noWidths)).toBe(
       `1 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
     );
   });
@@ -83,10 +84,10 @@ describe("paneFlex", () => {
   });
 
   test("without a greedy pane the last pane ignores its pin so the row fills", () => {
-    const panes: StudioPaneId[] = ["copilot", "timeline"];
+    const panes: StudioPaneId[] = ["copilot", "overview"];
     const widths = { copilot: 350, timeline: 500 };
     expect(paneFlex("copilot", panes, widths)).toBe("0 1 350px");
-    expect(paneFlex("timeline", panes, widths)).toBe(
+    expect(paneFlex("overview", panes, widths)).toBe(
       `1 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
     );
   });
@@ -124,6 +125,18 @@ describe("clampResizeDelta", () => {
   });
 });
 
+describe("paneWidthsKey", () => {
+  test("is stable across key order and changes with any width", () => {
+    expect(paneWidthsKey({ editor: 400, copilot: 300 })).toBe(
+      paneWidthsKey({ copilot: 300, editor: 400 }),
+    );
+    expect(paneWidthsKey({ copilot: 300 })).not.toBe(
+      paneWidthsKey({ copilot: 301 }),
+    );
+    expect(paneWidthsKey({})).toBe("");
+  });
+});
+
 describe("movePaneTo / movePaneBy", () => {
   const panes: StudioPaneId[] = ["copilot", "editor", "browser"];
 
@@ -142,8 +155,8 @@ describe("movePaneTo / movePaneBy", () => {
 
   test("dropping on itself or on an unknown pane is a no-op", () => {
     expect(movePaneTo(panes, "copilot", "copilot")).toEqual(panes);
-    expect(movePaneTo(panes, "timeline", "copilot")).toEqual(panes);
-    expect(movePaneTo(panes, "copilot", "timeline")).toEqual(panes);
+    expect(movePaneTo(panes, "overview", "copilot")).toEqual(panes);
+    expect(movePaneTo(panes, "copilot", "overview")).toEqual(panes);
   });
 
   test("moves one slot left or right, clamped at the row edges", () => {

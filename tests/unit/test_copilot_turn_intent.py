@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,7 +12,6 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _docs_answer_turn_directive,
-    _native_tools_for_turn,
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext, StructuredContext
@@ -34,6 +32,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     _turn_intent_classification_from_raw,
     build_turn_intent,
     classify_turn_intent,
+    turn_intent_defers_authoring_live_fill,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -341,6 +340,68 @@ def test_build_turn_intent_routes_raw_secret_to_refuse_over_llm_classification()
     assert intent.missing_context_question == "Store the credential in the Credentials UI."
     assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
     assert TurnIntentReasonCode.LLM_CLASSIFIER not in intent.reason_codes
+
+
+def test_build_turn_intent_defer_authoring_leaves_refuse_uncoerced_but_marks_reason() -> None:
+    policy = RequestPolicy(
+        authoring_intent="defer_authoring",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+    )
+
+    intent = build_turn_intent(
+        user_message="Fill the form on the open page now. Do not author or save a workflow yet.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        classifier_result=_classification(TurnIntentMode.REFUSE),
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING in intent.reason_codes
+
+
+def test_build_turn_intent_defer_authoring_raw_secret_drops_reason_and_keeps_refusal() -> None:
+    policy = RequestPolicy(
+        authoring_intent="defer_authoring",
+        credential_input_kind="raw_secret",
+        raw_secret_detected=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+        clarification_question="Store the credential in the Credentials UI.",
+    )
+
+    intent = build_turn_intent(
+        user_message="Fill the page now with password: hunter2, don't author a workflow yet.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+        classifier_result=_classification(TurnIntentMode.BUILD),
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert intent.authority.requires_user_input is True
+    assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
+    assert TurnIntentReasonCode.AUTHORING_INTENT_DEFER_AUTHORING not in intent.reason_codes
+    assert turn_intent_defers_authoring_live_fill(intent) is False
+
+
+def test_turn_intent_defers_authoring_live_fill_false_for_ordinary_build() -> None:
+    intent = build_turn_intent(
+        user_message="Build a workflow that fills the form and run it.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        classifier_result=_classification(TurnIntentMode.BUILD),
+    )
+
+    assert turn_intent_defers_authoring_live_fill(intent) is False
 
 
 def test_build_turn_intent_redacts_user_goal() -> None:
@@ -874,7 +935,8 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
         chat_history_messages=[],
         global_llm_context="",
         organization_id="org-1",
-        handler=None,
+        request_policy_handler=None,
+        turn_intent_handler=None,
         previous_user_message=None,
     )
 
@@ -889,22 +951,6 @@ def test_store_request_policy_attaches_classified_turn_intent_to_context() -> No
     assert ctx.turn_intent.mode == TurnIntentMode.DIAGNOSE
     assert ctx.turn_intent.authority.may_update_workflow is False
     assert ctx.turn_intent.authority.may_run_blocks is False
-
-
-def test_answer_only_turn_intent_keeps_native_tools_registered() -> None:
-    tools = [
-        SimpleNamespace(name="update_workflow"),
-        SimpleNamespace(name="get_run_results"),
-        SimpleNamespace(name="list_credentials"),
-    ]
-    intent = TurnIntent(
-        mode=TurnIntentMode.DIAGNOSE,
-        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
-    )
-
-    filtered = _native_tools_for_turn(tools, intent)
-
-    assert filtered == tools
 
 
 def test_turn_intent_classification_parser_normalizes_supported_llm_payloads() -> None:

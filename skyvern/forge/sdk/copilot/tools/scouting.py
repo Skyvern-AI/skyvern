@@ -5,7 +5,8 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, cast
+from dataclasses import replace
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
@@ -27,10 +28,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
+    has_witnessed_value_content,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    mint_scout_observation_contract_for_ctx,
+    record_scouted_output_coverage,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
 )
@@ -42,6 +47,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
     loaded_result_composition_evidence_from_page,
     loaded_result_composition_target_summary,
 )
@@ -61,6 +67,8 @@ from ._shared import (
 from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
+
+_FILL_CARRY_RETRYABLE_VALIDATION_FAILURES = frozenset({"page_mismatch", "selector_absent_from_page_evidence"})
 
 
 def _mark_page_inspected(ctx: AgentContext) -> None:
@@ -108,6 +116,7 @@ def _consume_pending_browser_interaction_observation(
 
 
 _MAX_SCOUTED_INTERACTIONS = 60
+_FILL_CARRY_SELECTOR_COUNT_TIMEOUT_SECONDS = 2.0
 
 
 async def _live_working_page_url(ctx: AgentContext) -> str | None:
@@ -128,7 +137,14 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
 
 async def _capture_scout_source_url(ctx: AgentContext) -> None:
     # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
-    ctx.pending_scout_source_url = await _live_working_page_url(ctx)
+    source_url = await _live_working_page_url(ctx)
+    ctx.pending_scout_source_url = source_url
+    if not source_url or ctx.fill_carry_rebound_done or not ctx.prior_fill_carry:
+        return
+    page_evidence = await _scout_act_observe_page_evidence(ctx, url=source_url)
+    if page_evidence is None or not has_bounded_page_schema(page_evidence):
+        return
+    await rebind_prior_fill_carry_from_page_evidence(ctx, page_evidence=page_evidence, url=source_url)
 
 
 def _consume_scout_source_url(ctx: AgentContext) -> str | None:
@@ -294,6 +310,39 @@ async def _resolve_scout_role_name(
     return "", ""
 
 
+def _capped_with_eviction_accounting(
+    items: list[ScoutedInteraction],
+    *,
+    collection: Literal["scout_trajectory", "scouted_interactions"],
+) -> list[ScoutedInteraction]:
+    if len(items) <= _MAX_SCOUTED_INTERACTIONS:
+        return items
+    try:
+        for item in items[: len(items) - _MAX_SCOUTED_INTERACTIONS]:
+            event: dict[str, Any] = {
+                "collection": collection,
+                "tool_name": item.get("tool_name"),
+                "selector": item.get("selector"),
+                "source_url": item.get("source_url"),
+            }
+            if collection == "scout_trajectory":
+                event["trajectory_index"] = item.get("trajectory_index")
+            LOG.info("copilot_scout_interaction_evicted", **event)
+    except Exception:
+        pass
+    return items[-_MAX_SCOUTED_INTERACTIONS:]
+
+
+def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
+    # len() regresses once eviction trims the list, so the next index continues from the highest recorded one.
+    highest = -1
+    for item in trajectory:
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and index > highest:
+            highest = index
+    return highest + 1 if highest >= 0 else len(trajectory)
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -302,10 +351,14 @@ def _record_scouted_interaction(
     source_url: str | None = None,
     value: str = "",
     typed_value: str = "",
+    raw_typed_value: str = "",
     key: str = "",
     typed_length: int = 0,
     role: str = "",
     accessible_name: str = "",
+    control_readonly: bool | None = None,
+    control_disabled: bool | None = None,
+    control_value_satisfied: bool | None = None,
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
@@ -313,6 +366,12 @@ def _record_scouted_interaction(
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
     if tool_name != "press_key" and not selector:
+        LOG.info(
+            "copilot_scout_capture_loss",
+            tool_name=tool_name,
+            reason="unresolvable_selector",
+            url=(source_url or "").strip() or None,
+        )
         return
     _reset_evaluate_tracker(ctx)
     artifact: ScoutedInteraction = {"tool_name": tool_name}
@@ -324,6 +383,8 @@ def _record_scouted_interaction(
         artifact["value"] = value
     if typed_value:
         artifact["typed_value"] = typed_value
+    if raw_typed_value:
+        artifact["raw_typed_value"] = raw_typed_value
     if key:
         artifact["key"] = key
     if typed_length:
@@ -332,6 +393,13 @@ def _record_scouted_interaction(
         artifact["role"] = role
     if accessible_name:
         artifact["accessible_name"] = accessible_name
+    if tool_name == "type_text":
+        if control_readonly is not None:
+            artifact["control_readonly"] = control_readonly
+        if control_disabled is not None:
+            artifact["control_disabled"] = control_disabled
+        if control_value_satisfied is not None:
+            artifact["control_value_satisfied"] = control_value_satisfied
     if credential_id:
         artifact["credential_id"] = credential_id
     if credential_field:
@@ -349,13 +417,13 @@ def _record_scouted_interaction(
         )
     ]
     interactions.append(artifact)
-    ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
 
     trajectory = list(ctx.scout_trajectory)
     trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
-    trajectory_artifact["trajectory_index"] = len(trajectory)
+    trajectory_artifact["trajectory_index"] = _next_trajectory_index(trajectory)
     trajectory.append(trajectory_artifact)
-    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
 
     LOG.info(
         "copilot_scout_interaction_captured",
@@ -366,6 +434,172 @@ def _record_scouted_interaction(
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
+
+
+def _page_evidence_has_selector(value: Any, selector: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("selector") == selector:
+            return True
+        return any(_page_evidence_has_selector(child, selector) for child in value.values())
+    if isinstance(value, list):
+        return any(_page_evidence_has_selector(child, selector) for child in value)
+    return False
+
+
+def _page_evidence_with_inputs_as_fields(page_evidence: dict[str, Any]) -> dict[str, Any]:
+    inputs = page_evidence.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        return page_evidence
+    fields: list[dict[str, Any]] = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            continue
+        field = dict(item)
+        selector = field.get("selector")
+        if isinstance(selector, str) and selector.startswith("input#"):
+            field["selector"] = f"#{selector.split('#', 1)[1]}"
+        fields.append(field)
+    if not fields:
+        return page_evidence
+    forms = page_evidence.get("forms")
+    normalized = dict(page_evidence)
+    normalized["forms"] = [*(forms if isinstance(forms, list) else []), {"fields": fields}]
+    return normalized
+
+
+async def _fill_carry_validation_failure(
+    ctx: AgentContext,
+    carry: FillCarry,
+    *,
+    page_evidence: dict[str, Any],
+    url: str,
+) -> str | None:
+    evidence_url = str(page_evidence.get("current_url") or page_evidence.get("inspected_url") or url).strip()
+    if not evidence_url or not _same_page_ignoring_fragment(carry.source_url, evidence_url):
+        return "page_mismatch"
+    count = await _selector_live_match_count(
+        ctx, carry.selector, timeout_seconds=_FILL_CARRY_SELECTOR_COUNT_TIMEOUT_SECONDS
+    )
+    if count != 1:
+        return "selector_count_mismatch"
+    selector_in_page_evidence = _page_evidence_has_selector(
+        _page_evidence_with_inputs_as_fields(page_evidence), carry.selector
+    )
+    if carry.role and carry.accessible_name:
+        role, accessible_name = await _resolve_scout_role_name(ctx, carry.selector)
+        if role != carry.role or accessible_name != carry.accessible_name:
+            return "role_name_mismatch"
+    elif not selector_in_page_evidence:
+        return "selector_absent_from_page_evidence"
+    return None
+
+
+def _fill_carry_to_interaction(carry: FillCarry, trajectory_index: int) -> ScoutedInteraction:
+    interaction: ScoutedInteraction = {
+        "tool_name": carry.tool_name,
+        "selector": carry.selector,
+        "source_url": carry.source_url,
+        "trajectory_index": trajectory_index,
+        "carried": True,
+    }
+    if carry.role:
+        interaction["role"] = carry.role
+    if carry.accessible_name:
+        interaction["accessible_name"] = carry.accessible_name
+    if carry.typed_length:
+        interaction["typed_length"] = carry.typed_length
+    if carry.tool_name == "type_text":
+        if carry.typed_value:
+            interaction["typed_value"] = carry.typed_value
+        if carry.control_readonly is not None:
+            interaction["control_readonly"] = carry.control_readonly
+        if carry.control_disabled is not None:
+            interaction["control_disabled"] = carry.control_disabled
+        if carry.control_value_satisfied is not None:
+            interaction["control_value_satisfied"] = carry.control_value_satisfied
+    elif carry.tool_name == "select_option" and carry.value:
+        interaction["value"] = carry.value
+    elif carry.tool_name == "fill_credential_field":
+        interaction["credential_id"] = carry.credential_id
+        interaction["credential_field"] = carry.credential_field
+    return interaction
+
+
+async def _maybe_rebind_prior_fill_carry(
+    ctx: AgentContext,
+    *,
+    page_evidence: dict[str, Any],
+    url: str,
+) -> None:
+    if ctx.fill_carry_rebound_done:
+        return
+    prior = []
+    for raw in ctx.prior_fill_carry:
+        try:
+            prior.append(FillCarry.model_validate(raw))
+        except Exception:
+            continue
+    if not prior:
+        ctx.fill_carry_rebound_done = True
+        return
+    # Inventory is credential metadata, not page state: rehydrate it even when page
+    # validation below drops the carried fills themselves.
+    for carry in prior:
+        if carry.tool_name == "fill_credential_field" and carry.credential_id and carry.available_fields:
+            ctx.scouted_credential_field_inventory_by_credential_id.setdefault(
+                carry.credential_id, frozenset(carry.available_fields)
+            )
+    rebound: list[FillCarry] = []
+    for carry in prior:
+        failure = await _fill_carry_validation_failure(ctx, carry, page_evidence=page_evidence, url=url)
+        if failure is not None:
+            LOG.info(
+                "copilot_fill_carry_rebind_degraded",
+                reason=failure,
+                url=url,
+                source_url=carry.source_url,
+            )
+            if failure not in _FILL_CARRY_RETRYABLE_VALIDATION_FAILURES:
+                ctx.fill_carry_rebound_done = True
+            return
+        rebound.append(carry)
+    ctx.fill_carry_rebound_done = True
+    trajectory = list(ctx.scout_trajectory)
+    for carry in rebound:
+        trajectory.append(_fill_carry_to_interaction(carry, _next_trajectory_index(trajectory)))
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
+    LOG.info(
+        "copilot_fill_carry_rebound",
+        url=url,
+        field_count=len(rebound),
+    )
+
+
+async def rebind_prior_fill_carry_from_current_page(ctx: AgentContext) -> bool:
+    if ctx.fill_carry_rebound_done or not ctx.prior_fill_carry:
+        return False
+    url = await _live_working_page_url(ctx)
+    if not url:
+        return False
+    page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+    if page_evidence is None or not has_bounded_page_schema(page_evidence):
+        return False
+    return await rebind_prior_fill_carry_from_page_evidence(ctx, page_evidence=page_evidence, url=url)
+
+
+async def rebind_prior_fill_carry_from_page_evidence(
+    ctx: AgentContext,
+    *,
+    page_evidence: dict[str, Any],
+    url: str,
+) -> bool:
+    if ctx.fill_carry_rebound_done or not ctx.prior_fill_carry:
+        return False
+    if not has_bounded_page_schema(page_evidence):
+        return False
+    trajectory_len = len(ctx.scout_trajectory)
+    await _maybe_rebind_prior_fill_carry(ctx, page_evidence=page_evidence, url=url)
+    return len(ctx.scout_trajectory) > trajectory_len
 
 
 _ACT_OBSERVE_TOOLS = frozenset({"click"})
@@ -381,6 +615,32 @@ def _scout_act_observe_capture_outcome(parsed: dict[str, Any] | None, *, started
 
 def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: float) -> str:
     return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
+
+
+def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
+    if not isinstance(packet, dict):
+        return 0
+    value = packet.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
+def _mint_current_loaded_result_source(
+    ctx: AgentContext,
+    page_evidence: dict[str, Any] | None,
+    *,
+    url: str,
+) -> LoadedResultCompositionEvidence | None:
+    if page_evidence is None:
+        return None
+    loaded_results = loaded_result_composition_evidence_from_page(
+        page_evidence,
+        source_tool="evaluate",
+        source_url=url,
+    )
+    if loaded_results is not None:
+        ctx.latest_evaluate_result_composition_steer = loaded_results
+        ctx.latest_evaluate_result_composition_signature = None
+    return loaded_results
 
 
 async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
@@ -412,6 +672,12 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
             else:
                 ctx.last_scout_act_observe_recapture_attempted = True
+                # A card that renders asynchronously after the click is absent from the first
+                # capture; settle briefly so the single recapture can witness it before crediting.
+                settle_seconds = min(settings.COPILOT_CLICK_SETTLE_DELAY_SECONDS, remaining_seconds)
+                if settle_seconds > 0:
+                    await asyncio.sleep(settle_seconds)
+                    remaining_seconds = timeout_seconds - (time.monotonic() - started)
                 try:
                     recaptured = await _composition_get_structured_evidence(
                         ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
@@ -443,6 +709,8 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
         url=url,
+        result_container_count=_evidence_list_len(parsed, "result_containers"),
+        key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
     )
@@ -470,11 +738,18 @@ async def _register_scout_interaction_observation(
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
         parsed = await _scout_act_observe_page_evidence(ctx, url=url)
-        if parsed is not None and has_bounded_page_schema(parsed):
+        # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
+        # that rendered witnessed value content is bindable even when it exposes no actionable schema.
+        if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
             # Identity keys overwrite the parsed packet so the entry stays a
             # scout_interaction observation, with the schema merged before append.
             evidence = {**parsed, **evidence}
             page_evidence = evidence
+            contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+            ctx.scout_observation_contract = contract
+            record_scouted_output_coverage(
+                ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
+            )
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
@@ -648,6 +923,7 @@ def _reset_evaluate_tracker(ctx: AgentContext) -> None:
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
     ctx.latest_evaluate_result_composition_steer = None
+    ctx.latest_evaluate_result_composition_signature = None
 
 
 def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
@@ -979,6 +1255,34 @@ class _UnsetEvidence:
 _EVIDENCE_UNSET = _UnsetEvidence()
 
 
+def _page_evidence_has_password_control(page_evidence: dict[str, Any]) -> bool:
+    forms = page_evidence.get("forms")
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        fields = form.get("fields")
+        if not isinstance(fields, list):
+            continue
+        for form_field in fields:
+            if isinstance(form_field, dict) and str(form_field.get("type") or "").strip().lower() == "password":
+                return True
+    return False
+
+
+def _record_scout_page_observation(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
+    observed_index: int | None = None
+    for item in ctx.scout_trajectory:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and (observed_index is None or index > observed_index):
+            observed_index = index
+    ctx.last_scout_observation_trajectory_index = observed_index
+    ctx.last_scout_observation_has_password_control = _page_evidence_has_password_control(page_evidence)
+
+
 async def _maybe_steer_evaluate_to_action(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -995,10 +1299,18 @@ async def _maybe_steer_evaluate_to_action(
             if isinstance(page_evidence, _UnsetEvidence)
             else page_evidence
         )
-        if parsed is None or not has_actionable_steer_content(parsed):
+        if parsed is None:
             _reset_evaluate_tracker(ctx)
             return False
-        loaded_results = loaded_result_composition_evidence_from_page(parsed)
+        contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=url)
+        ctx.scout_observation_contract = contract
+        if not has_actionable_steer_content(parsed):
+            record_scouted_output_coverage(ctx, parsed, contract=contract, include_lexical=False)
+            _reset_evaluate_tracker(ctx)
+            return False
+        record_scouted_output_coverage(ctx, parsed, contract=contract)
+        _record_scout_page_observation(ctx, parsed)
+        loaded_results = _mint_current_loaded_result_source(ctx, parsed, url=url)
         if loaded_results is not None:
             _reset_evaluate_tracker(ctx)
             ctx.latest_evaluate_result_composition_steer = loaded_results
@@ -1018,6 +1330,7 @@ async def _maybe_steer_evaluate_to_action(
             # The result is patched in-place; returning False keeps the normal tool-loop guard active.
             return False
         ctx.latest_evaluate_result_composition_steer = None
+        ctx.latest_evaluate_result_composition_signature = None
         identities = _actionable_target_identities(parsed)
         if not identities:
             _reset_evaluate_tracker(ctx)
@@ -1087,6 +1400,18 @@ def _register_reached_download_scout_interaction(ctx: AgentContext, target: Reac
     )
 
 
+def _with_trajectory_anchor(ctx: AgentContext, target: ReachedDownloadTarget) -> ReachedDownloadTarget:
+    """Pin the target to the trajectory position where the affordance was observed, using the stored
+    ``trajectory_index`` rather than the list position so the anchor survives trajectory eviction."""
+    trajectory = list(ctx.scout_trajectory)
+    if not trajectory:
+        return target
+    anchor = trajectory[-1].get("trajectory_index")
+    if not isinstance(anchor, int):
+        return target
+    return replace(target, trajectory_anchor=anchor)
+
+
 async def _maybe_attach_reached_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -1118,7 +1443,7 @@ async def _maybe_attach_reached_download_target(
         data["reached_download_guidance"] = _reached_download_guidance_for(target)
         if not target.already_registered:
             # The pure synthesizer compiles the terminal expect_download step from this typed object.
-            ctx.reached_download_target = target
+            ctx.reached_download_target = _with_trajectory_anchor(ctx, target)
             if ctx.synthesized_block_offered and not ctx.update_workflow_called:
                 # The prompt-side offer latched before this download target resolved, so it rendered the
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
@@ -1145,6 +1470,8 @@ async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, u
     if not isinstance(result.get("data"), dict):
         return
     page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+    if page_evidence is not None and has_bounded_page_schema(page_evidence):
+        await _maybe_rebind_prior_fill_carry(ctx, page_evidence=page_evidence, url=url)
     acted = await _maybe_steer_evaluate_to_action(ctx, result, url=url, page_evidence=page_evidence)
     await _maybe_attach_reached_download_target(
         ctx, result, url=url, page_evidence=_EVIDENCE_UNSET if acted else page_evidence

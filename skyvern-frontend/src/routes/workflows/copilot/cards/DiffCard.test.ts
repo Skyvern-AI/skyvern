@@ -79,4 +79,28 @@ describe("getDiffCardTitle", () => {
       ),
     ).toBe("Added browser step");
   });
+
+  it("labels a manually accepted review_tested draft as applied changes", () => {
+    expect(
+      getDiffCardTitle(turn({ proposalDisposition: "review_tested" }), {
+        accepted: true,
+      }),
+    ).toBe("Applied changes");
+  });
+
+  it("still lets a backend-supplied summary win over accepted", () => {
+    expect(
+      getDiffCardTitle(
+        turn({
+          proposalDisposition: "review_tested",
+          draft: {
+            blockCount: 1,
+            blockLabels: ["block_1"],
+            summary: "Added browser step",
+          },
+        }),
+        { accepted: true },
+      ),
+    ).toBe("Added browser step");
+  });
 });

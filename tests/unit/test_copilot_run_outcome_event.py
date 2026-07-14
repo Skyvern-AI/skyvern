@@ -20,9 +20,14 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
+from skyvern.forge.sdk.copilot.run_outcome import (
+    RecordedRunOutcome,
+    run_outcome_display_reason,
+    trusted_terminal_challenge_category_name,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _adjudicated_run_outcome,
     _record_run_blocks_result,
     _stash_recorded_run_outcome,
@@ -106,6 +111,7 @@ def _challenge_failure_result() -> dict[str, Any]:
             "category": "ANTI_BOT_DETECTION",
             "confidence_float": 0.95,
             "reasoning": "Typed run analysis reported an anti-bot challenge.",
+            "evidence_source": "challenge_state",
         }
     ]
     result["data"]["blocks"] = [
@@ -419,20 +425,14 @@ async def test_evaluating_hold_gets_final_frame_when_recording_raises(monkeypatc
     assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
 
 
-def test_recorder_returns_none_for_failed_run() -> None:
-    result = _run_result([], ok=False)
-    ctx = _ctx()
-    assert _record_run_blocks_result(ctx, result, completion_verification=None) is None
-    assert ctx.last_run_outcome is None
-
-
 def test_failed_rerun_clears_prior_recorded_outcome() -> None:
     ctx = _ctx()
     ctx.last_run_outcome = RecordedRunOutcome(verdict="not_demonstrated", reason_code="blocker_reported")
     ctx.last_run_outcome_block_labels = ["search_registry_person"]
 
-    _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
+    outcome = _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
 
+    assert outcome is None
     assert ctx.last_run_outcome is None
     assert ctx.last_run_outcome_block_labels == []
 
@@ -613,3 +613,38 @@ def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> Non
     for block in payload["blocks"]:
         assert "outcome" not in block
         assert "outcomeReason" not in block
+
+
+class TestGenuineAttemptRunStamp:
+    def test_ok_run_counts_as_genuine_attempt(self) -> None:
+        ctx = _ctx([_code_block("b0", {"records": [{"id": 1}]})])
+        _record_run_blocks_result(ctx, _run_result([_code_block("b0", {"records": [{"id": 1}]})]))
+        assert ctx.last_test_ok is True
+        assert ctx.last_run_blocks_workflow_run_id == "wr_test"
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_failed_run_counts_as_genuine_attempt(self) -> None:
+        ctx = _ctx([_code_block("b0", {})])
+        _record_run_blocks_result(ctx, _run_result([_code_block("b0", {})], ok=False))
+        assert ctx.last_test_ok is False
+        assert ctx.has_genuine_workflow_attempt() is True
+
+    def test_watchdog_softened_run_counts_as_genuine_attempt(self) -> None:
+        ctx = _ctx([_code_block("b0", {})])
+        ctx.copilot_total_timeout_exceeded = True
+        result = _run_result([_code_block("b0", {})], ok=False)
+        result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
+        _record_run_blocks_result(ctx, result)
+        assert ctx.last_test_ok is None
+        assert ctx.last_run_blocks_workflow_run_id == "wr_test"
+        assert ctx.has_genuine_workflow_attempt() is True
+
+
+def test_trusted_terminal_challenge_category_requires_carrier() -> None:
+    carried = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "artifact"}
+    keyword = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "keyword_only"}
+    legacy = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9}
+
+    assert trusted_terminal_challenge_category_name(carried) == "ANTI_BOT_DETECTION"
+    assert trusted_terminal_challenge_category_name(keyword) is None
+    assert trusted_terminal_challenge_category_name(legacy) is None

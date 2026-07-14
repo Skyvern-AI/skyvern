@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -192,31 +193,34 @@ function renderBrowserPane(initialPath: string) {
   const queryClient = new QueryClient();
   const view = render(
     <QueryClientProvider client={queryClient}>
-      <StudioShellContext.Provider
-        value={{
-          copilotPortalEl: null,
-          setEditorStreamSlot: () => {},
-          setBrowserStreamSlot,
-          setRunStreamSlot: () => {},
-        }}
-      >
-        <MemoryRouter initialEntries={[initialPath]}>
-          <Routes>
-            <Route
-              path="/workflows/:workflowPermanentId/studio"
-              element={
-                <>
-                  <div data-testid="pane-header">
-                    <BrowserPaneViewPills />
-                    <BrowserPaneActions />
-                  </div>
-                  <BrowserTab />
-                </>
-              }
-            />
-          </Routes>
-        </MemoryRouter>
-      </StudioShellContext.Provider>
+      <TooltipProvider delayDuration={0}>
+        <StudioShellContext.Provider
+          value={{
+            copilotPortalEl: null,
+            panelPortalEl: null,
+            setEditorStreamSlot: () => {},
+            setBrowserStreamSlot,
+            setRunStreamSlot: () => {},
+          }}
+        >
+          <MemoryRouter initialEntries={[initialPath]}>
+            <Routes>
+              <Route
+                path="/workflows/:workflowPermanentId/studio"
+                element={
+                  <>
+                    <div data-testid="pane-header">
+                      <BrowserPaneViewPills />
+                      <BrowserPaneActions />
+                    </div>
+                    <BrowserTab />
+                  </>
+                }
+              />
+            </Routes>
+          </MemoryRouter>
+        </StudioShellContext.Provider>
+      </TooltipProvider>
     </QueryClientProvider>,
   );
   return { ...view, setBrowserStreamSlot };
@@ -247,8 +251,10 @@ describe("BrowserTab view machine", () => {
     expect(
       screen.getByRole("button", { name: "Live" }).getAttribute("aria-pressed"),
     ).toBe("true");
-    expect(screen.queryByRole("button", { name: "Recording" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Screenshots" })).toBeNull();
+    // The replay pills stay visible even with nothing to replay; their views
+    // render empty states instead of the pills disappearing.
+    expect(screen.getByRole("button", { name: "Recording" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Screenshots" })).toBeTruthy();
   });
 
   it("registers the shell stream slot while live", () => {
@@ -266,11 +272,20 @@ describe("BrowserTab view machine", () => {
     );
   });
 
-  it("defaults an idle workflow with history and no session to the replay", () => {
+  it("edit entry stays on the (booting) live surface, not the latest run's replay", () => {
+    // The latest run has a recording but the URL names no run: the pane must
+    // come up live (warming) instead of flashing the replay while the debug
+    // session boots.
     seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
     renderBrowserPane(STUDIO_PATH);
 
-    expect(screen.getByTestId("hero-recording")).toBeTruthy();
+    expect(screen.queryByTestId("hero-recording")).toBeNull();
+    expect(screen.getByTestId("stream-status").textContent).toContain(
+      "Warming up your browser",
+    );
+    expect(
+      screen.getByRole("button", { name: "Live" }).getAttribute("aria-pressed"),
+    ).toBe("true");
   });
 
   it("prefers the live debug browser over an old run's replay when idle", () => {
@@ -301,7 +316,6 @@ describe("BrowserTab view machine", () => {
       stepId: "step_1",
       actionOrder: 0,
     });
-    expect(screen.getByText(/Inspecting ·/)).toBeTruthy();
   });
 
   it("stays live for an executing block run in the debug session", () => {
@@ -376,7 +390,26 @@ describe("BrowserTab view machine", () => {
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=act_1`);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
-    expect(screen.getByText("Recording", { exact: true })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop recording" })).toBeTruthy();
+  });
+
+  it("the header Stop button requests the same finish path as the drafts panel", () => {
+    seedRun({ status: Status.Completed });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    useRecordingStore.setState({ isRecording: true });
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop recording" }));
+    expect(useRecordingStore.getState().finishRequested).toBe(true);
+  });
+
+  it("a pinned Recording view without a recording shows the empty state", () => {
+    seedRun({ status: Status.Completed });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
+
+    fireEvent.click(screen.getByRole("button", { name: "Recording" }));
+    expect(screen.getByText("No recording for this run")).toBeTruthy();
   });
 
   it("flags a queued block run on the live debug stream", () => {
@@ -469,5 +502,22 @@ describe("BrowserTab pills and selection sync", () => {
     expect(
       screen.getByRole("button", { name: "Live" }).getAttribute("aria-pressed"),
     ).toBe("false");
+  });
+});
+
+describe("stream-mode badge dev gating", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("shows the transport badge in dev builds (vitest runs as dev)", () => {
+    renderBrowserPane(STUDIO_PATH);
+    expect(screen.queryByTestId("stream-mode-badge")).not.toBeNull();
+  });
+
+  it("hides the transport badge outside dev builds", () => {
+    vi.stubEnv("DEV", false);
+    renderBrowserPane(STUDIO_PATH);
+    expect(screen.queryByTestId("stream-mode-badge")).toBeNull();
   });
 });

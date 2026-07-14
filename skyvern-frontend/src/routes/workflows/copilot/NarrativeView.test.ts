@@ -900,6 +900,105 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
   });
 });
 
+describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", () => {
+  it("a pending untested draft outranks a non-build responseKind (old: Question)", () => {
+    const turn = buildTurn({
+      responseKind: "clarify",
+      draft: draft3,
+      proposalDisposition: "review_untested",
+    });
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("a pending tested draft outranks a non-build responseKind too", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        draft: draft3,
+        proposalDisposition: "review_tested",
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Workflow ready for review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("fallback chain: an untested draft outranks needsInput text when responseKind is null", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_untested",
+      terminalMessage: "Could you provide the login details?",
+    });
+    expect(turn.responseKind).toBeNull();
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+  });
+
+  it("old payload (hydrated, no responseKind) still gets the uxV1 draft-review reorder", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({ proposalDisposition: "review_untested" }),
+    )!;
+    expect(turn.responseKind).toBeNull();
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+  });
+
+  it("renames the pure-ask clarify headline to Needs your input", () => {
+    const summary = computeTurnSummary(
+      buildTurn({ responseKind: "clarify", verifiedSuccess: false }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Needs your input");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it.each([
+    ["refuse", "Declined"],
+    ["diagnose", "Answered"],
+  ] as const)(
+    "leaves %s as %s under uxV1 — only the clarify/Question case renames",
+    (kind, headline) => {
+      const summary = computeTurnSummary(
+        buildTurn({ responseKind: kind, verifiedSuccess: false }),
+        { uxV1: true },
+      );
+      expect(summary.headline).toBe(headline);
+      expect(summary.accent).toBe("qa");
+    },
+  );
+
+  it("isStoppedWithDraft keeps absolute precedence under uxV1 too", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        cancelled: true,
+        draft: draft3,
+        proposalDisposition: "review_untested",
+        responseKind: "build",
+        verifiedSuccess: true,
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Stopped with a draft");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("uxV1 fallback needsInput still renders Needs your input when no draft is pending", () => {
+    const turn = buildTurn({
+      terminalMessage: "Could you provide the login details?",
+    });
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Needs your input");
+  });
+});
+
 describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
   it("grafts clarify from the adjacent turn_outcome onto a pre-fix payload", () => {
     const turn = hydrateHistoryNarrative(reproClarifyPayload(), {

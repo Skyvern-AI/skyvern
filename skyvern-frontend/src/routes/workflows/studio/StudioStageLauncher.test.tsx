@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioStageLauncher } from "./StudioStageLauncher";
@@ -25,10 +26,12 @@ function LocationProbe() {
 
 function renderAt(path = "/workflows/wpid_1/studio?panes=") {
   return render(
-    <MemoryRouter initialEntries={[path]}>
-      <StudioStageLauncher />
-      <LocationProbe />
-    </MemoryRouter>,
+    <TooltipProvider delayDuration={0}>
+      <MemoryRouter initialEntries={[path]}>
+        <StudioStageLauncher />
+        <LocationProbe />
+      </MemoryRouter>
+    </TooltipProvider>,
   );
 }
 
@@ -50,27 +53,27 @@ beforeEach(() => {
 describe("StudioStageLauncher", () => {
   test("offers every pane as a labeled button", () => {
     renderAt();
-    for (const label of ["Copilot", "Editor", "Browser", "Timeline"]) {
+    for (const label of ["Copilot", "Editor", "Browser", "Overview"]) {
       expect(
         screen.getByRole("button", { name: new RegExp(`^${label}`) }),
       ).toBeTruthy();
     }
   });
 
-  test("keeps the Timeline launcher gated until a run exists, with the reason readable", () => {
+  test("keeps the Overview launcher gated until a run exists, with the reason readable", () => {
     renderAt();
     const timeline = screen.getByRole("button", { name: /no runs yet/ });
     expect((timeline as HTMLButtonElement).disabled).toBe(true);
   });
 
-  test("enables the Timeline launcher once a run exists", () => {
+  test("enables the Overview launcher once a run exists", () => {
     runSignalsMock.mockReturnValue({
       hasRun: true,
       runStatus: undefined,
       knownHasRuns: true,
     });
     renderAt();
-    const timeline = screen.getByRole("button", { name: "Timeline" });
+    const timeline = screen.getByRole("button", { name: "Overview" });
     expect((timeline as HTMLButtonElement).disabled).toBe(false);
   });
 

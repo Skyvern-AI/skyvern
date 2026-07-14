@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.models import (
+    PersistentBrowserSessionModel,
     TaskModel,
     TaskRunModel,
     WorkflowModel,
@@ -54,6 +55,7 @@ from skyvern.forge.sdk.db.utils import (
     truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -354,13 +356,16 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         credits: int,
         is_cached: bool = False,
+        topup_credits: int = 0,
     ) -> None:
         col = WorkflowRunModel.cached_credits_used if is_cached else WorkflowRunModel.credits_used
+        values: dict = {col: func.coalesce(col, 0) + credits}
+        if topup_credits:
+            topup_col = WorkflowRunModel.topup_credits_used
+            values[topup_col] = func.coalesce(topup_col, 0) + topup_credits
         async with self.Session() as session:
             result = await session.execute(
-                update(WorkflowRunModel)
-                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
-                .values({col: func.coalesce(col, 0) + credits})
+                update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == workflow_run_id).values(values)
             )
             if result.rowcount == 0:
                 LOG.warning(
@@ -578,6 +583,7 @@ class WorkflowRunsRepository(BaseRepository):
         page_size: int = 10,
         status: list[str] | None = None,
         search_key: str | None = None,
+        run_type: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         async with self.Session() as session:
             effective_status = func.coalesce(WorkflowRunModel.status, TaskRunModel.status)
@@ -600,6 +606,7 @@ class WorkflowRunsRepository(BaseRepository):
                     TaskRunModel.created_at.label("created_at"),
                     effective_wpid.label("workflow_permanent_id"),
                     TaskRunModel.script_run.label("script_run"),
+                    WorkflowRunModel.trigger_type.label("trigger_type"),
                     TaskRunModel.searchable_text.label("searchable_text"),
                     workflow_deleted_expr,
                 )
@@ -622,6 +629,9 @@ class WorkflowRunsRepository(BaseRepository):
 
             if status:
                 query = query.filter(effective_status.in_(status))
+
+            if run_type:
+                query = query.filter(TaskRunModel.task_run_type.in_(run_type))
 
             if search_key:
                 query = query.filter(
@@ -650,46 +660,49 @@ class WorkflowRunsRepository(BaseRepository):
             rows = [dict(row) for row in result.mappings().all()]
 
             if search_key:
-                task_run_exists = (
-                    select(1)
-                    .select_from(TaskRunModel)
-                    .where(TaskRunModel.organization_id == WorkflowRunModel.organization_id)
-                    .where(TaskRunModel.run_id == WorkflowRunModel.workflow_run_id)
-                    .correlate_except(TaskRunModel)
-                    .exists()
-                )
-                fallback_query = (
-                    select(
-                        WorkflowRunModel.workflow_run_id.label("task_run_id"),
-                        WorkflowRunModel.workflow_run_id.label("run_id"),
-                        literal(RunType.workflow_run.value).label("task_run_type"),
-                        WorkflowRunModel.status.label("status"),
-                        WorkflowModel.title.label("title"),
-                        WorkflowRunModel.started_at.label("started_at"),
-                        WorkflowRunModel.finished_at.label("finished_at"),
-                        WorkflowRunModel.created_at.label("created_at"),
-                        WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
-                        WorkflowRunModel.script_run.label("script_run"),
-                        WorkflowModel.title.label("searchable_text"),
-                        self._workflow_deleted_expr(
-                            WorkflowRunModel.workflow_permanent_id,
-                            WorkflowRunModel.organization_id,
-                        ),
+                # The fallback only yields workflow_run rows, so skip it when the run_type filter excludes them.
+                if not run_type or RunType.workflow_run in run_type:
+                    task_run_exists = (
+                        select(1)
+                        .select_from(TaskRunModel)
+                        .where(TaskRunModel.organization_id == WorkflowRunModel.organization_id)
+                        .where(TaskRunModel.run_id == WorkflowRunModel.workflow_run_id)
+                        .correlate_except(TaskRunModel)
+                        .exists()
                     )
-                    .select_from(WorkflowRunModel)
-                    .outerjoin(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
-                    .filter(WorkflowRunModel.organization_id == organization_id)
-                    .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
-                    .filter(WorkflowRunModel.debug_session_id.is_(None))
-                    .filter(WorkflowRunModel.copilot_session_id.is_(None))
-                    .filter(~task_run_exists)
-                )
-                fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
-                if status:
-                    fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
-                fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
-                fallback_result = await session.execute(fallback_query)
-                rows.extend(dict(row) for row in fallback_result.mappings().all())
+                    fallback_query = (
+                        select(
+                            WorkflowRunModel.workflow_run_id.label("task_run_id"),
+                            WorkflowRunModel.workflow_run_id.label("run_id"),
+                            literal(RunType.workflow_run.value).label("task_run_type"),
+                            WorkflowRunModel.status.label("status"),
+                            WorkflowModel.title.label("title"),
+                            WorkflowRunModel.started_at.label("started_at"),
+                            WorkflowRunModel.finished_at.label("finished_at"),
+                            WorkflowRunModel.created_at.label("created_at"),
+                            WorkflowRunModel.workflow_permanent_id.label("workflow_permanent_id"),
+                            WorkflowRunModel.script_run.label("script_run"),
+                            WorkflowRunModel.trigger_type.label("trigger_type"),
+                            WorkflowModel.title.label("searchable_text"),
+                            self._workflow_deleted_expr(
+                                WorkflowRunModel.workflow_permanent_id,
+                                WorkflowRunModel.organization_id,
+                            ),
+                        )
+                        .select_from(WorkflowRunModel)
+                        .outerjoin(WorkflowModel, WorkflowModel.workflow_id == WorkflowRunModel.workflow_id)
+                        .filter(WorkflowRunModel.organization_id == organization_id)
+                        .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                        .filter(WorkflowRunModel.debug_session_id.is_(None))
+                        .filter(WorkflowRunModel.copilot_session_id.is_(None))
+                        .filter(~task_run_exists)
+                    )
+                    fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
+                    if status:
+                        fallback_query = fallback_query.filter(WorkflowRunModel.status.in_(status))
+                    fallback_query = fallback_query.order_by(WorkflowRunModel.created_at.desc()).limit(query_limit)
+                    fallback_result = await session.execute(fallback_query)
+                    rows.extend(dict(row) for row in fallback_result.mappings().all())
                 rows.sort(key=lambda row: row["created_at"], reverse=True)
                 rows = rows[offset : offset + page_size]
 
@@ -726,10 +739,12 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_permanent_id: str,
         organization_id: str | None = None,
         sequential_key: str | None = None,
+        include_browser_session_rows: bool = False,
     ) -> WorkflowRun | None:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
-            query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+            if not include_browser_session_rows:
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(status=WorkflowRunStatus.queued)
@@ -761,10 +776,12 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_permanent_id: str,
         organization_id: str | None = None,
         sequential_key: str | None = None,
+        include_browser_session_rows: bool = False,
     ) -> WorkflowRun | None:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
-            query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+            if not include_browser_session_rows:
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
             query = query.filter_by(status=WorkflowRunStatus.running)
@@ -792,11 +809,35 @@ class WorkflowRunsRepository(BaseRepository):
             if run is None:
                 return None
 
-            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
-            # > sequential_key > whole workflow. A debug-session run carries a browser_session_id
-            # but is excluded from the session lane (as at enqueue), so it serializes on its key.
-            query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
+            self_forced = False
             if run.browser_session_id and not run.debug_session_id:
+                try:
+                    persistent_browser_session = (
+                        await session.scalars(
+                            select(PersistentBrowserSessionModel).filter_by(
+                                persistent_browser_session_id=run.browser_session_id,
+                                organization_id=run.organization_id,
+                            )
+                        )
+                    ).first()
+                    self_forced = (
+                        persistent_browser_session is not None
+                        and persistent_browser_session.runnable_type == FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to fetch persistent browser session for runtime lane selection",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=run.browser_session_id,
+                        organization_id=run.organization_id,
+                        exc_info=True,
+                    )
+
+            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
+            # > sequential_key > whole workflow. Debug and forced-session runs carry a
+            # browser_session_id but are excluded from the session lane as they are at enqueue.
+            query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
+            if run.browser_session_id and not run.debug_session_id and not self_forced:
                 query = query.filter_by(browser_session_id=run.browser_session_id)
             elif run.browser_address:
                 query = query.filter_by(browser_address=run.browser_address)
@@ -804,11 +845,13 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.filter_by(
                     workflow_permanent_id=run.workflow_permanent_id,
                     sequential_key=run.sequential_key,
-                ).filter(WorkflowRunModel.browser_session_id.is_(None))
-            else:
-                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id).filter(
-                    WorkflowRunModel.browser_session_id.is_(None)
                 )
+                if not self_forced:
+                    query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
+            else:
+                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id)
+                if not self_forced:
+                    query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
 
             # Sequential runs are stamped queued_at before Temporal submission; the fallback
             # only guards hand-created rows (e.g. tests) from comparing against None.
@@ -1155,6 +1198,8 @@ class WorkflowRunsRepository(BaseRepository):
         search_key: str | None = None,
         error_code: str | None = None,
         exclude_child_runs: bool = False,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -1175,6 +1220,10 @@ class WorkflowRunsRepository(BaseRepository):
             query = self._apply_error_code_filter(query, error_code)
             if status:
                 query = query.filter(WorkflowRunModel.status.in_(status))
+            if created_at_start is not None:
+                query = query.filter(WorkflowRunModel.created_at >= created_at_start)
+            if created_at_end is not None:
+                query = query.filter(WorkflowRunModel.created_at < created_at_end)
             query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             workflow_runs_and_titles_tuples = (await session.execute(query)).all()
             workflow_runs = [
@@ -1384,13 +1433,19 @@ class WorkflowRunsRepository(BaseRepository):
             workflow_run_parameters = (
                 await session.scalars(select(WorkflowRunParameterModel).filter_by(workflow_run_id=workflow_run_id))
             ).all()
+            if not workflow_run_parameters:
+                return []
+            if self._workflow_parameter_reader is None:
+                raise RuntimeError("workflow_parameter_reader dependency not set")
+            workflow_parameters_by_id = {
+                workflow_parameter.workflow_parameter_id: workflow_parameter
+                for workflow_parameter in await self._workflow_parameter_reader.get_workflow_parameters_by_ids(
+                    [workflow_run_parameter.workflow_parameter_id for workflow_run_parameter in workflow_run_parameters]
+                )
+            }
             results = []
             for workflow_run_parameter in workflow_run_parameters:
-                if self._workflow_parameter_reader is None:
-                    raise RuntimeError("workflow_parameter_reader dependency not set")
-                workflow_parameter = await self._workflow_parameter_reader.get_workflow_parameter(
-                    workflow_run_parameter.workflow_parameter_id
-                )
+                workflow_parameter = workflow_parameters_by_id.get(workflow_run_parameter.workflow_parameter_id)
                 if not workflow_parameter:
                     raise WorkflowParameterNotFound(workflow_parameter_id=workflow_run_parameter.workflow_parameter_id)
                 results.append(

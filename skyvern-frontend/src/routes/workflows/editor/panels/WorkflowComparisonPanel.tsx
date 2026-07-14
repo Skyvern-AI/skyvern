@@ -34,6 +34,9 @@ type Props = {
   onSelectState?: (version: WorkflowVersion) => void;
   mode?: ComparisonMode;
   onCopilotReviewClose?: (status: CopilotReviewStatus) => void;
+  // History mode: exits comparison without applying a version (the studio's
+  // "Keep current version"). Copilot mode keeps its own close flow.
+  onExit?: () => void;
 };
 
 // Mapping from WorkflowBlock.block_type to ReactFlow node.type
@@ -60,6 +63,8 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   goto_url: "url",
   http_request: "http_request",
   pdf_fill: "pdfFill",
+  split_pdf: "splitPdf",
+  email_inbox: "emailInbox",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
 };
@@ -139,6 +144,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
+    pinSavedSessionIp: version.pin_saved_session_ip ?? false,
     browserProfileId: version.browser_profile_id ?? null,
     browserProfileKey: version.browser_profile_key ?? null,
     model: version.model,
@@ -273,6 +279,7 @@ function WorkflowComparisonPanel({
   onSelectState,
   mode = "history",
   onCopilotReviewClose,
+  onExit,
 }: Props) {
   const comparisons = useMemo(() => {
     const blocks1 = version1?.workflow_definition?.blocks || [];
@@ -296,6 +303,20 @@ function WorkflowComparisonPanel({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [mode, onCopilotReviewClose]);
+
+  // ESC in history mode mirrors "Keep current version" when an exit is wired.
+  useEffect(() => {
+    if (mode !== "history" || !onExit) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onExit();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [mode, onExit]);
 
   // Statistics
   const stats = useMemo(
@@ -354,6 +375,17 @@ function WorkflowComparisonPanel({
     <div className="flex h-full w-full flex-col rounded-lg bg-slate-elevation2">
       {/* Header */}
       <div className="relative flex-shrink-0 p-4 pb-3">
+        {/* History-mode exit: keep the current version, drop the comparison. */}
+        {mode === "history" && onExit && (
+          <button
+            type="button"
+            onClick={onExit}
+            title="Exit comparison (Esc)"
+            className="absolute right-4 top-4 inline-flex h-7 items-center rounded-md border border-border px-2 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            Keep current version
+          </button>
+        )}
         {/* Close button for copilot mode */}
         {mode === "copilot" && onCopilotReviewClose && (
           <button

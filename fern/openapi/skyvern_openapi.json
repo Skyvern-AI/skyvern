@@ -8301,6 +8301,62 @@
             ],
             "title": "Source Browser Type"
           },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location"
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id"
+          },
+          "is_managed": {
+            "type": "boolean",
+            "title": "Is Managed",
+            "default": false
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "browser_profile_key_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key Digest"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -9255,6 +9311,37 @@
             ],
             "title": "Workflow Run Id",
             "description": "Workflow run whose persisted session should be captured. Omit for a blank profile."
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Explicit sticky-session id for this profile's pinned proxy identity."
           }
         },
         "type": "object",
@@ -9394,10 +9481,48 @@
             ],
             "description": "Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization.",
             "examples": [
+              "skyvern",
               "custom",
               "azure_vault",
               "bitwarden"
             ]
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this credential's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Optional advanced reuse key for this credential's pinned proxy identity."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id when updating this credential.",
+            "default": false
           }
         },
         "type": "object",
@@ -18657,6 +18782,16 @@
             "type": "boolean",
             "title": "Script Run",
             "default": false
+          },
+          "trigger_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunTriggerType"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -20340,6 +20475,43 @@
             ],
             "title": "Description",
             "description": "New description for the browser profile"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "Optional proxy location for this profile's pinned proxy identity."
+          },
+          "proxy_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Session Id",
+            "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "rotate_proxy_session_id": {
+            "type": "boolean",
+            "title": "Rotate Proxy Session Id",
+            "description": "Rotate the Skyvern-managed proxy sticky-session id for this profile.",
+            "default": false
           }
         },
         "type": "object",
@@ -25045,12 +25217,13 @@
         "type": "string",
         "enum": [
           "manual",
+          "mcp",
           "api",
           "scheduled",
           "webhook"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint"
       },
       "WorkflowSchedule": {
         "properties": {

@@ -1,7 +1,8 @@
 import { ReactFlowProvider } from "@xyflow/react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useEffect } from "react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { WorkflowSettings } from "../types/workflowTypes";
@@ -19,10 +20,31 @@ import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
+  const [searchParams] = useSearchParams();
   const studioEnabled = useWorkflowStudioEnabled();
-  const { data: workflow, isLoading } = useWorkflowQuery({
+  const {
+    data: fetchedWorkflow,
+    isLoading,
+    isError: workflowQueryFailed,
+  } = useWorkflowQuery({
     workflowPermanentId,
   });
+
+  // Runs outlive their agent: the workflow GET 404s once the agent is deleted,
+  // but a ?wr= deep link can still be served from the run's embedded workflow
+  // snapshot (the same query the run panes use), in a read-only degraded mode.
+  const deepLinkRunId = searchParams.get("wr");
+  const { data: fallbackRun, isLoading: fallbackRunIsLoading } =
+    useWorkflowRunWithWorkflowQuery(
+      studioEnabled && deepLinkRunId
+        ? { workflowRunId: deepLinkRunId }
+        : undefined,
+    );
+  const deletedWorkflowSnapshot =
+    studioEnabled && workflowQueryFailed && fallbackRun?.workflow?.deleted_at
+      ? fallbackRun.workflow
+      : undefined;
+  const effectiveWorkflow = fetchedWorkflow ?? deletedWorkflowSnapshot;
 
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
@@ -40,13 +62,18 @@ function WorkflowEditor() {
   useViaEntryPointCapture();
 
   useEffect(() => {
-    if (workflow) {
-      const initialParameters = getInitialParameters(workflow);
+    if (effectiveWorkflow) {
+      const initialParameters = getInitialParameters(effectiveWorkflow);
       setParameters(initialParameters);
     }
-  }, [workflow, setParameters]);
+  }, [effectiveWorkflow, setParameters]);
 
-  if (isLoading || isGlobalWorkflowsLoading) {
+  const awaitingRunFallback =
+    studioEnabled &&
+    workflowQueryFailed &&
+    Boolean(deepLinkRunId) &&
+    fallbackRunIsLoading;
+  if (isLoading || isGlobalWorkflowsLoading || awaitingRunFallback) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
         <div className="animate-pulse">
@@ -56,9 +83,11 @@ function WorkflowEditor() {
     );
   }
 
-  if (!workflow) {
+  if (!effectiveWorkflow) {
     return null;
   }
+  const workflow = effectiveWorkflow;
+  const workflowDeleted = Boolean(workflow.deleted_at);
 
   const isGlobalWorkflow = globalWorkflows?.some(
     (globalWorkflow) =>
@@ -70,6 +99,7 @@ function WorkflowEditor() {
 
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
+    pinSavedSessionIp: workflow.pin_saved_session_ip ?? false,
     browserProfileId: workflow.browser_profile_id ?? null,
     browserProfileKey: workflow.browser_profile_key ?? null,
     proxyLocation: workflow.proxy_location,
@@ -97,7 +127,11 @@ function WorkflowEditor() {
     errorCodeMapping: workflow.workflow_definition?.error_code_mapping ?? null,
   };
 
-  const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);
+  const elements = getElements(
+    blocksToRender,
+    settings,
+    !isGlobalWorkflow && !workflowDeleted,
+  );
 
   return (
     <div className="relative flex h-screen w-full flex-col">

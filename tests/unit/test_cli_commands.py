@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
+from skyvern.cli.commands import cli_app
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
+from skyvern.cli.status import _status_data
 
 # ---------------------------------------------------------------------------
 # _state.py
@@ -96,6 +100,24 @@ class TestOutput:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert parsed["error"]["message"] == "bad thing"
+
+
+# ---------------------------------------------------------------------------
+# status.py
+# ---------------------------------------------------------------------------
+
+
+class TestStatusCommands:
+    def test_status_start_commands_are_accepted_by_cli_parser(self) -> None:
+        runner = CliRunner()
+
+        for row in _status_data():
+            command_parts = shlex.split(row["start_command"])
+            assert command_parts[0] == "skyvern"
+
+            result = runner.invoke(cli_app, [*command_parts[1:], "--help"])
+
+            assert result.exit_code == 0, result.output
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +335,36 @@ class TestBrowserCommands:
 
 
 class TestWorkflowCommands:
+    def test_workflow_list_query_alias_maps_to_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        monkeypatch.setattr(workflow_cmd, "prepare_cli_runtime", lambda **_: None)
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_list",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflows": [], "page": 1, "page_size": 10, "count": 0, "has_more": False},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_list", tool)
+
+        result = CliRunner().invoke(workflow_cmd.workflow_app, ["list", "--query", "invoice", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert tool.await_args.kwargs == {
+            "search": "invoice",
+            "page": 1,
+            "page_size": 10,
+            "only_workflows": False,
+        }
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is True
+
     def test_workflow_get_outputs_mcp_envelope_in_json_mode(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:

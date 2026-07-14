@@ -13,7 +13,7 @@ from playwright.async_api import Page
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
-from skyvern.exceptions import SkyvernActionFailed, WorkflowRunContextNotInitialized
+from skyvern.exceptions import NoTOTPSecretFound, SkyvernActionFailed, WorkflowRunContextNotInitialized
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -21,6 +21,7 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
@@ -69,7 +70,10 @@ async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
         locator = page.locator(selector)
         element_id = await locator.get_attribute("unique_id", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
     except Exception:
-        LOG.exception("Failed to get element id by selector", selector=selector)
+        # A selector miss is an expected, handled fallback: callers treat a None return as
+        # a signal to take the heavier AI single-action path (and record a fallback episode),
+        # so warn without a stack trace rather than logging an error on every stale selector.
+        LOG.warning("Failed to get element id by selector", selector=selector)
         return None
     return element_id
 
@@ -310,7 +314,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         """Input text into an element using AI to determine the value."""
 
         # v3 mid-run hook — see ai_click for the contract.
-        if v3_parent_episode_id is None:
+        # Never expose an unresolved TOTP value to a reviewer that can write its prompt value directly to the page.
+        if v3_parent_episode_id is None and not is_unresolved_totp_value(value):
             ep_id, class_a = await self._maybe_run_v3_midrun(
                 action_type="fill",
                 failed_selector=failed_selector,
@@ -435,7 +440,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         if actions and isinstance(actions[0], InputTextAction):
                             action = cast(InputTextAction, actions[0])
             except Exception:
-                LOG.exception(f"Failed to adapt value for input text action on selector={selector}, value={value}")
+                LOG.exception("Failed to adapt value for input text action", selector=selector)
 
         if action and organization_id and task and step:
             result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
@@ -452,6 +457,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 v3_parent_episode_id=v3_parent_episode_id,
             )
         else:
+            if is_unresolved_totp_value(transformed_value):
+                raise NoTOTPSecretFound()
             locator = self.page.locator(selector)
             await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
         return value

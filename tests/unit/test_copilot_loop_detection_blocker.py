@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
 from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
@@ -47,6 +49,11 @@ def _ctx(
     if consecutive_tool_tracker is not None:
         ctx.consecutive_tool_tracker = consecutive_tool_tracker
     return ctx
+
+
+def _streak(tool_name: str, arguments: dict[str, object] | None = None) -> list[str]:
+    identity = tool_step_identity(tool_name, arguments)
+    return [identity, identity]
 
 
 def _current_page_challenge_evidence(*, observed_after_workflow_run: bool = True) -> dict[str, object]:
@@ -131,7 +138,7 @@ def test_native_dispatch_failed_step_loop_sets_signal_and_returns_payload() -> N
 
 
 def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["list_credentials", "list_credentials"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("list_credentials"))
     payload = _tool_loop_error(ctx, "list_credentials", None)
     assert payload is not None
     assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
@@ -142,7 +149,7 @@ def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
 
 
 def test_consecutive_evaluate_loop_with_loaded_results_uses_goal_aware_copy() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate"))
     ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
         result_container_count=1,
         table_result_container_count=1,
@@ -161,7 +168,7 @@ def test_consecutive_evaluate_loop_with_loaded_results_uses_goal_aware_copy() ->
 
 
 def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["list_credentials", "list_credentials"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("list_credentials"))
     ctx.latest_evaluate_result_composition_steer = LoadedResultCompositionEvidence(
         result_container_count=1,
         table_result_container_count=1,
@@ -179,7 +186,7 @@ def test_consecutive_non_evaluate_loop_ignores_loaded_result_steer() -> None:
 
 
 def test_consecutive_evaluate_loop_without_composition_steer_uses_generic_copy() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate"))
     payload = _tool_loop_error(ctx, "evaluate", None)
 
     assert payload is not None
@@ -448,7 +455,7 @@ def test_fixed_tier_copy_is_clean_for_every_loop_prone_tool(blocked_tool: str, r
 
 def test_native_and_mcp_paths_carry_equivalent_evidence_bearing_signals() -> None:
     def _prepped_ctx() -> CopilotContext:
-        ctx = _ctx(consecutive_tool_tracker=["list_credentials", "list_credentials"])
+        ctx = _ctx(consecutive_tool_tracker=_streak("list_credentials"))
         ctx.last_outcome_gate_reason = (
             "The run completed but did not demonstrate the goal outcome(s): the requested record is checked "
             "on a public registry site with a search form and expandable result rows."
@@ -485,7 +492,7 @@ def test_native_and_mcp_paths_carry_equivalent_evidence_bearing_signals() -> Non
 
 
 def test_native_tool_loop_error_terminal_challenge_preempts_same_tool_loop() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "document.body.innerText"}))
     ctx.composition_page_evidence = _current_page_challenge_evidence()
 
     payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
@@ -501,7 +508,7 @@ def test_native_tool_loop_error_terminal_challenge_preempts_same_tool_loop() -> 
 
 
 def test_native_tool_loop_error_does_not_preempt_on_pre_attempt_challenge() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "document.body.innerText"}))
     ctx.composition_page_evidence = _current_page_challenge_evidence(observed_after_workflow_run=False)
 
     payload = _tool_loop_error(ctx, "evaluate", {"expression": "document.body.innerText"})
@@ -517,7 +524,7 @@ def test_native_tool_loop_error_does_not_preempt_on_pre_attempt_challenge() -> N
 
 @pytest.mark.asyncio
 async def test_mcp_browser_tool_terminal_challenge_preempts_same_tool_loop() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "document.body.innerText"}))
     ctx.composition_page_evidence = _current_page_challenge_evidence()
 
     class _UnexpectedClient:
@@ -549,7 +556,7 @@ async def test_mcp_browser_tool_terminal_challenge_preempts_same_tool_loop() -> 
 
 @pytest.mark.asyncio
 async def test_mcp_synthesized_offer_gate_preempts_evaluate_loop_without_terminal_halt() -> None:
-    ctx = _ctx(consecutive_tool_tracker=["evaluate", "evaluate"])
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "document.body.innerText"}))
     ctx.turn_intent = TurnIntent(
         mode=TurnIntentMode.BUILD,
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
@@ -697,3 +704,109 @@ def test_composed_loop_reply_with_draft_affordance_passes_output_policy() -> Non
         output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
     )
     assert verdict.allowed, [code.value for code in verdict.reason_codes]
+
+
+def _dispatch_server(ctx: CopilotContext, client: object) -> SkyvernOverlayMCPServer:
+    server = SkyvernOverlayMCPServer(
+        transport=None,
+        overlays={},
+        alias_map={},
+        allowlist=frozenset({"evaluate"}),
+        context_provider=lambda: ctx,
+    )
+    server._client = client  # type: ignore[assignment]
+    return server
+
+
+class _OkResult:
+    structured_content = {"ok": True, "data": {}}
+    is_error = False
+    content: list = []
+
+
+@pytest.mark.asyncio
+async def test_mcp_admission_blocks_third_identical_identity_without_dispatch() -> None:
+    args = {"expression": "document.title"}
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", args))
+
+    class _UnexpectedClient:
+        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
+            raise AssertionError("consecutive loop blocker should skip MCP execution")
+
+    result = await _dispatch_server(ctx, _UnexpectedClient()).call_tool("evaluate", args)
+
+    parsed = json.loads(result.content[0].text)
+    assert result.isError is True
+    assert parsed["ok"] is False
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+
+
+@pytest.mark.asyncio
+async def test_mcp_admission_admits_distinct_argument_identity() -> None:
+    ctx = _ctx(consecutive_tool_tracker=_streak("evaluate", {"expression": "a"}))
+    calls: list[dict] = []
+
+    class _RecordingClient:
+        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
+            calls.append(a)
+            return _OkResult()
+
+    result = await _dispatch_server(ctx, _RecordingClient()).call_tool("evaluate", {"expression": "b"})
+
+    parsed = json.loads(result.content[0].text)
+    assert parsed["ok"] is True
+    assert len(calls) == 1
+    assert ctx.blocker_signal is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_exception_completion_leaves_same_consecutive_state_as_success() -> None:
+    args = {"expression": "document.title"}
+
+    success_ctx = _ctx(consecutive_tool_tracker=[])
+
+    class _OkClient:
+        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
+            return _OkResult()
+
+    await _dispatch_server(success_ctx, _OkClient()).call_tool("evaluate", args)
+
+    error_ctx = _ctx(consecutive_tool_tracker=[])
+
+    class _RaisingClient:
+        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
+            raise RuntimeError("boom")
+
+    result = await _dispatch_server(error_ctx, _RaisingClient()).call_tool("evaluate", args)
+    assert json.loads(result.content[0].text)["ok"] is False
+
+    assert error_ctx.consecutive_tool_tracker == success_ctx.consecutive_tool_tracker
+    assert success_ctx.consecutive_tool_tracker == [tool_step_identity("evaluate", args)]
+
+
+@pytest.mark.asyncio
+async def test_mcp_cancelled_admission_matches_error_completion_state() -> None:
+    args = {"expression": "document.title"}
+
+    error_ctx = _ctx(consecutive_tool_tracker=[], failed_tool_step_tracker={})
+
+    class _RaisingClient:
+        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
+            raise RuntimeError("boom")
+
+    await _dispatch_server(error_ctx, _RaisingClient()).call_tool("evaluate", args)
+
+    cancel_ctx = _ctx(consecutive_tool_tracker=[], failed_tool_step_tracker={})
+
+    class _CancellingClient:
+        async def call_tool(self, name: str, a: dict, raise_on_error: bool = False) -> object:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _dispatch_server(cancel_ctx, _CancellingClient()).call_tool("evaluate", args)
+
+    assert cancel_ctx.consecutive_tool_tracker == error_ctx.consecutive_tool_tracker
+    assert cancel_ctx.consecutive_tool_tracker == [tool_step_identity("evaluate", args)]
+    assert cancel_ctx.failed_tool_step_tracker == {}

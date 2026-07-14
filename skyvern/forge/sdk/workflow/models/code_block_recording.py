@@ -12,7 +12,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage, recorded_action_from_payload
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action
 
@@ -152,7 +152,7 @@ class CodeBlockActionRecording:
         try:
             masked = self._workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
             for raw in masked:
-                action = Action.model_validate(raw)
+                action = recorded_action_from_payload(raw)
                 action.task_id = self._task.task_id
                 action.step_id = self._step.step_id
                 action.step_order = self._step.order

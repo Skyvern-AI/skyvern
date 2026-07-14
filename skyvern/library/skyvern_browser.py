@@ -46,12 +46,14 @@ class SkyvernBrowser(BrowserContext):
         *,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
+        app_url: str | None = None,
     ):
         super().__init__(browser_context)
         self._skyvern = skyvern
         self._browser_context = browser_context
         self._browser_session_id = browser_session_id
         self._browser_address = browser_address
+        self._app_url = app_url
 
         self.workflow_run_id: None | str = None
 
@@ -74,6 +76,10 @@ class SkyvernBrowser(BrowserContext):
     @property
     def browser_address(self) -> str | None:
         return self._browser_address
+
+    @property
+    def app_url(self) -> str | None:
+        return self._app_url
 
     @property
     def skyvern(self) -> "Skyvern":

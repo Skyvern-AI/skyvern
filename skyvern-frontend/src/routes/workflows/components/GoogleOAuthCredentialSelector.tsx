@@ -13,6 +13,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import {
   getDefaultGoogleOAuthCredentialId,
   hasGoogleOAuthCredentialScopes,
+  isGoogleOAuthCredentialActive,
   useGoogleOAuthCredentials,
 } from "@/hooks/useGoogleOAuthCredentials";
 import { PlusIcon } from "@radix-ui/react-icons";
@@ -39,8 +40,10 @@ function GoogleOAuthCredentialSelector({
     isFetching,
   } = useGoogleOAuthCredentials();
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const credentials = allCredentials.filter((credential) =>
-    hasGoogleOAuthCredentialScopes(credential, requiredScopes),
+  const credentials = allCredentials.filter(
+    (credential) =>
+      isGoogleOAuthCredentialActive(credential) &&
+      hasGoogleOAuthCredentialScopes(credential, requiredScopes),
   );
 
   // Keep latest callback without forcing effect re-runs.

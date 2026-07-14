@@ -4,7 +4,11 @@ import {
   type WorkflowApiResponse,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
-import { getInitialParameters } from "./utils";
+import {
+  getInitialParameters,
+  skyvernCredentialToParameterYAML,
+} from "./utils";
+import { SkyvernCredential } from "./types";
 
 const baseWorkflow = {
   workflow_id: "w_test",
@@ -27,6 +31,7 @@ const baseWorkflow = {
   extra_http_headers: null,
   cdp_connect_headers: null,
   persist_browser_session: false,
+  pin_saved_session_ip: false,
   browser_profile_id: null,
   browser_profile_key: null,
   model: null,
@@ -95,5 +100,59 @@ describe("getInitialParameters", () => {
         dataType: WorkflowParameterValueType.CredentialId,
       }),
     ]);
+  });
+});
+
+describe("skyvernCredentialToParameterYAML", () => {
+  test("serializes a freshly selected single credential (no dataType) as an editable workflow credential_id parameter", () => {
+    const parameter: SkyvernCredential = {
+      key: "credentials",
+      parameterType: "credential",
+      credentialId: "cred_123",
+    };
+
+    expect(skyvernCredentialToParameterYAML(parameter)).toEqual({
+      parameter_type: "workflow",
+      workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+      default_value: "cred_123",
+      key: "credentials",
+      description: null,
+    });
+  });
+
+  test("serializes a legacy single credential (dataType set) as an editable workflow credential_id parameter", () => {
+    const parameter: SkyvernCredential = {
+      key: "credentials",
+      parameterType: "credential",
+      credentialId: "cred_123",
+      dataType: WorkflowParameterValueType.CredentialId,
+    };
+
+    expect(skyvernCredentialToParameterYAML(parameter)).toEqual({
+      parameter_type: "workflow",
+      workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+      default_value: "cred_123",
+      key: "credentials",
+      description: null,
+    });
+  });
+
+  test("serializes a rotation pool (2+ credentials) as a credential parameter", () => {
+    const parameter: SkyvernCredential = {
+      key: "credentials",
+      parameterType: "credential",
+      credentialId: "cred_1",
+      credentialIds: ["cred_1", "cred_2"],
+      selectionStrategy: "round_robin",
+    };
+
+    expect(skyvernCredentialToParameterYAML(parameter)).toEqual({
+      parameter_type: "credential",
+      credential_id: "cred_1",
+      credential_ids: ["cred_1", "cred_2"],
+      selection_strategy: "round_robin",
+      key: "credentials",
+      description: null,
+    });
   });
 });

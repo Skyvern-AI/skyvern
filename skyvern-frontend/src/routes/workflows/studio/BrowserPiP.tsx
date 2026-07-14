@@ -66,7 +66,7 @@ export function BrowserPiP() {
         <div
           className={cn(
             "absolute bottom-4 right-4 z-30 flex w-[22rem] flex-col overflow-hidden rounded-lg border bg-slate-elevation1 shadow-lg duration-150",
-            live ? "border-studio-accent/50" : "border-border",
+            live ? "border-success/50" : "border-border",
             minimized
               ? "animate-out fade-out zoom-out-95"
               : "animate-in fade-in zoom-in-95",

@@ -12,6 +12,46 @@ _EXPIRED_TOKEN_ERROR = ClientError(
 )
 
 
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": code}}, "GetObject")
+
+
+@pytest.mark.parametrize("code", ["NoSuchKey", "NotFound", "404"])
+def test_is_not_found_error_true_for_missing_object_codes(code: str) -> None:
+    client = aws.AsyncAWSClient()
+    assert client._is_not_found_error(_client_error(code)) is True
+
+
+@pytest.mark.parametrize("error", [_client_error("AccessDenied"), Exception("boom")])
+def test_is_not_found_error_false_for_other_errors(error: Exception) -> None:
+    client = aws.AsyncAWSClient()
+    assert client._is_not_found_error(error) is False
+
+
+@pytest.mark.asyncio
+async def test_download_file_missing_key_returns_none_without_traceback() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("NoSuchKey"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/missing.zip")
+    assert result is None
+    mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_file_real_error_still_logs_exception() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("AccessDenied"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/denied.zip")
+    assert result is None
+    mock_log.exception.assert_called_once()
+
+
 @pytest.fixture(autouse=True)
 def reset_aws_client():
     """Reset the global singleton before each test."""

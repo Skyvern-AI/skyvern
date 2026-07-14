@@ -44,7 +44,7 @@ import {
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import CloudContext from "@/store/CloudContext";
-import React, { useContext, useEffect, useMemo, useState } from "react";
+import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -78,18 +78,15 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
-import {
-  useFeatureFlagEnabled,
-  useFeatureFlagVariantKey,
-} from "posthog-js/react";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import {
-  ANALYTICS_DASHBOARD_FLAG,
-  WORKFLOW_TAGGING_FLAG,
-} from "@/util/featureFlags";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { useAnalyticsDashboardFlag } from "@/hooks/useAnalyticsDashboardFlag";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
+import { usePageSlots } from "@/store/PageSlots";
+import { resolveRunWindow } from "./resolveRunWindow";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -98,9 +95,15 @@ function WorkflowPage() {
   const isNewUser = onboarding?.isNewUser ?? false;
   const onboardingState = onboarding?.state ?? null;
   const onboardingFlag = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
-  const analyticsEnabled =
-    useFeatureFlagEnabled(ANALYTICS_DASHBOARD_FLAG) === true;
+  const analyticsEnabled = useAnalyticsDashboardFlag() === true;
   const [searchParams, setSearchParams] = useSearchParams();
+  // Snapped once on mount so the window stays stable across unrelated
+  // searchParams changes (page flips, search) instead of re-sampling `now`.
+  const runWindowNow = useRef(new Date());
+  const runWindow = useMemo(
+    () => resolveRunWindow(searchParams, runWindowNow.current),
+    [searchParams],
+  );
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
@@ -121,16 +124,18 @@ function WorkflowPage() {
     page,
     pageSize,
     search: debouncedSearch,
+    createdAtStart: runWindow.createdAtStart,
+    createdAtEnd: runWindow.createdAtEnd,
     refetchOnMount: "always",
   });
 
   useEffect(() => {
     if (!isLoading && workflowRuns && workflowRuns.length === 0 && page > 1) {
-      const params = new URLSearchParams();
+      const params = new URLSearchParams(searchParams);
       params.set("page", String(page - 1));
       setSearchParams(params, { replace: true });
     }
-  }, [workflowRuns, isLoading, page, setSearchParams]);
+  }, [workflowRuns, isLoading, page, searchParams, setSearchParams]);
 
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -158,76 +163,88 @@ function WorkflowPage() {
   );
   const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
+  const {
+    workflowAnalyticsPanel: WorkflowAnalyticsPanel,
+    workflowRunsFilterControls: WorkflowRunsFilterControls,
+  } = usePageSlots();
+
   if (!workflowPermanentId) {
     return null; // this should never happen
   }
 
   return (
     <div className="space-y-8">
-      <header className="flex justify-between">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <div className="flex flex-col gap-2">
-            {workflowIsLoading ? (
-              <>
-                <Skeleton className="h-7 w-56" />
-                <Skeleton className="h-7 w-56" />
-              </>
-            ) : (
-              <>
-                <h1 className="text-lg font-semibold">{workflow?.title}</h1>
-                <h2 className="text-sm">{workflowPermanentId}</h2>
-              </>
-            )}
+      <header className="flex flex-col gap-4">
+        <div className="flex justify-between">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            <div className="flex flex-col gap-0.5">
+              {workflowIsLoading ? (
+                <>
+                  <Skeleton className="h-7 w-56" />
+                  <Skeleton className="h-7 w-56" />
+                </>
+              ) : (
+                <>
+                  <h1 className="text-lg font-semibold">{workflow?.title}</h1>
+                  <h2 className="text-sm text-muted-foreground">
+                    {workflowPermanentId}
+                  </h2>
+                </>
+              )}
+            </div>
+            {taggingEnabled &&
+            !workflowIsLoading &&
+            workflowTags &&
+            workflowTags.length > 0 ? (
+              <TagChipList
+                tags={workflowTags}
+                descriptions={tagDescriptions}
+                colors={tagColors}
+                maxVisible={6}
+              />
+            ) : null}
           </div>
-          {taggingEnabled &&
-          !workflowIsLoading &&
-          workflowTags &&
-          workflowTags.length > 0 ? (
-            <TagChipList
-              tags={workflowTags}
-              descriptions={tagDescriptions}
-              colors={tagColors}
-              maxVisible={6}
-            />
-          ) : null}
-        </div>
-        <div className="flex gap-2">
-          {workflow && (
-            <WorkflowActions
-              workflow={workflow}
-              onSuccessfullyDeleted={() => navigate("/agents")}
-            />
-          )}
-          {isCloud && analyticsEnabled ? (
+          <div className="flex gap-2">
+            {workflow && (
+              <WorkflowActions
+                workflow={workflow}
+                onSuccessfullyDeleted={() => navigate("/agents")}
+              />
+            )}
+            {isCloud && analyticsEnabled ? (
+              <Button asChild variant="secondary">
+                <Link to={buildWorkflowAnalyticsPath(workflowPermanentId)}>
+                  <BarChartIcon className="mr-2 size-4" />
+                  Analytics
+                </Link>
+              </Button>
+            ) : null}
             <Button asChild variant="secondary">
-              <Link to={buildWorkflowAnalyticsPath(workflowPermanentId)}>
-                <BarChartIcon className="mr-2 size-4" />
-                Analytics
+              <Link to={`/agents/${workflowPermanentId}/scripts`}>
+                <CodeIcon className="mr-2 size-4" />
+                Scripts
               </Link>
             </Button>
-          ) : null}
-          <Button asChild variant="secondary">
-            <Link to={`/agents/${workflowPermanentId}/scripts`}>
-              <CodeIcon className="mr-2 size-4" />
-              Scripts
-            </Link>
-          </Button>
-          <Button asChild variant="secondary">
-            <Link
-              to={workflowEditorPath(workflowPermanentId, studioEnabled)}
-              data-testid="workflow-open-editor-link"
-            >
-              <Pencil2Icon className="mr-2 size-4" />
-              Edit
-            </Link>
-          </Button>
-          <Button asChild>
-            <Link to={`/agents/${workflowPermanentId}/run`}>
-              <PlayIcon className="mr-2 size-4" />
-              Run
-            </Link>
-          </Button>
+            <Button asChild variant="secondary">
+              <Link
+                to={workflowEditorPath(workflowPermanentId, studioEnabled)}
+                data-testid="workflow-open-editor-link"
+              >
+                <Pencil2Icon className="mr-2 size-4" />
+                Edit
+              </Link>
+            </Button>
+            <Button asChild>
+              <Link to={`/agents/${workflowPermanentId}/run`}>
+                <PlayIcon className="mr-2 size-4" />
+                Run
+              </Link>
+            </Button>
+          </div>
         </div>
+        {WorkflowAnalyticsPanel ? (
+          <WorkflowAnalyticsPanel workflowPermanentId={workflowPermanentId} />
+        ) : null}
       </header>
       <div className="space-y-4">
         <header>
@@ -275,10 +292,15 @@ function WorkflowPage() {
                 placeholder="Search runs by input..."
                 className="w-48 lg:w-72"
               />
-              <StatusFilterDropdown
-                values={statusFilters}
-                onChange={setStatusFilters}
-              />
+              <div className="flex items-center gap-2">
+                {WorkflowRunsFilterControls ? (
+                  <WorkflowRunsFilterControls />
+                ) : null}
+                <StatusFilterDropdown
+                  values={statusFilters}
+                  onChange={setStatusFilters}
+                />
+              </div>
             </div>
             <div className="overflow-hidden rounded-lg border border-border">
               <Table>

@@ -36,6 +36,11 @@ class WorkflowParameterReader(Protocol):
         organization_id: str | None = None,
     ) -> WorkflowParameter | None: ...
 
+    async def get_workflow_parameters_by_ids(
+        self,
+        workflow_parameter_ids: list[str],
+    ) -> list[WorkflowParameter]: ...
+
 
 @runtime_checkable
 class RunReader(Protocol):

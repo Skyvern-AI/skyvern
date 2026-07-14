@@ -92,6 +92,7 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileS
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
+from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -439,6 +440,23 @@ async def _take_workflow_run_block_screenshot(
             )
 
 
+def _build_fallback_navigation_payload(context: skyvern_context.SkyvernContext) -> dict[str, Any] | None:
+    """Navigation payload for a cached block's agent fallback task.
+
+    Beyond the workflow-level ``script_run_parameters``, this threads the current loop
+    iteration's value (``current_value`` / ``current_index`` / ``current_item``) into the
+    payload. Without it the fallback agent only sees the rendered goal prose, so select/search
+    interactions inside a loop resolve to a page-visible label instead of the intended value
+    (SKY-10708).
+    """
+    payload: dict[str, Any] = dict(context.script_run_parameters or {})
+    if context.loop_metadata:
+        for key in ("current_value", "current_index", "current_item"):
+            if key in context.loop_metadata:
+                payload[key] = context.loop_metadata[key]
+    return payload or None
+
+
 async def _create_workflow_block_run_and_task(
     block_type: BlockType,
     prompt: str | None = None,
@@ -498,8 +516,9 @@ async def _create_workflow_block_run_and_task(
             if url:
                 url = _render_template_with_label(url, label)
             # Include script parameters as navigation_payload so handlers
-            # (e.g. file upload) can find URLs like resume_link in the payload.
-            nav_payload = context.script_run_parameters or None
+            # (e.g. file upload) can find URLs like resume_link in the payload,
+            # plus the current loop value so a fallback search uses the intended value.
+            nav_payload = _build_fallback_navigation_payload(context)
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
@@ -1908,7 +1927,7 @@ async def run_task(
             await _handle_script_termination(e, "task block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run task block. Falling back to AI run.")
+            LOG.warning("Failed to run task block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.NAVIGATION,
                 cache_key=cache_key,
@@ -2114,14 +2133,15 @@ async def download(
                     # Skip incomplete downloads
                     if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
-                    final_file_name = download_suffix
-                    target_path = local_download_dir / (final_file_name + file_extension)
-                    counter = 1
-                    while target_path.exists():
-                        final_file_name = f"{download_suffix}_{counter}"
-                        target_path = local_download_dir / (final_file_name + file_extension)
-                        counter += 1
-                    rename_file(file_path, final_file_name + file_extension)
+                    local_basename = Path(file_path).name
+                    existing_names = {
+                        Path(f).name
+                        for f in list_files_in_directory(local_download_dir)
+                        if Path(f).name != local_basename
+                    }
+                    desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    if local_basename != desired_name:
+                        rename_file(file_path, desired_name)
 
             # Upload downloaded files from local filesystem to remote storage
             # so that get_downloaded_files() can find them for verification.
@@ -2194,7 +2214,7 @@ async def download(
             await _handle_script_termination(e, "download block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run download block. Falling back to AI run.")
+            LOG.warning("Failed to run download block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.FILE_DOWNLOAD,
                 cache_key=cache_key,
@@ -2284,7 +2304,7 @@ async def action(
             await _handle_script_termination(e, "action block", workflow_run_block_id, task_id, step_id, cache_key)
             raise
         except Exception as e:
-            LOG.exception("Failed to run action block. Falling back to AI run.")
+            LOG.warning("Failed to run action block. Falling back to AI run.", exc_info=True)
             await _fallback_to_ai_run(
                 block_type=BlockType.ACTION,
                 cache_key=cache_key,
@@ -2852,7 +2872,16 @@ async def upload_file(
     azure_blob_container_name: str | None = None,
     google_credential_id: str | None = None,
     google_drive_folder_id: str | None = None,
+    sftp_host: str | None = None,
+    sftp_port: int | None = None,
+    sftp_username: str | None = None,
+    sftp_password: str | None = None,
+    sftp_private_key: str | None = None,
+    sftp_private_key_passphrase: str | None = None,
+    sftp_remote_path: str | None = None,
+    sftp_host_key: str | None = None,
     path: str | None = None,
+    prompt: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     if s3_bucket:
@@ -2873,6 +2902,22 @@ async def upload_file(
         google_credential_id = _render_template_with_label(google_credential_id, label)
     if google_drive_folder_id:
         google_drive_folder_id = _render_template_with_label(google_drive_folder_id, label)
+    if sftp_host:
+        sftp_host = _render_template_with_label(sftp_host, label)
+    if sftp_username:
+        sftp_username = _render_template_with_label(sftp_username, label)
+    if sftp_password:
+        sftp_password = _render_template_with_label(sftp_password, label)
+    if sftp_private_key:
+        sftp_private_key = _render_template_with_label(sftp_private_key, label)
+    if sftp_private_key_passphrase:
+        sftp_private_key_passphrase = _render_template_with_label(sftp_private_key_passphrase, label)
+    if sftp_remote_path:
+        sftp_remote_path = _render_template_with_label(sftp_remote_path, label)
+    if sftp_host_key:
+        sftp_host_key = _render_template_with_label(sftp_host_key, label)
+    if prompt:
+        prompt = _render_template_with_label(prompt, label)
     if path:
         path = _render_template_with_label(path, label)
     file_upload_block = FileUploadBlock(
@@ -2889,6 +2934,15 @@ async def upload_file(
         azure_blob_container_name=azure_blob_container_name,
         google_credential_id=google_credential_id,
         google_drive_folder_id=google_drive_folder_id,
+        sftp_host=sftp_host,
+        sftp_port=sftp_port,
+        sftp_username=sftp_username,
+        sftp_password=sftp_password,
+        sftp_private_key=sftp_private_key,
+        sftp_private_key_passphrase=sftp_private_key_passphrase,
+        sftp_remote_path=sftp_remote_path,
+        sftp_host_key=sftp_host_key,
+        prompt=prompt,
         path=path,
     )
     await file_upload_block.execute_safe(
@@ -3002,6 +3056,7 @@ async def http_request(
     follow_redirects: bool = True,
     label: str | None = None,
     parameters: list[str] | None = None,
+    secret_response_paths: list[str] | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     method = _render_template_with_label(method, label)
@@ -3013,6 +3068,7 @@ async def http_request(
         body=body,
         timeout=timeout,
         follow_redirects=follow_redirects,
+        secret_response_paths=secret_response_paths,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,

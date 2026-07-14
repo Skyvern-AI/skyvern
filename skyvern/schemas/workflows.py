@@ -443,6 +443,8 @@ class BlockType(StrEnum):
     GOOGLE_SHEETS_READ = "google_sheets_read"
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
     PDF_FILL = "pdf_fill"
+    SPLIT_PDF = "split_pdf"
+    EMAIL_INBOX = "email_inbox"
 
 
 class AIFallbackMode(StrEnum):
@@ -491,6 +493,7 @@ class FileType(StrEnum):
     PDF = "pdf"
     IMAGE = "image"
     DOCX = "docx"
+    ZIP = "zip"
 
 
 class PDFFormat(StrEnum):
@@ -504,6 +507,7 @@ class FileStorageType(StrEnum):
     S3 = "s3"
     AZURE = "azure"
     GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
 
 
 class FileUploadDestination(BaseModel):
@@ -531,6 +535,14 @@ class FileUploadDestination(BaseModel):
 
     google_access_token: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
 
 
 class ParameterYAML(BaseModel, abc.ABC):
@@ -595,6 +607,8 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
 class CredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
     credential_id: str
+    credential_ids: list[str] | None = None
+    selection_strategy: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
@@ -912,6 +926,18 @@ class FileUploadBlockYAML(BlockYAML):
     azure_folder_path: str | None = None
     google_credential_id: str | None = None
     google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language control over which downloaded files are uploaded; empty means upload all.",
+    )
     path: str | None = None
 
 
@@ -956,6 +982,7 @@ class ValidationBlockYAML(BlockYAML):
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
+    without_page_information: bool = False
 
 
 class ActionBlockYAML(BlockYAML):
@@ -1105,9 +1132,16 @@ class HttpRequestBlockYAML(BlockYAML):
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
+    secret_response_paths: list[str] | None = None
 
     # Parameter keys for templating
     parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_secret_response_paths_file_conflict(self) -> "HttpRequestBlockYAML":
+        if self.save_response_as_file and self.secret_response_paths:
+            raise ValueError("secret_response_paths cannot be combined with save_response_as_file")
+        return self
 
 
 class PrintPageBlockYAML(BlockYAML):
@@ -1163,6 +1197,48 @@ class PdfFillBlockYAML(BlockYAML):
         return self
 
 
+class SplitPdfBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.SPLIT_PDF] = BlockType.SPLIT_PDF  # type: ignore
+    file_url: str
+    prompt: str
+    llm_key: str | None = None
+    parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def normalize_llm_selection(self) -> "SplitPdfBlockYAML":
+        raw_llm_key = self.llm_key.strip() if self.llm_key else None
+
+        if self.model:
+            self.llm_key = None
+            return self
+
+        if not raw_llm_key:
+            self.llm_key = None
+            return self
+
+        if _has_jinja_syntax(raw_llm_key):
+            self.llm_key = raw_llm_key
+            return self
+
+        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+        if model_name:
+            self.model = {"model_name": model_name}
+            self.llm_key = None
+            return self
+
+        if raw_llm_key in LLMConfigRegistry.get_model_names():
+            self.llm_key = raw_llm_key
+            return self
+
+        LOG.warning(
+            "Unrecognized split pdf llm_key; defaulting to Skyvern Optimized/default model path",
+            label=self.label,
+            llm_key=raw_llm_key,
+        )
+        self.llm_key = None
+        return self
+
+
 class WorkflowTriggerBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WORKFLOW_TRIGGER] = BlockType.WORKFLOW_TRIGGER  # type: ignore
 
@@ -1187,6 +1263,20 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     range: str | None = None
     credential_id: str | None = None
     has_header_row: bool = True
+    parameter_keys: list[str] | None = None
+
+
+class EmailInboxBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
+    email_client: Literal["gmail", "outlook"]
+    credential_id: str | None = None
+    folder: str | None = None
+    prompt: str | None = None
+    sender: str | None = None
+    subject: str | None = None
+    newer_than_days: int | None = None
+    max_results: int = 25
+    include_body: bool = True
     parameter_keys: list[str] | None = None
 
 
@@ -1243,8 +1333,10 @@ BLOCK_YAML_SUBCLASSES = (
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | PdfFillBlockYAML
+    | SplitPdfBlockYAML
     | WorkflowTriggerBlockYAML
     | GoogleSheetsReadBlockYAML
+    | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
@@ -1305,6 +1397,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
     browser_profile_key: str | None = None
     model: dict[str, Any] | None = None

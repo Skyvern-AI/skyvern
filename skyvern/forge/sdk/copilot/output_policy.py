@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
@@ -12,6 +13,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_yaml_in_chat,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
     RequestPolicy,
     contains_email_password_pair,
     request_policy_has_present_completion_contract,
@@ -20,17 +22,22 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
 )
+from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
-    credential_params,
+    credential_param_ids,
     parse_workflow_yaml,
     url_origin,
     workflow_blocks,
     workflow_credential_ids_from_parsed,
     workflow_credential_origins_from_parsed,
 )
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 WORKFLOW_PRESENT_SENTINEL = object()
+ACTUATION_OBLIGATION_STEER_REASON_CODE = "actuation_obligation_steer"
+ACTUATION_OBLIGATION_UNMET_REASON_CODE = "actuation_obligation_unmet"
+ACTUATION_OBLIGATION_BROWSER_ACTION_KEY = "browser_state:build:no_update:no_run"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
 # RHS of a secret-keyword assignment that references a bound value instead of carrying one:
@@ -127,6 +134,31 @@ _INTERNAL_TOOL_PARAPHRASE_PHRASES = ("nudge turn", "nudge-turn")
 _INTERNAL_COPILOT_SENTINEL_PREFIX = "[copilot:"
 _LOOP_DETECTED_MARKER = "loop detected"
 
+# Copilot's own paraphrase for a formatting change it made — not standard YAML
+# vocabulary, so a legitimate clarification is not going to phrase itself this way.
+# Runs for every response type, including ASK_QUESTION.
+_YAML_AUTHORING_JARGON_PHRASES = (
+    "folded code formatting",
+    "literal code formatting",
+)
+# Standard YAML block-scalar terminology (folded `>` vs literal `|`). A legitimate
+# ASK_QUESTION can ask the user which style they want for a multi-line value, so these
+# only count as a leak once the reply is final and user-visible.
+_YAML_BLOCK_SCALAR_TERM_PHRASES = (
+    "folded block scalar",
+    "literal block scalar",
+)
+
+
+def _contains_yaml_authoring_vocab_leak(user_response: str, response_type: str) -> bool:
+    lower = user_response.lower()
+    if any(phrase in lower for phrase in _YAML_AUTHORING_JARGON_PHRASES):
+        return True
+    return response_type in _USER_VISIBLE_REPLY_TYPES and any(
+        phrase in lower for phrase in _YAML_BLOCK_SCALAR_TERM_PHRASES
+    )
+
+
 _SELF_PRESCRIPTIVE_FIXED_PHRASE = "send me a normal instruction like"
 _SELF_PRESCRIPTIVE_IMPERATIVE_VERBS = frozenset({"send", "reply", "type", "respond"})
 _SELF_PRESCRIPTIVE_POLITE_PREFIXES = frozenset({"please", "kindly", "just", "now"})
@@ -182,6 +214,26 @@ class CopilotOutputKind(StrEnum):
     WORKFLOW_RUN_RESULT = "workflow_run_result"
 
 
+class CannotActReason(StrEnum):
+    MISSING_FIELD_VALUE = "missing_field_value"
+    AMBIGUOUS_TARGET = "ambiguous_target"
+    STRUCTURAL_BLOCKER = "structural_blocker"
+
+
+class ActuationObligationStatus(StrEnum):
+    ALLOWED = "allowed"
+    STEER = "steer"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class ActuationObligationEvaluation:
+    status: ActuationObligationStatus = ActuationObligationStatus.ALLOWED
+    reason_code: str = ""
+    cannot_act_reason: CannotActReason | None = None
+    obligation_key: str = ""
+
+
 class OutputPolicyReason(StrEnum):
     RAW_SECRET_LEAK = "raw_secret_leak"
     REQUEST_POLICY_CLARIFICATION_BYPASS = "request_policy_clarification_bypass"
@@ -198,6 +250,8 @@ class OutputPolicyReason(StrEnum):
     SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
     WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
     AVOIDABLE_OUTPUT_FIELD_CONFIRMATION = "avoidable_output_field_confirmation"
+    ACTUATION_OBLIGATION_STEER = ACTUATION_OBLIGATION_STEER_REASON_CODE
+    ACTUATION_OBLIGATION_UNMET = ACTUATION_OBLIGATION_UNMET_REASON_CODE
 
 
 @dataclass
@@ -231,8 +285,95 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
         OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION,
+        OutputPolicyReason.ACTUATION_OBLIGATION_STEER,
+        OutputPolicyReason.ACTUATION_OBLIGATION_UNMET,
     }
 )
+
+
+def coerce_cannot_act_reason(value: str | None) -> CannotActReason | None:
+    if value is None:
+        return None
+    try:
+        return CannotActReason(value)
+    except ValueError:
+        return None
+
+
+def turn_intent_requires_actuation(turn_intent: TurnIntent | None) -> bool:
+    return (
+        isinstance(turn_intent, TurnIntent)
+        and turn_intent.mode in {TurnIntentMode.BUILD, TurnIntentMode.UNKNOWN}
+        and RequiredContextKey.BROWSER_STATE in turn_intent.required_context
+        and not turn_intent.authority.may_update_workflow
+        and not turn_intent.authority.may_run_blocks
+    )
+
+
+def actuation_obligation_key(turn_intent: TurnIntent | None) -> str:
+    if not turn_intent_requires_actuation(turn_intent):
+        return ""
+    if turn_intent is not None and turn_intent.mode == TurnIntentMode.UNKNOWN:
+        return "browser_state:unknown:no_update:no_run"
+    return ACTUATION_OBLIGATION_BROWSER_ACTION_KEY
+
+
+def completion_criterion_requires_browser_fill_delivery(criterion: CompletionCriterion) -> bool:
+    if criterion.kind == "terminal_action" and criterion.terminal_action_family == "form":
+        return True
+    return criterion.kind == "outcome" and criterion.level == "run" and criterion.method_mandated
+
+
+def request_policy_requires_durable_fill(request_policy: RequestPolicy | None) -> bool:
+    return isinstance(request_policy, RequestPolicy) and any(
+        completion_criterion_requires_browser_fill_delivery(criterion)
+        for criterion in request_policy.completion_criteria
+    )
+
+
+def prior_turn_satisfies_actuation_terminal_condition(
+    prior_turn_outcome: TurnOutcome | None,
+    obligation_key: str,
+) -> bool:
+    # One key covers the turn's actuation obligation; a later partial action
+    # still failed the same browser-fill contract.
+    return (
+        prior_turn_outcome is not None
+        and prior_turn_outcome.reason_code
+        in {ACTUATION_OBLIGATION_STEER_REASON_CODE, ACTUATION_OBLIGATION_UNMET_REASON_CODE}
+        and prior_turn_outcome.actuation_obligation_key == obligation_key
+    )
+
+
+def evaluate_actuation_obligation(
+    *,
+    turn_intent: TurnIntent | None,
+    response_type: str,
+    output_kind: CopilotOutputKind,
+    successful_mutating_browser_actions: int,
+    cannot_act_reason: CannotActReason | None,
+    prior_turn_outcome: TurnOutcome | None,
+) -> ActuationObligationEvaluation:
+    obligation_key = actuation_obligation_key(turn_intent)
+    if (
+        not turn_intent_requires_actuation(turn_intent)
+        or response_type != "REPLY"
+        or output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER
+    ):
+        return ActuationObligationEvaluation(cannot_act_reason=cannot_act_reason)
+    if successful_mutating_browser_actions > 0 or cannot_act_reason is not None:
+        return ActuationObligationEvaluation(cannot_act_reason=cannot_act_reason, obligation_key=obligation_key)
+    if prior_turn_satisfies_actuation_terminal_condition(prior_turn_outcome, obligation_key):
+        return ActuationObligationEvaluation(
+            status=ActuationObligationStatus.TERMINAL,
+            reason_code=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
+            obligation_key=obligation_key,
+        )
+    return ActuationObligationEvaluation(
+        status=ActuationObligationStatus.STEER,
+        reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
+        obligation_key=obligation_key,
+    )
 
 
 def hard_block_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVerdict:
@@ -553,6 +694,8 @@ def _contains_internal_block_taxonomy_leak(
         return False
     if _contains_deprecated_block_identifier(user_response):
         return True
+    if _contains_yaml_authoring_vocab_leak(user_response, response_type):
+        return True
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response):
         return True
     if output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER:
@@ -837,7 +980,7 @@ def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request
     if not isinstance(workflow_definition, dict):
         return False
 
-    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
     if not credential_params_by_key:
         return False
 
@@ -861,7 +1004,7 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
 
 def _block_broadens_credential_scope(
     block: dict[str, Any],
-    credential_params_by_key: dict[str, str],
+    credential_params_by_key: Mapping[str, str | set[str]],
     approved_origins: dict[str, set[str]],
 ) -> bool:
     credential_ids = block_credential_ids(block, credential_params_by_key)

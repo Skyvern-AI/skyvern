@@ -66,17 +66,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _watchdog_user_failure_reason,
 )
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
-
-
-def _fresh_context() -> CopilotContext:
-    return CopilotContext(
-        organization_id="o",
-        workflow_id="w",
-        workflow_permanent_id="wp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
+from tests.unit.conftest import make_copilot_context as _fresh_context
 
 
 def _budget_trip_result(workflow_run_id: str = "wr_1") -> dict:
@@ -436,7 +426,10 @@ def test_progress_reply_after_post_run_observation_still_gets_anti_bot_nudge() -
     ctx = _fresh_context()
     ctx.update_workflow_called = True
     ctx.test_after_update_done = True
-    ctx.composition_page_evidence = {"anti_bot_indicators": ["human-verification"]}
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["human-verification"],
+        "challenge_controls": [{"tag": "div", "selector": "#human-verification-widget"}],
+    }
     _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
     _record_composition_page_observation(
         ctx,
@@ -977,10 +970,8 @@ def test_terminal_anti_bot_blocker_requires_gated_submit_evidence_for_disabled_f
     assert _last_run_has_terminal_anti_bot_blocker(ctx) is False
 
 
-def test_record_run_blocks_treats_structured_anti_bot_blocker_as_terminal_challenge() -> None:
-    ctx = _fresh_context()
-    ctx.workflow_yaml = "workflow_definition: {blocks: []}"
-    result = {
+def _prose_blocker_run_result() -> dict:
+    return {
         "ok": True,
         "data": {
             "workflow_run_id": "wr_blocked",
@@ -1004,17 +995,40 @@ def test_record_run_blocks_treats_structured_anti_bot_blocker_as_terminal_challe
         },
     }
 
+
+def test_record_run_blocks_keeps_prose_blocker_message_out_of_terminal_challenge() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = "workflow_definition: {blocks: []}"
+    result = _prose_blocker_run_result()
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_anti_bot is None
+    assert "Verify you are human" in ctx.last_test_failure_reason
+    categories = result["data"]["failure_categories"]
+    assert [category["category"] for category in categories] == ["PARAMETER_BINDING_ERROR"]
+    assert ctx.last_failure_category_top == "PARAMETER_BINDING_ERROR"
+    assert ctx.last_run_outcome is None or ctx.last_run_outcome.reason_code != "terminal_challenge_blocker"
+
+
+def test_record_run_blocks_treats_typed_anti_bot_flag_as_terminal_challenge() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = "workflow_definition: {blocks: []}"
+    result = _prose_blocker_run_result()
+    result["data"]["blocks"][0]["extracted_data"]["extracted_information"]["human_verification_required"] = True
+
     _record_run_blocks_result(ctx, result)
 
     assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_anti_bot is not None
-    assert "Verify you are human" in ctx.last_test_failure_reason
     assert ctx.last_failed_workflow_yaml == "workflow_definition: {blocks: []}"
-    assert result["data"]["failure_reason"] == "Run output reported a blocker: Verify you are human"
     categories = result["data"]["failure_categories"]
     assert categories[0]["category"] == "PARAMETER_BINDING_ERROR"
     assert categories[1]["category"] == "ANTI_BOT_DETECTION"
+    assert categories[1]["evidence_source"] == "artifact"
     assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
     assert ctx.last_run_outcome is not None
     assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
@@ -1098,6 +1112,61 @@ def test_record_run_blocks_prefers_nested_port_blocker_over_status_shell() -> No
     assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
     assert ctx.turn_halt is not None
     assert "Requested port" in ctx.turn_halt.extra["evidence_reason"]
+
+
+def test_record_run_blocks_keyword_only_top_category_is_not_latched() -> None:
+    ctx = _fresh_context()
+    result = {
+        "ok": False,
+        "error": "run failed",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "failure_reason": "Cloudflare interstitial was displayed while the page loaded.",
+            "failure_categories": [
+                {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.7, "evidence_source": "keyword_only"},
+                {"category": "PAGE_LOAD_TIMEOUT", "confidence_float": 0.8},
+            ],
+            "blocks": [],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_failure_category_top == "PAGE_LOAD_TIMEOUT"
+    assert ctx.last_test_anti_bot is None
+    assert ctx.turn_halt is None
+
+
+def test_watchdog_cancel_with_stale_challenge_markup_is_not_promoted() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["turnstile"],
+        "challenge_controls": [],
+        "challenge_state": {
+            "detected": True,
+            "kind": "captcha",
+            "requires_human_verification": False,
+            "gates_submit_controls": False,
+        },
+    }
+    result = {
+        "ok": False,
+        "error": "Run canceled after 90s of stagnation while a Cloudflare interstitial was displayed.",
+        "data": {
+            "workflow_run_id": "wr_cancelled",
+            "overall_status": "canceled",
+            "failure_reason": "Run canceled after stagnation.",
+            "blocks": [],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_anti_bot is None
+    assert ctx.last_failure_category_top != "ANTI_BOT_DETECTION"
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
 
 
 def test_record_run_blocks_combines_status_blocked_with_page_challenge_evidence() -> None:

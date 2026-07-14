@@ -264,6 +264,42 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            "gpt-5.6-sol",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            "gpt-5.6-terra",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            "gpt-5.6-luna",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -891,6 +927,81 @@ if settings.ENABLE_AZURE_GPT5_4:
                 api_key=settings.AZURE_GPT5_4_API_KEY,
                 api_version=settings.AZURE_GPT5_4_API_VERSION,
                 model_info={"model_name": "azure/gpt-5.4"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_SOL:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_SOL_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_SOL_DEPLOYMENT",
+                "AZURE_GPT5_6_SOL_API_KEY",
+                "AZURE_GPT5_6_SOL_API_BASE",
+                "AZURE_GPT5_6_SOL_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_SOL_API_BASE,
+                api_key=settings.AZURE_GPT5_6_SOL_API_KEY,
+                api_version=settings.AZURE_GPT5_6_SOL_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-sol"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_TERRA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_TERRA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_TERRA_DEPLOYMENT",
+                "AZURE_GPT5_6_TERRA_API_KEY",
+                "AZURE_GPT5_6_TERRA_API_BASE",
+                "AZURE_GPT5_6_TERRA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_TERRA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_TERRA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_TERRA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-terra"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_LUNA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_LUNA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_LUNA_DEPLOYMENT",
+                "AZURE_GPT5_6_LUNA_API_KEY",
+                "AZURE_GPT5_6_LUNA_API_BASE",
+                "AZURE_GPT5_6_LUNA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_LUNA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_LUNA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_LUNA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-luna"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,
@@ -1638,13 +1749,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1757,13 +1868,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,

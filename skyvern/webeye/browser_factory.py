@@ -170,6 +170,10 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
                 raw_path = await video.path()
             if raw_path is None:
                 return
+            # The await above may have raced a discard (RealBrowserState closing this page
+            # before it ever became the working page) — honor it even though it landed after.
+            if browser_artifacts.is_page_video_discarded(page):
+                return
             video_path = str(raw_path)
             # After the await, another handler may have already registered this path
             if video_path in tracked_paths:

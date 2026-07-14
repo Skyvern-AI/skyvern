@@ -12,13 +12,22 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.code_block_preflight import SANDBOX_UNRESOLVED_NAME_REASON_CODE
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    only_degraded_blocking,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.result_evidence import LoadedResultCompositionEvidence
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.result_evidence import (
+    LoadedResultCompositionEvidence,
+    ScoutObservationContract,
+    scout_observation_contract_valid,
+)
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, RunOutcomeReasonCode
 
 LOG = structlog.get_logger()
 
@@ -50,12 +59,17 @@ BuildTestOutcomeReasonCode = Literal[
     "metadata_reject",
     "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
+    "required_input_unbound",
+    "fallback_floor_turn_unsatisfiable",
+    "output_source_unobservable",
+    "actuation_exhausted",
 ]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
 _TEXT_MAX = 180
 _REF_TEXT_MAX = 96
+_VALUE_EXCERPT_MAX = 700
 _HISTORY_LIMIT = 8
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
 _PLAYWRIGHT_LOCATOR_WAIT_RE = re.compile(
@@ -78,18 +92,27 @@ class RecordedBuildTestOutcome(BaseModel):
     observed_evidence_summary: str = ""
     workflow_run_id: str | None = None
     block_labels: list[str] = Field(default_factory=list)
+    requested_block_labels: list[str] = Field(default_factory=list)
+    block_shape_hashes: dict[str, str] = Field(default_factory=dict)
     structural_failure_identity: str = ""
     verified_progress_marker: str = ""
     page_evidence_refs: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     missing_requested_output_facts: list[dict[str, object]] = Field(default_factory=list)
+    runtime_output_repair_facts: list[dict[str, object]] = Field(default_factory=list)
     authored_structure_signature: str | None = None
     display_text: str = ""
+    observed_page_value_excerpt: str = ""
     key_provenance: dict[str, str] = Field(default_factory=dict)
 
     @property
     def structural_key_payload(self) -> dict[str, object] | None:
-        if not (self.structural_failure_identity or self.verified_progress_marker or self.page_evidence_refs):
+        if not (
+            self.structural_failure_identity
+            or self.verified_progress_marker
+            or self.page_evidence_refs
+            or self.runtime_output_repair_facts
+        ):
             return None
         return {
             "version": _STRUCTURAL_KEY_VERSION,
@@ -103,6 +126,7 @@ class RecordedBuildTestOutcome(BaseModel):
             "page_evidence_refs": sorted(self.page_evidence_refs),
             "evidence_refs": sorted(self.evidence_refs),
             "missing_requested_output_facts": self.missing_requested_output_facts,
+            "runtime_output_repair_facts": self.runtime_output_repair_facts,
         }
 
     @property
@@ -158,10 +182,60 @@ class RecordedOutcomeGroundingRequirement(BaseModel):
     payload: RecordedOutcomeGroundingPayload | None = None
 
 
+BindingFrontierFacet = Literal[
+    "unexecuted_submit",
+    "value_shape",
+    "amend_in_place",
+    "selector_frontier",
+]
+_UNCROSSABLE_DIAGNOSTIC_REASONS = frozenset({"empty_page", "challenge_gated", "capture_degraded"})
+_AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES: frozenset[RunOutcomeReasonCode] = frozenset(
+    {"outcome_not_demonstrated", "no_meaningful_output"}
+)
+
+
+def _recorded_outcome_degrade_eligible(
+    recorded_run_outcome: RecordedRunOutcome,
+    failed_block: Mapping[str, object] | None,
+) -> bool:
+    if failed_block is not None:
+        return False
+    reason_code = recorded_run_outcome.reason_code
+    return reason_code is None or reason_code in _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES
+
+
+class RecordedOutcomeBindingConstraint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repeated_structural_key: str
+    phase: BuildTestOutcomePhase
+    reason_code: BuildTestOutcomeReasonCode
+    frontier_facet: BindingFrontierFacet
+    owning_block_labels: list[str] = Field(default_factory=list)
+    diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = "none"
+    workflow_run_id: str | None = None
+    recorded_block_signatures: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def frontier_uncrossable(self) -> bool:
+        return self.diagnostic_reason in _UNCROSSABLE_DIAGNOSTIC_REASONS
+
+    def owning_block_frontier_moved(self, candidate_block_signatures: Mapping[str, str]) -> bool:
+        if not self.owning_block_labels:
+            return True
+        for label in self.owning_block_labels:
+            recorded = self.recorded_block_signatures.get(label)
+            if recorded is None or candidate_block_signatures.get(label) != recorded:
+                return True
+        return False
+
+
 class _RecordedBuildTestOutcomeContext(Protocol):
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
     recorded_build_test_outcome_history: list[dict[str, object]]
+    recorded_persisted_block_run_workflow_run_id: str | None
     recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None
+    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None
 
 
 def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuildTestOutcome | None) -> None:
@@ -185,6 +259,8 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     )
     del history[:-_HISTORY_LIMIT]
     ctx.recorded_build_test_outcome_history = history
+    if outcome.phase == "persisted_block_run" and outcome.is_authoritative and outcome.workflow_run_id:
+        ctx.recorded_persisted_block_run_workflow_run_id = outcome.workflow_run_id
     LOG.info(
         "copilot recorded build-test outcome stored",
         phase=outcome.phase,
@@ -207,6 +283,110 @@ def authored_structure_signature_from_workflow(
     return _stable_hash(payload)
 
 
+def authored_block_signatures_from_workflow(
+    workflow_yaml: str | None,
+    code_artifact_metadata: object = None,
+) -> dict[str, str]:
+    payload = _authored_structure_payload_from_workflow(workflow_yaml, code_artifact_metadata)
+    if payload is None:
+        return {}
+    signatures: dict[str, str] = {}
+    code_blocks = payload.get("code_blocks")
+    if not isinstance(code_blocks, list):
+        return signatures
+    for block in code_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        label = _safe_str(block.get("label"))
+        if not label:
+            continue
+        signatures[label] = _stable_hash(
+            {
+                "code_hash": block.get("code_hash"),
+                "parameter_keys": block.get("parameter_keys"),
+                "output_metadata": block.get("output_metadata"),
+            }
+        )
+    return signatures
+
+
+def authored_block_parameter_keys_from_workflow(
+    workflow_yaml: str | None,
+    code_artifact_metadata: object = None,
+) -> dict[str, list[str]]:
+    payload = _authored_structure_payload_from_workflow(workflow_yaml, code_artifact_metadata)
+    if payload is None:
+        return {}
+    result: dict[str, list[str]] = {}
+    code_blocks = payload.get("code_blocks")
+    if not isinstance(code_blocks, list):
+        return result
+    for block in code_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        label = _safe_str(block.get("label"))
+        if not label:
+            continue
+        keys = block.get("parameter_keys")
+        if isinstance(keys, list):
+            result[label] = [_safe_str(key) for key in keys if _safe_str(key)]
+    return result
+
+
+def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontierFacet:
+    if outcome.reason_code == "scout_act_observe_hollow_after_interaction":
+        return "unexecuted_submit"
+    if outcome.runtime_output_repair_facts:
+        return "amend_in_place"
+    if outcome.missing_requested_output_facts:
+        return "value_shape"
+    if outcome.reason_code in {
+        "sandbox_unresolved_name",
+        "synthesized_parameter_binding_ambiguous",
+        "required_input_unbound",
+    }:
+        return "amend_in_place"
+    if outcome.reason_code in {"outcome_not_demonstrated", "no_meaningful_output", "runtime_missing_output_dependency"}:
+        return "value_shape"
+    return "selector_frontier"
+
+
+def _bind_recorded_outcome_constraint(ctx: object, requirement: RecordedOutcomeGroundingRequirement) -> None:
+    outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    payload = requirement.payload
+    if not isinstance(outcome, RecordedBuildTestOutcome) or payload is None:
+        return
+    owning_labels = _clean_list(
+        outcome.block_labels or ([outcome.attempted_block_label] if outcome.attempted_block_label else [])
+    )
+    recorded_signatures = authored_block_signatures_from_workflow(
+        getattr(ctx, "workflow_yaml", None),
+        getattr(ctx, "code_artifact_metadata", None),
+    )
+    constraint = RecordedOutcomeBindingConstraint(
+        repeated_structural_key=requirement.structural_key,
+        phase=outcome.phase,
+        reason_code=outcome.reason_code,
+        frontier_facet=_binding_frontier_facet(outcome),
+        owning_block_labels=owning_labels,
+        diagnostic_reason=payload.diagnostic_reason,
+        workflow_run_id=requirement.workflow_run_id,
+        recorded_block_signatures={
+            label: recorded_signatures[label] for label in owning_labels if label in recorded_signatures
+        },
+    )
+    ctx.recorded_outcome_binding_constraint = constraint  # type: ignore[attr-defined]
+    LOG.info(
+        "copilot recorded outcome binding bound",
+        repeated_structural_key=constraint.repeated_structural_key,
+        frontier_facet=constraint.frontier_facet,
+        owning_block_labels=constraint.owning_block_labels,
+        diagnostic_reason=constraint.diagnostic_reason,
+        frontier_uncrossable=constraint.frontier_uncrossable,
+        workflow_run_id=constraint.workflow_run_id,
+    )
+
+
 def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
     history = getattr(ctx, "recorded_build_test_outcome_history", None)
     if not isinstance(history, list) or not history:
@@ -223,6 +403,13 @@ def latest_recorded_build_test_outcome_repeated(ctx: object) -> bool | None:
         if isinstance(previous_key, str):
             return previous_key == latest["structural_key"]
     return None
+
+
+def run_backed_repair_evidence_exists(ctx: object) -> bool:
+    # Reached from the enforcement belt with an untyped ctx; a ctx without the latch must read as
+    # "no run-backed evidence" so the guardrail fails safe instead of raising.
+    run_id = getattr(ctx, "recorded_persisted_block_run_workflow_run_id", None)
+    return isinstance(run_id, str) and bool(run_id)
 
 
 def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGroundingRequirement | None:
@@ -255,6 +442,7 @@ def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGr
     )
     if workflow_run_id is None:
         ctx.composition_page_evidence = None  # type: ignore[attr-defined]
+        ctx.scout_observation_contract = None  # type: ignore[attr-defined]
     ctx.recorded_outcome_grounding_requirement = requirement  # type: ignore[attr-defined]
     LOG.info(
         "copilot recorded outcome grounding armed",
@@ -270,6 +458,7 @@ def arm_recorded_outcome_grounding_requirement(ctx: object) -> RecordedOutcomeGr
 
 def clear_recorded_outcome_grounding_requirement(ctx: object) -> None:
     ctx.recorded_outcome_grounding_requirement = None  # type: ignore[attr-defined]
+    ctx.recorded_outcome_binding_constraint = None  # type: ignore[attr-defined]
 
 
 def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
@@ -281,6 +470,9 @@ def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
     evidence = getattr(ctx, "composition_page_evidence", None)
     if isinstance(evidence, dict) and _evidence_current_url(evidence):
         return True
+    contract = getattr(ctx, "scout_observation_contract", None)
+    if scout_observation_contract_valid(contract):
+        return True
     observed_urls = getattr(ctx, "observed_browser_urls", None)
     return isinstance(observed_urls, list) and any(isinstance(url, str) and url.strip() for url in observed_urls)
 
@@ -290,13 +482,15 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
     if not isinstance(requirement, RecordedOutcomeGroundingRequirement):
         return False
     evidence = getattr(ctx, "composition_page_evidence", None)
+    contract = getattr(ctx, "scout_observation_contract", None)
     payload = _grounding_payload_from_evidence(requirement, evidence)
     if payload is None:
-        _log_grounding_rejection(requirement, evidence)
+        payload = _grounding_payload_from_scout_contract(requirement, contract)
+    if payload is None:
+        _log_grounding_rejection(requirement, evidence, contract)
         return False
-    ctx.recorded_outcome_grounding_requirement = requirement.model_copy(  # type: ignore[attr-defined]
-        update={"satisfied": True, "payload": payload}
-    )
+    satisfied_requirement = requirement.model_copy(update={"satisfied": True, "payload": payload})
+    ctx.recorded_outcome_grounding_requirement = satisfied_requirement  # type: ignore[attr-defined]
     LOG.info(
         "copilot recorded outcome grounding satisfied",
         structural_key=requirement.structural_key,
@@ -305,14 +499,19 @@ def maybe_satisfy_recorded_outcome_grounding_requirement(ctx: object) -> bool:
         observed_after_workflow_run=payload.observed_after_workflow_run,
         source_tool=payload.source_tool,
     )
+    _bind_recorded_outcome_constraint(ctx, satisfied_requirement)
     return True
 
 
-def _log_grounding_rejection(requirement: RecordedOutcomeGroundingRequirement, evidence: object) -> None:
+def _log_grounding_rejection(
+    requirement: RecordedOutcomeGroundingRequirement,
+    evidence: object,
+    contract: object = None,
+) -> None:
     evidence_dict = evidence if isinstance(evidence, dict) else {}
     LOG.info(
         "copilot recorded outcome grounding rejected",
-        reject_reason=_grounding_reject_reason(requirement, evidence),
+        reject_reason=_grounding_reject_reason(requirement, evidence, contract),
         structural_key=requirement.structural_key,
         requirement_workflow_run_id=requirement.workflow_run_id,
         evidence_workflow_run_id=evidence_dict.get("workflow_run_id"),
@@ -325,16 +524,64 @@ def _log_grounding_rejection(requirement: RecordedOutcomeGroundingRequirement, e
 def _grounding_reject_reason(
     requirement: RecordedOutcomeGroundingRequirement,
     evidence: object,
+    contract: object = None,
 ) -> Literal["not_inspect_source", "degraded_page", "run_id_mismatch", "no_url"]:
-    if not isinstance(evidence, dict) or evidence.get("source_tool") != _INSPECT_PAGE_SOURCE_TOOL:
+    if isinstance(evidence, dict) and evidence.get("source_tool") == _INSPECT_PAGE_SOURCE_TOOL:
+        if _evidence_current_url(evidence) is None:
+            return "no_url"
+        run_id = requirement.workflow_run_id
+        if isinstance(run_id, str) and run_id:
+            if evidence.get("observed_after_workflow_run") is not True or evidence.get("workflow_run_id") != run_id:
+                return "run_id_mismatch"
+        return "degraded_page"
+    if isinstance(contract, ScoutObservationContract):
+        return _scout_contract_reject_reason(requirement, contract)
+    return "not_inspect_source"
+
+
+def _scout_contract_reject_reason(
+    requirement: RecordedOutcomeGroundingRequirement,
+    contract: ScoutObservationContract,
+) -> Literal["not_inspect_source", "degraded_page", "run_id_mismatch", "no_url"]:
+    if not scout_observation_contract_valid(contract):
         return "not_inspect_source"
-    if _evidence_current_url(evidence) is None:
+    if not contract.source_url.strip():
         return "no_url"
     run_id = requirement.workflow_run_id
     if isinstance(run_id, str) and run_id:
-        if evidence.get("observed_after_workflow_run") is not True or evidence.get("workflow_run_id") != run_id:
+        if not contract.observed_after_workflow_run or contract.workflow_run_id != run_id:
             return "run_id_mismatch"
     return "degraded_page"
+
+
+def _grounding_payload_from_scout_contract(
+    requirement: RecordedOutcomeGroundingRequirement,
+    contract: object,
+) -> RecordedOutcomeGroundingPayload | None:
+    if not isinstance(contract, ScoutObservationContract) or not scout_observation_contract_valid(contract):
+        return None
+    run_id = requirement.workflow_run_id
+    if isinstance(run_id, str) and run_id:
+        if not contract.observed_after_workflow_run or contract.workflow_run_id != run_id:
+            return None
+    capture_degraded = not contract.has_bounded_page_schema
+    diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = (
+        "capture_degraded" if capture_degraded else "none"
+    )
+    return RecordedOutcomeGroundingPayload(
+        repeated_structural_key=requirement.structural_key,
+        source_tool=contract.source_tool,
+        observed_after_workflow_run=contract.observed_after_workflow_run,
+        workflow_run_id=contract.workflow_run_id,
+        capture_degraded=capture_degraded,
+        target_url=requirement.required_target_url,
+        source_url=contract.source_url,
+        requirement_workflow_run_id=requirement.workflow_run_id,
+        payload_workflow_run_id=contract.workflow_run_id,
+        diagnostic_reason=diagnostic_reason,
+        current_origin=_origin(contract.source_url),
+        current_url_present=True,
+    )
 
 
 def _grounding_payload_from_evidence(
@@ -355,8 +602,7 @@ def _grounding_payload_from_evidence(
     challenge_gated = _challenge_gated_page_evidence(evidence)
     capture_degraded = not has_bounded_page_schema(evidence)
     observed_empty_page = _observed_empty_page_evidence(evidence)
-    if (challenge_gated or capture_degraded or observed_empty_page) and not (isinstance(run_id, str) and run_id):
-        return None
+    # No-run degraded captures are typed grounding evidence; downstream binding remains a separate gate.
     diagnostic_reason: Literal["none", "empty_page", "challenge_gated", "capture_degraded"] = "none"
     if challenge_gated:
         diagnostic_reason = "challenge_gated"
@@ -517,6 +763,7 @@ def recorded_outcome_from_author_time_reject(
     structural_payload: Mapping[str, object] | None = None,
     authored_structure_signature: str | None = None,
     observed_evidence_summary: str = "",
+    observed_page_value_excerpt: str = "",
     page_evidence_refs: Sequence[str] = (),
     missing_requested_output_facts: Sequence[Mapping[str, object]] = (),
 ) -> RecordedBuildTestOutcome:
@@ -533,12 +780,26 @@ def recorded_outcome_from_author_time_reject(
         authored_structure_signature=authored_structure_signature,
         missing_requested_output_facts=[dict(fact) for fact in missing_requested_output_facts],
         observed_evidence_summary=_bounded_text(observed_evidence_summary),
+        observed_page_value_excerpt=" ".join(observed_page_value_excerpt.split())[:_VALUE_EXCERPT_MAX],
         page_evidence_refs=_clean_list(page_evidence_refs),
         key_provenance={
             "structural_failure_identity": "author-time validator structural reason",
             "page_evidence_refs": "author-time validator structural refs",
         },
     )
+
+
+def author_time_reject_missing_output_paths(latest: RecordedBuildTestOutcome | None) -> set[str]:
+    if latest is None or latest.phase != "author_time_reject":
+        return set()
+    paths: set[str] = set()
+    for fact in latest.missing_requested_output_facts:
+        if not isinstance(fact, Mapping):
+            continue
+        output_path = fact.get("output_path")
+        if isinstance(output_path, str) and output_path:
+            paths.add(output_path)
+    return paths
 
 
 def recorded_outcome_from_loaded_result_evidence(
@@ -592,6 +853,14 @@ def recorded_outcome_from_scout_act_observe_hollow(
     source_origin = _origin_ref(source_url)
     current_origin = _origin_ref(current_url)
     bounded_recapture_result = _bounded_ref(recapture_result)
+    value_excerpt = _observed_page_value_excerpt(page_evidence)
+    LOG.info(
+        "copilot_hollow_value_carry",
+        reason_code="scout_act_observe_hollow_after_interaction",
+        value_excerpt_len=len(value_excerpt),
+        value_excerpt_sha8=hashlib.sha256(value_excerpt.encode()).hexdigest()[:8] if value_excerpt else "",
+        current_origin=current_origin,
+    )
     structural_payload = {
         "interaction_tool": _bounded_ref(interaction_tool),
         "selector": _bounded_ref(selector),
@@ -621,9 +890,56 @@ def recorded_outcome_from_scout_act_observe_hollow(
         structural_failure_identity="scout_act_observe:" + _stable_hash(structural_payload),
         page_evidence_refs=page_refs,
         observed_evidence_summary="Scout interaction reached the page, but bounded page evidence stayed hollow.",
+        observed_page_value_excerpt=value_excerpt,
         key_provenance={
             "structural_failure_identity": "scout interaction identity and bounded hollow page shape",
             "page_evidence_refs": "scout interaction source/current URL origins and structural counts",
+        },
+    )
+
+
+def _required_input_unbound_identity(
+    failed_block: Mapping[str, object] | None,
+    referenced_unbound_keys: Sequence[str],
+) -> str:
+    return "required_input_unbound:" + _stable_hash(
+        {
+            "source": "required_input_unbound",
+            "referenced_unbound_keys": sorted({str(key) for key in referenced_unbound_keys}),
+            "block_label": _safe_str(failed_block.get("label")) if failed_block is not None else "",
+            "block_status": _safe_str(failed_block.get("status")) if failed_block is not None else "",
+        }
+    )
+
+
+def _required_input_unbound_outcome(
+    failed_block: Mapping[str, object] | None,
+    block_labels: list[str],
+    requested_block_labels: list[str],
+    block_shape_hashes: Mapping[str, str],
+    workflow_run_id: str | None,
+    authored_structure_signature: str | None,
+    referenced_unbound_keys: Sequence[str],
+) -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        attempted_block_label=_safe_str(failed_block.get("label")) if failed_block is not None else "",
+        verdict="repairable_failure",
+        reason_code="required_input_unbound",
+        workflow_run_id=workflow_run_id or None,
+        block_labels=block_labels,
+        requested_block_labels=requested_block_labels,
+        block_shape_hashes=dict(block_shape_hashes),
+        structural_failure_identity=_required_input_unbound_identity(failed_block, referenced_unbound_keys),
+        authored_structure_signature=authored_structure_signature,
+        observed_evidence_summary=_bounded_text(
+            "unbound required inputs: " + ", ".join(_clean_list(referenced_unbound_keys))
+        ),
+        key_provenance={
+            "structural_failure_identity": (
+                "resolution-seam unbound required parameter keys referenced by the failed block"
+            )
         },
     )
 
@@ -635,16 +951,40 @@ def recorded_outcome_from_run_blocks_result(
     recorded_run_outcome: RecordedRunOutcome | None = None,
     completion_verification: CompletionVerificationResult | None = None,
     authored_structure_signature: str | None = None,
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]] | None = None,
+    unbound_required_parameter_keys: Sequence[str] | None = None,
+    block_parameter_keys: Mapping[str, Sequence[str]] | None = None,
+    block_shape_hashes: Mapping[str, str] | None = None,
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     blocks = _block_dicts(data.get("blocks"))
     failed_block = _first_failed_block(blocks)
     block_labels = [_safe_str(block.get("label")) for block in blocks if _safe_str(block.get("label"))]
+    requested = data.get("requested_block_labels")
+    requested_block_labels = (
+        _clean_list([label for label in requested if isinstance(label, str)]) if isinstance(requested, list) else []
+    )
+    block_shape_hashes = dict(block_shape_hashes or {})
+    referenced_unbound_keys = _referenced_unbound_input_keys(
+        result,
+        failed_block,
+        unbound_required_parameter_keys or [],
+        block_parameter_keys or {},
+    )
     page_refs = _page_evidence_refs(page_evidence)
     output_refs = _output_evidence_refs(blocks)
     verification_identity = _completion_verification_identity(completion_verification)
     missing_output_facts = _missing_requested_output_facts(completion_verification, blocks)
+    authoritative_workflow_run_id = (
+        recorded_run_outcome.workflow_run_id if recorded_run_outcome is not None else None
+    ) or workflow_run_id
+    runtime_output_facts = _runtime_output_repair_facts(
+        completion_verification,
+        blocks,
+        registered_output_parameter_payloads or _mapping_list(data.get("registered_output_parameter_values")),
+        authoritative_workflow_run_id,
+    )
     if recorded_run_outcome is not None:
         reason_code = _run_outcome_reason_code(recorded_run_outcome)
         if reason_code == "terminal_challenge_blocker":
@@ -655,6 +995,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "terminal blocker precedence suppresses repair prompt"},
@@ -667,6 +1009,8 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code="verified_success",
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 verified_progress_marker=verification_identity or "run_completed_verified",
                 evidence_refs=output_refs,
                 authored_structure_signature=authored_structure_signature,
@@ -684,9 +1028,21 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "run outcome was not evaluated"},
+            )
+        if referenced_unbound_keys:
+            return _required_input_unbound_outcome(
+                failed_block,
+                block_labels,
+                requested_block_labels,
+                block_shape_hashes,
+                recorded_run_outcome.workflow_run_id or workflow_run_id or None,
+                authored_structure_signature,
+                referenced_unbound_keys,
             )
         structural_identity = verification_identity
         evidence_refs = output_refs
@@ -698,9 +1054,29 @@ def recorded_outcome_from_run_blocks_result(
                 reason_code=reason_code,
                 workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
                 block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
                 authored_structure_signature=authored_structure_signature,
                 observed_evidence_summary=recorded_run_outcome.display_reason or "",
                 key_provenance={"structural_failure_identity": "no typed verification/page/output identity available"},
+            )
+        if (
+            completion_verification is not None
+            and only_degraded_blocking(completion_verification)
+            and _recorded_outcome_degrade_eligible(recorded_run_outcome, failed_block)
+        ):
+            return RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="fallback_floor_turn_unsatisfiable",
+                workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
+                block_labels=block_labels,
+                requested_block_labels=requested_block_labels,
+                block_shape_hashes=block_shape_hashes,
+                authored_structure_signature=authored_structure_signature,
+                observed_evidence_summary=recorded_run_outcome.display_reason or "",
+                key_provenance={"structural_failure_identity": "turn-unsatisfiable fallback floor, no reachable route"},
             )
         return RecordedBuildTestOutcome(
             phase="persisted_block_run",
@@ -709,10 +1085,13 @@ def recorded_outcome_from_run_blocks_result(
             reason_code=reason_code,
             workflow_run_id=recorded_run_outcome.workflow_run_id or workflow_run_id or None,
             block_labels=block_labels,
+            requested_block_labels=requested_block_labels,
+            block_shape_hashes=block_shape_hashes,
             structural_failure_identity=structural_identity,
             page_evidence_refs=page_refs,
             evidence_refs=evidence_refs,
             missing_requested_output_facts=missing_output_facts,
+            runtime_output_repair_facts=runtime_output_facts,
             authored_structure_signature=authored_structure_signature,
             observed_evidence_summary=recorded_run_outcome.display_reason or "",
             key_provenance={
@@ -720,13 +1099,24 @@ def recorded_outcome_from_run_blocks_result(
                 "page_evidence_refs": "bounded post-run page evidence",
                 "evidence_refs": "run output structure",
                 "missing_requested_output_facts": "CompletionVerificationResult unsatisfied output paths and run output shape",
+                "runtime_output_repair_facts": "same-run registered output parameters and completion verdicts",
             },
         )
     run_status = _safe_str(data.get("overall_status"))
     failure_type = _safe_str(data.get("failure_type"))
-    failure_categories = _failure_category_refs(data.get("failure_categories"))
+    failure_categories = _failure_category_refs(carrier_backed_anti_bot_categories(data.get("failure_categories")))
     status = _safe_str(failed_block.get("status")) if failed_block is not None else run_status
     runtime_failure_identity = _runtime_failure_identity(failed_block)
+    if referenced_unbound_keys:
+        return _required_input_unbound_outcome(
+            failed_block,
+            block_labels,
+            requested_block_labels,
+            block_shape_hashes,
+            workflow_run_id or None,
+            authored_structure_signature,
+            referenced_unbound_keys,
+        )
     if not (failure_categories or failure_type or runtime_failure_identity or page_refs or output_refs):
         return None
     structural_identity = (
@@ -744,14 +1134,26 @@ def recorded_outcome_from_run_blocks_result(
     verdict: BuildTestOutcomeVerdict = "repairable_failure" if bool(result.get("ok")) is False else "progress_observed"
     if not structural_identity and not page_refs and not output_refs:
         verdict = "not_authoritative"
+    reason_code = "runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run"
+    has_runtime_failure_evidence = bool(failure_categories or failure_type or runtime_failure_identity or failed_block)
+    if (
+        verdict == "repairable_failure"
+        and not has_runtime_failure_evidence
+        and completion_verification is not None
+        and only_degraded_blocking(completion_verification)
+    ):
+        verdict = "not_authoritative"
+        reason_code = "fallback_floor_turn_unsatisfiable"
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
         attempted_block_label=_safe_str(failed_block.get("label")) if failed_block is not None else "",
         verdict=verdict,
-        reason_code="runtime_block_failure" if failed_block is not None or not bool(result.get("ok")) else "failed_run",
+        reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
         block_labels=block_labels,
+        requested_block_labels=requested_block_labels,
+        block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
         page_evidence_refs=page_refs,
         evidence_refs=output_refs,
@@ -964,6 +1366,22 @@ def _first_failed_block(blocks: Sequence[Mapping[str, object]]) -> Mapping[str, 
     return None
 
 
+def _referenced_unbound_input_keys(
+    result: Mapping[str, object],
+    failed_block: Mapping[str, object] | None,
+    unbound_required_parameter_keys: Sequence[str],
+    block_parameter_keys: Mapping[str, Sequence[str]],
+) -> list[str]:
+    if bool(result.get("ok")) is not False or failed_block is None:
+        return []
+    label = _safe_str(failed_block.get("label"))
+    referenced = block_parameter_keys.get(label) if label else None
+    if not referenced:
+        return []
+    referenced_set = set(referenced)
+    return [key for key in dict.fromkeys(unbound_required_parameter_keys) if key in referenced_set]
+
+
 def _runtime_failure_identity(failed_block: Mapping[str, object] | None) -> str:
     if failed_block is None:
         return ""
@@ -1002,6 +1420,32 @@ def _origin_ref(value: object) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
     return f"origin:{parsed.scheme}://{parsed.netloc}"
+
+
+def _observed_page_value_excerpt(page_evidence: Mapping[str, object] | None) -> str:
+    evidence = page_evidence or {}
+    for key in ("visible_text_excerpt", "visible_text", "bodyText"):
+        text = _safe_str(evidence.get(key))
+        if text.strip():
+            return " ".join(text.split())[:_VALUE_EXCERPT_MAX]
+    return ""
+
+
+def observed_value_extraction_scaffold_lines(observed_values: str, output_paths: Sequence[str]) -> list[str]:
+    observed_values = " ".join(observed_values.split())[:_VALUE_EXCERPT_MAX]
+    if not observed_values:
+        return []
+    paths = [path for path in dict.fromkeys(str(p).strip() for p in output_paths) if path]
+    if not paths:
+        return [f"observed_page_values: {observed_values}"]
+    lines = [
+        "OBSERVED PAGE VALUES CONTRACT: author a keyed extraction over the on-screen values below and bind "
+        "each required output_path to its observed value.",
+        f"observed_values: {observed_values}",
+        "bind_output_paths:",
+    ]
+    lines.extend(f"- {path}: <observed value>" for path in paths[:8])
+    return lines
 
 
 def _hollow_page_shape(page_evidence: Mapping[str, object] | None) -> dict[str, object]:
@@ -1170,6 +1614,59 @@ def _missing_requested_output_facts(
     return sorted(facts, key=lambda item: str(item.get("output_path") or ""))
 
 
+def _runtime_output_repair_facts(
+    completion_verification: CompletionVerificationResult | None,
+    blocks: Sequence[Mapping[str, object]],
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]],
+    workflow_run_id: str,
+) -> list[dict[str, object]]:
+    if completion_verification is None or completion_verification.status != "evaluated" or not workflow_run_id:
+        return []
+    facts: list[dict[str, object]] = []
+    for verdict in completion_verification.verdicts:
+        if not verdict.output_path:
+            continue
+        output_path = _bounded_ref(verdict.output_path)
+        if not _output_path_has_child(output_path):
+            continue
+        output_root = _output_path_root(output_path)
+        if not output_root:
+            continue
+        values, evidence_refs, block_labels = _runtime_output_values_for_path(
+            blocks,
+            registered_output_parameter_payloads,
+            workflow_run_id,
+            output_path,
+        )
+        owner_labels = _runtime_output_owner_labels(blocks, block_labels, verdict)
+        if verdict.satisfied:
+            if not owner_labels:
+                continue
+            value_status = "satisfied"
+        else:
+            value_status = _runtime_output_value_status(values, verdict)
+        fact: dict[str, object] = {
+            "workflow_run_id": _bounded_ref(workflow_run_id),
+            "output_path": output_path,
+            "output_root": output_root,
+            "criterion_id": _bounded_ref(verdict.criterion_id),
+            "reason_code": _bounded_ref(verdict.reason_code),
+            "value_status": value_status,
+        }
+        if verdict.satisfied or len(owner_labels) > 1:
+            fact["owner_labels"] = owner_labels
+        if len(owner_labels) == 1:
+            fact["block_label"] = owner_labels[0]
+        if verdict.grounding_mode:
+            fact["grounding_mode"] = verdict.grounding_mode
+        if verdict.expected_output_shape:
+            fact["expected_output_shape"] = _bounded_ref(verdict.expected_output_shape)
+        if evidence_refs:
+            fact["evidence_refs"] = evidence_refs
+        facts.append(fact)
+    return sorted(facts, key=lambda item: str(item.get("output_path") or ""))
+
+
 def _has_presence_only_output_evidence(verdict: CriterionVerdict) -> bool:
     return (
         verdict.reason_code == "structurally_abstained"
@@ -1181,6 +1678,10 @@ def _has_presence_only_output_evidence(verdict: CriterionVerdict) -> bool:
 
 def _output_path_root(output_path: str) -> str:
     return _bounded_ref(output_path.split(".", 1)[0].split("[", 1)[0])
+
+
+def _output_path_has_child(output_path: str) -> bool:
+    return "." in output_path or "[]" in output_path
 
 
 def _output_path_value_status(
@@ -1202,9 +1703,120 @@ def _output_path_value_status(
         return "empty_typed_value"
     grounding_mode = getattr(verdict, "grounding_mode", None)
     has_exact_value = getattr(verdict, "has_exact_value", False)
-    if grounding_mode == "shape" and not has_exact_value:
+    if grounding_mode in {"shape", "judgment_boolean"} and not has_exact_value:
         return "presence_only_evidence"
     return "typed_value_unverified"
+
+
+def _runtime_output_values_for_path(
+    blocks: Sequence[Mapping[str, object]],
+    registered_output_parameter_payloads: Sequence[Mapping[str, object]],
+    workflow_run_id: str,
+    output_path: str,
+) -> tuple[list[object], list[str], list[str]]:
+    values: list[object] = []
+    evidence_refs: list[str] = []
+    block_labels: list[str] = []
+    current_labels = {label for block in blocks for label in [_bounded_ref(block.get("label"))] if label}
+    for item in registered_output_parameter_payloads:
+        item_run_id = _safe_str(item.get("workflow_run_id"))
+        if item_run_id != workflow_run_id:
+            continue
+        value, present = _registered_output_value_for_path(item, output_path)
+        if not present:
+            continue
+        values.append(value)
+        label = _registered_output_owner_label(item, current_labels)
+        key = _bounded_ref(item.get("output_parameter_key"))
+        if label:
+            block_labels.append(label)
+        if label or key:
+            evidence_refs.append(f"registered_output:{label or 'unknown'}:{key or output_path}")
+    for block in blocks:
+        extracted = block.get("extracted_data")
+        if extracted is None:
+            continue
+        value, present = _value_at_output_path(extracted, output_path)
+        if not present:
+            continue
+        values.append(value)
+        label = _bounded_ref(block.get("label"))
+        if label:
+            block_labels.append(label)
+            evidence_refs.append(f"output:{label}")
+    return values, list(dict.fromkeys(evidence_refs)), sorted(dict.fromkeys(block_labels))
+
+
+def _registered_output_owner_label(item: Mapping[str, object], current_labels: set[str]) -> str:
+    label = _bounded_ref(item.get("block_label"))
+    if label in current_labels:
+        return label
+    return ""
+
+
+def _runtime_output_owner_labels(
+    blocks: Sequence[Mapping[str, object]],
+    block_labels: Sequence[str],
+    verdict: CriterionVerdict,
+) -> list[str]:
+    if not verdict.satisfied and verdict.requested_output_evidence_source == "independent_run_evidence":
+        return []
+    current_labels = {label for block in blocks for label in [_bounded_ref(block.get("label"))] if label}
+    labels = {label for label in block_labels if label in current_labels}
+    evidence_label = _block_output_evidence_ref_label(verdict.evidence_ref)
+    if evidence_label in current_labels:
+        labels.add(evidence_label)
+    return sorted(labels)
+
+
+def _block_output_evidence_ref_label(evidence_ref: str | None) -> str:
+    if not evidence_ref or not evidence_ref.startswith("block_outputs:"):
+        return ""
+    return _bounded_ref(evidence_ref.removeprefix("block_outputs:").split(".", 1)[0])
+
+
+def registered_output_payload_binds_output_path(
+    payloads: Sequence[Mapping[str, object]],
+    output_path: str,
+) -> bool:
+    for item in payloads:
+        value, present = _registered_output_value_for_path(item, output_path)
+        if present and not _is_empty_output_value(value):
+            return True
+    return False
+
+
+def _registered_output_value_for_path(item: Mapping[str, object], output_path: str) -> tuple[object | None, bool]:
+    value = item.get("value")
+    key = _safe_str(item.get("output_parameter_key"))
+    if key == output_path:
+        return value, True
+    if output_path.startswith("output.") and key == output_path.split(".", 1)[1]:
+        return value, True
+    if isinstance(value, Mapping):
+        if output_path.startswith("output."):
+            unwrapped_value, unwrapped_present = _value_at_output_path(value, output_path.split(".", 1)[1])
+            if unwrapped_present:
+                return unwrapped_value, True
+        return _value_at_output_path(value, output_path)
+    return None, False
+
+
+def _runtime_output_value_status(values: Sequence[object], verdict: CriterionVerdict) -> str:
+    if values:
+        if any(value is None for value in values):
+            return "null"
+        expected_shape = (verdict.expected_output_shape or "").casefold()
+        if expected_shape in {"string", "str"} and any(not isinstance(value, str) for value in values):
+            return "type_mismatch"
+        if expected_shape in {"array", "list"} and any(not isinstance(value, list) for value in values):
+            return "shape_mismatch"
+        if expected_shape in {"object", "dict"} and any(not isinstance(value, Mapping) for value in values):
+            return "shape_mismatch"
+        return "no_typed_value" if not verdict.has_exact_value else "type_mismatch"
+    if verdict.reason_code == "structurally_abstained":
+        return "structural_abstained"
+    return "no_typed_value"
 
 
 def _value_at_output_path(value: object, output_path: str) -> tuple[object | None, bool]:

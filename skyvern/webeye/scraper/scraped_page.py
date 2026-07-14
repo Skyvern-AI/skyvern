@@ -3,6 +3,7 @@ import json
 import re
 import typing
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
 
@@ -20,7 +21,24 @@ if typing.TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 CleanupElementTreeFunc = Callable[[Page | Frame, str, list[dict]], Awaitable[list[dict]]]
-ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[bool]]
+
+
+@dataclass
+class ScrapeFrameDecision:
+    """Result of a scrape-frame filter callback.
+
+    ``exclude`` drops the frame from the scraped element tree. ``placeholder``, when
+    set, is a non-interactable element-tree node appended in the frame's place — a
+    signal node for a frame the tree would otherwise miss (e.g. a cross-origin captcha
+    living inside a closed shadow root). Placeholders are tree-only: they are never
+    added to the flat interactable elements list, so they can never become a target.
+    """
+
+    exclude: bool
+    placeholder: dict | None = None
+
+
+ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[ScrapeFrameDecision]]
 
 ELEMENT_NODE_ATTRIBUTES = {
     "id",

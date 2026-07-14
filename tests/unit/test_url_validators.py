@@ -1,8 +1,16 @@
+import socket
+
 import pytest
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
-from skyvern.utils.url_validators import encode_url, is_blocked_host, validate_url
+from skyvern.utils.url_validators import (
+    encode_url,
+    is_blocked_host,
+    validate_fetch_url,
+    validate_redirect_url,
+    validate_url,
+)
 
 
 def test_encode_url_basic():
@@ -121,3 +129,60 @@ def test_is_blocked_host_allowed_hosts_normalize_brackets_and_mapped(
 @pytest.mark.parametrize("host", ["LOCALHOST", "LocalHost", "localhost"])
 def test_is_blocked_host_blocked_hosts_case_insensitive(host: str) -> None:
     assert is_blocked_host(host) is True
+
+
+def test_validate_fetch_url_blocks_hostname_resolving_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", port or 0))]
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_private)
+
+    with pytest.raises(BlockedHost):
+        validate_fetch_url("https://evil.example.test/file.pdf")
+
+
+def test_validate_fetch_url_fails_closed_on_dns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise OSError("dns unavailable")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+
+    with pytest.raises(BlockedHost):
+        validate_fetch_url("https://unresolvable.example.test/file.pdf")
+
+
+def test_validate_url_does_not_resolve_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("general URL validation should not resolve DNS")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", unexpected_dns)
+
+    assert validate_url("https://webhook.example.com/receive") is not None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://metadata.google.internal/computeMetadata/v1/",
+        "https://kubernetes.default.svc/api",
+        "https://my-service.namespace.svc.cluster.local/api",
+        "https://internal.local/api",
+    ],
+)
+def test_validate_url_blocks_internal_hostnames(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        raise AssertionError("internal hostname should be blocked before DNS")
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", unexpected_dns)
+
+    with pytest.raises(BlockedHost):
+        validate_url(url)
+
+
+def test_is_blocked_host_allows_public_svc_subdomain() -> None:
+    assert is_blocked_host("api.svc.example.com") is False
+
+
+def test_validate_redirect_url_rejects_private_redirect_target() -> None:
+    with pytest.raises(BlockedHost):
+        validate_redirect_url("https://example.com/file.pdf", "http://169.254.169.254/latest/meta-data")

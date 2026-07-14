@@ -91,6 +91,7 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
                 getattr(tool_context, "context", None),
                 tool_name,
                 {"ok": False, "error": error},
+                arguments=tool_arguments,
             )
         return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
     return ToolGuardrailFunctionOutput.allow(output_info=trace_data)

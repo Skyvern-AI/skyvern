@@ -84,8 +84,13 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return {
     ...actual,
     useParams: () => routeParams.current,
+    useSearchParams: () => [new URLSearchParams(), vi.fn()],
   };
 });
+
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => true,
+}));
 
 const saveData = {
   title: "Test WF",
@@ -101,6 +106,7 @@ const saveData = {
     proxyLocation: null,
     webhookCallbackUrl: null,
     persistBrowserSession: false,
+    pinSavedSessionIp: false,
     browserProfileId: null,
     browserProfileKey: null,
     model: null,
@@ -120,6 +126,12 @@ const saveData = {
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
+}));
+
+// Unrelated to this file's tests; the real hook needs a QueryClientProvider
+// this harness doesn't set up.
+vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";

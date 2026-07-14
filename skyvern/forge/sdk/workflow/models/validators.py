@@ -82,21 +82,26 @@ def _normalize_kv_dict(
 
 def normalize_run_metadata(v: dict[str, str] | None) -> dict[str, str] | None:
     """Normalize and bound user-supplied workflow run metadata tags."""
-    return _normalize_kv_dict(
+    normalized = _normalize_kv_dict(
         v,
         max_keys=RUN_METADATA_MAX_KEYS,
         max_key_length=RUN_METADATA_MAX_KEY_LENGTH,
         max_value_length=RUN_METADATA_MAX_VALUE_LENGTH,
         field_name="run_metadata",
     )
+    if not normalized:
+        return None
+    return {key: value for key, value in normalized.items() if not is_reserved_tag_key(key)} or None
 
 
-def _assert_valid_tag_key(key: str) -> None:
+def is_reserved_tag_key(key: str) -> bool:
+    return key.startswith(SKYVERN_TAG_NAMESPACE)
+
+
+def assert_valid_tag_key_shape(key: str) -> None:
     """Shape rules for a (trimmed, non-empty) tag key / group. Raises ValueError."""
     if len(key) > TAG_KEY_MAX_LENGTH:
         raise ValueError(f"tag keys must be at most {TAG_KEY_MAX_LENGTH} characters")
-    if key.startswith(SKYVERN_TAG_NAMESPACE):
-        raise ValueError(f"tag keys must not start with the reserved '{SKYVERN_TAG_NAMESPACE}' prefix")
     if not TAG_KEY_REGEX.match(key):
         raise ValueError(
             "tag keys must match '^[A-Za-z0-9][A-Za-z0-9_.-]*$' "
@@ -104,9 +109,18 @@ def _assert_valid_tag_key(key: str) -> None:
         )
 
 
-def normalize_optional_tag_key(key: object) -> str | None:
-    """Normalize an optional tag key (group). None or blank -> None (standalone
-    label); otherwise trim and enforce the key shape rules."""
+def assert_user_writable_tag_key(key: str) -> None:
+    assert_valid_tag_key_shape(key)
+    if is_reserved_tag_key(key):
+        raise ValueError(f"tag keys must not start with the reserved '{SKYVERN_TAG_NAMESPACE}' prefix")
+
+
+def normalize_optional_tag_key_shape(key: object) -> str | None:
+    """Normalize an optional tag key and enforce only shape rules.
+
+    Reserved ``skyvern.*`` keys are valid tag-key shapes; public write surfaces
+    layer ``assert_user_writable_tag_key`` on top.
+    """
     if key is None:
         return None
     if not isinstance(key, str):
@@ -114,7 +128,27 @@ def normalize_optional_tag_key(key: object) -> str | None:
     trimmed = key.strip()
     if not trimmed:
         return None
-    _assert_valid_tag_key(trimmed)
+    assert_valid_tag_key_shape(trimmed)
+    return trimmed
+
+
+def normalize_optional_tag_key(key: object) -> str | None:
+    """Normalize an optional tag key (group). None or blank -> None (standalone
+    label); otherwise trim and enforce public user-writability."""
+    trimmed = normalize_optional_tag_key_shape(key)
+    if trimmed is None:
+        return None
+    assert_user_writable_tag_key(trimmed)
+    return trimmed
+
+
+def normalize_optional_system_tag_key(key: object) -> str | None:
+    """Normalize a system-owned tag key. Only the reserved namespace is writable."""
+    trimmed = normalize_optional_tag_key_shape(key)
+    if trimmed is None:
+        return None
+    if not is_reserved_tag_key(trimmed):
+        raise ValueError(f"system tag keys must start with the reserved '{SKYVERN_TAG_NAMESPACE}' prefix")
     return trimmed
 
 

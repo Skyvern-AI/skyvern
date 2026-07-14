@@ -66,6 +66,15 @@ export function paneFlex(
 
 // Clamp a divider drag so neither neighbor goes under its min width. The
 // neighbors' total is preserved, so panes elsewhere in the row never move.
+// Stable serialization of the committed divider widths, for change detection
+// (the editor re-fits on width commits via FlowRenderer's paneLayoutKey).
+export function paneWidthsKey(widths: PaneWidths): string {
+  return Object.entries(widths)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([id, width]) => `${id}:${width}`)
+    .join(",");
+}
+
 export function clampResizeDelta(
   delta: number,
   left: { id: StudioPaneId; width: number },

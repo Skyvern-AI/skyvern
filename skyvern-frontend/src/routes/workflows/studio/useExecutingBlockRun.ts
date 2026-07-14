@@ -18,8 +18,8 @@ export function useExecutingBlockRun(): boolean {
   const isBlockRun = searchParams.has("bl");
   const urlRunId = searchParams.get("wr");
   const workflowRunId = isBlockRun && urlRunId ? urlRunId : undefined;
-  // Shares the run cache RunView/StudioSpine poll (5s while not finalized), so
-  // the gate releases on terminal status even with the Timeline pane closed.
+  // Shares the run cache RunView/StudioPaneToggles poll (5s while not finalized), so
+  // the gate releases on terminal status even with the Overview pane closed.
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     workflowRunId ? { workflowRunId } : undefined,
   );

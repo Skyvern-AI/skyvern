@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
+
+from skyvern.config import settings
 
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
@@ -28,8 +33,23 @@ from skyvern.forge.sdk.copilot.narration import (
     snapshot_ctx,
     tool_activity_display_label,
 )
-from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
+from skyvern.forge.sdk.copilot.output_utils import (
+    format_tool_result_for_user,
+    summarize_tool_result_detail,
+    user_facing_success,
+)
+from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
+from skyvern.forge.sdk.copilot.turn_halt import (
+    CopilotTurnHalt,
+    raise_if_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    CopilotUnrecoverableToolError,
+    _maybe_raise_unrecoverable_tool_error,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotCodegenProgressUpdate,
     WorkflowCopilotDesignEndUpdate,
     WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotNarrationUpdate,
@@ -45,7 +65,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
-    from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
@@ -61,6 +81,156 @@ _OBSERVATION_TOOLS = {
     "select_option",
     "press_key",
 }
+
+_AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "update_workflow"})
+# Pure substring heuristic over raw (unparsed) JSON text: a free-text field (e.g. navigation_goal)
+# that happens to contain the literal "label:" would also match. Accepted trade-off of not
+# json.loads-ing the partial buffer; worst case is a spurious drafted-block entry.
+_CODEGEN_LABEL_RE = re.compile(r"label:\s*\\?\"?([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
+_CODEGEN_MIN_GAP_SECONDS = 2.0
+# Keep enough trailing context that a label split across two argument deltas still matches.
+_CODEGEN_TAIL_OVERLAP = 96
+_CODEGEN_MAX_LABELS = 50
+
+
+class _CodegenCallState:
+    __slots__ = (
+        "tool_name",
+        "labels",
+        "_seen_labels",
+        "chars",
+        "n_deltas",
+        "tail",
+        "last_emit_monotonic",
+        "started_monotonic",
+    )
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        self.labels: list[str] = []
+        self._seen_labels: set[str] = set()
+        self.chars = 0
+        self.n_deltas = 0
+        self.tail = ""
+        self.last_emit_monotonic = 0.0
+        self.started_monotonic = time.monotonic()
+
+    def add_labels(self, text: str) -> bool:
+        found_new = False
+        for match in _CODEGEN_LABEL_RE.finditer(text):
+            if match.end() == len(text):
+                # Match runs up to the edge of the currently scanned text: the label may still
+                # be mid-stream, split across a delta boundary. Wait for a delimiter to confirm
+                # it (re-scanned via the tail overlap on the next delta) instead of committing
+                # a truncated fragment permanently.
+                continue
+            if len(self.labels) >= _CODEGEN_MAX_LABELS:
+                break
+            label = match.group(1)
+            if label in self._seen_labels:
+                continue
+            self._seen_labels.add(label)
+            self.labels.append(label)
+            found_new = True
+        return found_new
+
+
+class _CodegenProgressTracker:
+    """Tracks streamed authoring-tool-call arguments (keyed by output_index, per the
+    FAKE_RESPONSES_ID caveat) and emits throttled CODEGEN_PROGRESS frames."""
+
+    def __init__(self) -> None:
+        self._calls: dict[int, _CodegenCallState] = {}
+
+    async def on_raw_event(
+        self,
+        data: Any,
+        stream: EventSourceStream,
+        ctx: CopilotContext,
+        iteration: int,
+    ) -> None:
+        event_type = getattr(data, "type", "")
+
+        if event_type == "response.created":
+            self._calls.clear()
+            return
+
+        if event_type == "response.output_item.added":
+            item = getattr(data, "item", None)
+            if getattr(item, "type", None) != "function_call":
+                return
+            name = getattr(item, "name", None)
+            if name not in _AUTHORING_TOOL_NAMES:
+                return
+            output_index = getattr(data, "output_index", None)
+            if output_index is None:
+                return
+            state = _CodegenCallState(name)
+            self._calls[output_index] = state
+            await self._emit(stream, ctx, iteration, state)
+            return
+
+        if event_type == "response.function_call_arguments.delta":
+            output_index = getattr(data, "output_index", None)
+            tracked_state = self._calls.get(output_index) if output_index is not None else None
+            if tracked_state is None:
+                return
+            delta = getattr(data, "delta", "") or ""
+            tracked_state.n_deltas += 1
+            tracked_state.chars += len(delta)
+            found_new = tracked_state.add_labels(tracked_state.tail + delta)
+            tracked_state.tail = (tracked_state.tail + delta)[-_CODEGEN_TAIL_OVERLAP:]
+            gap_elapsed = (time.monotonic() - tracked_state.last_emit_monotonic) >= _CODEGEN_MIN_GAP_SECONDS
+            if found_new or gap_elapsed:
+                await self._emit(stream, ctx, iteration, tracked_state)
+            return
+
+        if event_type in ("response.output_item.done", "response.function_call_arguments.done"):
+            # Both events fire for one completed call; pop() makes the second a no-op.
+            output_index = getattr(data, "output_index", None)
+            finished_state = self._calls.pop(output_index, None) if output_index is not None else None
+            if finished_state is not None:
+                LOG.info(
+                    "copilot_codegen_progress_summary",
+                    tool_name=finished_state.tool_name,
+                    n_deltas=finished_state.n_deltas,
+                    chars=finished_state.chars,
+                    n_labels=len(finished_state.labels),
+                    elapsed=time.monotonic() - finished_state.started_monotonic,
+                )
+            return
+
+    async def _emit(
+        self,
+        stream: EventSourceStream,
+        ctx: CopilotContext,
+        iteration: int,
+        state: _CodegenCallState,
+    ) -> None:
+        try:
+            await maybe_emit_design_start(stream, ctx)
+        except Exception as emit_err:
+            LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
+
+        # Advance the throttle gate regardless of connection outcome: otherwise a
+        # permanently disconnected client leaves last_emit_monotonic frozen and every
+        # subsequent delta re-attempts is_disconnected(), the "never per delta" cost
+        # this throttle exists to bound.
+        state.last_emit_monotonic = time.monotonic()
+        if await stream.is_disconnected():
+            return
+        try:
+            await stream.send(
+                WorkflowCopilotCodegenProgressUpdate(
+                    tool_name=state.tool_name,
+                    blocks_drafted=list(state.labels),
+                    chars_streamed=state.chars,
+                    iteration=iteration,
+                    timestamp=datetime.now(timezone.utc),
+                )
+            )
+        except Exception as emit_err:
+            LOG.warning("copilot_codegen_progress_emit_failed", error=str(emit_err))
 
 
 def _code_repair_progress_text(parsed: dict[str, Any]) -> str | None:
@@ -96,24 +266,13 @@ async def stream_to_sse(
     reasons unrelated to a dropped client) is re-raised unchanged so
     asyncio's cancellation machinery still runs normally.
     """
-    from agents.stream_events import RunItemStreamEvent
-
-    from skyvern.forge.sdk.copilot.enforcement import (
-        CopilotUnrecoverableToolError,
-        _maybe_raise_unrecoverable_tool_error,
-        outcome_fully_verified,
-    )
-    from skyvern.forge.sdk.copilot.turn_halt import (
-        CopilotTurnHalt,
-        raise_if_turn_halt,
-        stash_turn_halt_from_blocker_signal,
-    )
-
     call_id_to_name: dict[str, str] = {}
     # Counts completed tool round-trips (tool_called + tool_output pair), not
     # raw stream events. Both TOOL_CALL and TOOL_RESULT for the same round
     # carry the same iteration value; it advances after the matching result.
     iteration = 0
+
+    codegen_tracker = _CodegenProgressTracker() if settings.WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED else None
 
     # Narrator state persists across enforcement iterations via ctx so
     # cadence (last_emitted_at, min-gap) survives run_with_enforcement retries.
@@ -134,6 +293,9 @@ async def stream_to_sse(
 
     try:
         async for event in result.stream_events():
+            if codegen_tracker is not None and isinstance(event, RawResponsesStreamEvent):
+                await codegen_tracker.on_raw_event(event.data, stream, ctx, iteration)
+                continue
             if not isinstance(event, RunItemStreamEvent):
                 continue
 
@@ -218,8 +380,10 @@ async def stream_to_sse(
                 else:
                     blocker_signals = _tool_blocker_signal_candidates(ctx)
                     summary = format_tool_result_for_user(tool_name, parsed, blocker_signal=blocker_signals)
-                    success = parsed.get("ok", True)
-                    detail = summarize_tool_result_detail(parsed, tool_name=tool_name, blocker_signal=blocker_signals)
+                    success = user_facing_success(parsed, blocker_signal=blocker_signals)
+                    detail = summarize_tool_result_detail(
+                        parsed, tool_name=tool_name, blocker_signal=blocker_signals, success=success
+                    )
                     narrator_state.record_activity(
                         build_tool_result_activity(tool_name, summary, success, iteration, call_id)
                     )
@@ -251,7 +415,7 @@ async def stream_to_sse(
                             summary=summary,
                             success=success,
                             iteration=iteration,
-                            details=extract_tool_details(tool_name, parsed),
+                            details=extract_tool_details(tool_name, parsed, success=success),
                         )
                         for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
                             narrator_state.record_transition(transition)
@@ -357,7 +521,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
         return
     blocker_signals = _tool_blocker_signal_candidates(ctx)
     summary = format_tool_result_for_user(pending.tool_name, parsed, blocker_signal=blocker_signals)
-    success = parsed.get("ok", True)
+    success = user_facing_success(parsed, blocker_signal=blocker_signals)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
@@ -373,7 +537,9 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             summary=summary,
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
-            detail=summarize_tool_result_detail(parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals),
+            detail=summarize_tool_result_detail(
+                parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
+            ),
             workflow_run_id=_tool_result_workflow_run_id(pending.tool_name, parsed),
         )
     )
@@ -478,6 +644,8 @@ def _update_enforcement_from_tool(
         ctx.post_update_nudge_count = 0
     if tool_name in ("update_workflow", "update_and_run_blocks") and has_blocks:
         ctx.synthesized_block_reopened_after_failed_run = False
+        ctx.synthesized_block_reopened_for_output_coverage = False
+        ctx.uncovered_output_rescout_steer_key = None
 
     if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks"):
         ctx.test_after_update_done = True

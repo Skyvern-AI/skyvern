@@ -247,11 +247,11 @@ export function RunOutputsSection({
                 href={file.url}
                 title={file.url}
                 aria-label={`Download ${file.filename}`}
-                className="group flex items-center gap-2.5 rounded-md border border-border bg-slate-elevation2 px-3 py-2 text-sm text-foreground transition-colors hover:border-studio-accent/40 hover:bg-slate-elevation3"
+                className="group flex items-center gap-2.5 rounded-md border border-border bg-slate-elevation2 px-3 py-2 text-sm text-foreground transition-colors hover:bg-slate-elevation3"
               >
                 <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate">{file.filename}</span>
-                <DownloadIcon className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-studio-accent-2" />
+                <DownloadIcon className="size-4 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
               </a>
             ))}
           </div>

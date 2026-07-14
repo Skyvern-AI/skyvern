@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
+from typing import cast
 
 import structlog
 from sqlalchemy import case, desc, or_, select
@@ -27,7 +28,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
-from skyvern.schemas.proxy_pinning import generate_proxy_session_id
+from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
 LOG = structlog.get_logger()
@@ -387,17 +388,34 @@ class BrowserSessionsRepository(BaseRepository):
         browser_type: PersistentBrowserType | None = None,
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
+        inherit_profile_proxy: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
-        proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
-            proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
-        )
         extensions_str: list[str] | None = (
             [extension.value for extension in extensions] if extensions is not None else None
         )
-        serialized_proxy_location = serialize_proxy_location(proxy_location)
         async with self.Session() as session:
+            if inherit_profile_proxy and browser_profile_id and proxy_session_id is None:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=browser_profile_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(BrowserProfileModel.deleted_at.is_(None))
+                )
+                browser_profile = (await session.scalars(query)).first()
+                if browser_profile and browser_profile.proxy_session_id:
+                    proxy_session_id = browser_profile.proxy_session_id
+                    # The ORM column stores the serialized string; deserialize before it flows
+                    # into serialize_proxy_location, which rejects a bare str.
+                    proxy_location = cast(
+                        ProxyLocationInput, parse_proxy_location_input(browser_profile.proxy_location)
+                    )
+
+            proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
+                proxy_location=proxy_location,
+                proxy_session_id=proxy_session_id,
+            )
+            serialized_proxy_location = serialize_proxy_location(proxy_location)
             browser_session = PersistentBrowserSessionModel(
                 organization_id=organization_id,
                 runnable_type=runnable_type,

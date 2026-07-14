@@ -20,11 +20,7 @@ import {
   resolveScreenshotBlockId,
 } from "../workflowRun/workflowTimelineUtils";
 import { type HeroSelection } from "./runview/HeroScreenshot";
-import {
-  actionLabel,
-  buildFilmstrip,
-  runOutcomeFromStatus,
-} from "./runProjections";
+import { buildFilmstrip, runOutcomeFromStatus } from "./runProjections";
 
 export type RunVisuals = {
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow | undefined;
@@ -40,7 +36,6 @@ export type RunVisuals = {
   // ?active= pins a specific step (anything but the live-edge "stream" pin).
   scrubbing: boolean;
   heroSelection: HeroSelection | null;
-  heroLabel: string;
 };
 
 function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
@@ -68,7 +63,7 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
   const [searchParams] = useSearchParams();
   const activeParam = searchParams.get("active");
-  // The Timeline pane's loop-iteration selection isn't in the URL; read it from the
+  // The Overview pane's loop-iteration selection isn't in the URL; read it from the
   // shared store so a selected iteration's screenshot resolves here too.
   const activeIteration = useRunViewStore((s) => s.activeIteration);
 
@@ -148,14 +143,6 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
   const hasScreenshots =
     hasScreenshotFrame || hasScreenshotCandidate(heroSelection);
 
-  const heroLabel = isAction(activeItem)
-    ? actionLabel(activeItem)
-    : isWorkflowRunBlock(activeItem)
-      ? (activeItem.label ?? "Screenshot")
-      : isObserverThought(activeItem)
-        ? (activeItem.thought ?? "Thought")
-        : "Screenshot";
-
   return {
     workflowRun,
     timeline,
@@ -169,6 +156,5 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
     hasScreenshots,
     scrubbing,
     heroSelection,
-    heroLabel,
   };
 }

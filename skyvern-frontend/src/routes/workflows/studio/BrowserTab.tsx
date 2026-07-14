@@ -1,8 +1,11 @@
 import { useCallback } from "react";
-import { ClockIcon, CounterClockwiseClockIcon } from "@radix-ui/react-icons";
+import { ClockIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
+
+import { PasteRecordedStepsHint } from "@/routes/workflows/copilot/PasteRecordedStepsHint";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 import { HeroRecording } from "./runview/HeroRecording";
 import { HeroScreenshot } from "./runview/HeroScreenshot";
@@ -28,6 +31,7 @@ export function BrowserTab() {
     liveSurface,
   } = useBrowserPaneView();
   const postHog = usePostHog();
+  const isRecording = useRecordingStore((s) => s.isRecording);
 
   const {
     workflowRun,
@@ -36,8 +40,6 @@ export function BrowserTab() {
     isPaused,
     recordingUrls,
     heroSelection,
-    heroLabel,
-    scrubbing,
   } = visuals;
 
   const onRecordingPlay = useCallback(
@@ -61,7 +63,9 @@ export function BrowserTab() {
   const showRunStream = liveSurface === "run" && runId != null;
 
   return (
-    <div className="flex h-full min-h-0 w-full flex-col p-3">
+    <div className="flex h-full min-h-0 w-full flex-col gap-3 p-3">
+      {!isRecording ? <PasteRecordedStepsHint /> : null}
+
       <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-border bg-slate-950">
         {view === "live" ? (
           showRunStream ? (
@@ -110,25 +114,23 @@ export function BrowserTab() {
             />
           )
         ) : view === "recording" ? (
-          <HeroRecording
-            recordingUrls={recordingUrls}
-            onPlay={onRecordingPlay}
-          />
+          recordingUrls.length > 0 ? (
+            <HeroRecording
+              recordingUrls={recordingUrls}
+              onPlay={onRecordingPlay}
+            />
+          ) : (
+            <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
+              No recording for this run
+            </div>
+          )
         ) : heroSelection ? (
-          <>
-            <HeroScreenshot selection={heroSelection} running={running} />
-            {scrubbing ? (
-              <div className="absolute left-3 top-3 flex max-w-[26rem] items-center gap-2 rounded-md bg-black/70 px-3 py-1.5 text-xs text-white backdrop-blur">
-                <CounterClockwiseClockIcon className="h-3.5 w-3.5 shrink-0" />
-                <span className="truncate">
-                  Inspecting · <b>{heroLabel}</b>
-                </span>
-              </div>
-            ) : null}
-          </>
+          <HeroScreenshot selection={heroSelection} running={running} />
         ) : (
           <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
-            Waiting for the first action…
+            {visuals.finalized
+              ? "No screenshots for this run"
+              : "Waiting for the first action…"}
           </div>
         )}
       </div>

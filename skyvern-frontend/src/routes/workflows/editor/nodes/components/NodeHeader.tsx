@@ -35,6 +35,7 @@ import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserS
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useBlockRunTarget } from "@/routes/workflows/editor/hooks/useBlockRunTarget";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { DebugSessionProfileIncompatibleDialog } from "@/routes/workflows/debugger/DebugSessionProfileIncompatibleDialog";
 import {
@@ -251,11 +252,9 @@ function NodeHeader({
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
-  const {
-    blockLabel: urlBlockLabel,
-    workflowPermanentId,
-    workflowRunId,
-  } = useParams();
+  const { workflowPermanentId } = useParams();
+  const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
+    useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
@@ -281,7 +280,9 @@ function NodeHeader({
   const { resolveLivePanes } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflowRun } = useWorkflowRunQuery({
+    workflowRunId: activeWorkflowRunId,
+  });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
@@ -297,11 +298,11 @@ function NodeHeader({
 
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued &&
-    urlBlockLabel !== undefined &&
-    urlBlockLabel === blockLabel;
+    targetBlockLabel !== undefined &&
+    targetBlockLabel === blockLabel;
 
   const thisBlockIsTargetted =
-    urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+    targetBlockLabel !== undefined && targetBlockLabel === blockLabel;
 
   const isRecording = recordingStore.isRecording;
 
@@ -367,36 +368,41 @@ function NodeHeader({
   });
 
   useEffect(() => {
-    if (!workflowRun || !workflowPermanentId || !workflowRunId) {
+    if (
+      !workflowRun ||
+      !workflowPermanentId ||
+      !activeWorkflowRunId ||
+      // Only block-scoped runs toast per block; full runs report via the run
+      // surfaces (?wr= without ?bl=).
+      targetBlockLabel === undefined
+    ) {
       return;
     }
 
     if (
-      workflowRunId === workflowRun?.workflow_run_id &&
+      activeWorkflowRunId === workflowRun?.workflow_run_id &&
       statusIsFinalized(workflowRun)
     ) {
-      // navigate(`/workflows/${workflowPermanentId}/build`);
-
       if (statusIsAFailureType(workflowRun)) {
         toast({
           variant: "destructive",
-          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
           description: `Reason: ${workflowRun.failure_reason}`,
         });
       } else if (statusIsFinalized(workflowRun)) {
         toast({
           variant: "success",
-          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
         });
       }
     }
   }, [
     queryClient,
-    urlBlockLabel,
+    targetBlockLabel,
     navigate,
     workflowPermanentId,
     workflowRun,
-    workflowRunId,
+    activeWorkflowRunId,
   ]);
 
   const runBlock = useMutation({
@@ -529,13 +535,14 @@ function NodeHeader({
         browserSessionId: debugSession.browser_session_id,
       });
 
-      return await client.post<Payload, { data: { run_id: string } }>(
+      const response = await client.post<Payload, { data: { run_id: string } }>(
         "/run/workflows/blocks",
         body,
       );
+      return { response, mergedParameters };
     },
-    onSuccess: (response) => {
-      if (!response) {
+    onSuccess: (result) => {
+      if (!result?.response) {
         log.error("Run block: no response", {
           workflowPermanentId,
           blockLabel,
@@ -548,6 +555,14 @@ function NodeHeader({
           description: "No response",
         });
         return;
+      }
+
+      const { response, mergedParameters } = result;
+
+      if (workflowPermanentId) {
+        useDebuggerLastRunValuesStore
+          .getState()
+          .setLastRunValues(workflowPermanentId, mergedParameters);
       }
 
       log.info("Run block: run started", {
@@ -622,7 +637,9 @@ function NodeHeader({
       const browserSessionId = debugSession.browser_session_id;
       const client = await getClient(credentialGetter);
       return client
-        .post(`/runs/${browserSessionId}/workflow_run/${workflowRunId}/cancel/`)
+        .post(
+          `/runs/${browserSessionId}/workflow_run/${activeWorkflowRunId}/cancel/`,
+        )
         .then((response) => response.data);
     },
     onSuccess: () => {
@@ -960,7 +977,9 @@ function NodeHeader({
             ) : (
               gripHandle
             ))}
-          <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+          <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+            {/* Without shrink-0, a long label or subtitle in the sibling
+            column steals width from this box before its own min-content. */}
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
           <div className="flex min-w-0 flex-col gap-1">
@@ -969,7 +988,10 @@ function NodeHeader({
               editable={editable}
               onChange={setLabel}
               titleClassName="text-base"
-              inputClassName="text-base"
+              // A negative margin here would shrink this auto-width column's
+              // measured size and clip short values via max-w-full, so the
+              // padding is offset with relative/left (paint-only) instead.
+              inputClassName="relative -left-1 px-1 text-base"
             />
 
             <div className="flex items-center gap-2">
@@ -1112,12 +1134,8 @@ function NodeHeader({
             },
             {
               onSuccess: () => {
-                if (workflowPermanentId) {
-                  useDebuggerLastRunValuesStore
-                    .getState()
-                    .setLastRunValues(workflowPermanentId, values);
-                }
-                // Close dialog on success - navigation also happens in mutation's onSuccess
+                // Close dialog on success - navigation and last-run-value
+                // persistence happen in the mutation's onSuccess.
                 setShowParamsDialog(false);
               },
               // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.

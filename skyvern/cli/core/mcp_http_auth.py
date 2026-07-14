@@ -564,6 +564,25 @@ def _unauthorized_response(message: str, *, include_oauth_challenge: bool = True
     )
 
 
+_EMPTY_API_KEY_MESSAGE = (
+    "Empty Skyvern API key. Paste your API key from https://app.skyvern.com Settings into your client's Skyvern "
+    "config (Claude Desktop: Settings -> Extensions -> Skyvern -> Configure)."
+)
+_EMPTY_BEARER_MESSAGE = (
+    "Empty Bearer token. Send a valid OAuth token or use an API key from https://app.skyvern.com Settings "
+    "(Claude Desktop: Settings -> Extensions -> Skyvern -> Configure)."
+)
+_MISSING_CREDENTIALS_MESSAGE = (
+    "Missing credentials. Use an API key from https://app.skyvern.com Settings (Claude Desktop: Settings -> "
+    "Extensions -> Skyvern -> Configure) or connect with an OAuth-capable client. Docs: "
+    "https://www.skyvern.com/docs/developers/getting-started/mcp"
+)
+_INVALID_API_KEY_MESSAGE = (
+    "Invalid Skyvern API key. Check the key from https://app.skyvern.com Settings in your client's Skyvern config "
+    "(Claude Desktop: Settings -> Extensions -> Skyvern -> Configure)."
+)
+
+
 def _internal_error_response() -> JSONResponse:
     return JSONResponse(
         {"error": {"code": "INTERNAL_ERROR", "message": "Internal server error"}},
@@ -604,16 +623,20 @@ class MCPAPIKeyMiddleware:
         auth_header = request.headers.get(AUTHORIZATION_HEADER, "")
         if auth_header.startswith(BEARER_PREFIX):
             bearer_token = auth_header[len(BEARER_PREFIX) :]
-            if not bearer_token:
-                response = _unauthorized_response("Empty Bearer token")
+            if not bearer_token.strip():
+                response = _unauthorized_response(_EMPTY_BEARER_MESSAGE)
                 await response(scope, receive, send)
                 return
             await self._handle_bearer(scope, receive, send, bearer_token)
             return
 
         api_key = request.headers.get(API_KEY_HEADER)
-        if not api_key:
-            response = _unauthorized_response("Missing x-api-key or Authorization: Bearer header")
+        if api_key is None:
+            response = _unauthorized_response(_MISSING_CREDENTIALS_MESSAGE)
+            await response(scope, receive, send)
+            return
+        if not api_key.strip():
+            response = _unauthorized_response(_EMPTY_API_KEY_MESSAGE, include_oauth_challenge=False)
             await response(scope, receive, send)
             return
 
@@ -696,7 +719,7 @@ class MCPAPIKeyMiddleware:
             scope["state"]["organization_id"] = validation.organization_id
         except HTTPException as e:
             if e.status_code in {401, 403}:
-                response = _unauthorized_response("Invalid API key", include_oauth_challenge=False)
+                response = _unauthorized_response(_INVALID_API_KEY_MESSAGE, include_oauth_challenge=False)
             elif e.status_code == 503:
                 response = _service_unavailable_response(e.detail or _VALIDATION_RETRY_EXHAUSTED_MESSAGE)
             else:

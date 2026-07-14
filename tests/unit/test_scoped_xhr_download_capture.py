@@ -17,14 +17,17 @@ def _make_response(
     content_disposition: str = 'inline; filename="report.pdf"',
     body: bytes = b"%PDF-1.4 fake",
     content_length: str | None = None,
+    url: str = "https://example.com/api/report",
 ) -> MagicMock:
     resp = AsyncMock()
     resp.status = status
     request_mock = MagicMock()
     request_mock.resource_type = resource_type
     resp.request = request_mock
-    resp.url = "https://example.com/api/report"
-    headers = {"content-type": content_type, "content-disposition": content_disposition}
+    resp.url = url
+    headers: dict[str, str] = {"content-type": content_type}
+    if content_disposition:
+        headers["content-disposition"] = content_disposition
     if content_length is not None:
         headers["content-length"] = content_length
     resp.headers = headers
@@ -222,3 +225,78 @@ class TestScopedXhrDownloadCapture:
         page = _make_page()
         capture = ScopedXhrDownloadCapture(page, tmp_path)
         await capture.drain()
+
+    @pytest.mark.asyncio
+    async def test_saves_xhr_generic_binary_with_large_body(self, tmp_path: Path) -> None:
+        """Production shape: XHR with application/*, large body, no Content-Disposition,
+        filename extracted from URL path."""
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+        response = _make_response(
+            content_type="application/*",
+            content_disposition="",
+            content_length="46681129",
+            body=b"fake-excel-bytes" * 1024,
+            url="https://example.com/report/General.xlsx",
+        )
+
+        await capture._on_response(response)
+
+        saved = tmp_path / "General.xlsx"
+        assert saved.exists()
+        assert saved.stat().st_size > 0
+
+    @pytest.mark.asyncio
+    async def test_skips_xhr_generic_binary_small_body(self, tmp_path: Path) -> None:
+        """XHR with application/* and very small Content-Length (6) should NOT save."""
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+        response = _make_response(
+            content_type="application/*",
+            content_disposition="",
+            content_length="6",
+            body=b"empty",
+            url="https://example.com/report/General.xlsx",
+        )
+
+        await capture._on_response(response)
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_saves_xhr_generic_binary_inline_no_filename_fallsback_to_url(self, tmp_path: Path) -> None:
+        """XHR with application/*, inline Content-Disposition (no filename), and URL fallback."""
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+        response = _make_response(
+            content_type="application/*",
+            content_disposition="inline",
+            content_length="99999999",
+            body=b"spreadsheet-data",
+            url="https://example.com/report/General.xlsx",
+        )
+
+        await capture._on_response(response)
+
+        saved = tmp_path / "General.xlsx"
+        assert saved.exists()
+        assert saved.stat().st_size > 0
+
+    @pytest.mark.asyncio
+    async def test_saves_xhr_generic_binary_attachment_no_filename_fallsback_to_url(self, tmp_path: Path) -> None:
+        """XHR with application/*, attachment header but no filename, and URL fallback."""
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+        response = _make_response(
+            content_type="application/*",
+            content_disposition="attachment",
+            content_length="99999999",
+            body=b"spreadsheet-data",
+            url="https://example.com/report/General.xlsx",
+        )
+
+        await capture._on_response(response)
+
+        saved = tmp_path / "General.xlsx"
+        assert saved.exists()
+        assert saved.stat().st_size > 0

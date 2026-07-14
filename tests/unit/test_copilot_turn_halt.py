@@ -12,19 +12,24 @@ from skyvern.forge.sdk.copilot.enforcement import (
     terminal_challenge_blocker_signal_from_page_evidence,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
     RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.turn_halt import (
+    ADVISORY_DISPATCH_STALLED_REASON_CODE,
     CopilotTurnHalt,
     TurnHaltKind,
+    expire_output_contract_ladder_at_turn_end,
     raise_if_turn_halt,
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
     turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_and_stash_blocker_signal
+from tests.unit.conftest import make_copilot_context
 
 
 def _signal(
@@ -82,8 +87,25 @@ def test_terminal_blockers_map_to_halts(signal: CopilotToolBlockerSignal, expect
     assert halt.blocker_signal is signal
 
 
+def _halt_ctx(**overrides: object) -> SimpleNamespace:
+    fields: dict[str, object] = {
+        "turn_halt": None,
+        "blocker_signal": None,
+        "blocker_signal_claimant": None,
+        "turn_ownership": None,
+        "gate_precedence_conflict_events": [],
+        "latest_tool_blocker_signal": None,
+        "tool_blocker_signals": [],
+        "output_contract_actuation_by_signature": {},
+        "output_contract_actuation_count_by_signature": {},
+        "output_contract_pending_run_evidence": {},
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def test_stash_and_raise_turn_halt_sets_context_once() -> None:
-    ctx = SimpleNamespace(turn_halt=None)
+    ctx = _halt_ctx()
     signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
 
     halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="stream")
@@ -96,10 +118,7 @@ def test_stash_and_raise_turn_halt_sets_context_once() -> None:
 
 
 def test_enforcement_backstop_converts_existing_terminal_blocker_signal() -> None:
-    ctx = SimpleNamespace(
-        turn_halt=None,
-        latest_tool_blocker_signal=None,
-        blocker_signal=None,
+    ctx = _halt_ctx(
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
     )
@@ -114,7 +133,7 @@ def test_enforcement_backstop_converts_existing_terminal_blocker_signal() -> Non
 
 
 def test_terminal_challenge_halt_preserves_signal_extra() -> None:
-    ctx = SimpleNamespace(turn_halt=None)
+    ctx = _halt_ctx()
     signal = _signal(
         internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
         extra={
@@ -177,96 +196,52 @@ def test_page_challenge_signal_records_explicit_terminal_blocker() -> None:
     assert signal.blocked_tool == "update_and_run_blocks"
 
 
-def test_current_page_challenge_signal_does_not_halt_before_bounded_attempt() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "challenge_state": {
-                "detected": True,
-                "kind": "human_verification",
-                "requires_human_verification": True,
-                "gates_submit_controls": True,
-                "gated_submit_controls": [{"text": "Search", "disabled": True}],
-            },
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="update_and_run_blocks",
-    )
-
-    assert signal is None
-
-
-def test_current_page_challenge_signal_does_not_defer_to_empty_result_shell() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "observed_after_workflow_run": True,
-            "challenge_state": {
-                "detected": True,
-                "kind": "human_verification",
-                "requires_human_verification": True,
-                "gates_submit_controls": True,
-                "gated_submit_controls": [{"text": "Search", "disabled": True}],
-            },
-            "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="evaluate",
-    )
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-
-
-def test_current_page_challenge_signal_does_not_defer_to_form_container_text() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "observed_after_workflow_run": True,
-            "challenge_state": {
-                "detected": True,
-                "kind": "captcha",
-                "requires_human_verification": True,
-                "gates_submit_controls": True,
-                "gated_submit_controls": [{"text": "Search", "disabled": True}],
-            },
-            "result_containers": [
-                {
-                    "tag": "form",
-                    "selector": "#record-search",
-                    "text_excerpt": (
-                        "First name Last name Results No records are available because the anti-bot "
-                        "challenge prevented the search from running."
-                    ),
-                }
-            ],
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="update_and_run_blocks",
-    )
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-
-
-def test_current_page_challenge_signal_reads_flow_evidence_packets() -> None:
-    ctx = SimpleNamespace(
-        flow_evidence=[
-            {
-                "observation_step": 1,
-                "evidence": {
+@pytest.mark.parametrize(
+    ("ctx", "blocked_tool", "expect_signal"),
+    [
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
+                    "challenge_state": {
+                        "detected": True,
+                        "kind": "human_verification",
+                        "requires_human_verification": True,
+                        "gates_submit_controls": True,
+                        "gated_submit_controls": [{"text": "Search", "disabled": True}],
+                    },
+                },
+            ),
+            "update_and_run_blocks",
+            False,
+            id="does_not_halt_before_bounded_attempt",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
+                    "observed_after_workflow_run": True,
+                    "challenge_state": {
+                        "detected": True,
+                        "kind": "human_verification",
+                        "requires_human_verification": True,
+                        "gates_submit_controls": True,
+                        "gated_submit_controls": [{"text": "Search", "disabled": True}],
+                    },
+                    "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+                },
+            ),
+            "evaluate",
+            True,
+            id="does_not_defer_to_empty_result_shell",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
                     "observed_after_workflow_run": True,
                     "challenge_state": {
                         "detected": True,
@@ -275,44 +250,79 @@ def test_current_page_challenge_signal_reads_flow_evidence_packets() -> None:
                         "gates_submit_controls": True,
                         "gated_submit_controls": [{"text": "Search", "disabled": True}],
                     },
-                    "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+                    "result_containers": [
+                        {
+                            "tag": "form",
+                            "selector": "#record-search",
+                            "text_excerpt": (
+                                "First name Last name Results No records are available because the anti-bot "
+                                "challenge prevented the search from running."
+                            ),
+                        }
+                    ],
                 },
-            }
-        ],
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-    )
+            ),
+            "update_and_run_blocks",
+            True,
+            id="does_not_defer_to_form_container_text",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                flow_evidence=[
+                    {
+                        "observation_step": 1,
+                        "evidence": {
+                            "observed_after_workflow_run": True,
+                            "challenge_state": {
+                                "detected": True,
+                                "kind": "captcha",
+                                "requires_human_verification": True,
+                                "gates_submit_controls": True,
+                                "gated_submit_controls": [{"text": "Search", "disabled": True}],
+                            },
+                            "result_containers": [{"selector": "#results", "text_excerpt": "Results"}],
+                        },
+                    }
+                ],
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+            ),
+            "update_and_run_blocks",
+            True,
+            id="reads_flow_evidence_packets",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                last_failure_category_top=None,
+                last_run_blocks_workflow_run_id=None,
+                composition_page_evidence={
+                    "challenge_state": {
+                        "detected": True,
+                        "kind": "human_verification",
+                        "requires_human_verification": False,
+                        "gates_submit_controls": False,
+                    },
+                    "result_containers": [
+                        {"selector": "#results", "row_count": 1, "sample_rows": ["Visible result row"]}
+                    ],
+                },
+            ),
+            "evaluate",
+            False,
+            id="defers_to_populated_result_container_evidence",
+        ),
+    ],
+)
+def test_current_page_challenge_signal_from_current_page_evidence(
+    ctx: SimpleNamespace, blocked_tool: str, expect_signal: bool
+) -> None:
+    signal = terminal_challenge_blocker_signal_from_current_page_evidence(ctx, blocked_tool=blocked_tool)
 
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="update_and_run_blocks",
-    )
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-
-
-def test_current_page_challenge_signal_defers_to_populated_result_container_evidence() -> None:
-    ctx = SimpleNamespace(
-        last_failure_category_top=None,
-        last_run_blocks_workflow_run_id=None,
-        composition_page_evidence={
-            "challenge_state": {
-                "detected": True,
-                "kind": "human_verification",
-                "requires_human_verification": False,
-                "gates_submit_controls": False,
-            },
-            "result_containers": [{"selector": "#results", "row_count": 1, "sample_rows": ["Visible result row"]}],
-        },
-    )
-
-    signal = terminal_challenge_blocker_signal_from_current_page_evidence(
-        ctx,
-        blocked_tool="evaluate",
-    )
-
-    assert signal is None
+    if expect_signal:
+        assert signal is not None
+        assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    else:
+        assert signal is None
 
 
 def _involuntary_repair_ceiling_signal() -> CopilotToolBlockerSignal:
@@ -337,7 +347,7 @@ def _consume_ctx(
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None,
     tool_blocker_signals: list[CopilotToolBlockerSignal] | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    return _halt_ctx(
         turn_halt=turn_halt,
         blocker_signal=blocker_signal,
         latest_tool_blocker_signal=latest_tool_blocker_signal,
@@ -347,7 +357,7 @@ def _consume_ctx(
 
 def test_verified_outcome_suppresses_and_consumes_involuntary_halt() -> None:
     signal = _involuntary_repair_ceiling_signal()
-    halt = stash_repair_ceiling_turn_halt(SimpleNamespace(turn_halt=None), signal, consecutive_identical_repair_count=3)
+    halt = stash_repair_ceiling_turn_halt(_halt_ctx(), signal, consecutive_identical_repair_count=3)
     ctx = _consume_ctx(
         turn_halt=halt,
         blocker_signal=signal,
@@ -389,7 +399,7 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
 def test_verified_outcome_does_not_clear_voluntary_blocker_when_involuntary_absent() -> None:
     challenge_signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
     loop_halt = stash_turn_halt_from_blocker_signal(
-        SimpleNamespace(turn_halt=None),
+        _halt_ctx(),
         _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step"),
         source="hook",
     )
@@ -456,6 +466,207 @@ def test_default_verified_argument_is_fail_safe_and_raises() -> None:
     signal = _involuntary_repair_ceiling_signal()
     ctx = _consume_ctx(blocker_signal=signal)
     stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx)
+
+
+def _output_contract_ctx(*, granted: bool) -> SimpleNamespace:
+    states = {"sig_a": OutputContractAdvisoryState.GRANTED} if granted else {}
+    return _halt_ctx(output_contract_actuation_by_signature=states)
+
+
+def test_loop_detected_deferred_while_output_contract_ladder_unresolved() -> None:
+    ctx = _output_contract_ctx(granted=True)
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn")
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement_backstop")
+
+    assert halt is None
+    assert ctx.turn_halt is None
+
+
+def test_loop_detected_promotes_once_output_contract_ladder_resolves() -> None:
+    ctx = _output_contract_ctx(granted=False)
+    signal = _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn")
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement_backstop")
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.LOOP_DETECTED
+
+
+def test_output_source_unobservable_terminal_promotes_even_while_ladder_unresolved() -> None:
+    ctx = _output_contract_ctx(granted=True)
+    signal = _signal(blocker_kind="tool_error", internal_reason_code="output_source_unobservable")
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+
+
+def test_active_terminal_challenge_promotes_while_ladder_unresolved() -> None:
+    ctx = _output_contract_ctx(granted=True)
+    signal = _signal(internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE)
+
+    halt = stash_turn_halt_from_blocker_signal(ctx, signal, source="run_execution")
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+
+
+def _defer_ledger_ctx() -> SimpleNamespace:
+    return _halt_ctx(
+        output_contract_actuation_by_signature={"sig_a": OutputContractAdvisoryState.GRANTED},
+        output_contract_run_output_observed_by_signature={},
+        output_contract_page_extraction_imposed_by_signature={},
+        output_contract_pending_run_evidence={"sig_a": ["output.confirmation_number"]},
+    )
+
+
+def _defer_count_ledger_ctx() -> SimpleNamespace:
+    return _halt_ctx(
+        output_contract_actuation_by_signature={"sig_a": OutputContractAdvisoryState.UNUSED},
+        output_contract_actuation_count_by_signature={"sig_a": 1},
+        output_contract_run_output_observed_by_signature={},
+        output_contract_page_extraction_imposed_by_signature={},
+        output_contract_pending_run_evidence={"sig_a": ["output.confirmation_number"]},
+    )
+
+
+def _loop_signal() -> CopilotToolBlockerSignal:
+    return _signal(blocker_kind="loop_detected", internal_reason_code="code_authoring_guardrail_churn")
+
+
+def test_defer_swallows_first_loop_signal_and_snapshots_progress() -> None:
+    ctx = _defer_ledger_ctx()
+    assert stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop") is None
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_defer_progress_token is not None
+
+
+def test_defer_never_expires_granted_grant_awaiting_forced_dispatch() -> None:
+    ctx = _defer_ledger_ctx()
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+
+
+def test_defer_expires_countonly_ladder_into_typed_terminal() -> None:
+    ctx = _defer_count_ledger_ctx()
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+
+
+def test_defer_re_arms_when_lifecycle_advances() -> None:
+    ctx = _defer_ledger_ctx()
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    ctx.output_contract_run_output_observed_by_signature["sig_a"] = True
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+
+
+def test_defer_countonly_ladder_reaches_a_terminal_within_two_stalled_signals() -> None:
+    ctx = _defer_count_ledger_ctx()
+    for _ in range(6):
+        stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+        if ctx.turn_halt is not None:
+            break
+    assert ctx.turn_halt is not None
+
+
+def test_turn_end_expiry_transitions_granted_and_emits_stalled_terminal() -> None:
+    ctx = make_copilot_context()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    ctx.output_contract_pending_run_evidence["sig_a"] = ["output.confirmation_number"]
+
+    halt = expire_output_contract_ladder_at_turn_end(ctx)
+
+    assert halt is not None
+    assert halt.kind == TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+    assert ctx.turn_halt is halt
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == ADVISORY_DISPATCH_STALLED_REASON_CODE
+    assert ctx.blocker_signal.renders_final_reply is True
+
+
+def test_turn_end_expiry_noop_without_live_grant() -> None:
+    ctx = make_copilot_context()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
+
+    assert expire_output_contract_ladder_at_turn_end(ctx) is None
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.CONSUMED
+
+
+def test_turn_end_expiry_keeps_existing_halt_but_expires_grant() -> None:
+    ctx = make_copilot_context()
+    terminal_signal = _signal(internal_reason_code="probable_site_block_stop")
+    existing = stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="test")
+    assert existing is not None
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    assert expire_output_contract_ladder_at_turn_end(ctx) is None
+    assert ctx.turn_halt is existing
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.EXPIRED
+
+
+def test_mid_turn_expiry_keeps_granted_early_return() -> None:
+    ctx = make_copilot_context()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+    stash_turn_halt_from_blocker_signal(ctx, _loop_signal(), source="enforcement_backstop")
+
+    assert ctx.turn_halt is None
+    assert ctx.output_contract_actuation_by_signature["sig_a"] == OutputContractAdvisoryState.GRANTED
+
+
+def test_terminal_stash_choke_point_claims_genuinely_terminal() -> None:
+    ctx = make_copilot_context()
+    signal = _signal(internal_reason_code="probable_site_block_stop")
+
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="test")
+
+    assert ctx.turn_ownership is not None
+    assert TurnClaimant.GENUINELY_TERMINAL in ctx.turn_ownership.claims
+
+
+def test_repair_ceiling_stash_choke_point_claims_genuinely_terminal() -> None:
+    ctx = make_copilot_context()
+    signal = _involuntary_repair_ceiling_signal()
+
+    stash_repair_ceiling_turn_halt(ctx, signal, consecutive_identical_repair_count=3)
+
+    assert ctx.turn_ownership is not None
+    assert TurnClaimant.GENUINELY_TERMINAL in ctx.turn_ownership.claims
+
+
+def test_raise_if_turn_halt_retires_halt_outranked_by_live_ladder() -> None:
+    ctx = make_copilot_context()
+    loop_signal = _signal(blocker_kind="loop_detected", internal_reason_code="loop_detected_generic")
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.LOOP_DETECTED, loop_signal)
+    stash_turn_halt_from_blocker_signal(ctx, loop_signal, source="test")
+    assert ctx.turn_halt is not None
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    raise_if_turn_halt(ctx)
+
+    assert ctx.turn_halt is None
+    assert any(event.site == "turn_halt" for event in ctx.gate_precedence_conflict_events)
+
+
+def test_raise_if_turn_halt_still_raises_genuinely_terminal_over_live_ladder() -> None:
+    ctx = make_copilot_context()
+    terminal_signal = _signal(internal_reason_code="probable_site_block_stop")
+    stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="test")
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
 
     with pytest.raises(CopilotTurnHalt):
         raise_if_turn_halt(ctx)

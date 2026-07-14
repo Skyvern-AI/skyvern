@@ -223,14 +223,147 @@ async def test_list_tools_emits_protocol_request_telemetry() -> None:
             tools = await client.list_tools()
 
     assert tools
-    assert any(
-        event == "mcp_request" and payload and payload["operation"] == "initialize"
+    initialize_payloads = [
+        payload
         for event, payload, _, _, _ in events
-    )
+        if event == "mcp_request" and payload and payload["operation"] == "initialize"
+    ]
+    assert len(initialize_payloads) == 1
+    # The in-memory fastmcp Client sends real clientInfo, so this exercises the full dispatch path.
+    assert isinstance(initialize_payloads[0]["client_name"], str)
+    assert initialize_payloads[0]["client_name"] not in ("", "unknown")
+    assert isinstance(initialize_payloads[0]["client_version"], str)
     assert any(
         event == "mcp_request" and payload and payload["operation"] == "tools/list"
         for event, payload, _, _, _ in events
     )
+
+
+def _initialize_context(params: object) -> MiddlewareContext:
+    return MiddlewareContext(message=SimpleNamespace(params=params), fastmcp_context=None)
+
+
+async def _run_initialize(context: MiddlewareContext) -> dict:
+    payloads: list[dict] = []
+
+    def fake_capture(event: str, data: dict | None = None, **_: object) -> None:
+        payloads.append(data or {})
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        return SimpleNamespace()
+
+    with patch.object(analytics, "capture", side_effect=fake_capture):
+        await MCPTelemetryMiddleware().on_initialize(context, call_next)
+
+    assert len(payloads) == 1
+    return payloads[0]
+
+
+@pytest.mark.asyncio
+async def test_initialize_captures_client_info() -> None:
+    context = _initialize_context(SimpleNamespace(clientInfo=SimpleNamespace(name="hermes-agent", version="1.2.3")))
+
+    with patch("skyvern.cli.mcp_tools.telemetry.LOG") as log_mock:
+        payload = await _run_initialize(context)
+
+    assert payload["client_name"] == "hermes-agent"
+    assert payload["client_version"] == "1.2.3"
+    log_kwargs = log_mock.info.call_args.kwargs
+    assert log_kwargs["mcp_client_name"] == "hermes-agent"
+    assert log_kwargs["mcp_client_version"] == "1.2.3"
+
+
+@pytest.mark.asyncio
+async def test_initialize_missing_client_info_defaults_to_unknown() -> None:
+    payload = await _run_initialize(_initialize_context(SimpleNamespace()))
+
+    assert payload["client_name"] == "unknown"
+    assert payload["client_version"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_initialize_malformed_client_info_defaults_to_unknown() -> None:
+    context = _initialize_context(SimpleNamespace(clientInfo=SimpleNamespace(name=123, version=["4.5"])))
+
+    payload = await _run_initialize(context)
+
+    assert payload["client_name"] == "unknown"
+    assert payload["client_version"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_initialize_truncates_oversized_client_info() -> None:
+    context = _initialize_context(SimpleNamespace(clientInfo=SimpleNamespace(name="x" * 10_000, version="1.0")))
+
+    payload = await _run_initialize(context)
+
+    assert payload["client_name"].endswith("... [truncated]")
+    assert len(payload["client_name"]) < 250
+    assert payload["client_version"] == "1.0"
+
+
+@pytest.mark.asyncio
+async def test_initialize_escapes_newlines_in_client_info() -> None:
+    context = _initialize_context(
+        SimpleNamespace(clientInfo=SimpleNamespace(name="evil\nclient", version="1.0\r\n2.0"))
+    )
+
+    payload = await _run_initialize(context)
+
+    assert payload["client_name"] == "evil\\nclient"
+    assert payload["client_version"] == "1.0\\r\\n2.0"
+
+
+@pytest.mark.asyncio
+async def test_initialize_survives_log_failure() -> None:
+    context = _initialize_context(SimpleNamespace(clientInfo=SimpleNamespace(name="hermes-agent", version="1.2.3")))
+    payloads: list[dict] = []
+
+    def fake_capture(event: str, data: dict | None = None, **_: object) -> None:
+        payloads.append(data or {})
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        return SimpleNamespace()
+
+    with (
+        patch("skyvern.cli.mcp_tools.telemetry.LOG.info", side_effect=RuntimeError("logger down")),
+        patch.object(analytics, "capture", side_effect=fake_capture),
+    ):
+        result = await MCPTelemetryMiddleware().on_initialize(context, call_next)
+
+    assert result is not None
+    assert len(payloads) == 1
+    assert payloads[0]["ok"] is True
+    assert payloads[0]["client_name"] == "hermes-agent"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_resolves_client_info_from_session() -> None:
+    payloads: list[dict] = []
+
+    def fake_capture(event: str, data: dict | None = None, **_: object) -> None:
+        payloads.append(data or {})
+
+    fastmcp_context = SimpleNamespace(
+        request_id="req-1",
+        session_id="sess-1",
+        client_id=None,
+        session=SimpleNamespace(
+            client_params=SimpleNamespace(clientInfo=SimpleNamespace(name="cursor", version="0.4"))
+        ),
+    )
+    context = MiddlewareContext(message=SimpleNamespace(name="skyvern_block_schema"), fastmcp_context=fastmcp_context)
+    response = SimpleNamespace(is_error=False, data={"ok": True}, content=[])
+
+    async def call_next(_context: MiddlewareContext[object]) -> object:
+        return response
+
+    with patch.object(analytics, "capture", side_effect=fake_capture):
+        await MCPTelemetryMiddleware().on_call_tool(context, call_next)
+
+    assert len(payloads) == 1
+    assert payloads[0]["client_name"] == "cursor"
+    assert payloads[0]["client_version"] == "0.4"
 
 
 @pytest.mark.asyncio

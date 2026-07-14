@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, List
 
 import aiohttp
@@ -39,11 +39,18 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import (
+    google_drive_service,
+    google_gmail_service,
+    google_oauth_service,
+    google_sheets_service,
+    microsoft_oauth_service,
+    sftp_service,
+)
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
-from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
+from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_gmail import GmailOTPVerificationContext
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
@@ -54,6 +61,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
 
@@ -62,6 +70,9 @@ LOG = structlog.get_logger()
 # Playwright's always-on ffmpeg VP8 encoder scales CPU with pixel count; 720p is the
 # legibility / CPU tradeoff point that the BROWSER_RECORDING_720P flag opts a run into.
 RECORDING_VIDEO_SIZE_720P: dict[str, int] = {"width": 1280, "height": 720}
+GMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
+GMAIL_OTP_MAX_RESULTS = 5
+GMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
@@ -114,6 +125,22 @@ class FieldOptionResolution:
     matched_value: str | None
     confidence: float
     fallback_to_llm: bool
+
+
+@dataclass
+class CodeBlockEngineFailure:
+    error_code: str | None
+    safe_message: str | None
+    failure_reason: str | None
+    exception_class: str | None
+    failing_line: int | None
+    healability_hint: bool | None
+
+
+@dataclass
+class CodeBlockEngineResult:
+    block_result: BlockResult | None
+    failure: CodeBlockEngineFailure | None
 
 
 def _remove_rect(element: dict) -> None:
@@ -682,6 +709,9 @@ class AgentFunction:
     workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the API process should run the built-in local scheduler loop."""
 
+    def is_wait_time_optimization_enabled(self) -> bool:
+        return False
+
     def build_proxy_session_extra_http_headers(self, proxy_session_id: str | None) -> dict[str, str] | None:
         return None
 
@@ -715,6 +745,15 @@ class AgentFunction:
 
         Cloud overrides this with the flex-router → standard-router mapping.
         OSS no-op so self-hosted users without flex routers see no behavior change.
+        """
+        return None
+
+    def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a provider-fallback router twin for the given LLM key, or None if none exists.
+
+        Cloud overrides this with the bare-Gemini-key → *_WITH_FALLBACK mapping so a
+        provider-specific failure falls over to another provider. OSS has no fallback
+        routers, so the default no-op leaves the caller's key untouched.
         """
         return None
 
@@ -810,7 +849,8 @@ class AgentFunction:
         workflow_run_context: "WorkflowRunContext",
         parameter_values: dict[str, Any],
         credential_parameter_keys: set[str],
-    ) -> Any | None:
+        recording_page: "RecordingPage | None" = None,
+    ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner sidecar, or return None for legacy.
 
         OSS no-op returns None so callers fall through to in-process execution. Cloud
@@ -1169,7 +1209,7 @@ class AgentFunction:
                 organization_id=organization_id,
                 credential_id=credential_id,
             )
-            return await google_oauth_service.access_token_from_secrets(secrets)
+            return await google_oauth_service.access_token_from_secrets(secrets, organization_id=organization_id)
         except google_oauth_service.EncryptionNotConfiguredError:
             LOG.error(
                 "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
@@ -1180,6 +1220,38 @@ class AgentFunction:
         except Exception:
             LOG.exception(
                 "Failed to get Google Sheets credentials",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            return None
+
+    async def get_microsoft_credentials(
+        self,
+        organization_id: str,
+        credential_id: str,
+        required_scopes: list[str] | None = None,
+    ) -> str | None:
+        try:
+            secrets = await microsoft_oauth_service.load_credential_secrets(
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            if required_scopes and not microsoft_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+                LOG.info(
+                    "Microsoft OAuth credential missing required scopes",
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    required_scopes=required_scopes,
+                )
+                return None
+            return await microsoft_oauth_service.refresh_and_rotate(
+                organization_id=organization_id,
+                credential_id=credential_id,
+                credential_secrets=secrets,
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to get Microsoft credentials",
                 organization_id=organization_id,
                 credential_id=credential_id,
             )
@@ -1209,7 +1281,7 @@ class AgentFunction:
                     required_scopes=required_scopes,
                 )
                 return None
-            return await google_oauth_service.credentials_from_secrets(secrets)
+            return await google_oauth_service.credentials_from_secrets(secrets, organization_id=organization_id)
         except google_oauth_service.EncryptionNotConfiguredError:
             LOG.error(
                 "Google credential encryption is not configured; operators must enable ENABLE_ENCRYPTION",
@@ -1235,7 +1307,103 @@ class AgentFunction:
         created_after: datetime | None = None,
         context: GmailOTPVerificationContext | None = None,
     ) -> "OTPValue | None":
-        """Cloud-only Gmail OTP lookup hook. OSS builds do not read inboxes."""
+        """Find an OTP in connected Gmail inboxes for a single polling window."""
+        if "@" not in totp_identifier:
+            return None
+
+        from skyvern.services.otp_service import parse_otp_login
+
+        lookup_context = context or GmailOTPVerificationContext()
+        now = datetime.now(timezone.utc)
+        required_scopes = list(google_oauth_service.GOOGLE_GMAIL_SCOPES)
+        credential_cache_age = (
+            (now - lookup_context.credential_ids_loaded_at).total_seconds()
+            if lookup_context.credential_ids_loaded_at
+            else None
+        )
+        if (
+            lookup_context.credential_ids is None
+            or credential_cache_age is None
+            or credential_cache_age >= GMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS
+        ):
+            try:
+                lookup_context.credential_ids = [
+                    credential.id
+                    for credential in await google_oauth_service.get_credentials_for_org(organization_id)
+                    if google_oauth_service.has_required_scopes(credential.scopes_granted, required_scopes)
+                ]
+                lookup_context.credential_ids_loaded_at = now
+            except Exception:
+                LOG.warning("Failed to list Google OAuth credentials for Gmail OTP lookup", exc_info=True)
+                return None
+
+        async with httpx.AsyncClient(timeout=20.0) as gmail_client:
+            for credential_id in lookup_context.credential_ids or []:
+                last_searched_at = lookup_context.last_searched_at_by_credential.get(credential_id)
+                if last_searched_at and (now - last_searched_at).total_seconds() < GMAIL_OTP_SEARCH_INTERVAL_SECONDS:
+                    continue
+                lookup_context.last_searched_at_by_credential[credential_id] = now
+                try:
+                    google_credentials = await self.get_google_workspace_credentials(
+                        organization_id=organization_id,
+                        credential_id=credential_id,
+                        required_scopes=required_scopes,
+                    )
+                    if not google_credentials or not google_credentials.token:
+                        continue
+                    candidates = await google_gmail_service.search_recent_otp_messages(
+                        access_token=google_credentials.token,
+                        totp_identifier=totp_identifier,
+                        created_after=created_after,
+                        max_results=GMAIL_OTP_MAX_RESULTS,
+                        client=gmail_client,
+                    )
+                except google_gmail_service.GmailAPIError as exc:
+                    LOG.warning(
+                        "Gmail OTP lookup failed",
+                        credential_id=credential_id,
+                        status=exc.status,
+                        code=exc.code,
+                    )
+                    continue
+                except Exception:
+                    LOG.warning(
+                        "Unexpected Gmail OTP lookup failure",
+                        credential_id=credential_id,
+                        exc_info=True,
+                    )
+                    continue
+
+                for candidate in candidates:
+                    if lookup_context.has_seen_message_id(candidate.message_id):
+                        continue
+                    try:
+                        otp_value = await parse_otp_login(candidate.content, organization_id)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to parse Gmail OTP candidate",
+                            credential_id=credential_id,
+                            message_id=candidate.message_id,
+                            exc_info=True,
+                        )
+                        continue
+                    lookup_context.remember_message_id(candidate.message_id)
+                    if otp_value:
+                        try:
+                            await app.DATABASE.otp.create_otp_code(
+                                organization_id,
+                                totp_identifier,
+                                otp_value.value,
+                                otp_value.value,
+                                otp_value.get_otp_type(),
+                                workflow_id=workflow_id,
+                                workflow_run_id=workflow_run_id,
+                                source="gmail",
+                            )
+                        except Exception:
+                            LOG.warning("Failed to persist Gmail OTP code", credential_id=credential_id, exc_info=True)
+                        return otp_value
+
         return None
 
     async def ensure_sheet_tab(
@@ -1245,14 +1413,18 @@ class AgentFunction:
         spreadsheet_id: str,
         title: str,
     ) -> int | None:
-        """Ensure a sheet tab with the given title exists in the spreadsheet.
-
-        Returns the sheet_id of the newly created tab, or None if the caller
-        should fall back to its own lookup (e.g. a concurrent creator won the
-        race). OSS base is a no-op that returns None; cloud override calls the
-        Sheets v4 batchUpdate addSheet endpoint.
-        """
-        return None
+        """Ensure a sheet tab with the given title exists in the spreadsheet."""
+        try:
+            tab = await google_sheets_service.create_sheet_tab(
+                access_token=access_token,
+                spreadsheet_id=spreadsheet_id,
+                title=title,
+            )
+            return tab.sheet_id
+        except google_sheets_service.GoogleSheetsAPIError as exc:
+            if exc.status == 400 and exc.code in {"duplicate", "duplicateSheetTitle"}:
+                return None
+            raise
 
     async def google_sheets_values_get(
         self,
@@ -1262,8 +1434,12 @@ class AgentFunction:
         ranges: str,
         fields: str | None = None,
     ) -> dict[str, Any] | None:
-        """Read ranges from a spreadsheet via spreadsheets.get. OSS no-op."""
-        return None
+        return await google_sheets_service.values_get(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            ranges=ranges,
+            fields=fields,
+        )
 
     async def google_sheets_values_append(
         self,
@@ -1273,8 +1449,12 @@ class AgentFunction:
         range_: str,
         values: list[list[Any]],
     ) -> dict[str, Any] | None:
-        """Append rows via spreadsheets.values.append. OSS no-op."""
-        return None
+        return await google_sheets_service.values_append(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            range_=range_,
+            values=values,
+        )
 
     async def google_sheets_values_update(
         self,
@@ -1284,8 +1464,12 @@ class AgentFunction:
         range_: str,
         values: list[list[Any]],
     ) -> dict[str, Any] | None:
-        """Update rows via spreadsheets.values.update. OSS no-op."""
-        return None
+        return await google_sheets_service.values_update(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            range_=range_,
+            values=values,
+        )
 
     async def google_sheets_batch_update(
         self,
@@ -1294,8 +1478,11 @@ class AgentFunction:
         spreadsheet_id: str,
         requests: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        """Apply a batchUpdate to a spreadsheet. OSS no-op."""
-        return None
+        return await google_sheets_service.batch_update(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            requests=requests,
+        )
 
     async def google_sheets_get_sheet_id(
         self,
@@ -1304,8 +1491,11 @@ class AgentFunction:
         spreadsheet_id: str,
         sheet_title: str,
     ) -> int | None:
-        """Resolve a tab title to its numeric sheetId. OSS no-op."""
-        return None
+        return await google_sheets_service.get_sheet_id_by_title(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title,
+        )
 
     async def google_sheets_get_grid_properties(
         self,
@@ -1314,8 +1504,11 @@ class AgentFunction:
         spreadsheet_id: str,
         sheet_title: str,
     ) -> Any | None:
-        """Return the named tab's grid dimensions (sheet_id, column_count, row_count). OSS no-op."""
-        return None
+        return await google_sheets_service.get_sheet_grid_properties(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title,
+        )
 
     async def google_sheets_get_grid_properties_by_id(
         self,
@@ -1324,8 +1517,11 @@ class AgentFunction:
         spreadsheet_id: str,
         sheet_id: int,
     ) -> Any | None:
-        """Return grid dimensions for a sheet matched by numeric sheetId. OSS no-op."""
-        return None
+        return await google_sheets_service.get_sheet_grid_properties_by_id(
+            access_token=access_token,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+        )
 
     async def generate_async_operations(
         self,
@@ -1521,6 +1717,24 @@ class AgentFunction:
             )
             return uploaded_file.web_view_link or f"https://drive.google.com/file/d/{uploaded_file.id}/view"
 
+        if destination.storage_type == FileStorageType.SFTP:
+            if not destination.sftp_host or not destination.sftp_username:
+                raise ValueError("SFTP destination is missing required fields")
+            if not destination.sftp_password and not destination.sftp_private_key:
+                raise ValueError("SFTP destination requires a password or private key")
+            await sftp_service.upload_file(
+                file_path=file_path,
+                host=destination.sftp_host,
+                port=destination.sftp_port if destination.sftp_port is not None else 22,
+                username=destination.sftp_username,
+                remote_path=destination.sftp_remote_path,
+                password=destination.sftp_password,
+                private_key=destination.sftp_private_key,
+                private_key_passphrase=destination.sftp_private_key_passphrase,
+                host_key=destination.sftp_host_key,
+            )
+            return destination.customer_uri
+
         raise ValueError(f"Unsupported storage type: {destination.storage_type}")
 
     @staticmethod
@@ -1575,6 +1789,10 @@ class AgentFunction:
         Returns a platform key string or None.
         Override in cloud to provide platform detection.
         """
+        return None
+
+    def detect_platform_for_tagging(self, url_or_domain: str | None) -> str | None:
+        """Detect a cloud platform for run tagging. OSS intentionally does not tag."""
         return None
 
     def match_field_to_canonical_category(self, field_label: str) -> Any:

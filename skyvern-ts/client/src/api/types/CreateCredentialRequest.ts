@@ -14,6 +14,12 @@ export interface CreateCredentialRequest {
     credential: CreateCredentialRequest.Credential;
     /** Which vault to store this credential in. If omitted, uses the instance default. Use this to mix Skyvern-hosted and custom credentials within the same organization. */
     vault_type?: Skyvern.CredentialVaultType;
+    /** Optional proxy location for this credential's pinned proxy identity. */
+    proxy_location?: CreateCredentialRequest.ProxyLocation;
+    /** Optional advanced reuse key for this credential's pinned proxy identity. */
+    proxy_session_id?: string;
+    /** Rotate the Skyvern-managed proxy sticky-session id when updating this credential. */
+    rotate_proxy_session_id?: boolean;
 }
 
 export namespace CreateCredentialRequest {
@@ -24,4 +30,8 @@ export namespace CreateCredentialRequest {
         | Skyvern.NonEmptyPasswordCredential
         | Skyvern.NonEmptyCreditCardCredential
         | Skyvern.SecretCredential;
+    /**
+     * Optional proxy location for this credential's pinned proxy identity.
+     */
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
 }

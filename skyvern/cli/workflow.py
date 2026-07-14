@@ -97,6 +97,7 @@ def workflow_list(
     search: str | None = typer.Option(
         None,
         "--search",
+        "--query",
         help="Search across workflow titles, folder names, and parameter metadata.",
     ),
     page: int = typer.Option(1, "--page", min=1, help="Page number (1-based)."),

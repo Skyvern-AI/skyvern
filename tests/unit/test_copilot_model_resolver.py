@@ -8,6 +8,19 @@ from unittest.mock import MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+
+
+def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) -> MagicMock:
+    if config is not None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
+            lambda key: config,
+        )
+    handler = MagicMock()
+    handler.llm_key = llm_key
+    return handler
+
 
 class TestModelResolver:
     def test_router_config_empty_model_list_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -22,15 +35,7 @@ class TestModelResolver:
             add_assistant_prefix=False,
             main_model_group="default",
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: router_config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "ROUTER_KEY"
+        handler = _install_config(monkeypatch, router_config, "ROUTER_KEY")
 
         with pytest.raises(InvalidLLMConfigError, match="empty model_list"):
             resolve_model_config(handler)
@@ -72,15 +77,7 @@ class TestModelResolver:
             temperature=0.3,
             max_completion_tokens=8192,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: router_config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "GEMINI_2_5_FLASH_WITH_FALLBACK"
+        handler = _install_config(monkeypatch, router_config, "GEMINI_2_5_FLASH_WITH_FALLBACK")
 
         model_name, run_config, llm_key, supports_vision = resolve_model_config(handler)
 
@@ -112,15 +109,7 @@ class TestModelResolver:
             add_assistant_prefix=False,
             main_model_group="nonexistent-group",
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: router_config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "MISCONFIGURED_ROUTER"
+        handler = _install_config(monkeypatch, router_config, "MISCONFIGURED_ROUTER")
 
         with capture_logs() as logs:
             model_name, _, _, _ = resolve_model_config(handler)
@@ -141,15 +130,7 @@ class TestModelResolver:
             temperature=0.5,
             max_tokens=4096,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "BASIC_KEY"
+        handler = _install_config(monkeypatch, config, "BASIC_KEY")
 
         model_name, run_config, llm_key, supports_vision = resolve_model_config(handler)
 
@@ -180,10 +161,7 @@ class TestModelResolver:
             fake_get_config,
         )
 
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "PRIMARY_KEY"
+        handler = _install_config(monkeypatch, None, "PRIMARY_KEY")
 
         model_name, _, llm_key, _ = resolve_model_config(handler, llm_key_override="FALLBACK_KEY")
 
@@ -203,15 +181,7 @@ class TestModelResolver:
             temperature=0.5,
             max_tokens=4096,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "BASIC_KEY"
+        handler = _install_config(monkeypatch, config, "BASIC_KEY")
 
         _, run_config, _, _ = resolve_model_config(handler)
 
@@ -226,15 +196,7 @@ class TestModelResolver:
             supports_vision=False,
             add_assistant_prefix=False,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "NO_VISION_KEY"
+        handler = _install_config(monkeypatch, config, "NO_VISION_KEY")
 
         _, _, _, supports_vision = resolve_model_config(handler)
         assert supports_vision is False
@@ -267,15 +229,7 @@ class TestModelResolver:
             add_assistant_prefix=False,
             litellm_params=lp,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "VERTEX_KEY"
+        handler = _install_config(monkeypatch, config, "VERTEX_KEY")
 
         with capture_logs() as logs:
             _, run_config, _, _ = resolve_model_config(handler)
@@ -310,15 +264,7 @@ class TestModelResolver:
             supports_vision=True,
             add_assistant_prefix=False,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "NO_TIMEOUT_KEY"
+        handler = _install_config(monkeypatch, config, "NO_TIMEOUT_KEY")
 
         _, run_config, _, _ = resolve_model_config(handler)
         assert run_config.model_settings is not None
@@ -337,15 +283,7 @@ class TestModelResolver:
             supports_vision=True,
             add_assistant_prefix=False,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "BASIC_KEY"
+        handler = _install_config(monkeypatch, config, "BASIC_KEY")
 
         resolve_model_config(handler)
 
@@ -362,15 +300,7 @@ class TestModelResolver:
             add_assistant_prefix=False,
             litellm_params=lp,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "EXPLICIT_TIMEOUT_KEY"
+        handler = _install_config(monkeypatch, config, "EXPLICIT_TIMEOUT_KEY")
 
         _, run_config, _, _ = resolve_model_config(handler)
         assert run_config.model_settings is not None
@@ -397,15 +327,7 @@ class TestModelResolver:
             add_assistant_prefix=False,
             litellm_params=lp,  # type: ignore[arg-type]
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "WITH_TYPO_KEY"
+        handler = _install_config(monkeypatch, config, "WITH_TYPO_KEY")
 
         with capture_logs() as logs:
             resolve_model_config(handler)
@@ -425,15 +347,7 @@ class TestModelResolver:
             add_assistant_prefix=False,
             litellm_params=lp,
         )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.model_resolver.LLMConfigRegistry.get_config",
-            lambda key: config,
-        )
-
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "CLEAN_KEY"
+        handler = _install_config(monkeypatch, config, "CLEAN_KEY")
 
         with capture_logs() as logs:
             resolve_model_config(handler)
@@ -485,10 +399,7 @@ class TestModelResolver:
         monkeypatch.setattr(settings, "OPENAI_COMPATIBLE_MODEL_KEY", "OPENAI_COMPATIBLE")
         monkeypatch.setattr(settings, "OPENAI_COMPATIBLE_MODEL_NAME", "gpt-4o")
 
-        from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-
-        handler = MagicMock()
-        handler.llm_key = "gpt-4o"  # the rewritten observability label
+        handler = _install_config(monkeypatch, None, "gpt-4o")  # the rewritten observability label
 
         model_name, run_config, llm_key, _ = resolve_model_config(handler)
 
@@ -497,3 +408,30 @@ class TestModelResolver:
         assert model_name == "openai/gpt-4o"
         assert run_config.model_provider._base_url == "https://api.githubcopilot.com"
         assert run_config.model_provider._api_key == "gho_test"
+
+
+@pytest.mark.parametrize(
+    "alias", ["ACME_UNREGISTERED_PROVIDER_MODEL", "ZZUNREGISTEREDPROVIDER", "ZZ-UNREGISTERED-HYPHEN-KEY"]
+)
+def test_resolve_model_config_raises_for_unregistered_registry_alias(alias: str) -> None:
+    # Copilot pointed at a registry-style alias whose config isn't registered here must fail
+    # fast, not synthesize a provider-less model that 400s inside the Agents SDK. SKY-12322.
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+    from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
+
+    assert not LLMConfigRegistry.is_registered(alias)
+    handler = MagicMock()
+    handler.llm_key = alias
+    with pytest.raises(InvalidLLMConfigError):
+        resolve_model_config(handler)
+
+
+@pytest.mark.parametrize("model_name", ["gpt-4o", "azure/gpt-4.1"])
+def test_resolve_model_config_synthesizes_self_hosted_model(model_name: str) -> None:
+    # A raw self-hosted model string is not registry-style, so the guard leaves it alone and
+    # get_config's synth fallback resolves it — the self-hosted LLM_KEY path stays intact.
+    handler = MagicMock()
+    handler.llm_key = model_name
+    resolved_model_name, _run_config, resolved_llm_key, _ = resolve_model_config(handler)
+    assert resolved_model_name == model_name
+    assert resolved_llm_key == model_name

@@ -35,7 +35,7 @@ def _proxy_header_hook() -> SimpleNamespace:
 @pytest.mark.asyncio
 async def test_login_block_credential_proxy_pin_applies_to_workflow_run() -> None:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(extra_http_headers={"X-Test": "1"}, proxy_location=None)
+    workflow_run = SimpleNamespace(workflow_run_id="wr_1", extra_http_headers={"X-Test": "1"}, proxy_location=None)
     block = SimpleNamespace(parameters=[_credential_parameter()])
     credential = SimpleNamespace(proxy_session_id="credential-pin", proxy_location=ProxyLocation.RESIDENTIAL_ISP)
 
@@ -63,7 +63,9 @@ async def test_login_block_credential_proxy_pin_applies_to_workflow_run() -> Non
 @pytest.mark.asyncio
 async def test_login_block_credential_proxy_pin_respects_existing_run_header() -> None:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(extra_http_headers={"dedicated-ip": "run-pin"}, proxy_location=None)
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_1", extra_http_headers={"dedicated-ip": "run-pin"}, proxy_location=None
+    )
     block = SimpleNamespace(parameters=[_credential_parameter()])
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
@@ -86,7 +88,9 @@ async def test_login_block_credential_proxy_pin_respects_existing_run_header() -
 @pytest.mark.asyncio
 async def test_login_block_credential_proxy_pin_preserves_run_proxy_location() -> None:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(extra_http_headers=None, proxy_location=ProxyLocation.RESIDENTIAL)
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_1", extra_http_headers=None, proxy_location=ProxyLocation.RESIDENTIAL
+    )
     block = SimpleNamespace(parameters=[_credential_parameter()])
     credential = SimpleNamespace(proxy_session_id="credential-pin", proxy_location=ProxyLocation.RESIDENTIAL_ISP)
 
@@ -113,7 +117,7 @@ async def test_login_block_credential_proxy_pin_preserves_run_proxy_location() -
 @pytest.mark.asyncio
 async def test_login_block_credential_proxy_pin_prefers_linked_profile_pin() -> None:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(extra_http_headers=None, proxy_location=None)
+    workflow_run = SimpleNamespace(workflow_run_id="wr_1", extra_http_headers=None, proxy_location=None)
     block = SimpleNamespace(parameters=[_credential_parameter()])
     credential = SimpleNamespace(
         proxy_session_id="credential-pin",
@@ -150,7 +154,7 @@ async def test_login_block_credential_proxy_pin_prefers_linked_profile_pin() -> 
 @pytest.mark.asyncio
 async def test_login_block_credential_proxy_pin_skips_when_linked_profile_is_unpinned() -> None:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(extra_http_headers=None, proxy_location=None)
+    workflow_run = SimpleNamespace(workflow_run_id="wr_1", extra_http_headers=None, proxy_location=None)
     block = SimpleNamespace(parameters=[_credential_parameter()])
     credential = SimpleNamespace(
         proxy_session_id="credential-pin",
@@ -180,7 +184,7 @@ async def test_login_block_credential_proxy_pin_skips_when_linked_profile_is_unp
 @pytest.mark.asyncio
 async def test_login_block_credential_proxy_pin_does_not_mutate_run_when_db_update_fails() -> None:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(extra_http_headers=None, proxy_location=None)
+    workflow_run = SimpleNamespace(workflow_run_id="wr_1", extra_http_headers=None, proxy_location=None)
     block = SimpleNamespace(parameters=[_credential_parameter()])
     credential = SimpleNamespace(proxy_session_id="credential-pin", proxy_location=ProxyLocation.RESIDENTIAL_ISP)
 

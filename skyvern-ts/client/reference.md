@@ -1,5 +1,5 @@
 # Reference
-<details><summary><code>client.<a href="/src/Client.ts">runSdkAction</a>({ ...params }) -> Skyvern.RunSdkActionResponse</code></summary>
+<details><summary><code>client.<a href="/src/Client.ts">getWorkflowVersions</a>(workflowPermanentId, { ...params }) -> Skyvern.Workflow[]</code></summary>
 <dl>
 <dd>
 
@@ -11,7 +11,7 @@
 <dl>
 <dd>
 
-Execute a single SDK action with the specified parameters
+Get all versions of a workflow by its permanent ID.
 </dd>
 </dl>
 </dd>
@@ -26,11 +26,8 @@ Execute a single SDK action with the specified parameters
 <dd>
 
 ```typescript
-await client.runSdkAction({
-    url: "url",
-    action: {
-        type: "ai_act"
-    }
+await client.getWorkflowVersions("workflow_permanent_id", {
+    template: true
 });
 
 ```
@@ -47,7 +44,15 @@ await client.runSdkAction({
 <dl>
 <dd>
 
-**request:** `Skyvern.RunSdkActionRequest` 
+**workflowPermanentId:** `string` 
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**request:** `Skyvern.GetWorkflowVersionsRequest` 
     
 </dd>
 </dl>
@@ -121,126 +126,6 @@ await client.artifacts.getArtifactContent("artifact_id");
 <dd>
 
 **requestOptions:** `Artifacts.RequestOptions` 
-    
-</dd>
-</dl>
-</dd>
-</dl>
-
-
-</dd>
-</dl>
-</details>
-
-## Server
-<details><summary><code>client.server.<a href="/src/api/resources/server/client/Client.ts">getVersion</a>() -> Record&lt;string, string&gt;</code></summary>
-<dl>
-<dd>
-
-#### 📝 Description
-
-<dl>
-<dd>
-
-<dl>
-<dd>
-
-Returns the current Skyvern server version (git SHA for official builds).
-</dd>
-</dl>
-</dd>
-</dl>
-
-#### 🔌 Usage
-
-<dl>
-<dd>
-
-<dl>
-<dd>
-
-```typescript
-await client.server.getVersion();
-
-```
-</dd>
-</dl>
-</dd>
-</dl>
-
-#### ⚙️ Parameters
-
-<dl>
-<dd>
-
-<dl>
-<dd>
-
-**requestOptions:** `Server.RequestOptions` 
-    
-</dd>
-</dl>
-</dd>
-</dl>
-
-
-</dd>
-</dl>
-</details>
-
-## Workflows
-<details><summary><code>client.workflows.<a href="/src/api/resources/workflows/client/Client.ts">resetWorkflowBrowserProfile</a>(workflowPermanentId) -> void</code></summary>
-<dl>
-<dd>
-
-#### 📝 Description
-
-<dl>
-<dd>
-
-<dl>
-<dd>
-
-Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.
-</dd>
-</dl>
-</dd>
-</dl>
-
-#### 🔌 Usage
-
-<dl>
-<dd>
-
-<dl>
-<dd>
-
-```typescript
-await client.workflows.resetWorkflowBrowserProfile("wpid_123");
-
-```
-</dd>
-</dl>
-</dd>
-</dl>
-
-#### ⚙️ Parameters
-
-<dl>
-<dd>
-
-<dl>
-<dd>
-
-**workflowPermanentId:** `string` — The permanent ID of the workflow. Starts with `wpid_`.
-    
-</dd>
-</dl>
-
-<dl>
-<dd>
-
-**requestOptions:** `Workflows.RequestOptions` 
     
 </dd>
 </dl>
@@ -765,6 +650,70 @@ await client.schedules.disable("workflow_permanent_id", "workflow_schedule_id");
 <dd>
 
 **requestOptions:** `Schedules.RequestOptions` 
+    
+</dd>
+</dl>
+</dd>
+</dl>
+
+
+</dd>
+</dl>
+</details>
+
+## Agents
+<details><summary><code>client.agents.<a href="/src/api/resources/agents/client/Client.ts">resetWorkflowBrowserProfile</a>(workflowPermanentId) -> void</code></summary>
+<dl>
+<dd>
+
+#### 📝 Description
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### 🔌 Usage
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+```typescript
+await client.agents.resetWorkflowBrowserProfile("wpid_123");
+
+```
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### ⚙️ Parameters
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+**workflowPermanentId:** `string` — The permanent ID of the workflow. Starts with `wpid_`.
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**requestOptions:** `Agents.RequestOptions` 
     
 </dd>
 </dl>

@@ -19,12 +19,13 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.config import settings
 from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.exceptions import ScriptTerminationException
+from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
@@ -37,6 +38,11 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _EXTRACT_FORM_FIELDS_JS: str | None = None
+
+
+def _is_pointer_interception_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "intercepts pointer events" in message or "intercepted by another element" in message
 
 
 def _get_extract_form_fields_js() -> str:
@@ -163,6 +169,28 @@ class SkyvernPage(Page):
     ) -> str:
         return value
 
+    async def _resolve_totp_placeholder_or_raise(
+        self,
+        value: str,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        if not is_unresolved_totp_value(value):
+            return value
+        try:
+            resolved_value = await self.get_actual_value(
+                value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+            )
+        except NoTOTPSecretFound:
+            raise
+        except Exception as exc:
+            raise NoTOTPSecretFound() from exc
+        if is_unresolved_totp_value(resolved_value):
+            raise NoTOTPSecretFound()
+        return resolved_value
+
     async def get_totp_digit(
         self,
         context: Any,
@@ -288,6 +316,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -298,6 +327,7 @@ class SkyvernPage(Page):
         prompt: str,
         ai: str | None = "fallback",
         mode: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -310,6 +340,7 @@ class SkyvernPage(Page):
         ai: str | None = "fallback",
         mode: str | None = None,
         recoverable_marker_id: int | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
@@ -377,8 +408,11 @@ class SkyvernPage(Page):
                 try:
                     # Retry selector lookup to handle page transitions (redirects,
                     # slow renders) before burning an expensive AI fallback call.
-                    locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
-                    await self._prepare_element(locator, timeout=timeout)
+                    if _skip_element_prep:
+                        locator = self._locator_scope.locator(selector).first
+                    else:
+                        locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
+                        await self._prepare_element(locator, timeout=timeout)
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
@@ -388,21 +422,27 @@ class SkyvernPage(Page):
                             selector=selector,
                         )
                         return selector
+                    should_retry_after_escape = (
+                        not _skip_element_prep
+                        or not isinstance(e, PlaywrightTimeoutError)
+                        or _is_pointer_interception_error(e)
+                    )
                     # The click may have failed because an autocomplete dropdown
                     # or other overlay is covering the target element.  Press
                     # Escape to dismiss it and retry once before falling to AI.
-                    try:
-                        await self.page.keyboard.press("Escape")
-                        await asyncio.sleep(0.3)
-                        locator = self._locator_scope.locator(selector).first
-                        await locator.click(timeout=timeout, **kwargs)
-                        LOG.info(
-                            "CSS selector click succeeded after dismissing overlay",
-                            selector=selector,
-                        )
-                        return selector
-                    except Exception:
-                        pass  # retry failed too — fall through to AI
+                    if should_retry_after_escape:
+                        try:
+                            await self.page.keyboard.press("Escape")
+                            await asyncio.sleep(0.3)
+                            locator = self._locator_scope.locator(selector).first
+                            await locator.click(timeout=timeout, **kwargs)
+                            LOG.info(
+                                "CSS selector click succeeded after dismissing overlay",
+                                selector=selector,
+                            )
+                            return selector
+                        except Exception:
+                            pass  # retry failed too — fall through to AI
                     LOG.info(
                         "CSS selector click failed, falling back to AI",
                         sampling=True,
@@ -476,6 +516,7 @@ class SkyvernPage(Page):
         mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str: ...
 
@@ -490,6 +531,7 @@ class SkyvernPage(Page):
         mode: str | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str: ...
 
@@ -505,6 +547,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -554,6 +597,11 @@ class SkyvernPage(Page):
                 raise ValueError("mode='direct' requires a selector.")
             if value is None:
                 raise ValueError("mode='direct' requires a value.")
+            value = await self._resolve_totp_placeholder_or_raise(
+                value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+            )
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
             await locator.fill(value, timeout=timeout, **kwargs)
@@ -601,6 +649,7 @@ class SkyvernPage(Page):
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             recoverable_marker_id=recoverable_marker_id,
+            _skip_element_prep=_skip_element_prep,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -613,6 +662,8 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
+        *,
+        _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
         # Backward compatibility
@@ -636,6 +687,7 @@ class SkyvernPage(Page):
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             recoverable_marker_id=recoverable_marker_id,
+            _skip_element_prep=_skip_element_prep,
         )
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -723,6 +775,14 @@ class SkyvernPage(Page):
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
 
+        resolved_totp_value: str | None = None
+        if value is not None and is_unresolved_totp_value(value):
+            resolved_totp_value = await self._resolve_totp_placeholder_or_raise(
+                value,
+                totp_identifier=kwargs.get("totp_identifier"),
+                totp_url=kwargs.get("totp_url"),
+            )
+
         timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
         data = kwargs.pop("data", None)
 
@@ -750,15 +810,20 @@ class SkyvernPage(Page):
                 )
             raise ValueError("Selector is required but was not provided")
 
-        actual_value = value or ""
-        try:
-            actual_value = await self.get_actual_value(
-                actual_value,
-                totp_identifier=kwargs.get("totp_identifier"),
-                totp_url=kwargs.get("totp_url"),
-            )
-        except Exception:
-            pass  # use original value
+        actual_value = resolved_totp_value if resolved_totp_value is not None else value or ""
+        if resolved_totp_value is None:
+            try:
+                actual_value = await self.get_actual_value(
+                    actual_value,
+                    totp_identifier=kwargs.get("totp_identifier"),
+                    totp_url=kwargs.get("totp_url"),
+                )
+            except NoTOTPSecretFound:
+                raise
+            except Exception:
+                pass  # use original value
+        if is_unresolved_totp_value(actual_value):
+            raise NoTOTPSecretFound()
 
         try:
             result = await self._do_autocomplete(
@@ -778,7 +843,7 @@ class SkyvernPage(Page):
             if prompt:
                 return await self._ai.ai_input_text(
                     selector=None,
-                    value=actual_value,
+                    value=value if resolved_totp_value is not None else actual_value,
                     intention=prompt,
                     data=data,
                     timeout=timeout,
@@ -946,6 +1011,7 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         recoverable_marker_id: int | None = None,
+        _skip_element_prep: bool = False,
     ) -> str:
         """Input text into an element identified by ``selector``.
 
@@ -962,6 +1028,15 @@ class SkyvernPage(Page):
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
 
+        original_value = value
+        resolved_totp_value: str | None = None
+        if is_unresolved_totp_value(value):
+            resolved_totp_value = await self._resolve_totp_placeholder_or_raise(
+                value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+            )
+
         # For single-digit TOTP values (from multi-field TOTP inputs), force fallback mode
         # so that we use the exact digit value instead of having AI generate a new one
         if value and len(value) == 1 and value.isdigit() and ai == "proactive":
@@ -970,25 +1045,40 @@ class SkyvernPage(Page):
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
-            original_value = value
             original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
-                    value = await self.get_actual_value(
-                        value,
-                        totp_identifier=totp_identifier,
-                        totp_url=totp_url,
-                    )
+                    if resolved_totp_value is not None:
+                        value = resolved_totp_value
+                    else:
+                        value = await self.get_actual_value(
+                            value,
+                            totp_identifier=totp_identifier,
+                            totp_url=totp_url,
+                        )
+                    if is_unresolved_totp_value(value):
+                        raise NoTOTPSecretFound()
                     # Retry selector lookup to handle page transitions (redirects,
                     # slow renders) before burning an expensive AI fallback call.
-                    locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
-                    await self._prepare_element(locator, timeout=timeout)
+                    if _skip_element_prep:
+                        locator = self._locator_scope.locator(selector).first
+                    else:
+                        locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
+                        await self._prepare_element(locator, timeout=timeout)
+                    if resolved_totp_value is not None:
+                        value = await self._resolve_totp_placeholder_or_raise(
+                            original_value,
+                            totp_identifier=totp_identifier,
+                            totp_url=totp_url,
+                        )
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
                     # dropdowns on search bars and typeaheads which destabilise the DOM
                     # and cause the locator to time out mid-input.
                     await locator.fill(value, timeout=timeout)
                     return original_value
+                except NoTOTPSecretFound:
+                    raise
                 except Exception as e:
                     LOG.warning(
                         "CSS selector fill failed, falling back to AI",
@@ -1001,7 +1091,7 @@ class SkyvernPage(Page):
             if intention:
                 return await self._ai.ai_input_text(
                     selector=selector,
-                    value=value,
+                    value=original_value if resolved_totp_value is not None else value,
                     intention=intention,
                     data=data,
                     totp_identifier=totp_identifier,
@@ -1032,6 +1122,12 @@ class SkyvernPage(Page):
             raise ValueError("Selector is required but was not provided")
 
         locator = self._locator_scope.locator(selector).first
+        if resolved_totp_value is not None:
+            value = await self._resolve_totp_placeholder_or_raise(
+                original_value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+            )
         await locator.fill(value, timeout=timeout)
         return value
 
@@ -1614,6 +1710,7 @@ class SkyvernPage(Page):
         for idx, value in sorted(mapping.items()):
             if idx >= len(form_fields) or value is None:
                 continue
+            totp_placeholder = value if isinstance(value, str) and is_unresolved_totp_value(value) else None
 
             field = form_fields[idx]
             selector = field.get("selector", "")
@@ -1622,7 +1719,9 @@ class SkyvernPage(Page):
             label = field.get("label") or field.get("name") or "unknown"
 
             try:
-                if field_type in ("radio_group", "checkbox_group"):
+                if totp_placeholder is not None:
+                    await self.fill(selector=selector, value=totp_placeholder, ai=None)
+                elif field_type in ("radio_group", "checkbox_group"):
                     LOG.info(
                         "fill_from_mapping: processing group field",
                         field_label=label[:50],
@@ -1769,6 +1868,8 @@ class SkyvernPage(Page):
                 else:
                     await self.fill(selector=selector, value=str(value), ai=None)
 
+            except NoTOTPSecretFound:
+                raise
             except Exception:
                 LOG.warning(
                     "fill_from_mapping: field fill failed, trying AI fallback",
@@ -1782,7 +1883,10 @@ class SkyvernPage(Page):
                     continue
                 try:
                     self._track_ai_call()
-                    if field_type in ("radio_group", "checkbox_group"):
+                    if totp_placeholder is not None:
+                        prompt = f"Fill the '{label}' field with the provided verification code"
+                        await self.fill(selector=selector, value=totp_placeholder, ai="fallback", prompt=prompt)
+                    elif field_type in ("radio_group", "checkbox_group"):
                         prompt = f"Select '{value}' for the question '{label}'"
                         await self.click(selector=selector, ai="fallback", prompt=prompt)
                     elif field_type in ("radio", "checkbox"):
@@ -1794,6 +1898,8 @@ class SkyvernPage(Page):
                     else:
                         prompt = f"Fill the '{label}' field with: {value}"
                         await self.fill(selector=selector, ai="fallback", prompt=prompt)
+                except NoTOTPSecretFound:
+                    raise
                 except Exception:
                     LOG.warning("fill_from_mapping: AI fallback also failed", field_label=label, exc_info=True)
 

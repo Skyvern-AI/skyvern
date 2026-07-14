@@ -27,6 +27,8 @@ add_type("text/plain", ".log")
 add_type("application/zstd", ".zst")
 
 _S3_OPERATION_RETRIES = 2
+# get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
+_S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
 LOG = structlog.get_logger()
 
 
@@ -107,6 +109,12 @@ class AsyncAWSClient:
     def _is_expired_token_error(self, error: Exception) -> bool:
         """Check if an exception is an AWS ExpiredTokenException."""
         return isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") == "ExpiredTokenException"
+
+    def _is_not_found_error(self, error: Exception) -> bool:
+        """Check if an exception is a missing-object (terminal not-found) error."""
+        return (
+            isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in _S3_NOT_FOUND_ERROR_CODES
+        )
 
     def _error_code(self, error: Exception) -> str:
         if isinstance(error, ClientError):
@@ -331,7 +339,14 @@ class AsyncAWSClient:
 
         try:
             return await self._s3_with_retry("download", _op, uri=uri)
-        except Exception:
+        except Exception as e:
+            # A missing object is terminal not-found, not a transient failure (e.g. first-run
+            # profile restore before any archive exists). Log once without a traceback so callers
+            # fall back immediately instead of surfacing repeated ERROR tracebacks.
+            if self._is_not_found_error(e):
+                if log_exception:
+                    LOG.info("S3 object not found", uri=uri)
+                return None
             if log_exception:
                 LOG.exception("S3 download failed", uri=uri)
             return None

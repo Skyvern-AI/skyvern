@@ -197,6 +197,47 @@ def test_build_engine_keeps_pool_class_selection_independent_of_connect_args(mon
     assert disabled_kwargs["connect_args"]["prepared_statement_name_func"] is agent_db._asyncpg_prepared_statement_name
 
 
+def test_build_engine_forwards_pool_sizing_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_create_async_engine(database_string: str, **kwargs: Any) -> object:
+        calls.append({"database_string": database_string, "kwargs": kwargs})
+        return object()
+
+    monkeypatch.setattr(agent_db, "create_async_engine", fake_create_async_engine)
+    monkeypatch.setattr(settings, "DISABLE_CONNECTION_POOL", False)
+    monkeypatch.setattr(settings, "DATABASE_POOL_SIZE", 20)
+    monkeypatch.setattr(settings, "DATABASE_POOL_MAX_OVERFLOW", 20)
+    monkeypatch.setattr(settings, "DATABASE_POOL_TIMEOUT", 10)
+    monkeypatch.setattr(settings, "DATABASE_POOL_RECYCLE", 1800)
+
+    agent_db._build_engine(DIRECT_ASYNCPG)
+
+    kwargs = calls[-1]["kwargs"]
+    assert kwargs["pool_size"] == 20
+    assert kwargs["max_overflow"] == 20
+    assert kwargs["pool_timeout"] == 10
+    assert kwargs["pool_recycle"] == 1800
+
+
+def test_build_engine_null_pool_does_not_forward_queue_pool_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_create_async_engine(database_string: str, **kwargs: Any) -> object:
+        calls.append({"database_string": database_string, "kwargs": kwargs})
+        return object()
+
+    monkeypatch.setattr(agent_db, "create_async_engine", fake_create_async_engine)
+    monkeypatch.setattr(settings, "DISABLE_CONNECTION_POOL", True)
+
+    agent_db._build_engine(DIRECT_ASYNCPG)
+
+    kwargs = calls[-1]["kwargs"]
+    assert kwargs["poolclass"] is pool.NullPool
+    for queue_pool_param in ("pool_size", "max_overflow", "pool_timeout", "pool_recycle"):
+        assert queue_pool_param not in kwargs
+
+
 def test_build_engine_strips_asyncpg_weak_sslmode_when_requiring_pooler_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
 

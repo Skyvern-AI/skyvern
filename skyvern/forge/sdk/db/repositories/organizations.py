@@ -193,7 +193,13 @@ class OrganizationsRepository(BaseRepository):
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account", "custom_credential_service", "custom_llm"],
+        token_type: Literal[
+            "api",
+            "onepassword_service_account",
+            "custom_credential_service",
+            "custom_llm",
+            "google_oauth_client_config",
+        ],
     ) -> OrganizationAuthToken | None: ...
 
     @overload
@@ -221,6 +227,7 @@ class OrganizationsRepository(BaseRepository):
             "bitwarden_credential",
             "custom_credential_service",
             "custom_llm",
+            "google_oauth_client_config",
         ],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | None:
         async with self.Session() as session:

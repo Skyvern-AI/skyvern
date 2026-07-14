@@ -55,6 +55,9 @@ class WorkflowRunBlock(BaseModel):
     subject: str | None = None
     body: str | None = None
 
+    # prompt block / text prompt block / for loop block
+    prompt: str | None = None
+
     # human interaction block
     instructions: str | None = None
     positive_descriptor: str | None = None

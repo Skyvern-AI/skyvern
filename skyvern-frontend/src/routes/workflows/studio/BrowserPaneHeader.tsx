@@ -27,17 +27,16 @@ import { toast } from "@/components/ui/use-toast";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { StreamModeBadge } from "@/routes/streaming/StreamDiagnostics";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
+import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
+import { ControlTooltip } from "./ControlTooltip";
+import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useStudioPaneCompact } from "./StudioShellContext";
 import { ViewToggle } from "./ViewToggle";
-
-const ICON_BUTTON =
-  "shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40";
 
 const RECORDING_ARCHIVED_LABEL =
   "Recording archived — contact support@skyvern.com to request restoration";
@@ -50,13 +49,16 @@ export function BrowserPaneViewPills() {
 
   return (
     <>
-      {compact ? null : (
+      {/* Stream-transport diagnostics are a local-dev aid; deployed builds
+          keep the header clean. */}
+      {compact || !import.meta.env.DEV ? null : (
         <StreamModeBadge mode={browserStreamingMode} className="shrink-0" />
       )}
+      <PaneHeaderDivider />
       <div
         role="group"
         aria-label="Browser view"
-        className="flex shrink-0 items-center gap-0.5 rounded-md border border-slate-700 bg-slate-elevation2 p-0.5"
+        className="flex shrink-0 items-center gap-1"
       >
         <ViewToggle
           active={view === "live"}
@@ -67,7 +69,19 @@ export function BrowserPaneViewPills() {
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
           }
         />
-        {hasRecording ? (
+        {!hasRecording && visuals.recordingArchived ? (
+          <ControlTooltip content={RECORDING_ARCHIVED_LABEL} blocked>
+            <button
+              type="button"
+              disabled
+              aria-label={RECORDING_ARCHIVED_LABEL}
+              className="pointer-events-none inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium text-muted-foreground opacity-60"
+            >
+              <PlayIcon className="h-3 w-3" />
+              {compact ? null : "Recording archived"}
+            </button>
+          </ControlTooltip>
+        ) : (
           <ViewToggle
             active={view === "recording"}
             onClick={() => setView("recording")}
@@ -75,27 +89,14 @@ export function BrowserPaneViewPills() {
             label="Recording"
             icon={<PlayIcon className="h-3 w-3" />}
           />
-        ) : visuals.recordingArchived ? (
-          <button
-            type="button"
-            disabled
-            title={RECORDING_ARCHIVED_LABEL}
-            aria-label={RECORDING_ARCHIVED_LABEL}
-            className="inline-flex cursor-not-allowed items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium text-muted-foreground opacity-60"
-          >
-            <PlayIcon className="h-3 w-3" />
-            {compact ? null : "Recording archived"}
-          </button>
-        ) : null}
-        {visuals.hasScreenshots ? (
-          <ViewToggle
-            active={view === "screenshots"}
-            onClick={() => setView("screenshots")}
-            compact={compact}
-            label="Screenshots"
-            icon={<ImageIcon className="h-3 w-3" />}
-          />
-        ) : null}
+        )}
+        <ViewToggle
+          active={view === "screenshots"}
+          onClick={() => setView("screenshots")}
+          compact={compact}
+          label="Screenshots"
+          icon={<ImageIcon className="h-3 w-3" />}
+        />
       </div>
     </>
   );
@@ -110,9 +111,7 @@ export function BrowserPaneActions() {
     useBrowserPaneView();
   const isRecording = useRecordingStore((s) => s.isRecording);
   const manualCapturePaused = useRecordingStore((s) => s.manualCapturePaused);
-  const startRecordingAtEnd = useRecordingLauncherStore(
-    (s) => s.startRecordingAtEnd,
-  );
+  const finishRequested = useRecordingStore((s) => s.finishRequested);
   // These act on the debug browser; while the pane streams the run's own
   // browser instead, they'd hit an invisible session — disable with a reason.
   const debugHidden = liveSurface === "run";
@@ -165,56 +164,75 @@ export function BrowserPaneActions() {
 
   return (
     <>
-      {isRecording ? (
-        <span
-          className={cn(
-            "flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium",
-            manualCapturePaused
-              ? "bg-amber-500/10 text-amber-500"
-              : "bg-red-500/10 text-red-500",
-          )}
-        >
-          <span
-            className={cn(
-              "h-2 w-2 rounded-full",
-              manualCapturePaused ? "bg-amber-500" : "animate-pulse bg-red-500",
-            )}
-          />
-          {compact ? null : manualCapturePaused ? "Paused" : "Recording"}
-        </span>
-      ) : (
-        <Button
-          variant="secondary"
-          size="sm"
-          className="h-7 shrink-0 gap-1.5 px-2 text-xs"
-          title="Record browser actions into blocks"
-          disabled={!browserSessionId || !startRecordingAtEnd}
-          onClick={() => startRecordingAtEnd?.()}
-        >
-          <span className="h-2 w-2 rounded-full bg-red-500" />
-          {compact ? null : "Record"}
-        </Button>
-      )}
-      <button
-        type="button"
-        title={debugHidden ? blockedTitle : "Reconnect"}
-        aria-label="Reconnect browser stream"
-        onClick={reload}
-        disabled={!browserSessionId || debugHidden}
-        className={ICON_BUTTON}
+      {isRecording
+        ? (() => {
+            // Same finish path as the drafts panel's Done: requestFinish stops
+            // capture and the mounted RecordingPanel commits the recorded steps.
+            const stopButton = (
+              <Button
+                variant="outline"
+                size="sm"
+                className={cn(
+                  "h-7 shrink-0 gap-1.5 border-border bg-transparent px-2 text-xs shadow-none",
+                  manualCapturePaused ? "text-amber-500" : "text-red-500",
+                )}
+                aria-label="Stop recording"
+                disabled={finishRequested}
+                onClick={() => useRecordingStore.getState().requestFinish()}
+              >
+                <span
+                  className={cn(
+                    "h-2 w-2 rounded-full",
+                    manualCapturePaused
+                      ? "bg-amber-500"
+                      : "animate-pulse bg-red-500",
+                  )}
+                />
+                {compact ? null : finishRequested ? "Stopping…" : "Stop"}
+              </Button>
+            );
+            // Labelled → no tooltip; compact collapses to the dot, so the
+            // tooltip carries the action.
+            return compact ? (
+              <ControlTooltip
+                content="Stop recording and save the recorded steps"
+                blocked={finishRequested}
+              >
+                {stopButton}
+              </ControlTooltip>
+            ) : (
+              stopButton
+            );
+          })()
+        : null}
+      <ControlTooltip
+        content={debugHidden ? blockedTitle : "Reconnect"}
+        blocked={!browserSessionId || debugHidden}
       >
-        <ReloadIcon className="h-3.5 w-3.5" />
-      </button>
-      <button
-        type="button"
-        title={debugHidden ? blockedTitle : "Open in new tab"}
-        aria-label="Open browser in new tab"
-        onClick={openInNewTab}
-        disabled={!browserSessionId || debugHidden}
-        className={ICON_BUTTON}
+        <button
+          type="button"
+          aria-label="Reconnect browser stream"
+          onClick={reload}
+          disabled={!browserSessionId || debugHidden}
+          className={PANE_HEADER_ICON_BUTTON_CLASS}
+        >
+          <ReloadIcon className="h-3.5 w-3.5" />
+        </button>
+      </ControlTooltip>
+      <ControlTooltip
+        content={debugHidden ? blockedTitle : "Open in new tab"}
+        blocked={!browserSessionId || debugHidden}
       >
-        <OpenInNewWindowIcon className="h-3.5 w-3.5" />
-      </button>
+        <button
+          type="button"
+          aria-label="Open browser in new tab"
+          onClick={openInNewTab}
+          disabled={!browserSessionId || debugHidden}
+          className={PANE_HEADER_ICON_BUTTON_CLASS}
+        >
+          <OpenInNewWindowIcon className="h-3.5 w-3.5" />
+        </button>
+      </ControlTooltip>
       <Dialog
         open={confirmOff}
         onOpenChange={(open) => {
@@ -224,17 +242,23 @@ export function BrowserPaneActions() {
           setConfirmOff(open);
         }}
       >
-        <DialogTrigger asChild>
-          <button
-            type="button"
-            title={debugHidden ? blockedTitle : "Turn off browser"}
-            aria-label="Turn off browser"
-            disabled={!workflowPermanentId || !browserSessionId || debugHidden}
-            className={ICON_BUTTON}
-          >
-            <PowerIcon className="h-3.5 w-3.5" />
-          </button>
-        </DialogTrigger>
+        <ControlTooltip
+          content={debugHidden ? blockedTitle : "Turn off browser"}
+          blocked={!workflowPermanentId || !browserSessionId || debugHidden}
+        >
+          <DialogTrigger asChild>
+            <button
+              type="button"
+              aria-label="Turn off browser"
+              disabled={
+                !workflowPermanentId || !browserSessionId || debugHidden
+              }
+              className={PANE_HEADER_ICON_BUTTON_CLASS}
+            >
+              <PowerIcon className="h-3.5 w-3.5" />
+            </button>
+          </DialogTrigger>
+        </ControlTooltip>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Turn off this browser?</DialogTitle>
