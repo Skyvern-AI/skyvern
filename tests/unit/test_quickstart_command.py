@@ -261,6 +261,8 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(_cli_bootstrap, "_RUNTIME_LOGGING_CONFIGURED", False)
     monkeypatch.setattr(run_commands.atexit, "register", lambda _: None)
+    eof_event = types.SimpleNamespace(set=lambda: None)
+    monkeypatch.setattr(run_commands, "_start_stdin_eof_watcher", lambda: (eof_event, eof_event))
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources_blocking", lambda: events.append("cleanup"))
     monkeypatch.setitem(sys.modules, "skyvern.forge.sdk.forge_log", fake_forge_log)
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.mcp_http_auth", fake_auth)
