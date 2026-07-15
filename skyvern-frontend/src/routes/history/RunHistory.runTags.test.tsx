@@ -110,7 +110,12 @@ vi.mock("@/api/AxiosClient", () => ({
 
 vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
   useRunTagsBatchQuery: () => ({
-    data: { wr_1: [{ key: "skyvern.platform", value: "platform_a" }] },
+    data: {
+      wr_1: [
+        { key: "skyvern.platform", value: "platform_a" },
+        { key: null, value: "adhoc" },
+      ],
+    },
     isPending: false,
   }),
 }));
@@ -136,11 +141,16 @@ vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
 vi.mock("@/routes/workflows/components/tagging/TagChipList", () => ({
   TagChipList: ({
     tags,
+    hideSystemTags,
   }: {
     tags: Array<{ key: string | null; value: string }>;
+    hideSystemTags?: boolean;
   }) => (
     <span data-testid="tag-chip-list">
-      {tags.map((tag) => `${tag.key ?? "label"}:${tag.value}`).join(",")}
+      {tags
+        .filter((tag) => !hideSystemTags || !tag.key?.startsWith("skyvern."))
+        .map((tag) => `${tag.key ?? "label"}:${tag.value}`)
+        .join(",")}
     </span>
   ),
 }));
@@ -171,12 +181,12 @@ afterEach(() => {
 });
 
 describe("RunHistory run tags", () => {
-  it("renders a run-tag chip on the all-runs list", () => {
+  it("shows user labels and hides reserved system tags on the all-runs list", () => {
     const { container } = render(<RunHistory />, { wrapper });
 
-    expect(
-      within(container).getByTestId("tag-chip-list").textContent,
-    ).toContain("platform_a");
+    const chipList = within(container).getByTestId("tag-chip-list");
+    expect(chipList.textContent).toContain("adhoc");
+    expect(chipList.textContent).not.toContain("platform_a");
   });
 
   it("selects only workflow runs and supports shift-range bulk actions", () => {

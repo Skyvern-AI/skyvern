@@ -127,7 +127,12 @@ vi.mock("./hooks/useTagValuesQuery", () => ({
 
 vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
   useRunTagsBatchQuery: () => ({
-    data: { wr_1: [{ key: "skyvern.status", value: "completed" }] },
+    data: {
+      wr_1: [
+        { key: "skyvern.status", value: "completed" },
+        { key: null, value: "adhoc" },
+      ],
+    },
     isPending: false,
   }),
 }));
@@ -145,11 +150,16 @@ vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
 vi.mock("./components/tagging/TagChipList", () => ({
   TagChipList: ({
     tags,
+    hideSystemTags,
   }: {
     tags: Array<{ key: string | null; value: string }>;
+    hideSystemTags?: boolean;
   }) => (
     <span data-testid="tag-chip-list">
-      {tags.map((tag) => `${tag.key ?? "label"}:${tag.value}`).join(",")}
+      {tags
+        .filter((tag) => !hideSystemTags || !tag.key?.startsWith("skyvern."))
+        .map((tag) => `${tag.key ?? "label"}:${tag.value}`)
+        .join(",")}
     </span>
   ),
 }));
@@ -222,12 +232,15 @@ function renderWorkflowPage(initialEntry = "/workflows/wpid_abc123") {
 }
 
 describe("WorkflowPage run tags", () => {
-  it("renders a run-tag chip on the agent runs list row", () => {
+  it("shows user labels and hides system tags on the agent runs list row", () => {
     const { container } = renderWorkflowPage();
 
     expect(
       within(container).getByTestId("tag-chip-list").textContent,
-    ).toContain("completed");
+    ).toContain("adhoc");
+    expect(
+      within(container).getByTestId("tag-chip-list").textContent,
+    ).not.toContain("completed");
   });
 
   it("shift-selects runs and exposes bulk tag actions", () => {
