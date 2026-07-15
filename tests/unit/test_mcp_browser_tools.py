@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
@@ -705,6 +707,156 @@ def _native_option_page(
     return page, select_option
 
 
+_SDK_LITERAL_VALUES = (
+    pytest.param('contains "double quotes"', id="double-quote"),
+    pytest.param("contains a single quote's mark", id="single-quote"),
+    pytest.param('contains "both" quote\'s marks', id="both-quotes"),
+    pytest.param("first line\nsecond line", id="newline"),
+    pytest.param(r"path\with\backslashes", id="backslash"),
+    pytest.param("unicode café 🐍", id="unicode"),
+    pytest.param('xpath=//div[@aria-label="Continue"]', id="xpath"),
+)
+
+
+def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = SimpleNamespace(
+        hover=AsyncMock(),
+        press=AsyncMock(),
+        scroll_into_view_if_needed=AsyncMock(),
+    )
+    raw_page = SimpleNamespace(locator=MagicMock(return_value=locator))
+    run_task_result = SimpleNamespace(
+        run_id="wr_test",
+        status="completed",
+        output=None,
+        failure_reason=None,
+        recording_url=None,
+        app_url=None,
+    )
+    page = SimpleNamespace(
+        page=raw_page,
+        _working_frame=object(),
+        agent=SimpleNamespace(run_task=AsyncMock(return_value=run_task_result)),
+        click=AsyncMock(side_effect=lambda *, selector=None, **_: selector),
+        evaluate=AsyncMock(return_value=False),
+        fill=AsyncMock(),
+        keyboard=SimpleNamespace(press=AsyncMock()),
+        locator=MagicMock(return_value=locator),
+        select_option=AsyncMock(),
+        validate=AsyncMock(return_value=True),
+        wait_for_selector=AsyncMock(),
+    )
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
+    monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+    )
+    monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={})))
+    monkeypatch.setattr(mcp_browser, "do_act", AsyncMock(return_value=SimpleNamespace(prompt="done", completed=True)))
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_frame_switch",
+        AsyncMock(return_value=SimpleNamespace(name="frame", url="https://example.test/frame")),
+    )
+    monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", AsyncMock(return_value=None))
+
+
+def _assert_sdk_equivalent_parses(result: dict[str, object]) -> ast.Module:
+    assert result["ok"] is True, result
+    data = result["data"]
+    assert isinstance(data, dict)
+    sdk_equivalent = data["sdk_equivalent"]
+    assert isinstance(sdk_equivalent, str)
+    return ast.parse(f"async def _f():\n    {sdk_equivalent}\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "field", "base_kwargs"),
+    [
+        pytest.param("skyvern_navigate", "url", {}, id="navigate-url"),
+        pytest.param("skyvern_click", "intent", {"selector": "#target"}, id="click-intent"),
+        pytest.param("skyvern_hover", "intent", {"selector": "#target"}, id="hover-intent"),
+        pytest.param("skyvern_type", "text", {"selector": "#target", "intent": "field"}, id="type-text"),
+        pytest.param("skyvern_type", "intent", {"selector": "#target", "text": "value"}, id="type-intent"),
+        pytest.param("skyvern_scroll", "intent", {"direction": "down", "selector": "#target"}, id="scroll-intent"),
+        pytest.param("skyvern_select_option", "value", {"intent": "dropdown"}, id="select-value"),
+        pytest.param("skyvern_select_option", "intent", {"value": "choice"}, id="select-intent"),
+        pytest.param("skyvern_press_key", "key", {"selector": "#target", "intent": "field"}, id="press-key"),
+        pytest.param("skyvern_press_key", "intent", {"selector": "#target", "key": "Enter"}, id="press-intent"),
+        pytest.param("skyvern_press_key", "key", {}, id="press-key-bare"),
+        pytest.param("skyvern_wait", "intent", {}, id="wait-intent"),
+        pytest.param("skyvern_evaluate", "expression", {}, id="evaluate-expression"),
+        pytest.param("skyvern_extract", "prompt", {}, id="extract-prompt"),
+        pytest.param("skyvern_validate", "prompt", {}, id="validate-prompt"),
+        pytest.param("skyvern_act", "prompt", {}, id="act-prompt"),
+        pytest.param("skyvern_run_task", "prompt", {}, id="run-task-prompt"),
+        pytest.param("skyvern_frame_switch", "name", {}, id="frame-name"),
+        pytest.param("skyvern_click", "selector", {}, id="click-selector"),
+        pytest.param("skyvern_hover", "selector", {}, id="hover-selector"),
+        pytest.param("skyvern_type", "selector", {"text": "value"}, id="type-selector"),
+        pytest.param("skyvern_scroll", "selector", {"direction": "down", "intent": "target"}, id="scroll-selector"),
+        pytest.param("skyvern_select_option", "selector", {"value": "choice"}, id="select-option-selector"),
+        pytest.param("skyvern_press_key", "selector", {"key": "Enter"}, id="press-key-selector"),
+        pytest.param("skyvern_wait", "selector", {}, id="wait-selector"),
+        pytest.param("skyvern_frame_switch", "selector", {}, id="frame-switch-selector"),
+    ],
+)
+@pytest.mark.parametrize("value", _SDK_LITERAL_VALUES)
+async def test_sdk_equivalent_quotes_caller_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    field: str,
+    base_kwargs: dict[str, object],
+    value: str,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+
+    result = await getattr(mcp_browser, tool_name)(**{**base_kwargs, field: value})
+
+    _assert_sdk_equivalent_parses(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selected_by", ["value", "label"])
+@pytest.mark.parametrize("value", _SDK_LITERAL_VALUES)
+async def test_click_native_option_sdk_equivalent_quotes_observed_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_by: Literal["value", "label"],
+    value: str,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    selection = browser_ops.NativeOptionSelection(
+        select_selector='xpath=//select[@aria-label="Region"]',
+        value=value if selected_by == "value" else None,
+        label=value if selected_by == "label" else None,
+        selected_by=selected_by,
+    )
+    monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", AsyncMock(return_value=selection))
+
+    result = await mcp_browser.skyvern_click(selector="#region > option")
+
+    _assert_sdk_equivalent_parses(result)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sdk_equivalent_truncates_before_quoting(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    expression = "x" * 79 + '"truncated'
+
+    result = await mcp_browser.skyvern_evaluate(expression=expression)
+
+    tree = _assert_sdk_equivalent_parses(result)
+    call = next(node for node in ast.walk(tree) if isinstance(node, ast.Call))
+    assert isinstance(call.args[0], ast.Constant)
+    assert call.args[0].value == expression[:80]
+
+
 @pytest.mark.asyncio
 async def test_skyvern_type_selector_is_resilient_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     fill = AsyncMock(return_value="Noor")
@@ -831,7 +983,7 @@ async def test_skyvern_click_native_option_selector_uses_parent_select(monkeypat
         "value": "east",
         "label": "East",
     }
-    assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", value="east")'
+    assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', value='east')"
 
 
 @pytest.mark.asyncio
@@ -847,7 +999,7 @@ async def test_skyvern_click_native_option_selector_can_fall_back_to_label(
     assert select_option.await_args_list[0].kwargs == {"value": "east", "timeout": 5000}
     assert select_option.await_args_list[1].kwargs == {"label": "East", "timeout": 5000}
     assert result["data"]["selected_option"]["selected_by"] == "label"
-    assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", label="East")'
+    assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', label='East')"
 
 
 @pytest.mark.asyncio
@@ -866,7 +1018,7 @@ async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch
     select_option.assert_awaited_once_with(index=3, timeout=5000)
     assert result["data"]["selected_option"]["selected_by"] == "index"
     assert result["data"]["selected_option"]["index"] == 3
-    assert result["data"]["sdk_equivalent"] == 'await page.select_option("#region", index=3)'
+    assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', index=3)"
 
 
 def test_exception_message_suppresses_body_outside_4xx() -> None:

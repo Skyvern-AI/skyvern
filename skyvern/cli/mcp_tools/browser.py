@@ -295,7 +295,7 @@ async def skyvern_navigate(
     return make_result(
         "skyvern_navigate",
         browser_context=ctx,
-        data={"url": result.url, "title": result.title, "sdk_equivalent": f'await page.goto("{url}")'},
+        data={"url": result.url, "title": result.title, "sdk_equivalent": f"await page.goto({url!r})"},
         timing_ms=timer.timing_ms,
     )
 
@@ -434,25 +434,25 @@ async def skyvern_click(
     if native_option_selection is not None:
         if native_option_selection.selected_by == "label":
             data["sdk_equivalent"] = (
-                f'await page.select_option("{native_option_selection.select_selector}", '
-                f'label="{native_option_selection.label}")'
+                f"await page.select_option({native_option_selection.select_selector!r}, "
+                f"label={native_option_selection.label!r})"
             )
         elif native_option_selection.selected_by == "index":
             data["sdk_equivalent"] = (
-                f'await page.select_option("{native_option_selection.select_selector}", '
+                f"await page.select_option({native_option_selection.select_selector!r}, "
                 f"index={native_option_selection.index})"
             )
         else:
             data["sdk_equivalent"] = (
-                f'await page.select_option("{native_option_selection.select_selector}", '
-                f'value="{native_option_selection.value}")'
+                f"await page.select_option({native_option_selection.select_selector!r}, "
+                f"value={native_option_selection.value!r})"
             )
     elif resolved_sel and intent:
-        data["sdk_equivalent"] = f'await page.click("{resolved_sel}", prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.click({resolved_sel!r}, prompt={intent!r})"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.click(prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.click(prompt={intent!r})"
     elif selector:
-        data["sdk_equivalent"] = f'await page.click("{selector}")'
+        data["sdk_equivalent"] = f"await page.click({selector!r})"
 
     return make_result(
         "skyvern_click",
@@ -814,11 +814,11 @@ async def skyvern_hover(
 
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode}
     if selector and intent:
-        data["sdk_equivalent"] = f'await page.locator("{selector}", prompt="{intent}").hover()'
+        data["sdk_equivalent"] = f"await page.locator({selector!r}, prompt={intent!r}).hover()"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.locator(prompt="{intent}").hover()'
+        data["sdk_equivalent"] = f"await page.locator(prompt={intent!r}).hover()"
     elif selector:
-        data["sdk_equivalent"] = f'await page.locator("{selector}").hover()'
+        data["sdk_equivalent"] = f"await page.locator({selector!r}).hover()"
 
     return make_result(
         "skyvern_hover",
@@ -976,11 +976,11 @@ async def skyvern_type(
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode, "text_length": len(text)}
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts
     if selector and intent:
-        data["sdk_equivalent"] = f'await page.fill("{selector}", "{text}", prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r}, prompt={intent!r})"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.fill(prompt="{intent}", value="{text}")'
+        data["sdk_equivalent"] = f"await page.fill(prompt={intent!r}, value={text!r})"
     elif selector:
-        data["sdk_equivalent"] = f'await page.fill("{selector}", "{text}")'
+        data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r})"
     return make_result(
         "skyvern_type",
         browser_context=ctx,
@@ -1111,9 +1111,9 @@ async def skyvern_scroll(
                 "intent": intent,
                 "ai_mode": ai_mode,
                 "sdk_equivalent": (
-                    f'await page.locator("{selector}", prompt="{intent}").scroll_into_view_if_needed()'
+                    f"await page.locator({selector!r}, prompt={intent!r}).scroll_into_view_if_needed()"
                     if selector
-                    else f'await page.locator(prompt="{intent}").scroll_into_view_if_needed()'
+                    else f"await page.locator(prompt={intent!r}).scroll_into_view_if_needed()"
                 ),
             },
             timing_ms=timer.timing_ms,
@@ -1458,11 +1458,11 @@ async def skyvern_select_option(
     data: dict[str, Any] = {"selector": selector, "intent": intent, "ai_mode": ai_mode, "value": value}
     # Build sdk_equivalent: prefer hybrid selector+prompt for production scripts
     if selector and intent:
-        data["sdk_equivalent"] = f'await page.select_option("{selector}", value="{value}", prompt="{intent}")'
+        data["sdk_equivalent"] = f"await page.select_option({selector!r}, value={value!r}, prompt={intent!r})"
     elif ai_mode:
-        data["sdk_equivalent"] = f'await page.select_option(prompt="{intent}", value="{value}")'
+        data["sdk_equivalent"] = f"await page.select_option(prompt={intent!r}, value={value!r})"
     elif selector:
-        data["sdk_equivalent"] = f'await page.select_option("{selector}", value="{value}")'
+        data["sdk_equivalent"] = f"await page.select_option({selector!r}, value={value!r})"
     if custom_attempt_ms:
         return make_result(
             "skyvern_select_option",
@@ -1537,13 +1537,13 @@ async def skyvern_press_key(
             )
 
     if selector and intent:
-        sdk_eq = f'await page.locator("{selector}", prompt="{intent}").press("{key}")'
+        sdk_eq = f"await page.locator({selector!r}, prompt={intent!r}).press({key!r})"
     elif intent:
-        sdk_eq = f'await page.locator(prompt="{intent}").press("{key}")'
+        sdk_eq = f"await page.locator(prompt={intent!r}).press({key!r})"
     elif selector:
-        sdk_eq = f'await page.locator("{selector}").press("{key}")'
+        sdk_eq = f"await page.locator({selector!r}).press({key!r})"
     else:
-        sdk_eq = f'await page.keyboard.press("{key}")'
+        sdk_eq = f"await page.keyboard.press({key!r})"
 
     return make_result(
         "skyvern_press_key",
@@ -1664,9 +1664,9 @@ async def skyvern_wait(
     if waited_for == "time":
         sdk_eq = f"await page.wait_for_timeout({time_ms})"
     elif waited_for == "intent":
-        sdk_eq = f'await page.validate("{intent}")'
+        sdk_eq = f"await page.validate({intent!r})"
     elif waited_for == "selector":
-        sdk_eq = f'await page.wait_for_selector("{selector}")'
+        sdk_eq = f"await page.wait_for_selector({selector!r})"
     return make_result(
         "skyvern_wait",
         browser_context=ctx,
@@ -1734,7 +1734,7 @@ async def skyvern_evaluate(
     return make_result(
         "skyvern_evaluate",
         browser_context=ctx,
-        data={"result": result, "sdk_equivalent": f'await page.evaluate("{expression[:80]}")'},
+        data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
         timing_ms=timer.timing_ms,
     )
 
@@ -1798,7 +1798,7 @@ async def skyvern_extract(
         browser_context=ctx,
         data={
             "extracted": result.extracted,
-            "sdk_equivalent": f'await page.extract(prompt="{prompt}")',
+            "sdk_equivalent": f"await page.extract(prompt={prompt!r})",
         },
         timing_ms=timer.timing_ms,
     )
@@ -1838,7 +1838,7 @@ async def skyvern_validate(
     return make_result(
         "skyvern_validate",
         browser_context=ctx,
-        data={"prompt": prompt, "valid": valid, "sdk_equivalent": f'await page.validate("{prompt}")'},
+        data={"prompt": prompt, "valid": valid, "sdk_equivalent": f"await page.validate({prompt!r})"},
         timing_ms=timer.timing_ms,
     )
 
@@ -1898,7 +1898,7 @@ async def skyvern_act(
         data={
             "prompt": result.prompt,
             "completed": result.completed,
-            "sdk_equivalent": f'await page.act("{prompt}")',
+            "sdk_equivalent": f"await page.act({prompt!r})",
         },
         timing_ms=timer.timing_ms,
     )
@@ -2015,7 +2015,7 @@ async def skyvern_run_task(
             "failure_reason": response.failure_reason,
             "recording_url": response.recording_url,
             "app_url": response.app_url,
-            "sdk_equivalent": f'await page.agent.run_task(prompt="{prompt}")',
+            "sdk_equivalent": f"await page.agent.run_task(prompt={prompt!r})",
         },
         timing_ms=timer.timing_ms,
     )
@@ -2254,9 +2254,9 @@ async def skyvern_frame_switch(
             "frame_url": result.url,
             "switched_by": "selector" if selector else ("name" if name else "index"),
             "sdk_equivalent": (
-                f'await page.frame_switch(selector="{selector}")'
+                f"await page.frame_switch(selector={selector!r})"
                 if selector
-                else f'await page.frame_switch(name="{name}")'
+                else f"await page.frame_switch(name={name!r})"
                 if name
                 else f"await page.frame_switch(index={index})"
             ),
