@@ -20,10 +20,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     JudgmentTruthCondition,
     RequestPolicy,
+    _apply_classifier_typed_requested_output_corroborators,
     _apply_requested_output_completion_criteria,
     _apply_validation_classification_completion_criteria,
     _classifier_fallback_policy,
-    _classify_request,
     _criterion_grounding_mode,
     _degrade_pathless_contingent_criteria,
     _parse_completion_criteria,
@@ -41,22 +41,31 @@ async def _policy_for_message(
     *,
     config: CopilotConfig | None = None,
 ) -> RequestPolicy:
-    async def _handler(**_: Any) -> dict[str, Any]:
-        return {
-            "testing_intent": "require_test",
-            "credential_input_kind": "none",
-            "requires_user_clarification": False,
-            "completion_criteria": criteria,
-        }
+    """Exercise the retained deterministic fallback canonicalizers directly.
 
-    return await _classify_request(
-        user_message,
-        workflow_yaml="",
-        chat_history=[],
-        global_llm_context="",
-        handler=_handler,
-        config=config,
+    Fresh classifier responses use typed request-slot binding instead; those integration
+    semantics are covered by test_copilot_request_policy_pinability_consumer.py.
+    """
+    policy = RequestPolicy(
+        testing_intent="require_test",
+        classifier_status="success",
+        classifier_failure_kind="none",
+        completion_criteria=_parse_completion_criteria(criteria),
     )
+    aliases = config.requested_output_path_aliases if config is not None else {}
+    _apply_requested_output_completion_criteria(policy, user_message, aliases)
+    _apply_validation_classification_completion_criteria(policy)
+    _apply_classifier_typed_requested_output_corroborators(policy)
+    _degrade_pathless_contingent_criteria(policy)
+    policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
+        {
+            criterion.requested_output_evidence_source
+            for criterion in policy.completion_criteria
+            if criterion.output_path is not None and criterion.requested_output_evidence_source != "runtime_output"
+        }
+    )
+    policy.completion_contract_status = "present" if policy.graded_completion_criteria() else "absent"
+    return policy
 
 
 def _stored(*criteria: CompletionCriterion) -> StoredCriteriaSet:
@@ -74,6 +83,63 @@ def _criteria_for_path(policy: RequestPolicy, output_path: str) -> list[Completi
 def _criteria_fingerprint(criteria: list[CompletionCriterion]) -> str:
     payload = json.dumps(criteria_to_json(criteria), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_p9_exact_value_unpinnable_output_mint_degrades() -> None:
+    policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome="The visible page path label is returned.",
+                output_path="output.visible_page_path_label",
+                expected_output_value="Public start-service path",
+                expected_output_shape="status_label",
+                pinability="unpinnable",
+            )
+        ]
+    )
+
+    _apply_requested_output_completion_criteria(policy, "Return visible_page_path_label.")
+
+    criterion = _criteria_for_path(policy, "output.visible_page_path_label")[0]
+    assert criterion.mint_disposition == "degraded"
+    assert criterion.mint_degrade == "undecidable_judgment"
+
+
+def test_p9_classifier_drift_normalizes_to_one_contract_shape() -> None:
+    prompt = "Return public_form_exists, visible_page_path_label, and recommended_next_action."
+    classifier_shapes = [
+        [
+            CompletionCriterion(id="c0", outcome="a public form exists for starting service"),
+            CompletionCriterion(id="c1", outcome="the visible page path label is returned"),
+        ],
+        [
+            CompletionCriterion(
+                id="c0",
+                outcome="a public form exists for starting service",
+                output_path="output.public_form_exists",
+            ),
+            CompletionCriterion(id="c1", outcome="the recommended next action is returned"),
+        ],
+        [
+            CompletionCriterion(id="c0", outcome="a public form exists for starting service"),
+            CompletionCriterion(id="c1", outcome="the visible page path label is returned"),
+            CompletionCriterion(
+                id="c2",
+                outcome="the public form result is returned",
+                output_path="output.public_form_exists",
+            ),
+            CompletionCriterion(id="c3", outcome="the recommended next action is returned"),
+        ],
+    ]
+    policies = [RequestPolicy(completion_criteria=criteria) for criteria in classifier_shapes]
+
+    for policy in policies:
+        _apply_requested_output_completion_criteria(policy, prompt)
+
+    serialized = [criteria_to_json(policy.completion_criteria) for policy in policies]
+    assert [len(policy.completion_criteria) for policy in policies] == [3, 3, 3]
+    assert serialized == [serialized[0], serialized[0], serialized[0]]
 
 
 def _requested_output_subset(policy: RequestPolicy, requested_output_paths: set[str]) -> list[CompletionCriterion]:
@@ -654,7 +720,7 @@ def test_requested_output_corroborator_respects_completion_criteria_cap() -> Non
     }
 
 
-def test_requested_output_corroborator_survives_when_requested_outputs_exceed_cap() -> None:
+def test_requested_output_canonicalization_drops_redundant_corroborator_when_outputs_exceed_cap() -> None:
     policy = RequestPolicy(
         completion_criteria=[
             CompletionCriterion(
@@ -686,9 +752,7 @@ def test_requested_output_corroborator_survives_when_requested_outputs_exceed_ca
     assert {
         criterion.output_path for criterion in _requested_output_subset(policy, requested_output_paths)
     } == requested_output_paths
-    assert len(corroborators) == 1
-    assert corroborators[0].id == "name_source"
-    assert corroborators[0].requested_output_corroborator is True
+    assert corroborators == []
 
 
 @pytest.mark.asyncio
@@ -868,7 +932,8 @@ def test_parse_completion_criteria_preserves_validation_classification_contract(
     assert len(parsed) == 2
     assert parsed[0].kind == "validation_classification"
     assert parsed[0].classification_output_key == "login_gated"
-    assert parsed[0].expected_classification is True
+    assert parsed[0].expected_classification is None
+    assert parsed[0].mint_disposition == "pending"
     assert parsed[1].kind == "outcome"
 
 
@@ -2160,7 +2225,8 @@ def test_scope_boundary_boolean_on_login_only_rekinds_and_drops_judgment_invaria
     assert promoted.kind == "validation_classification"
     assert promoted.classification_output_key == "login_only"
     assert promoted.expected_output_value is None
-    assert promoted.requested_output_evidence_source == "runtime_output"
+    assert promoted.requested_output_evidence_source == "independent_run_evidence"
+    assert promoted.mint_disposition == "pending"
 
 
 def test_scope_boundary_boolean_on_non_enumerated_path_keeps_judgment_invariant() -> None:
