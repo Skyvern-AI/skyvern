@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import structlog
 import yaml
@@ -44,11 +44,12 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
     parse_keyring,
     verify_artifact_signature,
 )
@@ -3071,6 +3072,47 @@ async def get_artifact_content(
         media_type=media_type,
         headers=headers,
     )
+
+
+@base_router.get(
+    "/artifacts/{artifact_id}/signed-url",
+    tags=["Artifacts"],
+    response_model=ArtifactSignedUrl,
+    description="Mint a fresh short-lived URL for the artifact's content, for use at the point of consumption.",
+    summary="Mint a short-lived artifact content URL",
+    responses={
+        200: {"description": "Freshly minted content URL"},
+        404: {"description": "Artifact not found or content unavailable"},
+    },
+    # Kept out of the public OpenAPI schema until the Fern SDK deliberately adopts it.
+    include_in_schema=False,
+)
+@base_router.get("/artifacts/{artifact_id}/signed-url/", response_model=ArtifactSignedUrl, include_in_schema=False)
+async def get_artifact_signed_url(
+    artifact_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ArtifactSignedUrl:
+    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
+        artifact_id=artifact_id,
+        organization_id=current_org.organization_id,
+    )
+    if not artifact:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    signed_url = await app.ARTIFACT_MANAGER.resolve_share_url(
+        artifact,
+        expiry_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    )
+    if not signed_url:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
+    expiry_values = parse_qs(urlparse(signed_url).query).get("expiry")
+    expires_at = int(expiry_values[0]) if expiry_values else None
+    return ArtifactSignedUrl(artifact_id=artifact_id, signed_url=signed_url, expires_at=expires_at)
 
 
 @base_router.get(

@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
+import { ArtifactVideo } from "@/components/ArtifactVideo";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { type Recording } from "@/routes/workflows/types/browserSessionTypes";
 import { artifactApiBaseUrl } from "@/util/env";
@@ -103,14 +104,14 @@ function BrowserSessionVideo() {
 
             {getRecordingUrl(recording.url) ? (
               <div className="w-full">
-                <video
+                <ArtifactVideo
                   controls
                   className="w-full max-w-4xl rounded-lg"
                   src={getRecordingUrl(recording.url)!}
                   preload="metadata"
                 >
                   Your browser does not support the video tag.
-                </video>
+                </ArtifactVideo>
                 <div className="mt-2 text-xs text-gray-500">
                   <a
                     href={getRecordingUrl(recording.url)!}

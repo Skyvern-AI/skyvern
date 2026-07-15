@@ -33,6 +33,11 @@ from pydantic import BaseModel, model_validator
 
 ARTIFACT_URL_EXPIRY_SECONDS = 12 * 60 * 60  # 12 hours — global default when no per-org override.
 
+# TTL for URLs minted at the point of use via GET /artifacts/{id}/signed-url.
+# Short on purpose: the consumer asks for a fresh URL right before dereferencing
+# it, so the window only needs to cover one fetch (or one video-buffering burst).
+ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS = 5 * 60
+
 # Bounds for the per-org override. 1 hour minimum keeps URLs useful for webhook
 # consumers that retry across short outages; 7 days maximum follows the AWS S3
 # presigned-URL cap so customers used to S3 don't get surprised. The route
