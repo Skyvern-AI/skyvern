@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_testing,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_grounding_requires_current_page
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -650,10 +651,16 @@ async def update_and_run_blocks_tool(
         serialized_code_artifact_metadata = scaffolded_code_artifact_metadata
         arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
 
+    if recorded_outcome_grounding_requires_current_page(copilot_ctx):
+        loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
+        if loop_error:
+            return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
+
     metadata_contract_preflight_reject = _metadata_contract_run_preflight_reject(
         copilot_ctx,
         workflow_yaml,
         serialized_code_artifact_metadata,
+        parameters or {},
     )
     if metadata_contract_preflight_reject is not None:
         record_tool_step_result_for_ctx(
@@ -710,6 +717,7 @@ async def update_and_run_blocks_tool(
                 if scaffold_applied or envelope_imposed
                 else code_artifact_metadata,
                 "block_labels": block_labels,
+                "parameters": parameters or {},
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
@@ -753,6 +761,29 @@ async def update_and_run_blocks_tool(
             workflow_permanent_id=copilot_ctx.workflow_permanent_id,
         )
         return json.dumps(skip_result)
+
+    exact_candidate_preflight_reject = _metadata_contract_run_preflight_reject(
+        copilot_ctx,
+        copilot_ctx.workflow_yaml or workflow_yaml,
+        copilot_ctx.code_artifact_metadata,
+        parameters or {},
+        enforce_untagged_declared_inputs=True,
+    )
+    if exact_candidate_preflight_reject is not None:
+        record_tool_step_result_for_ctx(
+            copilot_ctx,
+            "update_and_run_blocks",
+            arguments,
+            exact_candidate_preflight_reject,
+        )
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=exact_candidate_preflight_reject,
+            workflow_updated=True,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", exact_candidate_preflight_reject)
+        return json.dumps(sanitized)
 
     # Step 2: Compute frontier and run the blocks.
     new_definition = None

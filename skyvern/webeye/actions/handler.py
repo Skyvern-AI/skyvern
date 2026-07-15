@@ -4882,82 +4882,15 @@ def generate_totp_value_with_task(task: Task, parameter: str) -> str:
 
 async def _did_page_respond(
     incremental_scraped: IncrementalScrapePage,
-    frame: Page | Frame,
-    original_url: str,
     skyvern_frame: SkyvernFrame | None = None,
 ) -> bool:
     try:
         if skyvern_frame:
             await skyvern_frame.safe_wait_for_animation_end(caller="page_respond")
-        return frame.url != original_url or (await incremental_scraped.get_incremental_elements_num()) > 0
+        return (await incremental_scraped.get_incremental_elements_num()) > 0
     except Exception:
         LOG.debug("Failed to check incremental elements after click", exc_info=True)
         return True
-
-
-async def _click_in_javascript_and_verify(
-    action: ClickAction | UploadFileAction,
-    page: Page,
-    skyvern_element: SkyvernElement,
-    incremental_scraped: IncrementalScrapePage,
-    skyvern_frame: SkyvernFrame | None,
-    *,
-    anchor: str,
-    no_response_msg: str,
-) -> ActionResult:
-    try:
-        frame = skyvern_frame.get_frame() if skyvern_frame else page
-        original_url = frame.url
-        await skyvern_element.click_in_javascript()
-        if await _did_page_respond(incremental_scraped, frame, original_url, skyvern_frame):
-            return ActionSuccess()
-        LOG.info(
-            "Chain click: JS click did not trigger a page response",
-            action=action,
-            element=str(skyvern_element),
-        )
-        return ActionFailure(FailToClick(action.element_id, anchor=anchor, msg=no_response_msg))
-    except Exception as e:
-        return ActionFailure(FailToClick(action.element_id, anchor=anchor, msg=str(e)))
-
-
-async def _is_likely_sibling_control(element: SkyvernElement, timeout: int) -> bool:
-    try:
-        metrics = await element.get_locator().evaluate(
-            """(element) => {
-                const rect = element.getBoundingClientRect();
-                const root = document.documentElement;
-                return {
-                    width: rect.width,
-                    height: rect.height,
-                    viewport_width: window.innerWidth || root.clientWidth || 0,
-                    viewport_height: window.innerHeight || root.clientHeight || 0,
-                    inside_modal: Boolean(element.closest(
-                        'dialog,[role="dialog" i],[role="alertdialog" i],[aria-modal="true" i]'
-                    )),
-                };
-            }""",
-            timeout=timeout,
-        )
-    except Exception:
-        LOG.debug("Failed to classify blocking sibling", exc_info=True, element_id=element.get_id())
-        return False
-
-    if not isinstance(metrics, dict) or metrics.get("inside_modal") is not False:
-        return False
-    width = metrics.get("width")
-    height = metrics.get("height")
-    viewport_width = metrics.get("viewport_width")
-    viewport_height = metrics.get("viewport_height")
-    dimensions = (width, height, viewport_width, viewport_height)
-    numeric_dimensions: list[float] = []
-    for value in dimensions:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            return False
-        numeric_dimensions.append(float(value))
-    numeric_width, numeric_height, numeric_viewport_width, numeric_viewport_height = numeric_dimensions
-    # ponytail: non-modal overlays are size-gated; add style/z-index signals if smaller overlays surface.
-    return numeric_width < numeric_viewport_width / 2 and numeric_height < numeric_viewport_height / 2
 
 
 def _get_click_count(action: ClickAction | UploadFileAction) -> int:
@@ -5176,46 +5109,6 @@ async def chain_click(
                         )
                         action_results.append(ActionSuccess())
                         return action_results
-
-                # A non-anchor click (e.g. a primary form submit) blocked by an
-                # untracked overlay (a consent / opt-out / FCRA modal over the
-                # control): a coordinate click would land on whatever pixel is on
-                # top — the overlay's own button — so dispatch on the intended
-                # element instead (element.click() fires on the target node,
-                # bypassing hit-testing and never touching the overlay). This
-                # needs the observer to confirm the click landed; without one we
-                # fail cleanly rather than guess, like the blocker path below.
-                if (
-                    isinstance(action, ClickAction)
-                    and not action.file_url
-                    and not action.download
-                    and action.x is None
-                    and action.y is None
-                    and click_count == 1
-                    and incremental_scraped is not None
-                    and skyvern_element.get_tag_name() != InteractiveElement.A
-                ):
-                    LOG.info(
-                        "Chain click: click blocked by an untracked overlay; dispatching on the intended element "
-                        "instead of coordinate-clicking into the overlay",
-                        action=action,
-                        element=str(skyvern_element),
-                        locator=locator,
-                    )
-                    action_results.append(
-                        await _click_in_javascript_and_verify(
-                            action,
-                            page,
-                            skyvern_element,
-                            incremental_scraped,
-                            skyvern_frame,
-                            anchor="overlay_blocked",
-                            no_response_msg=(
-                                "click blocked by overlay; no page response after intended-element dispatch"
-                            ),
-                        )
-                    )
-                    return action_results
             else:
                 # Element is visible and elementFromPoint returns the target itself,
                 # but Playwright's click still failed (e.g. element transiently
@@ -5259,11 +5152,9 @@ async def chain_click(
                 element=str(blocking_element),
                 locator=locator,
             )
-            target_handler = await skyvern_element.get_element_handler()
-            if await blocking_element.is_parent_of(target_handler) or (
-                await blocking_element.is_sibling_of(target_handler)
-                and (incremental_scraped is None or await _is_likely_sibling_control(blocking_element, timeout))
-            ):
+            if await blocking_element.is_parent_of(
+                await skyvern_element.get_element_handler()
+            ) or await blocking_element.is_sibling_of(await skyvern_element.get_element_handler()):
                 LOG.info(
                     "Chain click: element is blocked by other elements, going to click on the blocking element",
                     action=action,
@@ -5285,23 +5176,28 @@ async def chain_click(
 
         # JS click dispatches directly on the DOM node, bypassing hit-testing.
         LOG.info(
-            "Chain click: blocker is not a safe retarget, trying JS click on original element",
+            "Chain click: blocker is not parent/sibling, trying JS click on original element",
             action=action,
             element=str(skyvern_element),
             locator=locator,
         )
-        action_results.append(
-            await _click_in_javascript_and_verify(
-                action,
-                page,
-                skyvern_element,
-                incremental_scraped,
-                skyvern_frame,
-                anchor="self_js",
-                no_response_msg="no page response after click",
+        try:
+            await skyvern_element.click_in_javascript()
+            if await _did_page_respond(incremental_scraped, skyvern_frame):
+                action_results.append(ActionSuccess())
+                return action_results
+            LOG.info(
+                "Chain click: JS click did not trigger a page response",
+                action=action,
+                element=str(skyvern_element),
             )
-        )
-        return action_results
+            action_results.append(
+                ActionFailure(FailToClick(action.element_id, anchor="self_js", msg="no page response after click"))
+            )
+            return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
+            return action_results
 
     finally:
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
