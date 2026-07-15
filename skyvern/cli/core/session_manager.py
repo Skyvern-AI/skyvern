@@ -107,12 +107,13 @@ def _identity_token(obj: Page | Frame) -> int:
     return token
 
 
-def page_ref_key(page: SkyvernBrowserPage) -> tuple[int, int | None, str]:
+def page_ref_key(page: SkyvernBrowserPage) -> tuple[int, int | None, str, str | None]:
     """Identity of the document context a ref snapshot was taken from."""
     return (
         _identity_token(page.page),
         _identity_token(page._working_frame) if page._working_frame is not None else None,
         page.url,
+        page._working_frame.url if page._working_frame is not None else None,
     )
 
 
@@ -165,7 +166,7 @@ def replace_session_ref_map(
     session_id: str | None = None,
     cdp_url: str | None = None,
     generation: int | None = None,
-    page_key: tuple[int, int | None, str] | None = None,
+    page_key: tuple[int, int | None, str, str | None] | None = None,
 ) -> bool:
     """Replace the session's ref snapshot (never merge). Returns False if discarded.
 
@@ -193,7 +194,7 @@ def get_session_ref(
     *,
     session_id: str | None = None,
     cdp_url: str | None = None,
-    page_key: tuple[int, int | None, str] | None = None,
+    page_key: tuple[int, int | None, str, str | None] | None = None,
 ) -> dict[str, Any] | None:
     """Resolve a ref, failing closed when the snapshot was bound to a different
     page/frame than the one the caller is on (popup steal, external tab close,
@@ -504,17 +505,13 @@ async def get_page(
 
     # Propagate iframe frame context from session state to the page
     if state._working_frame is not None:
-        # Guard against stale (detached) frame references
-        detached = False
         try:
             detached = state._working_frame.is_detached()
         except AttributeError:
-            pass  # frame object doesn't support is_detached (e.g., test mocks)
+            detached = False  # frame object doesn't support is_detached (e.g., test mocks)
         if detached:
-            LOG.debug("Clearing detached _working_frame from session state")
-            state._working_frame = None
-        else:
-            page._working_frame = state._working_frame
+            LOG.debug("Propagating detached _working_frame for explicit action failure")
+        page._working_frame = state._working_frame
 
     return page, ctx
 

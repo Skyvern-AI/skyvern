@@ -839,6 +839,16 @@ class ObservedElement:
     needs_disambiguation: bool = False
 
 
+class ObserveFrameError(RuntimeError):
+    """Failure to evaluate an observe snapshot inside the selected frame."""
+
+    def __init__(self, frame_name: str, frame_url: str, cause: Exception) -> None:
+        self.frame_name = frame_name
+        self.frame_url = frame_url
+        frame_id = frame_name or frame_url or "<unnamed>"
+        super().__init__(f"Failed to evaluate observe in frame {frame_id!r}: {cause}")
+
+
 @dataclass
 class ObserveResult:
     url: str
@@ -876,16 +886,23 @@ async def _get_dom_observe_elements(
     page: Any,
     selector: str | None = None,
     include_values: bool = False,
+    *,
+    frame_name: str | None = None,
+    frame_url: str | None = None,
 ) -> list[dict[str, Any]]:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
+        if frame_name is not None:
+            raise ObserveFrameError(frame_name, frame_url or "", RuntimeError("frame does not support evaluate"))
         return []
     try:
         result = await evaluate(
             _OBSERVE_INTERACTABLES_JS,
             {"scopeSelector": selector, "includeValues": include_values},
         )
-    except Exception:
+    except Exception as exc:
+        if frame_name is not None:
+            raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
         return []
     if not isinstance(result, list):
         return []
@@ -960,17 +977,51 @@ async def do_observe(
     # Execute-step params arrive as untyped JSON; a string like "false" must not
     # enable value capture — the opt-in counts only as a literal boolean True.
     include_values = include_values is True
-    accessibility = getattr(page, "accessibility", None)
-    if selector and accessibility is not None:
-        element_handle = await page.locator(selector).first.element_handle()
-        snapshot = await accessibility.snapshot(root=element_handle)
-    elif accessibility is not None:
-        snapshot = await accessibility.snapshot()
-    else:
+    working_frame = getattr(page, "_working_frame", None)
+    if working_frame is not None:
+        # A popup or tab change can make get_page() resolve a different page than the
+        # one the selected frame belongs to — observing that frame would report the
+        # wrong document as if it were the active page.
+        owner = getattr(working_frame, "page", None)
+        raw_page = getattr(page, "page", page)
+        if owner is not None and owner is not raw_page:
+            raise ObserveFrameError(
+                working_frame.name,
+                working_frame.url,
+                RuntimeError("frame belongs to a different page or tab"),
+            )
+        try:
+            detached = working_frame.is_detached()
+        except AttributeError:
+            detached = False
+        if detached:
+            raise ObserveFrameError(
+                working_frame.name,
+                working_frame.url,
+                RuntimeError("frame is detached"),
+            )
+    observe_target = working_frame if working_frame is not None else page
+    if working_frame is not None:
+        # Legacy page accessibility iframe roots are unreliable; DOM-only avoids cross-document merges.
         snapshot = None
+    else:
+        accessibility = getattr(page, "accessibility", None)
+        if selector and accessibility is not None:
+            element_handle = await page.locator(selector).first.element_handle()
+            snapshot = await accessibility.snapshot(root=element_handle)
+        elif accessibility is not None:
+            snapshot = await accessibility.snapshot()
+        else:
+            snapshot = None
 
     all_elements = _flatten_a11y_tree(snapshot)
-    dom_elements = await _get_dom_observe_elements(page, selector, include_values)
+    dom_elements = await _get_dom_observe_elements(
+        observe_target,
+        selector,
+        include_values,
+        frame_name=working_frame.name if working_frame is not None else None,
+        frame_url=working_frame.url if working_frame is not None else None,
+    )
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
@@ -1023,9 +1074,17 @@ async def do_observe(
             )
         )
 
+    if working_frame is not None:
+        try:
+            title = await working_frame.title()
+        except Exception as exc:
+            raise ObserveFrameError(working_frame.name, working_frame.url, exc) from exc
+    else:
+        title = await page.title()
+
     return ObserveResult(
-        url=page.url,
-        title=await page.title(),
+        url=working_frame.url if working_frame is not None else page.url,
+        title=title,
         elements=observed,
         element_count=len(observed),
         total_on_page=total,
@@ -1181,6 +1240,10 @@ async def do_execute(
             wall_ms = int((time.monotonic() - t0) * 1000)
             error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
             results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
+            if step.tool == "observe":
+                # A failed observe means the document may have been replaced; refs from
+                # an earlier observe in this batch must not survive it.
+                ref_map = {}
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:
