@@ -30,8 +30,8 @@ type Props = {
   // While a bulk apply is in flight, freeze the picker so a second pick can't
   // start a competing apply for the same selection.
   disabled?: boolean;
-  // Set for single-target pickers (workflow-row and run-tag menus) to enable
-  // removal; the bulk Actions surface omits them and stays add-only.
+  // Set by pickers that support removal (single rows and the run bulk union).
+  // The agent bulk Actions surface omits these and stays add-only.
   currentTags?: Array<Tag>;
   onRemove?: (tag: Tag) => void;
 };

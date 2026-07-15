@@ -32,6 +32,7 @@ import { BlockDetailThought } from "./blockDetail/BlockDetailThought";
 import { BlockDetailWorkflowTrigger } from "./blockDetail/BlockDetailWorkflowTrigger";
 import { BlockInspector } from "./blockDetail/BlockInspector";
 import { EmptyState } from "./blockDetail/EmptyState";
+import { BlockHealPanel } from "./BlockHealPanel";
 import {
   BlockDetailHeader,
   BlockDetailHeaderSkeleton,
@@ -263,6 +264,12 @@ function WorkflowRunBlockDetail({
         <div>
           {resolvedBlock && (
             <BlockInspector block={resolvedBlock} action={selectedAction} />
+          )}
+          {resolvedBlock && (
+            <BlockHealPanel
+              workflowRunId={workflowRunId ?? resolvedBlock.workflow_run_id}
+              workflowRunBlockId={resolvedBlock.workflow_run_block_id}
+            />
           )}
           {resolvedBlock && showDownloadedFiles && (
             <BlockDownloadedFiles
