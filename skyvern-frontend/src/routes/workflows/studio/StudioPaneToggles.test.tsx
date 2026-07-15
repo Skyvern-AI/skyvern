@@ -66,11 +66,11 @@ describe("StudioPaneToggles structure", () => {
     }
   });
 
-  test("reflects the default panes (copilot + browser) as expanded", () => {
+  test("reflects the default panes (editor + browser) as expanded", () => {
     renderAt();
-    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
+    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
     expect(tab(/^Browser/).getAttribute("aria-expanded")).toBe("true");
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
 
   test("reflects an explicit ?panes= list", () => {
@@ -99,9 +99,9 @@ describe("StudioPaneToggles structure", () => {
 describe("StudioPaneToggles pane toggling", () => {
   test("opening a closed pane appends it in click order", () => {
     renderAt();
-    fireEvent.click(tab(/^Editor/));
-    expect(currentPanes()).toBe("copilot,browser,editor");
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(tab(/^Copilot/));
+    expect(currentPanes()).toBe("editor,browser,copilot");
+    expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
   test("closing an open pane splices it out, keeping the rest in order", () => {
@@ -235,6 +235,6 @@ describe("StudioPaneToggles keyboard navigation", () => {
     renderAt();
     fireEvent.keyDown(tab(/^Copilot/), { key: "ArrowRight" });
     expect(currentPanes()).toBeNull();
-    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("false");
+    expect(tab(/^Editor/).getAttribute("aria-expanded")).toBe("true");
   });
 });

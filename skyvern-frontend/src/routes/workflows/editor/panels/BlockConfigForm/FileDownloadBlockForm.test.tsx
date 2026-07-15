@@ -12,6 +12,10 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { RunEngine } from "@/api/types";
 import type { FileDownloadNode } from "../../nodes/FileDownloadNode/types";
+import type {
+  FileDownloadBlock,
+  WorkflowApiResponse,
+} from "../../../types/workflowTypes";
 
 const mockNodes = new Map<
   string,
@@ -258,6 +262,7 @@ function setFileDownloadNode(
       engine: RunEngine.SkyvernV1,
       model: null,
       downloadTimeout: null,
+      downloadTarget: "website",
       ...overrides,
     },
   });
@@ -296,6 +301,19 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
       "wbi-navigation_goal",
     ) as HTMLTextAreaElement;
     expect(navigationGoal.value).toBe("download the latest invoice");
+  });
+
+  test("renders Download Target defaulted to Website without destination fields", () => {
+    setFileDownloadNode("d1");
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(screen.getByText("Download Target")).toBeDefined();
+    expect(screen.getByText("Website")).toBeDefined();
+    expect(screen.queryByText("Prompt")).toBeNull();
+    expect(screen.queryByText("S3 Bucket")).toBeNull();
+    expect(screen.queryByText("Storage Account Name")).toBeNull();
+    expect(screen.queryByText("Google Account")).toBeNull();
+    expect(screen.queryByText("SFTP Host")).toBeNull();
   });
 
   test("editing url propagates", () => {
@@ -483,5 +501,75 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
       ok = usePendingCommitsStore.getState().flush("d1");
     });
     expect(ok).toBe(true);
+  });
+});
+
+describe("file download serialization", () => {
+  test("omits destination fields for website downloads in saved and exported YAML", async () => {
+    const { convert, getWorkflowBlocks } = await vi.importActual<
+      typeof import("../../workflowEditorUtils")
+    >("../../workflowEditorUtils");
+    const destinationFields = [
+      "download_target",
+      "path",
+      "prompt",
+      "continue_on_empty",
+      "s3_bucket",
+      "aws_access_key_id",
+      "aws_secret_access_key",
+      "region_name",
+      "azure_storage_account_name",
+      "azure_storage_account_key",
+      "azure_blob_container_name",
+      "google_credential_id",
+      "google_drive_folder_id",
+      "sftp_host",
+      "sftp_port",
+      "sftp_username",
+      "sftp_password",
+      "sftp_private_key",
+      "sftp_private_key_passphrase",
+      "sftp_remote_path",
+      "sftp_host_key",
+    ];
+
+    setFileDownloadNode("d1", {
+      downloadTarget: "website",
+      path: "{{ workflow_run_id }}",
+      prompt: "stale prompt",
+      s3Bucket: "stale-s3",
+      azureBlobContainerName: "stale-azure",
+      googleDriveFolderId: "stale-google",
+      sftpHost: "stale-sftp",
+      continueOnEmpty: true,
+    });
+    const node = mockNodes.get("d1") as FileDownloadNode;
+    const [savedBlock] = getWorkflowBlocks([node], []);
+
+    const apiBlock = {
+      ...savedBlock,
+      parameters: [],
+      output_parameter: {},
+      download_target: "website",
+      path: "{{ workflow_run_id }}",
+      prompt: "stale prompt",
+      s3_bucket: "stale-s3",
+      azure_blob_container_name: "stale-azure",
+      google_drive_folder_id: "stale-google",
+      sftp_host: "stale-sftp",
+      continue_on_empty: true,
+    } as unknown as FileDownloadBlock;
+    const exportedBlock = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [apiBlock],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+
+    for (const field of destinationFields) {
+      expect(savedBlock).not.toHaveProperty(field);
+      expect(exportedBlock).not.toHaveProperty(field);
+    }
   });
 });

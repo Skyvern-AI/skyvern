@@ -11,6 +11,8 @@ Validates that the cached download flow:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,6 +40,8 @@ def mock_context():
     ctx = MagicMock()
     ctx.organization_id = "o_test_org"
     ctx.workflow_run_id = "wr_test_run"
+    ctx.browser_session_id = None
+    ctx.run_id = ctx.workflow_run_id
     ctx.prompt = None
     return ctx
 
@@ -67,6 +71,9 @@ def setup(mock_context, tmp_path):
 
         fallback_mock = AsyncMock()
         update_block_mock = AsyncMock()
+        run_cached_mock = AsyncMock()
+        wait_downloads_mock = AsyncMock()
+        get_download_dir_mock = MagicMock(return_value=download_dir)
 
         all_patches = [
             patch(f"{MODULE}.app", mock_app),
@@ -79,11 +86,12 @@ def setup(mock_context, tmp_path):
             patch(f"{MODULE}._render_template_with_label", side_effect=lambda p, _: p),
             patch(f"{MODULE}.skyvern_context.ensure_context", return_value=mock_context),
             patch(f"{MODULE}._prepare_cached_block_inputs", new_callable=AsyncMock),
-            patch(f"{MODULE}._run_cached_function", new_callable=AsyncMock),
+            patch(f"{MODULE}._run_cached_function", new=run_cached_mock),
             patch(f"{MODULE}._update_workflow_block", update_block_mock),
             patch(f"{MODULE}._fallback_to_ai_run", fallback_mock),
             patch(f"{MODULE}._clear_cached_block_overrides"),
-            patch(f"{MODULE}.get_path_for_workflow_download_directory", return_value=download_dir),
+            patch(f"{MODULE}.check_downloading_files_and_wait_for_download_to_complete", new=wait_downloads_mock),
+            patch(f"{MODULE}.get_path_for_workflow_download_directory", new=get_download_dir_mock),
             patch(f"{MODULE}.list_files_in_directory", side_effect=list_side),
             patch(f"{MODULE}.rename_file", rename),
         ]
@@ -99,6 +107,9 @@ def setup(mock_context, tmp_path):
             "fallback": fallback_mock,
             "update_block": update_block_mock,
             "rename": rename,
+            "run_cached": run_cached_mock,
+            "wait_downloads": wait_downloads_mock,
+            "get_download_dir": get_download_dir_mock,
         }
 
     return _setup
@@ -107,6 +118,30 @@ def setup(mock_context, tmp_path):
 def _cleanup(refs):
     for p in refs["patches"]:
         p.stop()
+
+
+def test_render_template_with_label_injects_workflow_run_id():
+    context = SimpleNamespace(workflow_run_id="wr_cached_run", script_run_parameters={}, loop_metadata=None)
+    workflow_run_context = SimpleNamespace(
+        values={},
+        workflow_title="Cached workflow",
+        workflow_id="wf_cached",
+        workflow_permanent_id="wpid_cached",
+        workflow_run_id="wr_cached_run",
+        browser_session_id=None,
+    )
+    mock_app = MagicMock()
+    mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = workflow_run_context
+
+    with (
+        patch(f"{MODULE}.app", mock_app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+    ):
+        from skyvern.services.script_service import _render_template_with_label
+
+        rendered = _render_template_with_label("exports/{{ workflow_run_id }}")
+
+    assert rendered == "exports/wr_cached_run"
 
 
 @pytest.mark.asyncio
@@ -127,6 +162,311 @@ async def test_cached_download_calls_save_downloaded_files(setup, tmp_path):
             organization_id="o_test_org",
             run_id="wr_test_run",
         )
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_dispatches_only_new_files_to_destination(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    existing_file = str(download_dir / "existing.pdf")
+    downloaded_file = str(download_dir / "downloaded.pdf")
+    refs = setup(
+        get_side_effect=[[], ["downloaded.pdf"]],
+        list_files_side_effect=[[existing_file], [existing_file, downloaded_file]],
+    )
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        with patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files:
+            await download(
+                prompt="Download invoice",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+                region_name="us-east-1",
+            )
+
+        file_download_block = dispatch_files.await_args.args[0]
+        assert file_download_block.download_target == "s3"
+        assert file_download_block.s3_bucket == "bucket"
+        assert file_download_block.aws_access_key_id == "access-key"
+        assert file_download_block.aws_secret_access_key == "secret-key"
+        assert file_download_block.region_name == "us-east-1"
+        dispatch_files.assert_awaited_once_with(
+            file_download_block,
+            storage_type="s3",
+            files_to_upload=[downloaded_file],
+            workflow_run_id="wr_test_run",
+            workflow_run_block_id="wrb_1",
+            organization_id="o_test_org",
+            workflow_run_context=refs["app"].WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value,
+        )
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_awaits_in_flight_downloads_before_snapshot(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    downloaded_file = str(download_dir / "downloaded.pdf")
+    refs = setup(
+        get_side_effect=[[], ["downloaded.pdf"]],
+        list_files_side_effect=[[], [downloaded_file]],
+    )
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        async def assert_waited_before_dispatch(*_args, **_kwargs):
+            refs["wait_downloads"].assert_awaited_once_with(
+                download_dir=download_dir,
+                organization_id="o_test_org",
+                browser_session_id=None,
+            )
+
+        with patch.object(
+            FileDownloadBlock,
+            "_dispatch_files_to_storage",
+            autospec=True,
+            side_effect=assert_waited_before_dispatch,
+        ) as dispatch_files:
+            await download(
+                prompt="Download invoice",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+            )
+
+        refs["wait_downloads"].assert_awaited_once_with(
+            download_dir=download_dir,
+            organization_id="o_test_org",
+            browser_session_id=None,
+        )
+        dispatch_files.assert_awaited_once()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_uses_parent_run_id_for_download_dir(setup, mock_context, tmp_path):
+    mock_context.run_id = "wr_parent_run"
+    mock_context.workflow_run_id = "wr_child_run"
+    download_dir = tmp_path / "downloads"
+    downloaded_file = str(download_dir / "downloaded.pdf")
+    refs = setup(
+        get_side_effect=[[], ["downloaded.pdf"]],
+        list_files_side_effect=[[], [downloaded_file]],
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        await download(prompt="Download invoice", label="test_block")
+
+        refs["get_download_dir"].assert_called_once_with("wr_parent_run")
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_dispatch_failure_does_not_fallback_to_ai(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    downloaded_file = str(download_dir / "downloaded.pdf")
+    refs = setup(
+        get_side_effect=[[], ["downloaded.pdf"]],
+        list_files_side_effect=[[], [downloaded_file]],
+    )
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        with (
+            patch.object(
+                FileDownloadBlock,
+                "_dispatch_files_to_storage",
+                autospec=True,
+                side_effect=RuntimeError("destination unavailable"),
+            ) as dispatch_files,
+            pytest.raises(RuntimeError, match="destination unavailable"),
+        ):
+            await download(
+                prompt="Download invoice",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+            )
+
+        dispatch_files.assert_awaited_once()
+        refs["fallback"].assert_not_awaited()
+        assert refs["update_block"].await_args.args[1].value == "failed"
+        assert refs["update_block"].await_args.kwargs["failure_reason"] == "destination unavailable"
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_ai_fallback_still_dispatches_to_destination(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    fallback_file = str(download_dir / "fallback.pdf")
+    refs = setup(
+        get_side_effect=[[]],
+        list_files_side_effect=[[], [], [fallback_file]],
+    )
+    refs["run_cached"].side_effect = RuntimeError("cached download failed")
+
+    async def create_fallback_download(**kwargs):
+        Path(fallback_file).write_bytes(b"fallback contents")
+
+    refs["fallback"].side_effect = create_fallback_download
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        with patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files:
+            await download(
+                prompt="Download invoice",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+            )
+
+        refs["fallback"].assert_awaited_once()
+        dispatch_files.assert_awaited_once()
+        assert dispatch_files.await_args.kwargs["files_to_upload"] == [fallback_file]
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_website_download_never_dispatches_external_storage(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    downloaded_file = str(download_dir / "downloaded.pdf")
+    refs = setup(
+        get_side_effect=[[], ["downloaded.pdf"]],
+        list_files_side_effect=[[], [downloaded_file]],
+    )
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        with patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files:
+            await download(
+                prompt="Download invoice",
+                label="test_block",
+                download_target="website",
+                s3_bucket="stale-bucket",
+                aws_access_key_id="stale-key",
+                aws_secret_access_key="stale-secret",
+            )
+
+        dispatch_files.assert_not_awaited()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_applies_destination_prompt_before_dispatch(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    invoice_file = str(download_dir / "invoice.pdf")
+    report_file = str(download_dir / "report.csv")
+    refs = setup(
+        get_side_effect=[[], ["invoice.pdf", "report.csv"]],
+        list_files_side_effect=[[], [invoice_file, report_file]],
+    )
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        selected_files = AsyncMock(return_value=([invoice_file], "Only the invoice matches."))
+        with (
+            patch.object(FileDownloadBlock, "_select_files_to_upload_with_prompt", selected_files),
+            patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files,
+        ):
+            await download(
+                prompt="Only upload invoice PDFs.",
+                navigation_goal="Download the invoice and report.",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+            )
+
+        file_download_block = dispatch_files.await_args.args[0]
+        selected_files.assert_awaited_once_with(
+            file_download_block,
+            prompt="Only upload invoice PDFs.",
+            files_to_upload=[invoice_file, report_file],
+            workflow_run_block_id="wrb_1",
+            organization_id="o_test_org",
+        )
+        assert dispatch_files.await_args.kwargs["files_to_upload"] == [invoice_file]
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_detects_same_path_content_replacement(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    replaced_file = download_dir / "invoice.pdf"
+    replaced_file.write_bytes(b"prior block contents")
+    refs = setup(
+        get_side_effect=[[], ["invoice.pdf"]],
+        list_files_side_effect=[[str(replaced_file)], [str(replaced_file)]],
+    )
+    refs["run_cached"].side_effect = lambda _: replaced_file.write_bytes(b"this block contents")
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        with (
+            patch(f"{MODULE}.CACHED_DOWNLOAD_NO_FILE_GRACE_SECONDS", 0),
+            patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files,
+        ):
+            await download(
+                prompt="Download invoice",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+            )
+
+        dispatch_files.assert_awaited_once()
+        assert dispatch_files.await_args.kwargs["files_to_upload"] == [str(replaced_file)]
+        refs["fallback"].assert_not_awaited()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_missing_destination_halts_without_fallback(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    downloaded_file = str(download_dir / "invoice.pdf")
+    refs = setup(
+        get_side_effect=[[], ["invoice.pdf"]],
+        list_files_side_effect=[[], [downloaded_file]],
+    )
+    try:
+        from skyvern.exceptions import ScriptTerminationException
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        with patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files:
+            # A misconfigured cached destination must halt the script (raise), not just return a
+            # failed status, so later generated statements do not run; and it must not download or fall back.
+            with pytest.raises(ScriptTerminationException):
+                await download(
+                    prompt="Download invoice",
+                    label="test_block",
+                    download_target="s3",
+                    aws_access_key_id="access-key",
+                    aws_secret_access_key="secret-key",
+                )
+
+        dispatch_files.assert_not_awaited()
+        refs["fallback"].assert_not_awaited()
     finally:
         _cleanup(refs)
 
@@ -379,7 +719,12 @@ async def test_rename_skips_crdownload_files(setup, tmp_path):
     refs = setup(
         get_side_effect=[[], ["invoice.pdf"]],
         # before, local verify, rename local_files_after, existing_names dedup lookup
-        list_files_side_effect=[[], [incomplete, complete], [incomplete, complete], [incomplete, complete]],
+        list_files_side_effect=[
+            [incomplete],
+            [incomplete, complete],
+            [incomplete, complete],
+            [incomplete, complete],
+        ],
         rename_mock=rename_mock,
     )
     try:
@@ -498,6 +843,53 @@ async def test_poll_waits_for_crdownload_to_complete(setup, tmp_path):
         refs["fallback"].assert_not_called()
         refs["update_block"].assert_called_once()
         refs["storage"].save_downloaded_files.assert_called_once()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_waits_for_all_files_before_dispatch(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    first_complete = str(download_dir / "a.pdf")
+    second_incomplete = str(download_dir / "b.pdf.crdownload")
+    second_complete = str(download_dir / "b.pdf")
+    refs = setup(
+        get_side_effect=[[], [first_complete, second_complete]],
+        list_files_side_effect=[
+            [],
+            [first_complete, second_incomplete],
+            [first_complete, second_complete],
+        ],
+    )
+    try:
+        from skyvern.services.script_service import FileDownloadBlock, download
+
+        async def assert_partial_state_not_settled(_delay):
+            refs["storage"].save_downloaded_files.assert_not_awaited()
+            dispatch_files.assert_not_awaited()
+            refs["update_block"].assert_not_awaited()
+
+        with (
+            patch.object(FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch_files,
+            patch(
+                f"{MODULE}.asyncio.sleep",
+                new_callable=AsyncMock,
+                side_effect=assert_partial_state_not_settled,
+            ) as sleep,
+        ):
+            await download(
+                prompt="Download reports",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+            )
+
+        sleep.assert_awaited_once()
+        dispatch_files.assert_awaited_once()
+        assert dispatch_files.await_args.kwargs["files_to_upload"] == [first_complete, second_complete]
+        assert refs["update_block"].await_args.args[1].value == "completed"
     finally:
         _cleanup(refs)
 

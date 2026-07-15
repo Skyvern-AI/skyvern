@@ -8,6 +8,7 @@ import { badgeVariants } from "@/components/ui/badge-variants";
 import { cn } from "@/util/utils";
 import {
   normalizeWorkflowTags,
+  isUserWritableTagKey,
   sortTags,
   tagElementKey,
   type Tag,
@@ -24,6 +25,7 @@ type Props = {
   colors?: TagColorMap;
   maxVisible?: number;
   className?: string;
+  onRemove?: (tag: Tag) => void;
 };
 
 // Generic list of tag chips with a "+N" overflow affordance. Standalone labels
@@ -34,6 +36,7 @@ function TagChipList({
   colors,
   maxVisible = 3,
   className,
+  onRemove,
 }: Props) {
   // Re-validate at render time: callers feed this straight from API payloads,
   // and a shape skew here previously killed the whole route via React #31.
@@ -56,6 +59,11 @@ function TagChipList({
             tag.key !== null ? descriptions?.get(tag.key) : undefined
           }
           color={tagColorFor(colors, tag.key, tag.value)}
+          onRemove={
+            onRemove && isUserWritableTagKey(tag.key)
+              ? () => onRemove(tag)
+              : undefined
+          }
         />
       ))}
       {hidden.length > 0 ? (

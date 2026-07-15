@@ -11,7 +11,7 @@ import inspect
 import re
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -2172,6 +2172,10 @@ async def test_direct_fill_dispatch_failure_does_not_regress_fill(mock_scraped_p
 
 # =============================================================================
 # Tests for selector fallback prep opt-out — SKY-12096
+#
+# Patching skyvern_page.asyncio.sleep rebinds the GLOBAL asyncio.sleep, so the mock also
+# records sleeps from coroutines running on other threads' event loops. Assert on locator
+# behavior or on this path's own sleep values — never on bare await_args.
 # =============================================================================
 
 
@@ -2193,7 +2197,7 @@ async def test_selector_fallback_default_runs_element_prep(mock_scraped_page, mo
     assert ("wait_for", "attached") in locator.calls
     assert ("wait_for", "visible") in locator.calls
     assert ("scroll_into_view_if_needed", None) in locator.calls
-    assert sleep.await_args is not None
+    assert call(0.15) in sleep.await_args_list
 
 
 @pytest.mark.asyncio
@@ -2215,9 +2219,9 @@ async def test_selector_fallback_prep_opt_out_uses_playwright_actionability(
             result = await skyvern_page.type("#target", "Noor", _skip_element_prep=True)
 
     assert result in ("#target", "Noor")
-    assert not any(call[0] == "wait_for" for call in locator.calls)
+    assert not any(recorded[0] == "wait_for" for recorded in locator.calls)
     assert ("scroll_into_view_if_needed", None) not in locator.calls
-    assert sleep.await_args is None
+    assert call(0.15) not in sleep.await_args_list
 
 
 @pytest.mark.asyncio
@@ -2225,11 +2229,12 @@ async def test_selector_click_prep_opt_out_preserves_direct_timeout_failure(mock
     locator = _RecordingLocator(click_error=PlaywrightTimeoutError("Timeout 5000ms exceeded."))
     skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
 
-    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(PlaywrightTimeoutError):
             await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
 
-    assert sleep.await_args is None
+    # A single click means the escape-dismiss retry never ran.
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [("click", None)]
 
 
 @pytest.mark.asyncio
@@ -2239,8 +2244,12 @@ async def test_selector_click_prep_opt_out_keeps_escape_retry_for_interception(m
     )
     skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
 
-    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock) as sleep:
+    with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
         with pytest.raises(PlaywrightTimeoutError):
             await skyvern_page.click("#target", _skip_element_prep=True, timeout=5000)
 
-    assert sleep.await_args is not None
+    # The second click is the retry after dismissing the intercepting overlay.
+    assert [recorded for recorded in locator.calls if recorded[0] == "click"] == [
+        ("click", None),
+        ("click", None),
+    ]

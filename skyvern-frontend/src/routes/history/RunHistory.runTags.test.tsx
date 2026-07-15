@@ -38,6 +38,19 @@ const run: TaskRunListItem = {
   trigger_type: null,
   searchable_text: null,
 };
+const secondRun: TaskRunListItem = {
+  ...run,
+  task_run_id: "tr_2",
+  run_id: "wr_2",
+  title: "Second Run",
+};
+const taskRun: TaskRunListItem = {
+  ...run,
+  task_run_id: "tr_3",
+  task_run_type: TaskRunType.TaskV2,
+  run_id: "tsk_1",
+  title: "Task Run",
+};
 
 vi.mock("use-debounce", () => ({
   useDebounce: <T,>(value: T): [T] => [value],
@@ -53,7 +66,7 @@ const runsQueryCalls: Array<Record<string, unknown>> = [];
 vi.mock("@/hooks/useRunsQuery", () => ({
   useRunsQuery: (props: Record<string, unknown>) => {
     runsQueryCalls.push(props);
-    return { data: [run], isFetching: false };
+    return { data: [run, secondRun, taskRun], isFetching: false };
   },
 }));
 
@@ -164,6 +177,57 @@ describe("RunHistory run tags", () => {
     expect(
       within(container).getByTestId("tag-chip-list").textContent,
     ).toContain("platform_a");
+  });
+
+  it("selects only workflow runs and supports shift-range bulk actions", () => {
+    render(<RunHistory />, { wrapper });
+
+    const first = screen.getByRole("checkbox", { name: "Select My Run" });
+    const second = screen.getByRole("checkbox", { name: "Select Second Run" });
+    expect(
+      screen.queryByRole("checkbox", { name: "Select Task Run" }),
+    ).toBeNull();
+
+    fireEvent.click(first.parentElement!);
+    fireEvent.click(second.parentElement!, { shiftKey: true });
+
+    expect(
+      screen.getByRole("toolbar", { name: "Bulk actions" }).textContent,
+    ).toContain("2 selected");
+
+    fireEvent.contextMenu(screen.getByRole("row", { name: /tsk_1 Task Run/ }));
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("hides selection when workflow tagging is disabled", () => {
+    flagState.taggingEnabled = false;
+    render(<RunHistory />, { wrapper });
+
+    expect(screen.queryByLabelText(/^Select /)).toBeNull();
+  });
+
+  it("does not restore selection after the tagging flag is toggled", () => {
+    const view = render(<RunHistory />, { wrapper });
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select My Run" }).parentElement!,
+    );
+
+    flagState.taggingEnabled = false;
+    view.rerender(<RunHistory />);
+    flagState.taggingEnabled = true;
+    view.rerender(<RunHistory />);
+
+    expect(screen.queryByRole("toolbar", { name: "Bulk actions" })).toBeNull();
+  });
+
+  it("opens the tag context menu from a workflow-run row", async () => {
+    render(<RunHistory />, { wrapper });
+
+    const row = screen.getByRole("row", { name: /wr_1 My Run/ });
+    fireEvent.contextMenu(row);
+
+    expect(await screen.findByRole("menu")).not.toBeNull();
+    expect(row.hasAttribute("data-row-active")).toBe(true);
   });
 });
 
