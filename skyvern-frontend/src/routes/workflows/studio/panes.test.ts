@@ -7,7 +7,6 @@ import {
   STUDIO_STAGE_GAP_PX,
   STUDIO_STAGE_PADDING_PX,
   STUDIO_PANE_MIN_WIDTH,
-  defaultPanesForWorkflowState,
   fitPanesToWidth,
   layoutClassForSearch,
   panesFitWidth,
@@ -77,16 +76,16 @@ describe("parsePanesParam", () => {
 });
 
 describe("panesFromDeepLink", () => {
-  test("a run deep link opens watch-and-review: Copilot, Browser, Overview", () => {
+  test("a run deep link opens watch-and-review: Browser, Overview", () => {
     expect(
       panesFromDeepLink({ runId: "wr_123", active: null, blockLabel: null }),
-    ).toEqual(["copilot", "browser", "overview"]);
+    ).toEqual(["browser", "overview"]);
   });
 
   test("an ?active= deep link opens the same run layout", () => {
     expect(
       panesFromDeepLink({ runId: null, active: "act_1", blockLabel: null }),
-    ).toEqual(["copilot", "browser", "overview"]);
+    ).toEqual(["browser", "overview"]);
   });
 
   test("a block run opens iterate: Editor, Browser, Overview", () => {
@@ -108,7 +107,7 @@ describe("panesFromDeepLink", () => {
   test("no deep link falls back to the default panes", () => {
     expect(
       panesFromDeepLink({ runId: null, active: null, blockLabel: null }),
-    ).toEqual(["copilot", "browser"]);
+    ).toEqual(["editor", "browser"]);
   });
 
   test("a learned run layout restores on a bare ?wr= entry", () => {
@@ -149,7 +148,7 @@ describe("panesFromDeepLink", () => {
         DEFAULT_STUDIO_PANES,
         ["editor", "overview"],
       ),
-    ).toEqual(["copilot", "browser", "overview"]);
+    ).toEqual(["browser", "overview"]);
   });
 
   test("null learned layout falls back to factory run panes", () => {
@@ -159,21 +158,17 @@ describe("panesFromDeepLink", () => {
         DEFAULT_STUDIO_PANES,
         null,
       ),
-    ).toEqual(["copilot", "browser", "overview"]);
+    ).toEqual(["browser", "overview"]);
   });
 });
 
 describe("resolveOpenPanes", () => {
   test("no params resolves to the default panes", () => {
-    expect(resolveOpenPanes("")).toEqual(["copilot", "browser"]);
+    expect(resolveOpenPanes("")).toEqual(["editor", "browser"]);
   });
 
-  test("?wr= resolves to Copilot, Browser and Overview", () => {
-    expect(resolveOpenPanes("?wr=wr_123")).toEqual([
-      "copilot",
-      "browser",
-      "overview",
-    ]);
+  test("?wr= resolves to Browser and Overview", () => {
+    expect(resolveOpenPanes("?wr=wr_123")).toEqual(["browser", "overview"]);
   });
 
   test("?wr= plus ?bl= resolves to Editor, Browser and Overview", () => {
@@ -185,11 +180,7 @@ describe("resolveOpenPanes", () => {
   });
 
   test("?active= resolves like a run deep link", () => {
-    expect(resolveOpenPanes("?active=act_1")).toEqual([
-      "copilot",
-      "browser",
-      "overview",
-    ]);
+    expect(resolveOpenPanes("?active=act_1")).toEqual(["browser", "overview"]);
   });
 
   test("an explicit ?panes= wins over the deep-link params", () => {
@@ -212,7 +203,7 @@ describe("resolveOpenPanes", () => {
 
   test("unrelated params do not affect the default", () => {
     expect(resolveOpenPanes("?embed=true&cache-key-value=x")).toEqual([
-      "copilot",
+      "editor",
       "browser",
     ]);
   });
@@ -246,23 +237,6 @@ describe("resolveOpenPanes", () => {
   });
 });
 
-describe("defaultPanesForWorkflowState", () => {
-  test("an empty agent starts on prompt-and-watch: Copilot + Browser", () => {
-    expect(defaultPanesForWorkflowState({ hasBlocks: false })).toEqual([
-      "copilot",
-      "browser",
-    ]);
-  });
-
-  test("a built agent adds the Editor: Copilot + Browser + Editor", () => {
-    expect(defaultPanesForWorkflowState({ hasBlocks: true })).toEqual([
-      "copilot",
-      "browser",
-      "editor",
-    ]);
-  });
-});
-
 describe("resolveOpenPanes with custom defaults", () => {
   test("no params resolves to the given defaults", () => {
     expect(resolveOpenPanes("", ["copilot", "editor"])).toEqual([
@@ -273,7 +247,6 @@ describe("resolveOpenPanes with custom defaults", () => {
 
   test("deep links are unaffected by custom defaults", () => {
     expect(resolveOpenPanes("?wr=wr_123", ["copilot", "editor"])).toEqual([
-      "copilot",
       "browser",
       "overview",
     ]);

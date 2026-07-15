@@ -75,5 +75,11 @@ describe("useRunTagMutations", () => {
     });
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["runs"] });
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["workflowRuns"],
+    });
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["run-tag-suggestions"],
+    });
   });
 });

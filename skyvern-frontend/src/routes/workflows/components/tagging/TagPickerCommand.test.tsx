@@ -203,4 +203,18 @@ describe("TagPickerCommand system tags", () => {
     expect(screen.queryByText(/^Add /)).toBeNull();
     expect(onApply).not.toHaveBeenCalled();
   });
+
+  it("keeps current system tags out of the removable group", () => {
+    const onRemove = vi.fn();
+    renderPicker(vi.fn(), {
+      currentTags: [
+        { key: "skyvern.platform", value: "browser" },
+        { key: "env", value: "prod" },
+      ],
+      onRemove,
+    });
+
+    expect(screen.getByText("env: prod")).toBeTruthy();
+    expect(screen.queryByText("skyvern.platform: browser")).toBeNull();
+  });
 });
