@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_contingent_missing_antecedent_degraded,
     is_fallback_floor_base_criterion,
     is_turn_unsatisfiable_fallback_degraded,
+    is_undecidable_judgment_degraded,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.utils.strings import escape_code_fences
@@ -2461,7 +2462,11 @@ def carry_degraded_criterion_ids(
     criteria: Iterable[CompletionCriterion],
 ) -> CompletionVerificationResult:
     criteria = list(criteria)
-    degraded = [criterion.id for criterion in criteria if is_turn_unsatisfiable_fallback_degraded(criterion)]
+    degraded = [
+        criterion.id
+        for criterion in criteria
+        if is_turn_unsatisfiable_fallback_degraded(criterion) or is_undecidable_judgment_degraded(criterion)
+    ]
     contingent_degraded = [
         criterion.id for criterion in criteria if is_contingent_missing_antecedent_degraded(criterion)
     ]
