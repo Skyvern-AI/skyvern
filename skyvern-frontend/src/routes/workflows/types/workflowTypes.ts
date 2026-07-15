@@ -575,6 +575,27 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   disable_cache?: boolean;
   engine: RunEngine | null;
   download_timeout: number | null; // seconds
+  download_target: "website" | "s3" | "azure" | "google_drive" | "sftp";
+  path: string;
+  prompt: string | null;
+  s3_bucket: string | null;
+  region_name: string | null;
+  aws_access_key_id: string | null;
+  aws_secret_access_key: string | null;
+  azure_storage_account_name: string | null;
+  azure_storage_account_key: string | null;
+  azure_blob_container_name: string | null;
+  google_credential_id: string | null;
+  google_drive_folder_id: string | null;
+  sftp_host: string | null;
+  sftp_port: number | null;
+  sftp_username: string | null;
+  sftp_password: string | null;
+  sftp_private_key: string | null;
+  sftp_private_key_passphrase: string | null;
+  sftp_remote_path: string | null;
+  sftp_host_key: string | null;
+  continue_on_empty: boolean;
 };
 
 export type PDFParserBlock = WorkflowBlockBase & {

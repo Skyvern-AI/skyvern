@@ -915,6 +915,27 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
           downloadTimeout: block.download_timeout ?? null, // seconds
+          downloadTarget: block.download_target ?? "website",
+          path: block.path ?? "{{ workflow_run_id }}",
+          prompt: block.prompt ?? null,
+          s3Bucket: block.s3_bucket ?? "",
+          awsAccessKeyId: block.aws_access_key_id ?? "",
+          awsSecretAccessKey: block.aws_secret_access_key ?? "",
+          regionName: block.region_name ?? "",
+          azureStorageAccountName: block.azure_storage_account_name ?? "",
+          azureStorageAccountKey: block.azure_storage_account_key ?? "",
+          azureBlobContainerName: block.azure_blob_container_name ?? "",
+          googleCredentialId: block.google_credential_id ?? "",
+          googleDriveFolderId: block.google_drive_folder_id ?? "",
+          sftpHost: block.sftp_host ?? "",
+          sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
+          sftpUsername: block.sftp_username ?? "",
+          sftpPassword: block.sftp_password ?? "",
+          sftpPrivateKey: block.sftp_private_key ?? "",
+          sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
+          sftpRemotePath: block.sftp_remote_path ?? "",
+          sftpHostKey: block.sftp_host_key ?? "",
+          continueOnEmpty: block.continue_on_empty ?? false,
         },
       };
     }
@@ -3069,6 +3090,44 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
         download_timeout: node.data.downloadTimeout, // seconds
+        ...(node.data.downloadTarget &&
+          node.data.downloadTarget !== "website" && {
+            download_target: node.data.downloadTarget,
+            path: node.data.path,
+            prompt: node.data.prompt,
+            continue_on_empty: node.data.continueOnEmpty ?? false,
+            ...(node.data.downloadTarget === "s3" && {
+              s3_bucket: node.data.s3Bucket ?? "",
+              aws_access_key_id: node.data.awsAccessKeyId ?? "",
+              aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
+              region_name: node.data.regionName ?? "",
+            }),
+            ...(node.data.downloadTarget === "azure" && {
+              azure_storage_account_name:
+                node.data.azureStorageAccountName ?? "",
+              azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
+              azure_blob_container_name: node.data.azureBlobContainerName ?? "",
+            }),
+            ...(node.data.downloadTarget === "google_drive" && {
+              google_credential_id: node.data.googleCredentialId ?? "",
+              google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+            }),
+            ...(node.data.downloadTarget === "sftp" && {
+              sftp_host: node.data.sftpHost ?? "",
+              sftp_port:
+                node.data.sftpPort &&
+                Number.isFinite(Number(node.data.sftpPort))
+                  ? Number(node.data.sftpPort)
+                  : null,
+              sftp_username: node.data.sftpUsername ?? "",
+              sftp_password: node.data.sftpPassword ?? "",
+              sftp_private_key: node.data.sftpPrivateKey ?? "",
+              sftp_private_key_passphrase:
+                node.data.sftpPrivateKeyPassphrase ?? "",
+              sftp_remote_path: node.data.sftpRemotePath ?? "",
+              sftp_host_key: node.data.sftpHostKey ?? "",
+            }),
+          }),
       };
     }
     case "sendEmail": {
@@ -4433,6 +4492,42 @@ function convertBlocksToBlockYAML(
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
           download_timeout: null, // seconds
+          ...(block.download_target &&
+            block.download_target !== "website" && {
+              download_target: block.download_target,
+              path: block.path,
+              prompt: block.prompt,
+              continue_on_empty: block.continue_on_empty ?? false,
+              ...(block.download_target === "s3" && {
+                s3_bucket: block.s3_bucket ?? "",
+                aws_access_key_id: block.aws_access_key_id ?? "",
+                aws_secret_access_key: block.aws_secret_access_key ?? "",
+                region_name: block.region_name ?? "",
+              }),
+              ...(block.download_target === "azure" && {
+                azure_storage_account_name:
+                  block.azure_storage_account_name ?? "",
+                azure_storage_account_key:
+                  block.azure_storage_account_key ?? "",
+                azure_blob_container_name:
+                  block.azure_blob_container_name ?? "",
+              }),
+              ...(block.download_target === "google_drive" && {
+                google_credential_id: block.google_credential_id ?? "",
+                google_drive_folder_id: block.google_drive_folder_id ?? "",
+              }),
+              ...(block.download_target === "sftp" && {
+                sftp_host: block.sftp_host ?? "",
+                sftp_port: block.sftp_port ?? null,
+                sftp_username: block.sftp_username ?? "",
+                sftp_password: block.sftp_password ?? "",
+                sftp_private_key: block.sftp_private_key ?? "",
+                sftp_private_key_passphrase:
+                  block.sftp_private_key_passphrase ?? "",
+                sftp_remote_path: block.sftp_remote_path ?? "",
+                sftp_host_key: block.sftp_host_key ?? "",
+              }),
+            }),
         };
         return blockYaml;
       }

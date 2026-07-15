@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import CloudContext from "@/store/CloudContext";
 import { PageSlotsProvider } from "@/store/PageSlots";
@@ -40,6 +41,11 @@ const workflowRun: WorkflowRunApiResponse = {
   workflow_permanent_id: "wpid_abc123",
   workflow_run_id: "wr_1",
   workflow_title: "Test Workflow",
+};
+const secondWorkflowRun: WorkflowRunApiResponse = {
+  ...workflowRun,
+  title: "Second Run",
+  workflow_run_id: "wr_2",
 };
 
 vi.mock("posthog-js/react", () => ({
@@ -101,7 +107,7 @@ vi.mock("./hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: (props: Record<string, unknown>) => {
     workflowRunsQueryCalls.push(props);
     return {
-      data: [workflowRun],
+      data: [workflowRun, secondWorkflowRun],
       isLoading: false,
     };
   },
@@ -121,7 +127,12 @@ vi.mock("./hooks/useTagValuesQuery", () => ({
 
 vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
   useRunTagsBatchQuery: () => ({
-    data: { wr_1: [{ key: "skyvern.status", value: "completed" }] },
+    data: {
+      wr_1: [
+        { key: "skyvern.status", value: "completed" },
+        { key: null, value: "adhoc" },
+      ],
+    },
     isPending: false,
   }),
 }));
@@ -139,11 +150,16 @@ vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
 vi.mock("./components/tagging/TagChipList", () => ({
   TagChipList: ({
     tags,
+    hideSystemTags,
   }: {
     tags: Array<{ key: string | null; value: string }>;
+    hideSystemTags?: boolean;
   }) => (
     <span data-testid="tag-chip-list">
-      {tags.map((tag) => `${tag.key ?? "label"}:${tag.value}`).join(",")}
+      {tags
+        .filter((tag) => !hideSystemTags || !tag.key?.startsWith("skyvern."))
+        .map((tag) => `${tag.key ?? "label"}:${tag.value}`)
+        .join(",")}
     </span>
   ),
 }));
@@ -191,34 +207,80 @@ function LocationProbe() {
 }
 
 function renderWorkflowPage(initialEntry = "/workflows/wpid_abc123") {
+  const queryClient = new QueryClient();
   return render(
-    <CloudContext.Provider value={true}>
-      <PageSlotsProvider value={{}}>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          <Routes>
-            <Route
-              path="/workflows/:workflowPermanentId"
-              element={
-                <>
-                  <WorkflowPage />
-                  <LocationProbe />
-                </>
-              }
-            />
-          </Routes>
-        </MemoryRouter>
-      </PageSlotsProvider>
-    </CloudContext.Provider>,
+    <QueryClientProvider client={queryClient}>
+      <CloudContext.Provider value={true}>
+        <PageSlotsProvider value={{}}>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            <Routes>
+              <Route
+                path="/workflows/:workflowPermanentId"
+                element={
+                  <>
+                    <WorkflowPage />
+                    <LocationProbe />
+                  </>
+                }
+              />
+            </Routes>
+          </MemoryRouter>
+        </PageSlotsProvider>
+      </CloudContext.Provider>
+    </QueryClientProvider>,
   );
 }
 
 describe("WorkflowPage run tags", () => {
-  it("renders a run-tag chip on the agent runs list row", () => {
+  it("shows user labels and hides system tags on the agent runs list row", () => {
     const { container } = renderWorkflowPage();
 
     expect(
       within(container).getByTestId("tag-chip-list").textContent,
-    ).toContain("completed");
+    ).toContain("adhoc");
+    expect(
+      within(container).getByTestId("tag-chip-list").textContent,
+    ).not.toContain("completed");
+  });
+
+  it("shift-selects runs and exposes bulk tag actions", () => {
+    renderWorkflowPage();
+
+    const first = screen.getByRole("checkbox", { name: "Select wr_1" });
+    const second = screen.getByRole("checkbox", { name: "Select wr_2" });
+    fireEvent.click(first.parentElement!);
+    fireEvent.click(second.parentElement!, { shiftKey: true });
+
+    expect(
+      screen.getByRole("toolbar", { name: "Bulk actions" }).textContent,
+    ).toContain("2 selected");
+  });
+
+  it("hides selection when workflow tagging is disabled", () => {
+    flagState.taggingEnabled = false;
+    renderWorkflowPage();
+
+    expect(screen.queryByLabelText(/^Select /)).toBeNull();
+  });
+
+  it("shift-selects runs and exposes bulk tag actions", () => {
+    renderWorkflowPage();
+
+    const first = screen.getByRole("checkbox", { name: "Select wr_1" });
+    const second = screen.getByRole("checkbox", { name: "Select wr_2" });
+    fireEvent.click(first.parentElement!);
+    fireEvent.click(second.parentElement!, { shiftKey: true });
+
+    expect(
+      screen.getByRole("toolbar", { name: "Bulk actions" }).textContent,
+    ).toContain("2 selected");
+  });
+
+  it("hides selection when workflow tagging is disabled", () => {
+    flagState.taggingEnabled = false;
+    renderWorkflowPage();
+
+    expect(screen.queryByLabelText(/^Select /)).toBeNull();
   });
 });
 

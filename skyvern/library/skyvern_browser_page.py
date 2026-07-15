@@ -85,7 +85,7 @@ class SkyvernBrowserPage(SkyvernPage):
                 raise ValueError(f"Frame index {index} out of range (0-{len(frames) - 1}).")
             frame = frames[index]
 
-        self._working_frame = frame
+        self._working_frame = None if frame is self.page.main_frame else frame
         return {
             "name": frame.name if frame else None,
             "url": frame.url if frame else None,

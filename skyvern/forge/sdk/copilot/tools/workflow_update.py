@@ -9,7 +9,8 @@ import keyword
 import re
 import textwrap
 import tokenize
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -19,6 +20,7 @@ from urllib.parse import urlsplit
 
 import structlog
 import yaml
+from jinja2 import TemplateSyntaxError
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.forge import app
@@ -27,6 +29,7 @@ from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_sta
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
+    build_definition_contract_unsatisfied_blocker_signal,
     build_output_source_unobservable_blocker_signal,
     clear_terminal_evidence_on_workflow_edit,
     stash_blocker_signal,
@@ -35,9 +38,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
+    RecordedOutcomeGroundingRequirement,
     _stable_hash,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
+    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
@@ -54,6 +59,7 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _CODE_SUBMIT_ACTION_RE,
+    _CREDENTIAL_FIELDS,
     _INTERNAL_SCOUT_VARS,
     _SYNTHESIZED_BLOCK_LABEL,
     CREDENTIAL_FILL_TOOL_NAME,
@@ -78,6 +84,8 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_input_templated_locator,
     credential_scout_gap,
     freeze_requested_output_extraction_candidate,
+    grounded_parameter_key_is_safe,
+    grounded_submit_rung_binding_fingerprint,
     input_correspondences_for_interaction,
     locator_selector_literals,
     missing_rung_text,
@@ -93,6 +101,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     uncovered_required_emitted_interactions,
     uncovered_rung_records,
 )
+from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     composition_page_evidence_error,
@@ -150,9 +159,11 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
     JudgmentPredicate,
     RequestedOutputEvidenceSource,
+    RequestedOutputPathMintSource,
     _coerce_requested_output_evidence_source,
     _is_judgment_boolean_criterion,
 )
@@ -160,7 +171,9 @@ from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_produ
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     AuthorTimeGateAblationPayload,
+    ScoutedFieldParameterBinding,
     ScoutedInteraction,
+    ScoutedSubmitRungBinding,
     copilot_author_time_gate_log_only_enabled,
     record_author_time_gate_ablation_event,
 )
@@ -177,7 +190,12 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_turn, current_turn_owner
+from skyvern.forge.sdk.copilot.turn_ownership import (
+    TurnClaimant,
+    claim_and_stash_blocker_signal,
+    claim_turn,
+    current_turn_owner,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     credential_param_ids,
     parse_workflow_yaml,
@@ -190,6 +208,7 @@ from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS,
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.templating import get_missing_variables
 
 from ._shared import (
     BLOCK_RUNNING_TOOLS,
@@ -227,6 +246,13 @@ from .guardrails import (
 )
 
 LOG = structlog.get_logger()
+
+_CLASSIFIER_DEFAULT_MINT_SOURCE: RequestedOutputPathMintSource = "classifier_default"
+if REQUESTED_OUTPUT_PATH_MINT_SOURCES != {_CLASSIFIER_DEFAULT_MINT_SOURCE}:
+    raise RuntimeError(
+        "RequestedOutputPathMintSource gained a member; the requested-output author-exclusion "
+        "must be revisited before this equality can stay strict."
+    )
 
 
 class BlockObservationRef(BaseModel):
@@ -1657,6 +1683,8 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return set()
     paths: set[str] = set()
+    # Criteria at this seam are polymorphic (typed CompletionCriterion plus lighter duck-typed
+    # shapes), so read fields via getattr — a non-model criterion must still contribute its path.
     for criterion in _active_completion_criteria(ctx):
         if isinstance(criterion, CompletionCriterion) and _is_judgment_boolean_criterion(criterion):
             continue
@@ -1667,6 +1695,8 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
         if getattr(criterion, "kind", None) == "validation_classification":
             continue
         if getattr(criterion, "mint_degrade", None) is not None:
+            continue
+        if getattr(criterion, "requested_output_path_mint_source", None) == _CLASSIFIER_DEFAULT_MINT_SOURCE:
             continue
         path = _canonical_requested_output_path(getattr(criterion, "output_path", None))
         if path and _output_path_has_child(path):
@@ -1698,6 +1728,601 @@ def _active_completion_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     if request_policy is None:
         return []
     return request_policy.graded_completion_criteria()
+
+
+class _DefinitionPlaneReject(NamedTuple):
+    criterion_ids: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    unreferenced_parameter_keys: tuple[str, ...]
+
+
+def _expression_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
+    if isinstance(expression, ast.Name) and isinstance(expression.ctx, ast.Load):
+        return set(bindings.get(expression.id, set()))
+    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        local_bindings = {name: set(sources) for name, sources in bindings.items()}
+        comprehension_sources: set[str] = set()
+        for generator in expression.generators:
+            comprehension_sources.update(_expression_parameter_sources(generator.iter, local_bindings))
+            _bind_parameter_sources(generator.target, set(), local_bindings)
+            for condition in generator.ifs:
+                comprehension_sources.update(_expression_parameter_sources(condition, local_bindings))
+        if isinstance(expression, ast.DictComp):
+            comprehension_sources.update(_expression_parameter_sources(expression.key, local_bindings))
+            comprehension_sources.update(_expression_parameter_sources(expression.value, local_bindings))
+        else:
+            comprehension_sources.update(_expression_parameter_sources(expression.elt, local_bindings))
+        return comprehension_sources
+    if isinstance(expression, ast.Lambda):
+        local_bindings = {name: set(sources) for name, sources in bindings.items()}
+        for argument in (*expression.args.posonlyargs, *expression.args.args, *expression.args.kwonlyargs):
+            local_bindings[argument.arg] = set()
+        if expression.args.vararg is not None:
+            local_bindings[expression.args.vararg.arg] = set()
+        if expression.args.kwarg is not None:
+            local_bindings[expression.args.kwarg.arg] = set()
+        return _expression_parameter_sources(expression.body, local_bindings)
+    if isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return set()
+    sources: set[str] = set()
+    for child in ast.iter_child_nodes(expression):
+        sources.update(_expression_parameter_sources(child, bindings))
+    return sources
+
+
+def _awaited_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
+    if isinstance(expression, ast.Await):
+        return _expression_parameter_sources(expression.value, bindings)
+    if isinstance(expression, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return set()
+    sources: set[str] = set()
+    for child in ast.iter_child_nodes(expression):
+        sources.update(_awaited_parameter_sources(child, bindings))
+    return sources
+
+
+def _bind_parameter_sources(target: ast.expr, sources: set[str], bindings: dict[str, set[str]]) -> None:
+    if isinstance(target, ast.Name):
+        bindings[target.id] = set(sources)
+        return
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _bind_parameter_sources(element, sources, bindings)
+
+
+def _merge_parameter_bindings(left: Mapping[str, set[str]], right: Mapping[str, set[str]]) -> dict[str, set[str]]:
+    return {name: set(left.get(name, set())) | set(right.get(name, set())) for name in set(left) | set(right)}
+
+
+def _loop_body_has_reachable_break(statements: Sequence[ast.stmt]) -> bool:
+    for statement in statements:
+        if isinstance(statement, ast.Break):
+            return True
+        if isinstance(
+            statement, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            if not _statements_can_fall_through([statement]):
+                return False
+            continue
+        if isinstance(statement, ast.If):
+            if isinstance(statement.test, ast.Constant):
+                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
+                if _loop_body_has_reachable_break(selected_branch):
+                    return True
+            elif _loop_body_has_reachable_break(statement.body) or _loop_body_has_reachable_break(statement.orelse):
+                return True
+        elif isinstance(statement, (ast.Try, ast.TryStar)):
+            if statement.finalbody:
+                if _loop_body_has_reachable_break(statement.finalbody):
+                    return True
+                if not _statements_can_fall_through(statement.finalbody):
+                    return False
+            branches = [statement.body, statement.orelse]
+            branches.extend(handler.body for handler in statement.handlers)
+            if any(_loop_body_has_reachable_break(branch) for branch in branches):
+                return True
+        elif isinstance(statement, (ast.With, ast.AsyncWith)) and _loop_body_has_reachable_break(statement.body):
+            return True
+        elif isinstance(statement, ast.Match) and any(
+            _loop_body_has_reachable_break(case.body) for case in statement.cases
+        ):
+            return True
+        if not _statements_can_fall_through([statement]):
+            return False
+    return False
+
+
+def _statements_can_fall_through(statements: Sequence[ast.stmt]) -> bool:
+    for statement in statements:
+        if isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            return False
+        if isinstance(statement, ast.If):
+            if isinstance(statement.test, ast.Constant):
+                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
+                if not _statements_can_fall_through(selected_branch):
+                    return False
+                continue
+            if statement.orelse:
+                if not _statements_can_fall_through(statement.body) and not _statements_can_fall_through(
+                    statement.orelse
+                ):
+                    return False
+        if (
+            isinstance(statement, ast.While)
+            and isinstance(statement.test, ast.Constant)
+            and bool(statement.test.value)
+            and not _loop_body_has_reachable_break(statement.body)
+        ):
+            return False
+        if isinstance(statement, (ast.Try, ast.TryStar)):
+            if statement.finalbody and not _statements_can_fall_through(statement.finalbody):
+                return False
+            normal_falls_through = _statements_can_fall_through(statement.body) and _statements_can_fall_through(
+                statement.orelse
+            )
+            handler_falls_through = any(_statements_can_fall_through(handler.body) for handler in statement.handlers)
+            if not normal_falls_through and not handler_falls_through:
+                return False
+    return True
+
+
+def _statement_parameter_dataflow(
+    statements: Sequence[ast.stmt], bindings: dict[str, set[str]]
+) -> tuple[set[str], dict[str, set[str]]]:
+    consumed: set[str] = set()
+    current = {name: set(sources) for name, sources in bindings.items()}
+    for statement in statements:
+        if isinstance(statement, ast.Assign):
+            consumed.update(_awaited_parameter_sources(statement.value, current))
+            sources = _expression_parameter_sources(statement.value, current)
+            for target in statement.targets:
+                _bind_parameter_sources(target, sources, current)
+            continue
+        if isinstance(statement, ast.AnnAssign):
+            value = statement.value
+            sources = _expression_parameter_sources(value, current) if value is not None else set()
+            if value is not None:
+                consumed.update(_awaited_parameter_sources(value, current))
+            _bind_parameter_sources(statement.target, sources, current)
+            continue
+        if isinstance(statement, ast.AugAssign):
+            sources = _expression_parameter_sources(statement.target, current)
+            sources.update(_expression_parameter_sources(statement.value, current))
+            consumed.update(_awaited_parameter_sources(statement.value, current))
+            _bind_parameter_sources(statement.target, sources, current)
+            continue
+        if isinstance(statement, ast.Expr):
+            consumed.update(_awaited_parameter_sources(statement.value, current))
+            continue
+        if isinstance(statement, ast.Return):
+            if statement.value is not None:
+                consumed.update(_expression_parameter_sources(statement.value, current))
+            break
+        if isinstance(statement, ast.Raise):
+            if statement.exc is not None:
+                consumed.update(_expression_parameter_sources(statement.exc, current))
+            break
+        if isinstance(statement, ast.If):
+            consumed.update(_expression_parameter_sources(statement.test, current))
+            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
+                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.orelse, current)
+                consumed.update(branch_consumed)
+                current = branch_bindings
+                continue
+            if isinstance(statement.test, ast.Constant) and statement.test.value is True:
+                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.body, current)
+                consumed.update(branch_consumed)
+                current = branch_bindings
+                continue
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
+            consumed.update(body_consumed)
+            consumed.update(else_consumed)
+            body_falls_through = _statements_can_fall_through(statement.body)
+            else_falls_through = _statements_can_fall_through(statement.orelse)
+            if body_falls_through and else_falls_through:
+                current = _merge_parameter_bindings(body_bindings, else_bindings)
+            elif body_falls_through:
+                current = body_bindings
+            elif else_falls_through:
+                current = else_bindings
+            else:
+                break
+            continue
+        if isinstance(statement, (ast.For, ast.AsyncFor)):
+            consumed.update(_expression_parameter_sources(statement.iter, current))
+            loop_bindings = {name: set(sources) for name, sources in current.items()}
+            _bind_parameter_sources(statement.target, set(), loop_bindings)
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, loop_bindings)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
+            consumed.update(body_consumed)
+            consumed.update(else_consumed)
+            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
+            continue
+        if isinstance(statement, ast.While):
+            consumed.update(_expression_parameter_sources(statement.test, current))
+            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
+                else_consumed, current = _statement_parameter_dataflow(statement.orelse, current)
+                consumed.update(else_consumed)
+                continue
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
+            consumed.update(body_consumed)
+            consumed.update(else_consumed)
+            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
+            continue
+        if isinstance(statement, (ast.Try, ast.TryStar)):
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
+            consumed.update(body_consumed)
+            merged = body_bindings
+            for handler in statement.handlers:
+                handler_bindings = {name: set(sources) for name, sources in current.items()}
+                if handler.name:
+                    handler_bindings[handler.name] = set()
+                handler_consumed, handler_bindings = _statement_parameter_dataflow(handler.body, handler_bindings)
+                consumed.update(handler_consumed)
+                merged = _merge_parameter_bindings(merged, handler_bindings)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, body_bindings)
+            consumed.update(else_consumed)
+            merged = _merge_parameter_bindings(merged, else_bindings)
+            final_consumed, current = _statement_parameter_dataflow(statement.finalbody, merged)
+            consumed.update(final_consumed)
+            continue
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            with_bindings = {name: set(sources) for name, sources in current.items()}
+            for item in statement.items:
+                consumed.update(_expression_parameter_sources(item.context_expr, current))
+                if item.optional_vars is not None:
+                    _bind_parameter_sources(item.optional_vars, set(), with_bindings)
+            body_consumed, current = _statement_parameter_dataflow(statement.body, with_bindings)
+            consumed.update(body_consumed)
+            continue
+        if isinstance(statement, ast.Match):
+            consumed.update(_expression_parameter_sources(statement.subject, current))
+            merged = {name: set(sources) for name, sources in current.items()}
+            for case in statement.cases:
+                if case.guard is not None:
+                    consumed.update(_expression_parameter_sources(case.guard, current))
+                case_consumed, case_bindings = _statement_parameter_dataflow(case.body, current)
+                consumed.update(case_consumed)
+                merged = _merge_parameter_bindings(merged, case_bindings)
+            current = merged
+            continue
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function_bindings = {name: set(sources) for name, sources in current.items()}
+            for argument in (
+                *statement.args.posonlyargs,
+                *statement.args.args,
+                *statement.args.kwonlyargs,
+            ):
+                function_bindings[argument.arg] = set()
+            if statement.args.vararg is not None:
+                function_bindings[statement.args.vararg.arg] = set()
+            if statement.args.kwarg is not None:
+                function_bindings[statement.args.kwarg.arg] = set()
+            function_consumed, _ = _statement_parameter_dataflow(statement.body, function_bindings)
+            current[statement.name] = function_consumed
+            continue
+        if isinstance(statement, ast.ClassDef):
+            current[statement.name] = set()
+            continue
+        consumed.update(_expression_parameter_sources(statement, current))
+    return consumed, current
+
+
+def _code_runtime_parameter_sources(code: str, parameter_keys: set[str]) -> set[str] | None:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    initial_bindings = {key: {key} for key in parameter_keys}
+    consumed, _ = _statement_parameter_dataflow(tree.body, initial_bindings)
+    return consumed
+
+
+def _value_template_parameter_sources(value: Any, parameter_keys: set[str], depth: int = 0) -> set[str]:
+    if depth > 12:
+        return set()
+    if isinstance(value, str):
+        try:
+            return get_missing_variables(value, {}) & parameter_keys
+        except TemplateSyntaxError:
+            return set()
+    if isinstance(value, Mapping):
+        sources: set[str] = set()
+        raw_keys = value.get("parameter_keys")
+        if isinstance(raw_keys, list):
+            sources.update(key for key in raw_keys if key in parameter_keys)
+        for child in value.values():
+            sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
+        return sources
+    if isinstance(value, list):
+        list_sources: set[str] = set()
+        for child in value:
+            list_sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
+        return list_sources
+    return set()
+
+
+def _non_code_runtime_parameter_sources(parsed: Mapping[str, Any], parameter_keys: set[str]) -> set[str]:
+    definition = parsed.get("workflow_definition")
+    blocks = definition.get("blocks") if isinstance(definition, Mapping) else None
+    sources: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, Mapping):
+            return
+        is_block = "block_type" in value
+        if is_block and _enum_or_string_name(value.get("block_type")) != BlockType.CODE.value:
+            own_fields = {
+                key: child
+                for key, child in value.items()
+                if key not in {*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS}
+            }
+            sources.update(_value_template_parameter_sources(own_fields, parameter_keys))
+        for key in (*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS):
+            visit(value.get(key))
+
+    visit(blocks)
+    return sources
+
+
+def _workflow_runtime_parameter_sources(parsed: dict[str, Any]) -> set[str] | None:
+    parameter_keys = _declared_string_workflow_parameter_keys(parsed)
+    sources: set[str] = set()
+    for block in _workflow_code_blocks(parsed):
+        raw_parameter_keys = block.get("parameter_keys")
+        block_parameter_keys = (
+            {key for key in raw_parameter_keys if isinstance(key, str) and key}
+            if isinstance(raw_parameter_keys, list)
+            else set()
+        )
+        block_sources = _code_runtime_parameter_sources(str(block.get("code") or ""), block_parameter_keys)
+        if block_sources is None:
+            return None
+        sources.update(block_sources)
+    sources.update(_non_code_runtime_parameter_sources(parsed, parameter_keys))
+    return sources
+
+
+def _definition_plane_preflight_reject(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    *,
+    enforce_untagged_declared_inputs: bool = False,
+) -> _DefinitionPlaneReject | None:
+    definition_criteria = [
+        criterion for criterion in _active_completion_criteria(ctx) if criterion.level == "definition"
+    ]
+    code_only_browser = _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    if not definition_criteria and not (code_only_browser and enforce_untagged_declared_inputs):
+        return None
+    unreferenced_parameter_keys: tuple[str, ...] = ()
+    runtime_sources: set[str] | None = None
+    if code_only_browser:
+        parsed = parse_workflow_yaml(workflow_yaml)
+        if isinstance(parsed, dict):
+            runtime_sources = _workflow_runtime_parameter_sources(parsed)
+            if runtime_sources is None:
+                return None
+            parameter_keys = _declared_string_workflow_parameter_keys(parsed)
+            unreferenced_parameter_keys = tuple(sorted(parameter_keys - runtime_sources))
+    unsatisfied = [
+        verdict
+        for verdict in grade_definition_criteria(definition_criteria, workflow_yaml)
+        if verdict.state == "unsatisfied"
+    ]
+    if runtime_sources is not None and not unreferenced_parameter_keys:
+        unsatisfied = [
+            verdict for verdict in unsatisfied if verdict.reason_code != "definition_parameters_unreferenced"
+        ]
+    if not unsatisfied and not unreferenced_parameter_keys:
+        return None
+    return _DefinitionPlaneReject(
+        criterion_ids=tuple(verdict.criterion_id for verdict in unsatisfied)
+        or tuple(criterion.id for criterion in definition_criteria),
+        reason_codes=tuple(verdict.reason_code for verdict in unsatisfied)
+        or (("definition_parameters_unreferenced",) if unreferenced_parameter_keys else ()),
+        unreferenced_parameter_keys=unreferenced_parameter_keys,
+    )
+
+
+def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
+    if rejection.unreferenced_parameter_keys:
+        keys = ", ".join(f"`{key}`" for key in rejection.unreferenced_parameter_keys)
+        return f"The submitted workflow declares reusable parameters that no block references: {keys}."
+    return "The submitted workflow does not satisfy its active definition-level requirements."
+
+
+def _record_definition_plane_reject(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    rejection: _DefinitionPlaneReject,
+    *,
+    code_artifact_metadata: object = None,
+) -> None:
+    authored_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
+    block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+    _record_author_time_reject_outcome(
+        ctx,
+        reason_code="definition_contract_unsatisfied",
+        summary=_definition_plane_reject_error(rejection),
+        structural_payload={
+            "reason_code": "definition_contract_unsatisfied",
+            "criterion_ids": rejection.criterion_ids,
+            "definition_reason_codes": rejection.reason_codes,
+            "unreferenced_parameter_keys": rejection.unreferenced_parameter_keys,
+            "authored_structure_signature": authored_signature,
+        },
+        authored_structure_signature=authored_signature,
+        block_labels=block_labels,
+    )
+
+
+def _stash_unresolved_recorded_outcome_grounding_halt(
+    ctx: AgentContext,
+    unresolved_parameter_keys: Iterable[str],
+) -> bool:
+    requirement = ctx.recorded_outcome_grounding_requirement
+    constraint = ctx.recorded_outcome_binding_constraint
+    latest = ctx.latest_recorded_build_test_outcome
+    if (
+        not isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        or requirement.phase != "author_time_reject"
+        or not requirement.satisfied
+        or not isinstance(constraint, RecordedOutcomeBindingConstraint)
+        or constraint.repeated_structural_key != requirement.structural_key
+        or not isinstance(latest, RecordedBuildTestOutcome)
+        or latest.structural_key != requirement.structural_key
+        or latest_recorded_build_test_outcome_repeated(ctx) is not True
+    ):
+        return False
+    keys = sorted(set(unresolved_parameter_keys))
+    if not keys:
+        return False
+    signal = build_definition_contract_unsatisfied_blocker_signal(
+        unresolved_parameter_keys=keys,
+        grounding_unresolved=True,
+    )
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, signal, force_stash=True)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="recorded_outcome_regrounding")
+    LOG.info(
+        "copilot recorded outcome regrounding halted before reauthor",
+        structural_key=requirement.structural_key,
+        unresolved_parameter_keys=keys,
+    )
+    return True
+
+
+def _trajectory_with_grounded_submit_rung_binding(
+    ctx: AgentContext,
+    parsed: Mapping[str, Any],
+    runtime_parameters: Mapping[str, Any] | None,
+) -> tuple[ScoutedInteraction, ...] | None:
+    requirement = ctx.recorded_outcome_grounding_requirement
+    constraint = ctx.recorded_outcome_binding_constraint
+    if (
+        not isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        or not requirement.satisfied
+        or requirement.payload is None
+        or requirement.payload.source_tool != "inspect_page_for_composition"
+        or requirement.payload.target_url != "current_page"
+        or not isinstance(constraint, RecordedOutcomeBindingConstraint)
+        or constraint.repeated_structural_key != requirement.structural_key
+    ):
+        return None
+    declared_keys = _declared_string_workflow_parameter_keys(parsed)
+    if not declared_keys or any(not grounded_parameter_key_is_safe(key) for key in declared_keys):
+        return None
+    supplied = runtime_parameters if isinstance(runtime_parameters, Mapping) else {}
+    definition = parsed.get("workflow_definition")
+    rows = definition.get("parameters") if isinstance(definition, Mapping) else None
+    defaults = (
+        {str(row.get("key") or "").strip(): row.get("default_value") for row in rows if isinstance(row, Mapping)}
+        if isinstance(rows, list)
+        else {}
+    )
+    values: dict[str, str] = {}
+    for key in sorted(declared_keys):
+        value = supplied.get(key, defaults.get(key))
+        if not isinstance(value, str) or not value:
+            return None
+        values[key] = value
+
+    evidence = ctx.composition_page_evidence
+    forms = evidence.get("forms") if isinstance(evidence, Mapping) else None
+    current_url = str(evidence.get("current_url") or "").strip() if isinstance(evidence, Mapping) else ""
+    if not isinstance(forms, list) or not current_url or requirement.payload.source_url != current_url:
+        return None
+    captured_clicks: list[tuple[int, int, str, str]] = []
+    for fallback_index, interaction in enumerate(ctx.scout_trajectory):
+        if not isinstance(interaction, Mapping) or interaction.get("tool_name") != "click":
+            continue
+        raw_index = interaction.get("trajectory_index")
+        trajectory_index = raw_index if isinstance(raw_index, int) and raw_index >= 0 else fallback_index
+        captured_clicks.append(
+            (
+                fallback_index,
+                trajectory_index,
+                str(interaction.get("selector") or "").strip(),
+                str(interaction.get("source_url") or "").strip(),
+            )
+        )
+
+    candidates: list[tuple[int, int, ScoutedSubmitRungBinding]] = []
+    for form in forms:
+        if not isinstance(form, Mapping):
+            continue
+        fields = [field for field in form.get("fields") or [] if isinstance(field, Mapping)]
+        controls = [control for control in form.get("submit_controls") or [] if isinstance(control, Mapping)]
+        submit_matches: set[tuple[int, int, str]] = set()
+        for control in controls:
+            submit_selector = str(control.get("selector") or "").strip()
+            if control.get("disabled") is True or not submit_selector:
+                continue
+            matching_clicks = [
+                click for click in captured_clicks if click[2] == submit_selector and click[3] == current_url
+            ]
+            if len(matching_clicks) == 1:
+                submit_matches.add((matching_clicks[0][0], matching_clicks[0][1], submit_selector))
+        if len(submit_matches) != 1:
+            continue
+        submit_position, submit_trajectory_index, submit_selector = next(iter(submit_matches))
+        bindings: list[ScoutedFieldParameterBinding] = []
+        used_selectors: set[str] = set()
+        for key, value in values.items():
+            matching_fields = [
+                field
+                for field in fields
+                if field.get("disabled") is not True
+                and str(field.get("selector") or "").strip()
+                and field.get("value") == value
+            ]
+            if len(matching_fields) != 1:
+                bindings = []
+                break
+            selector = str(matching_fields[0].get("selector") or "").strip()
+            if selector in used_selectors:
+                bindings = []
+                break
+            used_selectors.add(selector)
+            bindings.append({"parameter_key": key, "field_selector": selector})
+        if len(bindings) == len(values):
+            fingerprint = grounded_submit_rung_binding_fingerprint(
+                repeated_structural_key=constraint.repeated_structural_key,
+                source_url=current_url,
+                submit_selector=submit_selector,
+                submit_trajectory_index=submit_trajectory_index,
+                field_bindings=bindings,
+            )
+            candidates.append(
+                (
+                    submit_position,
+                    submit_trajectory_index,
+                    {
+                        "repeated_structural_key": constraint.repeated_structural_key,
+                        "fingerprint": fingerprint,
+                        "field_bindings": bindings,
+                    },
+                )
+            )
+    if len(candidates) != 1:
+        return None
+    submit_position, submit_trajectory_index, submit_rung_binding = candidates[0]
+    derived = [cast(ScoutedInteraction, dict(interaction)) for interaction in ctx.scout_trajectory]
+    derived[submit_position]["submit_rung_binding"] = submit_rung_binding
+    LOG.info(
+        "copilot recorded outcome submit rung bound",
+        binding_fingerprint=submit_rung_binding["fingerprint"],
+        parameter_keys=[binding["parameter_key"] for binding in submit_rung_binding["field_bindings"]],
+        binding_count=len(submit_rung_binding["field_bindings"]),
+        submit_trajectory_index=submit_trajectory_index,
+    )
+    return tuple(derived)
 
 
 def _judgment_output_paths(ctx: AgentContext) -> set[str]:
@@ -3031,6 +3656,54 @@ def _apply_metadata_contract_scaffold(
     return items
 
 
+def _scaffold_metadata_from_owned_carrier_produced_output(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> tuple[object, bool]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return raw_code_artifact_metadata, False
+    if not ctx.spine_imposition_owned_attempt:
+        return raw_code_artifact_metadata, False
+    carrier_label = str(ctx.spine_imposition_carrier_label or "").strip()
+    if not carrier_label:
+        return raw_code_artifact_metadata, False
+    if carrier_label not in _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_code_artifact_metadata):
+        return raw_code_artifact_metadata, False
+    carrier_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(carrier_label)
+    if carrier_block is None:
+        return raw_code_artifact_metadata, False
+    produced_paths = {
+        path
+        for path in _code_block_produced_output_paths(str(carrier_block.get("code") or ""))
+        if _output_path_has_child(path)
+    } - _judgment_output_paths(ctx)
+    if not produced_paths:
+        return raw_code_artifact_metadata, False
+    schema_text = _schema_template_text_for_required_paths(produced_paths)
+    items = [
+        copy.deepcopy(item)
+        for item in _code_artifact_metadata_items(raw_code_artifact_metadata)
+        if _raw_metadata_item_mapping(item) is not None
+    ]
+    target_index: int | None = None
+    for index, raw_item in enumerate(items):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is not None and str(item.get("block_label") or "").strip() == carrier_label:
+            target_index = index
+            break
+    if target_index is None:
+        target: dict[str, Any] = {"block_label": carrier_label}
+        items.append(target)
+    else:
+        target = dict(items[target_index])
+        items[target_index] = target
+    target["block_label"] = carrier_label
+    target["artifact_id"] = _artifact_id_for_block_label(carrier_label)
+    _ensure_metadata_contract_rows(target, goal_value_paths=produced_paths, schema_text=schema_text)
+    return items, True
+
+
 def _scaffold_metadata_contract_for_update(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -3038,7 +3711,7 @@ def _scaffold_metadata_contract_for_update(
 ) -> tuple[object, bool]:
     contract = _output_contract_required_paths_source(ctx)
     if not contract.union:
-        return raw_code_artifact_metadata, False
+        return _scaffold_metadata_from_owned_carrier_produced_output(ctx, workflow_yaml, raw_code_artifact_metadata)
     signature = _output_contract_signature(
         ctx=ctx,
         workflow_yaml=workflow_yaml,
@@ -4305,13 +4978,54 @@ def _metadata_contract_run_preflight_reject(
     ctx: AgentContext,
     workflow_yaml: str,
     raw_code_artifact_metadata: object,
+    runtime_parameters: Mapping[str, Any] | None = None,
+    *,
+    enforce_untagged_declared_inputs: bool = False,
 ) -> dict[str, Any] | None:
+    definition_reject = (
+        _definition_plane_preflight_reject(
+            ctx,
+            workflow_yaml,
+            enforce_untagged_declared_inputs=enforce_untagged_declared_inputs,
+        )
+        if isinstance(ctx, AgentContext)
+        else None
+    )
+    parsed = parse_workflow_yaml(workflow_yaml)
+    grounded_binding_available = (
+        isinstance(ctx, AgentContext)
+        and isinstance(parsed, Mapping)
+        and _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters) is not None
+    )
+    if definition_reject is not None and (enforce_untagged_declared_inputs or not grounded_binding_available):
+        halted = _stash_unresolved_recorded_outcome_grounding_halt(
+            ctx,
+            definition_reject.unreferenced_parameter_keys,
+        )
+        if not halted:
+            _record_definition_plane_reject(
+                ctx,
+                workflow_yaml,
+                definition_reject,
+                code_artifact_metadata=raw_code_artifact_metadata,
+            )
+        return {
+            "ok": False,
+            "error": _definition_plane_reject_error(definition_reject),
+            "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": {
+                "reason_code": "definition_contract_unsatisfied",
+                "definition_criterion_ids": list(definition_reject.criterion_ids),
+                "definition_reason_codes": list(definition_reject.reason_codes),
+                "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+            },
+        }
     convergence_reject = _recorded_outcome_convergence_reject(
         ctx,
         workflow_yaml=workflow_yaml,
         code_artifact_metadata=raw_code_artifact_metadata,
     )
-    if convergence_reject is not None:
+    if convergence_reject is not None and not grounded_binding_available:
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
         _record_author_time_reject_outcome(
             ctx,
@@ -5450,6 +6164,7 @@ class _SynthesizedCodeImpositionResult:
     scrubbed_selected_metadata_label: str | None = None
     selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
     minted_parameter_keys: list[str] = dataclass_field(default_factory=list)
+    metadata_repair_contract: dict[str, object] | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -6129,6 +6844,32 @@ def _direct_locator_receiver_signature(node: ast.AST) -> str | None:
     return None
 
 
+# page.get_by_label(...) is a durable locator factory strict synthesis never emits, so it is scanned
+# as a durable mutation receiver only to route it through the admissibility contract, never to admit it.
+_DURABLE_NON_SYNTHESIZED_FACTORY_METHODS = frozenset({"get_by_label"})
+
+
+def _durable_non_synthesized_receiver_signature(node: ast.AST) -> str | None:
+    receiver = _locator_receiver_for_signature(node)
+    if (
+        isinstance(receiver, ast.Call)
+        and isinstance(receiver.func, ast.Attribute)
+        and receiver.func.attr in _DURABLE_NON_SYNTHESIZED_FACTORY_METHODS
+        and isinstance(receiver.func.value, ast.Name)
+        and receiver.func.value.id == "page"
+    ):
+        return _call_name(receiver)
+    return None
+
+
+def _receiver_is_durable_non_synthesized_factory(receiver: str) -> bool:
+    try:
+        node = ast.parse(receiver, mode="eval").body
+    except SyntaxError:
+        return False
+    return _durable_non_synthesized_receiver_signature(node) is not None
+
+
 def _direct_page_method_signature(node: ast.AST) -> str | None:
     if not isinstance(node, ast.Name) or node.id != "page":
         return None
@@ -6149,7 +6890,9 @@ def _browser_mutation_signature_for_call(node: ast.Call) -> _BrowserMutationSign
     if not isinstance(func, ast.Attribute):
         return None
     if func.attr in _LOCATOR_MUTATION_METHODS:
-        receiver = _direct_locator_receiver_signature(func.value)
+        receiver = _direct_locator_receiver_signature(func.value) or _durable_non_synthesized_receiver_signature(
+            func.value
+        )
         if receiver is not None:
             return _BrowserMutationSignature(func.attr, receiver, ast.dump(node, include_attributes=False))
         return None
@@ -6275,6 +7018,8 @@ def _browser_expression_kind(node: ast.AST, bindings: _BrowserBindings) -> _Brow
     if isinstance(node, ast.Name) and node.id in bindings.locator_aliases and node.id in _INTERNAL_SCOUT_VARS:
         return _BrowserExpressionKind.LOCATOR
     if _direct_locator_receiver_signature(node) is not None:
+        return _BrowserExpressionKind.LOCATOR
+    if _durable_non_synthesized_receiver_signature(node) is not None:
         return _BrowserExpressionKind.LOCATOR
     if isinstance(node, ast.Attribute) and node.attr in {"first", "last"}:
         if _browser_expression_kind(node.value, bindings) == _BrowserExpressionKind.LOCATOR:
@@ -6591,11 +7336,18 @@ def _whole_trajectory_browser_surface_violations(
     synthesized_code: str,
     prior_yaml: str | None = None,
     synthesized_diagnostics: SynthesisDiagnostics | None = None,
+    admit_on_receiver: bool = False,
+    restrict_to_durable_factory: bool = False,
 ) -> _BrowserSurfaceValidation:
     violations: list[str] = []
     provenance: list[_BrowserSurfaceRejectionProvenance] = []
     scouted_mutations, _, _ = _browser_surface_for_code(synthesized_code)
     scouted_signatures = set(scouted_mutations)
+    # Freehand admission is selector-resolvability, so a block that replays a scouted locator with a
+    # different literal argument stays admissible; imposition siblings keep the stricter full-call match.
+    admitted_receivers = {
+        (mutation.method, normalized_locator_expr(mutation.receiver)) for mutation in scouted_mutations
+    }
     for block in code_blocks:
         if block is selected_code_block:
             continue
@@ -6604,7 +7356,21 @@ def _whole_trajectory_browser_surface_violations(
         label = _code_block_label(block)
         block_code = str(block.get("code") or "")
         block_mutations, _, block_ambiguous = _browser_surface_for_code(block_code)
-        unscouted_mutations = [mutation for mutation in block_mutations if mutation not in scouted_signatures]
+        if admit_on_receiver:
+            unscouted_mutations = [
+                mutation
+                for mutation in block_mutations
+                if mutation.receiver != "page"
+                and (mutation.method, normalized_locator_expr(mutation.receiver)) not in admitted_receivers
+            ]
+        else:
+            unscouted_mutations = [mutation for mutation in block_mutations if mutation not in scouted_signatures]
+        if restrict_to_durable_factory:
+            unscouted_mutations = [
+                mutation
+                for mutation in unscouted_mutations
+                if _receiver_is_durable_non_synthesized_factory(mutation.receiver)
+            ]
         if unscouted_mutations:
             action_text = ", ".join(
                 f"{mutation.receiver}.{mutation.method}" for mutation in sorted(unscouted_mutations)
@@ -6624,7 +7390,7 @@ def _whole_trajectory_browser_surface_violations(
                 f"Unable to impose synthesized code block: `{label}` contains unscouted browser action(s): "
                 f"{action_text}.{_provenance_suffix_text(block_provenance)}"
             )
-        if block_ambiguous:
+        if block_ambiguous and not restrict_to_durable_factory:
             ambiguous_provenance = [
                 _ambiguous_browser_action_provenance(action, site="whole_trajectory", block_label=label)
                 for action in block_ambiguous
@@ -6868,6 +7634,197 @@ def _persist_seam_spine_under_build_result(
         block_label=", ".join(_code_block_label(block) for block in code_blocks) or _SYNTHESIZED_BLOCK_LABEL,
         site="persist_seam",
     )
+
+
+_FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE = "freehand_unresolvable_selector"
+_FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE = "freehand_unguarded_credential_fill"
+
+
+def _workflow_credential_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
+    workflow_definition = parsed.get("workflow_definition")
+    parameters = workflow_definition.get("parameters") if isinstance(workflow_definition, dict) else None
+    if not isinstance(parameters, list):
+        return set()
+    keys: set[str] = set()
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping) or not _is_credential_parameter(parameter):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _credential_field_fill_argument(arg: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if (
+        isinstance(arg, ast.Attribute)
+        and arg.attr in _CREDENTIAL_FIELDS
+        and isinstance(arg.value, ast.Name)
+        and arg.value.id in credential_parameter_keys
+    ):
+        return True
+    target = arg.value if isinstance(arg, ast.Await) else arg
+    return (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Attribute)
+        and target.func.attr == "otp"
+        and isinstance(target.func.value, ast.Name)
+        and target.func.value.id in credential_parameter_keys
+    )
+
+
+def _is_credential_field_fill_call(node: ast.AST, credential_parameter_keys: AbstractSet[str]) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fill"
+        and bool(node.args)
+        and _credential_field_fill_argument(node.args[0], credential_parameter_keys)
+    )
+
+
+def _is_presence_guard_test(test: ast.AST) -> bool:
+    for node in ast.walk(test):
+        if isinstance(node, ast.Attribute) and node.attr in {"count", "is_visible"}:
+            return True
+        if isinstance(node, ast.Name) and node.id in _INTERNAL_SCOUT_VARS:
+            return True
+    return False
+
+
+def _credential_fill_is_presence_guarded(node: ast.AST, parents: Mapping[int, ast.AST]) -> bool:
+    current: ast.AST = node
+    while id(current) in parents:
+        parent = parents[id(current)]
+        if (
+            isinstance(parent, ast.If)
+            and any(current is stmt for stmt in parent.body)
+            and _is_presence_guard_test(parent.test)
+        ):
+            return True
+        current = parent
+    return False
+
+
+def _block_has_unguarded_credential_fill(code: str, credential_parameter_keys: AbstractSet[str]) -> bool:
+    if not credential_parameter_keys:
+        return False
+    tree = _wrapped_code_ast(code)
+    if tree is None:
+        return False
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return any(
+        _is_credential_field_fill_call(node, credential_parameter_keys)
+        and not _credential_fill_is_presence_guarded(node, parents)
+        for node in ast.walk(tree)
+    )
+
+
+def _freehand_surface_reject(
+    workflow_yaml: str, code_blocks: list[dict[str, Any]], validation: _BrowserSurfaceValidation
+) -> _SynthesizedCodeImpositionResult:
+    first = validation.provenance[0] if validation.provenance else None
+    repair_context = CodeAuthoringRepairContext(
+        block_label=first.block_label if first is not None else _code_block_label(code_blocks[0]),
+        reason_code=_FREEHAND_UNRESOLVABLE_SELECTOR_REASON_CODE,
+        selector=first.nearest_selector if first is not None else None,
+    )
+    return _SynthesizedCodeImpositionResult(
+        workflow_yaml=workflow_yaml,
+        violations=validation.violations,
+        repair_context=repair_context,
+    )
+
+
+def _persist_seam_freehand_surface_result(
+    workflow_yaml: str, ctx: AgentContext
+) -> _SynthesizedCodeImpositionResult | None:
+    # Imposition validates only the spine it rewrites; this leg closes the persist lanes where a changed
+    # freehand browser block never reached that surface gate, applying the same admissibility to siblings.
+    if not ctx.impose_synthesized_code_block:
+        return None
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    scout_trajectory = ctx.scout_trajectory
+    if not scout_trajectory:
+        return None
+    if not str(scout_trajectory[0].get("source_url") or "").strip():
+        return None
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return None
+    code_blocks = _workflow_code_blocks(parsed)
+    if not code_blocks:
+        return None
+    _, prior_yaml = _prior_yaml_source(ctx)
+    carrier_label = ctx.spine_imposition_carrier_label
+    exempt_block = (
+        next((block for block in code_blocks if _code_block_label(block) == carrier_label), None)
+        if carrier_label
+        else None
+    )
+    credential_parameter_keys = _workflow_credential_parameter_keys(parsed)
+    for block in code_blocks:
+        if block is exempt_block:
+            continue
+        if prior_yaml is not None and not _submitted_code_block_changed(block, prior_yaml):
+            continue
+        if not _block_has_unguarded_credential_fill(str(block.get("code") or ""), credential_parameter_keys):
+            continue
+        label = _code_block_label(block)
+        LOG.info("copilot_freehand_unguarded_credential_fill", block_label=label)
+        violation = (
+            f"Unable to persist code block: `{label}` fills a credential field without a presence guard, so it "
+            "re-fills and times out when the workflow replays on an already-authenticated page. Reuse the "
+            "synthesized entry rung, which fills only when the login form is still present."
+        )
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=[violation],
+            repair_context=CodeAuthoringRepairContext(
+                block_label=label, reason_code=_FREEHAND_UNGUARDED_CREDENTIAL_REASON_CODE
+            ),
+        )
+    synthesized = synthesize_code_block(
+        scout_trajectory, strict_selectors=True, reached_download_target=ctx.reached_download_target
+    )
+    synthesized_code = "" if synthesized is None else (synthesized.interaction_code or synthesized.code)
+    synthesized_diagnostics = None if synthesized is None else synthesized.diagnostics
+    sentinel_selected: dict[str, Any] = {}
+    selected_code_block = exempt_block if exempt_block is not None else sentinel_selected
+    # get_by_label is never a synthesized selector, so an unresolvable one is rejected regardless of whether
+    # the scout reached its goal; a fragment scout still fails this class closed to the scout-the-step route.
+    factory_validation = _whole_trajectory_browser_surface_violations(
+        code_blocks=code_blocks,
+        selected_code_block=selected_code_block,
+        submitted_selected_code="",
+        synthesized_code=synthesized_code,
+        prior_yaml=prior_yaml,
+        synthesized_diagnostics=synthesized_diagnostics,
+        admit_on_receiver=True,
+        restrict_to_durable_factory=True,
+    )
+    if factory_validation.violations:
+        return _freehand_surface_reject(workflow_yaml, code_blocks, factory_validation)
+    # The full synthesized spine is an authoritative admissibility reference only when the scout captured a
+    # durable entry through a commit; a fragment scout would false-reject legitimate multi-block authoring.
+    if synthesized is None or not synthesized_trajectory_reaches_goal(ctx):
+        return None
+    validation = _whole_trajectory_browser_surface_violations(
+        code_blocks=code_blocks,
+        selected_code_block=selected_code_block,
+        submitted_selected_code="",
+        synthesized_code=synthesized_code,
+        prior_yaml=prior_yaml,
+        synthesized_diagnostics=synthesized_diagnostics,
+        admit_on_receiver=True,
+    )
+    if not validation.violations:
+        return None
+    return _freehand_surface_reject(workflow_yaml, code_blocks, validation)
 
 
 def _workflow_yaml_browser_call_pairs(workflow_yaml: str) -> list[tuple[str, str]]:
@@ -7422,7 +8379,8 @@ def _stub_with_raw_prompt_violation(ctx: AgentContext, parsed: Mapping[str, Any]
 
 
 def _code_references_parameter(code: str, key: str) -> bool:
-    return re.search(rf"\b{re.escape(key)}\b", code) is not None
+    sources = _code_runtime_parameter_sources(code, {key})
+    return sources is not None and key in sources
 
 
 def _orphan_minted_parameter_violation(parsed: Mapping[str, Any], minted_keys: list[str]) -> str | None:
@@ -7937,13 +8895,6 @@ def _reconcile_synthesized_parameters(
             parameters.append(_string_parameter_row(synthesized_default, key))
             continue
 
-        if len(non_credential_synthesized) != 1:
-            add_binding_violation(
-                key,
-                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
-            )
-            continue
-
         typed_length = typed_length or scout_typed_length or (typed_lengths[0] if len(typed_lengths) == 1 else None)
         direct_fill_usage = _submitted_direct_fill_type_usage(submitted_code, key)
         if direct_fill_usage.matched and direct_fill_usage.mismatched:
@@ -7954,6 +8905,17 @@ def _reconcile_synthesized_parameters(
                 "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values.",
             )
             continue
+
+        if len(non_credential_synthesized) != 1:
+            if matched_scout is not None or direct_fill_usage.matched:
+                parameters.append(_required_string_parameter_row(key))
+                continue
+            add_binding_violation(
+                key,
+                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
+            )
+            continue
+
         if direct_fill_usage.matched:
             parameters.append(_required_string_parameter_row(key))
             continue
@@ -8072,10 +9034,34 @@ def _split_selected_output_owner_into_browser_stages(
     return []
 
 
-def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
+def _co_computed_metadata_repair_contract(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> dict[str, object] | None:
+    # Derive the missing-metadata block labels the same way the save-path reject does, so the repair
+    # hint names the actually-uncovered block(s) rather than the imposed carrier in a multi-block workflow.
+    missing_labels = _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_metadata)
+    if not missing_labels:
+        return None
+    required_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
+    return _metadata_repair_contract(
+        block_labels=missing_labels,
+        required_paths=required_paths,
+        source=source,
+        reason_code=reason_code,
+    )
+
+
+def _maybe_impose_synthesized_code_block(
+    workflow_yaml: str,
+    ctx: AgentContext,
+    runtime_parameters: Mapping[str, Any] | None = None,
+) -> _SynthesizedCodeImpositionResult:
     ctx.pending_goal_complete_landing = False
     ctx.pending_requested_output_extraction_candidate = None
     ctx.spine_imposition_owned_attempt = False
+    ctx.spine_imposition_carrier_label = None
     if not getattr(ctx, "impose_synthesized_code_block", False):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
@@ -8100,6 +9086,24 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    grounded_trajectory = _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters)
+    requirement = ctx.recorded_outcome_grounding_requirement
+    constraint = ctx.recorded_outcome_binding_constraint
+    declared_keys = _declared_string_workflow_parameter_keys(parsed)
+    if (
+        grounded_trajectory is None
+        and declared_keys
+        and isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        and requirement.satisfied
+        and isinstance(constraint, RecordedOutcomeBindingConstraint)
+        and constraint.repeated_structural_key == requirement.structural_key
+        and _stash_unresolved_recorded_outcome_grounding_halt(ctx, declared_keys)
+    ):
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: current-page parameter binding is unresolved."],
+        )
+    synthesis_trajectory: Sequence[Mapping[str, Any]] = grounded_trajectory or scout_trajectory
     code_blocks = _workflow_code_blocks(parsed)
     prior_source, prior_yaml = _prior_yaml_source(ctx)
     code_block = _select_synthesized_imposition_code_block(
@@ -8114,6 +9118,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             LOG.info("copilot_spine_imposition_no_carrier", code_block_count=len(code_blocks))
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
     submitted_code = str(code_block.get("code") or "")
+    ctx.spine_imposition_carrier_label = _code_block_label(code_block)
 
     owns_spine = reaches_goal
     ctx.spine_imposition_owned_attempt = owns_spine
@@ -8134,14 +9139,14 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     ) or requested_output_extraction_plan_changed(ctx, extraction_plan)
     synthesized = (
         synthesize_code_block_with_extraction(
-            scout_trajectory,
+            synthesis_trajectory,
             extraction_plan,
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
         )
         if extraction_plan is not None
         else synthesize_code_block(
-            scout_trajectory,
+            synthesis_trajectory,
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
         )
@@ -8150,6 +9155,14 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
+        )
+    if synthesized.diagnostics.grounded_submit_binding_fingerprints:
+        LOG.info(
+            "copilot recorded outcome binding consumed by synthesizer",
+            structural_key=requirement.structural_key
+            if isinstance(requirement, RecordedOutcomeGroundingRequirement)
+            else None,
+            binding_fingerprints=synthesized.diagnostics.grounded_submit_binding_fingerprints,
         )
     imposed_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     if extraction_plan is not None:
@@ -8323,6 +9336,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     violations.extend(parameter_reconciliation.violations)
     if repair_context is None:
         repair_context = parameter_reconciliation.repair_context
+    raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
     if violations:
         persisted_calls = ctx.persisted_draft_browser_calls
         if ambiguous_reject_present and ctx.update_workflow_called and persisted_calls is not None:
@@ -8334,9 +9348,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             workflow_yaml=workflow_yaml,
             violations=violations,
             repair_context=repair_context,
+            metadata_repair_contract=_co_computed_metadata_repair_contract(ctx, workflow_yaml, raw_metadata),
         )
 
-    raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
     metadata_declares_goal_values = bool(raw_metadata) and _raw_metadata_declares_goal_values_for_block(
         raw_metadata, str(code_block.get("label") or "")
     )
@@ -9639,7 +10653,12 @@ async def _update_workflow(
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     _enrich_scout_trajectory_input_correspondences(workflow_yaml, ctx)
-    imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+    runtime_parameters = params.get("parameters")
+    imposition = _maybe_impose_synthesized_code_block(
+        workflow_yaml,
+        ctx,
+        runtime_parameters if isinstance(runtime_parameters, Mapping) else None,
+    )
     # Consume the one-shot credential-scout reopen before the gate below so a fresh reject can re-arm it.
     ctx.synthesized_block_reopened_for_credential_scout = False
     if imposition.violations:
@@ -9669,7 +10688,10 @@ async def _update_workflow(
         return reject(
             error="\n".join(imposition.violations),
             user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(imposition.repair_context),
+            data=_code_repair_progress_data(
+                imposition.repair_context,
+                metadata_repair_contract=imposition.metadata_repair_contract,
+            ),
             repair_context=imposition.repair_context,
         )
     workflow_yaml = imposition.workflow_yaml
@@ -9683,6 +10705,17 @@ async def _update_workflow(
                 user_facing_summary=_compiled_authoring_user_summary(),
                 data=_code_repair_progress_data(seam_under_build.repair_context),
                 repair_context=seam_under_build.repair_context,
+                record_repair_context_outcome=False,
+            )
+        freehand_surface = _persist_seam_freehand_surface_result(workflow_yaml, ctx)
+        if freehand_surface is not None:
+            _set_code_authoring_repair_context(ctx, freehand_surface.repair_context)
+            _record_code_authoring_guardrail_reject(ctx)
+            return reject(
+                error="\n".join(freehand_surface.violations),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data=_code_repair_progress_data(freehand_surface.repair_context),
+                repair_context=freehand_surface.repair_context,
                 record_repair_context_outcome=False,
             )
     stripped_sandbox_imports: list[str] = []
@@ -9712,6 +10745,29 @@ async def _update_workflow(
             error="\n".join(final_structural_violations),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
+        )
+    definition_reject = _definition_plane_preflight_reject(ctx, workflow_yaml)
+    if definition_reject is not None:
+        halted = _stash_unresolved_recorded_outcome_grounding_halt(
+            ctx,
+            definition_reject.unreferenced_parameter_keys,
+        )
+        if not halted:
+            _record_definition_plane_reject(
+                ctx,
+                workflow_yaml,
+                definition_reject,
+                code_artifact_metadata=ctx.raw_code_artifact_metadata,
+            )
+        return reject(
+            error=_definition_plane_reject_error(definition_reject),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data={
+                "reason_code": "definition_contract_unsatisfied",
+                "definition_criterion_ids": list(definition_reject.criterion_ids),
+                "definition_reason_codes": list(definition_reject.reason_codes),
+                "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+            },
         )
     params["workflow_yaml"] = workflow_yaml
     metadata_scrubbed_by_imposition = False

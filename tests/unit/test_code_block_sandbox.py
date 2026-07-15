@@ -687,6 +687,50 @@ async def wrapper({default_args}):
 
         return filtered_user_function
 
+    def test_inline_exec_emits_audit_event_with_hash_not_code(self) -> None:
+        """The inline exec path emits codeblock.inline_exec_entered with a code hash, never the code."""
+        import hashlib
+        from unittest.mock import MagicMock
+
+        from structlog.testing import capture_logs
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="audit_output",
+            description="test output",
+            output_parameter_id="op_audit",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        secret_marker = "s3cr3t_business_logic_token"
+        code = f"x = {secret_marker!r}\nreturn {{'x': x}}"
+        block = CodeBlock(label="audit_block", code=code, output_parameter=output_parameter)
+
+        with capture_logs() as logs:
+            block.generate_async_user_function(
+                block.code,
+                MagicMock(),
+                workflow_run_id="wr-audit",
+                organization_id="org-audit",
+                workflow_run_block_id="wrb-audit",
+            )
+
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_entered"]
+        assert len(events) == 1
+        entry = events[0]
+        assert entry["code_sha256"] == hashlib.sha256(code.encode("utf-8")).hexdigest()
+        assert entry["code_len"] == len(code)
+        assert entry["in_process"] is True
+        assert isinstance(entry["pid"], int) and entry["pid"] > 0
+        assert entry["hostname"]
+        assert entry["organization_id"] == "org-audit"
+        assert entry["workflow_run_id"] == "wr-audit"
+        assert entry["workflow_run_block_id"] == "wrb-audit"
+        # SECURITY: the raw user code must never appear in the audit payload.
+        assert secret_marker not in json.dumps(entry, default=str)
+
     @pytest.mark.asyncio
     async def test_safe_code_runs_successfully(self) -> None:
         """Legitimate code should execute and return results."""
