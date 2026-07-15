@@ -296,6 +296,19 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
             ),
             id="contingent-mint-degrade",
         ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="slot-id",
+                    outcome="The requested status is returned.",
+                    output_path="output.status",
+                    request_slot_id="a" * 64,
+                    pinability="pinned",
+                    mint_disposition="pending",
+                ),
+            ),
+            id="request-slot-contract-fields",
+        ),
     ],
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
