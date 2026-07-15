@@ -1896,6 +1896,36 @@ def test_mint_degraded_output_path_leaves_observation_lane() -> None:
     assert wu._output_contract_required_paths_source(ctx).union == set()
 
 
+def test_face_c_degraded_mint_preserves_satisfiable_value_bearing_authoring_path() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_degraded",
+            outcome="Whether the requested action is available is returned.",
+            output_path="output.action_is_available",
+            contingent_on="the action is unavailable",
+            contingent_antecedent_output_path="output.blocker",
+            mint_degrade="undecidable_judgment",
+            mint_disposition="degraded",
+            pinability="unpinnable",
+        ),
+        CompletionCriterion(
+            id="c_visible_label",
+            outcome="The visible action label is returned.",
+            output_path="output.visible_action_label",
+            pinability="shapeless_valid",
+        ),
+    )
+
+    contract = wu._output_contract_required_paths_source(ctx)
+    skeleton = wu._return_skeleton_for_required_paths(contract.union, contract.declaration_paths)
+
+    assert contract.observation_paths == {"output.visible_action_label"}
+    assert contract.declaration_paths == set()
+    assert contract.union != {"output.blocker"}
+    assert skeleton == 'return {"output": {"visible_action_label": visible_action_label}}'
+    assert "None" not in skeleton
+
+
 def test_classifier_minted_download_path_excluded_from_author_coverage() -> None:
     ctx = _antecedent_ctx(
         CompletionCriterion(
