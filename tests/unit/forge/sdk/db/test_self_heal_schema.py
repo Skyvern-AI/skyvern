@@ -54,16 +54,19 @@ def test_heal_migration_chains_from_current_head() -> None:
     heads = script.get_heads()
     assert len(heads) == 1
 
-    revision = script.get_revision("2b8e37d98d97")
-    assert revision is not None
-    # down_revision is re-pointed to main's head on every rebase (migration-rebase policy);
-    # assert the parent resolves to a real revision instead of pinning a specific hash.
+    # Revision hashes differ between this repo and the OSS mirror (migrations are
+    # regenerated on sync), so locate the migration by its docstring title instead.
+    heal_revisions = [
+        rev for rev in script.walk_revisions() if rev.doc == "add heal episode workflow block label index"
+    ]
+    assert len(heal_revisions) == 1
+    revision = heal_revisions[0]
     assert revision.down_revision is not None
     assert script.get_revision(revision.down_revision) is not None
     # The heal migration must be part of the single linear history, not pinned as the tip:
     # later migrations stack on top of it.
     ancestors = {rev.revision for rev in script.walk_revisions(base="base", head=heads[0])}
-    assert "2b8e37d98d97" in ancestors
+    assert "3b9d7a4c1e2f" in ancestors
 
 
 def _episode(
