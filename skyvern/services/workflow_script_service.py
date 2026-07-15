@@ -219,7 +219,8 @@ def _jinja_domain_filter(url: str) -> str:
         "https://boards.greenhouse.io/robinhood/jobs/123" → "boards.greenhouse.io"
     """
     try:
-        return urllib.parse.urlparse(str(url)).netloc or str(url)
+        netloc = urllib.parse.urlparse(str(url)).netloc
+        return netloc.rpartition("@")[2] or str(url)
     except Exception:
         return str(url)
 
