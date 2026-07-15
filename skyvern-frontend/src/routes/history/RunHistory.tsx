@@ -484,6 +484,9 @@ function RunHistory() {
                   descriptions={tagDescriptions}
                   colors={tagColors}
                   maxVisible={2}
+                  hideSystemTags
+                  compact
+                  className="shrink-0"
                 />
               ) : null}
             </div>
@@ -641,22 +644,34 @@ function RunHistory() {
             </div>
           ) : null}
           <div className="flex items-center justify-between gap-4">
-            <TableSearchInput
-              value={search}
-              onChange={(value) => {
-                setSearch(value);
-                const params = new URLSearchParams(searchParams);
-                params.set("page", "1");
-                setSearchParams(params, { replace: true });
-              }}
-              placeholder={
-                workflowPermanentIdFilter
-                  ? "Clear the agent filter above to search"
-                  : "Search by run ID or input..."
-              }
-              disabled={!!workflowPermanentIdFilter}
-              className="w-48 lg:w-72"
-            />
+            <div className="flex items-center gap-2">
+              <TableSearchInput
+                value={search}
+                onChange={(value) => {
+                  setSearch(value);
+                  const params = new URLSearchParams(searchParams);
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+                placeholder={
+                  workflowPermanentIdFilter
+                    ? "Clear the agent filter above to search"
+                    : "Search by run ID or input..."
+                }
+                disabled={!!workflowPermanentIdFilter}
+                className="w-48 lg:w-72"
+              />
+              {taggingEnabled ? (
+                <TagFilterControl
+                  tagKeys={tagFilterKeys}
+                  labelSuggestions={runTagSuggestions?.labels}
+                  valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                  value={tagTerms}
+                  onChange={writeTagsParam}
+                  colors={tagColors}
+                />
+              ) : null}
+            </div>
             <div className="flex items-center gap-2">
               <RunTypeFilterDropdown
                 values={runTypeGroups}
@@ -671,16 +686,6 @@ function RunHistory() {
                   setSearchParams(params, { replace: true });
                 }}
               />
-              {taggingEnabled ? (
-                <TagFilterControl
-                  tagKeys={tagFilterKeys}
-                  labelSuggestions={runTagSuggestions?.labels}
-                  valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
-                  value={tagTerms}
-                  onChange={writeTagsParam}
-                  colors={tagColors}
-                />
-              ) : null}
               <StatusFilterDropdown
                 values={statusFilters}
                 onChange={(filters) => {

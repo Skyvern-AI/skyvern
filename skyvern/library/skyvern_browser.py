@@ -1,4 +1,5 @@
 # ruff: noqa: E402
+import shutil
 from typing import TYPE_CHECKING, Any
 
 from skyvern.exceptions import require_local_extra_modules
@@ -47,6 +48,9 @@ class SkyvernBrowser(BrowserContext):
         browser_session_id: str | None = None,
         browser_address: str | None = None,
         app_url: str | None = None,
+        local_cdp_port: int | None = None,
+        local_user_data_dir: str | None = None,
+        local_user_data_dir_owned: bool = False,
     ):
         super().__init__(browser_context)
         self._skyvern = skyvern
@@ -54,6 +58,9 @@ class SkyvernBrowser(BrowserContext):
         self._browser_session_id = browser_session_id
         self._browser_address = browser_address
         self._app_url = app_url
+        self._local_cdp_port = local_cdp_port
+        self._local_user_data_dir = local_user_data_dir
+        self._local_user_data_dir_owned = local_user_data_dir_owned
 
         self.workflow_run_id: None | str = None
 
@@ -76,6 +83,18 @@ class SkyvernBrowser(BrowserContext):
     @property
     def browser_address(self) -> str | None:
         return self._browser_address
+
+    @property
+    def local_cdp_port(self) -> int | None:
+        return self._local_cdp_port
+
+    @property
+    def local_user_data_dir(self) -> str | None:
+        return self._local_user_data_dir
+
+    @property
+    def local_user_data_dir_owned(self) -> bool:
+        return self._local_user_data_dir_owned
 
     @property
     def app_url(self) -> str | None:
@@ -142,6 +161,8 @@ class SkyvernBrowser(BrowserContext):
             ```
         """
         await self._browser_context.close(**kwargs)
+        if self._local_user_data_dir_owned and self._local_user_data_dir:
+            shutil.rmtree(self._local_user_data_dir, ignore_errors=True)
 
         if self._browser_session_id:
             await self._skyvern.close_browser_session(self._browser_session_id)

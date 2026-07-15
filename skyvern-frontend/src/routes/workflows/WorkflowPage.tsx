@@ -347,21 +347,18 @@ function WorkflowPage() {
         ) : (
           <>
             <div className="flex items-center justify-between gap-4">
-              <TableSearchInput
-                value={search}
-                onChange={(value) => {
-                  setSearch(value);
-                  const params = new URLSearchParams(searchParams);
-                  params.set("page", "1");
-                  setSearchParams(params, { replace: true });
-                }}
-                placeholder="Search runs by input..."
-                className="w-48 lg:w-72"
-              />
               <div className="flex items-center gap-2">
-                {WorkflowRunsFilterControls ? (
-                  <WorkflowRunsFilterControls />
-                ) : null}
+                <TableSearchInput
+                  value={search}
+                  onChange={(value) => {
+                    setSearch(value);
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page", "1");
+                    setSearchParams(params, { replace: true });
+                  }}
+                  placeholder="Search runs by input..."
+                  className="w-48 lg:w-72"
+                />
                 {taggingEnabled ? (
                   <TagFilterControl
                     tagKeys={tagFilterKeys}
@@ -371,6 +368,11 @@ function WorkflowPage() {
                     onChange={writeTagsParam}
                     colors={tagColors}
                   />
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2">
+                {WorkflowRunsFilterControls ? (
+                  <WorkflowRunsFilterControls />
                 ) : null}
                 <StatusFilterDropdown
                   values={statusFilters}
@@ -476,6 +478,9 @@ function WorkflowPage() {
                                   descriptions={tagDescriptions}
                                   colors={tagColors}
                                   maxVisible={2}
+                                  hideSystemTags
+                                  compact
+                                  className="shrink-0 font-sans"
                                 />
                               ) : null}
                             </div>

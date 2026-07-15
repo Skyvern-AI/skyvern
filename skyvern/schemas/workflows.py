@@ -510,6 +510,14 @@ class FileStorageType(StrEnum):
     SFTP = "sftp"
 
 
+class FileDownloadTarget(StrEnum):
+    WEBSITE = "website"
+    S3 = "s3"
+    AZURE = "azure"
+    GOOGLE_DRIVE = "google_drive"
+    SFTP = "sftp"
+
+
 class FileUploadDestination(BaseModel):
     """Customer-storage destination for a single file upload.
 
@@ -1086,6 +1094,27 @@ class HumanInteractionBlockYAML(BlockYAML):
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
+    download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_blob_container_name: str | None = None
+    google_credential_id: str | None = None
+    google_drive_folder_id: str | None = None
+    sftp_host: str | None = None
+    sftp_port: int | None = None
+    sftp_username: str | None = None
+    sftp_password: str | None = None
+    sftp_private_key: str | None = None
+    sftp_private_key_passphrase: str | None = None
+    sftp_remote_path: str | None = None
+    sftp_host_key: str | None = None
+    path: str | None = None
+    prompt: str | None = None
+    continue_on_empty: bool = False
     navigation_goal: str
     url: str | None = None
     title: str = ""

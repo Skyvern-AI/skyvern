@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 
@@ -21,12 +22,29 @@ from skyvern.schemas.proxy_location import ProxyLocationInput, proxy_location_to
 from skyvern.schemas.run_enums import RunEngine, RunStatus
 
 LOG = structlog.get_logger()
+_DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 2.0
 
 if TYPE_CHECKING:
     from playwright.async_api import Playwright
 
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
+
+
+async def _read_devtools_active_port(user_data_dir: pathlib.Path) -> int:
+    active_port_file = user_data_dir / "DevToolsActivePort"
+    deadline = asyncio.get_running_loop().time() + _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS
+    last_error: OSError | ValueError | IndexError | None = None
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            port = int(active_port_file.read_text().splitlines()[0])
+            if not 1 <= port <= 65535:
+                raise ValueError(f"invalid CDP port: {port}")
+            return port
+        except (OSError, ValueError, IndexError) as exc:
+            last_error = exc
+            await asyncio.sleep(0.01)
+    raise RuntimeError(f"Chromium did not publish a valid CDP port in {active_port_file}") from last_error
 
 
 def _get_browser_session_url(browser_session: BrowserSessionResponse) -> str:
@@ -467,7 +485,7 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         headless: bool = False,
-        port: int = DEFAULT_CDP_PORT,
+        port: int | None = None,
         args: list[str] | None = None,
         user_data_dir: str | None = None,
     ) -> SkyvernBrowser:
@@ -478,7 +496,8 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             headless: Whether to run the browser in headless mode. Defaults to False.
-            port: The port number for the CDP endpoint. Defaults to DEFAULT_CDP_PORT.
+            port: The port number for the CDP endpoint. Anonymous launches use an
+                OS-assigned port; explicitly configured launches retain DEFAULT_CDP_PORT.
             args: Additional command-line arguments to pass to Chromium. Defaults to None.
                 Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
 
@@ -490,24 +509,48 @@ class Skyvern(AsyncSkyvern):
 
         playwright = await self._get_playwright()
 
-        if user_data_dir:
+        use_instance_defaults = user_data_dir is None and port is None
+        if use_instance_defaults:
+            user_data_path = pathlib.Path(tempfile.mkdtemp(prefix="skyvern-browser-"))
+            launch_port = 0
+        elif user_data_dir:
             user_data_path = pathlib.Path(user_data_dir)
+            launch_port = port if port is not None else DEFAULT_CDP_PORT
         else:
             user_data_path = pathlib.Path(tempfile.gettempdir()) / "skyvern-browser"
+            launch_port = port if port is not None else DEFAULT_CDP_PORT
 
         launch_args = [
-            f"--remote-debugging-port={port}",
+            f"--remote-debugging-port={launch_port}",
         ]
         if args:
             launch_args.extend(args)
 
-        browser_context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_path),
-            headless=headless,
-            args=launch_args,
+        browser_context = None
+        try:
+            browser_context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_path),
+                headless=headless,
+                args=launch_args,
+            )
+            resolved_port = await _read_devtools_active_port(user_data_path) if use_instance_defaults else launch_port
+        except Exception:
+            try:
+                if browser_context is not None:
+                    await browser_context.close()
+            finally:
+                if use_instance_defaults:
+                    shutil.rmtree(user_data_path, ignore_errors=True)
+            raise
+        browser_address = f"http://localhost:{resolved_port}"
+        return SkyvernBrowser(
+            self,
+            browser_context,
+            browser_address=browser_address,
+            local_cdp_port=resolved_port,
+            local_user_data_dir=str(user_data_path),
+            local_user_data_dir_owned=use_instance_defaults,
         )
-        browser_address = f"http://localhost:{port}"
-        return SkyvernBrowser(self, browser_context, browser_address=browser_address)
 
     async def connect_to_browser_over_cdp(self, cdp_url: str) -> SkyvernBrowser:
         """Connect to an existing browser instance via Chrome DevTools Protocol (CDP).

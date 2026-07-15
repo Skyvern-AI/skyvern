@@ -1063,10 +1063,22 @@ def _merge_registered_output_parameter_values_into_blocks(data: dict[str, Any]) 
             block["extracted_data"] = {key: value}
 
 
+def _registered_output_identity_workflow(
+    *,
+    dispatch_to_worker: bool,
+    dispatch_workflow: Workflow | None,
+    runtime_workflow: Workflow,
+) -> Workflow | None:
+    if dispatch_to_worker:
+        return dispatch_workflow
+    return runtime_workflow
+
+
 async def _attach_registered_output_parameter_values(
     *,
     workflow_run_id: str,
     workflow: Workflow | None,
+    output_identity_workflow: Workflow | None = None,
     data: dict[str, Any],
     persisted_output_parameters: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -1086,7 +1098,8 @@ async def _attach_registered_output_parameter_values(
     if not registered_rows:
         return {}
 
-    index_by_id, index_by_key = _workflow_output_parameter_indexes(workflow)
+    exact_output_identity = output_identity_workflow is not None
+    index_by_id, index_by_key = _workflow_output_parameter_indexes(output_identity_workflow or workflow)
     persisted_key_by_id = {
         output_parameter_id: key
         for parameter in persisted_output_parameters or []
@@ -1100,8 +1113,15 @@ async def _attach_registered_output_parameter_values(
         if not isinstance(output_parameter_id, str) or not output_parameter_id:
             continue
         block_info = dict(index_by_id.get(output_parameter_id, {}))
+        if exact_output_identity and not block_info:
+            LOG.info(
+                "Skipped registered output with no exact run-definition identity",
+                workflow_run_id=workflow_run_id,
+                output_parameter_id=output_parameter_id,
+            )
+            continue
         output_parameter_key = block_info.get("output_parameter_key")
-        if not isinstance(output_parameter_key, str) or not output_parameter_key:
+        if not exact_output_identity and (not isinstance(output_parameter_key, str) or not output_parameter_key):
             output_parameter_key = persisted_key_by_id.get(output_parameter_id)
             if isinstance(output_parameter_key, str):
                 block_info["output_parameter_key"] = output_parameter_key
@@ -2202,12 +2222,16 @@ async def _run_blocks_and_collect_debug(
     if not run_ok and run and getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
 
+    output_identity_workflow = _registered_output_identity_workflow(
+        dispatch_to_worker=dispatch_to_worker,
+        dispatch_workflow=dispatch_workflow,
+        runtime_workflow=runtime_workflow,
+    )
+
     registered_outputs_by_label = await _attach_registered_output_parameter_values(
         workflow_run_id=workflow_run.workflow_run_id,
-        # Dispatched runs: the worker wrote outputs keyed by the persisted dispatch version's
-        # regenerated output-parameter ids, so map against that version (not runtime_workflow,
-        # which is intentionally left with the source ids). Inline runs map against runtime_workflow.
-        workflow=dispatch_workflow if dispatch_workflow is not None else runtime_workflow,
+        workflow=runtime_workflow,
+        output_identity_workflow=output_identity_workflow,
         data=result_data,
         persisted_output_parameters=all_output_params,
     )

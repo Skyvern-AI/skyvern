@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -13,19 +13,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PlusIcon } from "@radix-ui/react-icons";
 import type { Parameter } from "@/routes/workflows/types/workflowTypes";
+import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConfigFields";
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
 import { buildScheduleParametersPayload } from "@/routes/workflows/components/scheduleParameters";
 import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
 import {
-  CRON_PRESETS,
-  cronToHumanReadable,
-  isValidCron,
-  getNextRuns,
-  formatNextRun,
-  getTimezones,
   getLocalTimezone,
+  isValidCron,
+  meetsMinCronInterval,
 } from "./cronUtils";
-import { cn } from "@/util/utils";
 
 type Props = {
   workflowParameters: ReadonlyArray<Parameter>;
@@ -48,7 +44,6 @@ function CreateScheduleDialog({
   const [open, setOpen] = useState(false);
   const [cronExpression, setCronExpression] = useState("0 9 * * *");
   const [timezone, setTimezone] = useState(getLocalTimezone);
-  const [timezoneFilter, setTimezoneFilter] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const {
@@ -71,22 +66,12 @@ function CreateScheduleDialog({
     }
   }, [open, workflowParameters, resetParameters]);
 
-  const allTimezones = useMemo(() => getTimezones(), []);
-  const filteredTimezones = useMemo(() => {
-    if (timezoneFilter === null) return allTimezones;
-    if (!timezoneFilter) return allTimezones;
-    const lower = timezoneFilter.toLowerCase();
-    return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
-  }, [allTimezones, timezoneFilter]);
-
   const valid = isValidCron(cronExpression);
-  const humanReadable = valid ? cronToHumanReadable(cronExpression) : null;
-  const nextRuns = valid ? getNextRuns(cronExpression, timezone, 5) : [];
+  const cronAccepted = valid && meetsMinCronInterval(cronExpression);
 
   function resetFormState() {
     setCronExpression("0 9 * * *");
     setTimezone(getLocalTimezone());
-    setTimezoneFilter(null);
     setName("");
     setDescription("");
     resetParameters();
@@ -94,7 +79,7 @@ function CreateScheduleDialog({
 
   function handleSubmit() {
     const parametersValid = validateParameters();
-    if (!valid || !parametersValid) return;
+    if (!cronAccepted || !parametersValid) return;
     const payload = buildScheduleParametersPayload(
       parameters,
       workflowParameters,
@@ -155,115 +140,20 @@ function CreateScheduleDialog({
             disabled={isPending}
           />
 
-          <div className="space-y-2">
-            <Label>Quick Presets</Label>
-            <div className="flex flex-wrap gap-2">
-              {CRON_PRESETS.map((preset) => (
-                <Button
-                  key={preset.label}
-                  variant={
-                    cronExpression === preset.expression
-                      ? "default"
-                      : "secondary"
-                  }
-                  size="sm"
-                  onClick={() => setCronExpression(preset.expression)}
-                >
-                  {preset.label}
-                </Button>
-              ))}
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <Label>Cron Expression</Label>
-            <Input
-              value={cronExpression}
-              onChange={(e) => setCronExpression(e.target.value)}
-              placeholder="* * * * *"
-              className={cn(!valid && cronExpression && "border-destructive")}
-            />
-            {humanReadable && (
-              <p className="text-sm text-muted-foreground">{humanReadable}</p>
-            )}
-            {!valid && cronExpression && (
-              <p className="text-sm text-destructive">
-                Invalid cron expression
-              </p>
-            )}
-          </div>
-
-          <div className="space-y-2">
-            <Label>Timezone</Label>
-            <Input
-              value={timezoneFilter ?? timezone}
-              onChange={(e) => setTimezoneFilter(e.target.value)}
-              onFocus={(e) => e.currentTarget.select()}
-              onBlur={() => {
-                if (
-                  filteredTimezones.length === 1 &&
-                  filteredTimezones[0] !== undefined
-                ) {
-                  setTimezone(filteredTimezones[0]);
-                }
-                setTimezoneFilter(null);
-              }}
-              placeholder="Search timezones..."
-            />
-            {timezoneFilter !== null && (
-              <div className="max-h-40 overflow-y-auto rounded-md border border-border bg-slate-elevation3">
-                {filteredTimezones.slice(0, 20).map((tz) => (
-                  <button
-                    key={tz}
-                    type="button"
-                    className={cn(
-                      "w-full px-3 py-1.5 text-left text-sm hover:bg-muted dark:hover:bg-slate-700",
-                      tz === timezone &&
-                        "bg-muted text-foreground dark:bg-slate-700",
-                    )}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      setTimezone(tz);
-                      setTimezoneFilter(null);
-                    }}
-                  >
-                    {tz}
-                  </button>
-                ))}
-                {filteredTimezones.length === 0 && (
-                  <div className="px-3 py-2 text-sm text-muted-foreground dark:text-slate-500">
-                    No timezones found
-                  </div>
-                )}
-              </div>
-            )}
-            <p className="text-xs text-muted-foreground dark:text-slate-500">
-              Current: {timezone}
-            </p>
-          </div>
-
-          {nextRuns.length > 0 && (
-            <div className="space-y-2">
-              <Label>Next Scheduled Runs</Label>
-              <div className="space-y-1 rounded-md border border-border bg-slate-elevation3 p-3">
-                {nextRuns.map((run) => (
-                  <div
-                    key={run.toISOString()}
-                    className="text-xs text-muted-foreground"
-                  >
-                    {formatNextRun(run, timezone)}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          <ScheduleConfigFields
+            cronExpression={cronExpression}
+            timezone={timezone}
+            onCronChange={setCronExpression}
+            onTimezoneChange={setTimezone}
+            disabled={isPending}
+          />
         </div>
 
         <DialogFooter>
           <Button variant="secondary" onClick={() => setOpen(false)}>
             Cancel
           </Button>
-          <Button disabled={!valid || isPending} onClick={handleSubmit}>
+          <Button disabled={!cronAccepted || isPending} onClick={handleSubmit}>
             {isPending ? "Creating..." : "Create Schedule"}
           </Button>
         </DialogFooter>

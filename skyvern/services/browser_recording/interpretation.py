@@ -253,9 +253,9 @@ class RecordingInterpretationSession:
         self.organization_id = organization_id
         self.workflow_permanent_id = workflow_permanent_id
         self.on_update = on_update
-        # Identifies the client-side recording attempt. A cached session is
-        # reused across reconnects only when this matches; a new recording sends
-        # a new id, forcing a fresh session (state machines reset from scratch).
+        # Identifies the client-side recording attempt. The registry continues an
+        # unfinished session across reconnects even when this differs (the client
+        # lost its state, e.g. page reload — SKY-12429) and adopts the new id.
         self.recording_attempt_id = recording_attempt_id
         self.set_deltas_enabled(deltas_enabled)
         self.interpretation_session_id = str(uuid.uuid4())
