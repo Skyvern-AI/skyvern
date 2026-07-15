@@ -1,7 +1,7 @@
 """add VNC metadata to persistent browser sessions
 
 Revision ID: d4f7a9c2e681
-Revises: 2b8e37d98d97
+Revises: 1915b0e1126e
 Create Date: 2026-07-13 18:18:10.000000
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "d4f7a9c2e681"
-down_revision: Union[str, None] = "2b8e37d98d97"
+down_revision: Union[str, None] = "1915b0e1126e"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

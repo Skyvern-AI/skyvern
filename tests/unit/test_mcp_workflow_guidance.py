@@ -66,6 +66,8 @@ def test_workflow_get_routes_search_and_browse_to_workflow_list() -> None:
     """get fetches ONE workflow by known id; search/browse/paginate belong on workflow_list (SKY-12087/89/90/91)."""
     doc = skyvern_workflow_get.__doc__ or ""
     assert "skyvern_workflow_list" in doc
+    assert "skyvern workflow get --id <wpid> --definition-file wf.json" in doc
+    assert "skyvern workflow update --id <wpid> --definition @wf.json" in doc
     params = inspect.signature(skyvern_workflow_get).parameters
     assert params["workflow_id"].default is inspect.Parameter.empty
 
@@ -82,6 +84,8 @@ def test_workflow_update_keeps_serialized_definition() -> None:
     """update takes the whole workflow serialized into `definition`; flat fields are rejected (SKY-12072)."""
     doc = skyvern_workflow_update.__doc__ or ""
     assert "definition" in doc
+    assert "skyvern workflow get --id <wpid> --definition-file wf.json" in doc
+    assert "skyvern workflow update --id <wpid> --definition @wf.json" in doc
     params = inspect.signature(skyvern_workflow_update).parameters
     assert params["definition"].default is inspect.Parameter.empty
 

@@ -6,6 +6,8 @@ OSS-synced: only example.* / RFC-2606 placeholder targets.
 from __future__ import annotations
 
 import ast
+import asyncio
+import hashlib
 import json
 import keyword
 import sys
@@ -21,6 +23,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
     _ENTRY_RESUME_AFTER_AUTH_VAR,
     _ENTRY_REUSED_VAR,
+    _ENTRY_TARGET_VAR,
     _INDENT,
     _MAX_STEPS,
     _READONLY_DEFERRED_VAR,
@@ -37,9 +40,12 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     SynthesisDiagnostics,
     _get_by_role_expr,
     _get_by_role_expr_strict,
+    _is_submit_interaction,
     build_input_templated_locator,
     build_synthesized_artifact_metadata,
     code_contains_credential_fill,
+    credential_scout_gap,
+    grounded_submit_rung_binding_fingerprint,
     input_correspondences_for_interaction,
     is_optional_dismissal_only_trajectory,
     obligation_finding_reason_code,
@@ -89,6 +95,110 @@ def real_mypy() -> None:
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
     return {"tool_name": tool_name, **fields}
+
+
+def _submit_rung_binding(
+    interaction: dict[str, Any],
+    *,
+    trajectory_index: int,
+    fields: list[dict[str, str]],
+) -> dict[str, Any]:
+    repeated_structural_key = "recorded-p5-key"
+    return {
+        "repeated_structural_key": repeated_structural_key,
+        "field_bindings": fields,
+        "fingerprint": grounded_submit_rung_binding_fingerprint(
+            repeated_structural_key=repeated_structural_key,
+            source_url=str(interaction["source_url"]),
+            submit_selector=str(interaction["selector"]),
+            submit_trajectory_index=trajectory_index,
+            field_bindings=fields,
+        ),
+    }
+
+
+def test_grounded_submit_rung_binding_changes_candidate_and_preserves_trajectory() -> None:
+    trajectory = [
+        _interaction("click", selector="#open", source_url="https://example.com/form", trajectory_index=0),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=1),
+    ]
+    plain = synthesize_code_block(trajectory, strict_selectors=True)
+    fields = [
+        {"parameter_key": "company_name", "field_selector": "#company"},
+        {"parameter_key": "contact_email", "field_selector": "#email"},
+    ]
+    trajectory[1]["submit_rung_binding"] = _submit_rung_binding(trajectory[1], trajectory_index=1, fields=fields)
+    original = [dict(interaction) for interaction in trajectory]
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert plain is not None
+    assert result is not None
+    assert trajectory == original
+    assert hashlib.sha256(plain.code.encode()).hexdigest() == (
+        "9703bf1b2b7a0a9a2e8145f89055e20c312a3cf2d6b0dc9a34d4d325bba6361f"
+    )
+    assert result.code != plain.code
+    assert result.code.index('page.locator("#company").fill(str(company_name))') < result.code.index(
+        'page.locator("#submit").click()'
+    )
+    assert result.code.index('page.locator("#email").fill(str(contact_email))') < result.code.index(
+        'page.locator("#submit").click()'
+    )
+    assert {parameter["key"] for parameter in result.parameters} == {"company_name", "contact_email"}
+    assert result.diagnostics.grounded_submit_binding_fingerprints == [
+        trajectory[1]["submit_rung_binding"]["fingerprint"]
+    ]
+    assert [record["trajectory_index"] for record in result.diagnostics.emitted_interactions] == [0, 1]
+
+
+def test_grounded_submit_rung_binding_targets_exact_submit_trajectory_index() -> None:
+    trajectory = [
+        _interaction("click", selector="#submit", source_url="https://example.com/landing", trajectory_index=0),
+        _interaction("click", selector="#open", source_url="https://example.com/form", trajectory_index=1),
+        _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=2),
+    ]
+    fields = [{"parameter_key": "company_name", "field_selector": "#company"}]
+    trajectory[2]["submit_rung_binding"] = _submit_rung_binding(trajectory[2], trajectory_index=2, fields=fields)
+
+    result = synthesize_code_block(trajectory, strict_selectors=True)
+
+    assert result is not None
+    first_submit = result.code.index('page.locator("#submit").click()')
+    fill = result.code.index('page.locator("#company").fill(str(company_name))')
+    second_submit = result.code.rindex('page.locator("#submit").click()')
+    assert first_submit < fill < second_submit
+
+
+@pytest.mark.parametrize("mutation", ["incomplete", "leftover", "fingerprint"])
+def test_grounded_submit_rung_binding_fails_closed_on_invalid_bundle(mutation: str) -> None:
+    interaction = _interaction("click", selector="#submit", source_url="https://example.com/form", trajectory_index=0)
+    fields = [{"parameter_key": "company_name", "field_selector": "#company"}]
+    interaction["submit_rung_binding"] = _submit_rung_binding(interaction, trajectory_index=0, fields=fields)
+    trajectory = [interaction]
+    if mutation == "incomplete":
+        interaction["submit_rung_binding"]["field_bindings"] = []
+    elif mutation == "leftover":
+        trajectory.append(
+            _interaction(
+                "click",
+                selector="#second-submit",
+                source_url="https://example.com/form",
+                trajectory_index=1,
+                submit_rung_binding=_submit_rung_binding(
+                    {
+                        "selector": "#second-submit",
+                        "source_url": "https://example.com/form",
+                    },
+                    trajectory_index=1,
+                    fields=[{"parameter_key": "contact_email", "field_selector": "#email"}],
+                ),
+            )
+        )
+    else:
+        interaction["submit_rung_binding"]["fingerprint"] = "stale"
+
+    assert synthesize_code_block(trajectory, strict_selectors=True) is None
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
@@ -478,6 +588,56 @@ class TestLocatorSynthesis:
         assert result is not None
         assert ".first" not in result.code
         assert 'await page.locator("button").click()' not in result.code
+        dropped = [
+            d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
+        ]
+        assert dropped
+
+    def test_attribute_selector_emitted_verbatim_when_not_scout_ambiguous(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="button[data-action='orderDocuments']",
+                source_url="https://example.com/portal",
+                role="button",
+                accessible_name="Order Documents",
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "button[data-action='orderDocuments']" in result.code
+
+    def test_strict_reanchors_scout_ambiguous_attribute_selector(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="button[data-action='orderDocuments']",
+                source_url="https://example.com/portal",
+                role="button",
+                accessible_name="Order Documents",
+                ambiguous=True,
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "data-action" not in result.code
+        assert 'await page.get_by_role("button", name="Order Documents", exact=True).click()' in result.code
+
+    def test_strict_drops_scout_ambiguous_attribute_selector_without_role_name(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#open", source_url="https://example.com/home"),
+            _interaction(
+                "click",
+                selector="button[data-action='businessToggle']",
+                source_url="https://example.com/portal",
+                ambiguous=True,
+            ),
+        ]
+        result = synthesize_code_block(trajectory, strict_selectors=True)
+        assert result is not None
+        assert "data-action" not in result.code
         dropped = [
             d for d in result.diagnostics.dropped_interactions if d.get("reason_code") == "ambiguous_bare_selector"
         ]
@@ -3592,3 +3752,156 @@ def test_synthesize_input_purity() -> None:
     synthesize_code_block(list(trajectory), strict_selectors=False)
     synthesize_code_block(list(trajectory), strict_selectors=True)
     assert trajectory == snapshot
+
+
+def _credential_fill(**overrides: Any) -> dict[str, Any]:
+    fields = {
+        "selector": "#username",
+        "source_url": "https://example.com/login",
+        "credential_id": "cred_1",
+        "credential_name": "portal",
+        "credential_field": "username",
+        "typed_length": 8,
+    }
+    fields.update(overrides)
+    return _interaction(CREDENTIAL_FILL_TOOL_NAME, **fields)
+
+
+class _FakeLocator:
+    def __init__(self, page: _FakePage, selector: str) -> None:
+        self._page = page
+        self._selector = selector
+
+    async def count(self) -> int:
+        return self._page.counts.get(self._selector, 0)
+
+    async def wait_for(self, *, state: str, timeout: float | None = None) -> None:
+        if self._page.counts.get(self._selector, 0) < 1:
+            raise TimeoutError(f"{self._selector} not visible")
+
+    async def fill(self, value: object) -> None:
+        if self._page.counts.get(self._selector, 0) != 1:
+            raise AssertionError(
+                f"strict-mode fill on {self._selector} with count {self._page.counts.get(self._selector, 0)}"
+            )
+        self._page.filled.append(self._selector)
+
+    async def click(self) -> None:
+        self._page.clicked.append(self._selector)
+
+    async def press(self, key: str) -> None:
+        self._page.pressed.append((self._selector, key))
+
+
+class _FakePage:
+    def __init__(self, counts: dict[str, int]) -> None:
+        self.counts = counts
+        self.filled: list[str] = []
+        self.clicked: list[str] = []
+        self.pressed: list[tuple[str, str]] = []
+        self.goto_calls: list[str] = []
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(self, selector)
+
+    async def goto(self, url: str, *, wait_until: str | None = None) -> None:
+        self.goto_calls.append(url)
+
+    async def wait_for_load_state(self, state: str) -> None:
+        return None
+
+
+def _run_synthesized_block(code: str, page: _FakePage, portal: object) -> None:
+    namespace: dict[str, Any] = {}
+    exec("async def _block(page, portal):\n" + code, namespace)
+    asyncio.run(namespace["_block"](page, portal))
+
+
+class TestLoginOnlyPresenceGuardSynthesis:
+    def _login_only_trajectory(self, *, submit: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            _credential_fill(selector="#username", credential_field="username"),
+            _credential_fill(selector="#password", credential_field="password"),
+            submit,
+        ]
+
+    def test_click_submit_wraps_whole_prefix_in_count_guard(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" in result.code
+        guard_line = next(i for i, ln in enumerate(result.code.splitlines()) if ".count() == 1:" in ln)
+        body = result.code.splitlines()[guard_line + 1 : guard_line + 5]
+        assert any(".fill(portal.username)" in ln for ln in body)
+        assert any(".fill(portal.password)" in ln for ln in body)
+        assert any('page.locator("#login-btn").click()' in ln for ln in body)
+        assert all(ln.startswith(_INDENT * 2) for ln in body)
+
+    def test_enter_submit_is_recognized_and_guarded(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("press_key", selector="#password", key="Enter", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" in result.code
+        assert '        await page.locator("#password").press("Enter")' in result.code
+
+    def test_present_state_runs_full_login(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({"#username": 1, "#password": 1, "#login-btn": 1})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == ["#username", "#password"]
+        assert page.clicked == ["#login-btn"]
+
+    def test_absent_state_skips_login_without_timeout(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == []
+        assert page.clicked == []
+        assert page.goto_calls == ["https://example.com/login"]
+
+    def test_multiple_match_state_does_not_strict_mode_fail(self) -> None:
+        traj = self._login_only_trajectory(
+            submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
+        )
+        result = synthesize_code_block(traj, strict_selectors=True)
+        assert result is not None
+        page = _FakePage({"#username": 2, "#password": 2, "#login-btn": 2})
+        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        assert page.filled == []
+        assert page.clicked == []
+
+
+class TestSharedSubmitPredicate:
+    def test_click_and_enter_are_submits_but_tab_is_not(self) -> None:
+        assert _is_submit_interaction({"tool_name": "click"}) is True
+        assert _is_submit_interaction({"tool_name": "press_key", "key": "Enter"}) is True
+        assert _is_submit_interaction({"tool_name": "press_key", "key": "Tab"}) is False
+        assert _is_submit_interaction({"tool_name": "type_text"}) is False
+
+    def test_tab_only_post_fill_reports_missing_submit(self) -> None:
+        trajectory = [
+            _credential_fill(selector="#username", credential_field="username"),
+            _interaction("press_key", selector="#username", key="Tab", source_url="https://example.com/login"),
+        ]
+        gap = credential_scout_gap(trajectory, [(frozenset({"cred_1"}), frozenset({"username"}))], requires_submit=True)
+        assert gap.missing_submit is True
+
+    def test_enter_post_fill_satisfies_submit(self) -> None:
+        trajectory = [
+            _credential_fill(selector="#username", credential_field="username"),
+            _interaction("press_key", selector="#username", key="Enter", source_url="https://example.com/login"),
+        ]
+        gap = credential_scout_gap(trajectory, [(frozenset({"cred_1"}), frozenset({"username"}))], requires_submit=True)
+        assert gap.missing_submit is False

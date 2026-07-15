@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_testing,
 )
+from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_grounding_requires_current_page
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error as composition_page_evidence_error,
 )
@@ -224,6 +225,7 @@ from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog
 from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
+from .scouting import _capture_scout_ambiguity as _capture_scout_ambiguity
 from .scouting import _capture_scout_role_name as _capture_scout_role_name
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
@@ -234,6 +236,7 @@ from .scouting import _consume_scout_source_url as _consume_scout_source_url
 from .scouting import _mark_page_inspected as _mark_page_inspected
 from .scouting import _mark_pending_browser_interaction_observation as _mark_pending_browser_interaction_observation
 from .scouting import _mark_post_run_page_observed as _mark_post_run_page_observed
+from .scouting import _prenav_ambiguity_for_selector as _prenav_ambiguity_for_selector
 from .scouting import _prenav_role_name_for_selector as _prenav_role_name_for_selector
 from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
@@ -648,10 +651,16 @@ async def update_and_run_blocks_tool(
         serialized_code_artifact_metadata = scaffolded_code_artifact_metadata
         arguments["code_artifact_metadata"] = serialized_code_artifact_metadata
 
+    if recorded_outcome_grounding_requires_current_page(copilot_ctx):
+        loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
+        if loop_error:
+            return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
+
     metadata_contract_preflight_reject = _metadata_contract_run_preflight_reject(
         copilot_ctx,
         workflow_yaml,
         serialized_code_artifact_metadata,
+        parameters or {},
     )
     if metadata_contract_preflight_reject is not None:
         record_tool_step_result_for_ctx(
@@ -708,6 +717,7 @@ async def update_and_run_blocks_tool(
                 if scaffold_applied or envelope_imposed
                 else code_artifact_metadata,
                 "block_labels": block_labels,
+                "parameters": parameters or {},
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
@@ -751,6 +761,29 @@ async def update_and_run_blocks_tool(
             workflow_permanent_id=copilot_ctx.workflow_permanent_id,
         )
         return json.dumps(skip_result)
+
+    exact_candidate_preflight_reject = _metadata_contract_run_preflight_reject(
+        copilot_ctx,
+        copilot_ctx.workflow_yaml or workflow_yaml,
+        copilot_ctx.code_artifact_metadata,
+        parameters or {},
+        enforce_untagged_declared_inputs=True,
+    )
+    if exact_candidate_preflight_reject is not None:
+        record_tool_step_result_for_ctx(
+            copilot_ctx,
+            "update_and_run_blocks",
+            arguments,
+            exact_candidate_preflight_reject,
+        )
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=exact_candidate_preflight_reject,
+            workflow_updated=True,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", exact_candidate_preflight_reject)
+        return json.dumps(sanitized)
 
     # Step 2: Compute frontier and run the blocks.
     new_definition = None

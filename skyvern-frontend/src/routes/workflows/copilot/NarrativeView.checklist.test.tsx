@@ -341,3 +341,53 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     expect(screen.queryByText("Block 1")).toBeNull();
   });
 });
+
+describe("NarrativeView — narrator content condensing (SKY-11971)", () => {
+  const retriedBlockActivity: ActivityEntry[] = [
+    activityEntry({
+      id: "tc-x1",
+      kind: "tool_call",
+      toolName: "extract",
+      displayLabel: "Extracting",
+    }),
+    activityEntry({
+      id: "tr-x1",
+      kind: "tool_result",
+      toolName: "extract",
+      success: false,
+      text: "no results found",
+    }),
+    activityEntry({
+      id: "tc-x2",
+      kind: "tool_call",
+      toolName: "extract",
+      displayLabel: "Extracting",
+    }),
+    activityEntry({
+      id: "tr-x2",
+      kind: "tool_result",
+      toolName: "extract",
+      success: true,
+      text: "top 5 titles + links",
+    }),
+  ];
+
+  const retriedTurn = (): TurnNarrativeState => ({
+    ...testActiveTurn(),
+    blocks: [runningBlock({ activity: retriedBlockActivity })],
+  });
+
+  it("checklist (uxV1): folds the block's failed-then-retried tool activity into one row with an attempt count", () => {
+    render(<NarrativeView turn={retriedTurn()} uxV1 />);
+    expect(screen.queryByText("no results found")).toBeNull();
+    expect(screen.getByText("top 5 titles + links")).toBeTruthy();
+    expect(screen.getByText(/2 attempts/)).toBeTruthy();
+  });
+
+  it("legacy (uxV1 absent): renders every raw call/result row unfolded, exactly as before", () => {
+    render(<NarrativeView turn={retriedTurn()} />);
+    expect(screen.getByText("no results found")).toBeTruthy();
+    expect(screen.getByText("top 5 titles + links")).toBeTruthy();
+    expect(screen.queryByText(/attempts/)).toBeNull();
+  });
+});

@@ -134,7 +134,7 @@ function BlockOutputs({
               />
             </>
           ) : (
-            <div className="flex h-full w-full flex-1 items-center justify-center bg-slate-950 text-slate-100">
+            <div className="flex h-full w-full flex-1 items-center justify-center bg-muted text-muted-foreground dark:bg-slate-950 dark:text-slate-100">
               No output defined
             </div>
           )}

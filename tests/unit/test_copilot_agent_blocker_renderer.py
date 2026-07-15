@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BlockerKind,
     CopilotToolBlockerSignal,
     RecoveryHint,
+    build_definition_contract_unsatisfied_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
@@ -527,6 +528,21 @@ def test_turn_halt_exit_keeps_halt_signal_when_context_signal_is_cleared() -> No
     result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
 
     assert result.user_response == signal.user_facing_reason
+
+
+def test_definition_contract_halt_renders_sorted_parameter_names_without_internal_machinery() -> None:
+    ctx = _ctx()
+    signal = build_definition_contract_unsatisfied_blocker_signal(
+        unresolved_parameter_keys=["service_address", "business_name", "contact_email"]
+    )
+    halt = TurnHalt(kind=TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED, blocker_signal=signal)
+
+    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
+
+    assert result.user_response == signal.user_facing_reason
+    assert result.user_response.index("business_name") < result.user_response.index("contact_email")
+    assert result.user_response.index("contact_email") < result.user_response.index("service_address")
+    assert "update_and_run_blocks" not in result.user_response
 
 
 def test_turn_halt_exit_renders_code_authoring_churn_reason() -> None:

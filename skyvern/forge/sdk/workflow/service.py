@@ -139,6 +139,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     is_adaptive_caching,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import encrypt_workflow_definition_secrets
 from skyvern.forge.sdk.workflow.status_mapping import (
     BLOCK_STATUS_MAP,
     NONFINAL_BLOCK_STATUSES,
@@ -5423,6 +5424,7 @@ class WorkflowService:
         edited_by: str | None = None,
     ) -> Workflow:
         try:
+            await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             return await app.DATABASE.workflows.create_workflow(
                 title=title,
                 workflow_definition=workflow_definition.model_dump(mode="json"),
@@ -5860,6 +5862,7 @@ class WorkflowService:
                         workflow_definition.parameters,
                         organization,
                     )
+            await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
                 workflow_id=workflow_id,
                 title=title,

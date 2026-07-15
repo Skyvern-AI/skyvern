@@ -7,7 +7,7 @@ import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { liveSearch } from "./liveSearch";
 import {
-  defaultPanesForWorkflowState,
+  DEFAULT_STUDIO_PANES,
   fitPanesToWidth,
   panesFitWidth,
   resolveOpenPanes,
@@ -45,8 +45,7 @@ function sanitizeLearnedPanes(
  * loaded — so the latch decides from real data, never a placeholder.
  *
  * Built agents restore the user's last edit-class pane arrangement; empty
- * agents always start on the factory prompt-and-watch default (deliberate
- * first-run experience).
+ * agents always start on the factory Editor + Browser default.
  */
 export function StudioPaneDefaultsProvider({
   hasBlocks,
@@ -57,14 +56,16 @@ export function StudioPaneDefaultsProvider({
 }) {
   const location = useLocation();
 
+  // hasBlocks gates only the learned-layout lookup, not the factory default
+  // itself — empty agents never restore a saved arrangement.
   const [defaultPanes] = useState<readonly StudioPaneId[]>(() => {
     if (!hasBlocks) {
-      return defaultPanesForWorkflowState({ hasBlocks });
+      return [...DEFAULT_STUDIO_PANES];
     }
     const learnedEdit = sanitizeLearnedPanes(
       useStudioShellStore.getState().paneLayouts["edit"],
     );
-    return learnedEdit ?? defaultPanesForWorkflowState({ hasBlocks });
+    return learnedEdit ?? [...DEFAULT_STUDIO_PANES];
   });
 
   const [learnedRunPanes] = useState<readonly StudioPaneId[] | null>(() =>

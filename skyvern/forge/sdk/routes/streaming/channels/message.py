@@ -613,7 +613,14 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
                 if exfiltration_channel is not None:
                     ensure_live_interpretation()
-                    await exfiltration_channel.rearm_all_pages()
+                    try:
+                        await exfiltration_channel.rearm_all_pages()
+                    except Exception:
+                        LOG.exception(
+                            f"{class_name} failed to re-arm recording capture.",
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Failed to re-arm recording capture.")
                     return
 
                 ensure_live_interpretation()
@@ -633,10 +640,30 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     if live_interpretation_browser_session_id:
                         interpretation_registry.ingest_events(live_interpretation_browser_session_id, events)
 
-                exfiltration_channel = await ExfiltrationChannel(
+                # A dead browser target (ECONNREFUSED / 502 from connect_over_cdp) must
+                # not escape handle_data: that kills the websocket loop, the frontend
+                # reconnects and re-sends begin-exfiltration, and the recording spins
+                # in a crash-loop capturing nothing.
+                new_channel = ExfiltrationChannel(
                     on_event=on_event,
                     vnc_channel=vnc_channel,
-                ).start()
+                )
+                try:
+                    exfiltration_channel = await new_channel.start()
+                except Exception:
+                    LOG.exception(
+                        f"{class_name} failed to start recording capture.",
+                        **message_channel.identity,
+                    )
+                    try:
+                        await new_channel.stop()
+                    except Exception:
+                        LOG.debug(
+                            f"{class_name} failed to clean up after recording capture start failure.",
+                            **message_channel.identity,
+                            exc_info=True,
+                        )
+                    await send_error(message.kind, "Failed to start recording capture.")
 
             case MessageKind.CEDE_CONTROL:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
@@ -724,7 +751,18 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 if exfiltration_channel is None:
                     return
 
-                await exfiltration_channel.stop()
+                # Channel teardown is best-effort: a browser whose target already
+                # closed raises here, and that must never skip the interpretation
+                # flush below — losing every draft the user just recorded.
+                try:
+                    await exfiltration_channel.stop()
+                except Exception:
+                    # Expected race (target already closed), so warning, not error.
+                    LOG.warning(
+                        f"{class_name} failed to stop recording capture cleanly.",
+                        **message_channel.identity,
+                        exc_info=True,
+                    )
 
                 exfiltration_channel = None
                 if live_interpretation_browser_session_id:
@@ -745,7 +783,14 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
             case MessageKind.RECORDING_REARM_CAPTURE:
                 if exfiltration_channel is not None:
-                    await exfiltration_channel.rearm_all_pages()
+                    try:
+                        await exfiltration_channel.rearm_all_pages()
+                    except Exception:
+                        LOG.exception(
+                            f"{class_name} failed to re-arm recording capture.",
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Failed to re-arm recording capture.")
 
             case MessageKind.GET_BROWSER_URL:
                 try:
@@ -928,7 +973,15 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         await asyncio.gather(*loops, return_exceptions=True)
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
         if exfiltration_channel is not None:
-            await exfiltration_channel.stop()
+            try:
+                await exfiltration_channel.stop()
+            except Exception:
+                # Expected race (target already closed), so warning, not error.
+                LOG.warning(
+                    f"{class_name} failed to stop recording capture during teardown.",
+                    **message_channel.identity,
+                    exc_info=True,
+                )
         # Live interpretation is torn down only on explicit end-exfiltration so a
         # disconnect→reconnect can resume the same in-flight recording session.
         await message_channel.close(reason="loop-channel-closed")

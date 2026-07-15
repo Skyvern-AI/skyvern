@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES as GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -57,6 +60,7 @@ class TurnHaltKind(StrEnum):
     SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
     OUTPUT_SOURCE_UNOBSERVABLE = "output_source_unobservable"
     DELIVERED_UNVERIFIED = "delivered_unverified"
+    DEFINITION_CONTRACT_UNSATISFIED = "definition_contract_unsatisfied"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -94,6 +98,7 @@ _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
         ADVISORY_DISPATCH_STALLED_REASON_CODE,
     }
 )
+_DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES = frozenset({DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE})
 
 # Halts the agent did not choose: a verified outcome may suppress these.
 # ACTIVE_TERMINAL_CHALLENGE is voluntary and is deliberately excluded so a
@@ -105,6 +110,7 @@ _INVOLUNTARY_TURN_HALT_KINDS = frozenset(
         TurnHaltKind.REPAIR_CEILING_REACHED,
         TurnHaltKind.SCHEMA_INCOMPATIBILITY,
         TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE,
+        TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED,
     }
 )
 _INVOLUNTARY_BLOCKER_REASON_CODES = (
@@ -112,6 +118,7 @@ _INVOLUNTARY_BLOCKER_REASON_CODES = (
     | _PROBABLE_SITE_BLOCK_REASON_CODES
     | _SCHEMA_INCOMPATIBILITY_REASON_CODES
     | _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES
+    | _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES
     | frozenset({REPAIR_CEILING_REASON_CODE})
 )
 _VERIFIED_SUPPRESSIBLE_ACTIVE_TERMINAL_REASON_CODES = frozenset({ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE})
@@ -146,6 +153,8 @@ def _kind_for_blocker_signal(signal: CopilotToolBlockerSignal) -> TurnHaltKind |
         return TurnHaltKind.SCHEMA_INCOMPATIBILITY
     if reason in _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES:
         return TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
+    if reason in _DEFINITION_CONTRACT_UNSATISFIED_REASON_CODES:
+        return TurnHaltKind.DEFINITION_CONTRACT_UNSATISFIED
     return None
 
 

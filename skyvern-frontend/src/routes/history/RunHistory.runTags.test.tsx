@@ -38,6 +38,19 @@ const run: TaskRunListItem = {
   trigger_type: null,
   searchable_text: null,
 };
+const secondRun: TaskRunListItem = {
+  ...run,
+  task_run_id: "tr_2",
+  run_id: "wr_2",
+  title: "Second Run",
+};
+const taskRun: TaskRunListItem = {
+  ...run,
+  task_run_id: "tr_3",
+  task_run_type: TaskRunType.TaskV2,
+  run_id: "tsk_1",
+  title: "Task Run",
+};
 
 vi.mock("use-debounce", () => ({
   useDebounce: <T,>(value: T): [T] => [value],
@@ -53,7 +66,7 @@ const runsQueryCalls: Array<Record<string, unknown>> = [];
 vi.mock("@/hooks/useRunsQuery", () => ({
   useRunsQuery: (props: Record<string, unknown>) => {
     runsQueryCalls.push(props);
-    return { data: [run], isFetching: false };
+    return { data: [run, secondRun, taskRun], isFetching: false };
   },
 }));
 
@@ -97,7 +110,12 @@ vi.mock("@/api/AxiosClient", () => ({
 
 vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
   useRunTagsBatchQuery: () => ({
-    data: { wr_1: [{ key: "skyvern.platform", value: "platform_a" }] },
+    data: {
+      wr_1: [
+        { key: "skyvern.platform", value: "platform_a" },
+        { key: null, value: "adhoc" },
+      ],
+    },
     isPending: false,
   }),
 }));
@@ -123,11 +141,16 @@ vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
 vi.mock("@/routes/workflows/components/tagging/TagChipList", () => ({
   TagChipList: ({
     tags,
+    hideSystemTags,
   }: {
     tags: Array<{ key: string | null; value: string }>;
+    hideSystemTags?: boolean;
   }) => (
     <span data-testid="tag-chip-list">
-      {tags.map((tag) => `${tag.key ?? "label"}:${tag.value}`).join(",")}
+      {tags
+        .filter((tag) => !hideSystemTags || !tag.key?.startsWith("skyvern."))
+        .map((tag) => `${tag.key ?? "label"}:${tag.value}`)
+        .join(",")}
     </span>
   ),
 }));
@@ -158,12 +181,63 @@ afterEach(() => {
 });
 
 describe("RunHistory run tags", () => {
-  it("renders a run-tag chip on the all-runs list", () => {
+  it("shows user labels and hides reserved system tags on the all-runs list", () => {
     const { container } = render(<RunHistory />, { wrapper });
 
+    const chipList = within(container).getByTestId("tag-chip-list");
+    expect(chipList.textContent).toContain("adhoc");
+    expect(chipList.textContent).not.toContain("platform_a");
+  });
+
+  it("selects only workflow runs and supports shift-range bulk actions", () => {
+    render(<RunHistory />, { wrapper });
+
+    const first = screen.getByRole("checkbox", { name: "Select My Run" });
+    const second = screen.getByRole("checkbox", { name: "Select Second Run" });
     expect(
-      within(container).getByTestId("tag-chip-list").textContent,
-    ).toContain("platform_a");
+      screen.queryByRole("checkbox", { name: "Select Task Run" }),
+    ).toBeNull();
+
+    fireEvent.click(first.parentElement!);
+    fireEvent.click(second.parentElement!, { shiftKey: true });
+
+    expect(
+      screen.getByRole("toolbar", { name: "Bulk actions" }).textContent,
+    ).toContain("2 selected");
+
+    fireEvent.contextMenu(screen.getByRole("row", { name: /tsk_1 Task Run/ }));
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("hides selection when workflow tagging is disabled", () => {
+    flagState.taggingEnabled = false;
+    render(<RunHistory />, { wrapper });
+
+    expect(screen.queryByLabelText(/^Select /)).toBeNull();
+  });
+
+  it("does not restore selection after the tagging flag is toggled", () => {
+    const view = render(<RunHistory />, { wrapper });
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select My Run" }).parentElement!,
+    );
+
+    flagState.taggingEnabled = false;
+    view.rerender(<RunHistory />);
+    flagState.taggingEnabled = true;
+    view.rerender(<RunHistory />);
+
+    expect(screen.queryByRole("toolbar", { name: "Bulk actions" })).toBeNull();
+  });
+
+  it("opens the tag context menu from a workflow-run row", async () => {
+    render(<RunHistory />, { wrapper });
+
+    const row = screen.getByRole("row", { name: /wr_1 My Run/ });
+    fireEvent.contextMenu(row);
+
+    expect(await screen.findByRole("menu")).not.toBeNull();
+    expect(row.hasAttribute("data-row-active")).toBe(true);
   });
 });
 

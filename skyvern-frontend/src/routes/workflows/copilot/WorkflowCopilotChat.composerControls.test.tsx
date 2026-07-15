@@ -317,6 +317,34 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 on", () => {
       screen.queryByText("Prompt queued. Waiting for live browser..."),
     ).toBeNull();
   });
+
+  it("embeds the input: idle placeholder matches the mock, textarea borderless inside a focus-within container", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    const ta = textarea();
+
+    expect(ta.getAttribute("placeholder")).toBe(
+      "Ask Copilot to build or change your workflow…",
+    );
+    // Border + focus ring moved off the textarea onto the wrapping container.
+    expect(ta.className).not.toContain("border-input");
+    expect(ta.parentElement?.className).toContain("focus-within");
+  });
+
+  it("places the mic and send inside the container, with the mic to the right of the input", async () => {
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    const ta = textarea();
+    const container = ta.parentElement as HTMLElement;
+    const mic = screen.getByRole("button", { name: "Dictate message" });
+    const send = screen.getByRole("button", { name: "Send" });
+
+    expect(container.contains(mic)).toBe(true);
+    expect(container.contains(send)).toBe(true);
+    // Embedded on the right: the mic now follows the textarea in DOM order
+    // (it sits before it in the legacy flat row).
+    expect(
+      ta.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
 });
 
 describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 off (parity)", () => {
@@ -340,5 +368,21 @@ describe("WorkflowCopilotChat — S4 composer, copilot_ux_v1 off (parity)", () =
     expect(
       screen.queryByRole("button", { name: "Cancel queued message" }),
     ).toBeNull();
+  });
+
+  it("keeps the legacy flat row: bordered textarea, legacy placeholder, mic before the input", async () => {
+    mockCopilotUxV1Enabled.mockReturnValue(false);
+    await renderChat({ copilotV2: true, codeBlockMode: true });
+    const ta = textarea();
+    const mic = screen.getByRole("button", { name: "Dictate message" });
+
+    expect(ta.getAttribute("placeholder")).toBe(
+      "Message Skyvern Copilot, or paste recorded steps…",
+    );
+    expect(ta.className).toContain("border-input");
+    // Legacy layout: the mic sits before the textarea, outside any embedded container.
+    expect(
+      ta.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
   });
 });
