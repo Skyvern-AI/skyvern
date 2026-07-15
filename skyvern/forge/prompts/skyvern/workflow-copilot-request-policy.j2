@@ -1,5 +1,5 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+contract_version=1; testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
@@ -31,6 +31,9 @@ completion_contract:
 
 completion_criteria:
 - An array of the END-STATE OUTCOMES that must be true for the user's goal to be done. Each item is {outcome, contingent_on, contingent_antecedent_output_path, deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}.
+- Each item may additionally carry request_slot_source_id and request_slot_source_quote under the fresh contract described below.
+- When a criterion represents a request-owned output member, set request_slot_source_id and request_slot_source_quote to the exact source ID and smallest unique exact quote from REQUEST SLOT SOURCES below. The typed request-slot producer owns its final identity, path, plane, and pinability. Do not infer or emit pinability here.
+- Set request_slot_source_id and request_slot_source_quote to null for criteria that are not request-owned output members. Never invent, normalize, rename, or paraphrase a source quote.
 - outcome: a short statement of an end state the workflow must achieve (an END, not a step). Extract the goal as outcomes the user wants to be true, not the recipe they describe.
 - contingent_on: null for ordinary criteria. Use a short antecedent string only when this criterion should be graded only if that antecedent happens, for example {"contingent_on": "the provider site blocks online submission", "contingent_antecedent_output_path": "output.blocker", "outcome": "the blocker is reported to the user"}. The antecedent goes in contingent_on; the consequent to grade goes in outcome. Do not encode if/then criteria only in prose.
 - contingent_antecedent_output_path: null unless the antecedent is represented by a structured run output field. The only valid form is output.<field> (for example output.blocker). Do not emit transcript paths, selectors, regexes, JSONPath, screenshots, nested paths, or prose conditions here.
@@ -103,6 +106,8 @@ Latest assistant turn (slot-purpose anchor):
 ```{{ latest_assistant_turn }}```
 Retained recent history:
 ```{{ retained_history }}```
+REQUEST SLOT SOURCES (authoritative user text anchors; server-owned slot identity and pinability are resolved separately):
+```{{ request_slot_sources }}```
 Current workflow YAML:
 ```{{ workflow_yaml }}```
 {% if active_completion_criteria %}ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):

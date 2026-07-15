@@ -22,6 +22,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     CriterionKind,
     ExpectedOutputShape,
+    MintDisposition,
+    Pinability,
     RequestedOutputEvidenceSource,
     RequestedOutputPathMintSource,
     TerminalActionFamily,
@@ -54,6 +56,8 @@ TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
 _CRITERION_KINDS = ("outcome", "terminal_action", "validation_classification")
 _TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
+_PINABILITY_VALUES = ("pinned", "shapeless_valid", "unpinnable")
+_MINT_DISPOSITION_VALUES = ("pending", "decidable", "degraded")
 
 
 @dataclass(frozen=True)
@@ -160,6 +164,12 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
         if criterion.judgment_truth_condition is not None:
             item["judgment_predicate"] = criterion.judgment_truth_condition.predicate
             item["judgment_polarity_when_holds"] = criterion.judgment_truth_condition.polarity_when_holds
+        if criterion.request_slot_id is not None:
+            item["request_slot_id"] = criterion.request_slot_id
+        if criterion.pinability is not None:
+            item["pinability"] = criterion.pinability
+        if criterion.mint_disposition != "decidable":
+            item["mint_disposition"] = criterion.mint_disposition
         items.append(item)
     return items
 
@@ -202,6 +212,18 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             RequestedOutputPathMintSource | None,
             mint_source_raw if mint_source_raw in REQUESTED_OUTPUT_PATH_MINT_SOURCES else None,
         )
+        request_slot_id_raw = item.get("request_slot_id")
+        request_slot_id = (
+            request_slot_id_raw
+            if isinstance(request_slot_id_raw, str)
+            and len(request_slot_id_raw) == 64
+            and all(char in "0123456789abcdef" for char in request_slot_id_raw)
+            else None
+        )
+        pinability_raw = item.get("pinability")
+        pinability = pinability_raw if pinability_raw in _PINABILITY_VALUES else None
+        mint_disposition_raw = item.get("mint_disposition")
+        mint_disposition = mint_disposition_raw if mint_disposition_raw in _MINT_DISPOSITION_VALUES else "decidable"
         stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
         stored_expected_output_value = _coerce_expected_output_value(expected_output_value)
         stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
@@ -246,6 +268,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 judgment_truth_condition=_coerce_judgment_truth_condition(
                     item.get("judgment_predicate"), item.get("judgment_polarity_when_holds")
                 ),
+                request_slot_id=request_slot_id,
+                pinability=cast(Pinability | None, pinability),
+                mint_disposition=cast(MintDisposition, mint_disposition),
             )
         )
     return tuple(criteria)
