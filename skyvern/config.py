@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     # Script reviewer settings
     SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
+    SELF_HEAL_DAILY_CAP: int = 5
 
     ADDITIONAL_MODULES: list[str] = []
 
@@ -223,6 +224,8 @@ class Settings(BaseSettings):
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
     ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
+    SELF_HEAL_MAX_ACTIONS: int = 15
+    SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     ALLOWED_ORIGIN_REGEX: str | None = None

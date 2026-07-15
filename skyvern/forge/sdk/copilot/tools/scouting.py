@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_loaded_result_evidence,
@@ -59,6 +58,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
     ScoutedInteraction,
+    resolve_browser_state_for_context,
 )
 
 from ._shared import (
@@ -127,10 +127,7 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
     if not ctx.browser_session_id:
         return None
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=ctx.browser_session_id)
         if not browser_state:
             return None
         page = await browser_state.get_or_create_page()

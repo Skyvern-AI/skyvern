@@ -964,6 +964,11 @@ class AgentFunction:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
 
+    async def resolve_self_heal_api_key(self, organization_id: str) -> str | None:
+        del organization_id
+        api_key = settings.SKYVERN_API_KEY
+        return api_key if api_key and api_key != "PLACEHOLDER" else None
+
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
