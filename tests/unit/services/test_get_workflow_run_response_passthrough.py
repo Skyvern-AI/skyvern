@@ -35,6 +35,8 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
         queued_at=now,
         started_at=now,
         finished_at=now,
+        credits_used=9,
+        cached_credits_used=4,
     )
 
     status_resp = MagicMock(
@@ -72,5 +74,9 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.run_with == "code"
     assert resp.status == RunStatus.completed
     assert resp.step_count == 4
+    assert resp.usage is not None
+    assert resp.usage.billable_credits_used == 9
+    assert resp.usage.cached_credits_used == 4
+    assert resp.usage.total_credits_used == 13
     assert resp.run_request is not None
     assert resp.run_request.browser_session_id == "pbs_123"

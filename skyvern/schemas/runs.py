@@ -391,6 +391,28 @@ class UploadFileResponse(BaseModel):
     presigned_url: str = Field(description="Presigned URL to access the uploaded file")
 
 
+class RunUsageResponse(BaseModel):
+    source: Literal["task_run", "workflow_run"] = Field(
+        description="Where the usage numbers were read from.",
+        examples=["task_run", "workflow_run"],
+    )
+    duration_ms: int | None = Field(default=None, description="Recorded run duration in milliseconds.")
+    total_cost_usd: float | None = Field(
+        default=None,
+        description="Total known USD cost recorded for task runs. Null when exact cost is not recorded.",
+    )
+    compute_cost_usd: float | None = Field(default=None, description="Recorded browser compute cost in USD.")
+    llm_cost_usd: float | None = Field(default=None, description="Recorded LLM cost in USD.")
+    proxy_cost_usd: float | None = Field(default=None, description="Recorded proxy cost in USD.")
+    captcha_cost_usd: float | None = Field(default=None, description="Recorded captcha-solving cost in USD.")
+    billable_credits_used: int | None = Field(default=None, description="Non-cached credits charged for this run.")
+    cached_credits_used: int | None = Field(default=None, description="Cached credits consumed for this run.")
+    total_credits_used: int | None = Field(
+        default=None,
+        description="Sum of billable and cached credits when credit counters are available.",
+    )
+
+
 class BaseRunResponse(BaseModel):
     run_id: str = Field(
         description="Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs.",
@@ -450,6 +472,10 @@ class BaseRunResponse(BaseModel):
     step_count: int | None = Field(
         default=None,
         description="Total number of steps executed in this run",
+    )
+    usage: RunUsageResponse | None = Field(
+        default=None,
+        description="Run usage ledger for API clients that need spend, credit, or duration visibility.",
     )
 
 

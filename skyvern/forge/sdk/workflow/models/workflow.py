@@ -20,7 +20,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
-from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
+from skyvern.schemas.runs import ProxyLocationInput, RunUsageResponse, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
@@ -377,6 +377,7 @@ class WorkflowRunResponseBase(BaseModel):
     )
     credits_used: int = 0
     cached_credits_used: int = 0
+    usage: RunUsageResponse | None = None
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
     browser_session_id: str | None = None
