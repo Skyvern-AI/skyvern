@@ -198,7 +198,7 @@ type ActionRowPresentation = {
 // (failed null_action) is labeled Error instead of Screenshot. The leading
 // text reuses the matched definition step's plain-English copy so a fired
 // action reads the same as the editor, falling back to the action's own
-// reasoning and finally to the readable action type chip.
+// reasoning and finally to the readable action type label.
 function getCodeActionRowPresentation(
   action: ActionsApiResponse,
   matchedStep: CodeBlockStep | null,
@@ -287,24 +287,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-function getTimelineTypeLabel(block: WorkflowRunBlock): string {
-  switch (block.block_type) {
-    case "conditional":
-      return "Condition";
-    case "for_loop":
-    case "while_loop":
-      return "Loop";
-    case "navigation":
-    case "task":
-    case "task_v2":
-      return "Task";
-    case "http_request":
-      return "HTTP";
-    default:
-      return workflowBlockTitle[block.block_type];
-  }
 }
 
 // getCodeBlockTitle ends at the bare "Code" label for prompt-less runs, which
@@ -590,16 +572,13 @@ function TimelineActionRows({
                 <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                   #{displayIndex}
                 </span>
-                <span
-                  className={cn(
-                    "shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium",
-                    tone === "error"
-                      ? "border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-300"
-                      : "border-border text-muted-foreground",
-                  )}
-                >
-                  {label}
-                </span>
+                {tone === "error" ? (
+                  <span className="shrink-0 text-[10px] text-rose-700 dark:text-rose-300">
+                    {label}
+                  </span>
+                ) : (
+                  <span className="sr-only">{label}</span>
+                )}
                 {summary && (
                   <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
                     · {summary}
@@ -705,7 +684,7 @@ function TimelineCodeStepRows({
                 <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                   #{index + 1}
                 </span>
-                <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                <span className="shrink-0 text-[10px] text-muted-foreground">
                   {getReadableActionType(step.action_type)}
                 </span>
                 {summary && (
@@ -780,7 +759,7 @@ function TimelineSkippedStepRows({
                   className="size-2 shrink-0 rounded-full border border-dashed border-border dark:border-slate-500"
                   aria-hidden="true"
                 />
-                <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                <span className="shrink-0 text-[10px] text-muted-foreground">
                   {getReadableActionType(step.action_type)}
                 </span>
                 {summary && (
@@ -946,7 +925,7 @@ function TimelineSkippedBranchGroup({
               className="size-2 shrink-0 rounded-full border border-dashed border-border dark:border-slate-500"
               aria-hidden="true"
             />
-            <span className="shrink-0 rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            <span className="shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
               {branchMarker}
             </span>
             <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
@@ -1000,7 +979,6 @@ function WorkflowRunTimelineBlockItem({
   const duration =
     block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
   const blockTypeTitle = workflowBlockTitle[block.block_type];
-  const blockTypeLabel = getTimelineTypeLabel(block);
   const blockIndex = blockOrder?.get(block.workflow_run_block_id);
   const actions = block.actions ?? [];
   const actionCount = actions.length;
@@ -1187,7 +1165,12 @@ function WorkflowRunTimelineBlockItem({
               status={block.status}
               isFinalized={!!workflowRunIsFinalized}
             />
-            <span title={blockTypeTitle} className="shrink-0">
+            <span
+              title={blockTypeTitle}
+              role="img"
+              aria-label={blockTypeTitle}
+              className="shrink-0"
+            >
               <WorkflowBlockIcon
                 workflowBlockType={block.block_type}
                 className="size-3.5 text-tertiary-foreground"
@@ -1198,9 +1181,6 @@ function WorkflowRunTimelineBlockItem({
                 #{blockIndex}
               </span>
             )}
-            <span className="inline-flex min-w-[6rem] max-w-[8rem] shrink-0 justify-center truncate rounded bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-tertiary-foreground dark:bg-slate-700/70">
-              {blockTypeLabel}
-            </span>
             <span className="min-w-0 max-w-[12rem] truncate text-foreground dark:text-slate-200">
               {blockName}
             </span>
