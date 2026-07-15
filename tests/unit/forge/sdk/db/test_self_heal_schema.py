@@ -66,7 +66,7 @@ def test_heal_migration_chains_from_current_head() -> None:
     # The heal migration must be part of the single linear history, not pinned as the tip:
     # later migrations stack on top of it.
     ancestors = {rev.revision for rev in script.walk_revisions(base="base", head=heads[0])}
-    assert "3b9d7a4c1e2f" in ancestors
+    assert "2b8e37d98d97" in ancestors
 
 
 def _episode(
