@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -560,13 +560,270 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
-_PASSWORD_NAME_RE = re.compile(
-    r"\bpass(?:word|phrase|code)s?\b|\bsecret\b|\btoken\b|\bcredential\b|\bpwd\b|\bpasswd\b|\bpin\b",
-    re.IGNORECASE,
-)
-
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
+
+_OBSERVE_INTERACTABLES_JS = r"""
+({ scopeSelector, includeValues }) => {
+  const root = scopeSelector ? document.querySelector(scopeSelector) : document.body;
+  if (!root) return [];
+
+  const esc = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"));
+  const classes = (element) => (element.className || "").toString();
+  const lowerClasses = (element) => classes(element).toLowerCase();
+  const isPassword = (element) => element.tagName.toLowerCase() === "input" && (element.getAttribute("type") || "").toLowerCase() === "password";
+  const text = (element) => {
+    const aria = element.getAttribute("aria-label");
+    if (aria?.trim()) return aria.trim();
+    const labelledBy = element.getAttribute("aria-labelledby");
+    if (labelledBy) {
+      const labelledText = labelledBy
+        .split(/\s+/)
+        .map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || "")
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (labelledText) return labelledText;
+    }
+    if (element.id) {
+      const labelText = (document.querySelector(`label[for="${esc(element.id)}"]`)?.innerText || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (labelText) return labelText;
+    }
+    if (element.labels && element.labels.length) {
+      const labelsText = Array.from(element.labels)
+        .map((node) => node.innerText || node.textContent || "")
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (labelsText) return labelsText;
+    }
+    // Deliberate: unlabeled non-password inputs may surface their value as the accessible
+    // name (identification fallback), independent of includeValues; passwords never do.
+    return (element.innerText || element.textContent || element.getAttribute("placeholder") || (isPassword(element) ? "" : element.value) || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+  const cssPath = (element) => {
+    if (element.id) return `#${esc(element.id)}`;
+    const parts = [];
+    for (let current = element; current && current.nodeType === Node.ELEMENT_NODE && current !== document.documentElement; current = current.parentElement) {
+      let part = current.tagName.toLowerCase();
+      if (current.id) {
+        parts.unshift(`#${esc(current.id)}`);
+        break;
+      }
+      const siblings = current.parentElement
+        ? Array.from(current.parentElement.children).filter((child) => child.tagName === current.tagName)
+        : [];
+      if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(current) + 1})`;
+      parts.unshift(part);
+    }
+    return parts.join(" > ");
+  };
+  const visible = (element) => {
+    if (element.tagName.toLowerCase() === "option") return element.parentElement ? visible(element.parentElement) : false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return !element.hidden && element.getAttribute("aria-hidden") !== "true" && style?.display !== "none" && style?.visibility !== "hidden" && style?.visibility !== "collapse" && rect.width > 0 && rect.height > 0;
+  };
+  const explicitRole = (element) => (element.getAttribute("role") || "").toLowerCase();
+  const nativeRole = (element) => {
+    const tag = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") || "").toLowerCase();
+    if (["button", "select", "option", "textarea"].includes(tag)) {
+      return { button: "button", select: "combobox", option: "option", textarea: "textbox" }[tag];
+    }
+    if (tag === "a" && element.href) return "link";
+    if (tag !== "input") return "";
+    return { checkbox: "checkbox", radio: "radio", range: "slider", search: "searchbox" }[type] || "textbox";
+  };
+  const widgetRoles = new Set(["button", "checkbox", "combobox", "link", "listbox", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "radio", "searchbox", "slider", "spinbutton", "switch", "tab", "textbox", "treeitem"]);
+  const pointer = (element) => window.getComputedStyle(element)?.cursor === "pointer";
+  const staticClick = (element) => element.hasAttribute("onclick") || typeof element.onclick === "function" || element.hasAttribute("jsaction");
+  const frameworkClick = (element) => {
+    if (element.getAttributeNames().some((attr) => ["ng-click", "data-ng-click", "x-ng-click", "(click)"].includes(attr.toLowerCase()))) return true;
+    try {
+      return Boolean(window.jQuery?._data?.(element, "events")?.click);
+    } catch (_) {
+      return false;
+    }
+  };
+  const knownClass = (element) => {
+    const className = classes(element);
+    return className.includes("dropdown-item") || className.includes("ui-menu-item") || className.includes("pac-item") || className.includes("rddlItem") || className === "option";
+  };
+  const ancestorMatching = (element, predicate) => {
+    for (let current = element.parentElement, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
+      if (predicate(current)) return current;
+    }
+    return null;
+  };
+  const optionContainer = (element) => ancestorMatching(element, (candidate) => {
+    const role = explicitRole(candidate);
+    const cls = lowerClasses(candidate);
+    return role === "listbox" || role === "menu" || ["list", "menu", "option", "dropdown", "select"].some((token) => cls.includes(token));
+  });
+  const interactiveAncestor = (element) => ancestorMatching(element, (candidate) => {
+    const role = explicitRole(candidate);
+    const cls = lowerClasses(candidate);
+    return pointer(candidate) || staticClick(candidate) || frameworkClick(candidate) || candidate.getAttribute("tabindex") === "0" || candidate.getAttribute("aria-expanded") === "true" || cls.includes("open") || role === "combobox" || role === "listbox";
+  });
+  const optionLike = (element) => Boolean(text(element) && optionContainer(element) && interactiveAncestor(element));
+  const roleFor = (element) => explicitRole(element) || nativeRole(element) || (optionLike(element) ? "option" : "button");
+  const candidate = (element) => {
+    if (!visible(element) || (window.getComputedStyle(element)?.pointerEvents === "none" && !element.disabled)) return false;
+    const tag = element.tagName.toLowerCase();
+    return Boolean(nativeRole(element) || widgetRoles.has(explicitRole(element)) || staticClick(element) || frameworkClick(element) || knownClass(element) || pointer(element) || (tag === "div" && element.getAttribute("tabindex") === "0") || optionLike(element));
+  };
+
+  // querySelectorAll excludes the root itself — a scoped observe must still surface the scoped element.
+  return (scopeSelector ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*")))
+    .filter(candidate)
+    .map((element) => {
+      const tag = element.tagName.toLowerCase();
+      const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
+      if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
+        item.value = element.value || element.getAttribute("value") || "";
+      }
+      if (tag === "select") item.options = Array.from(element.options).map((option) => text(option));
+      return item;
+    })
+    .filter((item) => item.name || item.role);
+}
+"""
+
+
+_NATIVE_OPTION_TARGET_JS = r"""
+(element) => {
+  if (!element || element.tagName?.toLowerCase() !== "option") return null;
+  const select = element.closest("select");
+  if (!select) return null;
+
+  const esc = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"));
+  const cssPath = (target) => {
+    if (target.id) return `#${esc(target.id)}`;
+    const parts = [];
+    for (let current = target; current && current.nodeType === Node.ELEMENT_NODE && current !== document.documentElement; current = current.parentElement) {
+      let part = current.tagName.toLowerCase();
+      if (current.id) {
+        parts.unshift(`#${esc(current.id)}`);
+        break;
+      }
+      const siblings = current.parentElement
+        ? Array.from(current.parentElement.children).filter((child) => child.tagName === current.tagName)
+        : [];
+      if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(current) + 1})`;
+      parts.unshift(part);
+    }
+    return parts.join(" > ");
+  };
+
+  return {
+    select_selector: cssPath(select),
+    index: Array.prototype.indexOf.call(select.options, element),
+    value: element.value ?? element.getAttribute("value") ?? "",
+    label: (element.label || element.textContent || "").replace(/\s+/g, " ").trim(),
+  };
+}
+"""
+
+
+_NATIVE_OPTION_PROBE_TIMEOUT_MS = 1000
+
+
+@dataclass
+class NativeOptionSelection:
+    select_selector: str
+    value: str | None = None
+    label: str | None = None
+    index: int | None = None
+    selected_by: Literal["index", "value", "label"] = "index"
+
+
+async def select_native_option_if_targeted(
+    page: Any,
+    selector: str,
+    *,
+    timeout: int = 30000,
+) -> NativeOptionSelection | None:
+    """If ``selector`` targets a native <option>, select it via its parent <select>.
+
+    Native options inside a collapsed select are not actionable click targets in
+    Playwright. This keeps selector/ref driven click flows deterministic by
+    translating that specific target shape into a select_option call.
+    """
+    raw_page = getattr(page, "page", page)
+    locator_factory = getattr(raw_page, "locator", None)
+    if locator_factory is None:
+        return None
+
+    locator = locator_factory(selector)
+    first_locator = getattr(locator, "first", locator)
+    # Bounded classification probe: only decides whether the target is a native <option>.
+    # If the element is not readily present, defer to the caller's click (preserving
+    # direct-mode fast-fail and resilient-mode waiting) instead of blocking the full
+    # action timeout here.
+    probe_timeout = min(timeout, _NATIVE_OPTION_PROBE_TIMEOUT_MS)
+    try:
+        option_info = await first_locator.evaluate(_NATIVE_OPTION_TARGET_JS, timeout=probe_timeout)
+    except Exception:
+        return None
+    if not isinstance(option_info, dict):
+        return None
+
+    select_selector = option_info.get("select_selector")
+    if not isinstance(select_selector, str) or not select_selector:
+        return None
+
+    select_locator = locator_factory(select_selector)
+    value = option_info.get("value")
+    label = option_info.get("label")
+    index = option_info.get("index")
+    last_error: Exception | None = None
+
+    # The ref identified ONE specific <option>. Prefer its index so duplicate or empty option
+    # values cannot resolve to the wrong option; fall back to value, then label.
+    if isinstance(index, int) and index >= 0:
+        try:
+            await select_locator.select_option(index=index, timeout=timeout)
+            return NativeOptionSelection(
+                select_selector=select_selector,
+                value=str(value) if value is not None else None,
+                label=str(label) if label else None,
+                index=index,
+                selected_by="index",
+            )
+        except Exception as exc:
+            last_error = exc
+
+    if value is not None:
+        try:
+            await select_locator.select_option(value=str(value), timeout=timeout)
+            return NativeOptionSelection(
+                select_selector=select_selector,
+                value=str(value),
+                label=str(label) if label else None,
+                index=index if isinstance(index, int) else None,
+                selected_by="value",
+            )
+        except Exception as exc:
+            last_error = exc
+
+    if label:
+        await select_locator.select_option(label=str(label), timeout=timeout)
+        return NativeOptionSelection(
+            select_selector=select_selector,
+            value=str(value) if value is not None else None,
+            label=str(label),
+            index=index if isinstance(index, int) else None,
+            selected_by="label",
+        )
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError(f"Native option target {selector!r} has no selectable index, value, or label")
 
 
 @dataclass
@@ -575,6 +832,7 @@ class ObservedElement:
     role: str
     name: str
     tag: str
+    selector: str | None = None
     value: str | None = None
     options: list[str] | None = None
     match_index: int = 0
@@ -596,17 +854,13 @@ def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
         return []
     result: list[dict[str, Any]] = []
     if node.get("role") and node["role"] != "WebArea":
+        # a11y snapshots carry current input values; drop them at capture so the guarded
+        # DOM scan (includeValues gate in _OBSERVE_INTERACTABLES_JS) is the only value source.
+        node.pop("value", None)
         result.append(node)
     for child in node.get("children", []):
         result.extend(_flatten_a11y_tree(child))
     return result
-
-
-def _is_password_field(role: str, name: str) -> bool:
-    """DESIGN-2: Detect password-type fields for value redaction."""
-    if _PASSWORD_NAME_RE.search(name):
-        return True
-    return role == "textbox" and "password" in name.lower()
 
 
 def _extract_options(node: dict[str, Any]) -> list[str] | None:
@@ -618,59 +872,152 @@ def _extract_options(node: dict[str, Any]) -> list[str] | None:
     return opts if opts else None
 
 
+async def _get_dom_observe_elements(
+    page: Any,
+    selector: str | None = None,
+    include_values: bool = False,
+) -> list[dict[str, Any]]:
+    evaluate = getattr(page, "evaluate", None)
+    if evaluate is None:
+        return []
+    try:
+        result = await evaluate(
+            _OBSERVE_INTERACTABLES_JS,
+            {"scopeSelector": selector, "includeValues": include_values},
+        )
+    except Exception:
+        return []
+    if not isinstance(result, list):
+        return []
+    return [element for element in result if isinstance(element, dict)]
+
+
+def _merge_dom_observe_elements(
+    a11y_elements: list[dict[str, Any]],
+    dom_elements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = list(a11y_elements)
+    selector_seen = {element.get("selector") for element in merged if element.get("selector")}
+
+    # Only upgrade an a11y element with a DOM selector when the (role, name, tag) key is
+    # unambiguous on both sides. A duplicate label would otherwise risk attaching the
+    # selector to the wrong element — a confidently wrong deterministic action. Ambiguous
+    # DOM elements still fall through to the append path with their own distinct selector.
+    def _key(role: str, name: str, tag: str) -> tuple[str, str, str]:
+        return role, name, tag
+
+    a11y_key_counts: dict[tuple[str, str, str], int] = {}
+    for element in merged:
+        if not element.get("selector"):
+            role = element.get("role", "")
+            key = _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, ""))
+            a11y_key_counts[key] = a11y_key_counts.get(key, 0) + 1
+    dom_key_counts: dict[tuple[str, str, str], int] = {}
+    for dom_element in dom_elements:
+        key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
+        dom_key_counts[key] = dom_key_counts.get(key, 0) + 1
+
+    for dom_element in dom_elements:
+        dom_selector = dom_element.get("selector")
+        if dom_selector and dom_selector in selector_seen:
+            continue
+        dom_key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
+        unambiguous = a11y_key_counts.get(dom_key, 0) == 1 and dom_key_counts.get(dom_key, 0) == 1
+        matched_existing = False
+        if unambiguous:
+            for existing in merged:
+                if (
+                    not existing.get("selector")
+                    and existing.get("role", "") == dom_element.get("role", "")
+                    and existing.get("name", "") == dom_element.get("name", "")
+                    and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
+                ):
+                    existing["selector"] = dom_selector
+                    if dom_element.get("value") is not None:
+                        existing["value"] = dom_element["value"]
+                    if dom_element.get("options") and not existing.get("children"):
+                        existing["options"] = dom_element.get("options")
+                    matched_existing = True
+                    if dom_selector:
+                        selector_seen.add(dom_selector)
+                    break
+        if not matched_existing:
+            merged.append(dom_element)
+            if dom_selector:
+                selector_seen.add(dom_selector)
+
+    return merged
+
+
 async def do_observe(
     page: Any,
     selector: str | None = None,
     interactive_only: bool = True,
     max_elements: int = 50,
+    include_values: bool = False,
 ) -> ObserveResult:
     """Capture interactive elements with stable refs for batch operations."""
-    if selector:
+    # Execute-step params arrive as untyped JSON; a string like "false" must not
+    # enable value capture — the opt-in counts only as a literal boolean True.
+    include_values = include_values is True
+    accessibility = getattr(page, "accessibility", None)
+    if selector and accessibility is not None:
         element_handle = await page.locator(selector).first.element_handle()
-        snapshot = await page.accessibility.snapshot(root=element_handle)
+        snapshot = await accessibility.snapshot(root=element_handle)
+    elif accessibility is not None:
+        snapshot = await accessibility.snapshot()
     else:
-        snapshot = await page.accessibility.snapshot()
+        snapshot = None
 
     all_elements = _flatten_a11y_tree(snapshot)
+    dom_elements = await _get_dom_observe_elements(page, selector, include_values)
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
 
+    all_elements = _merge_dom_observe_elements(all_elements, dom_elements)
+
     total = len(all_elements)
 
-    # Compute group sizes against the FULL filtered list (pre-cap) so that
-    # kept elements colliding with off-cap siblings still get disambiguated.
+    # Compute group sizes against the FULL filtered list (pre-cap) so that kept elements
+    # colliding with off-cap siblings still get disambiguated. Also assign a STABLE match
+    # ordinal in original (pre-cap, pre-reorder) order so the `nth=N` fallback ref keeps
+    # pointing at the right element even when the cap reorders elements below.
     full_group_size: dict[tuple[str, str], int] = {}
+    stable_counts: dict[tuple[str, str], int] = {}
     for elem in all_elements:
-        full_group_size[(elem.get("role", ""), elem.get("name", ""))] = (
-            full_group_size.get((elem.get("role", ""), elem.get("name", "")), 0) + 1
-        )
+        gkey = (elem.get("role", ""), elem.get("name", ""))
+        full_group_size[gkey] = full_group_size.get(gkey, 0) + 1
+        elem["_match_index"] = stable_counts.get(gkey, 0)
+        stable_counts[gkey] = elem["_match_index"] + 1
 
-    capped = all_elements[:max_elements]
+    if total > max_elements:
+        # Keep the custom options this scan surfaces from being crowded out of the cap:
+        # option-role elements first, then other selector-bearing elements, then the rest.
+        options = [e for e in all_elements if e.get("role") == "option"]
+        other_selector = [e for e in all_elements if e.get("role") != "option" and e.get("selector")]
+        rest = [e for e in all_elements if e.get("role") != "option" and not e.get("selector")]
+        capped = (options + other_selector + rest)[:max_elements]
+    else:
+        capped = all_elements
 
     observed: list[ObservedElement] = []
-    group_counts: dict[tuple[str, str], int] = {}
     for i, elem in enumerate(capped):
         role = elem.get("role", "")
         name = elem.get("name", "")
-        value = elem.get("value")
-
-        # DESIGN-2: Redact password field values
-        if value and _is_password_field(role, name):
-            value = "***"
 
         key = (role, name)
-        match_index = group_counts.get(key, 0)
-        group_counts[key] = match_index + 1
+        match_index = elem.get("_match_index", 0)
 
         observed.append(
             ObservedElement(
                 ref=f"e{i}",
                 role=role,
                 name=name,
-                tag=_ROLE_TO_TAG.get(role, ""),
-                value=value,
-                options=_extract_options(elem),
+                tag=elem.get("tag") or _ROLE_TO_TAG.get(role, ""),
+                selector=elem.get("selector"),
+                value=elem.get("value"),
+                options=elem.get("options") or _extract_options(elem),
                 match_index=match_index,
                 needs_disambiguation=full_group_size[key] > 1,
             )
@@ -694,6 +1041,7 @@ def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
             "role": e.role,
             "name": e.name,
             "tag": e.tag,
+            "selector": e.selector,
             "value": e.value,
             "options": e.options,
         }
@@ -703,8 +1051,15 @@ def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
     return result
 
 
+def ref_map_from_elements(elements: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Ref-map/registry entries persist across calls — they hold ref-resolution fields, never input values."""
+    return {element["ref"]: {k: v for k, v in element.items() if k != "value"} for element in elements}
+
+
 def ref_to_selector(elem: dict[str, Any]) -> str:
     """Convert an observed element's a11y data to a Playwright role selector."""
+    if selector := elem.get("selector"):
+        return selector
     role = elem.get("role", "")
     name = elem.get("name", "")
     if name:
@@ -749,6 +1104,14 @@ class ExecuteStep:
     params: dict[str, Any] = field(default_factory=dict)
 
 
+class ToolStepError(RuntimeError):
+    """Step failure that preserves the failing tool's structured error payload."""
+
+    def __init__(self, error: dict[str, Any]) -> None:
+        super().__init__(error.get("message", "Tool execution failed"))
+        self.error = error
+
+
 @dataclass
 class StepResult:
     step: int
@@ -756,7 +1119,7 @@ class StepResult:
     ok: bool
     wall_ms: int = 0
     data: dict[str, Any] | None = None
-    error: str | None = None
+    error: str | dict[str, Any] | None = None
 
 
 @dataclass
@@ -771,6 +1134,7 @@ async def do_execute(
     dispatch_fn: Any,
     steps: list[ExecuteStep],
     stop_on_error: bool = True,
+    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool] | None = None,
 ) -> ExecuteResult:
     """Execute a sequence of deterministic browser operations in one batch.
 
@@ -781,6 +1145,9 @@ async def do_execute(
     nav_failed = False
 
     for i, step in enumerate(steps):
+        if step.tool == "navigate":
+            ref_map = {}
+
         # DESIGN-3: Block sensitive ops after failed navigate
         if nav_failed and not stop_on_error and step.tool in _SENSITIVE_TOOLS:
             results.append(
@@ -797,16 +1164,23 @@ async def do_execute(
         t0 = time.monotonic()
         try:
             result = await dispatch_fn(step, ref_map)
+            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges).
+            # If session publication rejects the snapshot (a concurrent navigation
+            # invalidated it), the batch must not act on it either.
+            if step.tool == "observe" and result and "elements" in result:
+                new_map = ref_map_from_elements(result["elements"])
+                if on_ref_map_update is None or on_ref_map_update(new_map):
+                    ref_map = new_map
+                else:
+                    ref_map = {}
+
             wall_ms = int((time.monotonic() - t0) * 1000)
             results.append(StepResult(step=i, tool=step.tool, ok=True, wall_ms=wall_ms, data=result))
 
-            # DESIGN-4: Each observe REPLACES the entire ref_map (not merges)
-            if step.tool == "observe" and result and "elements" in result:
-                ref_map = {elem["ref"]: elem for elem in result["elements"]}
-
         except Exception as e:
             wall_ms = int((time.monotonic() - t0) * 1000)
-            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=str(e)))
+            error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
+            results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:

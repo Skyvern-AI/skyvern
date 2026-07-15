@@ -12,6 +12,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import create_named_temporary_file
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
@@ -474,6 +475,51 @@ class ArtifactManager:
             artifact_type=ArtifactType.SESSION_REPLAY,
             checksum=checksum,
             file_size=file_size,
+        )
+
+    async def create_browser_session_data_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        artifact_type: ArtifactType,
+        filename: str,
+        data: bytes,
+    ) -> str:
+        """Upload browser-session file data and record a deduplicated artifact row.
+
+        Idempotent on ``(browser_session_id, uri, artifact_type)`` where ``uri`` derives from
+        ``filename``: re-ingesting the same filename overwrites the stored object but returns the
+        existing row unchanged, so its ``file_size``/``checksum`` reflect the first write.
+        """
+        if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+            raise ValueError("filename must be a file name without path components")
+
+        temp_file = create_named_temporary_file(delete=False)
+        try:
+            temp_file.write(data)
+            temp_file.close()
+            uri = await app.STORAGE.sync_browser_session_file(
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                artifact_type=artifact_type.value,
+                local_file_path=temp_file.name,
+                remote_path=filename,
+            )
+        finally:
+            temp_file.close()
+            try:
+                os.remove(temp_file.name)
+            except FileNotFoundError:
+                pass
+
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=artifact_type,
+            file_size=len(data),
         )
 
     async def _create_browser_session_artifact(
@@ -1728,9 +1774,13 @@ class ArtifactManager:
                 f"Timeout (30s) while waiting for upload aio tasks for primary_keys={primary_keys}",
                 primary_keys=primary_keys,
             )
-
-        for primary_key in primary_keys:
-            del self.upload_aiotasks_map[primary_key]
+        finally:
+            # Release tracking refs on every exit path — including caller cancellation and
+            # non-timeout gather errors — so an orphaned entry can't pin a completed upload Task
+            # and the artifact bytes its traceback retains. pop() keeps overlapping waits on the
+            # same key idempotent (no KeyError).
+            for primary_key in primary_keys:
+                self.upload_aiotasks_map.pop(primary_key, None)
 
         # Flush any accumulated step archives for the given task IDs
         primary_key_set = set(primary_keys)

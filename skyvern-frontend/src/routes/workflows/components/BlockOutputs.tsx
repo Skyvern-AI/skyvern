@@ -101,7 +101,7 @@ function BlockOutputs({
         )}
         {pageName === "override" && (
           <header className="flex w-full items-center justify-end gap-2 text-xs">
-            <Label className="text-xs font-normal text-slate-300">
+            <Label className="text-xs font-normal text-tertiary-foreground">
               Use Override
             </Label>
             <HelpTooltip content="Use this override instead of the last block output" />
@@ -134,7 +134,7 @@ function BlockOutputs({
               />
             </>
           ) : (
-            <div className="flex h-full w-full flex-1 items-center justify-center bg-slate-950">
+            <div className="flex h-full w-full flex-1 items-center justify-center bg-muted text-muted-foreground dark:bg-slate-950 dark:text-slate-100">
               No output defined
             </div>
           )}

@@ -10,6 +10,8 @@ from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.mcp_tools import mcp
+from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowRequest
 from tests.unit._mcp_test_helpers import patch_get_workflow_by_id as _patch_get_workflow_by_id
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
@@ -54,6 +56,76 @@ def _fake_workflow_dict(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def _large_runtime_workflow_definition() -> dict[str, object]:
+    runtime_parameters: list[dict[str, object]] = []
+    for index in range(30):
+        parameter: dict[str, object] = {
+            "parameter_type": "workflow",
+            "key": f"input_{index:02d}",
+            "workflow_parameter_type": "json" if index < 10 else "string",
+            "default_value": [f"item-{index}"] if index < 10 else f"value-{index}",
+        }
+        runtime_parameters.append(
+            {
+                **parameter,
+                "workflow_parameter_id": f"wp_{index:02d}",
+                "workflow_id": "wf_test",
+            }
+        )
+
+    def code_block(index: int, label: str) -> dict[str, object]:
+        parameter = runtime_parameters[index % len(runtime_parameters)]
+        return {
+            "block_type": "code",
+            "label": label,
+            "code": f"source = {parameter['key']!r}\nresult = {'x' * 1800!r}",
+            "parameters": [parameter],
+            "output_parameter": {
+                "parameter_type": "output",
+                "key": f"{label}_output",
+                "output_parameter_id": f"op_{index:03d}",
+                "workflow_id": "wf_test",
+            },
+        }
+
+    blocks = [code_block(index, f"portal_step_{index:03d}") for index in range(68)]
+    blocks.extend(
+        [
+            {
+                "block_type": "navigation",
+                "label": "open_portal",
+                "url": "https://example.com",
+                "navigation_goal": "Open the portal landing page.",
+                "parameters": [runtime_parameters[28]],
+            },
+            {
+                "block_type": "extraction",
+                "label": "extract_portal_summary",
+                "data_extraction_goal": "Extract a concise portal summary.",
+                "data_schema": {"type": "object", "properties": {"summary": {"type": "string"}}},
+                "parameters": [runtime_parameters[29]],
+            },
+        ]
+    )
+    for loop_index in range(10):
+        blocks.append(
+            {
+                "block_type": "for_loop",
+                "label": f"portal_loop_{loop_index:02d}",
+                "loop_over": runtime_parameters[loop_index],
+                "loop_blocks": [
+                    code_block(
+                        68 + loop_index * 2 + child_index,
+                        f"portal_loop_{loop_index:02d}_step_{child_index}",
+                    )
+                    for child_index in range(2)
+                ],
+            }
+        )
+
+    return {"parameters": runtime_parameters, "blocks": blocks}
 
 
 def _patch_skyvern_http(
@@ -508,6 +580,111 @@ async def test_workflow_update_defaults_proxy_when_existing_is_null(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_workflow_update_fetches_existing_workflow_once_for_all_injectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing_workflow = _fake_workflow_dict(
+        proxy_location="RESIDENTIAL_AU",
+        run_sequentially=True,
+        sequential_key="existing-sequential-key",
+        workflow_definition={
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "report_url",
+                    "workflow_parameter_type": "string",
+                }
+            ],
+            "blocks": [
+                {
+                    "block_type": "code",
+                    "label": "build_report",
+                    "parameter_keys": ["report_url"],
+                    "code": "result = report_url",
+                }
+            ],
+        },
+    )
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=existing_workflow)
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "report_url",
+                    "workflow_parameter_type": "string",
+                }
+            ],
+            "blocks": [
+                {
+                    "block_type": "code",
+                    "label": "build_report",
+                    "code": "result = report_url",
+                }
+            ],
+        },
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True
+    methods = [call.kwargs["method"] for call in request_mock.await_args_list]
+    assert methods.count("GET") == 1
+    assert methods.count("POST") == 1
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert sent_definition["proxy_location"] == "RESIDENTIAL_AU"
+    assert sent_definition["run_sequentially"] is True
+    assert sent_definition["sequential_key"] == "existing-sequential-key"
+    assert sent_definition["workflow_definition"]["blocks"][0]["parameter_keys"] == ["report_url"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_does_not_fetch_existing_workflow_for_unparseable_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition="{",
+        format="json",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == workflow_tools.ErrorCode.INVALID_INPUT
+    assert request_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_not_found_error_from_lazy_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    request_mock = _patch_skyvern_http(
+        monkeypatch,
+        response_payload={"detail": "Workflow not found"},
+        status_code=404,
+    )
+    definition = {
+        "title": "Updated workflow",
+        "workflow_definition": {"parameters": [], "blocks": []},
+    }
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == workflow_tools.ErrorCode.WORKFLOW_NOT_FOUND
+    assert request_mock.await_count == 1
+    assert request_mock.await_args.kwargs["method"] == "GET"
+
+
+@pytest.mark.asyncio
 async def test_workflow_update_preserves_sequential_settings_when_omitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -554,6 +731,78 @@ async def test_workflow_update_preserves_sequential_settings_when_omitted(
     assert result["ok"] is True
     assert sent_definition.get("run_sequentially") is True
     assert sent_definition.get("sequential_key") == "existing-sequential-key"
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_preserves_all_update_safe_settings_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Required fields are caller-owned; proxy has its own injector; folder is retained by the service;
+    # enable_self_healing/code_version already inherit when normalized to None.
+    excluded_fields = {
+        "title",
+        "workflow_definition",
+        "proxy_location",
+        "folder_id",
+        "enable_self_healing",
+        "code_version",
+    }
+    assert set(workflow_tools._WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS) == (
+        set(WorkflowCreateYAMLRequest.model_fields) - excluded_fields
+    )
+
+    preserved_values: dict[str, object] = {
+        "description": "Existing description",
+        "webhook_callback_url": "https://example.com/webhook",
+        "totp_verification_url": "https://example.com/totp",
+        "totp_identifier": "existing@example.com",
+        "persist_browser_session": True,
+        "pin_saved_session_ip": True,
+        "browser_profile_id": "bp_existing",
+        "browser_profile_key": "{{ account_id }}",
+        "model": {"name": "existing-model"},
+        "is_saved_task": True,
+        "max_screenshot_scrolls": 7,
+        "max_elapsed_time_minutes": 10,
+        "extra_http_headers": {"X-Existing": "value"},
+        "cdp_connect_headers": {"X-CDP-Existing": "***"},
+        "status": "draft",
+        "run_with": "code",
+        "ai_fallback": False,
+        "cache_key": None,
+        "adaptive_caching": True,
+        "generate_script_on_terminal": True,
+        "run_sequentially": True,
+        "sequential_key": "existing-sequential-key",
+    }
+    existing_workflow = _fake_workflow_dict(
+        proxy_location="RESIDENTIAL",
+        workflow_definition={"parameters": [], "blocks": []},
+        **preserved_values,
+    )
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=existing_workflow)
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        assert workflow_id == "wpid_test"
+        assert version is None
+        return existing_workflow
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(
+            {
+                "title": "Updated workflow",
+                "workflow_definition": {"parameters": [], "blocks": []},
+            }
+        ),
+        format="json",
+    )
+
+    assert result["ok"] is True
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]
+    assert {field: sent_definition[field] for field in preserved_values} == preserved_values
 
 
 @pytest.mark.asyncio
@@ -3806,3 +4055,139 @@ async def test_get_then_update_round_trip_preserves_block_parameter_link(
     assert block.get("parameter_keys") == ["report_url"]
     assert "parameters" not in block
     assert "output_parameter" not in block
+
+
+@pytest.mark.asyncio
+async def test_large_workflow_surgical_edit_preserves_every_other_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime_definition = _large_runtime_workflow_definition()
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(proxy_location="RESIDENTIAL", workflow_definition=runtime_definition)
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    got = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    assert got["ok"] is True
+    assert len(json.dumps(got, ensure_ascii=False)) > MCP_MAX_RESPONSE_CHARS
+    authoring_definition = got["data"]["workflow_definition"]
+    serialized_definition = json.dumps(
+        {
+            "title": got["data"]["title"],
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": authoring_definition,
+        }
+    )
+    authoring_blocks = workflow_tools._iter_blocks_flat(authoring_definition["blocks"])
+
+    assert len(serialized_definition.encode()) >= 150_000
+    assert len(authoring_blocks) == 100
+    assert len(authoring_definition["parameters"]) == 30
+    assert {"code", "navigation", "extraction", "for_loop"} <= {block["block_type"] for block in authoring_blocks}
+    WorkflowRequest.model_validate(
+        {
+            "json_definition": {
+                "title": got["data"]["title"],
+                "proxy_location": "RESIDENTIAL",
+                "workflow_definition": authoring_definition,
+            }
+        }
+    )
+
+    normalized_definition = workflow_tools._normalize_json_definition(
+        {
+            "title": got["data"]["title"],
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": authoring_definition,
+        }
+    )["workflow_definition"]
+    expected_definition = json.loads(json.dumps(normalized_definition))
+    edited_block = next(block for block in authoring_blocks if block["block_type"] == "code")
+    edited_block["code"] = f"{edited_block['code']}\nresult = 'surgical edit'"
+    expected_edited_block = next(
+        block
+        for block in workflow_tools._iter_blocks_flat(expected_definition["blocks"])
+        if block["label"] == edited_block["label"]
+    )
+    expected_edited_block["code"] = edited_block["code"]
+    serialized_definition = json.dumps(
+        {
+            "title": got["data"]["title"],
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": authoring_definition,
+        }
+    )
+
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=serialized_definition,
+        format="json",
+    )
+
+    assert result["ok"] is True
+    sent_definition = request_mock.await_args.kwargs["json"]["json_definition"]["workflow_definition"]
+    assert sent_definition == expected_definition
+
+
+@pytest.mark.parametrize(("version", "expected_version_hint"), [(7, "--version 7"), (None, None)])
+@pytest.mark.asyncio
+async def test_registered_large_workflow_get_returns_structured_cli_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    version: int | None,
+    expected_version_hint: str | None,
+) -> None:
+    runtime_definition = _large_runtime_workflow_definition()
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(
+            proxy_location="RESIDENTIAL",
+            workflow_definition=runtime_definition,
+            version=version or 1,
+        )
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+
+    arguments: dict[str, object] = {"workflow_id": "wpid_test"}
+    if version is not None:
+        arguments["version"] = version
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_get", arguments)
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is False
+    assert "_truncated" not in result.data
+    assert str(MCP_MAX_RESPONSE_CHARS) in result.data["error"]["message"]
+    get_hint = result.data["error"]["hint"].split(", edit wf.json", 1)[0]
+    assert (expected_version_hint in get_hint) if expected_version_hint is not None else "--version" not in get_hint
+    assert "skyvern workflow update --id wpid_test --definition @wf.json" in result.data["error"]["hint"]
+    data = result.data["data"]
+    assert (data["workflow_permanent_id"], data["title"], data["version"]) == (
+        "wpid_test",
+        "Example Workflow",
+        version or 1,
+    )
+    assert (data["block_count"], data["parameter_count"]) == (100, 30)
+    assert data["definition_chars"] >= 150_000
+
+
+@pytest.mark.asyncio
+async def test_registered_small_workflow_get_passes_through_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow = _fake_workflow_dict(
+        proxy_location="RESIDENTIAL",
+        workflow_definition={"parameters": [], "blocks": []},
+    )
+
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return workflow
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
+    direct = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    async with Client(mcp) as client:
+        registered = await client.call_tool("skyvern_workflow_get", {"workflow_id": "wpid_test"})
+
+    assert registered.is_error is False
+    assert isinstance(registered.data, dict)
+    assert registered.data["data"] == direct["data"]
+    assert registered.data["error"] is None and "_truncated" not in registered.data

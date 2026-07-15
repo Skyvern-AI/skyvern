@@ -37,6 +37,7 @@ const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
   { value: "pdf", label: "PDF" },
   { value: "image", label: "Image" },
   { value: "docx", label: "DOCX" },
+  { value: "zip", label: "ZIP" },
 ];
 
 const FILE_EXTENSION_TO_TYPE: Record<string, FileParserFileType> = {
@@ -50,6 +51,7 @@ const FILE_EXTENSION_TO_TYPE: Record<string, FileParserFileType> = {
   gif: "image",
   webp: "image",
   docx: "docx",
+  zip: "zip",
 };
 
 function detectFileTypeFromUrl(url: string): FileParserFileType | null {
@@ -110,7 +112,7 @@ function FileParserEditorBody({
     <div data-testid="file-parser-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File URL</Label>
+          <Label className="text-xs text-tertiary-foreground">File URL</Label>
           <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
@@ -122,7 +124,7 @@ function FileParserEditorBody({
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File Type</Label>
+          <Label className="text-xs text-tertiary-foreground">File Type</Label>
           <HelpTooltip content={helpTooltips["fileParser"]["fileType"]} />
         </div>
         <Select

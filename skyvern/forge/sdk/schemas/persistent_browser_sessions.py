@@ -60,6 +60,9 @@ class Extensions(StrEnum):
     CaptchaSolver = "captcha-solver"
 
 
+FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE = "forced_workflow_run"
+
+
 class PersistentBrowserSession(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

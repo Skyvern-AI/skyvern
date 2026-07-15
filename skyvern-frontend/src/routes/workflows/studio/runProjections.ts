@@ -3,6 +3,7 @@ import {
   ActionType,
   ReadableActionTypes,
   Status,
+  WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
 import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
 import {
@@ -10,6 +11,7 @@ import {
   WorkflowRunTimelineItem,
 } from "@/routes/workflows/types/workflowRunTypes";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
+import { isRecord } from "@/util/utils";
 import { normalizeUtcTimestamp } from "@/util/timeFormat";
 
 export type RunOutcome = "idle" | "running" | "failed" | "success";
@@ -61,6 +63,54 @@ export function finalizedRunStatus(
     return null;
   }
   return statusIsFinalized({ status }) ? status : null;
+}
+
+type RunOutputSignals = Pick<
+  WorkflowRunStatusApiResponseWithWorkflow,
+  | "outputs"
+  | "errors"
+  | "downloaded_files"
+  | "downloaded_file_urls"
+  | "task_v2"
+  | "webhook_failure_reason"
+>;
+
+// The pane-header indicator and RunView's Outputs tab both key off this; keep
+// them routed through here so they can't drift. The extracted_information cast
+// below is unsound on purpose — a string value must stay truthy via
+// Object.values, matching what RunOutputsSection actually renders.
+export function runHasOutputs(
+  workflowRun: RunOutputSignals | null | undefined,
+): boolean {
+  if (!workflowRun) {
+    return false;
+  }
+  const hasErrors =
+    Array.isArray(workflowRun.errors) && workflowRun.errors.some(isRecord);
+  const outputs = workflowRun.outputs;
+  const extractedInformation =
+    isRecord(outputs) && "extracted_information" in outputs
+      ? (outputs.extracted_information as Record<string, unknown>)
+      : null;
+  const hasExtracted =
+    extractedInformation != null &&
+    Object.values(extractedInformation).some((value) => value !== null);
+  // A raw-count check, not RunView's deduped file list — dedup only ever
+  // shrinks a non-empty input, never zeroes it out, so truthiness matches.
+  const hasDownloads =
+    (workflowRun.downloaded_files?.length ?? 0) > 0 ||
+    (workflowRun.downloaded_file_urls?.length ?? 0) > 0;
+  const hasObserverOutput = workflowRun.task_v2?.output != null;
+  const hasWebhookFailure =
+    workflowRun.task_v2?.webhook_failure_reason != null ||
+    workflowRun.webhook_failure_reason != null;
+  return (
+    hasErrors ||
+    hasExtracted ||
+    hasDownloads ||
+    hasObserverOutput ||
+    hasWebhookFailure
+  );
 }
 
 export type FilmstripFrame = {

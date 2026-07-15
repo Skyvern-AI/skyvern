@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import BlockerKind, CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import (
+    MAX_CODE_AUTHORING_GUARDRAIL_REJECTS,
+    _record_code_authoring_guardrail_reject,
+)
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-
-
-def _ctx() -> CopilotContext:
-    return CopilotContext(
-        organization_id="org",
-        workflow_id="wf",
-        workflow_permanent_id="wfp",
-        workflow_yaml="",
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-    )
+from skyvern.forge.sdk.copilot.mcp_adapter import _stash_and_emit_loop_blocker
+from skyvern.forge.sdk.copilot.output_contracts import OutputContractAdvisoryState
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.turn_ownership import (
+    TurnClaimant,
+    blocker_signal_render_allowed,
+    current_turn_owner,
+)
+from tests.unit.conftest import make_copilot_context as _ctx
 
 
 def _signal(
@@ -40,14 +41,6 @@ def test_recoverable_blocker_clears_on_matching_tool_success() -> None:
     ctx.blocker_signal = _signal(cleared_by=frozenset({"update_workflow"}))
     record_tool_step_result_for_ctx(ctx, "update_workflow", {"workflow_yaml": "y"}, {"ok": True})
     assert ctx.blocker_signal is None
-
-
-def test_recoverable_blocker_does_not_clear_on_unrelated_tool_success() -> None:
-    ctx = _ctx()
-    signal = _signal(cleared_by=frozenset({"update_workflow"}))
-    ctx.blocker_signal = signal
-    record_tool_step_result_for_ctx(ctx, "list_credentials", None, {"ok": True})
-    assert ctx.blocker_signal is signal
 
 
 def test_loop_blocker_clears_on_progress_tool_success() -> None:
@@ -289,3 +282,57 @@ def test_reconciliation_requires_input_does_not_clear_after_metadata_only_succes
     assert ctx.pending_reconciliation_run_id == "wr_pending"
     assert ctx.blocker_signal is not None
     assert ctx.blocker_signal.internal_reason_code == "tool_error_pending_reconciliation_requires_input"
+
+
+def test_preflight_reject_leaves_churn_floor_armed_for_rest_of_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx()
+    monkeypatch.setattr(
+        workflow_update_module,
+        "_recorded_outcome_convergence_reject",
+        lambda *_args, **_kwargs: workflow_update_module._ConvergenceReject(
+            "sig", "identical_authored_structure", False
+        ),
+    )
+
+    reject = workflow_update_module._metadata_contract_run_preflight_reject(ctx, "title: X", [])
+    assert reject is not None
+    assert ctx.turn_ownership is not None
+    assert TurnClaimant.METADATA_RUN_PREFLIGHT_REJECT in ctx.turn_ownership.claims
+    assert current_turn_owner(ctx) is None
+
+    ctx.code_authoring_guardrail_reject_count = MAX_CODE_AUTHORING_GUARDRAIL_REJECTS - 1
+    _record_code_authoring_guardrail_reject(ctx)
+
+    signal = ctx.blocker_signal
+    assert signal is not None
+    assert signal.internal_reason_code == "code_authoring_guardrail_churn"
+    assert blocker_signal_render_allowed(ctx, signal) is True
+
+
+def test_mcp_loop_blocker_yield_still_blocks_the_tool() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+
+    payload = _stash_and_emit_loop_blocker(ctx, "update_workflow has been called 4 times in a row", "update_workflow")
+
+    assert isinstance(payload, str) and payload
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert any(
+        event.fingerprint == "output_contract_actuation>loop_detected" for event in ctx.gate_precedence_conflict_events
+    )
+
+
+def test_mcp_loop_blocker_re_emits_after_ladder_resolves() -> None:
+    ctx = _ctx()
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.GRANTED
+    _stash_and_emit_loop_blocker(ctx, "update_workflow has been called 4 times in a row", "update_workflow")
+    assert ctx.blocker_signal is None
+
+    ctx.output_contract_actuation_by_signature["sig_a"] = OutputContractAdvisoryState.CONSUMED
+    payload = _stash_and_emit_loop_blocker(ctx, "update_workflow has been called 4 times in a row", "update_workflow")
+
+    assert payload is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert ctx.turn_halt is not None

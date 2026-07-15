@@ -5,7 +5,7 @@ import copy
 import typing
 from enum import StrEnum
 from random import uniform
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import structlog
 from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
@@ -366,6 +366,20 @@ class SkyvernElement:
             )
             return False
 
+    async def supports_text_input(self) -> bool:
+        if self.get_tag_name().lower() in COMMON_INPUT_TAGS:
+            return True
+        if await self.is_editable():
+            return True
+
+        class_name = await self.get_attr("class")
+        if class_name and "blinking-cursor" in class_name.lower():
+            return True
+
+        # Fallback for browser editable checks that fail closed on contenteditable elements.
+        contenteditable = await self.get_attr("contenteditable")
+        return contenteditable is not None and str(contenteditable).lower() != "false"
+
     async def is_child_of_pdf_object(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
         parent_locator = self.get_locator().locator("..")
         tag_name: str | None = await parent_locator.evaluate("el => el.tagName", timeout=timeout)
@@ -514,6 +528,117 @@ class SkyvernElement:
             return None
 
         return href
+
+    async def resolve_http_href(self, page: Page) -> str | None:
+        """Return the anchor's ``href`` as an absolute ``http``/``https`` URL.
+
+        Returns ``None`` for non-anchor elements, empty/fragment-only hrefs, and
+        any scheme other than http/https (``javascript:``, ``mailto:``, ``tel:``…).
+        Browser-normalized hrefs are preferred so ``<base>`` and iframe URL
+        resolution match click behavior; ``urljoin`` (which correctly treats
+        root paths like ``/billpay`` as absolute against the origin) remains a
+        fallback for evaluate failures.
+        """
+        if self.get_tag_name() != InteractiveElement.A:
+            return None
+
+        raw_href: str | None = await self.get_attr("href", mode="static")
+        if not raw_href:
+            return None
+
+        href = raw_href.strip()
+        if not href or href.startswith("#"):
+            return None
+
+        resolved: str | None = None
+        try:
+            normalized = await SkyvernFrame.evaluate(
+                frame=self.get_frame(),
+                expression="(element) => element instanceof HTMLAnchorElement ? element.href : null",
+                arg=await self.get_element_handler(),
+            )
+        except Exception:
+            normalized = None
+        if isinstance(normalized, str) and normalized.strip():
+            resolved = normalized.strip()
+
+        if not resolved:
+            # Base the fallback on the owning frame's URL so root-relative
+            # hrefs inside a cross-origin iframe resolve against the frame's
+            # origin, not the top-level page's origin.
+            frame_url: str | None = None
+            try:
+                frame_url = self.get_frame().url
+            except Exception:
+                frame_url = None
+            resolved = urljoin(frame_url or page.url, href)
+
+        parsed = urlparse(resolved)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return None
+        if not parsed.netloc:
+            return None
+
+        return resolved
+
+    async def try_navigate_via_href(self, page: Page) -> str | None:
+        """Follow this anchor's ``href`` directly via its owning frame.
+
+        Intended for the ``blocking_element is None and blocked=True`` branch of
+        ``chain_click``: an untracked overlay is intercepting the anchor and a
+        coordinate click would dispatch overlay JS, which can navigate to an
+        unintended URL.  Following the href avoids that side effect entirely.
+
+        Returns the resolved URL on success, ``None`` when no safe URL can be
+        derived or when frame navigation raises an unrecoverable error.
+        """
+        # TODO: share a lower-level href-resolution + goto/download-success
+        # helper with ``navigate_to_a_href``.  Keep the entry points separate:
+        # that one is pre-click tab/download guarding, this one is a post-
+        # click-failure fallback when coordinate click would be unsafe.
+        resolved = await self.resolve_http_href(page)
+        if not resolved:
+            return None
+
+        target = await self.get_attr("target", mode="static")
+        if target and target.strip().lower() != "_self":
+            return None
+
+        try:
+            frame = self.get_frame()
+        except Exception:
+            LOG.warning(
+                "Unable to resolve anchor owning frame; falling back to coordinate click",
+                exc_info=True,
+                href=resolved,
+                current_url=page.url,
+            )
+            return None
+
+        LOG.info(
+            "Navigating to anchor href to bypass unsafe coordinate fallback",
+            href=resolved,
+            current_url=page.url,
+            element_id=self.get_id(),
+        )
+        try:
+            await frame.goto(resolved, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            return resolved
+        except Exception as e:
+            error = str(e)
+            # Same exceptions ``navigate_to_a_href`` treats as effective
+            # navigations: aborted downloads and download-in-progress.
+            if "net::ERR_ABORTED" in error:
+                return resolved
+            if "Download is starting" in error:
+                return resolved
+            LOG.warning(
+                "Failed to navigate to anchor href; falling back to coordinate click",
+                exc_info=True,
+                href=resolved,
+                current_url=page.url,
+            )
+            return None
 
     async def find_blocking_element(
         self, dom: DomUtil, incremental_page: IncrementalScrapePage | None = None

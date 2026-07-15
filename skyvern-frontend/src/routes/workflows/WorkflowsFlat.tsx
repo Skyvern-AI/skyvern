@@ -733,11 +733,11 @@ function WorkflowsFlat() {
           ) : (
             <div className="rounded-lg border border-slate-200 bg-slate-elevation1 py-6 text-center dark:border-slate-700">
               <div className="mx-auto max-w-md">
-                <FolderIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
+                <FolderIcon className="mx-auto mb-3 h-10 w-10 text-blue-700 opacity-50 dark:text-blue-400" />
                 <h3 className="mb-2 text-slate-900 dark:text-slate-100">
                   Organize Your Agents with Folders
                 </h3>
-                <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
+                <p className="mb-4 text-sm text-muted-foreground dark:text-slate-400">
                   Keep your agents organized by creating folders. Group related
                   agents together by project, team, or agent type for easier
                   management.
@@ -938,7 +938,7 @@ function WorkflowsFlat() {
                           {showCheckbox && <TableCell />}
                           <TableCell colSpan={2}>
                             <div className="flex min-w-0 items-center gap-2">
-                              <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
+                              <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-700 dark:text-blue-400" />
                               <span className="truncate" title={workflow.title}>
                                 {workflow.title}
                               </span>
@@ -967,6 +967,7 @@ function WorkflowsFlat() {
                           tagKeys={tagKeys}
                           labelSuggestions={labelSuggestions}
                           valueSuggestionsByKey={valueSuggestionsByKey}
+                          currentTags={workflowTags ?? []}
                           taggingEnabled={taggingEnabled}
                           selectedCount={selected.size}
                           onNavigate={(path) => navigate(path)}
@@ -1062,7 +1063,7 @@ function WorkflowsFlat() {
                             >
                               {workflow.folder_id ? (
                                 <div className="flex min-w-0 items-center gap-1.5">
-                                  <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+                                  <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
                                   <span
                                     className="truncate text-sm"
                                     title={
@@ -1200,7 +1201,7 @@ function WorkflowsFlat() {
           </Table>
           <div className="relative px-3 py-3">
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-              <span className="text-slate-400">Items per page</span>
+              <span className="text-muted-foreground">Items per page</span>
               <select
                 className="h-9 rounded-md border border-slate-300 bg-background px-3"
                 value={itemsPerPage}

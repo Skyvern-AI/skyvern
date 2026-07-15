@@ -227,6 +227,8 @@ class WorkflowParametersRepository(BaseRepository):
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):
@@ -422,6 +424,22 @@ class WorkflowParametersRepository(BaseRepository):
             ).first():
                 return convert_to_workflow_parameter(workflow_parameter, self.debug_enabled)
             return None
+
+    @db_operation("get_workflow_parameters_by_ids")
+    async def get_workflow_parameters_by_ids(self, workflow_parameter_ids: list[str]) -> list[WorkflowParameter]:
+        # Batch equivalent of get_workflow_parameter: matches on id only, without a
+        # deleted_at filter, so historical workflow-run lookups still resolve soft-deleted params.
+        if not workflow_parameter_ids:
+            return []
+        async with self.Session() as session:
+            workflow_parameters = (
+                await session.scalars(
+                    select(WorkflowParameterModel).where(
+                        WorkflowParameterModel.workflow_parameter_id.in_(workflow_parameter_ids)
+                    )
+                )
+            ).all()
+            return [convert_to_workflow_parameter(parameter, self.debug_enabled) for parameter in workflow_parameters]
 
     @db_operation("create_task_generation")
     async def create_task_generation(

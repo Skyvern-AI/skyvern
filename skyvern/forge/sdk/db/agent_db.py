@@ -25,14 +25,19 @@ from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.db.repositories.debug import DebugRepository
 from skyvern.forge.sdk.db.repositories.folders import FoldersRepository
 from skyvern.forge.sdk.db.repositories.google_oauth import GoogleOAuthRepository
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import MicrosoftOAuthRepository
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
 from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
+from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
 from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
+    WorkflowRunCredentialSelectionsRepository,
+)
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.db.utils import (
@@ -345,6 +350,8 @@ def _build_engine(database_string: str) -> AsyncEngine:
         pool_pre_ping=True,
         pool_size=settings.DATABASE_POOL_SIZE,
         max_overflow=settings.DATABASE_POOL_MAX_OVERFLOW,
+        pool_timeout=settings.DATABASE_POOL_TIMEOUT,
+        pool_recycle=settings.DATABASE_POOL_RECYCLE,
     )
 
 
@@ -366,15 +373,20 @@ class AgentDB(BaseAlchemyDB):
         self.tasks = TasksRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflows = WorkflowsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
+            self.Session, debug_enabled, self.is_retryable_error
+        )
         self.credentials = CredentialRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credential_folders = CredentialFoldersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.otp = OTPRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.debug = DebugRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.scripts = ScriptsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.self_heal = SelfHealRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.tags = TagsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(
             self.Session,
             debug_enabled,

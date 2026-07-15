@@ -1,9 +1,17 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  END_ANCHOR_BOTTOM_PX,
+  endAnchoredViewport,
+  flowJumpVisibility,
   isMeaningfulPaneResize,
   isViewportStranded,
   PANE_RESIZE_EPSILON_PX,
+  paneRecenterViewport,
+  START_ANCHOR_MARGIN_X_PX,
+  START_ANCHOR_MIN_ZOOM,
+  START_ANCHOR_TOP_PX,
+  startAnchoredViewport,
 } from "./paneFit";
 
 describe("isMeaningfulPaneResize", () => {
@@ -108,5 +116,264 @@ describe("isViewportStranded", () => {
         bounds: chainBounds,
       }),
     ).toBe(false);
+  });
+});
+
+describe("startAnchoredViewport", () => {
+  // A long chain: taller than any pane, so a whole-graph fit would zoom far
+  // out and center the middle.
+  const longChain = { x: 0, y: 0, width: 500, height: 4000 };
+
+  test("anchors the flow start at the pane top at 1:1 zoom when the chain fits", () => {
+    expect(
+      startAnchoredViewport({
+        pane: { width: 800, height: 600 },
+        bounds: longChain,
+      }),
+    ).toEqual({ x: 150, y: START_ANCHOR_TOP_PX, zoom: 1 });
+  });
+
+  test("never zooms in past 1:1 on a very wide pane", () => {
+    const viewport = startAnchoredViewport({
+      pane: { width: 2000, height: 900 },
+      bounds: longChain,
+    });
+    expect(viewport?.zoom).toBe(1);
+    expect(viewport?.x).toBe((2000 - 500) / 2);
+  });
+
+  test("zooms out to fit the chain width in a narrow pane", () => {
+    const pane = { width: 424, height: 600 };
+    const viewport = startAnchoredViewport({ pane, bounds: longChain });
+    expect(viewport?.zoom).toBeCloseTo(
+      (pane.width - 2 * START_ANCHOR_MARGIN_X_PX) / longChain.width,
+    );
+    // Fit-width leaves exactly the margin as equal gutters.
+    expect(viewport?.x).toBeCloseTo(START_ANCHOR_MARGIN_X_PX);
+  });
+
+  test("respects the canvas minimum zoom in an over-tight pane", () => {
+    const viewport = startAnchoredViewport({
+      pane: { width: 220, height: 600 },
+      bounds: longChain,
+    });
+    expect(viewport?.zoom).toBe(START_ANCHOR_MIN_ZOOM);
+    // Still centered: overflow crops both sides equally.
+    expect(viewport?.x).toBeCloseTo((220 - 500 * START_ANCHOR_MIN_ZOOM) / 2);
+  });
+
+  test("offset bounds still land the first block at the top margin", () => {
+    const bounds = { x: -100, y: 300, width: 500, height: 2000 };
+    const viewport = startAnchoredViewport({
+      pane: { width: 800, height: 600 },
+      bounds,
+    });
+    expect(viewport).not.toBeNull();
+    const { x, y, zoom } = viewport!;
+    // Screen-space position of the flow's top-left corner.
+    expect(bounds.y * zoom + y).toBeCloseTo(START_ANCHOR_TOP_PX);
+    expect(bounds.x * zoom + x).toBeCloseTo((800 - 500) / 2);
+  });
+
+  test("degenerate panes and empty flows return null", () => {
+    expect(
+      startAnchoredViewport({
+        pane: { width: 0, height: 0 },
+        bounds: longChain,
+      }),
+    ).toBeNull();
+    expect(
+      startAnchoredViewport({
+        pane: { width: 800, height: 600 },
+        bounds: { x: 0, y: 0, width: 0, height: 0 },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("endAnchoredViewport", () => {
+  const longChain = { x: 0, y: 0, width: 500, height: 4000 };
+
+  test("anchors the flow end just above the pane bottom at 1:1 zoom", () => {
+    expect(
+      endAnchoredViewport({
+        pane: { width: 800, height: 600 },
+        bounds: longChain,
+      }),
+    ).toEqual({ x: 150, y: 600 - END_ANCHOR_BOTTOM_PX - 4000, zoom: 1 });
+  });
+
+  test("mirrors the start anchor's zoom and horizontal centering", () => {
+    const pane = { width: 424, height: 600 };
+    const start = startAnchoredViewport({ pane, bounds: longChain });
+    const end = endAnchoredViewport({ pane, bounds: longChain });
+    expect(end).not.toBeNull();
+    expect(end!.zoom).toBe(start!.zoom);
+    expect(end!.x).toBe(start!.x);
+    // Screen-space position of the flow's bottom edge.
+    expect((longChain.y + longChain.height) * end!.zoom + end!.y).toBeCloseTo(
+      pane.height - END_ANCHOR_BOTTOM_PX,
+    );
+  });
+
+  test("offset bounds still land the flow bottom at the bottom margin", () => {
+    const bounds = { x: -100, y: 300, width: 500, height: 2000 };
+    const pane = { width: 800, height: 600 };
+    const viewport = endAnchoredViewport({ pane, bounds });
+    expect(viewport).not.toBeNull();
+    expect(
+      (bounds.y + bounds.height) * viewport!.zoom + viewport!.y,
+    ).toBeCloseTo(pane.height - END_ANCHOR_BOTTOM_PX);
+  });
+
+  test("degenerate panes and empty flows return null", () => {
+    expect(
+      endAnchoredViewport({
+        pane: { width: 0, height: 0 },
+        bounds: longChain,
+      }),
+    ).toBeNull();
+    expect(
+      endAnchoredViewport({
+        pane: { width: 800, height: 600 },
+        bounds: { x: 0, y: 0, width: 0, height: 0 },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("flowJumpVisibility", () => {
+  const pane = { width: 800, height: 600 };
+  const longChain = { x: 0, y: 0, width: 500, height: 4000 };
+
+  test("a start-anchored long flow only offers the jump to its end", () => {
+    const viewport = startAnchoredViewport({ pane, bounds: longChain });
+    expect(
+      flowJumpVisibility({ pane, viewport: viewport!, bounds: longChain }),
+    ).toEqual({ showJumpToStart: false, showJumpToEnd: true });
+  });
+
+  test("an end-anchored long flow only offers the jump back to its start", () => {
+    const viewport = endAnchoredViewport({ pane, bounds: longChain });
+    expect(
+      flowJumpVisibility({ pane, viewport: viewport!, bounds: longChain }),
+    ).toEqual({ showJumpToStart: true, showJumpToEnd: false });
+  });
+
+  test("scrolled into the middle of a long flow offers both jumps", () => {
+    expect(
+      flowJumpVisibility({
+        pane,
+        viewport: { x: 150, y: -1700, zoom: 1 },
+        bounds: longChain,
+      }),
+    ).toEqual({ showJumpToStart: true, showJumpToEnd: true });
+  });
+
+  test("a flow that fits the pane shows neither button", () => {
+    const shortChain = { x: 0, y: 0, width: 500, height: 400 };
+    expect(
+      flowJumpVisibility({
+        pane,
+        viewport: { x: 150, y: START_ANCHOR_TOP_PX, zoom: 1 },
+        bounds: shortChain,
+      }),
+    ).toEqual({ showJumpToStart: false, showJumpToEnd: false });
+  });
+
+  test("a short flow panned out of view still shows neither button", () => {
+    const shortChain = { x: 0, y: 0, width: 500, height: 400 };
+    expect(
+      flowJumpVisibility({
+        pane,
+        viewport: { x: 150, y: -2000, zoom: 1 },
+        bounds: shortChain,
+      }),
+    ).toEqual({ showJumpToStart: false, showJumpToEnd: false });
+  });
+
+  test("zooming in far enough makes a short flow jumpable again", () => {
+    // 400 world px at zoom 2 = 800 screen px > the 600px pane.
+    const shortChain = { x: 0, y: 0, width: 500, height: 400 };
+    expect(
+      flowJumpVisibility({
+        pane,
+        viewport: { x: 0, y: -100, zoom: 2 },
+        bounds: shortChain,
+      }),
+    ).toEqual({ showJumpToStart: true, showJumpToEnd: true });
+  });
+
+  test("degenerate geometry shows neither button", () => {
+    expect(
+      flowJumpVisibility({
+        pane: { width: 0, height: 0 },
+        viewport: { x: 0, y: 0, zoom: 1 },
+        bounds: longChain,
+      }),
+    ).toEqual({ showJumpToStart: false, showJumpToEnd: false });
+    expect(
+      flowJumpVisibility({
+        pane,
+        viewport: { x: 0, y: 0, zoom: 1 },
+        bounds: { x: 0, y: 0, width: 0, height: 0 },
+      }),
+    ).toEqual({ showJumpToStart: false, showJumpToEnd: false });
+  });
+});
+
+describe("paneRecenterViewport", () => {
+  const chain = { x: 0, y: 0, width: 500, height: 4000 };
+
+  test("recenters horizontally and keeps the scroll position at unchanged zoom", () => {
+    // Fitted for a 1000-wide pane (x=250), scrolled into the flow (y=-800),
+    // then a sibling pane opened and the pane shrank to 700.
+    expect(
+      paneRecenterViewport({
+        pane: { width: 700, height: 600 },
+        bounds: chain,
+        viewport: { x: 250, y: -800, zoom: 1 },
+      }),
+    ).toEqual({ x: 100, y: -800, zoom: 1 });
+  });
+
+  test("scales the scroll anchor when the new width changes zoom", () => {
+    const pane = { width: 424, height: 600 };
+    const viewport = paneRecenterViewport({
+      pane,
+      bounds: chain,
+      viewport: { x: 250, y: -800, zoom: 1 },
+    });
+    expect(viewport).not.toBeNull();
+    const expectedZoom = (pane.width - 2 * START_ANCHOR_MARGIN_X_PX) / 500;
+    expect(viewport!.zoom).toBeCloseTo(expectedZoom);
+    // The content point at the pane's top edge stays put across the zoom.
+    expect(-viewport!.y / viewport!.zoom).toBeCloseTo(800);
+  });
+
+  test("is a no-op for an already start-anchored viewport", () => {
+    const pane = { width: 800, height: 600 };
+    const anchored = startAnchoredViewport({ pane, bounds: chain });
+    expect(anchored).not.toBeNull();
+    expect(
+      paneRecenterViewport({ pane, bounds: chain, viewport: anchored! }),
+    ).toEqual(anchored);
+  });
+
+  test("degenerate geometry returns null", () => {
+    expect(
+      paneRecenterViewport({
+        pane: { width: 0, height: 0 },
+        bounds: chain,
+        viewport: { x: 0, y: 0, zoom: 1 },
+      }),
+    ).toBeNull();
+    expect(
+      paneRecenterViewport({
+        pane: { width: 800, height: 600 },
+        bounds: chain,
+        viewport: { x: 0, y: 0, zoom: 0 },
+      }),
+    ).toBeNull();
   });
 });

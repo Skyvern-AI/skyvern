@@ -91,13 +91,16 @@ function LoopEditorBody({
         <>
           <div className="space-y-2">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Loop Value</Label>
+              <Label className="text-xs text-tertiary-foreground">
+                Loop Value
+              </Label>
               <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
             </div>
             <WorkflowBlockInput
               nodeId={blockId}
               value={loopVariableReference}
               onChange={(v) => update({ loopVariableReference: v })}
+              data-testid="loop-variable-input"
             />
           </div>
 
@@ -118,7 +121,9 @@ function LoopEditorBody({
               onCheckedChange={setBool("completeIfEmpty")}
               data-testid="checkbox-completeIfEmpty"
             />
-            <Label className="text-xs text-slate-300">Continue if Empty</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Continue if Empty
+            </Label>
             <HelpTooltip content="When checked, the for loop block will successfully complete and workflow execution will continue if the loop value is empty" />
           </div>
           <div className="flex items-center gap-2">
@@ -128,7 +133,7 @@ function LoopEditorBody({
               onCheckedChange={setBool("continueOnFailure")}
               data-testid="checkbox-continueOnFailure"
             />
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               Continue Workflow if Loop Fails
             </Label>
             <HelpTooltip content={helpTooltips["loop"]["continueOnFailure"]} />
@@ -140,7 +145,7 @@ function LoopEditorBody({
               onCheckedChange={setBool("nextLoopOnFailure")}
               data-testid="checkbox-nextLoopOnFailure"
             />
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               Skip Iterations that Fail
             </Label>
             <HelpTooltip content={helpTooltips["loop"]["nextLoopOnFailure"]} />
@@ -150,7 +155,9 @@ function LoopEditorBody({
         <>
           <div className="space-y-2">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Loop Condition</Label>
+              <Label className="text-xs text-tertiary-foreground">
+                Loop Condition
+              </Label>
               <HelpTooltip content={buildWhileLoopConditionTooltip()} />
             </div>
             <WorkflowBlockInput
@@ -163,6 +170,7 @@ function LoopEditorBody({
                     inferBranchCriteriaTypeFromExpression(v),
                 })
               }
+              data-testid="while-condition-input"
             />
           </div>
 
@@ -173,7 +181,7 @@ function LoopEditorBody({
               onCheckedChange={setBool("continueOnFailure")}
               data-testid="checkbox-continueOnFailure"
             />
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               Continue Workflow if Loop Fails
             </Label>
             <HelpTooltip
@@ -187,7 +195,7 @@ function LoopEditorBody({
               onCheckedChange={setBool("nextLoopOnFailure")}
               data-testid="checkbox-nextLoopOnFailure"
             />
-            <Label className="text-xs text-slate-300">
+            <Label className="text-xs text-tertiary-foreground">
               Skip Iterations that Fail
             </Label>
             <HelpTooltip

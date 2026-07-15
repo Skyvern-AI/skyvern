@@ -57,6 +57,9 @@ const SEQUENTIAL_KEY_TOOLTIP =
 const BROWSER_PROFILE_KEY_TOOLTIP =
   "Template for separating saved browser profiles. Use + to insert an agent input, or type a static key. Runs with the same rendered value reuse the same saved profile.";
 
+const PIN_SAVED_SESSION_IP_TOOLTIP =
+  "Pin this workflow's saved sessions to a consistent proxy IP across runs, so restored logins are not invalidated by IP changes. Requires the Residential (ISP) proxy location. With a Browser Profile Key, each saved profile keeps its own IP.";
+
 const WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES = 4 * 60;
 const WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES = 8 * 60;
 
@@ -324,6 +327,7 @@ function WorkflowSettingsEditorBody({
             onCheckedChange={(value) =>
               update({
                 persistBrowserSession: value,
+                pinSavedSessionIp: value ? data.pinSavedSessionIp : false,
                 browserProfileKey: value ? data.browserProfileKey : null,
               })
             }
@@ -331,6 +335,17 @@ function WorkflowSettingsEditorBody({
         </div>
         {data.persistBrowserSession && (
           <div className="flex flex-col gap-3 rounded-md bg-slate-elevation4 p-4 pl-4">
+            <div className="flex items-center gap-2">
+              <Label>Keep Same IP Across Runs</Label>
+              <HelpTooltip content={PIN_SAVED_SESSION_IP_TOOLTIP} />
+              <Switch
+                className="ml-auto"
+                checked={data.pinSavedSessionIp}
+                onCheckedChange={(value) =>
+                  update({ pinSavedSessionIp: value })
+                }
+              />
+            </div>
             <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <Label>Browser Profile Key (optional)</Label>
@@ -349,18 +364,18 @@ function WorkflowSettingsEditorBody({
                   className="nopan text-xs"
                   data-testid="browser-profile-key-template"
                 />
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-muted-foreground">
                   Use + to insert an input like {"{{ credential_id }}"}. Leave
                   empty to use one saved profile for this agent.
                 </p>
                 {!data.runSequentially && data.browserProfileKey && (
-                  <p className="text-xs text-amber-300">
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
                     Overlapping runs with the same rendered key can overwrite
                     the same saved profile.
                   </p>
                 )}
                 {data.browserProfileId && (
-                  <p className="text-xs text-amber-300">
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
                     Starting Browser Profile bypasses saved-session loading and
                     write-back. Leave it empty when separating saved profiles.
                   </p>

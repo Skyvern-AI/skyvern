@@ -11,12 +11,16 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_CLICKABLE_CONTROLS,
     _MAX_FIELDS_PER_FORM,
     _MAX_FORMS,
+    _MAX_KEY_VALUE_RELATIONS,
     _MAX_MODAL_DISMISS_CONTROLS,
     _MAX_MODAL_OVERLAYS,
     _MAX_NAVIGATION_TARGETS,
     _MAX_PAGE_OBSTRUCTIONS,
     _MAX_RESULT_CONTAINERS,
+    _MAX_RESULT_SAMPLE_ROWS,
+    _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
+    _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
     _MODAL_DISMISS_HINTS,
     _MODAL_DISMISS_SYMBOLS,
@@ -42,61 +46,123 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
 )
 
 
+_JS_TEXT_HELPER = "const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
+
+_JS_IS_EDITABLE_HELPER = (
+    "const isEditable = (node) => {"
+    "  const tag = (node.tagName || '').toLowerCase();"
+    "  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;"
+    "  return node.isContentEditable === true;"
+    "};"
+)
+
+_JS_IMPLICIT_ROLE_HELPER = (
+    "const implicitRole = (node) => {"
+    "  const tag = (node.tagName || '').toLowerCase();"
+    "  const type = (node.getAttribute('type') || '').toLowerCase();"
+    "  if (tag === 'a' && node.hasAttribute('href')) return 'link';"
+    "  if (tag === 'button') return 'button';"
+    "  if (tag === 'select') return 'combobox';"
+    "  if (tag === 'textarea') return 'textbox';"
+    "  if (tag === 'input') {"
+    "    if (['button', 'submit', 'reset'].includes(type)) return 'button';"
+    "    if (type === 'checkbox') return 'checkbox';"
+    "    if (type === 'radio') return 'radio';"
+    "    if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
+    "  }"
+    "  if (/^h[1-6]$/.test(tag)) return 'heading';"
+    "  return '';"
+    "};"
+)
+
+# ARIA roles whose accessible name is computed from the element's own text content (ARIA name-from-content).
+# Editable roles (textbox/combobox/searchbox/spinbutton/listbox) are deliberately absent so a typed-into
+# control never leaks its value as an accessible name.
+_JS_NAME_FROM_CONTENT_ROLES = (
+    "const nameFromContentRoles = new Set(["
+    "'button', 'link', 'checkbox', 'radio', 'heading', 'tab', 'menuitem', "
+    "'menuitemcheckbox', 'menuitemradio', 'option', 'switch', 'treeitem', "
+    "'cell', 'gridcell', 'columnheader', 'rowheader', 'row', 'tooltip'"
+    "]);"
+)
+
+_JS_ACCESSIBLE_NAME_HELPER = (
+    "const accessibleName = (node, role) => {"
+    "  const aria = text(node.getAttribute('aria-label'));"
+    "  if (aria) return aria;"
+    "  const labelledby = node.getAttribute('aria-labelledby');"
+    "  if (labelledby) {"
+    "    const parts = labelledby.split(/\\s+/).map((id) => {"
+    "      const ref = document.getElementById(id);"
+    "      return ref ? text(ref.textContent) : '';"
+    "    }).filter(Boolean);"
+    "    if (parts.length) return text(parts.join(' '));"
+    "  }"
+    "  const id = node.getAttribute('id');"
+    "  if (id) {"
+    "    let lab = null;"
+    "    try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
+    "    if (lab) { const t = text(lab.textContent); if (t) return t; }"
+    "  }"
+    "  const parentLabel = node.closest ? node.closest('label') : null;"
+    "  if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
+    "  const title = text(node.getAttribute('title'));"
+    "  if (title) return title;"
+    "  const placeholder = text(node.getAttribute('placeholder'));"
+    "  if (placeholder) return placeholder;"
+    "  if (role && nameFromContentRoles.has(role) && !isEditable(node)) {"
+    "    const content = text(node.textContent);"
+    "    if (content) return content;"
+    "  }"
+    "  return '';"
+    "};"
+)
+
+
 # Given a CSS selector, return the element's ARIA role and accessible name so the code-block
-# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The
-# name is read only from true label sources, never the element's own textContent/value.
+# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The name
+# follows the ARIA algorithm: label sources first, then name-from-content for content-named roles only.
 def scout_accessible_role_name_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return (
         "(() => {"
         f"  const el = document.querySelector({sel});"
         "  if (!el) return null;"
-        "  const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
-        "  const implicitRole = (node) => {"
-        "    const tag = (node.tagName || '').toLowerCase();"
-        "    const type = (node.getAttribute('type') || '').toLowerCase();"
-        "    if (tag === 'a' && node.hasAttribute('href')) return 'link';"
-        "    if (tag === 'button') return 'button';"
-        "    if (tag === 'select') return 'combobox';"
-        "    if (tag === 'textarea') return 'textbox';"
-        "    if (tag === 'input') {"
-        "      if (['button', 'submit', 'reset'].includes(type)) return 'button';"
-        "      if (type === 'checkbox') return 'checkbox';"
-        "      if (type === 'radio') return 'radio';"
-        "      if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
-        "    }"
-        "    if (/^h[1-6]$/.test(tag)) return 'heading';"
-        "    return '';"
-        "  };"
-        "  const accessibleName = (node) => {"
-        "    const aria = text(node.getAttribute('aria-label'));"
-        "    if (aria) return aria;"
-        "    const labelledby = node.getAttribute('aria-labelledby');"
-        "    if (labelledby) {"
-        "      const parts = labelledby.split(/\\s+/).map((id) => {"
-        "        const ref = document.getElementById(id);"
-        "        return ref ? text(ref.textContent) : '';"
-        "      }).filter(Boolean);"
-        "      if (parts.length) return text(parts.join(' '));"
-        "    }"
-        "    const id = node.getAttribute('id');"
-        "    if (id) {"
-        "      let lab = null;"
-        "      try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
-        "      if (lab) { const t = text(lab.textContent); if (t) return t; }"
-        "    }"
-        "    const parentLabel = node.closest ? node.closest('label') : null;"
-        "    if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
-        # textContent/value are never name sources: for a typed-into textbox/contenteditable
-        # they would leak the raw typed value as accessible_name.
-        "    const title = text(node.getAttribute('title'));"
-        "    if (title) return title;"
-        "    const placeholder = text(node.getAttribute('placeholder'));"
-        "    if (placeholder) return placeholder;"
-        "    return '';"
-        "  };"
+        f"  {_JS_TEXT_HELPER}"
+        f"  {_JS_IS_EDITABLE_HELPER}"
+        f"  {_JS_IMPLICIT_ROLE_HELPER}"
+        f"  {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"  {_JS_ACCESSIBLE_NAME_HELPER}"
         "  const role = text(el.getAttribute('role')) || implicitRole(el);"
-        "  return { role: role, accessible_name: accessibleName(el) };"
+        "  return { role: role, accessible_name: accessibleName(el, role) };"
+        "})()"
+    )
+
+
+# Count elements whose computed ARIA role and accessible name exactly match, so a scout-ambiguous
+# selector's get_by_role(role, name, exact=True) re-anchor is only trusted when it resolves uniquely.
+def role_name_match_count_expression(role: str, name: str) -> str:
+    target_role = json.dumps(role)
+    target_name = json.dumps(name)
+    return (
+        "(() => {"
+        "  try {"
+        f"    {_JS_TEXT_HELPER}"
+        f"    {_JS_IS_EDITABLE_HELPER}"
+        f"    {_JS_IMPLICIT_ROLE_HELPER}"
+        f"    {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"    {_JS_ACCESSIBLE_NAME_HELPER}"
+        f"    const targetRole = {target_role};"
+        f"    const targetName = {target_name};"
+        "    let count = 0;"
+        "    const nodes = document.querySelectorAll('*');"
+        "    for (const el of nodes) {"
+        "      const role = text(el.getAttribute('role')) || implicitRole(el);"
+        "      if (role !== targetRole) continue;"
+        "      if (accessibleName(el, role) === targetName) { count++; if (count > 1) break; }"
+        "    }"
+        "    return count;"
+        "  } catch (e) { return -1; }"
         "})()"
     )
 
@@ -106,6 +172,34 @@ def scout_accessible_role_name_expression(css_selector: str) -> str:
 def selector_match_count_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
+
+
+# Read only the readonly/disabled control-state booleans for a CSS or XPath selector; never reads the
+# element's value. An unresolvable selector or non-CSS/XPath engine returns null (UNKNOWN editability).
+def scout_control_state_expression(selector: str) -> str:
+    sel = json.dumps(selector)
+    return (
+        "(() => {"
+        f"  const sel = {sel};"
+        "  let el = null;"
+        "  try {"
+        "    if (/^\\s*(xpath=|\\(?\\/)/.test(sel)) {"
+        "      const x = sel.replace(/^\\s*xpath=/, '');"
+        "      const r = document.evaluate(x, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
+        "      el = r ? r.singleNodeValue : null;"
+        "    } else {"
+        "      el = document.querySelector(sel);"
+        "    }"
+        "  } catch (e) { return null; }"
+        "  if (!el) return null;"
+        "  const attrOf = (k) => (el.getAttribute && el.getAttribute(k)) || '';"
+        "  const readonly = el.readOnly === true || (el.hasAttribute && el.hasAttribute('readonly'))"
+        "    || attrOf('aria-readonly').toLowerCase() === 'true';"
+        "  const disabled = el.disabled === true || (el.hasAttribute && el.hasAttribute('disabled'))"
+        "    || attrOf('aria-disabled').toLowerCase() === 'true';"
+        "  return { readonly: !!readonly, disabled: !!disabled };"
+        "})()"
+    )
 
 
 COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
@@ -170,6 +264,10 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
     f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
+    f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
+    f"const MAX_REVEAL_KEY_VALUE_RELATIONS={int(_MAX_REVEAL_KEY_VALUE_RELATIONS)};"
+    f"const MAX_TABLE_HEADERS={int(_MAX_TABLE_HEADERS)};"
+    f"const MAX_RESULT_SAMPLE_ROWS={int(_MAX_RESULT_SAMPLE_ROWS)};"
     f"const MAX_SELECT_OPTIONS={int(_MAX_SELECT_OPTIONS)};"
     f"const MAX_CHALLENGE_CONTROLS={int(_MAX_CHALLENGE_CONTROLS)};"
     f"const MAX_CLICKABLE_CONTROLS={int(_MAX_CLICKABLE_CONTROLS)};"
@@ -377,17 +475,45 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
 }
 
 const resultContainers = [];
+let resultContainersTruncated = false;
+const selectorMatchCount = (selector) => { if (!selector) return 0; try { return document.querySelectorAll(selector).length; } catch (e) { return 0; } };
+const elementVisible = (node) => {
+  if (!node || !node.getBoundingClientRect) return false;
+  let style; try { style = window.getComputedStyle(node); } catch (e) { return false; }
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.05 && rect.width > 0 && rect.height > 0;
+};
 const resultRowTextIsContent = (s) => {
   const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
   return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
 };
 const resultEntry = (node, tag) => {
-  const entry = { tag: tag, id: attr(node, 'id'), selector: selectorFor(node), is_table: tag === 'table' };
+  const selector = selectorFor(node);
+  const entry = { tag: tag, id: attr(node, 'id'), selector: selector, selector_match_count: selectorMatchCount(selector), visible: elementVisible(node), is_table: tag === 'table' };
 	  if (tag === 'table') {
-	    let rows = Array.from(node.querySelectorAll('tbody tr')).filter((r) => r.querySelector('td'));
-	    if (!rows.length) rows = Array.from(node.querySelectorAll('tr')).filter((r) => r.querySelector('td'));
-	    const sampleRows = rows.map((r) => Array.from(r.children || []).map((c) => nodeText(c)).filter(Boolean).join(' ') || nodeText(r)).filter(resultRowTextIsContent).slice(0, 5);
-	    if (sampleRows.length) { entry.row_count = sampleRows.length; entry.sample_rows = sampleRows; }
+	    let rows = Array.from(node.querySelectorAll(':scope > tbody > tr')).filter((r) => r.querySelector(':scope > td'));
+	    if (!rows.length) rows = Array.from(node.querySelectorAll(':scope > tr')).filter((r) => r.querySelector(':scope > td'));
+	    entry.row_count = rows.length;
+	    entry.rows_truncated = rows.length > MAX_RESULT_SAMPLE_ROWS;
+	    const headerNodes = Array.from(node.querySelectorAll(':scope > thead > tr > th'));
+	    const headers = headerNodes.slice(0, MAX_TABLE_HEADERS).map((h, i) => ({ text: nodeText(h), column_index: i })).filter((h) => !!h.text);
+	    if (headers.length) entry.headers = headers;
+	    entry.span_free = !node.querySelector('th[colspan],th[rowspan],td[colspan],td[rowspan]');
+	    entry.nested_table_free = !node.querySelector(':scope table');
+	    entry.row_selector = selector ? selector + ' > tbody > tr' : '';
+	    entry.rows = rows.slice(0, MAX_RESULT_SAMPLE_ROWS).map((row, rowIndex) => ({
+	      row_index: rowIndex,
+	      visible: elementVisible(row),
+	      has_row_header: !!row.querySelector(':scope > th'),
+	      cells: Array.from(row.querySelectorAll(':scope > th, :scope > td')).slice(0, MAX_TABLE_HEADERS).map((cell, columnIndex) => ({
+	        column_index: columnIndex,
+	        visible: elementVisible(cell),
+	        has_text: !!nodeText(cell),
+	        text: nodeText(cell),
+	      })),
+	    }));
+	    const sampleRows = rows.map((r) => Array.from(r.children || []).map((c) => nodeText(c)).filter(Boolean).join(' ') || nodeText(r)).filter(resultRowTextIsContent).slice(0, MAX_RESULT_SAMPLE_ROWS);
+	    if (sampleRows.length) entry.sample_rows = sampleRows;
 	  } else {
 	    const text = nodeText(node);
 	    if (text) entry.text_excerpt = text;
@@ -395,14 +521,76 @@ const resultEntry = (node, tag) => {
 	  return entry;
 	};
 	for (const node of all) {
-	  if (resultContainers.length >= MAX_RESULT_CONTAINERS) break;
 	  const tag = (node.tagName || '').toLowerCase();
 	  if (SKIP_TAGS.has(tag)) continue;
 	  const identity = (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase();
 	  if (tag === 'table' || RESULT_CONTAINER_HINTS.some((h) => identity.includes(h))) {
+	    if (resultContainers.length >= MAX_RESULT_CONTAINERS) { resultContainersTruncated = true; break; }
 	    resultContainers.push(resultEntry(node, tag));
 	  }
 	}
+
+const keyValueRelations = [];
+let keyValueRelationsTruncated = false;
+const keyValueSkipTags = new Set(['body', 'form', 'html', 'table', 'tbody', 'thead', 'tr']);
+for (const node of all) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  const children = Array.from(node.children || []);
+  if (children.length !== 2) continue;
+  if (children[0].children && children[0].children.length > 0) continue;
+  const keyText = nodeText(children[0]);
+  const valueText = nodeText(children[1]);
+  if (!keyText || keyText.length > 120 || !valueText || keyText === valueText) continue;
+  if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; break; }
+  const selector = selectorFor(node);
+  const matches = selectorMatchCount(selector);
+  if (!matches) continue;
+  let position = -1;
+  try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
+  if (position < 0) continue;
+  keyValueRelations.push({ key_text: keyText, value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
+}
+
+const revealHintTokens = (node) => (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const matchesResultHintToken = (node) => revealHintTokens(node).some((t) => RESULT_CONTAINER_HINTS.includes(t));
+const revealHeadingTags = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+let revealRelationCount = 0;
+let revealRelationsTruncated = false;
+for (const node of all) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (keyValueSkipTags.has(tag) || !elementVisible(node)) continue;
+  if (!matchesResultHintToken(node)) continue;
+  const children = Array.from(node.children || []);
+  if (children.length < 3 || children.length > 6) continue;
+  if (children.some((c) => c.children && c.children.length > 0)) continue;
+  const heading = children[0];
+  if (!revealHeadingTags.has((heading.tagName || '').toLowerCase()) || !elementVisible(heading)) continue;
+  const keyText = nodeText(heading);
+  if (!keyText || keyText.length > 120) continue;
+  const selector = selectorFor(node);
+  const matches = selectorMatchCount(selector);
+  if (!matches) continue;
+  let position = -1;
+  try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
+  if (position < 0) continue;
+  const valueLeaves = [];
+  for (let i = 1; i < children.length; i++) {
+    const leaf = children[i];
+    if (!elementVisible(leaf)) continue;
+    const valueText = nodeText(leaf);
+    if (!valueText || keyText === valueText) continue;
+    valueLeaves.push({ index: i, valueText: valueText });
+  }
+  const revealKeyText = valueLeaves.length === 1 ? keyText : '';
+  let capped = false;
+  for (const leaf of valueLeaves) {
+    if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
+    keyValueRelations.push({ key_text: revealKeyText, value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    revealRelationCount++;
+  }
+  if (capped) break;
+}
 
 const challengeControls = [];
 const seenChallenge = new Set();
@@ -483,6 +671,10 @@ return JSON.stringify({
   forms: forms,
   navigation_targets: navTargets,
   result_containers: resultContainers,
+  result_containers_truncated: resultContainersTruncated,
+  key_value_relations: keyValueRelations,
+  key_value_relations_truncated: keyValueRelationsTruncated,
+  reveal_relations_truncated: revealRelationsTruncated,
   clickable_controls: clickableControls,
   challenge_controls: challengeControls,
   modal_overlays: modalOverlays,

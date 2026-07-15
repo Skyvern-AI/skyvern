@@ -313,36 +313,35 @@ def test_preserves_other_fields() -> None:
     assert block["complete_criterion"] == _wrapped("Form submitted")
 
 
-def test_returns_input_unchanged_on_malformed_yaml() -> None:
-    malformed = textwrap.dedent(
-        """
-        title: bad
-        workflow_definition:
-          blocks:
-            - block_type: task
-              navigation_goal: "unclosed
-        """
-    ).strip()
-
-    out = wrap_block_goals(malformed, USER_MESSAGE)
-
-    assert out == malformed
-
-
-def test_returns_input_unchanged_when_workflow_definition_missing() -> None:
-    src = yaml.safe_dump({"title": "no definition"}, sort_keys=False)
-
-    out = wrap_block_goals(src, USER_MESSAGE)
-
-    assert out == src
-
-
-def test_returns_input_unchanged_when_blocks_not_list() -> None:
-    src = yaml.safe_dump(
-        {"title": "bad blocks", "workflow_definition": {"blocks": "not a list"}},
-        sort_keys=False,
-    )
-
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            textwrap.dedent(
+                """
+                title: bad
+                workflow_definition:
+                  blocks:
+                    - block_type: task
+                      navigation_goal: "unclosed
+                """
+            ).strip(),
+            id="malformed_yaml",
+        ),
+        pytest.param(
+            yaml.safe_dump({"title": "no definition"}, sort_keys=False),
+            id="workflow_definition_missing",
+        ),
+        pytest.param(
+            yaml.safe_dump(
+                {"title": "bad blocks", "workflow_definition": {"blocks": "not a list"}},
+                sort_keys=False,
+            ),
+            id="blocks_not_list",
+        ),
+    ],
+)
+def test_returns_input_unchanged_on_degenerate_input(src: str) -> None:
     out = wrap_block_goals(src, USER_MESSAGE)
 
     assert out == src

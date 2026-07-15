@@ -1,123 +1,275 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, extract_filename, is_download_response
+from skyvern.webeye.cdp_download_interceptor import (
+    CDPDownloadInterceptor,
+    _is_stale_interception_error,
+    extract_filename,
+    is_download_response,
+)
 
 
 class TestIsDownloadResponse:
     """Tests for is_download_response()."""
 
-    def test_attachment_header(self) -> None:
-        headers = {"content-disposition": 'attachment; filename="report.csv"', "content-type": "text/csv"}
-        assert is_download_response(headers, 200) is True
-
-    def test_attachment_header_case_insensitive(self) -> None:
-        headers = {"content-disposition": 'Attachment; filename="report.csv"', "content-type": "text/csv"}
-        assert is_download_response(headers, 200) is True
-
-    def test_download_mime_type_pdf(self) -> None:
-        headers = {"content-type": "application/pdf"}
-        assert is_download_response(headers, 200) is True
-
-    def test_download_mime_type_zip(self) -> None:
-        headers = {"content-type": "application/zip"}
-        assert is_download_response(headers, 200) is True
-
-    def test_download_mime_type_xlsx(self) -> None:
-        headers = {
-            "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        }
-        assert is_download_response(headers, 200) is True
-
-    def test_download_mime_type_octet_stream(self) -> None:
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200) is True
-
-    def test_download_mime_type_with_charset(self) -> None:
-        headers = {"content-type": "application/pdf; charset=utf-8"}
-        assert is_download_response(headers, 200) is True
-
-    def test_html_not_download(self) -> None:
-        headers = {"content-type": "text/html"}
-        assert is_download_response(headers, 200) is False
-
-    def test_json_not_download(self) -> None:
-        headers = {"content-type": "application/json"}
-        assert is_download_response(headers, 200) is False
-
-    def test_json_with_attachment_not_download(self) -> None:
-        """JSON responses with Content-Disposition: attachment should NOT be treated as downloads."""
-        headers = {
-            "content-disposition": "attachment",
-            "content-type": "application/json",
-        }
-        assert is_download_response(headers, 200) is False
-
-    def test_xml_not_download(self) -> None:
-        headers = {"content-type": "application/xml"}
-        assert is_download_response(headers, 200) is False
-
-    def test_grpc_not_download(self) -> None:
-        headers = {"content-type": "application/grpc"}
-        assert is_download_response(headers, 200) is False
-
-    def test_empty_headers_not_download(self) -> None:
-        assert is_download_response({}, 200) is False
-
-    # Resource type filtering — XHR/Fetch require BOTH attachment AND download MIME
-    def test_xhr_attachment_and_download_mime_is_download(self) -> None:
-        """XHR with attachment + download MIME type should be treated as download."""
-        headers = {"content-disposition": "attachment", "content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200, resource_type="XHR") is True
-
-    def test_fetch_attachment_and_download_mime_is_download(self) -> None:
-        """Fetch with attachment + download MIME type should be treated as download."""
-        headers = {"content-disposition": "attachment", "content-type": "application/pdf"}
-        assert is_download_response(headers, 200, resource_type="Fetch") is True
-
-    def test_xhr_attachment_pdf_is_download(self) -> None:
-        """Real-world case: XHR download with attachment header and PDF content-type."""
-        headers = {
-            "content-disposition": "attachment; filename=Invoice_12345.pdf; filename*=UTF-8''Invoice_12345.pdf",
-            "content-type": "application/pdf",
-        }
-        assert is_download_response(headers, 200, resource_type="XHR") is True
-
-    # XHR/Fetch with attachment but non-download MIME should NOT be download
-    def test_xhr_attachment_text_plain_not_download(self) -> None:
-        """Google-style XHR: text/plain + attachment should NOT be treated as download."""
-        headers = {"content-disposition": 'attachment; filename="f.txt"', "content-type": "text/plain; charset=UTF-8"}
-        assert is_download_response(headers, 200, resource_type="XHR") is False
-
-    def test_xhr_attachment_text_html_not_download(self) -> None:
-        """XHR with text/html + attachment should NOT be treated as download."""
-        headers = {"content-disposition": "attachment", "content-type": "text/html"}
-        assert is_download_response(headers, 200, resource_type="XHR") is False
-
-    def test_fetch_attachment_only_not_download(self) -> None:
-        """Fetch with attachment but no download MIME type should NOT be download."""
-        headers = {"content-disposition": "attachment"}
-        assert is_download_response(headers, 200, resource_type="Fetch") is False
-
-    def test_xhr_attachment_csv_not_download(self) -> None:
-        """Known limitation: CSV via XHR is not detected because text/csv is not in DOWNLOAD_MIME_TYPES."""
-        headers = {"content-disposition": "attachment", "content-type": "text/csv"}
-        assert is_download_response(headers, 200, resource_type="XHR") is False
-
-    # XHR/Fetch without attachment header should NOT be download (MIME-only false positive)
-    def test_xhr_mime_only_not_download(self) -> None:
-        """XHR with download MIME type but no Content-Disposition at all should NOT be treated as download."""
-        headers = {"content-type": "application/pdf"}
-        assert is_download_response(headers, 200, resource_type="XHR") is False
-
-    def test_fetch_mime_only_not_download(self) -> None:
-        """Fetch with download MIME type but no Content-Disposition at all should NOT be treated as download."""
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200, resource_type="Fetch") is False
+    @pytest.mark.parametrize(
+        ("headers", "status_code", "resource_type", "expected"),
+        [
+            pytest.param(
+                {"content-disposition": 'Attachment; filename="report.csv"', "content-type": "text/csv"},
+                200,
+                "",
+                True,
+                id="attachment_header",
+            ),
+            pytest.param(
+                {"content-disposition": 'attachment; filename="report.csv"', "content-type": "text/csv"},
+                200,
+                "",
+                True,
+                id="attachment_header_lowercase",
+            ),
+            pytest.param(
+                {"content-type": "application/pdf"},
+                200,
+                "",
+                True,
+                id="download_mime_pdf",
+            ),
+            pytest.param(
+                {"content-type": "application/zip"},
+                200,
+                "",
+                True,
+                id="download_mime_zip",
+            ),
+            pytest.param(
+                {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+                200,
+                "",
+                True,
+                id="download_mime_xlsx",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                200,
+                "",
+                True,
+                id="download_mime_octet_stream",
+            ),
+            pytest.param(
+                {"content-type": "application/pdf; charset=utf-8"},
+                200,
+                "",
+                True,
+                id="download_mime_with_charset",
+            ),
+            pytest.param({"content-type": "text/html"}, 200, "", False, id="html_not_download"),
+            pytest.param({"content-type": "application/json"}, 200, "", False, id="json_not_download"),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/json"},
+                200,
+                "",
+                False,
+                id="api_attachment_not_download",
+            ),
+            pytest.param({"content-type": "application/xml"}, 200, "", False, id="xml_not_download"),
+            pytest.param({"content-type": "application/grpc"}, 200, "", False, id="grpc_not_download"),
+            pytest.param({}, 200, "", False, id="empty_headers_not_download"),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/octet-stream"},
+                200,
+                "XHR",
+                True,
+                id="xhr_attachment_download_mime",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/pdf"},
+                200,
+                "Fetch",
+                True,
+                id="fetch_attachment_download_mime",
+            ),
+            pytest.param(
+                {
+                    "content-disposition": (
+                        "attachment; filename=Invoice_12345.pdf; filename*=UTF-8''Invoice_12345.pdf"
+                    ),
+                    "content-type": "application/pdf",
+                },
+                200,
+                "XHR",
+                True,
+                id="xhr_attachment_pdf_filename_star",
+            ),
+            pytest.param(
+                {"content-disposition": 'attachment; filename="f.txt"', "content-type": "text/plain; charset=UTF-8"},
+                200,
+                "XHR",
+                False,
+                id="xhr_attachment_text_plain_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "text/html"},
+                200,
+                "XHR",
+                False,
+                id="xhr_attachment_text_html_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment"},
+                200,
+                "Fetch",
+                False,
+                id="fetch_attachment_only_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "text/csv"},
+                200,
+                "XHR",
+                True,
+                id="xhr_attachment_csv_is_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/csv"},
+                200,
+                "XHR",
+                True,
+                id="xhr_attachment_application_csv_is_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "46681129"},
+                200,
+                "XHR",
+                True,
+                id="xhr_generic_binary_with_bytes_is_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*"},
+                200,
+                "XHR",
+                False,
+                id="xhr_generic_binary_no_length_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "6"},
+                200,
+                "XHR",
+                False,
+                id="xhr_generic_binary_small_body_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*"},
+                200,
+                "",
+                False,
+                id="non_xhr_generic_binary_no_length_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*"},
+                200,
+                "Document",
+                False,
+                id="non_xhr_generic_binary_document_no_length_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "9999999"},
+                200,
+                "Other",
+                False,
+                id="non_xhr_generic_binary_other_large_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/*", "content-length": "2048"},
+                200,
+                "Fetch",
+                True,
+                id="fetch_generic_binary_with_bytes_is_download",
+            ),
+            pytest.param(
+                {"content-type": "application/pdf"},
+                200,
+                "XHR",
+                False,
+                id="xhr_mime_only_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                200,
+                "Fetch",
+                False,
+                id="fetch_mime_only_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/json"},
+                200,
+                "XHR",
+                False,
+                id="xhr_json_attachment_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                200,
+                "Font",
+                False,
+                id="font_resource_type_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                200,
+                "Stylesheet",
+                False,
+                id="stylesheet_resource_type_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                200,
+                "Script",
+                False,
+                id="script_resource_type_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                200,
+                "Image",
+                False,
+                id="image_resource_type_not_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/pdf"},
+                200,
+                "Document",
+                True,
+                id="document_resource_type_is_download",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment", "content-type": "application/pdf"},
+                404,
+                "",
+                False,
+                id="error_status_code_not_download",
+            ),
+            pytest.param(
+                {"content-type": "application/octet-stream"},
+                500,
+                "",
+                False,
+                id="server_error_not_download",
+            ),
+        ],
+    )
+    def test_is_download_response_table(
+        self,
+        headers: dict[str, str],
+        status_code: int,
+        resource_type: str,
+        expected: bool,
+    ) -> None:
+        assert is_download_response(headers, status_code, resource_type=resource_type) is expected
 
     def test_xhr_inline_pdf_with_filename_not_download(self) -> None:
         """XHR with inline + filename is NOT a CDP download — handled by ScopedXhrDownloadCapture instead."""
@@ -127,45 +279,6 @@ class TestIsDownloadResponse:
         }
         assert is_download_response(headers, 200, resource_type="XHR") is False
 
-    # XHR/Fetch with attachment but API content-type should still be filtered
-    def test_xhr_json_attachment_not_download(self) -> None:
-        """XHR with JSON content-type and attachment header should NOT be download."""
-        headers = {"content-disposition": "attachment", "content-type": "application/json"}
-        assert is_download_response(headers, 200, resource_type="XHR") is False
-
-    def test_font_resource_type_not_download(self) -> None:
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200, resource_type="Font") is False
-
-    def test_stylesheet_resource_type_not_download(self) -> None:
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200, resource_type="Stylesheet") is False
-
-    def test_script_resource_type_not_download(self) -> None:
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200, resource_type="Script") is False
-
-    def test_image_resource_type_not_download(self) -> None:
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 200, resource_type="Image") is False
-
-    def test_document_resource_type_is_download(self) -> None:
-        """Document resource type (link click) should allow download detection."""
-        headers = {"content-disposition": "attachment", "content-type": "application/pdf"}
-        assert is_download_response(headers, 200, resource_type="Document") is True
-
-    def test_empty_resource_type_is_download(self) -> None:
-        headers = {"content-type": "application/pdf"}
-        assert is_download_response(headers, 200, resource_type="") is True
-
-    def test_error_status_code_not_download(self) -> None:
-        headers = {"content-disposition": "attachment", "content-type": "application/pdf"}
-        assert is_download_response(headers, 404) is False
-
-    def test_server_error_not_download(self) -> None:
-        headers = {"content-type": "application/octet-stream"}
-        assert is_download_response(headers, 500) is False
-
 
 class TestExtractFilename:
     """Tests for extract_filename().
@@ -174,59 +287,73 @@ class TestExtractFilename:
     the caller (_resolve_save_path) is responsible for generating a fallback name.
     """
 
-    def test_rfc5987_filename_star(self) -> None:
-        headers = {"content-disposition": "attachment; filename*=UTF-8''my%20report%282024%29.pdf"}
-        result = extract_filename(headers, "https://example.com/download")
-        assert result == "my report(2024).pdf"
-
-    def test_regular_filename(self) -> None:
-        headers = {"content-disposition": 'attachment; filename="report.csv"'}
-        result = extract_filename(headers, "https://example.com/download")
-        assert result == "report.csv"
-
-    def test_unquoted_filename(self) -> None:
-        headers = {"content-disposition": "attachment; filename=report.csv"}
-        result = extract_filename(headers, "https://example.com/download")
-        assert result == "report.csv"
-
-    def test_filename_star_takes_priority(self) -> None:
-        headers = {
-            "content-disposition": "attachment; filename=\"fallback.csv\"; filename*=UTF-8''preferred.csv",
-        }
-        result = extract_filename(headers, "https://example.com/download")
-        assert result == "preferred.csv"
-
-    def test_url_path_fallback(self) -> None:
-        headers: dict[str, str] = {}
-        result = extract_filename(headers, "https://example.com/files/document.pdf")
-        assert result == "document.pdf"
-
-    def test_url_path_with_encoded_chars(self) -> None:
-        headers: dict[str, str] = {}
-        result = extract_filename(headers, "https://example.com/files/my%20report.xlsx")
-        assert result == "my report.xlsx"
-
-    def test_url_path_no_extension_returns_empty(self) -> None:
-        """No extension in URL path and no Content-Disposition — returns empty string."""
-        headers: dict[str, str] = {}
-        result = extract_filename(headers, "https://example.com/download")
-        assert result == ""
-
-    def test_no_headers_no_url_returns_empty(self) -> None:
-        """Completely empty inputs — returns empty string for _resolve_save_path to handle."""
-        result = extract_filename({}, "https://example.com/api/export")
-        assert result == ""
-
-    def test_empty_content_disposition(self) -> None:
-        headers = {"content-disposition": ""}
-        result = extract_filename(headers, "https://example.com/files/data.csv")
-        assert result == "data.csv"
-
-    def test_content_disposition_inline(self) -> None:
-        """inline disposition without filename should fall back to URL."""
-        headers = {"content-disposition": "inline"}
-        result = extract_filename(headers, "https://example.com/files/report.pdf")
-        assert result == "report.pdf"
+    @pytest.mark.parametrize(
+        ("headers", "url", "expected"),
+        [
+            pytest.param(
+                {"content-disposition": "attachment; filename*=UTF-8''my%20report%282024%29.pdf"},
+                "https://example.com/download",
+                "my report(2024).pdf",
+                id="rfc5987_filename_star",
+            ),
+            pytest.param(
+                {"content-disposition": 'attachment; filename="report.csv"'},
+                "https://example.com/download",
+                "report.csv",
+                id="regular_filename",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment; filename=report.csv"},
+                "https://example.com/download",
+                "report.csv",
+                id="unquoted_filename",
+            ),
+            pytest.param(
+                {"content-disposition": "attachment; filename=\"fallback.csv\"; filename*=UTF-8''preferred.csv"},
+                "https://example.com/download",
+                "preferred.csv",
+                id="filename_star_takes_priority",
+            ),
+            pytest.param(
+                {},
+                "https://example.com/files/document.pdf",
+                "document.pdf",
+                id="url_path_fallback",
+            ),
+            pytest.param(
+                {},
+                "https://example.com/files/my%20report.xlsx",
+                "my report.xlsx",
+                id="url_path_with_encoded_chars",
+            ),
+            pytest.param(
+                {},
+                "https://example.com/download",
+                "",
+                id="url_path_no_extension_returns_empty",
+            ),
+            pytest.param(
+                {},
+                "https://example.com/api/export",
+                "",
+                id="no_headers_no_url_returns_empty",
+            ),
+            pytest.param(
+                {"content-disposition": ""},
+                "https://example.com/files/data.csv",
+                "data.csv",
+                id="empty_content_disposition_url_fallback",
+            ),
+            pytest.param(
+                {"content-disposition": "inline"},
+                "https://example.com/files/report.pdf",
+                "report.pdf",
+                id="content_disposition_inline_url_fallback",
+            ),
+        ],
+    )
+    def test_extract_filename_table(self, headers: dict[str, str], url: str, expected: str) -> None:
+        assert extract_filename(headers, url) == expected
 
     def test_path_traversal_returned_raw(self) -> None:
         """extract_filename returns raw name; sanitization is done in _resolve_save_path."""
@@ -242,19 +369,42 @@ class TestResolveSavePath:
         interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
         return interceptor
 
-    def test_normal_filename(self, tmp_path: Path) -> None:
-        interceptor = self._make_interceptor(tmp_path)
-        save_path, filename = interceptor._resolve_save_path("report.pdf")
-        assert filename == "report.pdf"
-        assert save_path == tmp_path / "report.pdf"
+    @pytest.mark.parametrize(
+        ("raw_filename", "content_type", "expected_filename", "preexisting_file", "output_dir_parts"),
+        [
+            pytest.param("report.pdf", "", "report.pdf", False, (), id="normal_filename"),
+            pytest.param("", "", None, False, (), id="empty_filename_uuid_fallback"),
+            pytest.param(None, "", None, False, (), id="default_param_empty_string"),
+            pytest.param("report.pdf", "", "report.pdf", True, (), id="collision_returns_same_path"),
+            pytest.param("file.txt", "", "file.txt", False, ("sub", "dir"), id="creates_missing_output_dir"),
+        ],
+    )
+    def test_resolve_save_path_table(
+        self,
+        tmp_path: Path,
+        raw_filename: str | None,
+        content_type: str,
+        expected_filename: str | None,
+        preexisting_file: bool,
+        output_dir_parts: tuple[str, ...],
+    ) -> None:
+        output_dir = tmp_path.joinpath(*output_dir_parts)
+        interceptor = self._make_interceptor(output_dir)
+        if preexisting_file:
+            (output_dir / raw_filename).write_bytes(b"existing")
 
-    def test_empty_filename_gets_uuid_fallback(self, tmp_path: Path) -> None:
-        """Empty filename should generate a download_{uuid} fallback."""
-        interceptor = self._make_interceptor(tmp_path)
-        save_path, filename = interceptor._resolve_save_path("")
-        assert filename.startswith("download_")
-        assert len(filename) > len("download_")
-        assert save_path == tmp_path / filename
+        if raw_filename is None:
+            save_path, filename = interceptor._resolve_save_path()
+        else:
+            save_path, filename = interceptor._resolve_save_path(raw_filename, content_type)
+
+        if expected_filename is None:
+            assert filename.startswith("download_")
+            assert len(filename) > len("download_")
+        else:
+            assert filename == expected_filename
+        assert save_path == output_dir / filename
+        assert output_dir.exists()
 
     def test_empty_filename_gets_pdf_uuid_fallback(self, tmp_path: Path) -> None:
         interceptor = self._make_interceptor(tmp_path)
@@ -262,12 +412,6 @@ class TestResolveSavePath:
         assert filename.startswith("download_")
         assert filename.endswith(".pdf")
         assert save_path == tmp_path / filename
-
-    def test_default_param_empty_string(self, tmp_path: Path) -> None:
-        """Calling without arguments should also trigger fallback."""
-        interceptor = self._make_interceptor(tmp_path)
-        _, filename = interceptor._resolve_save_path()
-        assert filename.startswith("download_")
 
     def test_path_traversal_sanitized(self, tmp_path: Path) -> None:
         """Path traversal components should be stripped — only the final name is kept."""
@@ -294,30 +438,6 @@ class TestResolveSavePath:
         save_path, filename = interceptor._resolve_save_path("invoice_5/19/2026.pdf", "application/pdf")
         assert filename == "invoice_5_19_2026.pdf"
         assert save_path == tmp_path / "invoice_5_19_2026.pdf"
-
-    def test_increments_download_index(self, tmp_path: Path) -> None:
-        interceptor = self._make_interceptor(tmp_path)
-        assert interceptor._download_index == 0
-        interceptor._resolve_save_path("a.pdf")
-        assert interceptor._download_index == 1
-        interceptor._resolve_save_path("b.pdf")
-        assert interceptor._download_index == 2
-
-    def test_collision_warning_logged(self, tmp_path: Path) -> None:
-        """Existing file with the same name should warn but still return the path."""
-        interceptor = self._make_interceptor(tmp_path)
-        # Create a file that will collide
-        (tmp_path / "report.pdf").write_bytes(b"existing")
-        save_path, filename = interceptor._resolve_save_path("report.pdf")
-        assert filename == "report.pdf"
-        assert save_path == tmp_path / "report.pdf"
-
-    def test_creates_output_dir_if_missing(self, tmp_path: Path) -> None:
-        nested = tmp_path / "sub" / "dir"
-        interceptor = CDPDownloadInterceptor(output_dir=str(nested))
-        save_path, _ = interceptor._resolve_save_path("file.txt")
-        assert nested.exists()
-        assert save_path.parent == nested
 
 
 class TestCDPDownloadInterceptorProxyAuth:
@@ -590,3 +710,476 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
+
+
+class TestStaleInterceptionRace:
+    """Fetch.continueRequest/continueResponse can fail with 'Invalid InterceptionId' when the
+    interception is resolved/cancelled or its target detaches before our async handler responds.
+    That is a benign race (SKY-11964), not an error-level failure, and retrying it is futile."""
+
+    _MOD = "skyvern.webeye.cdp_download_interceptor"
+
+    def _make_interceptor(self) -> CDPDownloadInterceptor:
+        return CDPDownloadInterceptor(output_dir="/tmp/test_downloads")
+
+    def _make_cdp_session(self) -> MagicMock:
+        session = MagicMock()
+        session.send = AsyncMock()
+        return session
+
+    @staticmethod
+    def _response_event() -> dict:
+        return {
+            "requestId": "req-1",
+            "request": {"url": "https://example.com/analytics/collect"},
+            "resourceType": "XHR",
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "content-type", "value": "text/plain"}],
+        }
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            pytest.param("Protocol error (Fetch.continueResponse): Invalid InterceptionId", True, id="invalid_id"),
+            pytest.param("Protocol error (Fetch.continueRequest): Invalid InterceptionId", True, id="invalid_id_req"),
+            pytest.param("Target page, context or browser has been closed", True, id="target_closed"),
+            pytest.param("Session closed. Most likely the page has been closed.", True, id="session_closed"),
+            pytest.param("Protocol error (Fetch.continueResponse): Some other CDP failure", False, id="other_cdp"),
+            pytest.param("Connection reset by peer", False, id="generic"),
+        ],
+    )
+    def test_is_stale_interception_error(self, message: str, expected: bool) -> None:
+        assert _is_stale_interception_error(Exception(message)) is expected
+
+    @pytest.mark.asyncio
+    async def test_stale_continue_response_not_retried_or_error_logged(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): Invalid InterceptionId")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Only the original continueResponse — no futile recovery retry against a dead interception.
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_stale_response_error_still_retries_and_logs(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueResponse): boom")
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(self._response_event(), cdp_session)
+
+        # Original continueResponse + one recovery attempt; real failures still surface as errors.
+        assert cdp_session.send.call_count == 2
+        mock_log.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_request_stage_error_not_logged_as_error(self) -> None:
+        interceptor = self._make_interceptor()
+        cdp_session = self._make_cdp_session()
+        cdp_session.send.side_effect = Exception("Protocol error (Fetch.continueRequest): Invalid InterceptionId")
+        event = {
+            "requestId": "req-2",
+            "request": {"url": "https://example.com/page"},
+            "resourceType": "Document",
+            # No responseStatusCode — Request-stage event
+        }
+
+        with patch(f"{self._MOD}.LOG") as mock_log:
+            await interceptor._handle_request_paused(event, cdp_session)
+
+        assert cdp_session.send.call_count == 1
+        mock_log.error.assert_not_called()
+
+
+class TestBlobDownloadCapture:
+    """Browser-initiated blob: URL downloads (e.g. a page that builds the file client-side and
+    triggers a blob download) must be read back via SkyvernFrame and saved, not dropped."""
+
+    _READ_BLOB = "skyvern.webeye.cdp_download_interceptor.SkyvernFrame.read_blob_url_bytes"
+
+    @staticmethod
+    def _context(num_pages: int = 1) -> MagicMock:
+        context = MagicMock()
+        context.pages = [MagicMock() for _ in range(num_pages)]
+        return context
+
+    @pytest.mark.asyncio
+    async def test_blob_download_read_and_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        pdf_bytes = b"%PDF-1.4 fake blob invoice bytes"
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/abc-123", "suggestedFilename": "invoice.pdf"}
+            )
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == "invoice.pdf"
+        assert saved[0].read_bytes() == pdf_bytes
+
+    @pytest.mark.asyncio
+    async def test_blob_download_falls_through_pages_until_readable(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context(num_pages=2)
+        pdf_bytes = b"%PDF blob"
+        read = AsyncMock(side_effect=[None, pdf_bytes])
+
+        with patch(self._READ_BLOB, new=read):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/xyz", "suggestedFilename": "bill.pdf"}
+            )
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == pdf_bytes
+        assert read.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_blob_download_threads_max_size_and_guards_oversize(self, tmp_path: Path) -> None:
+        import skyvern.webeye.cdp_download_interceptor as mod
+
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        read = AsyncMock(return_value=b"x" * 2048)  # exceeds the patched limit (defense-in-depth)
+
+        with patch.object(mod, "MAX_FILE_SIZE_BYTES", 1024), patch(self._READ_BLOB, new=read):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/big", "suggestedFilename": "huge.pdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        # the in-page size limit is threaded to the shared reader, and probe mode quiets the
+        # per-page fallback so non-owning pages don't spam ERROR logs
+        assert read.await_args.kwargs["max_size_bytes"] == 1024
+        assert read.await_args.kwargs["probe"] is True
+
+    @pytest.mark.asyncio
+    async def test_blob_download_unreadable_is_noop(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=None)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/gone", "suggestedFilename": "x.pdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blob_download_saves_distinct_file_with_identical_bytes(self, tmp_path: Path) -> None:
+        # Two independent downloads can share bytes but differ by name — the second must not be
+        # dropped just because matching bytes already exist on disk.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        pdf_bytes = b"%PDF identical bytes, different download"
+        (tmp_path / "prior.pdf").write_bytes(pdf_bytes)
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/second", "suggestedFilename": "invoice.pdf"}
+            )
+
+        names = sorted(p.name for p in tmp_path.iterdir())
+        assert names == ["invoice.pdf", "prior.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_blob_download_no_context_is_noop(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        with patch(self._READ_BLOB, new=AsyncMock()) as read:
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/none", "suggestedFilename": "x.pdf"}
+            )
+        read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_blob_download_already_captured_via_fetch_is_skipped(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        url = "blob:https://example.com/dup"
+        interceptor._downloaded_urls.add(url)
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock()) as read:
+            await interceptor._handle_browser_download({"url": url, "suggestedFilename": "x.pdf"})
+
+        read.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestDirectHttpDownloadAuthAndHtmlGuard:
+    """_download_url_directly falls back from the cookie-sharing Playwright APIRequestContext to a
+    raw urllib fetch. That fallback must (1) still carry the browser session's cookies, and (2) not
+    silently save an HTML login/session-gate page under a binary filename.
+
+    Regression: a session-gated download endpoint fetched without cookies returns its HTML login
+    page (HTTP 200); the old fallback issued a cookieless request and saved that HTML as e.g. a
+    .zip while reporting the download as successful.
+    """
+
+    _URLOPEN = "urllib.request.urlopen"
+
+    @staticmethod
+    def _fake_urlopen(body: bytes, content_type: str) -> MagicMock:
+        class _Resp:
+            headers = {"content-type": content_type}
+
+            def read(self) -> bytes:
+                return body
+
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+        return MagicMock(return_value=_Resp())
+
+    @staticmethod
+    def _context_forcing_urllib(cookies: list[dict]) -> MagicMock:
+        """Browser context whose APIRequestContext returns proxy-407 (non-OK), forcing the urllib
+        fallback, and whose cookies() returns the given session cookies."""
+        ctx = MagicMock()
+        non_ok = MagicMock()
+        non_ok.ok = False
+        non_ok.status = 407
+        ctx.request.get = AsyncMock(return_value=non_ok)
+        ctx.cookies = AsyncMock(return_value=cookies)
+        return ctx
+
+    _LOGIN_HTML = (
+        b'\n<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">\n'
+        b"<html><head><title>Login</title></head>"
+        b"<body><form method='post' action='./Login.aspx'></form></body></html>"
+    )
+
+    @pytest.mark.asyncio
+    async def test_urllib_fallback_forwards_browser_cookies(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib(
+            [{"name": "ASP.NET_SessionId", "value": "sess123"}, {"name": "auth", "value": "tok"}]
+        )
+        zip_bytes = b"PK\x03\x04 real zip payload"
+        urlopen = self._fake_urlopen(zip_bytes, "application/zip")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        sent_request = urlopen.call_args.args[0]
+        assert sent_request.get_header("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
+        # The cookie must be an unredirected header so urllib does not replay it across a cross-host
+        # redirect (session-cookie leak): urllib copies req.headers on redirect, not unredirected_hdrs.
+        assert "Cookie" not in sent_request.headers
+        assert sent_request.unredirected_hdrs.get("Cookie") == "ASP.NET_SessionId=sess123; auth=tok"
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["statement.zip"]
+        assert saved[0].read_bytes() == zip_bytes
+
+    @pytest.mark.asyncio
+    async def test_cookie_header_skips_control_char_values(self, tmp_path: Path) -> None:
+        # A stored cookie value with CR/LF must not inject extra directives into the Cookie line.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib(
+            [{"name": "good", "value": "ok"}, {"name": "bad", "value": "x\r\nSet-Cookie: evil=1"}]
+        )
+        urlopen = self._fake_urlopen(b"PK\x03\x04 zip payload", "application/zip")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        assert urlopen.call_args.args[0].get_header("Cookie") == "good=ok"
+
+    @pytest.mark.asyncio
+    async def test_html_login_page_for_binary_filename_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_html_login_page_for_encoded_binary_filename_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement%2Ezip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_html_payload_for_encoded_html_filename_is_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(b"<!DOCTYPE html><html><body>report</body></html>", "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/report", "report%2Ehtml")
+
+        assert [path.name for path in tmp_path.iterdir()] == ["report.html"]
+
+    @pytest.mark.asyncio
+    async def test_html_payload_for_double_encoded_binary_filename_is_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly(
+                "https://site.example/download?f=statement%252Ezip", "statement%252Ezip"
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_html_body_without_html_content_type_still_rejected(self, tmp_path: Path) -> None:
+        # Some servers mislabel the login page's content-type; sniff the body markup too.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "application/octet-stream")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(b"<!-- generated --><!DOCTYPE html><html><body>login</body></html>", id="comment"),
+            pytest.param(b'<?xml version="1.0"?><html><body>login</body></html>', id="xml-declaration"),
+            pytest.param(b"<head><title>Login</title></head><body>login</body>", id="omitted-html-root"),
+            pytest.param(b"<head\n><title>Login</title></head><body>login</body>", id="tag-newline"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_html_body_with_legal_leading_markup_is_rejected(self, tmp_path: Path, body: bytes) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(body, "application/octet-stream")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download", "statement.zip")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_real_binary_payload_is_saved(self, tmp_path: Path) -> None:
+        # Guard must not over-reject genuine binary downloads.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        pdf = b"%PDF-1.7 real invoice bytes"
+        urlopen = self._fake_urlopen(pdf, "application/pdf")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?i=1", "invoice.pdf")
+
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["invoice.pdf"]
+        assert saved[0].read_bytes() == pdf
+
+    @pytest.mark.asyncio
+    async def test_html_payload_for_html_filename_is_saved(self, tmp_path: Path) -> None:
+        # An HTML document downloaded under an .html name is honest, not a masquerade — keep it.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(b"<!DOCTYPE html><html><body>report</body></html>", "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/report", "report.html")
+
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["report.html"]
+
+    @pytest.mark.asyncio
+    async def test_http_browser_download_routes_through_direct_download(self, tmp_path: Path) -> None:
+        # Real wiring: an http(s) browser download goes through _download_url_directly, which
+        # forwards cookies and rejects the HTML login masquerade.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([{"name": "sid", "value": "x"}])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._handle_browser_download(
+                {
+                    "url": "https://site.example/download?f=report.zip",
+                    "suggestedFilename": "report.zip",
+                }
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        assert urlopen.call_args.args[0].get_header("Cookie") == "sid=x"
+
+    @pytest.mark.asyncio
+    async def test_nameless_binary_content_type_html_body_not_saved(self, tmp_path: Path) -> None:
+        # No filename extension but a binary content-type + HTML body is still a masquerade.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "application/octet-stream")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download", "")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_nameless_html_content_type_is_saved(self, tmp_path: Path) -> None:
+        # A nameless download that is honestly HTML (html content-type, no binary claim) is kept.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/page", "")
+
+        assert len(list(tmp_path.iterdir())) == 1
+
+    @pytest.mark.asyncio
+    async def test_extensionless_named_html_login_page_is_not_saved(self, tmp_path: Path) -> None:
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "text/html; charset=utf-8")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download", "statement")
+
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_binary_payload_mislabeled_as_html_is_saved(self, tmp_path: Path) -> None:
+        # A real binary payload a server mislabels as text/html must be saved, not discarded:
+        # the body is the ground truth, so a non-HTML body is never treated as a masquerade.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        zip_bytes = b"PK\x03\x04 genuine archive, not html"
+        urlopen = self._fake_urlopen(zip_bytes, "text/html")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/download?f=statement.zip", "statement.zip")
+
+        saved = list(tmp_path.iterdir())
+        assert [p.name for p in saved] == ["statement.zip"]
+        assert saved[0].read_bytes() == zip_bytes
+
+    @pytest.mark.asyncio
+    async def test_nameless_no_content_type_html_is_saved(self, tmp_path: Path) -> None:
+        # Nameless download with no content-type and an HTML body makes no binary claim, so it is
+        # saved as-is (intentional "no claim, no mismatch"), not rejected.
+        interceptor = CDPDownloadInterceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context_forcing_urllib([])
+        urlopen = self._fake_urlopen(self._LOGIN_HTML, "")
+
+        with patch(self._URLOPEN, urlopen):
+            await interceptor._download_url_directly("https://site.example/page", "")
+
+        assert len(list(tmp_path.iterdir())) == 1

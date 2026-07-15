@@ -137,6 +137,33 @@ def test_terminal_challenge_categories_follow_anti_bot_root_cause_aliases() -> N
     assert TERMINAL_CHALLENGE_FAILURE_CATEGORIES == ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES
 
 
+def test_update_state_ignores_keyword_only_anti_bot_categories_for_identity() -> None:
+    wf = _make_workflow([_Block("open", url="https://a.test")])
+    keyword_entry = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.7, "evidence_source": "keyword_only"}
+
+    ctx_a = _make_ctx(failure_reason="Timeout waiting for #search", workflow=wf, executed_labels=["open"])
+    update_repeated_failure_state(ctx_a, {"ok": False, "data": {"failure_categories": [dict(keyword_entry)]}})
+    ctx_b = _make_ctx(failure_reason="ValueError: missing column 'name'", workflow=wf, executed_labels=["open"])
+    update_repeated_failure_state(ctx_b, {"ok": False, "data": {"failure_categories": [dict(keyword_entry)]}})
+
+    assert ctx_a.last_failure_signature is not None
+    assert ctx_b.last_failure_signature is not None
+    assert ctx_a.last_failure_signature != ctx_b.last_failure_signature
+
+
+def test_update_state_keeps_carrier_backed_anti_bot_category_identity() -> None:
+    wf = _make_workflow([_Block("open", url="https://a.test")])
+    carrier_entry = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "challenge_state"}
+
+    ctx_a = _make_ctx(failure_reason="Challenge page A blocked the run", workflow=wf, executed_labels=["open"])
+    update_repeated_failure_state(ctx_a, {"ok": False, "data": {"failure_categories": [dict(carrier_entry)]}})
+    ctx_b = _make_ctx(failure_reason="Different challenge prose on retry", workflow=wf, executed_labels=["open"])
+    update_repeated_failure_state(ctx_b, {"ok": False, "data": {"failure_categories": [dict(carrier_entry)]}})
+
+    assert ctx_a.last_failure_signature is not None
+    assert ctx_a.last_failure_signature == ctx_b.last_failure_signature
+
+
 def test_fingerprint_empty_without_workflow_definition() -> None:
     assert compute_frontier_fingerprint(["open"], None) == ""
 

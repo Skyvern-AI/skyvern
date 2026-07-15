@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from skyvern.forge.sdk.copilot.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.copilot.failure_tracking import ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE, url_origin
@@ -54,6 +55,8 @@ def run_outcome_display_reason(text: str | None) -> str | None:
 def trusted_terminal_challenge_category_name(entry: Mapping[str, Any]) -> str | None:
     category = entry.get("category")
     if not isinstance(category, str) or category not in TERMINAL_CHALLENGE_FAILURE_CATEGORIES:
+        return None
+    if not is_carrier_backed_category_entry(entry):
         return None
     confidence = entry.get("confidence_float")
     if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):

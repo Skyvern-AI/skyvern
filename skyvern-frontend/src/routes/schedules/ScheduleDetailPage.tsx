@@ -33,8 +33,10 @@ import {
   getNextRuns,
   getTimezones,
   isValidCron,
+  meetsMinCronInterval,
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import { cn } from "@/util/utils";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
 import {
@@ -52,7 +54,7 @@ function ScheduleDetailPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { workflowPermanentId, scheduleId } = useParams();
-  const { data, isLoading, isError } = useScheduleDetailQuery(
+  const { data, isLoading, isError, error } = useScheduleDetailQuery(
     workflowPermanentId,
     scheduleId,
   );
@@ -106,6 +108,8 @@ function ScheduleDetailPage() {
   // ! end TODO
 
   const editValid = isValidCron(editCron);
+  const editIntervalTooShort = editValid && !meetsMinCronInterval(editCron);
+  const editCronAccepted = editValid && !editIntervalTooShort;
   const editHumanReadable = editValid ? cronToHumanReadable(editCron) : null;
   const editNextRuns = editValid ? getNextRuns(editCron, editTimezone, 5) : [];
 
@@ -118,15 +122,22 @@ function ScheduleDetailPage() {
   }
 
   if (isError || !data) {
+    const detail = getErrorDetail(error);
     return (
       <div className="py-20 text-center text-sm text-red-400">
         Failed to load schedule details.
+        {detail && (
+          <span className="mt-1 block text-xs text-slate-500">{detail}</span>
+        )}
       </div>
     );
   }
 
   const { schedule, next_runs } = data;
   const humanReadable = cronToHumanReadable(schedule.cron_expression);
+  const scheduleCronTooFrequent =
+    isValidCron(schedule.cron_expression) &&
+    !meetsMinCronInterval(schedule.cron_expression);
 
   function startEditing() {
     setEditCron(schedule.cron_expression);
@@ -149,7 +160,7 @@ function ScheduleDetailPage() {
   function handleSave() {
     if (!workflowPermanentId || !scheduleId) return;
     const parametersValid = validateParameters();
-    if (!editValid || !parametersValid) return;
+    if (!editCronAccepted || !parametersValid) return;
     // Only persist explicitly-set overrides. The form is seeded from
     // workflow defaults, so blindly sending the whole values dict would
     // pin the current default into the schedule and change semantics from
@@ -163,9 +174,10 @@ function ScheduleDetailPage() {
         workflowPermanentId,
         scheduleId,
         request: {
+          // `enabled` is intentionally omitted so the edit preserves whatever
+          // the enable/disable toggle set, even if this detail query is stale.
           cron_expression: editCron,
           timezone: editTimezone,
-          enabled: schedule.enabled,
           parameters: payload,
           ...(editName && { name: editName }),
           description: editDescription || undefined,
@@ -346,7 +358,7 @@ function ScheduleDetailPage() {
                   placeholder="* * * * *"
                   className={cn(
                     "h-8 text-sm",
-                    !editValid && editCron && "border-destructive",
+                    editCron && !editCronAccepted && "border-destructive",
                   )}
                 />
                 {editHumanReadable && (
@@ -355,6 +367,11 @@ function ScheduleDetailPage() {
                 {!editValid && editCron && (
                   <p className="text-xs text-destructive">
                     Invalid cron expression
+                  </p>
+                )}
+                {editIntervalTooShort && (
+                  <p className="text-xs text-destructive">
+                    Schedule runs must be at least 5 minutes apart.
                   </p>
                 )}
               </div>
@@ -431,7 +448,7 @@ function ScheduleDetailPage() {
                 <Button
                   size="sm"
                   className="h-7 text-xs"
-                  disabled={!editValid || updateMutation.isPending}
+                  disabled={!editCronAccepted || updateMutation.isPending}
                   onClick={handleSave}
                 >
                   {updateMutation.isPending ? "Saving..." : "Save"}
@@ -464,6 +481,12 @@ function ScheduleDetailPage() {
                   {schedule.cron_expression}
                 </code>
               </div>
+              {scheduleCronTooFrequent && (
+                <div className="rounded border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-xs text-amber-200">
+                  This schedule fires more often than the 5-minute minimum.
+                  Saving any change requires updating its cron expression first.
+                </div>
+              )}
             </div>
           )}
         </div>

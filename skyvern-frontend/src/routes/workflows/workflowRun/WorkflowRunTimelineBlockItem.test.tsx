@@ -898,8 +898,8 @@ describe("WorkflowRunTimelineBlockItem", () => {
     // The step at the failure line (3) executed no fired action and is not after
     // the failure, so it surfaces nowhere.
     expect(screen.queryByText(/Submit the form/)).toBeNull();
-    // Neutral slate tone — never the rose error tone.
-    expect(didntRun[0]!.className).toMatch(/text-slate-400/);
+    // Neutral muted tone — never the rose error tone.
+    expect(didntRun[0]!.className).toMatch(/text-muted-foreground/);
     expect(didntRun[0]!.className).not.toMatch(/rose/);
   });
 

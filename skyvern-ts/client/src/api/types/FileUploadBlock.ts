@@ -21,5 +21,7 @@ export interface FileUploadBlock {
     azure_storage_account_name?: string;
     azure_storage_account_key?: string;
     azure_blob_container_name?: string;
+    google_credential_id?: string;
+    google_drive_folder_id?: string;
     path?: string;
 }

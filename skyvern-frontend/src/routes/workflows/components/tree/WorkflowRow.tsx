@@ -101,7 +101,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         {showCheckbox && <TableCell />}
         <TableCell colSpan={2} style={firstCellStyle}>
           <div className="flex min-w-0 items-center gap-2">
-            <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
+            <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-700 dark:text-blue-400" />
             <span className="truncate" title={workflow.title}>
               {workflow.title}
             </span>
@@ -134,6 +134,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         tagKeys={tagKeys}
         labelSuggestions={labelSuggestions}
         valueSuggestionsByKey={valueSuggestionsByKey}
+        currentTags={workflowTags ?? []}
         selectedCount={selectedCount}
         taggingEnabled={taggingEnabled}
         onNavigate={(path) => navigate(path)}
@@ -209,7 +210,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
           >
             {workflow.folder_id ? (
               <div className="flex min-w-0 items-center gap-1.5">
-                <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+                <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
                 <span
                   className="truncate text-sm"
                   title={

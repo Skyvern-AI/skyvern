@@ -71,6 +71,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
     await context._register_credential_parameter_value("cred-1", parameter, organization)
 
     assert context.get_credential_totp_identifier("credential_param") == "user@example.com"
+    assert context.get_resolved_credential_parameter_id("credential_param") == "cred-1"
 
 
 async def _register_with_credential(monkeypatch: pytest.MonkeyPatch, credential: object) -> WorkflowRunContext:

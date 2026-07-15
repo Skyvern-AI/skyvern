@@ -69,6 +69,8 @@ const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
 const downloadFilenameTooltip =
   "The complete filename (without extension) for downloaded files. Extension is automatically determined from the response Content-Type.";
+const secretResponsePathsTooltip =
+  "One dot-path per line into the JSON response body (e.g. data.ssn). Matched values are stored as secrets: hidden from outputs, logs, and the AI, and usable in later blocks like credentials.";
 
 function HttpRequestEditor({ blockId }: { blockId: string }) {
   // Subscribe to the node's data slice. The sidebar mount lives outside the
@@ -101,6 +103,7 @@ function HttpRequestEditorBody({
     parameterKeys,
     downloadFilename,
     saveResponseAsFile,
+    secretResponsePaths = [],
     continueOnFailure,
   } = data;
 
@@ -193,7 +196,7 @@ function HttpRequestEditorBody({
         <div className="flex gap-4">
           <div className="w-32 space-y-2">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Method</Label>
+              <Label className="text-xs text-tertiary-foreground">Method</Label>
               <HelpTooltip content={methodTooltip} />
             </div>
             <Select
@@ -220,7 +223,7 @@ function HttpRequestEditorBody({
           </div>
           <div className="flex-1 space-y-2">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">URL</Label>
+              <Label className="text-xs text-tertiary-foreground">URL</Label>
               <HelpTooltip content={urlTooltip} />
             </div>
             <WorkflowBlockInputTextarea
@@ -237,7 +240,9 @@ function HttpRequestEditorBody({
         <div className="space-y-2">
           <div className="flex items-center justify-between">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Headers</Label>
+              <Label className="text-xs text-tertiary-foreground">
+                Headers
+              </Label>
               <HelpTooltip content={headersTooltip} />
             </div>
             <QuickHeadersDialog onAdd={handleQuickHeaders}>
@@ -268,7 +273,7 @@ function HttpRequestEditorBody({
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">Body</Label>
+                <Label className="text-xs text-tertiary-foreground">Body</Label>
                 <HelpTooltip content={bodyTooltip} />
               </div>
               <Popover>
@@ -307,7 +312,7 @@ function HttpRequestEditorBody({
         {showBodyEditor && (
           <div className="space-y-2">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Files</Label>
+              <Label className="text-xs text-tertiary-foreground">Files</Label>
               <HelpTooltip content={filesTooltip} />
             </div>
             <CodeEditor
@@ -349,7 +354,9 @@ function HttpRequestEditorBody({
               <div className="flex gap-4">
                 <div className="w-32 space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">Timeout</Label>
+                    <Label className="text-xs text-tertiary-foreground">
+                      Timeout
+                    </Label>
                     <HelpTooltip content={timeoutTooltip} />
                   </div>
                   <Input
@@ -366,13 +373,13 @@ function HttpRequestEditorBody({
                 </div>
                 <div className="flex-1 space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Follow Redirects
                     </Label>
                     <HelpTooltip content={followRedirectsTooltip} />
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-slate-400">
+                    <span className="text-xs text-muted-foreground">
                       Automatically follow HTTP redirects
                     </span>
                     <Switch
@@ -386,7 +393,7 @@ function HttpRequestEditorBody({
                 </div>
                 <div className="flex-1 space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Continue on Failure
                     </Label>
                     <HelpTooltip
@@ -407,7 +414,7 @@ function HttpRequestEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Save Response as File
                     </Label>
                     <HelpTooltip content="When enabled, the response body will be saved as a file instead of being parsed as JSON/text." />
@@ -421,9 +428,9 @@ function HttpRequestEditorBody({
                   />
                 </div>
                 {saveResponseAsFile && (
-                  <div className="space-y-2 border-l-2 border-slate-600 pl-4">
+                  <div className="space-y-2 border-l-2 border-border pl-4 dark:border-slate-600">
                     <div className="flex gap-2">
-                      <Label className="text-xs text-slate-300">
+                      <Label className="text-xs text-tertiary-foreground">
                         Download Filename
                       </Label>
                       <HelpTooltip content={downloadFilenameTooltip} />
@@ -441,14 +448,35 @@ function HttpRequestEditorBody({
                   </div>
                 )}
               </div>
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-tertiary-foreground">
+                    Secret Response Paths
+                  </Label>
+                  <HelpTooltip content={secretResponsePathsTooltip} />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={blockId}
+                  onChange={(next) =>
+                    update({
+                      secretResponsePaths: next ? next.split("\n") : [],
+                    })
+                  }
+                  value={secretResponsePaths.join("\n")}
+                  placeholder="data.ssn"
+                  className="nopan text-xs"
+                  disabled={!editable}
+                  hideActions
+                />
+              </div>
             </div>
           </AccordionContent>
         </AccordionItem>
       </Accordion>
 
       {!hasInteracted && (
-        <div className="workflow-editor-tip rounded-md bg-slate-800/50 p-3">
-          <div className="space-y-2 text-xs text-slate-400">
+        <div className="workflow-editor-tip rounded-md bg-muted/50 p-3">
+          <div className="space-y-2 text-xs text-muted-foreground">
             <div className="flex items-center gap-2">
               <MagicWandIcon className="h-3 w-3" />
               <span className="font-medium">Quick Tips:</span>

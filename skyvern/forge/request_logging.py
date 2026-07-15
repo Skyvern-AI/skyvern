@@ -27,6 +27,10 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/credentials/totp",
     "POST /api/v1/totp",
     "GET /v1/credentials/totp",
+    "PUT /v1/google/oauth/config",
+    "PUT /api/v1/google/oauth/config",
+    "POST /v1/google/oauth/callback",
+    "POST /api/v1/google/oauth/callback",
 }
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

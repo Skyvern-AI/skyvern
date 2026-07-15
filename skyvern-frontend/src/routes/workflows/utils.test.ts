@@ -1,10 +1,96 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ProxyLocation,
+  type WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
+import type { WorkflowParameter } from "./types/workflowTypes";
+import {
+  getInitialValues,
+  getRerunNavigationState,
   normalizeJsonParameterFormValue,
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
+
+function buildWorkflowRun(
+  overrides: Partial<WorkflowRunStatusApiResponseWithWorkflow> = {},
+): WorkflowRunStatusApiResponseWithWorkflow {
+  return {
+    parameters: { query: "status report", payload: ["alpha"] },
+    proxy_location: ProxyLocation.ResidentialDE,
+    webhook_callback_url: "https://example.com/webhook",
+    max_screenshot_scrolls: 8,
+    run_with: "code",
+    browser_profile_id: "profile_synthetic",
+    extra_http_headers: { "X-Test": "synthetic" },
+    ...overrides,
+  } as WorkflowRunStatusApiResponseWithWorkflow;
+}
+
+describe("getRerunNavigationState", () => {
+  it("maps exactly the six legacy rerun fields", () => {
+    const state = getRerunNavigationState(buildWorkflowRun());
+
+    expect(state).toEqual({
+      data: { query: "status report", payload: ["alpha"] },
+      proxyLocation: ProxyLocation.ResidentialDE,
+      webhookCallbackUrl: "https://example.com/webhook",
+      maxScreenshotScrolls: 8,
+      runWith: "code",
+      browserProfileId: "profile_synthetic",
+    });
+    expect(state).not.toHaveProperty("extraHttpHeaders");
+    expect(state).not.toHaveProperty("cdpConnectHeaders");
+    expect(state).not.toHaveProperty("cdpAddress");
+  });
+
+  it("matches the legacy nullish fallbacks", () => {
+    const workflowRun = {
+      parameters: null,
+      proxy_location: null,
+      webhook_callback_url: null,
+      max_screenshot_scrolls: null,
+      run_with: null,
+      browser_profile_id: null,
+    } as unknown as WorkflowRunStatusApiResponseWithWorkflow;
+
+    expect(getRerunNavigationState(workflowRun)).toEqual({
+      data: {},
+      proxyLocation: ProxyLocation.Residential,
+      webhookCallbackUrl: "",
+      maxScreenshotScrolls: null,
+      runWith: "agent",
+      browserProfileId: null,
+    });
+  });
+
+  it("flows rerun data through initial values with JSON normalization", () => {
+    const state = getRerunNavigationState(buildWorkflowRun());
+    const workflowParameters = [
+      {
+        parameter_type: "workflow",
+        key: "query",
+        workflow_parameter_type: "string",
+      },
+      {
+        parameter_type: "workflow",
+        key: "payload",
+        workflow_parameter_type: "json",
+      },
+    ] as WorkflowParameter[];
+
+    expect(
+      getInitialValues(
+        { state } as Parameters<typeof getInitialValues>[0],
+        workflowParameters,
+      ),
+    ).toEqual({
+      query: "status report",
+      payload: '[\n  "alpha"\n]',
+    });
+  });
+});
 
 describe("parseJsonWorkflowParameterValue", () => {
   it("parses a JSON array string", () => {

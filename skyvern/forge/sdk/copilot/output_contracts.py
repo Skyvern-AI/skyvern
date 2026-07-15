@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml
@@ -10,6 +11,127 @@ from skyvern.schemas.workflows import BlockType
 
 _ORDERED_CHILD_BLOCK_LIST_KEYS = ("loop_blocks", "blocks")
 _ORDERED_BRANCH_LIST_KEYS = ("branch_conditions", "branches", "ordered_branches")
+
+OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE = "output_source_unobservable"
+OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE = "actuation_exhausted"
+
+
+class OutputContractBailFamily(StrEnum):
+    STATIC_RETURN = "static_return"
+    STRUCTURAL = "structural"
+
+
+class OutputContractActuationKind(StrEnum):
+    IMPOSED = "imposed"
+    STRUCTURE_DIRECTIVE = "structure_directive"
+    ADVISORY_RUN = "advisory_run"
+    BLOCKED_TERMINAL = "blocked_terminal"
+
+
+class OutputContractAdvisoryState(StrEnum):
+    UNUSED = "unused"
+    GRANTED = "granted"
+    CONSUMED = "consumed"
+    EXPIRED = "expired"
+
+
+# A suffix whose sole defect is an un-keyable static return is STATIC_RETURN; every other split
+# defect, and any unknown or mixed blocker set, is STRUCTURAL. The family is observability-only
+# and no longer gates the advisory run, which is family-uniform and keyed on observable source.
+_STATIC_RETURN_BLOCKERS = frozenset({"static_return_envelope_unavailable"})
+
+
+def classify_output_contract_bail_family(blockers: Iterable[str]) -> OutputContractBailFamily:
+    codes = {str(blocker).strip() for blocker in blockers if str(blocker).strip()}
+    if codes and codes <= _STATIC_RETURN_BLOCKERS:
+        return OutputContractBailFamily.STATIC_RETURN
+    return OutputContractBailFamily.STRUCTURAL
+
+
+@dataclass(frozen=True)
+class OutputContractActuationEvidence:
+    imposed_available: bool
+    click_only_spine: bool
+    observed_required_values: bool
+    prior_actuation: bool
+    prior_directive_unconsumed: bool
+    advisory_state: OutputContractAdvisoryState = OutputContractAdvisoryState.UNUSED
+    actuation_progress_exhausted: bool = False
+    declick_attempt_failed: bool = False
+    advisory_run_grantable: bool = False
+    consumed_run_output_observed: bool = False
+    consumed_run_bound_required_path: bool = False
+    consumed_run_carried_page_extraction: bool = False
+    loaded_result_source_producible: bool = False
+
+
+@dataclass(frozen=True)
+class OutputContractActuation:
+    kind: OutputContractActuationKind
+    family: OutputContractBailFamily
+    reason_code: str = ""
+
+
+def resolve_output_contract_actuation(
+    *,
+    family: OutputContractBailFamily,
+    evidence: OutputContractActuationEvidence,
+) -> OutputContractActuation:
+    """Total lattice keyed on typed evidence, never reject counts: terminals require typed
+    evidence (output_source_unobservable only for a click-only spine with zero observed values
+    AND a failed de-click-only attempt; actuation_exhausted only after an advisory run was
+    consumed), and any observable source — regardless of family — always reaches one adjudicating
+    advisory run before any exhaustion terminal, so exhaustion count alone with a producible source
+    never terminals and a lone flaky scout pass never terminals a producible click-only shape.
+    A grantable advisory run (a producible separated-spine source whose imposition flaked this pass)
+    preempts the no-source terminal until it is consumed, so arm D never fires while a run is still
+    grantable. The exhaustion terminal keys on the executed run's observed output, never on draft
+    shape: it requires that a consumed run's output was observed, that the run carried the imposed
+    page-source extraction, and that it still bound no required path. A consumed run whose output was
+    observed but bound nothing without a page-source extraction on board is not exhaustion evidence —
+    it re-enters the ladder once so the stronger page-source imposition can bind the on-screen values a
+    code static-return provably cannot key."""
+    if evidence.imposed_available:
+        return OutputContractActuation(OutputContractActuationKind.IMPOSED, family)
+    grantable_source = (
+        evidence.advisory_run_grantable and evidence.advisory_state != OutputContractAdvisoryState.CONSUMED
+    )
+    observable_source = (
+        evidence.observed_required_values or evidence.loaded_result_source_producible or not evidence.click_only_spine
+    )
+    producible_source = observable_source or grantable_source
+    progressed = evidence.actuation_progress_exhausted or evidence.prior_actuation
+    if (
+        evidence.click_only_spine
+        and not evidence.observed_required_values
+        and not evidence.loaded_result_source_producible
+        and evidence.declick_attempt_failed
+        and not grantable_source
+    ):
+        return OutputContractActuation(
+            OutputContractActuationKind.BLOCKED_TERMINAL,
+            family,
+            OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
+        )
+    if (
+        producible_source
+        and evidence.advisory_state in {OutputContractAdvisoryState.UNUSED, OutputContractAdvisoryState.GRANTED}
+        and (evidence.actuation_progress_exhausted or evidence.prior_directive_unconsumed)
+    ):
+        return OutputContractActuation(OutputContractActuationKind.ADVISORY_RUN, family)
+    if (
+        evidence.advisory_state == OutputContractAdvisoryState.CONSUMED
+        and progressed
+        and evidence.consumed_run_output_observed
+        and evidence.consumed_run_carried_page_extraction
+        and not evidence.consumed_run_bound_required_path
+    ):
+        return OutputContractActuation(
+            OutputContractActuationKind.BLOCKED_TERMINAL,
+            family,
+            OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+        )
+    return OutputContractActuation(OutputContractActuationKind.STRUCTURE_DIRECTIVE, family)
 
 
 @dataclass(frozen=True)

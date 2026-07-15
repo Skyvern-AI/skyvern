@@ -36,8 +36,8 @@ _METHOD_ACTION_TYPES: dict[str, str] = {
     "reload": "reload_page",
     "evaluate": "execute_js",
     "wait_for_timeout": "wait",
-    # SkyvernPage @action_wrap high-level API (mirrors skyvern_page.py)
-    "extract": "extract",
+    # SkyvernPage @action_wrap high-level API (mirrors skyvern_page.py). `extract` is excluded:
+    # code blocks run on a raw Playwright page and must not reach the LLM extraction path.
     "fill_autocomplete": "input_text",
     "upload_file": "upload_file",
     "complete": "complete",
@@ -68,7 +68,7 @@ _READ_METHODS: dict[str, str] = {
 }
 # Methods whose natural-language `prompt` is the first positional argument (it is keyword-only on the
 # interaction methods, which the keyword scan below already covers).
-_PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
+_PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
 # Awaited calls that are sync/no-op helpers — never surfaced as their own step.
 _IGNORED_METHODS: frozenset[str] = frozenset(
     {"wait_for_load_state", "wait_for_selector", "wait_for_url", "wait_for_function"}
@@ -265,7 +265,7 @@ def _describe(span: CodeActionSpan) -> str:
 
 
 def _consolidate_read_spans(spans: list[CodeActionSpan]) -> list[CodeActionSpan]:
-    """Merge adjacent raw DOM reads into one extract span; an explicit page.extract() is not a read and stays separate."""
+    """Merge adjacent raw DOM reads into one extract span."""
     consolidated: list[CodeActionSpan] = []
     for span in spans:
         prev = consolidated[-1] if consolidated else None

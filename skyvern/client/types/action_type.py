@@ -18,6 +18,8 @@ ActionType = typing.Union[
         "complete",
         "reload_page",
         "close_page",
+        "new_tab",
+        "switch_tab",
         "extract",
         "verification_code",
         "goto_url",

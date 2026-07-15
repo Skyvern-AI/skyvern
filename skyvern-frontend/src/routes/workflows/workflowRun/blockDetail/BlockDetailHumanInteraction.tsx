@@ -18,14 +18,14 @@ function BlockDetailHumanInteraction({ block }: Props) {
       )}
       {block.subject && (
         <Section title="Email subject">
-          <span className="break-words text-xs text-slate-300">
+          <span className="break-words text-xs text-tertiary-foreground">
             {block.subject}
           </span>
         </Section>
       )}
       {recipients.length > 0 && (
         <Section title="Recipients">
-          <ul className="space-y-1 text-xs text-slate-300">
+          <ul className="space-y-1 text-xs text-tertiary-foreground">
             {recipients.map((address) => (
               <li key={address} className="break-all">
                 {address}

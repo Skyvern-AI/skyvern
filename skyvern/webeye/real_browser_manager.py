@@ -6,6 +6,7 @@ import os
 import structlog
 from playwright.async_api import async_playwright
 
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT
 from skyvern.exceptions import FailedToNavigateToUrl, MissingBrowserState
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
@@ -197,30 +198,49 @@ class RealBrowserManager(BrowserManager):
         browser_profile_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
-        (
-            browser_context,
-            browser_artifacts,
-            browser_cleanup,
-        ) = await BrowserContextFactory.create_browser_context(
-            pw,
-            proxy_location=proxy_location,
-            url=url,
-            task_id=task_id,
-            workflow_run_id=workflow_run_id,
-            workflow_permanent_id=workflow_permanent_id,
-            script_id=script_id,
-            organization_id=organization_id,
-            extra_http_headers=extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
-            browser_address=browser_address,
-            browser_profile_id=browser_profile_id,
-        )
+        try:
+            (
+                browser_context,
+                browser_artifacts,
+                browser_cleanup,
+            ) = await BrowserContextFactory.create_browser_context(
+                pw,
+                proxy_location=proxy_location,
+                url=url,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
+            )
+        except BaseException:
+            # start() already launched the local Node driver, so a failed context
+            # creation (e.g. a remote-CDP connect_over_cdp error) would leak that driver
+            # per attempt; stop it here, time-bounded like RealBrowserState.close() so a
+            # hung stop() cannot stall the original error. BaseException so a cancellation
+            # also releases the driver; a stop() error/timeout must never mask the original.
+            try:
+                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                    await pw.stop()
+            except Exception:
+                LOG.warning(
+                    "Failed to stop Playwright driver after browser-context creation failure",
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+            raise
         return RealBrowserState(
             pw=pw,
             browser_context=browser_context,
             page=None,
             browser_artifacts=browser_artifacts,
             browser_cleanup=browser_cleanup,
+            release_driver_on_close=browser_address is not None,
         )
 
     def evict_page(self, page_id: str) -> None:
@@ -300,6 +320,7 @@ class RealBrowserManager(BrowserManager):
                 await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
+                    organization_id=task.organization_id,
                 )
 
         self.pages[task.task_id] = browser_state
@@ -469,6 +490,7 @@ class RealBrowserManager(BrowserManager):
                 await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
+                    organization_id=workflow_run.organization_id,
                 )
 
         self.pages[workflow_run_id] = browser_state
@@ -656,7 +678,12 @@ class RealBrowserManager(BrowserManager):
             # honest signal — it hits ``{task_id}.png`` for standalone tasks
             # and is a deliberate no-op for workflow tasks.
             await self._stop_frame_publisher(task_id=task_id)
-            await browser_state_to_close.close(close_browser_on_completion=close_browser_on_completion)
+            # A state backing a persistent session stays cached in the sessions
+            # manager for reuse; its driver is released when the session closes.
+            await browser_state_to_close.close(
+                close_browser_on_completion=close_browser_on_completion,
+                release_driver=False if browser_session_id else None,
+            )
         LOG.info("Task is cleaned up")
 
         if browser_session_id:
@@ -744,7 +771,10 @@ class RealBrowserManager(BrowserManager):
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
                 await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
-                await browser_state_to_close.close(close_browser_on_completion=effective_close)
+                await browser_state_to_close.close(
+                    close_browser_on_completion=effective_close,
+                    release_driver=False if (shared or browser_session_id) else None,
+                )
 
         if not streams_active:
             self.pages.pop(workflow_run_id, None)
@@ -763,7 +793,10 @@ class RealBrowserManager(BrowserManager):
                     workflow_run_id=workflow_run_id,
                 )
             try:
-                await task_browser_state.close(close_browser_on_completion=effective_close)
+                await task_browser_state.close(
+                    close_browser_on_completion=effective_close,
+                    release_driver=False if (shared or browser_session_id) else None,
+                )
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",

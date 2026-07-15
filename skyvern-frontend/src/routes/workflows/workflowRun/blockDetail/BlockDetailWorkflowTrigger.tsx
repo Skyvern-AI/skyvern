@@ -41,13 +41,16 @@ function BlockDetailWorkflowTrigger({ block }: Props) {
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <Link
               to={`/runs/${subRun.workflow_run_id}`}
-              className="break-all font-mono text-sky-400 hover:underline"
+              className="break-all font-mono text-sky-700 hover:underline dark:text-sky-400"
             >
               {subRun.workflow_run_id}
             </Link>
             {subRun.status && (
-              <span className="text-slate-500">
-                · <span className="text-slate-300">{subRun.status}</span>
+              <span className="text-muted-foreground dark:text-slate-500">
+                ·{" "}
+                <span className="text-tertiary-foreground">
+                  {subRun.status}
+                </span>
               </span>
             )}
           </div>

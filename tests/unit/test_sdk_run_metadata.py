@@ -68,14 +68,14 @@ def test_run_workflow_sends_run_metadata() -> None:
     )
 
     response = client.run_workflow(
-        workflow_id="wpid_123",
+        agent_id="wpid_123",
         run_metadata={"customer": "acme", "tier": "enterprise"},
     )
 
     assert response.run_id == "wr_123"
     assert captured_bodies == [
         {
-            "workflow_id": "wpid_123",
+            "agent_id": "wpid_123",
             "run_metadata": {"customer": "acme", "tier": "enterprise"},
         }
     ]
@@ -103,14 +103,14 @@ def test_run_workflow_sends_max_elapsed_time() -> None:
     )
 
     response = client.run_workflow(
-        workflow_id="wpid_123",
+        agent_id="wpid_123",
         max_elapsed_time_minutes=10,
     )
 
     assert response.run_id == "wr_123"
     assert captured_bodies == [
         {
-            "workflow_id": "wpid_123",
+            "agent_id": "wpid_123",
             "max_elapsed_time_minutes": 10,
         }
     ]
@@ -160,7 +160,7 @@ def test_retry_workflow_run_uses_retry_route() -> None:
 
     assert response.run_id == "wr_retry"
     assert captured_requests[0].method == "POST"
-    assert captured_requests[0].url.path == "/v1/workflows/runs/wr_original/retry"
+    assert captured_requests[0].url.path == "/v1/agents/runs/wr_original/retry"
     assert captured_requests[0].headers["x-max-steps-override"] == "12"
     assert captured_requests[0].headers["x-user-agent"] == "skyvern-ui"
 
@@ -187,7 +187,7 @@ async def test_async_retry_workflow_run_uses_retry_route() -> None:
 
     assert response.run_id == "wr_retry"
     assert captured_requests[0].method == "POST"
-    assert captured_requests[0].url.path == "/v1/workflows/runs/wr_original/retry"
+    assert captured_requests[0].url.path == "/v1/agents/runs/wr_original/retry"
     assert captured_requests[0].headers["x-max-steps-override"] == "8"
     assert captured_requests[0].headers["x-user-agent"] == "skyvern-ui"
 
@@ -216,7 +216,7 @@ def test_get_workflow_runs_by_id_uses_workflow_scoped_route() -> None:
 
     assert runs[0].workflow_run_id == "wr_123"
     assert captured_requests[0].method == "GET"
-    assert captured_requests[0].url.path == "/v1/workflows/wpid_123/runs"
+    assert captured_requests[0].url.path == "/v1/agents/wpid_123/runs"
     assert captured_requests[0].url.params["page"] == "1"
     assert captured_requests[0].url.params["page_size"] == "10"
     assert captured_requests[0].url.params["status"] == "completed"
@@ -249,9 +249,27 @@ async def test_async_get_workflow_runs_by_id_uses_workflow_scoped_route() -> Non
 
     assert runs[0].workflow_run_id == "wr_123"
     assert captured_requests[0].method == "GET"
-    assert captured_requests[0].url.path == "/v1/workflows/wpid_123/runs"
+    assert captured_requests[0].url.path == "/v1/agents/wpid_123/runs"
     assert captured_requests[0].url.params["page"] == "2"
     assert captured_requests[0].url.params["page_size"] == "5"
     assert captured_requests[0].url.params["status"] == "failed"
     assert captured_requests[0].url.params["search_key"] == "prod"
     assert captured_requests[0].url.params["error_code"] == "TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_connect_to_cloud_browser_session_threads_app_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LibrarySkyvern(base_url="https://api.example.test", api_key="test-key")
+    cdp_browser = SimpleNamespace(contexts=[SimpleNamespace(_loop=None)])
+    fake_playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=cdp_browser)))
+    monkeypatch.setattr(client, "_get_playwright", AsyncMock(return_value=fake_playwright))
+    browser_session = SimpleNamespace(
+        browser_session_id="pbs_123",
+        browser_address="wss://cdp.example.test",
+        app_url="https://app.example.test/browser-sessions/pbs_123",
+    )
+
+    browser = await client._connect_to_cloud_browser_session(browser_session)
+
+    assert browser.app_url == "https://app.example.test/browser-sessions/pbs_123"
+    assert browser.browser_session_id == "pbs_123"

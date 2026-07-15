@@ -1,6 +1,6 @@
 import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   RunEngine,
   Status,
@@ -12,6 +12,11 @@ import { Status404 } from "@/components/Status404";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   Dialog,
   DialogClose,
@@ -27,13 +32,17 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
+import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { buildTaskRunPayload } from "@/util/taskRunPayload";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { PlayIcon, ReloadIcon, TokensIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "react-router-dom";
 import { statusIsFinalized } from "../types";
@@ -42,6 +51,11 @@ import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import * as env from "@/util/env";
 import { TaskRunVerificationCodeForm } from "./TaskRunVerificationCodeForm";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { useRunTagsQuery } from "../hooks/useRunTagsQuery";
+import { RunTagPickerCommand } from "../components/tagging/RunTagPickerCommand";
+
+const EMPTY_LABEL_SUGGESTIONS: Array<string> = [];
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -61,6 +75,7 @@ function TaskDetails() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
 
   const {
     data: task,
@@ -94,6 +109,23 @@ function TaskDetails() {
       },
       enabled: !!workflowRun?.workflow_id,
     });
+
+  const workflowRunId = task?.workflow_run_id ?? null;
+  const { data: runTags = [] } = useRunTagsQuery(workflowRunId, {
+    enabled: taggingEnabled,
+  });
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
+  const tagDescriptions = useMemo(
+    () =>
+      new Map(
+        tagKeys.map((tagKey): [string, string | null] => [
+          tagKey.key,
+          tagKey.description,
+        ]),
+      ),
+    [tagKeys],
+  );
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
 
   const cancelTaskMutation = useMutation({
     mutationFn: async () => {
@@ -207,14 +239,44 @@ function TaskDetails() {
       <header className="space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-5">
-            <span className="text-3xl">{taskId}</span>
-            {taskIsLoading ? (
-              <Skeleton className="h-8 w-32" />
-            ) : (
-              task && <StatusBadge status={task.status} />
-            )}
+            <div className="flex min-w-0 flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                <span className="text-3xl">{taskId}</span>
+                {taskIsLoading ? (
+                  <Skeleton className="h-8 w-32" />
+                ) : (
+                  task && <StatusBadge status={task.status} />
+                )}
+              </div>
+              {taggingEnabled && runTags.length > 0 ? (
+                <TagChipList
+                  tags={runTags}
+                  descriptions={tagDescriptions}
+                  colors={tagColors}
+                  maxVisible={6}
+                />
+              ) : null}
+            </div>
           </div>
           <div className="flex items-center gap-2">
+            {taggingEnabled && workflowRunId ? (
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button variant="secondary">
+                    <TokensIcon className="mr-2 h-4 w-4" />
+                    Tags
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-72 p-0" align="end">
+                  <RunTagPickerCommand
+                    workflowRunId={workflowRunId}
+                    tagKeys={tagKeys}
+                    labelSuggestions={EMPTY_LABEL_SUGGESTIONS}
+                    currentTags={runTags}
+                  />
+                </PopoverContent>
+              </Popover>
+            ) : null}
             {/** API & Webhooks consolidated dropdown + controlled dialog */}
             <ApiWebhookActionsMenu
               getOptions={() => {

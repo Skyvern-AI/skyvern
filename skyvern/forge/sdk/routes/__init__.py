@@ -7,11 +7,11 @@ from skyvern.forge.sdk.routes import credentials  # noqa: F401
 from skyvern.forge.sdk.routes import custom_llms  # noqa: F401
 from skyvern.forge.sdk.routes import debug_sessions  # noqa: F401
 from skyvern.forge.sdk.routes import prompts  # noqa: F401
-from skyvern.forge.sdk.routes import pylon  # noqa: F401
 from skyvern.forge.sdk.routes import run_blocks  # noqa: F401
 from skyvern.forge.sdk.routes import runtime_config  # noqa: F401
 from skyvern.forge.sdk.routes import scripts  # noqa: F401
 from skyvern.forge.sdk.routes import sdk  # noqa: F401
+from skyvern.forge.sdk.routes import self_heal  # noqa: F401
 from skyvern.forge.sdk.routes import webhooks  # noqa: F401
 from skyvern.forge.sdk.routes import workflow_schedules  # noqa: F401
 from skyvern.forge.sdk.routes.streaming import cdp_input  # noqa: F401

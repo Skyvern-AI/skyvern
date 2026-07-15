@@ -374,7 +374,7 @@ class Skyvern(AsyncSkyvern):
         request_options: RequestOptions | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
-            workflow_id=workflow_id,
+            agent_id=workflow_id,
             parameters=parameters,
             template=template,
             title=title,
@@ -662,7 +662,12 @@ class Skyvern(AsyncSkyvern):
             browser_session.browser_address, headers={"x-api-key": self._api_key}
         )
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        return SkyvernBrowser(self, browser_context, browser_session_id=browser_session.browser_session_id)
+        return SkyvernBrowser(
+            self,
+            browser_context,
+            browser_session_id=browser_session.browser_session_id,
+            app_url=browser_session.app_url,
+        )
 
     async def _get_playwright(self) -> Playwright:
         if self._playwright is None:

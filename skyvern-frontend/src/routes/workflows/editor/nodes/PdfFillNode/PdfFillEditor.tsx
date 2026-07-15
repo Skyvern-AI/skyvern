@@ -1,4 +1,4 @@
-import { PlusIcon } from "@radix-ui/react-icons";
+import { ExclamationTriangleIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useCallback } from "react";
 
@@ -82,9 +82,17 @@ function PdfFillEditorBody({
 
   return (
     <div data-testid="pdf-fill-block-form" className="space-y-4">
+      <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+        <ExclamationTriangleIcon className="mt-0.5 size-3 shrink-0" />
+        <span>
+          Works best on fillable PDFs with form fields. Unstructured PDFs
+          (scanned or flat documents) are filled best-effort and may be less
+          reliable.
+        </span>
+      </p>
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File URL</Label>
+          <Label className="text-xs text-tertiary-foreground">File URL</Label>
           <HelpTooltip content={helpTooltips["pdf_fill"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
@@ -97,7 +105,7 @@ function PdfFillEditorBody({
 
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Prompt</Label>
+          <Label className="text-xs text-tertiary-foreground">Prompt</Label>
           <HelpTooltip content={helpTooltips["pdf_fill"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
@@ -112,7 +120,7 @@ function PdfFillEditorBody({
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Payload</Label>
+            <Label className="text-xs text-tertiary-foreground">Payload</Label>
             <HelpTooltip content={helpTooltips["pdf_fill"]["payload"]} />
           </div>
           <Popover>
@@ -180,7 +188,9 @@ function PdfFillEditorBody({
               />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">LLM Key</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    LLM Key
+                  </Label>
                   <HelpTooltip content={helpTooltips["pdf_fill"]["llmKey"]} />
                 </div>
                 <WorkflowBlockInput

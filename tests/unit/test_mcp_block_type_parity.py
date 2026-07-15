@@ -102,6 +102,20 @@ _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
         added_at=date(2026, 6, 11),
         notes="Fern SDK regen happens via CI post-deploy",
     ),
+    BlockDriftEntry(
+        block_type="split_pdf",
+        ticket="SKY-12071",
+        owner="@suchintan",
+        added_at=date(2026, 7, 8),
+        notes="Fern SDK regen happens via CI post-deploy",
+    ),
+    BlockDriftEntry(
+        block_type="email_inbox",
+        ticket="SKY-12068",
+        owner="@suchintan",
+        added_at=date(2026, 7, 8),
+        notes="Fern SDK regen happens via CI post-deploy",
+    ),
 )
 
 

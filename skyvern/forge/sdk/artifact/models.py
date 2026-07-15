@@ -11,6 +11,7 @@ class ArtifactType(StrEnum):
     RECORDING = "recording"
     AUDIO = "audio"
     SESSION_REPLAY = "session_replay"
+    EVAL_SCORE = "eval_score"
     BROWSER_CONSOLE_LOG = "browser_console_log"
 
     SKYVERN_LOG = "skyvern_log"

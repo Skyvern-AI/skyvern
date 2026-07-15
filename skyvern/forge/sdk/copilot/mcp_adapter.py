@@ -48,6 +48,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_ownership import emit_blocker_signal_payload
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -62,6 +63,8 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "pending_scout_source_url",
     "pending_scout_typed_value",
     "pending_scout_role_name",
+    "pending_scout_ambiguous",
+    "pending_scout_reanchor",
     "post_budget_page_inspection_required",
     "post_budget_page_inspection_url",
     "post_budget_page_inspection_run_id",
@@ -71,12 +74,21 @@ _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "code_only_target_page_evidence_seen",
     "last_evaluate_actionable_signature",
     "last_evaluate_actionable_url",
+    "last_scout_observation_trajectory_index",
+    "last_scout_observation_has_password_control",
     "latest_evaluate_result_composition_steer",
+    "latest_evaluate_result_composition_signature",
     "last_auto_acted_signature",
     "reached_download_target",
     "synthesized_block_offered",
     "synthesized_block_offered_trajectory_len",
     "synthesized_block_offered_goal_complete",
+    "scouted_output_covered_paths",
+    "scout_observation_contract",
+    "requested_output_extraction_candidate",
+    "synthesized_block_reopened_for_output_coverage",
+    "uncovered_output_rescout_context_key",
+    "uncovered_output_rescout_steer_key",
     "consecutive_no_progress_interaction_count",
 )
 
@@ -131,7 +143,7 @@ _CURRENT_PAGE_TERMINAL_CHALLENGE_MCP_TOOLS = frozenset(
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
     return payload
 
@@ -144,7 +156,7 @@ def _stash_and_emit_current_page_terminal_challenge_blocker(ctx: Any, tool_name:
     )
     if signal is None:
         return None
-    payload = stash_blocker_signal(ctx, signal)
+    payload = emit_blocker_signal_payload(ctx, signal)
     stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_current_page_terminal_challenge")
     return payload
 
@@ -327,7 +339,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     None,
                 ),
             )
-            payload = stash_blocker_signal(copilot_ctx, persistence_signal)
+            payload = emit_blocker_signal_payload(copilot_ctx, persistence_signal)
             result = {"ok": False, "error": payload}
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result)
@@ -342,7 +354,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
-        loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
+        loop_error = detect_tool_loop(tracker, tool_name, arguments) if isinstance(tracker, list) else None
         if loop_error:
             LOG.warning(
                 "Tool loop detected, skipping execution",

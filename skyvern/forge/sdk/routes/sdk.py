@@ -19,10 +19,7 @@ from skyvern.forge.sdk.schemas.sdk_actions import (
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.forge.sdk.workflow.models.workflow import (
-    WorkflowRequestBody,
-    WorkflowRunStatus,
-)
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.schemas.workflows import BlockType, WorkflowStatus
 
 LOG = structlog.get_logger()
@@ -93,9 +90,8 @@ async def run_sdk_action(
             version=None,
             trigger_type=WorkflowRunTriggerType.api,
         )
-        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+        workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(
             workflow_run_id=workflow_run.workflow_run_id,
-            status=WorkflowRunStatus.completed,
         )
 
     task = await app.DATABASE.tasks.create_task(

@@ -121,6 +121,53 @@ async def test_create_workflow_from_request_preserves_enable_self_healing_when_o
 
 
 @pytest.mark.asyncio
+async def test_create_workflow_from_request_preserves_pin_saved_session_ip_when_omitted() -> None:
+    service, _ = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None, existing_pin_saved_session_ip=True
+    )
+
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+    )
+
+    create_workflow_mock = service.create_workflow
+    assert isinstance(create_workflow_mock, AsyncMock)
+    assert create_workflow_mock.await_args is not None
+    assert create_workflow_mock.await_args.kwargs["pin_saved_session_ip"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_explicit_false_clears_pin_saved_session_ip() -> None:
+    service, _ = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None, existing_pin_saved_session_ip=True
+    )
+
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+        pin_saved_session_ip=False,
+    )
+
+    await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+    )
+
+    create_workflow_mock = service.create_workflow
+    assert isinstance(create_workflow_mock, AsyncMock)
+    assert create_workflow_mock.await_args is not None
+    assert create_workflow_mock.await_args.kwargs["pin_saved_session_ip"] is False
+
+
+@pytest.mark.asyncio
 async def test_create_workflow_from_request_explicit_false_clears_enable_self_healing() -> None:
     service, _ = _make_workflow_update_service(
         existing_max_elapsed_time_minutes=None, existing_enable_self_healing=True
@@ -227,6 +274,7 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
 def _make_workflow_update_service(
     existing_max_elapsed_time_minutes: int | None,
     existing_enable_self_healing: bool = True,
+    existing_pin_saved_session_ip: bool = False,
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
@@ -237,6 +285,7 @@ def _make_workflow_update_service(
         code_version=None,
         max_elapsed_time_minutes=existing_max_elapsed_time_minutes,
         enable_self_healing=existing_enable_self_healing,
+        pin_saved_session_ip=existing_pin_saved_session_ip,
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
     updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")

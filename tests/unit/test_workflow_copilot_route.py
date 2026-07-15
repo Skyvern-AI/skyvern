@@ -51,9 +51,12 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
+from tests.unit.copilot_route_test_support import install_fake_create, setup_new_copilot_mocks
 
 
-def _make_chat_request(mode: str | None = None, code_block: bool | None = None) -> WorkflowCopilotChatRequest:
+def _make_chat_request(
+    mode: str | None = None, code_block: bool | None = None, keep_pending_proposal: bool = False
+) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
         workflow_id="wf-request",
@@ -63,6 +66,7 @@ def _make_chat_request(mode: str | None = None, code_block: bool | None = None) 
         workflow_yaml="title: Example",
         mode=mode,
         code_block=code_block,
+        keep_pending_proposal=keep_pending_proposal,
     )
 
 
@@ -234,24 +238,6 @@ def test_terminal_narrative_metadata_preserves_payload_and_adds_contract_fields(
     assert "proposalDisposition" not in payload
 
 
-def _install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Capture the stream handler that the route hands to EventSourceStream."""
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def fake_create(request: object, handler: object, ping_interval: int = 10) -> object:
-        del request, ping_interval
-        captured["handler"] = handler
-        return sentinel
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.FastAPIEventSourceStream.create",
-        fake_create,
-    )
-    captured["sentinel"] = sentinel
-    return captured
-
-
 def _install_mock_provider(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -268,58 +254,6 @@ def _install_mock_provider(
 
 
 @pytest.mark.asyncio
-async def test_flag_off_dispatches_to_old_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flag off -> workflow_copilot_chat_post must use the old-copilot stream handler.
-
-    We verify by patching _new_copilot_chat_post to something that would
-    raise if called, then confirming the old path was used instead.
-    """
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
-    # force_stub_app's _LazyNamespace auto-creates truthy AsyncMocks for any attribute
-    # access, so the provider needs an explicit False stub to keep this test accurate.
-    _install_mock_provider(monkeypatch, return_value=False)
-
-    new_copilot_mock = AsyncMock(side_effect=AssertionError("new-copilot path must not run when flag is off"))
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
-        new_copilot_mock,
-    )
-
-    captured = _install_fake_create(monkeypatch)
-
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
-
-    assert response is captured["sentinel"]
-    new_copilot_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_flag_on_dispatches_to_new_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flag on -> workflow_copilot_chat_post delegates to _new_copilot_chat_post."""
-    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-
-    sentinel = object()
-    new_copilot_mock = AsyncMock(return_value=sentinel)
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
-        new_copilot_mock,
-    )
-
-    request = MagicMock()
-    request.headers = {}
-    organization = SimpleNamespace(organization_id="org-1")
-
-    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
-
-    assert response is sentinel
-    new_copilot_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """mode='ask' must take the v1 path even when the settings flag is on."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
@@ -330,7 +264,7 @@ async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.Monke
         new_copilot_mock,
     )
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -373,7 +307,7 @@ async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch)
         "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
         new_copilot_mock,
     )
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -389,74 +323,6 @@ async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch)
     response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
     assert response is new_copilot_mock.return_value
     new_copilot_mock.assert_awaited_once()
-
-
-def _setup_new_copilot_mocks(
-    monkeypatch: pytest.MonkeyPatch,
-    chat: SimpleNamespace,
-    original_workflow: SimpleNamespace,
-    agent_result: SimpleNamespace,
-) -> AsyncMock:
-    """Wire up everything the new-copilot stream handler touches.
-
-    Returns the restore-on-error mock so callers can assert on it.
-    """
-    if not hasattr(agent_result, "response_type"):
-        agent_result.response_type = "REPLY"
-    if not hasattr(agent_result, "total_tokens"):
-        agent_result.total_tokens = None
-    if not hasattr(agent_result, "output_policy_diagnostics"):
-        agent_result.output_policy_diagnostics = None
-    if not hasattr(agent_result, "turn_id"):
-        agent_result.turn_id = None
-    if not hasattr(agent_result, "narrative_summary"):
-        agent_result.narrative_summary = None
-    if not hasattr(agent_result, "narrative_payload"):
-        agent_result.narrative_payload = None
-
-    async def fake_llm_handler(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        return None
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
-        fake_llm_handler,
-    )
-
-    restore_mock = AsyncMock()
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot._restore_workflow_definition",
-        restore_mock,
-    )
-
-    run_agent_mock = AsyncMock(return_value=agent_result)
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
-        run_agent_mock,
-    )
-
-    # DB surfaces: the new-copilot handler reaches the repository directly via
-    # app.DATABASE.workflow_params.*  and app.DATABASE.workflows.*  -- mock
-    # those attribute chains.
-    app.DATABASE.workflow_params = SimpleNamespace(
-        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
-        get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
-        update_workflow_copilot_chat=AsyncMock(),
-        create_workflow_copilot_chat_message=AsyncMock(
-            return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
-        ),
-    )
-    app.DATABASE.workflows = SimpleNamespace(
-        get_workflow_by_permanent_id=AsyncMock(return_value=original_workflow),
-    )
-    app.DATABASE.observer = SimpleNamespace(
-        get_workflow_run_blocks=AsyncMock(return_value=[]),
-    )
-    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
-    app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
-    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
-
-    return restore_mock
 
 
 @pytest.mark.asyncio
@@ -485,7 +351,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -514,7 +380,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         turn_outcome=None,
     )
 
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -542,7 +408,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
 @pytest.mark.asyncio
 async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -645,7 +511,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     expected_summary: str,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -670,7 +536,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         unvalidated=False,
         turn_outcome=None,
     )
-    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     monkeypatch.setattr(
         "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
         AsyncMock(side_effect=error),
@@ -728,7 +594,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -753,7 +619,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
         unvalidated=False,
         turn_outcome=None,
     )
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     finalise_results: list[object] = []
     original_finalise = workflow_copilot_route._finalise_normal_turn
 
@@ -797,6 +663,515 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert len(clear_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_error",
+    [RuntimeError("post-agent route boom"), LLMProviderError("OPENAI_GPT5_5")],
+    ids=["generic-exception-handler", "llm-provider-error-handler"],
+)
+async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: BaseException,
+) -> None:
+    # Route-level (not direct-function-call) pin: keep_pending_proposal must
+    # reach both exception-recovery call sites, not just _persist_proposed_workflow_state.
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise raised_error
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert recovered_result.clear_proposed_workflow is False
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert not clear_calls, f"keep_pending_proposal=True must survive restore-driven recovery, got {update_calls!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_error",
+    [RuntimeError("post-agent route boom"), LLMProviderError("OPENAI_GPT5_5")],
+    ids=["generic-exception-handler", "llm-provider-error-handler"],
+)
+async def test_route_error_honors_real_agent_explicit_clear_despite_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: BaseException,
+) -> None:
+    # The real (pre-exception) agent_result can itself carry clear_proposed_workflow=True;
+    # the recovery path must not silently drop that signal just because it's rebuilding
+    # a synthetic result for the error reply.
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=True,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise raised_error
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert recovered_result.clear_proposed_workflow is True
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert clear_calls, (
+        f"real agent_result.clear_proposed_workflow=True must win even with keep_pending_proposal, got {update_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_error",
+    [RuntimeError("post-commit route boom"), LLMProviderError("OPENAI_GPT5_5")],
+    ids=["generic-exception-handler", "llm-provider-error-handler"],
+)
+async def test_route_error_after_staged_commit_clears_stale_proposal_despite_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: BaseException,
+) -> None:
+    # An auto-accept turn eligible for a staged commit (has_staged_proposal=True) that
+    # then hits an exception elsewhere in finalisation still invalidates a stale kept
+    # proposal — the recovered synthetic result doesn't carry has_staged_proposal
+    # forward, so this must be pre-baked into clear_proposed_workflow at the call site.
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        has_staged_proposal=True,
+        proposal_disposition="auto_applicable",
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise raised_error
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_not_awaited()
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert recovered_result.clear_proposed_workflow is True
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert clear_calls, (
+        f"staged-commit-eligible turn must clear a stale proposal even with keep_pending_proposal, got {update_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_clears_stale_proposal_when_rollback_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed rollback leaves canonical's state unverified — keep_pending_proposal
+    must not be honored against an assumption ("nothing changed") that didn't hold."""
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="Here is a plain reply.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        turn_outcome=None,
+    )
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock.side_effect = RuntimeError("rollback boom")
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(keep_pending_proposal=True),
+        agent_result=agent_result,
+    )
+
+    restore_mock.assert_awaited_once()
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert clear_calls, (
+        f"failed rollback must clear a stale proposal even with keep_pending_proposal, got {update_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_error",
+    [RuntimeError("post-agent route boom"), LLMProviderError("OPENAI_GPT5_5")],
+    ids=["generic-exception-handler", "llm-provider-error-handler"],
+)
+async def test_route_error_recovery_clears_stale_proposal_when_its_own_rollback_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: BaseException,
+) -> None:
+    # The recovery block's OWN restore attempt (not the main flow's — flaky_finalise
+    # bypasses that entirely) can itself fail; that must still force-clear a kept
+    # proposal rather than trust an unverified "rollback succeeded" assumption.
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock.side_effect = RuntimeError("rollback boom")
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise raised_error
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert recovered_result.clear_proposed_workflow is True
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert clear_calls, f"a failed recovery-path rollback must clear a stale proposal, got {update_calls!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised_error",
+    [RuntimeError("post-write route boom"), LLMProviderError("OPENAI_GPT5_5")],
+    ids=["generic-exception-handler", "llm-provider-error-handler"],
+)
+async def test_route_error_before_write_keeps_older_proposal_despite_attempted_fresh_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    raised_error: BaseException,
+) -> None:
+    # Negative companion to test_route_error_after_real_fresh_write_clears_it_even_with_
+    # no_prior_proposal: agent_result.updated_workflow being SET only means a write was
+    # ATTEMPTED. flaky_finalise bypasses _finalise_normal_turn's real body entirely, so
+    # the write never actually reaches chat.proposed_workflow — an older, legitimately
+    # keep_pending_proposal-protected proposal must survive, not get force-cleared just
+    # because this turn also carried an (unpersisted) fresh draft.
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "older-stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "fresh draft"}),
+        global_llm_context=None,
+        workflow_yaml="title: fresh draft\n",
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        has_staged_proposal=False,
+        proposal_disposition="review_untested",
+        unvalidated=False,
+        turn_outcome=None,
+    )
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise raised_error
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_not_awaited()
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert recovered_result.clear_proposed_workflow is False
+    app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unlike the flaky_finalise-based tests above (which bypass _finalise_normal_turn's
+    # real body entirely), this lets the REAL first attempt genuinely write the fresh
+    # proposal to chat.proposed_workflow before a LATER step (chat-message creation)
+    # fails — the bug this pins is that chat.proposed_workflow stayed in-memory None
+    # (never synced after the write), so the retry's `elif chat.proposed_workflow is
+    # not None` guard silently skipped the clear even though clear_proposed_workflow
+    # correctly computed True.
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="Here is your draft.",
+        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "fresh draft"}),
+        global_llm_context=None,
+        workflow_yaml="title: fresh draft\n",
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        has_staged_proposal=False,
+        proposal_disposition="review_untested",
+        turn_outcome=None,
+    )
+    _restore_mock, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    call_count = {"n": 0}
+    original_return = workflow_params.create_workflow_copilot_chat_message.return_value
+
+    async def flaky_create_message(*args: object, **kwargs: object) -> object:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("chat row insert boom")
+        return original_return
+
+    workflow_params.create_workflow_copilot_chat_message = AsyncMock(side_effect=flaky_create_message)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(keep_pending_proposal=True), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    update_calls = workflow_params.update_workflow_copilot_chat.await_args_list
+    write_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is not None]
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert write_calls, "the first attempt must have genuinely persisted the fresh draft"
+    assert clear_calls, (
+        f"the orphaned fresh draft must clear on retry even though chat had no prior proposal, got {update_calls!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -851,7 +1226,7 @@ async def test_proposed_workflow_cleared_on_restore(
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -880,7 +1255,7 @@ async def test_proposed_workflow_cleared_on_restore(
         turn_outcome=None,
     )
 
-    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -925,7 +1300,7 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -976,7 +1351,7 @@ async def test_apply_without_review_commits_and_clears_proposal_when_auto_accept
         turn_outcome=None,
     )
 
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     workflow_service = SimpleNamespace(update_workflow_definition=AsyncMock())
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
     monkeypatch.setattr(
@@ -1022,7 +1397,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 ) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -1054,7 +1429,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         turn_outcome=None,
     )
 
-    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -1097,7 +1472,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
 async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -1136,7 +1511,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
         turn_outcome=None,
     )
 
-    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
     request = MagicMock()
     request.headers = {"x-api-key": "sk-test-key"}
@@ -1245,7 +1620,7 @@ async def test_provider_failure_falls_back_to_legacy(monkeypatch: pytest.MonkeyP
         new_copilot_mock,
     )
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -1269,7 +1644,7 @@ async def test_env_off_posthog_off_uses_legacy(monkeypatch: pytest.MonkeyPatch) 
         new_copilot_mock,
     )
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     request = MagicMock()
     request.headers = {}
@@ -1293,7 +1668,7 @@ async def test_legacy_path_persists_copilot_yaml_on_proposal(monkeypatch: pytest
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
     _install_mock_provider(monkeypatch, return_value=False)
 
-    captured = _install_fake_create(monkeypatch)
+    captured = install_fake_create(monkeypatch)
 
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
@@ -1385,6 +1760,273 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
     persisted = calls[0].kwargs["proposed_workflow"]
     assert persisted is not None
     assert persisted.get("_copilot_unvalidated") is not True
+
+
+def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace:
+    fields: dict[str, object] = dict(
+        updated_workflow=None,
+        clear_proposed_workflow=False,
+        proposal_disposition="review_untested",
+        cancelled=False,
+        apply_without_review=False,
+        output_policy_diagnostics=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.asyncio
+async def test_persist_state_restored_keep_pending_proposal_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Opt-in keep_pending_proposal suppresses the restored-alone clear so a bypassed
+    # proposal stays actionable across a follow-up turn with no new draft.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result()
+
+    await workflow_copilot_route._persist_proposed_workflow_state(
+        chat, agent_result, restored=True, keep_pending_proposal=True
+    )
+
+    app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_state_restored_without_keep_still_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin today's default (keep_pending_proposal=False) behavior next to its opt-in twin above.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result()
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=True)
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_state_keep_pending_proposal_does_not_suppress_explicit_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # keep_pending_proposal only neutralizes the restored-alone justification; an
+    # agent-explicit clear_proposed_workflow must still win.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result(
+        clear_proposed_workflow=True, proposal_disposition="no_proposal"
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(
+        chat, agent_result, restored=False, keep_pending_proposal=True
+    )
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_state_keep_pending_proposal_does_not_block_new_proposal_overwrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fresh proposal always overwrites regardless of keep_pending_proposal/restored.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=False,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result(
+        updated_workflow=SimpleNamespace(model_dump=lambda mode: {"title": "new draft"}),
+        workflow_yaml="title: new draft\n",
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(
+        chat, agent_result, restored=True, keep_pending_proposal=True
+    )
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    persisted = calls[0].kwargs["proposed_workflow"]
+    assert persisted is not None
+    assert persisted.get("title") == "new draft"
+
+
+@pytest.mark.asyncio
+async def test_persist_state_keep_pending_proposal_survives_auto_accept_stale_unvalidated_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # auto_accept doesn't cover review_untested/review_tested, so a gate-worthy
+    # unvalidated proposal can coexist with chat.auto_accept=True; the third
+    # elif's clear must also respect keep_pending_proposal.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=True,
+        proposed_workflow={"existing": True, "_copilot_unvalidated": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result()
+
+    await workflow_copilot_route._persist_proposed_workflow_state(
+        chat, agent_result, restored=False, keep_pending_proposal=True
+    )
+
+    app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persist_state_auto_accept_stale_unvalidated_still_clears_without_keep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pin today's default (keep_pending_proposal=False) next to its opt-in twin above.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=True,
+        proposed_workflow={"existing": True, "_copilot_unvalidated": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result()
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_state_staged_commit_clears_stale_proposal_despite_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A later turn's own auto-commit (chat.auto_accept, not apply_without_review)
+    # supersedes an earlier bypassed proposal even when the client asked to keep
+    # it — the committed canonical workflow already moved past it.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=True,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result(
+        proposal_disposition="auto_applicable",
+        has_staged_proposal=True,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(
+        chat, agent_result, restored=False, keep_pending_proposal=True
+    )
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_state_staged_commit_clears_stale_proposal_on_default_path_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This clause is unflagged: it also fixes SKY-12130 orphaning for every current
+    # client, not just callers that opt into keep_pending_proposal. Pin the default
+    # (keep_pending_proposal=False, the pre-existing behavior for all callers today)
+    # path explicitly, not just the opt-in one above.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=True,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result(
+        proposal_disposition="auto_applicable",
+        has_staged_proposal=True,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
+
+    calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    assert len(calls) == 1
+    assert calls[0].kwargs["proposed_workflow"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_state_auto_applicable_without_staged_commit_still_protected_by_keep_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # auto_applicable alone isn't enough — only an actual staged commit this turn
+    # invalidates the earlier proposal. No staged content means nothing
+    # superseded it, so keep_pending_proposal still applies.
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        auto_accept=True,
+        proposed_workflow={"existing": True},
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(update_workflow_copilot_chat=AsyncMock()),
+    )
+    agent_result = _make_bypassed_proposal_agent_result(
+        proposal_disposition="auto_applicable",
+        has_staged_proposal=False,
+    )
+
+    await workflow_copilot_route._persist_proposed_workflow_state(
+        chat, agent_result, restored=False, keep_pending_proposal=True
+    )
+
+    app.DATABASE.workflow_params.update_workflow_copilot_chat.assert_not_awaited()
 
 
 def _schema_incompatibility_ctx() -> SimpleNamespace:

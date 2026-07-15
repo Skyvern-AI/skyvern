@@ -10,6 +10,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update
 from ..core.serialization import FieldMetadata
 from .action_block_data_schema import ActionBlockDataSchema
 from .action_block_parameters_item import ActionBlockParametersItem
+from .ai_fallback_mode import AiFallbackMode
 from .aws_secret_parameter import AwsSecretParameter
 from .branch_condition import BranchCondition
 from .code_block_parameters_item import CodeBlockParametersItem
@@ -77,6 +78,8 @@ class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
+    selector: typing.Optional[str] = None
+    ai_fallback: typing.Optional[AiFallbackMode] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -535,6 +538,7 @@ class WorkflowDefinitionBlocksItem_Login(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
+    skip_saved_profile: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

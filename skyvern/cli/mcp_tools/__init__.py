@@ -154,6 +154,7 @@ from .tabs import (
     skyvern_tab_wait_for_new,
 )
 from .workflow import (
+    guard_definition_size,
     skyvern_workflow_cancel,
     skyvern_workflow_create,
     skyvern_workflow_delete,
@@ -165,6 +166,12 @@ from .workflow import (
     skyvern_workflow_status,
     skyvern_workflow_update,
     skyvern_workflow_update_folder,
+)
+
+_RUN_TASK_TOOL_DESCRIPTION = (
+    "Run a one-off autonomous trial via the highest-cost AI path. "
+    "Not for production or reusable automations. "
+    "Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute."
 )
 
 
@@ -289,6 +296,15 @@ Precision tools support intent (AI), selector (deterministic), or hybrid (both) 
 - console_messages and network_requests capture events from session start — call anytime.
 - Workflow, schedule, credential, script, folder, and block tools do NOT need a browser session.
 - schedule_create requires an existing workflow_permanent_id — call workflow_list or workflow_create first.
+- get_html reads an element by selector on the CURRENT page — navigate first; there is no fetch-HTML-by-URL.
+- workflow_get and workflow_run need a KNOWN workflow_permanent_id (wpid_); run starts a NEW run. To \
+search, browse, or paginate workflows use workflow_list — do NOT pass query/search/page/only_workflows \
+to workflow_get or workflow_create. To re-run an existing run, use workflow_retry with its workflow_run_id (wr_).
+- workflow_create/update take the ENTIRE workflow serialized into `definition` (title, blocks, and \
+parameters all inside); flat top-level fields are rejected.
+- browser_session_create MAKES a new session and takes no session_id/url/steps/selector — load a url with \
+navigate, run steps with execute, using the returned session_id. session_list returns ALL sessions (no pagination).
+- block_schema takes a block_type string only (no definition/format); validate a full block with block_validate(block_json=...).
 
 ## Session Lifecycle
 
@@ -370,7 +386,11 @@ mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
-mcp.tool(tags={"ai_powered"}, annotations=_web_dest("Run Autonomous Browser Task (AI)"))(skyvern_run_task)
+mcp.tool(
+    description=_RUN_TASK_TOOL_DESCRIPTION,
+    tags={"ai_powered"},
+    annotations=_web_dest("Run Autonomous Browser Task (AI)"),
+)(skyvern_run_task)
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_mut("Log in to Website (AI)"))(skyvern_login)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL"))(skyvern_navigate)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
@@ -460,7 +480,7 @@ mcp.tool(tags={"folder"}, annotations=_dest("Delete Folder"))(skyvern_folder_del
 
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool(tags={"workflow"}, annotations=_ro("List Workflows"))(size_capped(skyvern_workflow_list))
-mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow"))(size_capped(skyvern_workflow_get))
+mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow"))(size_capped(guard_definition_size(skyvern_workflow_get)))
 mcp.tool(tags={"workflow"}, annotations=_ro("List Workflow Runs"))(size_capped(skyvern_workflow_run_list))
 mcp.tool(tags={"workflow"}, annotations=_mut("Create Workflow"))(skyvern_workflow_create)
 mcp.tool(tags={"workflow"}, annotations=_mut("Update Workflow"))(skyvern_workflow_update)

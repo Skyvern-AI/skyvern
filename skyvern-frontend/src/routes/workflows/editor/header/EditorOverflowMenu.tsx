@@ -36,8 +36,16 @@ import { CodeSubmenu } from "./CodeSubmenu";
 
 export function EditorOverflowMenu({
   triggerClassName = "size-10 min-w-[2.5rem]",
+  onVersionHistory,
+  embedded = false,
 }: {
   triggerClassName?: string;
+  // Studio override: the shell collapses to an editor-only layout before
+  // opening the panel (comparison renders in the editor canvas).
+  onVersionHistory?: () => void;
+  // Embedded (studio) hosts provide their own TooltipProvider with the shell's
+  // fast timing; standalone (legacy header) brings a local one.
+  embedded?: boolean;
 } = {}) {
   const { workflowPermanentId } = useParams();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -93,32 +101,41 @@ export function EditorOverflowMenu({
     templateMutation.mutate(newIsTemplate);
   };
 
+  // Disabled-trigger idiom: the span keeps the tooltip firing (and keyboard
+  // reachable) while recording disables the button underneath.
+  const trigger = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className="inline-flex shrink-0"
+          {...(isRecording ? { tabIndex: 0 } : {})}
+        >
+          <DropdownMenuTrigger asChild>
+            <Button
+              disabled={isRecording}
+              size="icon"
+              variant="tertiary"
+              className={triggerClassName}
+              aria-label="More actions"
+            >
+              <DotsHorizontalIcon className="size-5" />
+            </Button>
+          </DropdownMenuTrigger>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>More actions</TooltipContent>
+    </Tooltip>
+  );
+
   return (
     <DropdownMenu modal={false}>
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <DropdownMenuTrigger asChild>
-              <Button
-                disabled={isRecording}
-                size="icon"
-                variant="tertiary"
-                className={triggerClassName}
-                aria-label="More actions"
-              >
-                <DotsHorizontalIcon className="size-5" />
-              </Button>
-            </DropdownMenuTrigger>
-          </TooltipTrigger>
-          <TooltipContent>More actions</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      {embedded ? trigger : <TooltipProvider>{trigger}</TooltipProvider>}
       <DropdownMenuContent align="end" className="min-w-[12rem]">
         <CodeSubmenu />
         {!workflowRunIsRunningOrQueued && (
           <DropdownMenuItem
             disabled={isRecording}
-            onSelect={() => toggleHistoryPanel()}
+            onSelect={() => (onVersionHistory ?? toggleHistoryPanel)()}
           >
             <CounterClockwiseClockIcon className="mr-2 size-4" />
             Version history
@@ -140,7 +157,7 @@ export function EditorOverflowMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={requestTour}>
           <span className="flex-1">Take a tour</span>
-          <kbd className="ml-4 text-xs text-slate-400">Shift+?</kbd>
+          <kbd className="ml-4 text-xs text-muted-foreground">Shift+?</kbd>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

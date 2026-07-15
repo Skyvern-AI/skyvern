@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
     advance_to_composing,
 )
+from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     download_scout_act_required_for_policy,
@@ -45,6 +46,7 @@ from .scouting import (
     _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
     _actionable_targets_for_result,
     _attach_scout_page_summary,
+    _capture_scout_ambiguity,
     _capture_scout_role_name,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
@@ -53,6 +55,7 @@ from .scouting import (
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_reached_download_target,
+    _prenav_ambiguity_for_selector,
     _prenav_role_name_for_selector,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
@@ -300,6 +303,7 @@ async def _click_pre_hook(
     # cannot leave a prior click's stash for this click's post-hook to consume.
     ctx.pending_scout_role_name = None
     ctx.pending_scout_click_selector = None
+    ctx.pending_scout_ambiguous = None
     await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
@@ -323,6 +327,7 @@ async def _click_pre_hook(
             ),
         }
     await _capture_scout_role_name(ctx, selector)
+    await _capture_scout_ambiguity(ctx, selector)
     return None
 
 
@@ -358,8 +363,13 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
     await _capture_scout_source_url(ctx)
-    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
+    result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
+    if result is None:
+        await _capture_scout_ambiguity(ctx, params.get("selector", ""))
+    return result
 
 
 async def _press_key_pre_hook(
@@ -422,6 +432,10 @@ async def _click_post_hook(
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
     ctx.pending_scout_role_name = None
+    pending_ambiguous = ctx.pending_scout_ambiguous
+    ctx.pending_scout_ambiguous = None
+    pending_reanchor = ctx.pending_scout_reanchor
+    ctx.pending_scout_reanchor = None
     attempted_selector = ctx.pending_scout_click_selector
     ctx.pending_scout_click_selector = None
     if result.get("ok") and result.get("data"):
@@ -438,6 +452,9 @@ async def _click_post_hook(
         role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
         if navigated and not (role and accessible_name):
             role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+        ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
+        if ambiguous:
+            role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
         result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
         _record_scouted_interaction(
             ctx,
@@ -446,6 +463,7 @@ async def _click_post_hook(
             source_url=source_url,
             role=role,
             accessible_name=accessible_name,
+            ambiguous=ambiguous,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="click", selector=selector, source_url=source_url, url=url
@@ -593,11 +611,72 @@ async def _attach_reperception_targets_on_non_advancing_click(
 _TYPE_READBACK_SETTLE_SECONDS = 0.3
 
 
+async def _read_scout_field_value(ctx: AgentContext, selector: str) -> str | None:
+    """Read a field's current value through the discovery MCP surface, or None when unavailable."""
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    try:
+        readback = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_get_value", {"selector": selector}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.debug("scout field-value read failed; leaving the value unread", exc_info=True)
+        return None
+    if not isinstance(readback, dict) or not readback.get("ok"):
+        return None
+    value = (readback.get("data") or {}).get("value")
+    return value if isinstance(value, str) else None
+
+
+_XPATH_SELECTOR_RE = re.compile(r"^\s*(?:xpath=|\(?/)")
+_ENGINE_PREFIXED_SELECTOR_RE = re.compile(r"^\s*[A-Za-z][\w-]*=")
+
+
+def _selector_supports_control_state_probe(selector: str) -> bool:
+    """Only bare CSS and XPath resolve inside the probe expression. A Playwright-engine selector
+    (``role=``, ``text=``, or a ``>>`` chain) would throw in-page and cost a round-trip to learn nothing.
+    """
+    if _XPATH_SELECTOR_RE.match(selector):
+        return True
+    return ">>" not in selector and not _ENGINE_PREFIXED_SELECTOR_RE.match(selector)
+
+
+async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[bool | None, bool | None]:
+    """Return (readonly, disabled) booleans for a captured type_text target, either None when the control
+    state cannot be resolved (unavailable surface, unresolvable/non-CSS-or-XPath selector). No raw field
+    value crosses this boundary — the evaluate reads attributes only.
+    """
+    if not isinstance(selector, str) or not selector.strip():
+        return None, None
+    if not _selector_supports_control_state_probe(selector):
+        return None, None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None, None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_evaluate", {"expression": scout_control_state_expression(selector)}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.debug("scout control-state probe failed; treating editability as unknown", exc_info=True)
+        return None, None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None, None
+    state = (result.get("data") or {}).get("result")
+    if not isinstance(state, dict):
+        return None, None
+    return bool(state.get("readonly")), bool(state.get("disabled"))
+
+
 async def _verify_scout_type_landed(
     ctx: AgentContext,
     *,
     selector: str,
     typed_length: Any,
+    prefetched_value: str | None = None,
 ) -> dict[str, Any] | None:
     """Confirm a non-empty type actually entered the field, else return a failure.
 
@@ -613,29 +692,15 @@ async def _verify_scout_type_landed(
         return None
     if not isinstance(typed_length, int) or typed_length <= 0:
         return None
-    server = getattr(ctx, "discovery_mcp_server", None)
-    if server is None:
+    if getattr(ctx, "discovery_mcp_server", None) is None:
         return None
 
-    async def _read_back() -> Any:
-        try:
-            readback = await asyncio.wait_for(
-                server.call_internal_tool("skyvern_get_value", {"selector": selector}),
-                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            LOG.debug("scout type-landed read-back failed; leaving the type result unverified", exc_info=True)
-            return None
-        if not isinstance(readback, dict) or not readback.get("ok"):
-            return None
-        return (readback.get("data") or {}).get("value")
-
-    value = await _read_back()
+    value = prefetched_value if prefetched_value is not None else await _read_scout_field_value(ctx, selector)
     if isinstance(value, str) and value.strip() == "":
         # A controlled/React input can mirror its value asynchronously, so a first read may be
         # transiently empty; settle briefly and re-read once before declaring the type lost.
         await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
-        value = await _read_back()
+        value = await _read_scout_field_value(ctx, selector)
     if isinstance(value, str) and value.strip() == "":
         return {
             "ok": False,
@@ -668,11 +733,27 @@ async def _type_text_post_hook(
             "typed_length": typed_length,
             "url": url,
         }
-        landing_failure = await _verify_scout_type_landed(ctx, selector=selector, typed_length=typed_length)
-        if landing_failure is not None:
+        has_landing_probe = (
+            isinstance(selector, str) and bool(selector.strip()) and isinstance(typed_length, int) and typed_length > 0
+        )
+        field_value = await _read_scout_field_value(ctx, selector) if has_landing_probe else None
+        control_readonly, control_disabled = (
+            await _probe_scout_control_state(ctx, selector) if has_landing_probe else (None, None)
+        )
+        is_readonly_or_disabled = bool(control_readonly) or bool(control_disabled)
+        landing_failure = await _verify_scout_type_landed(
+            ctx, selector=selector, typed_length=typed_length, prefetched_value=field_value
+        )
+        if landing_failure is not None and not is_readonly_or_disabled:
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        value_landed = (
+            isinstance(typed_length, int)
+            and typed_length > 0
+            and isinstance(pending_typed_value, str)
+            and len(pending_typed_value) == typed_length
+        )
         typed_value = (
             safe_typed_default_value(
                 pending_typed_value,
@@ -680,12 +761,20 @@ async def _type_text_post_hook(
                 role=role,
                 accessible_name=accessible_name,
             )
-            if isinstance(typed_length, int)
-            and typed_length > 0
-            and isinstance(pending_typed_value, str)
-            and len(pending_typed_value) == typed_length
+            if value_landed
             else None
         )
+        raw_typed_value = pending_typed_value if value_landed and isinstance(pending_typed_value, str) else ""
+        if is_readonly_or_disabled and isinstance(pending_typed_value, str):
+            settled_value = field_value
+            if settled_value is not None and settled_value != pending_typed_value:
+                await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
+                settled_value = await _read_scout_field_value(ctx, selector)
+            control_value_satisfied: bool | None = (
+                settled_value == pending_typed_value if settled_value is not None else None
+            )
+        else:
+            control_value_satisfied = None
         _record_scouted_interaction(
             ctx,
             tool_name="type_text",
@@ -693,8 +782,12 @@ async def _type_text_post_hook(
             source_url=source_url,
             typed_length=typed_length,
             typed_value=typed_value or "",
+            raw_typed_value=raw_typed_value,
             role=role,
             accessible_name=accessible_name,
+            control_readonly=control_readonly,
+            control_disabled=control_disabled,
+            control_value_satisfied=control_value_satisfied,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
@@ -712,6 +805,7 @@ async def _evaluate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    ctx.scout_observation_contract = None
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
         _reset_evaluate_tracker(ctx)
@@ -775,6 +869,10 @@ async def _select_option_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_ambiguous = ctx.pending_scout_ambiguous
+    ctx.pending_scout_ambiguous = None
+    pending_reanchor = ctx.pending_scout_reanchor
+    ctx.pending_scout_reanchor = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = _selector_from_tool_data(data)
@@ -786,6 +884,9 @@ async def _select_option_post_hook(
             "url": url,
         }
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        ambiguous = _prenav_ambiguity_for_selector(pending_ambiguous, selector)
+        if ambiguous:
+            role, accessible_name = _prenav_role_name_for_selector(pending_reanchor, selector)
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
@@ -794,6 +895,7 @@ async def _select_option_post_hook(
             value=data.get("value", ""),
             role=role,
             accessible_name=accessible_name,
+            ambiguous=ambiguous,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=selector, source_url=source_url, url=url

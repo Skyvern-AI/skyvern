@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     WorkflowTriggerBlock,
 )
+from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
@@ -85,6 +86,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
+from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -168,6 +170,8 @@ def convert_workflow_definition(
                 key=parameter.key,
                 description=parameter.description,
                 credential_id=parameter.credential_id,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
                 created_at=now,
                 modified_at=now,
             )
@@ -633,9 +637,34 @@ def block_yaml_to_block(
             azure_blob_container_name=block_yaml.azure_blob_container_name,
             google_credential_id=block_yaml.google_credential_id,
             google_drive_folder_id=block_yaml.google_drive_folder_id,
+            sftp_host=block_yaml.sftp_host,
+            sftp_port=block_yaml.sftp_port,
+            sftp_username=block_yaml.sftp_username,
+            sftp_password=block_yaml.sftp_password,
+            sftp_private_key=block_yaml.sftp_private_key,
+            sftp_private_key_passphrase=block_yaml.sftp_private_key_passphrase,
+            sftp_remote_path=block_yaml.sftp_remote_path,
+            sftp_host_key=block_yaml.sftp_host_key,
+            prompt=block_yaml.prompt,
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:
+        missing_smtp_keys = [
+            key
+            for key in (
+                block_yaml.smtp_host_secret_parameter_key,
+                block_yaml.smtp_port_secret_parameter_key,
+                block_yaml.smtp_username_secret_parameter_key,
+                block_yaml.smtp_password_secret_parameter_key,
+            )
+            if key not in parameters
+        ]
+        if missing_smtp_keys:
+            raise InvalidWorkflowDefinition(
+                f"Send email block '{block_yaml.label}' references undefined parameter(s): "
+                f"{', '.join(sorted(set(missing_smtp_keys)))}. "
+                "Declare these parameters in the workflow before using them."
+            )
         return SendEmailBlock(
             **base_kwargs,
             smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
@@ -676,6 +705,7 @@ def block_yaml_to_block(
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             error_code_mapping=block_yaml.error_code_mapping,
+            without_page_information=block_yaml.without_page_information,
             # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
             max_steps_per_run=2,
         )
@@ -842,6 +872,7 @@ def block_yaml_to_block(
             follow_redirects=block_yaml.follow_redirects,
             download_filename=block_yaml.download_filename,
             save_response_as_file=block_yaml.save_response_as_file,
+            secret_response_paths=block_yaml.secret_response_paths,
             parameters=http_request_block_parameters,
         )
     elif block_yaml.block_type == BlockType.GOTO_URL:
@@ -873,6 +904,16 @@ def block_yaml_to_block(
             parameters=pdf_fill_block_parameters,
         )
 
+    elif block_yaml.block_type == BlockType.SPLIT_PDF:
+        split_pdf_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return SplitPdfBlock(
+            **base_kwargs,
+            file_url=block_yaml.file_url,
+            prompt=block_yaml.prompt,
+            llm_key=block_yaml.llm_key,
+            parameters=split_pdf_block_parameters,
+        )
+
     elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:
         workflow_trigger_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return WorkflowTriggerBlock(
@@ -894,6 +935,21 @@ def block_yaml_to_block(
             credential_id=block_yaml.credential_id,
             has_header_row=block_yaml.has_header_row,
             parameters=google_sheets_read_parameters,
+        )
+    elif block_yaml.block_type == BlockType.EMAIL_INBOX:
+        email_inbox_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return EmailInboxBlock(
+            **base_kwargs,
+            email_client=block_yaml.email_client,
+            credential_id=block_yaml.credential_id,
+            folder=block_yaml.folder,
+            prompt=block_yaml.prompt,
+            sender=block_yaml.sender,
+            subject=block_yaml.subject,
+            newer_than_days=block_yaml.newer_than_days,
+            max_results=block_yaml.max_results,
+            include_body=block_yaml.include_body,
+            parameters=email_inbox_parameters,
         )
     elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:
         google_sheets_write_parameters = _resolve_block_parameters(block_yaml, parameters)

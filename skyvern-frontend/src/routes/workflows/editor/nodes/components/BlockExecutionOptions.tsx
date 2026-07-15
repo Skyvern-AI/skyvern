@@ -71,7 +71,7 @@ export function BlockExecutionOptions({
         onIncludeActionHistoryInVerificationChange && (
           <div className="flex items-center justify-between">
             <div className="flex gap-2">
-              <Label className="text-xs font-normal text-slate-300">
+              <Label className="text-xs font-normal text-tertiary-foreground">
                 Include Action History
               </Label>
               <HelpTooltip
@@ -116,7 +116,7 @@ export function BlockExecutionOptions({
           return (
             <div className="flex items-center justify-between">
               <div className="flex gap-2">
-                <Label className="text-xs font-normal text-slate-300">
+                <Label className="text-xs font-normal text-tertiary-foreground">
                   On block failure
                 </Label>
                 <HelpTooltip
@@ -159,7 +159,7 @@ export function BlockExecutionOptions({
         (!isInsideForLoop || !showNextLoopOnFailure) && (
           <div className="flex items-center justify-between">
             <div className="flex gap-2">
-              <Label className="text-xs font-normal text-slate-300">
+              <Label className="text-xs font-normal text-tertiary-foreground">
                 Continue on Failure
               </Label>
               <HelpTooltip

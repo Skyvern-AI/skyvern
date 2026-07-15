@@ -149,7 +149,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules`,
             ),
             method: "GET",
             headers: _headers,
@@ -184,7 +184,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling GET /v1/workflows/{workflow_permanent_id}/schedules.",
+                    "Timeout exceeded when calling GET /v1/agents/{workflow_permanent_id}/schedules.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -230,7 +230,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules`,
             ),
             method: "POST",
             headers: _headers,
@@ -268,7 +268,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling POST /v1/workflows/{workflow_permanent_id}/schedules.",
+                    "Timeout exceeded when calling POST /v1/agents/{workflow_permanent_id}/schedules.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -313,7 +313,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}`,
             ),
             method: "GET",
             headers: _headers,
@@ -348,7 +348,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling GET /v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}.",
+                    "Timeout exceeded when calling GET /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -399,7 +399,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}`,
             ),
             method: "PUT",
             headers: _headers,
@@ -437,7 +437,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling PUT /v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}.",
+                    "Timeout exceeded when calling PUT /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -482,7 +482,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}`,
             ),
             method: "DELETE",
             headers: _headers,
@@ -517,7 +517,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling DELETE /v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}.",
+                    "Timeout exceeded when calling DELETE /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -562,7 +562,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}/enable`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}/enable`,
             ),
             method: "POST",
             headers: _headers,
@@ -597,7 +597,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling POST /v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable.",
+                    "Timeout exceeded when calling POST /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -642,7 +642,7 @@ export class Schedules {
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
                     environments.SkyvernEnvironment.Cloud,
-                `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}/disable`,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}/disable`,
             ),
             method: "POST",
             headers: _headers,
@@ -677,7 +677,7 @@ export class Schedules {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
-                    "Timeout exceeded when calling POST /v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable.",
+                    "Timeout exceeded when calling POST /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({

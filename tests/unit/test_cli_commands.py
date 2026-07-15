@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
+from skyvern.cli.commands import cli_app
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
+from skyvern.cli.status import _status_data
 
 # ---------------------------------------------------------------------------
 # _state.py
@@ -96,6 +100,24 @@ class TestOutput:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert parsed["error"]["message"] == "bad thing"
+
+
+# ---------------------------------------------------------------------------
+# status.py
+# ---------------------------------------------------------------------------
+
+
+class TestStatusCommands:
+    def test_status_start_commands_are_accepted_by_cli_parser(self) -> None:
+        runner = CliRunner()
+
+        for row in _status_data():
+            command_parts = shlex.split(row["start_command"])
+            assert command_parts[0] == "skyvern"
+
+            result = runner.invoke(cli_app, [*command_parts[1:], "--help"])
+
+            assert result.exit_code == 0, result.output
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +335,36 @@ class TestBrowserCommands:
 
 
 class TestWorkflowCommands:
+    def test_workflow_list_query_alias_maps_to_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        monkeypatch.setattr(workflow_cmd, "prepare_cli_runtime", lambda **_: None)
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_list",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflows": [], "page": 1, "page_size": 10, "count": 0, "has_more": False},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_list", tool)
+
+        result = CliRunner().invoke(workflow_cmd.workflow_app, ["list", "--query", "invoice", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert tool.await_args.kwargs == {
+            "search": "invoice",
+            "page": 1,
+            "page_size": 10,
+            "only_workflows": False,
+        }
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is True
+
     def test_workflow_get_outputs_mcp_envelope_in_json_mode(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
@@ -331,7 +383,7 @@ class TestWorkflowCommands:
         tool = AsyncMock(return_value=expected)
         monkeypatch.setattr(workflow_cmd, "tool_workflow_get", tool)
 
-        workflow_cmd.workflow_get(workflow_id="wpid_123", version=2, json_output=True)
+        workflow_cmd.workflow_get(workflow_id="wpid_123", version=2, definition_file=None, json_output=True)
 
         parsed = json.loads(capsys.readouterr().out)
         # emit_tool_result adds schema_version and warnings defaults to the output copy
@@ -339,6 +391,76 @@ class TestWorkflowCommands:
         assert parsed["data"] == expected["data"]
         assert parsed["schema_version"] == "1.0"
         assert tool.await_args.kwargs == {"workflow_id": "wpid_123", "version": 2}
+
+    def test_workflow_get_definition_file_feeds_directly_into_update(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import asyncio
+
+        from skyvern.cli import workflow as workflow_cmd
+        from skyvern.cli.mcp_tools import workflow as workflow_tools
+
+        preserved_settings = {
+            "description": "Existing description",
+            "webhook_callback_url": "https://example.com/webhook",
+            "persist_browser_session": True,
+            "browser_profile_id": "bp_existing",
+            "run_with": "code",
+            "cache_key": None,
+            "adaptive_caching": True,
+            "ai_fallback": False,
+        }
+        existing_workflow = {
+            "title": "Status workflow",
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [{"block_type": "code", "label": "report_status", "code": "return {'status': 'ready'}"}],
+            },
+            **preserved_settings,
+        }
+        exported = {
+            "title": existing_workflow["title"],
+            "proxy_location": existing_workflow["proxy_location"],
+            "workflow_definition": existing_workflow["workflow_definition"],
+        }
+        monkeypatch.setattr(workflow_cmd, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(
+            workflow_cmd,
+            "tool_workflow_get",
+            AsyncMock(return_value={"ok": True, "data": existing_workflow}),
+        )
+        definition_file = tmp_path / "wf.json"
+
+        cli_result = CliRunner().invoke(
+            workflow_cmd.workflow_app,
+            ["get", "--id", "wpid_123", "--definition-file", str(definition_file)],
+        )
+
+        assert cli_result.exit_code == 0, cli_result.output
+        assert "Wrote workflow definition to" in cli_result.output
+        assert json.loads(definition_file.read_text()) == exported
+
+        monkeypatch.setattr(workflow_tools, "get_workflow_by_id", AsyncMock(return_value=existing_workflow))
+        update_raw = AsyncMock(
+            return_value={"workflow_permanent_id": "wpid_123", "title": "Status workflow", "version": 2}
+        )
+        monkeypatch.setattr(workflow_tools, "update_workflow_raw", update_raw)
+
+        update_result = asyncio.run(
+            workflow_cmd.tool_workflow_update(
+                workflow_id="wpid_123",
+                definition=definition_file.read_text(),
+                format="json",
+            )
+        )
+
+        assert update_result["ok"] is True
+        update_raw.assert_awaited_once()
+        sent_definition = update_raw.await_args.kwargs["json_definition"]
+        assert {field: sent_definition[field] for field in preserved_settings} == preserved_settings
 
     def test_workflow_create_reads_definition_from_file(
         self,

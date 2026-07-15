@@ -1,6 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
-import { ArrowTopRightIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ArrowTopRightIcon,
+  ExclamationTriangleIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -18,12 +22,14 @@ import { Switch } from "@/components/ui/switch";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { type AppNode } from "..";
+import { parameterIsSkyvernCredential } from "../../types";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
@@ -74,9 +80,28 @@ function LoginEditorBody({
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
+  const workflowParameters = useWorkflowParametersStore(
+    (state) => state.parameters,
+  );
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
   );
+  const credentialParameterKey =
+    data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined;
+  const credentialIsRotating = useMemo(() => {
+    if (!credentialParameterKey) return false;
+
+    const parameter = workflowParameters.find(
+      (workflowParameter) => workflowParameter.key === credentialParameterKey,
+    );
+
+    if (!parameter || parameter.parameterType !== "credential") return false;
+
+    return (
+      parameterIsSkyvernCredential(parameter) &&
+      (parameter.credentialIds?.length ?? 0) >= 2
+    );
+  }, [credentialParameterKey, workflowParameters]);
   const hasTotpValues = Boolean(
     data.totpIdentifier?.trim() || data.totpVerificationUrl?.trim(),
   );
@@ -92,11 +117,11 @@ function LoginEditorBody({
       <div className="space-y-2">
         <div className="flex justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">URL</Label>
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
             <HelpTooltip content={helpTooltips["login"]["url"]} />
           </div>
           {isFirstWorkflowBlock ? (
-            <div className="flex justify-end text-xs text-slate-400">
+            <div className="flex justify-end text-xs text-muted-foreground">
               Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
@@ -111,7 +136,7 @@ function LoginEditorBody({
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Login Goal</Label>
+          <Label className="text-xs text-tertiary-foreground">Login Goal</Label>
           <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
         </div>
         <WorkflowBlockInputTextarea
@@ -123,16 +148,19 @@ function LoginEditorBody({
           className="nopan text-xs"
         />
       </div>
-      <div className="space-y-3 rounded-md border border-slate-700/50 bg-slate-900/30 p-3">
-        <p className="text-xs font-medium text-slate-300">Authentication</p>
+      <div className="space-y-3 rounded-md border border-border/50 bg-slate-elevation1/30 p-3">
+        <p className="text-xs font-medium text-tertiary-foreground">
+          Authentication
+        </p>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Credential</Label>
-          <p className="text-[0.7rem] text-slate-400">
+          <Label className="text-xs text-tertiary-foreground">Credential</Label>
+          <p className="text-[0.7rem] text-muted-foreground">
             Credentials are encrypted server-side; secret values never echo back
             into the editor.
           </p>
           <LoginBlockCredentialSelector
             nodeId={blockId}
+            editable={editable}
             value={
               data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined
             }
@@ -150,13 +178,29 @@ function LoginEditorBody({
             onUrlAutoFill={(url) => {
               if (editable) update({ url });
             }}
+            currentInstructions={data.navigationGoal}
+            onInstructionsAutoFill={(navigationGoal) => {
+              if (editable) update({ navigationGoal });
+            }}
           />
         </div>
         {showTwoFactorFields ? (
           <div className="space-y-3">
+            {credentialIsRotating && hasTotpValues ? (
+              <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                <ExclamationTriangleIcon className="mt-0.5 size-3 shrink-0" />
+                <span>
+                  Block-level 2FA overrides every rotated account with a single
+                  destination. Remove it unless all accounts share one 2FA
+                  inbox.
+                </span>
+              </p>
+            ) : null}
             <div className="space-y-2">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">2FA Identifier</Label>
+                <Label className="text-xs text-tertiary-foreground">
+                  2FA Identifier
+                </Label>
                 <HelpTooltip
                   content={helpTooltips["login"]["totpIdentifier"]}
                 />
@@ -173,14 +217,14 @@ function LoginEditorBody({
                 className="nopan text-xs"
               />
               {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                <p className="text-xs text-slate-500">
+                <p className="text-xs text-muted-foreground dark:text-slate-500">
                   Leave empty to use the credential's value.
                 </p>
               ) : null}
             </div>
             <div className="space-y-2">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
+                <Label className="text-xs text-tertiary-foreground">
                   2FA Verification URL
                 </Label>
                 <HelpTooltip
@@ -199,22 +243,27 @@ function LoginEditorBody({
               <button
                 type="button"
                 onClick={() => setTwoFactorRequested(false)}
-                className="text-xs text-slate-400 transition-colors hover:text-slate-200"
+                className="text-xs text-muted-foreground transition-colors hover:text-foreground dark:hover:text-slate-200"
               >
                 Cancel
               </button>
             ) : null}
           </div>
+        ) : credentialIsRotating ? (
+          <p className="text-xs text-muted-foreground">
+            2FA is handled per account — each rotated credential uses its own
+            verification settings.
+          </p>
         ) : showCredentialTotpSummary ? (
           <div className="flex items-center justify-between gap-2">
             <a
               href="/credentials?tab=twoFactor"
               target="_blank"
               rel="noopener noreferrer"
-              className="min-w-0 break-words text-xs text-slate-400 transition-colors hover:text-slate-200"
+              className="min-w-0 break-words text-xs text-muted-foreground transition-colors hover:text-foreground dark:hover:text-slate-200"
             >
               Skyvern is waiting for 2FA codes with this identifier:{" "}
-              <span className="font-mono text-slate-300">
+              <span className="font-mono text-tertiary-foreground">
                 {credentialTotpIdentifier}
               </span>
               <ArrowTopRightIcon className="ml-0.5 inline size-3 align-text-bottom" />
@@ -267,7 +316,9 @@ function LoginEditorBody({
                 />
               </div>
               <div className="space-y-2">
-                <Label className="text-xs text-slate-300">Complete if...</Label>
+                <Label className="text-xs text-tertiary-foreground">
+                  Complete if...
+                </Label>
                 <WorkflowBlockInputTextarea
                   aiImprove={AI_IMPROVE_CONFIGS.login.completeCriterion}
                   nodeId={blockId}
@@ -279,7 +330,7 @@ function LoginEditorBody({
               <Separator />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Engine
                   </Label>
                 </div>
@@ -291,7 +342,7 @@ function LoginEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Max Steps Override
                   </Label>
                   <HelpTooltip
@@ -316,7 +367,7 @@ function LoginEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip

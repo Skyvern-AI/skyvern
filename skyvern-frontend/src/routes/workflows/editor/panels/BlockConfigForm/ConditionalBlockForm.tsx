@@ -1,38 +1,41 @@
-import { useReactFlow } from "@xyflow/react";
+import { useNodesData } from "@xyflow/react";
 import { useEffect, useMemo } from "react";
 
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { Label } from "@/components/ui/label";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 
-import { AppNode, isWorkflowBlockNode } from "../../nodes";
-import { BranchesEditor } from "../../nodes/ConditionalNode/BranchesEditor";
+import { type AppNode, isWorkflowBlockNode } from "../../nodes";
 import {
-  type ConditionalNode,
+  getConditionLabel,
+  orderBranchesWithDefaultsLast,
+} from "../../nodes/ConditionalNode/branchDisplayUtils";
+import {
   type ConditionalNodeData,
+  defaultBranchCriteria,
 } from "../../nodes/ConditionalNode/types";
+import { useUpdate } from "../../useUpdate";
 import { useDebouncedSidebarSave } from "../useDebouncedSidebarSave";
 
 function ConditionalBlockForm({ blockId }: { blockId: string }) {
-  const rf = useReactFlow<AppNode>();
-  const node = rf.getNode(blockId);
-  if (!node || !isWorkflowBlockNode(node) || node.type !== "conditional") {
+  const nodeSlice = useNodesData<AppNode>(blockId);
+  if (
+    !nodeSlice ||
+    !isWorkflowBlockNode(nodeSlice as AppNode) ||
+    nodeSlice.type !== "conditional"
+  ) {
     return null;
   }
-  return (
-    <ConditionalBlockFormBody
-      blockId={blockId}
-      node={node as ConditionalNode}
-    />
-  );
+  return <ConditionalBlockFormBody blockId={blockId} data={nodeSlice.data} />;
 }
 
 function ConditionalBlockFormBody({
   blockId,
-  node,
+  data,
 }: {
   blockId: string;
-  node: ConditionalNode;
+  data: ConditionalNodeData;
 }) {
-  const data = node.data;
   const {
     branches,
     activeBranchId,
@@ -40,6 +43,14 @@ function ConditionalBlockFormBody({
     continueOnFailure,
     nextLoopOnFailure,
   } = data;
+  const orderedBranches = useMemo(
+    () => orderBranchesWithDefaultsLast(branches),
+    [branches],
+  );
+  const update = useUpdate<ConditionalNodeData>({
+    id: blockId,
+    editable: data.editable,
+  });
 
   const value = useMemo(
     () => ({
@@ -68,9 +79,66 @@ function ConditionalBlockFormBody({
     return () => store.unregister(blockId);
   }, [blockId, commit]);
 
+  const handleExpressionChange = (
+    branchId: string,
+    expression: string,
+  ): void => {
+    const targetBranch = branches.find((branch) => branch.id === branchId);
+    if (!targetBranch || targetBranch.is_default) {
+      return;
+    }
+
+    update({
+      branches: branches.map((branch) => {
+        if (branch.id !== branchId) {
+          return branch;
+        }
+        return {
+          ...branch,
+          criteria: {
+            ...(branch.criteria ?? { ...defaultBranchCriteria }),
+            expression,
+          },
+        };
+      }),
+    });
+  };
+
   return (
-    <div data-testid="conditional-block-form" className="space-y-4">
-      <BranchesEditor nodeId={blockId} data={data as ConditionalNodeData} />
+    <div data-testid="conditional-block-form" className="space-y-3">
+      {orderedBranches.map((branch, index) => {
+        const isDefaultBranch = branch.is_default;
+        const branchExpression = isDefaultBranch
+          ? "Executed when no other condition matches"
+          : (branch.criteria?.expression ?? "");
+        return (
+          <div
+            key={branch.id}
+            className="space-y-2 rounded-md border border-border bg-slate-elevation2 p-3"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <Label className="text-xs text-tertiary-foreground">
+                {getConditionLabel(branch, index)}
+              </Label>
+              {branch.id === activeBranchId && (
+                <span className="rounded bg-slate-elevation5 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-tertiary-foreground">
+                  Active
+                </span>
+              )}
+            </div>
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              value={branchExpression}
+              disabled={!data.editable || isDefaultBranch}
+              onChange={(nextValue) =>
+                handleExpressionChange(branch.id, nextValue)
+              }
+              placeholder="Enter condition to evaluate (Jinja, natural language, or both)"
+              className="nopan text-xs"
+            />
+          </div>
+        );
+      })}
     </div>
   );
 }

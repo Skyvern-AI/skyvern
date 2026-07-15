@@ -48,11 +48,14 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         browser_session_id="pbs_1",
         scouted_interactions=[],
         scout_trajectory=[],
+        prior_fill_carry=[],
+        fill_carry_rebound_done=False,
         observed_browser_urls=[],
         pending_scout_source_url=None,
         pending_browser_interaction_observation=None,
         discovery_mcp_server=None,
         secret_scrub_values=[],
+        scouted_credential_field_inventory_by_credential_id={},
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -133,6 +136,33 @@ class TestResolveCredentialFillValue:
         assert (value, error) == (_FAKE_PASSWORD, None)
 
     @pytest.mark.asyncio
+    async def test_resolve_records_live_scout_field_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=None))
+        ctx = _ctx()
+        _, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "username")
+        assert error is None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+
+    @pytest.mark.asyncio
+    async def test_resolve_inventory_excludes_empty_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password="", totp=None))
+        ctx = _ctx()
+        _, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "username")
+        assert error is None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {"cred_123": frozenset({"username"})}
+
+    @pytest.mark.asyncio
+    async def test_resolve_error_records_no_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password="", totp=None))
+        ctx = _ctx()
+        value, _, error = await tools_module._resolve_credential_fill_value(ctx, "cred_123", "password")
+        assert value is None
+        assert error is not None
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {}
+
+    @pytest.mark.asyncio
     async def test_totp_mints_fresh_code_not_the_seed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._wire_vault(
             monkeypatch,
@@ -182,15 +212,24 @@ class TestResolveCredentialFillValue:
         assert "TOTP" in error
 
     @pytest.mark.asyncio
-    async def test_email_otp_credential_returns_runtime_otp_steer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize(
+        ("totp_type", "totp_identifier"),
+        [
+            pytest.param(TotpType.EMAIL, "otp@example.test", id="email-otp"),
+            pytest.param(TotpType.TEXT, "+15550101111", id="text-otp"),
+        ],
+    )
+    async def test_otp_credential_returns_runtime_otp_steer(
+        self, monkeypatch: pytest.MonkeyPatch, totp_type: TotpType, totp_identifier: str
+    ) -> None:
         self._wire_vault(
             monkeypatch,
             PasswordCredential(
                 username=_FAKE_USERNAME,
                 password=_FAKE_PASSWORD,
                 totp=None,
-                totp_type=TotpType.EMAIL,
-                totp_identifier="otp@example.test",
+                totp_type=totp_type,
+                totp_identifier=totp_identifier,
             ),
         )
         value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "totp")
@@ -198,26 +237,7 @@ class TestResolveCredentialFillValue:
         assert error is not None
         assert "await <credential_parameter>.otp()" in error
         assert "workflow run" in error
-        assert "otp@example.test" not in error
-
-    @pytest.mark.asyncio
-    async def test_text_otp_credential_returns_runtime_otp_steer(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._wire_vault(
-            monkeypatch,
-            PasswordCredential(
-                username=_FAKE_USERNAME,
-                password=_FAKE_PASSWORD,
-                totp=None,
-                totp_type=TotpType.TEXT,
-                totp_identifier="+15550101111",
-            ),
-        )
-        value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "totp")
-        assert value is None
-        assert error is not None
-        assert "await <credential_parameter>.otp()" in error
-        assert "workflow run" in error
-        assert "+15550101111" not in error
+        assert totp_identifier not in error
 
     @pytest.mark.asyncio
     async def test_missing_credential_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:

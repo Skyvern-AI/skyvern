@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 import structlog
 
 from skyvern.config import settings
@@ -15,16 +13,8 @@ LOG = structlog.get_logger()
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
 
 
-@dataclass(frozen=True)
-class LLMConfigRegistrationIssue:
-    llm_key: str
-    missing_env_vars: tuple[str, ...]
-    detail: str
-
-
 class LLMConfigRegistry:
     _configs: dict[str, LLMRouterConfig | LLMConfig] = {}
-    _config_issues: dict[str, LLMConfigRegistrationIssue] = {}
 
     @staticmethod
     def is_router_config(llm_key: str) -> bool:
@@ -42,59 +32,21 @@ class LLMConfigRegistry:
             raise MissingLLMProviderEnvVarsError(llm_key, missing_env_vars)
 
     @classmethod
-    def record_config_issue(cls, llm_key: str, missing_env_vars: list[str], detail: str) -> None:
-        cls._configs.pop(llm_key, None)
-        cls._config_issues[llm_key] = LLMConfigRegistrationIssue(
-            llm_key=llm_key,
-            missing_env_vars=tuple(missing_env_vars),
-            detail=detail,
-        )
-        LOG.warning(
-            "Skipping invalid LLM config",
-            llm_key=llm_key,
-            missing_env_vars=missing_env_vars,
-            detail=detail,
-        )
-
-    @classmethod
-    def get_config_issue(cls, llm_key: str) -> LLMConfigRegistrationIssue | None:
-        return cls._config_issues.get(llm_key)
-
-    @classmethod
-    def get_config_issues(cls) -> list[LLMConfigRegistrationIssue]:
-        return list(cls._config_issues.values())
-
-    @classmethod
     def register_config(cls, llm_key: str, config: LLMRouterConfig | LLMConfig) -> None:
         if llm_key in cls._configs:
             raise DuplicateLLMConfigError(llm_key)
 
-        try:
-            cls.validate_config(llm_key, config)
-        except MissingLLMProviderEnvVarsError as exc:
-            if settings.ENV != "local":
-                raise
-            cls.record_config_issue(
-                llm_key,
-                config.get_missing_env_vars(),
-                str(exc),
-            )
-            return
+        cls.validate_config(llm_key, config)
 
-        cls._config_issues.pop(llm_key, None)
         cls._configs[llm_key] = config
 
     @classmethod
     def deregister_config(cls, llm_key: str) -> None:
         """Remove a registered LLM config. Idempotent — no-op if key doesn't exist."""
         cls._configs.pop(llm_key, None)
-        cls._config_issues.pop(llm_key, None)
 
     @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
-        if issue := cls.get_config_issue(llm_key):
-            raise InvalidLLMConfigError(issue.detail)
-
         if llm_key not in cls._configs:
             # If the key is not found in registered configs, treat it as a general model
             if not llm_key:
@@ -303,6 +255,42 @@ if settings.ENABLE_OPENAI:
         "OPENAI_GPT5_5",
         LLMConfig(
             "gpt-5.5",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            "gpt-5.6-sol",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            "gpt-5.6-terra",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            "gpt-5.6-luna",
             ["OPENAI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -939,6 +927,81 @@ if settings.ENABLE_AZURE_GPT5_4:
                 api_key=settings.AZURE_GPT5_4_API_KEY,
                 api_version=settings.AZURE_GPT5_4_API_VERSION,
                 model_info={"model_name": "azure/gpt-5.4"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_SOL:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_SOL_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_SOL_DEPLOYMENT",
+                "AZURE_GPT5_6_SOL_API_KEY",
+                "AZURE_GPT5_6_SOL_API_BASE",
+                "AZURE_GPT5_6_SOL_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_SOL_API_BASE,
+                api_key=settings.AZURE_GPT5_6_SOL_API_KEY,
+                api_version=settings.AZURE_GPT5_6_SOL_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-sol"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_TERRA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_TERRA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_TERRA_DEPLOYMENT",
+                "AZURE_GPT5_6_TERRA_API_KEY",
+                "AZURE_GPT5_6_TERRA_API_BASE",
+                "AZURE_GPT5_6_TERRA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_TERRA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_TERRA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_TERRA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-terra"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_LUNA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_LUNA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_LUNA_DEPLOYMENT",
+                "AZURE_GPT5_6_LUNA_API_KEY",
+                "AZURE_GPT5_6_LUNA_API_BASE",
+                "AZURE_GPT5_6_LUNA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_LUNA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_LUNA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_LUNA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-luna"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,
@@ -1686,13 +1749,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1805,13 +1868,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -2104,13 +2167,8 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
     openai_compatible_model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
 
     if not openai_compatible_model_name:
-        detail = "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
-        if settings.ENV != "local":
-            raise InvalidLLMConfigError(detail)
-        LLMConfigRegistry.record_config_issue(
-            openai_compatible_model_key,
-            ["OPENAI_COMPATIBLE_MODEL_NAME"],
-            detail,
+        raise InvalidLLMConfigError(
+            "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
         )
     else:
         # Required environment variables to check

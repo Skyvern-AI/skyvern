@@ -270,6 +270,18 @@ const nodeLibraryItems: Array<{
     description: "Fill a PDF form",
   },
   {
+    nodeType: "splitPdf",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.SplitPDF}
+        className="size-6"
+      />
+    ),
+    title: "Split PDF",
+    description:
+      "Split one PDF into multiple PDFs based on a prompt and save each to S3.",
+  },
+  {
     nodeType: "workflowTrigger",
     icon: (
       <WorkflowBlockIcon
@@ -279,6 +291,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "Agent Trigger Block",
     description: "Trigger another agent",
+  },
+  {
+    nodeType: "emailInbox",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.EmailInbox}
+        className="size-6"
+      />
+    ),
+    title: "Email Inbox",
+    description: "Search Gmail or Outlook inboxes",
   },
   {
     nodeType: "googleSheetsRead",
@@ -417,7 +440,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                   }}
                 >
                   <div className="flex min-w-0 gap-2">
-                    <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+                    <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
                       {item.icon}
                     </div>
                     <div className="flex min-w-0 flex-col gap-1">
@@ -433,7 +456,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                 </div>
               ))
             ) : (
-              <div className="p-4 text-center text-sm text-slate-400">
+              <div className="p-4 text-center text-sm text-muted-foreground">
                 No results found
               </div>
             )}

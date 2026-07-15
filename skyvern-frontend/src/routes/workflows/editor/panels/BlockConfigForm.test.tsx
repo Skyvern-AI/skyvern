@@ -21,6 +21,12 @@ vi.mock("@xyflow/react", async () => {
   };
 });
 
+vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
+  WorkflowBlockInputTextarea: ({ value }: { value: string }) => (
+    <textarea readOnly value={value} />
+  ),
+}));
+
 // The sidebar header now renders an editable title for block nodes, which
 // pulls in the label-change hook (needs a ReactFlow store). Stub it so these
 // commit-orchestration tests stay scoped to the body, not the title. The
@@ -78,7 +84,7 @@ describe("BLOCK_FORMS dispatcher", () => {
     }
   });
 
-  test("contains the 27 expected node.type keys", () => {
+  test("contains the 29 expected node.type keys", () => {
     expect(new Set(BLOCK_FORM_KEYS)).toEqual(
       new Set([
         "task",
@@ -108,17 +114,48 @@ describe("BLOCK_FORMS dispatcher", () => {
         "googleSheetsRead",
         "googleSheetsWrite",
         "pdfFill",
+        "splitPdf",
+        "emailInbox",
       ]),
     );
-    expect(BLOCK_FORM_KEYS).toHaveLength(27);
+    expect(BLOCK_FORM_KEYS).toHaveLength(29);
   });
 
-  test("conditional routes to the sidebar placeholder (canvas tile owns BranchesEditor)", () => {
-    mockNodeFixtures.set("c1", { id: "c1", type: "conditional" });
+  test("conditional routes to a sidebar form that shows branch prompts", () => {
+    mockNodeFixtures.set("c1", {
+      id: "c1",
+      type: "conditional",
+      data: {
+        editable: true,
+        branches: [
+          {
+            id: "branch_a",
+            criteria: {
+              criteria_type: "jinja2_template",
+              expression: "{{ total > 100 }}",
+              description: null,
+            },
+            next_block_label: null,
+            description: null,
+            is_default: false,
+          },
+          {
+            id: "branch_default",
+            criteria: null,
+            next_block_label: null,
+            description: null,
+            is_default: true,
+          },
+        ],
+        activeBranchId: "branch_a",
+        mergeLabel: null,
+        continueOnFailure: false,
+        nextLoopOnFailure: false,
+      },
+    });
     render(<BlockConfigForm blockId="c1" />);
-    expect(
-      screen.getByTestId("block-config-form-conditional-placeholder"),
-    ).toBeDefined();
+    expect(screen.getByTestId("conditional-block-form")).toBeDefined();
+    expect(screen.getByDisplayValue("{{ total > 100 }}")).toBeDefined();
   });
 
   test("returns null when the node lookup misses (block was deleted)", () => {

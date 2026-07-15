@@ -22,6 +22,7 @@ from skyvern.forge.sdk.api.files import (
     get_skyvern_temp_dir,
     make_temp_directory,
     unzip_files,
+    wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import (
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.utils.script_file_paths import build_script_file_storage_uri
 from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
@@ -146,7 +148,12 @@ class S3Storage(BaseStorage):
         Returns:
             The S3 URI for the script file
         """
-        return f"{self._build_base_uri(organization_id)}/scripts/{script_id}/{script_version}/{file_path}"
+        return build_script_file_storage_uri(
+            self._build_base_uri(organization_id),
+            script_id=script_id,
+            script_version=script_version,
+            file_path=file_path,
+        )
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         # We compress HAR files with zstd level 3 to reduce storage size.
@@ -690,6 +697,10 @@ class S3Storage(BaseStorage):
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         for file in files:
+            fpath = os.path.join(download_dir, file)
+            if not os.path.isfile(fpath):
+                continue
+            file = await wait_for_pending_extension_rename(download_dir, file)
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     only_structural_requested_output_abstentions,
@@ -56,6 +57,7 @@ class DiagnosisFailureType(StrEnum):
     ACTIVE_RUN_TERMINAL_EVIDENCE = "active_run_terminal_evidence"
     UNRECOVERABLE_TOOL_ERROR = "unrecoverable_tool_error"
     SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
+    DELIVERED_UNVERIFIED = "delivered_unverified"
     UNKNOWN = "unknown"
 
 
@@ -161,8 +163,9 @@ def build_diagnosis_repair_contract(
     run_ok = bool(result.get("ok", False))
     suspicious = run_ok and bool(getattr(ctx, "last_test_suspicious_success", False))
     failed_blocks = _failed_block_labels(blocks)
-    categories = _failure_categories(data)
-    terminal_challenge_categories = _trusted_terminal_challenge_categories(data)
+    carrier_categories = carrier_backed_anti_bot_categories(data.get("failure_categories"))
+    categories = _failure_categories(carrier_categories)
+    terminal_challenge_categories = _trusted_terminal_challenge_categories(carrier_categories)
     run_status = _safe_str(data.get("overall_status"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     summary = _failure_summary(result, data, blocks)
@@ -177,11 +180,18 @@ def build_diagnosis_repair_contract(
     outcome_verified = outcome_fully_verified(ctx)
     completion_verification = getattr(ctx, "completion_verification_result", None)
     completion_verification_failed = _completion_verification_failed(completion_verification)
+    delivered_unverified = bool(
+        run_ok
+        and getattr(ctx, "delivered_unverified_terminal", False) is True
+        and workflow_run_id
+        and workflow_run_id == getattr(ctx, "delivered_unverified_workflow_run_id", None)
+    )
     failure_type = _failure_type(
         run_ok,
         suspicious,
         outcome_verified,
         completion_verification_failed,
+        delivered_unverified,
         failed_blocks,
         categories,
         terminal_challenge_categories,
@@ -247,6 +257,8 @@ def build_diagnosis_repair_contract(
             "Stop re-authoring: the edited extraction schema declares fields that map to no output the "
             "workflow produces, so the mismatch is not repairable without user input."
         )
+    elif failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED:
+        decision_summary = "No repair selected; the latest run returned requested output but it was not verified."
     if (
         next_action == RepairNextAction.NO_CHANGE
         and user_goal_satisfied is True
@@ -255,7 +267,9 @@ def build_diagnosis_repair_contract(
         completion_check = "Current run already satisfies the goal."
     else:
         completion_check = {
-            RepairNextAction.NO_CHANGE: "No repair selected; completion remains unverified.",
+            RepairNextAction.NO_CHANGE: "No repair selected; completion is delivered but not independently verified."
+            if failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED
+            else "No repair selected; completion remains unverified.",
             RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
             RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
         }.get(
@@ -424,10 +438,7 @@ def _turn_intent_summary(ctx: Any) -> dict[str, Any]:
         return {}
 
 
-def _failure_categories(data: dict[str, Any]) -> list[str]:
-    raw = data.get("failure_categories")
-    if not isinstance(raw, list):
-        return []
+def _failure_categories(raw: list[Any]) -> list[str]:
     return list(
         dict.fromkeys(
             category
@@ -439,10 +450,7 @@ def _failure_categories(data: dict[str, Any]) -> list[str]:
     )
 
 
-def _trusted_terminal_challenge_categories(data: dict[str, Any]) -> list[str]:
-    raw = data.get("failure_categories")
-    if not isinstance(raw, list):
-        return []
+def _trusted_terminal_challenge_categories(raw: list[Any]) -> list[str]:
     return list(
         dict.fromkeys(
             category
@@ -480,6 +488,7 @@ def _failure_type(
     suspicious: bool,
     outcome_verified: bool,
     completion_verification_failed: bool,
+    delivered_unverified: bool,
     failed_blocks: list[str],
     categories: list[str],
     terminal_challenge_categories: list[str],
@@ -530,7 +539,11 @@ def _failure_type(
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if outcome_verified:
         return DiagnosisFailureType.NO_FAILURE
-    if failed_blocks or category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
+    if failed_blocks:
+        return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    if delivered_unverified:
+        return DiagnosisFailureType.DELIVERED_UNVERIFIED
+    if category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if completion_verification_failed:
         return DiagnosisFailureType.SUSPICIOUS_SUCCESS
@@ -551,7 +564,7 @@ def _next_action(
     data: dict[str, Any],
     repair_context: CodeAuthoringRepairContext | None,
 ) -> RepairNextAction:
-    if failure_type == DiagnosisFailureType.NO_FAILURE:
+    if failure_type in {DiagnosisFailureType.NO_FAILURE, DiagnosisFailureType.DELIVERED_UNVERIFIED}:
         return RepairNextAction.NO_CHANGE
     if failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR:
         return RepairNextAction.STOP
@@ -645,6 +658,8 @@ def _verification_satisfaction(
 ) -> tuple[bool | None, bool | None]:
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
         return False, False
+    if failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED:
+        return True, False
     if isinstance(data, dict) and data.get("active_run_terminal_evidence_detected") is True:
         trace = data.get("active_run_terminal_completion_verification")
         fully_satisfied = isinstance(trace, dict) and trace.get("fully_satisfied") is True

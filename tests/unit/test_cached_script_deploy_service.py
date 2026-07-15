@@ -726,7 +726,17 @@ async def run(parameters):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "file_path",
-    ["../outside.py", "/main.py", "dir//main.py", "dir/../main.py", "dir\\main.py", "./main.py"],
+    [
+        "../outside.py",
+        "/main.py",
+        "dir//main.py",
+        "dir/../main.py",
+        "dir\\main.py",
+        "./main.py",
+        "%2e%2e/outside.py",
+        "main.py%00.txt",
+        "C:/main.py",
+    ],
 )
 async def test_dry_run_rejects_unsafe_file_paths(file_path: str) -> None:
     source = """
@@ -742,7 +752,7 @@ async def run(parameters):
             encoding=FileEncoding.BASE64,
             mime_type="text/x-python",
         ),
-        ScriptFileCreate(
+        ScriptFileCreate.model_construct(
             path=file_path,
             content=_b64("x = 1\n"),
             encoding=FileEncoding.BASE64,

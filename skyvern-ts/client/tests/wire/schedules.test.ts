@@ -102,7 +102,7 @@ describe("Schedules", () => {
         };
         server
             .mockEndpoint()
-            .get("/v1/workflows/workflow_permanent_id/schedules")
+            .get("/v1/agents/workflow_permanent_id/schedules")
             .respondWith()
             .statusCode(200)
             .jsonBody(rawResponseBody)
@@ -139,7 +139,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .get("/v1/workflows/workflow_permanent_id/schedules")
+            .get("/v1/agents/workflow_permanent_id/schedules")
             .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)
@@ -174,7 +174,7 @@ describe("Schedules", () => {
         };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/schedules")
+            .post("/v1/agents/workflow_permanent_id/schedules")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(200)
@@ -214,7 +214,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/schedules")
+            .post("/v1/agents/workflow_permanent_id/schedules")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(422)
@@ -253,7 +253,7 @@ describe("Schedules", () => {
         };
         server
             .mockEndpoint()
-            .get("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id")
+            .get("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id")
             .respondWith()
             .statusCode(200)
             .jsonBody(rawResponseBody)
@@ -289,7 +289,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .get("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id")
+            .get("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id")
             .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)
@@ -324,7 +324,7 @@ describe("Schedules", () => {
         };
         server
             .mockEndpoint()
-            .put("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id")
+            .put("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(200)
@@ -364,7 +364,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .put("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id")
+            .put("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(422)
@@ -386,7 +386,7 @@ describe("Schedules", () => {
         const rawResponseBody = { ok: true };
         server
             .mockEndpoint()
-            .delete("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id")
+            .delete("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id")
             .respondWith()
             .statusCode(200)
             .jsonBody(rawResponseBody)
@@ -405,7 +405,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .delete("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id")
+            .delete("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id")
             .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)
@@ -440,7 +440,7 @@ describe("Schedules", () => {
         };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id/enable")
+            .post("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id/enable")
             .respondWith()
             .statusCode(200)
             .jsonBody(rawResponseBody)
@@ -476,7 +476,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id/enable")
+            .post("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id/enable")
             .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)
@@ -511,7 +511,7 @@ describe("Schedules", () => {
         };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id/disable")
+            .post("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id/disable")
             .respondWith()
             .statusCode(200)
             .jsonBody(rawResponseBody)
@@ -547,7 +547,7 @@ describe("Schedules", () => {
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
-            .post("/v1/workflows/workflow_permanent_id/schedules/workflow_schedule_id/disable")
+            .post("/v1/agents/workflow_permanent_id/schedules/workflow_schedule_id/disable")
             .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)

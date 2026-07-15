@@ -31,6 +31,7 @@ interface StartSettings {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  pinSavedSessionIp: boolean;
   browserProfileId: string | null;
   browserProfileKey: string | null;
   model: WorkflowModel | null;
@@ -66,6 +67,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         : ProxyLocation.Residential,
       persistBrowserSession: data.withWorkflowSettings
         ? data.persistBrowserSession
+        : false,
+      pinSavedSessionIp: data.withWorkflowSettings
+        ? data.pinSavedSessionIp
         : false,
       browserProfileId: data.withWorkflowSettings
         ? data.browserProfileId
@@ -233,14 +237,14 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         id="a"
         className="opacity-0"
       />
-      <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+      <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
         Start
         {loopParent ? (
-          <div className="workflow-editor-tip mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
-            <span className="workflow-editor-tip-icon rounded bg-slate-700 p-1 text-lg">
+          <div className="workflow-editor-tip mt-4 flex gap-3 rounded-md bg-muted p-3 normal-case tracking-normal">
+            <span className="workflow-editor-tip-icon rounded bg-muted p-1 text-lg dark:bg-slate-700">
               💡
             </span>
-            <div className="space-y-1 text-left font-normal text-slate-400">
+            <div className="space-y-1 text-left font-normal text-muted-foreground">
               {loopParent.data.loopKind === "while" ? (
                 <>
                   Use{" "}
@@ -258,7 +262,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
           </div>
         ) : null}
         {isInsideConditional && (
-          <div className="mt-4 rounded-md border border-dashed border-slate-500 p-4 text-center font-normal normal-case tracking-normal text-slate-300">
+          <div className="mt-4 rounded-md border border-dashed border-border p-4 text-center font-normal normal-case tracking-normal text-tertiary-foreground dark:border-slate-500">
             Start adding blocks to be executed for the selected condition
           </div>
         )}

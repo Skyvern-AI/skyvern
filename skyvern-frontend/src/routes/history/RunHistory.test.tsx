@@ -10,10 +10,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 
-import { TaskRunType } from "@/api/types";
+import { TaskRunType, TriggerType, type TaskRunListItem } from "@/api/types";
 import { RunHistory } from "./RunHistory";
 
-const workflowRun = {
+const workflowRun: TaskRunListItem = {
   task_run_id: "tr_1",
   task_run_type: TaskRunType.WorkflowRun,
   run_id: "wr_123",
@@ -25,6 +25,7 @@ const workflowRun = {
   workflow_permanent_id: "wpid_1",
   workflow_deleted: false,
   script_run: false,
+  trigger_type: null,
   searchable_text: "city Paris",
 };
 
@@ -32,6 +33,8 @@ const workflowRun = {
 // across renders (which would retrigger effects under test).
 const runsData = [workflowRun];
 const runsQueryResult = { data: runsData, isFetching: false };
+
+const { useRunsQuerySpy } = vi.hoisted(() => ({ useRunsQuerySpy: vi.fn() }));
 
 vi.mock("use-debounce", () => ({
   useDebounce: <T,>(value: T): [T] => [value],
@@ -42,12 +45,34 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => false,
 }));
 
+const runsQueryCalls: Array<Record<string, unknown>> = [];
+
 vi.mock("@/hooks/useRunsQuery", () => ({
-  useRunsQuery: () => runsQueryResult,
+  useRunsQuery: (props: Record<string, unknown>) => {
+    useRunsQuerySpy(props);
+    runsQueryCalls.push(props);
+    return runsQueryResult;
+  },
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
+}));
+
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => true,
+}));
+
+vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
+  useRunTagsBatchQuery: () => ({ data: {} }),
+}));
+
+vi.mock("@/routes/workflows/hooks/useTagKeysQuery", () => ({
+  useTagKeysQuery: () => ({ data: [] }),
+}));
+
+vi.mock("@/routes/workflows/hooks/useTagValuesQuery", () => ({
+  useTagValuesQuery: () => ({ data: new Map() }),
 }));
 
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
@@ -56,6 +81,40 @@ vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
 
 vi.mock("@/components/StatusFilterDropdown", () => ({
   StatusFilterDropdown: () => <div data-testid="status-filter" />,
+}));
+
+vi.mock("@/components/RunTypeFilterDropdown", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/RunTypeFilterDropdown")>();
+  return {
+    ...actual,
+    RunTypeFilterDropdown: ({
+      values,
+      onChange,
+    }: {
+      values: Array<string>;
+      onChange: (values: Array<string>) => void;
+    }) => (
+      <button
+        data-testid="run-type-filter"
+        onClick={() =>
+          onChange(
+            values.includes("agent")
+              ? values.filter((value) => value !== "agent")
+              : [...values, "agent"],
+          )
+        }
+      >
+        toggle-agent
+      </button>
+    ),
+  };
+});
+
+vi.mock("@/components/TriggerTypeBadge", () => ({
+  TriggerTypeBadge: ({ triggerType }: { triggerType: string }) => (
+    <span data-testid={`trigger-type-${triggerType}`}>{triggerType}</span>
+  ),
 }));
 
 vi.mock("@/components/onboarding/OnboardingEmptyState", () => ({
@@ -116,8 +175,41 @@ function activateSearch() {
 }
 
 afterEach(() => {
+  runsData.splice(0, runsData.length, workflowRun);
+  runsQueryCalls.length = 0;
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("RunHistory search highlighting", () => {
+  it("does not highlight the run id for a sub-3-char query", () => {
+    const { container } = renderRunHistory();
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: "12" },
+    });
+
+    expect(container.innerHTML).not.toContain("bg-blue-500/30");
+  });
+
+  it("highlights the run id once the query reaches 3 chars", () => {
+    const { container } = renderRunHistory();
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: "123" },
+    });
+
+    expect(container.innerHTML).toContain("bg-blue-500/30");
+  });
+
+  it("sends a trimmed search value to the runs query, not just a trimmed length check", () => {
+    renderRunHistory();
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: " 123" },
+    });
+
+    const calls = useRunsQuerySpy.mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { search?: string };
+    expect(lastCall.search).toBe("123");
+  });
 });
 
 describe("RunHistory inputs during filtering", () => {
@@ -142,5 +234,40 @@ describe("RunHistory inputs during filtering", () => {
 
     expect(await screen.findByText("Run Inputs")).toBeTruthy();
     expect(screen.getByText("Paris")).toBeTruthy();
+  });
+
+  it("renders the MCP trigger badge from persisted trigger_type", () => {
+    runsData.splice(0, runsData.length, {
+      ...workflowRun,
+      trigger_type: TriggerType.Mcp,
+    });
+
+    renderRunHistory();
+
+    expect(screen.getByTestId("trigger-type-mcp")).toBeTruthy();
+  });
+
+  it("expands the selected run-type group into raw run types for the runs query", () => {
+    renderRunHistory();
+
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual(
+      [],
+    );
+
+    fireEvent.click(screen.getByTestId("run-type-filter"));
+
+    // The curated Agent group expands to the engine-specific CUA run types.
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual([
+      TaskRunType.OpenaiCua,
+      TaskRunType.AnthropicCua,
+      TaskRunType.UiTars,
+      TaskRunType.YutoriNavigator,
+    ]);
+
+    fireEvent.click(screen.getByTestId("run-type-filter"));
+
+    expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual(
+      [],
+    );
   });
 });

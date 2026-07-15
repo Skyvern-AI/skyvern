@@ -22,6 +22,11 @@ import {
 } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
+import {
+  RunTypeFilterDropdown,
+  RunTypeGroup,
+  runTypeGroupToRunTypes,
+} from "@/components/RunTypeFilterDropdown";
 import { TriggerTypeBadge } from "@/components/TriggerTypeBadge";
 import {
   Pagination,
@@ -54,6 +59,7 @@ import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import {
@@ -72,6 +78,14 @@ import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingStat
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
+import { useRunTagsBatchQuery } from "@/routes/tasks/hooks/useRunTagsBatchQuery";
+import { useRunTagSuggestionsQuery } from "@/routes/tasks/hooks/useRunTagSuggestionsQuery";
+import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
+import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
+import { TagFilterControl } from "@/routes/workflows/components/tagging/TagFilterControl";
+import { useRunTagFilterParam } from "@/routes/workflows/hooks/useRunTagFilterParam";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
@@ -95,8 +109,34 @@ function parseStatusParam(raw: string | null): Array<Status> {
   return out;
 }
 
+const runTypeGroupValues = new Set<string>(Object.values(RunTypeGroup));
+
+function parseRunTypeParam(raw: string | null): Array<RunTypeGroup> {
+  if (!raw) {
+    return [];
+  }
+  const seen = new Set<RunTypeGroup>();
+  const out: Array<RunTypeGroup> = [];
+  for (const token of raw.split(",")) {
+    const trimmed = token.trim();
+    if (!runTypeGroupValues.has(trimmed)) {
+      continue;
+    }
+    const group = trimmed as RunTypeGroup;
+    if (seen.has(group)) {
+      continue;
+    }
+    seen.add(group);
+    out.push(group);
+  }
+  return out;
+}
+
 // Scheduled workflow runs carry a deterministic `wr_sched_<hash>` id prefix.
 function inferTriggerType(run: TaskRunListItem): TriggerType | null {
+  if (run.trigger_type) {
+    return run.trigger_type;
+  }
   if (
     run.task_run_type === TaskRunType.WorkflowRun &&
     run.run_id.startsWith("wr_sched_")
@@ -144,16 +184,41 @@ function RunHistory() {
     () => parseStatusParam(searchParams.get("status")),
     [searchParams],
   );
+  const runTypeGroups = useMemo(
+    () => parseRunTypeParam(searchParams.get("run_type")),
+    [searchParams],
+  );
+  const runTypeFilters = useMemo(
+    () => runTypeGroups.flatMap((group) => runTypeGroupToRunTypes[group]),
+    [runTypeGroups],
+  );
+  const { tagTerms, tagsParam, writeTagsParam } = useRunTagFilterParam(
+    searchParams,
+    setSearchParams,
+  );
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  // A stale ?tags= URL param would 403 the request when tagging is disabled.
+  const effectiveTagsParam = taggingEnabled ? tagsParam : undefined;
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
-  const effectiveSearch = workflowPermanentIdFilter || debouncedSearch;
+  // The /runs search_key requires min 3 chars (trigram index); shorter queries 422.
+  const trimmedSearch = debouncedSearch.trim();
+  const textSearch = trimmedSearch.length >= 3 ? trimmedSearch : "";
+  const effectiveSearch = workflowPermanentIdFilter || textSearch;
 
-  const { data: rawRuns, isFetching } = useRunsQuery({
+  const {
+    data: rawRuns,
+    isFetching,
+    isError,
+    refetch,
+  } = useRunsQuery({
     page,
     pageSize: itemsPerPage,
     statusFilters,
+    runTypeFilters,
     search: effectiveSearch,
+    tags: effectiveTagsParam,
   });
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
@@ -162,7 +227,9 @@ function RunHistory() {
     page: page + 1,
     pageSize: itemsPerPage,
     statusFilters,
+    runTypeFilters,
     search: effectiveSearch,
+    tags: effectiveTagsParam,
     enabled: rawRuns?.length === itemsPerPage,
   });
 
@@ -192,6 +259,35 @@ function RunHistory() {
 
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
+
+  const runIds = useMemo(() => (runs ?? []).map((r) => r.run_id), [runs]);
+  const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
+    enabled: taggingEnabled,
+  });
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
+  const tagDescriptions = useMemo(
+    () =>
+      new Map(
+        tagKeys.map((tagKey): [string, string | null] => [
+          tagKey.key,
+          tagKey.description,
+        ]),
+      ),
+    [tagKeys],
+  );
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
+  const { data: runTagSuggestions } = useRunTagSuggestionsQuery({
+    enabled: taggingEnabled,
+  });
+  const tagFilterKeys = useMemo(
+    () =>
+      (runTagSuggestions?.keys ?? []).map((key) => ({
+        key,
+        description: null,
+        workflow_count: 0,
+      })),
+    [runTagSuggestions?.keys],
+  );
 
   const { matchesParameter } = useKeywordSearch(debouncedSearch);
   const { expandedRows, toggleExpanded: toggleParametersExpanded } =
@@ -237,6 +333,26 @@ function RunHistory() {
       ));
     }
 
+    // Failed to load runs
+    if (isError) {
+      return (
+        <TableMessageRow colSpan={6}>
+          <div className="flex items-center justify-center gap-3">
+            <span>Failed to load runs.</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                refetch();
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        </TableMessageRow>
+      );
+    }
+
     // No runs found
     if (runs?.length === 0) {
       return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
@@ -251,6 +367,7 @@ function RunHistory() {
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
       const navPath = getRunNavigationPath(run, studioEnabled);
       const triggerType = inferTriggerType(run);
+      const runTags = runTagsMap[run.run_id];
 
       const titleContent =
         triggerType || run.script_run || run.workflow_deleted ? (
@@ -289,13 +406,23 @@ function RunHistory() {
             }}
           >
             <TableCell className="max-w-0 truncate" title={run.run_id}>
-              <HighlightText text={run.run_id} query={debouncedSearch} />
+              <HighlightText text={run.run_id} query={textSearch} />
             </TableCell>
             <TableCell
               className="max-w-0 truncate"
               title={run.title ?? undefined}
             >
-              {titleContent}
+              <div className="flex min-w-0 flex-col gap-1">
+                {titleContent}
+                {taggingEnabled && runTags && runTags.length > 0 ? (
+                  <TagChipList
+                    tags={runTags}
+                    descriptions={tagDescriptions}
+                    colors={tagColors}
+                    maxVisible={2}
+                  />
+                ) : null}
+              </div>
             </TableCell>
             <TableCell>
               {isKnownStatus(run.status) ? (
@@ -375,7 +502,9 @@ function RunHistory() {
 
   const hasActiveFilters =
     statusFilters.length > 0 ||
-    !!debouncedSearch ||
+    runTypeGroups.length > 0 ||
+    tagTerms.length > 0 ||
+    !!textSearch ||
     !!workflowPermanentIdFilter;
   const showOnboardingEmpty =
     !isFetching &&
@@ -445,19 +574,44 @@ function RunHistory() {
               disabled={!!workflowPermanentIdFilter}
               className="w-48 lg:w-72"
             />
-            <StatusFilterDropdown
-              values={statusFilters}
-              onChange={(filters) => {
-                const params = new URLSearchParams(searchParams);
-                if (filters.length === 0) {
-                  params.delete("status");
-                } else {
-                  params.set("status", filters.join(","));
-                }
-                params.set("page", "1");
-                setSearchParams(params, { replace: true });
-              }}
-            />
+            <div className="flex items-center gap-2">
+              <RunTypeFilterDropdown
+                values={runTypeGroups}
+                onChange={(groups) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (groups.length === 0) {
+                    params.delete("run_type");
+                  } else {
+                    params.set("run_type", groups.join(","));
+                  }
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
+              {taggingEnabled ? (
+                <TagFilterControl
+                  tagKeys={tagFilterKeys}
+                  labelSuggestions={runTagSuggestions?.labels}
+                  valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                  value={tagTerms}
+                  onChange={writeTagsParam}
+                  colors={tagColors}
+                />
+              ) : null}
+              <StatusFilterDropdown
+                values={statusFilters}
+                onChange={(filters) => {
+                  const params = new URLSearchParams(searchParams);
+                  if (filters.length === 0) {
+                    params.delete("status");
+                  } else {
+                    params.set("status", filters.join(","));
+                  }
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              />
+            </div>
           </div>
           <div className="overflow-hidden rounded-lg border border-border">
             <Table className="sm:table-fixed">

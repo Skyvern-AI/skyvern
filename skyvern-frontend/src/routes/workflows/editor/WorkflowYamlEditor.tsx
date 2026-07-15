@@ -51,29 +51,32 @@ function WorkflowYamlEditor({ variant = "fullscreen" }: Props) {
         }
       }}
     >
-      <div className="flex items-center justify-between gap-3 border-b border-slate-700 bg-slate-elevation2 px-4 py-2">
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-slate-elevation2 px-4 py-2">
         <div className="flex min-w-0 items-center gap-3">
-          <span className="truncate text-xs text-slate-500">
+          <span className="truncate text-xs text-muted-foreground dark:text-slate-500">
             Editing the workflow definition · switch to Visual to apply, then
             Save
           </span>
           {committing ? (
-            <span className="flex shrink-0 items-center gap-1.5 text-xs text-slate-400">
+            <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
               <ReloadIcon className="size-3 animate-spin" />
               Applying…
             </span>
           ) : null}
         </div>
-        <YamlModeToggle
-          mode="code"
-          onVisual={switchToVisual}
-          disabled={committing}
-        />
+        {/* The studio's pane variant hosts this toggle in the pane header. */}
+        {fullscreen ? (
+          <YamlModeToggle
+            mode="code"
+            onVisual={switchToVisual}
+            disabled={committing}
+          />
+        ) : null}
       </div>
       {error ? (
         <div
           role="alert"
-          className="border-b border-red-900/50 bg-red-950/60 px-4 py-2 text-sm text-red-200"
+          className="border-b border-red-300 bg-red-100 px-4 py-2 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/60 dark:text-red-200"
         >
           <strong className="font-semibold">Invalid YAML:</strong> {error}
         </div>

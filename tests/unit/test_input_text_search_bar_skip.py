@@ -95,6 +95,7 @@ def _mock_search_input() -> MagicMock:
     el.get_attr = AsyncMock(return_value=None)
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=True)
+    el.supports_text_input = AsyncMock(return_value=True)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
     el.is_auto_completion_input = AsyncMock(return_value=False)

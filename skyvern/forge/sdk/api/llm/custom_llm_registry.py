@@ -31,8 +31,15 @@ class CustomLLMRegistryEntry:
 _custom_llm_configs: dict[str, CustomLLMRegistryEntry] = {}
 
 
+CUSTOM_LLM_KEY_PREFIX = "CUSTOM_LLM_"
+
+
 def custom_llm_key(custom_llm_id: str) -> str:
-    return f"CUSTOM_LLM_{custom_llm_id}"
+    return f"{CUSTOM_LLM_KEY_PREFIX}{custom_llm_id}"
+
+
+def is_custom_llm_key(llm_key: str) -> bool:
+    return llm_key.startswith(CUSTOM_LLM_KEY_PREFIX)
 
 
 def custom_llm_model_name(custom_llm_id: str) -> str:
