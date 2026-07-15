@@ -154,6 +154,7 @@ from .tabs import (
     skyvern_tab_wait_for_new,
 )
 from .workflow import (
+    guard_definition_size,
     skyvern_workflow_cancel,
     skyvern_workflow_create,
     skyvern_workflow_delete,
@@ -479,7 +480,7 @@ mcp.tool(tags={"folder"}, annotations=_dest("Delete Folder"))(skyvern_folder_del
 
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool(tags={"workflow"}, annotations=_ro("List Workflows"))(size_capped(skyvern_workflow_list))
-mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow"))(size_capped(skyvern_workflow_get))
+mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow"))(size_capped(guard_definition_size(skyvern_workflow_get)))
 mcp.tool(tags={"workflow"}, annotations=_ro("List Workflow Runs"))(size_capped(skyvern_workflow_run_list))
 mcp.tool(tags={"workflow"}, annotations=_mut("Create Workflow"))(skyvern_workflow_create)
 mcp.tool(tags={"workflow"}, annotations=_mut("Update Workflow"))(skyvern_workflow_update)
