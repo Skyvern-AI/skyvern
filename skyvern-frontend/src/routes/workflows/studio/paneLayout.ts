@@ -11,6 +11,11 @@ export type { PaneWidths };
 // rest of the row.
 export const STUDIO_PANE_DEFAULT_WIDTH = 300;
 
+// The unpinned side pane of ANY two-pane row with a greedy pane opens at this
+// share, so the greedy pane keeps ~65% — mirrors the legacy split on the
+// factory defaults (editor+browser, browser+overview).
+export const STUDIO_TWO_PANE_SIDE_BASIS = "35%";
+
 // The browser is the best consumer of free space; the canvas takes over when
 // the browser is closed. With neither open, every open pane flexes equally.
 export function greedyPaneOf(
@@ -58,9 +63,14 @@ export function paneFlex(
   if (pinned !== undefined) {
     return `0 1 ${pinned}px`;
   }
-  // Without a greedy pane, unpinned panes share the free space equally.
-  return greedy === undefined
-    ? `1 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`
+  if (greedy === undefined) {
+    // Without a greedy pane, unpinned panes share the free space equally.
+    return `1 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`;
+  }
+  // Any two-pane row gives the unpinned side pane ~35% (the greedy pane keeps
+  // ~65%); 3+ panes keep the fixed default so the greedy pane isn't starved.
+  return panes.length === 2
+    ? `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`
     : `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`;
 }
 
