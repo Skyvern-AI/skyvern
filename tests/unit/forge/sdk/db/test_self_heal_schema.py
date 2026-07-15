@@ -54,7 +54,7 @@ def test_heal_migration_chains_from_current_head() -> None:
     heads = script.get_heads()
     assert len(heads) == 1
 
-    revision = script.get_revision("3b9d7a4c1e2f")
+    revision = script.get_revision("2b8e37d98d97")
     assert revision is not None
     # down_revision is re-pointed to main's head on every rebase (migration-rebase policy);
     # assert the parent resolves to a real revision instead of pinning a specific hash.
@@ -63,7 +63,7 @@ def test_heal_migration_chains_from_current_head() -> None:
     # The heal migration must be part of the single linear history, not pinned as the tip:
     # later migrations stack on top of it.
     ancestors = {rev.revision for rev in script.walk_revisions(base="base", head=heads[0])}
-    assert "3b9d7a4c1e2f" in ancestors
+    assert "2b8e37d98d97" in ancestors
 
 
 def _episode(
