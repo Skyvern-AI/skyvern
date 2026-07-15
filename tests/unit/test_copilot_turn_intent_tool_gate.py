@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentAuthority,
     TurnIntentMode,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 
 # Tokens that must never appear in any LLM-visible string emitted by an
 # authority gate. The previous prose path leaked all of these.
@@ -482,6 +483,22 @@ def test_get_run_results_routes_through_authority_dispatcher_but_request_policy_
     ctx = _ctx(intent, policy)
     assert _authority_tool_error(ctx, "get_run_results") is None
     assert ctx.blocker_signal is None
+
+
+def test_runtime_self_heal_origin_blocks_native_tool_calls() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+    ctx = _ctx(intent)
+    ctx.turn_origin = TurnOrigin.runtime_self_heal
+
+    payload = _authority_tool_error(ctx, "update_workflow")
+
+    assert payload is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "runtime_self_heal_native_tool_blocked"
+    assert ctx.blocker_signal.blocker_kind == "tool_error"
 
 
 @pytest.mark.parametrize(

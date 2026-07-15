@@ -122,6 +122,8 @@ def _episode_for_run(
     ("episodes", "expected"),
     [
         ([HealStatus.fired_completed, HealStatus.fired_failed], "healed"),
+        ([HealStatus.fired_unverified, HealStatus.fired_failed], "failed"),
+        ([HealStatus.fired_unverified], "unverified"),
         ([HealStatus.fired_unverified, HealStatus.skipped], "unverified"),
         ([HealStatus.fired_failed, HealStatus.skipped], "failed"),
         ([HealStatus.skipped], "skipped"),

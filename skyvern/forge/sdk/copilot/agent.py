@@ -193,6 +193,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     classify_turn_intent,
     turn_intent_defers_authoring_live_fill,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
     derive_response_kind,
@@ -3250,6 +3251,13 @@ async def _translate_to_agent_result(
 
     turn_intent = ctx.turn_intent if isinstance(ctx.turn_intent, TurnIntent) else None
     may_update_workflow = turn_intent is None or turn_intent.authority.may_update_workflow
+    if resp_type == "REPLACE_WORKFLOW" and ctx.turn_origin == TurnOrigin.runtime_self_heal:
+        LOG.warning("copilot suppressed inline REPLACE_WORKFLOW on runtime self-heal turn")
+        user_response = _with_inline_reject_note(
+            user_response,
+            "Runtime self-heal cannot update workflow definitions; retrying in read-only recovery mode.",
+        )
+        resp_type = "REPLY"
     if resp_type == "REPLACE_WORKFLOW" and turn_intent is not None and not turn_intent.authority.may_update_workflow:
         # A no-mutation turn (e.g. DIAGNOSE) must not stage a draft even via an inline REPLACE_WORKFLOW, which
         # bypasses the may_update_workflow=False authority enforced on the update_workflow tool. Downgrade to a
@@ -3825,6 +3833,88 @@ def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None
     return fallback_key
 
 
+async def _run_agent_loop_with_surface(
+    *,
+    ctx: Any,
+    stream: EventSourceStream,
+    chat_id: str,
+    user_message: str,
+    system_prompt: Callable[[object, object], str] | str,
+    model_name: str,
+    run_config: Any,
+    llm_key: str,
+    copilot_config: CopilotConfig,
+    native_tools: list[Any],
+    alias_map: dict[str, str],
+    overlays: dict[str, Any],
+    output_guardrails: list[Any],
+    allow_untested_retry: bool = False,
+) -> Any:
+    from agents import Agent
+    from agents.mcp import MCPServerManager
+
+    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
+    from skyvern.forge.sdk.copilot.enforcement import run_with_enforcement
+    from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+    from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
+
+    mcp_server = SkyvernOverlayMCPServer(
+        transport=skyvern_mcp,
+        overlays=overlays,
+        alias_map=alias_map,
+        allowlist=frozenset(alias_map.values()),
+        context_provider=lambda: ctx,
+    )
+    ctx.discovery_mcp_server = mcp_server
+    agent = Agent(
+        name="workflow-copilot",
+        instructions=system_prompt,
+        tools=native_tools,
+        mcp_servers=[mcp_server],
+        model=model_name,
+        output_guardrails=output_guardrails,
+    )
+    session = create_copilot_session(chat_id)
+    model_token = _copilot_model_name.set(model_name)
+    try:
+        async with MCPServerManager([mcp_server]) as manager:
+            agent.mcp_servers = list(manager.active_servers)
+            attempts = 2 if allow_untested_retry else 1
+            for attempt in range(attempts):
+                try:
+                    result = await run_with_enforcement(
+                        agent=agent,
+                        initial_input=user_message,
+                        ctx=ctx,
+                        stream=stream,
+                        max_turns=copilot_config.max_turns,
+                        hooks=CopilotRunHooks(ctx),
+                        run_config=run_config,
+                        session=session,
+                        copilot_config=copilot_config,
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        attempt + 1 < attempts
+                        and getattr(ctx, "last_workflow", None) is None
+                        and isinstance(exc, LiteLLMNotFoundError)
+                    ):
+                        LOG.warning("Retrying untested draft agent loop after model lookup failure")
+                        continue
+                    raise
+        LOG.info(
+            "Copilot agent model attempt succeeded",
+            workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+            llm_key=llm_key,
+        )
+        return result
+    finally:
+        _copilot_model_name.reset(model_token)
+        session.close()
+
+
 def _build_request_policy_clarification_result(
     policy: RequestPolicy,
     prior_global_llm_context: str | None,
@@ -4127,6 +4217,49 @@ def _build_copilot_output_guardrails(
         OutputGuardrailCls(
             guardrail_function=copilot_output_policy_guardrail,
             name="copilot_output_policy_guardrail",
+        )
+    ]
+
+
+def _build_self_heal_output_guardrails(
+    OutputGuardrailCls: Any,
+    GuardrailFunctionOutputCls: Any,
+) -> list[Any]:
+    # Self-heal final output is machine-consumed, not user-facing chat text.
+    # Chat output policy requires CopilotContext and fails closed in headless runs; self-heal only trips on mutate/ask-human.
+    def self_heal_output_guardrail(_context: Any, _agent: Any, agent_output: Any) -> Any:
+        try:
+            final_text = extract_final_text(agent_output)
+        except Exception:
+            final_text = _agent_output_to_text(agent_output)
+
+        action_data = parse_final_response(final_text)
+        response_type = str(action_data.get("type") or "REPLY").strip().upper()
+        if response_type not in COPILOT_RESPONSE_TYPES:
+            response_type = "REPLY"
+
+        raw_upper = final_text.upper()
+        replace_marker_present = "REPLACE_WORKFLOW" in raw_upper
+        user_response = action_data.get("user_response")
+        parse_failed = response_type == "REPLY" and (
+            str(user_response or "") == final_text or str(user_response or "") == "Done."
+        )
+        tripwire_triggered = response_type in {"REPLACE_WORKFLOW", "ASK_QUESTION"} or (
+            parse_failed and replace_marker_present
+        )
+
+        trace_data = {
+            "response_type": response_type,
+            "tripwire_triggered": tripwire_triggered,
+            "origin": "runtime_self_heal",
+        }
+        LOG.info("self-heal output guardrail verdict", **trace_data)
+        return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=tripwire_triggered)
+
+    return [
+        OutputGuardrailCls(
+            guardrail_function=self_heal_output_guardrail,
+            name="self_heal_output_guardrail",
         )
     ]
 
@@ -4513,7 +4646,6 @@ async def _run_copilot_turn_impl(
             MaxTurnsExceeded,
             OutputGuardrailTripwireTriggered,
         )
-        from agents.mcp import MCPServerManager
         from agents.run_context import RunContextWrapper
     except ModuleNotFoundError as e:
         if e.name == "agents":
@@ -4690,7 +4822,6 @@ async def _run_copilot_turn_impl(
             ctx=ctx,
         )
 
-    from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotBuiltUnverified,
         CopilotGoalSatisfied,
@@ -4698,12 +4829,8 @@ async def _run_copilot_turn_impl(
         CopilotTotalTimeoutError,
         CopilotUnrecoverableToolError,
         gate_decision_trace_fields,
-        run_with_enforcement,
     )
-    from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-    from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
     from skyvern.forge.sdk.copilot.tools import (
         NATIVE_TOOLS,
         _build_skyvern_mcp_overlays,
@@ -4806,62 +4933,22 @@ async def _run_copilot_turn_impl(
         attempt_run_config: Any,
         attempt_llm_key: str,
     ) -> RunResultStreaming:
-        mcp_server = SkyvernOverlayMCPServer(
-            transport=skyvern_mcp,
-            overlays=overlays,
+        return await _run_agent_loop_with_surface(
+            ctx=ctx,
+            stream=stream,
+            chat_id=chat_id,
+            user_message=user_message,
+            system_prompt=system_prompt,
+            model_name=attempt_model_name,
+            run_config=attempt_run_config,
+            llm_key=attempt_llm_key,
+            copilot_config=copilot_config,
+            native_tools=native_tools,
             alias_map=alias_map,
-            allowlist=frozenset(alias_map.values()),
-            context_provider=lambda: ctx,
-        )
-        # The discovery walker reaches the connected FastMCP client through
-        # ctx, without exposing private overlay state.
-        ctx.discovery_mcp_server = mcp_server
-        agent = Agent(
-            name="workflow-copilot",
-            instructions=system_prompt,
-            tools=native_tools,
-            mcp_servers=[mcp_server],
-            model=attempt_model_name,
+            overlays=overlays,
             output_guardrails=output_guardrails,
+            allow_untested_retry=ctx.allow_untested_workflow_draft,
         )
-        session = create_copilot_session(chat_id)
-        model_token = _copilot_model_name.set(attempt_model_name)
-        try:
-            async with MCPServerManager([mcp_server]) as manager:
-                agent.mcp_servers = list(manager.active_servers)
-                attempts = 2 if ctx.allow_untested_workflow_draft else 1
-                for attempt in range(attempts):
-                    try:
-                        result = await run_with_enforcement(
-                            agent=agent,
-                            initial_input=user_message,
-                            ctx=ctx,
-                            stream=stream,
-                            max_turns=copilot_config.max_turns,
-                            hooks=CopilotRunHooks(ctx),
-                            run_config=attempt_run_config,
-                            session=session,
-                            copilot_config=copilot_config,
-                        )
-                        break
-                    except Exception as exc:
-                        if (
-                            attempt + 1 < attempts
-                            and ctx.last_workflow is None
-                            and isinstance(exc, LiteLLMNotFoundError)
-                        ):
-                            LOG.warning("Retrying untested draft agent loop after model lookup failure")
-                            continue
-                        raise
-            LOG.info(
-                "Copilot agent model attempt succeeded",
-                workflow_permanent_id=chat_request.workflow_permanent_id,
-                llm_key=attempt_llm_key,
-            )
-            return result
-        finally:
-            _copilot_model_name.reset(model_token)
-            session.close()
 
     try:
         with trace_context:

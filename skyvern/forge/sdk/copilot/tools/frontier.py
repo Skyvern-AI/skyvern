@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
@@ -1193,10 +1194,7 @@ async def _workflow_with_runtime_frontier_starter_url_seed(
 
     current_page_url: str | None = None
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if browser_state is not None:
             page = await browser_state.get_working_page()
             # Playwright Page.url is exposed as a dynamic property at this boundary.

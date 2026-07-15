@@ -152,10 +152,10 @@ def resolve_block_outcome(
     statuses = {episode.status for episode in episodes}
     if HealStatus.fired_completed in statuses:
         return "healed"
-    if HealStatus.fired_unverified in statuses:
-        return "unverified"
     if HealStatus.fired_failed in statuses:
         return "failed"
+    if HealStatus.fired_unverified in statuses:
+        return "unverified"
     if HealStatus.skipped in statuses:
         return "skipped"
     return "none"

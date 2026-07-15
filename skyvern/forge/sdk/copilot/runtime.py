@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
     from skyvern.forge.sdk.copilot.turn_ownership import GatePrecedenceConflictEvent, TurnClaimant, TurnOwnership
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -242,6 +243,7 @@ class AgentContext:
     turn_origin: TurnOrigin = TurnOrigin.interactive
     injected_browser_state: BrowserState | None = None
     heal_workflow_run_id: str | None = None
+    turn_intent: TurnIntent | None = None
     # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
@@ -648,6 +650,33 @@ async def _resolve_self_heal_browser_state(ctx: AgentContext) -> tuple[str, Brow
     return session_id, browser_state, page
 
 
+async def resolve_browser_state_for_context(
+    ctx: AgentContext,
+    *,
+    session_id: str | None = None,
+) -> BrowserState | None:
+    resolved_session_id = session_id if session_id is not None else ctx.browser_session_id
+    if not resolved_session_id:
+        return None
+    if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
+        try:
+            _resolved_session_id, browser_state, _ = await _resolve_self_heal_browser_state(ctx)
+            if _resolved_session_id != resolved_session_id:
+                LOG.info(
+                    "Resolved self-heal browser session id differs from requested",
+                    requested_session_id=resolved_session_id,
+                    resolved_session_id=_resolved_session_id,
+                    organization_id=ctx.organization_id,
+                )
+            return browser_state
+        except HealAdoptionFailed:
+            return None
+    return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+        session_id=resolved_session_id,
+        organization_id=ctx.organization_id,
+    )
+
+
 @asynccontextmanager
 async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
@@ -684,10 +713,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         ctx.browser_session_id = browser_session_id
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
     else:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
         if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
             # Keep the session id out of the raised message -- it can propagate
             # to LLM- or user-visible output -- but log it for operators.
@@ -726,6 +752,12 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             # new SkyvernBrowser's pages[-1] fallback.
             state._active_page = working_page
         register_copilot_session(browser_session_id, state)
+        if is_self_heal_session_id(browser_session_id):
+            LOG.info(
+                "registered self-heal browser session",
+                session_id=browser_session_id,
+                organization_id=ctx.organization_id,
+            )
         try:
             async with scoped_session(state):
                 yield
@@ -737,6 +769,8 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             else:
                 ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
             unregister_copilot_session(browser_session_id)
+            if is_self_heal_session_id(browser_session_id):
+                LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:
         reset_api_key_override(override_token)
 
