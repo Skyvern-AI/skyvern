@@ -144,6 +144,7 @@ class _Ctx:
         self.synthesized_goal_complete_landed = False
         self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
+        self.scout_observed_terminal_criterion_ids: set[str] = set()
         self.scout_observation_contract: object | None = None
         self.flow_evidence: list[dict[str, object]] = []
         self.copilot_config: CopilotConfig | None = None
@@ -2459,6 +2460,101 @@ class TestScoutOutputCoverageGate:
         ctx = self._authoring_ctx(registered)
         assert uncovered_requested_output_paths(ctx) == set()
         assert synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_independent_run_evidence_is_exempt_while_runtime_output_stays_gated(self) -> None:
+        independent = CompletionCriterion(
+            id="output.login_gate_present",
+            outcome="whether a login gate blocked the target is recorded",
+            output_path="output.login_gate_present",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_independent_run_evidence_is_exempt_from_repair_context(self) -> None:
+        independent = CompletionCriterion(
+            id="output.login_gate_present",
+            outcome="whether a login gate blocked the target is recorded",
+            output_path="output.login_gate_present",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["login_gate_present", "document_name"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+
+    @pytest.mark.parametrize(
+        "evidence_source",
+        ["registered_output_parameter", "registered_artifact_content"],
+    )
+    def test_registered_post_run_evidence_remains_uncovered_from_repair_context(
+        self,
+        evidence_source: str,
+    ) -> None:
+        registered = CompletionCriterion(
+            id="output.confirmation_number",
+            outcome="the confirmation number is registered after the run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source=evidence_source,
+        )
+        ctx = self._authoring_ctx(registered)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["confirmation_number"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.confirmation_number"}
+
+    @pytest.mark.parametrize(
+        "evidence_source",
+        ["registered_output_parameter", "registered_artifact_content"],
+    )
+    def test_registered_post_run_evidence_stays_gated_when_independent_evidence_uses_same_repair_path(
+        self,
+        evidence_source: str,
+    ) -> None:
+        independent = CompletionCriterion(
+            id="independent_confirmation_number",
+            outcome="the confirmation number is confirmed by an independent run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        registered = CompletionCriterion(
+            id="registered_confirmation_number",
+            outcome="the confirmation number is registered after the run",
+            output_path="output.confirmation_number",
+            requested_output_evidence_source=evidence_source,
+        )
+        ctx = self._authoring_ctx(independent, registered)
+        ctx.last_code_authoring_repair_context = CodeAuthoringRepairContext(
+            block_label="extract_order",
+            reason_code="metadata_reject",
+            required_goal_value_paths=["confirmation_number"],
+        )
+
+        assert uncovered_requested_output_paths(ctx) == {"output.confirmation_number"}
+
+    def test_runtime_output_stays_gated_when_independent_evidence_uses_same_path(self) -> None:
+        independent = CompletionCriterion(
+            id="independent_document_name",
+            outcome="the document name is confirmed by an independent run",
+            output_path="output.document_name",
+            requested_output_evidence_source="independent_run_evidence",
+        )
+        runtime = _criterion("output.document_name", "the order status document name is captured")
+        ctx = self._authoring_ctx(independent, runtime)
+
+        assert uncovered_requested_output_paths(ctx) == {"output.document_name"}
+        assert synthesized_trajectory_is_goal_complete(ctx) is False
 
     def test_runtime_output_stays_gated_alongside_exempt_source(self) -> None:
         registered = CompletionCriterion(

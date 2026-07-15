@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource,
@@ -283,6 +284,36 @@ class TestExfiltrationChannelEvents:
         assert channel._network_activity_flush_task is None
         await asyncio.sleep(0.1)
         assert len(events) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_survives_closed_page_during_undecorate(self) -> None:
+        """SKY-12366: a closed browser target must not crash channel teardown.
+
+        In production the browser target churns mid-recording (take-control toggles,
+        navigations, bot-detection pages), so when stop() calls undecorate() on a page
+        whose target is already gone, page.add_init_script raises TargetClosedError.
+        That must be swallowed: otherwise it propagates out of stop() -> handle_data ->
+        the message-channel loop and tears down the whole recording pipeline, which is
+        what dropped users' clicks/typing and produced empty workflows.
+        """
+        channel, _ = _make_channel()
+
+        closed_page = _make_page(url="https://example.com")
+        closed_page.add_init_script = AsyncMock(
+            side_effect=TargetClosedError("Page.add_init_script: Target page, context or browser has been closed")
+        )
+
+        browser_context = MagicMock()
+        browser_context.pages = [closed_page]
+        channel.browser_context = browser_context
+
+        # Must not raise: TargetClosedError from undecorate() would otherwise escape
+        # stop() -> handle_data -> the message-channel loop.
+        result = await channel.stop()
+
+        assert result is channel
+        # The undecorate path genuinely ran and hit the closed-target error.
+        closed_page.add_init_script.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_exfiltrate_rearms_existing_page_without_duplicate_listeners(self) -> None:

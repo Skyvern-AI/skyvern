@@ -6,6 +6,7 @@ Session resolution and output formatting are caller responsibilities.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import GuardError
 
@@ -563,10 +564,19 @@ _ROLE_TO_TAG: dict[str, str] = {
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
+_DOMUTILS_INTERACTABILITY_READY_JS = r"""
+() => typeof isInteractable === "function" && typeof getHoverStylesMap === "function" && typeof buildTreeFromBody === "function"
+"""
+
+# getHoverStylesMap() can await cross-origin stylesheet fetches with no abort signal; bound the
+# scan so main-page observe falls back to a11y and selected-frame observe raises a typed error.
+_DOM_SCAN_TIMEOUT_SECONDS = 30.0
+
 _OBSERVE_INTERACTABLES_JS = r"""
-({ scopeSelector, includeValues }) => {
+async ({ scopeSelector, includeValues }) => {
   const root = scopeSelector ? document.querySelector(scopeSelector) : document.body;
   if (!root) return [];
+  let hoverStylesMap;
 
   const esc = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"));
   const classes = (element) => (element.className || "").toString();
@@ -622,12 +632,6 @@ _OBSERVE_INTERACTABLES_JS = r"""
     }
     return parts.join(" > ");
   };
-  const visible = (element) => {
-    if (element.tagName.toLowerCase() === "option") return element.parentElement ? visible(element.parentElement) : false;
-    const style = window.getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    return !element.hidden && element.getAttribute("aria-hidden") !== "true" && style?.display !== "none" && style?.visibility !== "hidden" && style?.visibility !== "collapse" && rect.width > 0 && rect.height > 0;
-  };
   const explicitRole = (element) => (element.getAttribute("role") || "").toLowerCase();
   const nativeRole = (element) => {
     const tag = element.tagName.toLowerCase();
@@ -639,7 +643,6 @@ _OBSERVE_INTERACTABLES_JS = r"""
     if (tag !== "input") return "";
     return { checkbox: "checkbox", radio: "radio", range: "slider", search: "searchbox" }[type] || "textbox";
   };
-  const widgetRoles = new Set(["button", "checkbox", "combobox", "link", "listbox", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "radio", "searchbox", "slider", "spinbutton", "switch", "tab", "textbox", "treeitem"]);
   const pointer = (element) => window.getComputedStyle(element)?.cursor === "pointer";
   const staticClick = (element) => element.hasAttribute("onclick") || typeof element.onclick === "function" || element.hasAttribute("jsaction");
   const frameworkClick = (element) => {
@@ -649,10 +652,6 @@ _OBSERVE_INTERACTABLES_JS = r"""
     } catch (_) {
       return false;
     }
-  };
-  const knownClass = (element) => {
-    const className = classes(element);
-    return className.includes("dropdown-item") || className.includes("ui-menu-item") || className.includes("pac-item") || className.includes("rddlItem") || className === "option";
   };
   const ancestorMatching = (element, predicate) => {
     for (let current = element.parentElement, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
@@ -672,25 +671,48 @@ _OBSERVE_INTERACTABLES_JS = r"""
   });
   const optionLike = (element) => Boolean(text(element) && optionContainer(element) && interactiveAncestor(element));
   const roleFor = (element) => explicitRole(element) || nativeRole(element) || (optionLike(element) ? "option" : "button");
-  const candidate = (element) => {
-    if (!visible(element) || (window.getComputedStyle(element)?.pointerEvents === "none" && !element.disabled)) return false;
-    const tag = element.tagName.toLowerCase();
-    return Boolean(nativeRole(element) || widgetRoles.has(explicitRole(element)) || staticClick(element) || frameworkClick(element) || knownClass(element) || pointer(element) || (tag === "div" && element.getAttribute("tabindex") === "0") || optionLike(element));
-  };
+  // The bare-option overlay must never resurface an element the production predicate rejected
+  // for being invisible, hidden, or inert — a hidden input surfaced here would leak its value
+  // through the name fallback.
+  const overlayEligible = (element) =>
+    isElementVisible(element) &&
+    !isHidden(element) &&
+    !isScriptOrStyle(element) &&
+    !(getElementComputedStyle(element)?.pointerEvents === "none" && !element.disabled && !isHoverOnlyElement(element));
+  // Overlay: bare options inside an interactive option container are driver-discoverable even
+  // though the production predicate ignores them. "Bare" is strict: anything with a native or
+  // explicit role (or a frame-family tag) gets production's FULL verdict, including its later
+  // vetoes (disabled-select options, frame exclusions) — the overlay never overrides those.
+  const overlayVetoedTags = new Set(["html", "iframe", "frame", "frameset"]);
+  const bareElement = (element) => !overlayVetoedTags.has(element.tagName.toLowerCase()) && !nativeRole(element) && !explicitRole(element);
+  const candidate = (element) => isInteractable(element, hoverStylesMap) || (bareElement(element) && overlayEligible(element) && optionLike(element));
 
-  // querySelectorAll excludes the root itself — a scoped observe must still surface the scoped element.
-  return (scopeSelector ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*")))
-    .filter(candidate)
-    .map((element) => {
-      const tag = element.tagName.toLowerCase();
-      const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
-      if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
-        item.value = element.value || element.getAttribute("value") || "";
-      }
-      if (tag === "select") item.options = Array.from(element.options).map((option) => text(option));
-      return item;
-    })
-    .filter((item) => item.name || item.role);
+  // A later production scrape must compute hover styles at ITS OWN time: cache ownership is
+  // snapshotted in the same evaluation and restored in finally (identity-guarded). Ceiling:
+  // two FIRST-TIME builds interleaving is last-writer-wins inside getHoverStylesMap, so the
+  // loser costs one spare recompute — never a stale cache.
+  const hadHoverCache = Boolean(window.globalHoverStylesMap);
+  try {
+    hoverStylesMap = await getHoverStylesMap();
+    // querySelectorAll excludes the root itself — a scoped observe must still surface the scoped element.
+    // The scan deliberately stays light-DOM-only; shadow roots are not traversed.
+    return (scopeSelector ? [root, ...root.querySelectorAll("*")] : Array.from(root.querySelectorAll("*")))
+      .filter(candidate)
+      .map((element) => {
+        const tag = element.tagName.toLowerCase();
+        const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
+        if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
+          item.value = element.value || element.getAttribute("value") || "";
+        }
+        if (tag === "select") item.options = Array.from(element.options).map((option) => text(option));
+        return item;
+      })
+      .filter((item) => item.name || item.role);
+  } finally {
+    if (!hadHoverCache && window.globalHoverStylesMap === hoverStylesMap) {
+      window.globalHoverStylesMap = undefined;
+    }
+  }
 }
 """
 
@@ -839,6 +861,16 @@ class ObservedElement:
     needs_disambiguation: bool = False
 
 
+class ObserveFrameError(RuntimeError):
+    """Failure to evaluate an observe snapshot inside the selected frame."""
+
+    def __init__(self, frame_name: str, frame_url: str, cause: Exception) -> None:
+        self.frame_name = frame_name
+        self.frame_url = frame_url
+        frame_id = frame_name or frame_url or "<unnamed>"
+        super().__init__(f"Failed to evaluate observe in frame {frame_id!r}: {cause}")
+
+
 @dataclass
 class ObserveResult:
     url: str
@@ -876,16 +908,26 @@ async def _get_dom_observe_elements(
     page: Any,
     selector: str | None = None,
     include_values: bool = False,
+    *,
+    frame_name: str | None = None,
+    frame_url: str | None = None,
 ) -> list[dict[str, Any]]:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
+        if frame_name is not None:
+            raise ObserveFrameError(frame_name, frame_url or "", RuntimeError("frame does not support evaluate"))
         return []
     try:
-        result = await evaluate(
-            _OBSERVE_INTERACTABLES_JS,
-            {"scopeSelector": selector, "includeValues": include_values},
-        )
-    except Exception:
+        async with asyncio.timeout(_DOM_SCAN_TIMEOUT_SECONDS):
+            if await evaluate(_DOMUTILS_INTERACTABILITY_READY_JS) is not True:
+                await evaluate(JS_FUNCTION_DEFS)
+            result = await evaluate(
+                _OBSERVE_INTERACTABLES_JS,
+                {"scopeSelector": selector, "includeValues": include_values},
+            )
+    except Exception as exc:
+        if frame_name is not None:
+            raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
         return []
     if not isinstance(result, list):
         return []
@@ -960,17 +1002,51 @@ async def do_observe(
     # Execute-step params arrive as untyped JSON; a string like "false" must not
     # enable value capture — the opt-in counts only as a literal boolean True.
     include_values = include_values is True
-    accessibility = getattr(page, "accessibility", None)
-    if selector and accessibility is not None:
-        element_handle = await page.locator(selector).first.element_handle()
-        snapshot = await accessibility.snapshot(root=element_handle)
-    elif accessibility is not None:
-        snapshot = await accessibility.snapshot()
-    else:
+    working_frame = getattr(page, "_working_frame", None)
+    if working_frame is not None:
+        # A popup or tab change can make get_page() resolve a different page than the
+        # one the selected frame belongs to — observing that frame would report the
+        # wrong document as if it were the active page.
+        owner = getattr(working_frame, "page", None)
+        raw_page = getattr(page, "page", page)
+        if owner is not None and owner is not raw_page:
+            raise ObserveFrameError(
+                working_frame.name,
+                working_frame.url,
+                RuntimeError("frame belongs to a different page or tab"),
+            )
+        try:
+            detached = working_frame.is_detached()
+        except AttributeError:
+            detached = False
+        if detached:
+            raise ObserveFrameError(
+                working_frame.name,
+                working_frame.url,
+                RuntimeError("frame is detached"),
+            )
+    observe_target = working_frame if working_frame is not None else page
+    if working_frame is not None:
+        # Legacy page accessibility iframe roots are unreliable; DOM-only avoids cross-document merges.
         snapshot = None
+    else:
+        accessibility = getattr(page, "accessibility", None)
+        if selector and accessibility is not None:
+            element_handle = await page.locator(selector).first.element_handle()
+            snapshot = await accessibility.snapshot(root=element_handle)
+        elif accessibility is not None:
+            snapshot = await accessibility.snapshot()
+        else:
+            snapshot = None
 
     all_elements = _flatten_a11y_tree(snapshot)
-    dom_elements = await _get_dom_observe_elements(page, selector, include_values)
+    dom_elements = await _get_dom_observe_elements(
+        observe_target,
+        selector,
+        include_values,
+        frame_name=working_frame.name if working_frame is not None else None,
+        frame_url=working_frame.url if working_frame is not None else None,
+    )
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
@@ -1023,9 +1099,17 @@ async def do_observe(
             )
         )
 
+    if working_frame is not None:
+        try:
+            title = await working_frame.title()
+        except Exception as exc:
+            raise ObserveFrameError(working_frame.name, working_frame.url, exc) from exc
+    else:
+        title = await page.title()
+
     return ObserveResult(
-        url=page.url,
-        title=await page.title(),
+        url=working_frame.url if working_frame is not None else page.url,
+        title=title,
         elements=observed,
         element_count=len(observed),
         total_on_page=total,
@@ -1181,6 +1265,10 @@ async def do_execute(
             wall_ms = int((time.monotonic() - t0) * 1000)
             error_payload: str | dict[str, Any] = e.error if isinstance(e, ToolStepError) else str(e)
             results.append(StepResult(step=i, tool=step.tool, ok=False, wall_ms=wall_ms, error=error_payload))
+            if step.tool == "observe":
+                # A failed observe means the document may have been replaced; refs from
+                # an earlier observe in this batch must not survive it.
+                ref_map = {}
             if step.tool == "navigate":
                 nav_failed = True
             if stop_on_error:

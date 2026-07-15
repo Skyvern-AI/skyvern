@@ -93,13 +93,13 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
 
   return (
     <div
-      className="relative z-10 w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
+      className="relative z-10 w-[25rem] rounded-xl border border-border bg-background p-5 shadow-xl"
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
       <div className="space-y-4">
         <header>
           <h1 className="text-lg">Inputs</h1>
-          <span className="text-sm text-slate-400">
+          <span className="text-sm text-muted-foreground">
             Create placeholder values that you can link in nodes. You will be
             prompted to fill them in before running your agent.
           </span>
@@ -141,11 +141,11 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         </Tooltip>
                       </TooltipProvider>
                       {parameter.parameterType === "workflow" ? (
-                        <span className="shrink-0 text-sm text-slate-400">
+                        <span className="shrink-0 text-sm text-muted-foreground">
                           {getLabelForWorkflowParameterType(parameter.dataType)}
                         </span>
                       ) : (
-                        <span className="shrink-0 text-sm text-slate-400">
+                        <span className="shrink-0 text-sm text-muted-foreground">
                           {parameter.parameterType === "onepassword" ||
                           parameter.parameterType === "secret" ||
                           parameter.parameterType === "creditCardData"
@@ -221,7 +221,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           }}
         >
           {operationPanelState.operation === "add" && (
-            <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 px-2 shadow-xl">
+            <div className="w-80 rounded-xl border border-border bg-background p-5 px-2 shadow-xl">
               <WorkflowParameterEditPanel
                 type={operationPanelState.type}
                 onSave={(parameter) => {
@@ -245,7 +245,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           )}
           {operationPanelState.operation === "edit" &&
             operationPanelState.parameter && (
-              <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 px-2 shadow-xl">
+              <div className="w-80 rounded-xl border border-border bg-background p-5 px-2 shadow-xl">
                 <WorkflowParameterEditPanel
                   key={operationPanelState.parameter?.key}
                   type={operationPanelState.type}

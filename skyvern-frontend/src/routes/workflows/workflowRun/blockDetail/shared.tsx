@@ -78,14 +78,14 @@ function StatusPill({ status }: { status: Status | null }) {
   }
   if (isRunning) {
     return (
-      <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-2 py-0.5 text-xs text-sky-300">
+      <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-2 py-0.5 text-xs text-sky-700 dark:text-sky-300">
         <ReloadIcon className="size-3.5 animate-spin" />
         <span>Running</span>
       </span>
     );
   }
   return (
-    <span className="inline-flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-xs capitalize text-slate-300">
+    <span className="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5 text-xs capitalize text-tertiary-foreground dark:bg-slate-700">
       {status}
     </span>
   );
@@ -137,21 +137,21 @@ function BlockDetailHeader({
       : null;
 
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1">
+    <div className="border-b border-border bg-slate-elevation1">
       <div
         data-slot="block-detail-header-primary"
         className="flex items-center gap-2 px-3 py-2"
       >
         <WorkflowBlockIcon
           workflowBlockType={block.block_type}
-          className="size-4 shrink-0 text-slate-300"
+          className="size-4 shrink-0 text-tertiary-foreground"
         />
-        <span className="min-w-0 truncate text-sm font-semibold text-slate-100">
+        <span className="min-w-0 truncate text-sm font-semibold text-foreground">
           {workflowBlockTitle[block.block_type]}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-2">
           {duration && (
-            <span className="text-[10px] tabular-nums text-slate-500">
+            <span className="text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
               {duration}
             </span>
           )}
@@ -160,34 +160,36 @@ function BlockDetailHeader({
       </div>
       <div
         data-slot="block-detail-header-meta"
-        className="flex min-w-0 items-center gap-1.5 px-3 pb-2 text-[11px] text-slate-500"
+        className="flex min-w-0 items-center gap-1.5 px-3 pb-2 text-[11px] text-muted-foreground dark:text-slate-500"
       >
         {block.label && (
           <>
             <TruncatedWithTooltip
               full={block.label}
-              className="max-w-[12rem] text-slate-400"
+              className="max-w-[12rem] text-muted-foreground"
             />
             <span className="shrink-0 text-slate-600">·</span>
           </>
         )}
         <TruncatedWithTooltip
           full={block.workflow_run_block_id}
-          className="max-w-[11rem] font-mono text-[10px] text-slate-500"
+          className="max-w-[11rem] font-mono text-[10px] text-muted-foreground dark:text-slate-500"
         />
         {iterationLabel && (
-          <span className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-tertiary-foreground">
             {iterationLabel}
           </span>
         )}
       </div>
       {currentValuePreview && (
-        <div className="flex min-w-0 items-center gap-2 border-t border-slate-700/50 px-3 py-1.5 text-[11px] duration-200 animate-in fade-in slide-in-from-top-1">
-          <span className="shrink-0 text-slate-500">Iterated value:</span>
+        <div className="flex min-w-0 items-center gap-2 border-t border-border/50 px-3 py-1.5 text-[11px] duration-200 animate-in fade-in slide-in-from-top-1">
+          <span className="shrink-0 text-muted-foreground dark:text-slate-500">
+            Iterated value:
+          </span>
           <TooltipProvider delayDuration={300}>
             <Tooltip>
               <TooltipTrigger asChild>
-                <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-slate-300">
+                <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-tertiary-foreground">
                   {currentValuePreview}
                 </code>
               </TooltipTrigger>
@@ -202,8 +204,10 @@ function BlockDetailHeader({
         </div>
       )}
       {block.description && (
-        <div className="border-t border-slate-700/50 px-3 py-2 duration-200 animate-in fade-in slide-in-from-top-1">
-          <div className="text-xs text-slate-400">{block.description}</div>
+        <div className="border-t border-border/50 px-3 py-2 duration-200 animate-in fade-in slide-in-from-top-1">
+          <div className="text-xs text-muted-foreground">
+            {block.description}
+          </div>
         </div>
       )}
     </div>
@@ -212,7 +216,7 @@ function BlockDetailHeader({
 
 function BlockDetailHeaderSkeleton() {
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1">
+    <div className="border-b border-border bg-slate-elevation1">
       <div className="flex items-center gap-2 px-3 py-2">
         <Skeleton className="size-4 shrink-0 rounded" />
         <Skeleton className="h-4 w-24 rounded" />
@@ -245,10 +249,10 @@ function Section({
         className,
       )}
     >
-      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+      <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground dark:text-slate-500">
         {title}
       </div>
-      <div className="text-sm text-slate-300">{children}</div>
+      <div className="text-sm text-tertiary-foreground">{children}</div>
     </div>
   );
 }
@@ -282,7 +286,7 @@ function CodeBlock({
   if (copyValue !== undefined) {
     return (
       <div className={cn("group relative", className)}>
-        <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 pr-10 font-mono text-xs text-slate-200">
+        <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 pr-10 font-mono text-xs text-foreground dark:text-slate-200">
           {children}
         </pre>
         <div className="absolute right-1 top-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
@@ -294,7 +298,7 @@ function CodeBlock({
   return (
     <pre
       className={cn(
-        "overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 font-mono text-xs text-slate-200",
+        "overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 font-mono text-xs text-foreground dark:text-slate-200",
         className,
       )}
     >
@@ -311,7 +315,7 @@ function JsonView({ value }: { value: unknown }) {
 function GoalText({ text }: { text: string | null | undefined }) {
   if (!text) return null;
   return (
-    <div className="whitespace-pre-wrap text-sm leading-relaxed text-slate-300">
+    <div className="whitespace-pre-wrap text-sm leading-relaxed text-tertiary-foreground">
       {text}
     </div>
   );

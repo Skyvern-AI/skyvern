@@ -68,6 +68,7 @@ REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
         "output.downloaded_file_artifact_ids",
     }
 )
+_LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH = "output.downloaded_files"
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -215,6 +216,8 @@ _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "val
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
 _REQUESTED_OUTPUT_EVIDENCE_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputEvidenceSource))
+RequestedOutputPathMintSource = Literal["classifier_default"]
+REQUESTED_OUTPUT_PATH_MINT_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputPathMintSource))
 
 _OUTPUT_INTENT_RE = re.compile(
     r"\b(?:read|capture|extract|output|return|returns|returned|include|includes|including|"
@@ -296,6 +299,7 @@ class CompletionCriterion:
     expected_output_value: ExpectedOutputValue | None = None
     expected_output_shape: ExpectedOutputShape | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource = "runtime_output"
+    requested_output_path_mint_source: RequestedOutputPathMintSource | None = None
     kind: CriterionKind = "outcome"
     terminal_action_family: TerminalActionFamily | None = None
     classification_output_key: str | None = None
@@ -851,6 +855,13 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
         return []
     criteria: list[CompletionCriterion] = []
     seen: set[tuple[str, ...]] = set()
+    registered_download_item_count = sum(
+        1
+        for candidate in raw
+        if isinstance(candidate, dict)
+        and _normalize_deliverable_kind(candidate.get("deliverable_kind")) == "registered_download"
+        and _coerce_criterion_kind(candidate.get("kind")) != "validation_classification"
+    )
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -908,6 +919,22 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             requested_output_evidence_source = "runtime_output"
         elif isinstance(expected_output_value, bool) or expected_output_shape == "goal_judgment_boolean":
             requested_output_evidence_source = "independent_run_evidence"
+        requested_output_path_mint_source: RequestedOutputPathMintSource | None = None
+        if (
+            output_path is None
+            and expected_output_value is None
+            and deliverable_kind == "registered_download"
+            and kind != "validation_classification"
+            and registered_download_item_count == 1
+        ):
+            output_path = _LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH
+            requested_output_path_mint_source = "classifier_default"
+            LOG.info(
+                "copilot_registered_download_requested_output_minted",
+                output_path=output_path,
+                requested_output_path_mint_source=requested_output_path_mint_source,
+                criterion_id=f"c{len(criteria)}",
+            )
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
@@ -941,6 +968,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 expected_output_value=expected_output_value,
                 expected_output_shape=expected_output_shape,
                 requested_output_evidence_source=requested_output_evidence_source,
+                requested_output_path_mint_source=requested_output_path_mint_source,
                 kind=kind,
                 terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
                 classification_output_key=classification_output_key,

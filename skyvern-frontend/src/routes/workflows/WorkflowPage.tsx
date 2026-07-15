@@ -57,6 +57,8 @@ import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { TagChipList } from "./components/tagging/TagChipList";
+import { TagFilterControl } from "./components/tagging/TagFilterControl";
+import { useRunTagFilterParam } from "./hooks/useRunTagFilterParam";
 import { WorkflowActions } from "./WorkflowActions";
 import { useDebounce } from "use-debounce";
 import {
@@ -87,6 +89,15 @@ import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingStat
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { usePageSlots } from "@/store/PageSlots";
 import { resolveRunWindow } from "./resolveRunWindow";
+import { useRunTagsBatchQuery } from "@/routes/tasks/hooks/useRunTagsBatchQuery";
+import { useRunTagSuggestionsQuery } from "@/routes/tasks/hooks/useRunTagSuggestionsQuery";
+import {
+  SelectionCheckboxCell,
+  SelectionHeaderCheckboxCell,
+} from "@/components/SelectionCheckbox";
+import { useRowSelection } from "@/hooks/useRowSelection";
+import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
+import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -118,6 +129,14 @@ function WorkflowPage() {
   const { expandedRows, toggleExpanded: toggleParametersExpanded } =
     useParameterExpansion();
 
+  const { tagTerms, tagsParam, writeTagsParam } = useRunTagFilterParam(
+    searchParams,
+    setSearchParams,
+  );
+
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
     statusFilters,
@@ -126,6 +145,8 @@ function WorkflowPage() {
     search: debouncedSearch,
     createdAtStart: runWindow.createdAtStart,
     createdAtEnd: runWindow.createdAtEnd,
+    // A stale ?tags= URL param would 403 the request when tagging is disabled.
+    tags: taggingEnabled ? tagsParam : undefined,
     refetchOnMount: "always",
   });
 
@@ -141,8 +162,6 @@ function WorkflowPage() {
     workflowPermanentId,
   });
 
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
     { enabled: taggingEnabled },
@@ -162,6 +181,52 @@ function WorkflowPage() {
     [tagKeys],
   );
   const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
+  const runIds = useMemo(
+    () => (workflowRuns ?? []).map((r) => r.workflow_run_id),
+    [workflowRuns],
+  );
+  const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
+    enabled: taggingEnabled,
+  });
+  const { data: runTagSuggestions } = useRunTagSuggestionsQuery({
+    enabled: taggingEnabled,
+  });
+  const tagFilterKeys = useMemo(
+    () =>
+      (runTagSuggestions?.keys ?? []).map((key) => ({
+        key,
+        description: null,
+        workflow_count: 0,
+      })),
+    [runTagSuggestions?.keys],
+  );
+  const selectableRuns = taggingEnabled ? (workflowRuns ?? []) : [];
+  const showCheckbox = selectableRuns.length > 0;
+  const columnCount = showCheckbox ? 6 : 5;
+  const {
+    selectedItems: selectedRuns,
+    isSelected,
+    allSelected,
+    someSelected,
+    indexById: selectableIndexById,
+    handleSelect,
+    toggleSelectAll,
+    clearSelection,
+  } = useRowSelection({
+    items: selectableRuns,
+    getId: (run) => run.workflow_run_id,
+    resetKey: JSON.stringify([
+      page,
+      statusFilters,
+      debouncedSearch,
+      tagsParam,
+      runWindow.createdAtStart,
+      runWindow.createdAtEnd,
+      workflowPermanentId,
+      taggingEnabled,
+    ]),
+    anchorResetKey: pageSize,
+  });
 
   const {
     workflowAnalyticsPanel: WorkflowAnalyticsPanel,
@@ -253,6 +318,7 @@ function WorkflowPage() {
         {!isLoading &&
         workflowRuns?.length === 0 &&
         statusFilters.length === 0 &&
+        tagTerms.length === 0 &&
         !debouncedSearch &&
         isNewUser &&
         onboardingState?.first_run_at === null &&
@@ -281,17 +347,29 @@ function WorkflowPage() {
         ) : (
           <>
             <div className="flex items-center justify-between gap-4">
-              <TableSearchInput
-                value={search}
-                onChange={(value) => {
-                  setSearch(value);
-                  const params = new URLSearchParams(searchParams);
-                  params.set("page", "1");
-                  setSearchParams(params, { replace: true });
-                }}
-                placeholder="Search runs by input..."
-                className="w-48 lg:w-72"
-              />
+              <div className="flex items-center gap-2">
+                <TableSearchInput
+                  value={search}
+                  onChange={(value) => {
+                    setSearch(value);
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page", "1");
+                    setSearchParams(params, { replace: true });
+                  }}
+                  placeholder="Search runs by input..."
+                  className="w-48 lg:w-72"
+                />
+                {taggingEnabled ? (
+                  <TagFilterControl
+                    tagKeys={tagFilterKeys}
+                    labelSuggestions={runTagSuggestions?.labels}
+                    valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                    value={tagTerms}
+                    onChange={writeTagsParam}
+                    colors={tagColors}
+                  />
+                ) : null}
+              </div>
               <div className="flex items-center gap-2">
                 {WorkflowRunsFilterControls ? (
                   <WorkflowRunsFilterControls />
@@ -305,7 +383,17 @@ function WorkflowPage() {
             <div className="overflow-hidden rounded-lg border border-border">
               <Table>
                 <TableHeader>
-                  <TableRow>
+                  <TableRow className="group/header">
+                    {showCheckbox && (
+                      <SelectionHeaderCheckboxCell
+                        allSelected={allSelected}
+                        someSelected={someSelected}
+                        hasSelection={selectedRuns.length > 0}
+                        onToggleAll={toggleSelectAll}
+                        ariaLabel="Select all runs"
+                        className="w-10"
+                      />
+                    )}
                     <TableHead className="w-[20%]">ID</TableHead>
                     <TableHead className="w-[20%]">Status</TableHead>
                     <TableHead className="w-[20%]">Created At</TableHead>
@@ -317,9 +405,11 @@ function WorkflowPage() {
                 </TableHeader>
                 <TableBody>
                   {isLoading ? (
-                    <TableMessageRow colSpan={5}>Loading runs…</TableMessageRow>
+                    <TableMessageRow colSpan={columnCount}>
+                      Loading runs…
+                    </TableMessageRow>
                   ) : workflowRuns?.length === 0 ? (
-                    <TableMessageRow colSpan={5}>
+                    <TableMessageRow colSpan={columnCount}>
                       No agent runs found
                     </TableMessageRow>
                   ) : (
@@ -340,90 +430,138 @@ function WorkflowPage() {
                         workflowRun.workflow_run_id,
                       );
 
+                      const runTags = runTagsMap[workflowRun.workflow_run_id];
+                      const selectableIndex =
+                        selectableIndexById.get(workflowRun.workflow_run_id) ??
+                        -1;
+                      const isRowSelected = isSelected(
+                        workflowRun.workflow_run_id,
+                      );
+                      const runPath = studioEnabled
+                        ? `/agents/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
+                        : legacyRunDetailPath(
+                            workflowPermanentId,
+                            workflowRun.workflow_run_id,
+                          );
+
+                      const mainRow = (
+                        <TableRow
+                          onClick={(event) => {
+                            if (event.ctrlKey || event.metaKey) {
+                              window.open(
+                                window.location.origin + runPath,
+                                "_blank",
+                                "noopener,noreferrer",
+                              );
+                              return;
+                            }
+                            navigate(runPath);
+                          }}
+                          className="group/row cursor-pointer select-none"
+                          data-state={isRowSelected ? "selected" : undefined}
+                        >
+                          {showCheckbox && (
+                            <SelectionCheckboxCell
+                              index={selectableIndex}
+                              checked={isRowSelected}
+                              hasSelection={selectedRuns.length > 0}
+                              onSelect={handleSelect}
+                              ariaLabel={`Select ${workflowRun.workflow_run_id}`}
+                            />
+                          )}
+                          <TableCell className="font-mono text-xs text-muted-foreground">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="min-w-0 truncate">
+                                {workflowRunId}
+                              </span>
+                              {taggingEnabled && runTags?.length ? (
+                                <TagChipList
+                                  tags={runTags}
+                                  descriptions={tagDescriptions}
+                                  colors={tagColors}
+                                  maxVisible={2}
+                                  hideSystemTags
+                                  compact
+                                  className="shrink-0 font-sans"
+                                />
+                              ) : null}
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <StatusBadge status={workflowRun.status} />
+                          </TableCell>
+                          <TableCell
+                            className="text-muted-foreground"
+                            title={basicTimeFormat(workflowRun.created_at)}
+                          >
+                            {compactLocalDateTime(workflowRun.created_at)}
+                          </TableCell>
+                          <TableCell className="tabular-nums text-muted-foreground">
+                            {formatExecutionTime(
+                              workflowRun.started_at ?? workflowRun.created_at,
+                              workflowRun.finished_at,
+                            ) ?? "-"}
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex justify-end gap-2">
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      size="icon"
+                                      variant="ghost"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        toggleParametersExpanded(
+                                          workflowRun.workflow_run_id,
+                                        );
+                                      }}
+                                      className={cn(
+                                        isExpanded
+                                          ? "text-blue-700 dark:text-blue-400"
+                                          : "text-muted-foreground hover:text-foreground",
+                                      )}
+                                    >
+                                      <MixerHorizontalIcon className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    {isExpanded ? "Hide Inputs" : "Show Inputs"}
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      );
+
                       return (
                         <React.Fragment key={workflowRun.workflow_run_id}>
-                          {/* Main run row */}
-                          <TableRow
-                            onClick={(event) => {
-                              const url = studioEnabled
-                                ? `/agents/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
-                                : legacyRunDetailPath(
-                                    workflowPermanentId,
-                                    workflowRun.workflow_run_id,
-                                  );
-
-                              if (event.ctrlKey || event.metaKey) {
-                                window.open(
-                                  window.location.origin + url,
-                                  "_blank",
-                                  "noopener,noreferrer",
-                                );
-                                return;
+                          {taggingEnabled ? (
+                            <RunRowContextMenu
+                              workflowRunId={workflowRun.workflow_run_id}
+                              runPath={runPath}
+                              currentTags={runTags ?? []}
+                              tagKeys={tagFilterKeys}
+                              labelSuggestions={runTagSuggestions?.labels ?? []}
+                              valueSuggestionsByKey={
+                                runTagSuggestions?.valuesByKey
                               }
-                              navigate(url);
-                            }}
-                            className="cursor-pointer"
-                          >
-                            <TableCell className="font-mono text-xs text-muted-foreground">
-                              {workflowRunId}
-                            </TableCell>
-                            <TableCell>
-                              <StatusBadge status={workflowRun.status} />
-                            </TableCell>
-                            <TableCell
-                              className="text-muted-foreground"
-                              title={basicTimeFormat(workflowRun.created_at)}
+                              selectedCount={selectedRuns.length}
+                              onNavigate={navigate}
                             >
-                              {compactLocalDateTime(workflowRun.created_at)}
-                            </TableCell>
-                            <TableCell className="tabular-nums text-muted-foreground">
-                              {formatExecutionTime(
-                                workflowRun.started_at ??
-                                  workflowRun.created_at,
-                                workflowRun.finished_at,
-                              ) ?? "-"}
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex justify-end gap-2">
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <Button
-                                        size="icon"
-                                        variant="ghost"
-                                        onClick={(event) => {
-                                          event.stopPropagation();
-                                          toggleParametersExpanded(
-                                            workflowRun.workflow_run_id,
-                                          );
-                                        }}
-                                        className={cn(
-                                          isExpanded
-                                            ? "text-blue-400"
-                                            : "text-muted-foreground hover:text-foreground",
-                                        )}
-                                      >
-                                        <MixerHorizontalIcon className="h-4 w-4" />
-                                      </Button>
-                                    </TooltipTrigger>
-                                    <TooltipContent>
-                                      {isExpanded
-                                        ? "Hide Inputs"
-                                        : "Show Inputs"}
-                                    </TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-
+                              {mainRow}
+                            </RunRowContextMenu>
+                          ) : (
+                            mainRow
+                          )}
                           {/* Expanded parameters section */}
                           {isExpanded && (
                             <TableRow
                               key={`${workflowRun.workflow_run_id}-params`}
                             >
                               <TableCell
-                                colSpan={5}
+                                colSpan={columnCount}
                                 className="bg-slate-50 dark:bg-slate-900/50"
                               >
                                 <WorkflowRunParameters
@@ -442,6 +580,18 @@ function WorkflowPage() {
                   )}
                 </TableBody>
               </Table>
+              {taggingEnabled && selectedRuns.length > 0 ? (
+                <RunBulkActionBar
+                  selectedRunIds={selectedRuns.map(
+                    (run) => run.workflow_run_id,
+                  )}
+                  runTagsMap={runTagsMap}
+                  tagKeys={tagFilterKeys}
+                  labelSuggestions={runTagSuggestions?.labels ?? []}
+                  valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                  onClearSelection={clearSelection}
+                />
+              ) : null}
               <RunParametersDialog
                 open={openRunParams !== null}
                 onOpenChange={(open) => {
@@ -452,7 +602,7 @@ function WorkflowPage() {
               />
               <div className="relative px-3 py-3">
                 <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-                  <span className="text-slate-400">Items per page</span>
+                  <span className="text-muted-foreground">Items per page</span>
                   <Select
                     value={String(pageSize)}
                     onValueChange={(size) => {
@@ -580,7 +730,7 @@ function WorkflowRunParameters({
 
   if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
+      <div className="ml-8 py-4 text-sm text-muted-foreground">
         No inputs for this run
       </div>
     );

@@ -418,7 +418,7 @@ function WorkflowRunCode(props?: Props) {
             className={cn(
               "rounded-full border px-2.5 py-1 text-xs transition-colors",
               activeChipVersion === usedVersion
-                ? "border-blue-500 bg-blue-500/20 text-blue-300"
+                ? "border-blue-500 bg-blue-500/20 text-blue-700 dark:text-blue-300"
                 : "border-border text-muted-foreground hover:border-muted-foreground",
             )}
             onClick={() => setSelectedVersion(didGenerate ? usedVersion : null)}
@@ -437,8 +437,8 @@ function WorkflowRunCode(props?: Props) {
           className={cn(
             "rounded-full border px-2.5 py-1 text-xs transition-colors",
             activeChipVersion === generatedVersion || selectedVersion === null
-              ? "border-emerald-500 bg-emerald-500/20 text-emerald-300"
-              : "border-slate-700 text-slate-400 hover:border-slate-500",
+              ? "border-emerald-500 bg-emerald-500/20 text-emerald-700 dark:text-emerald-300"
+              : "border-border text-muted-foreground hover:border-border dark:hover:border-slate-500",
           )}
           onClick={() => setSelectedVersion(null)}
           disabled={isEditing}

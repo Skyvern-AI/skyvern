@@ -108,7 +108,7 @@ function SidebarIdentityIcon({
   // The gear doubles as the generic "settings" glyph: it covers both the start
   // node and the unknown-block fallback (a detached/untyped node has no icon).
   return (
-    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
+    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
       {!identity.isStart && identity.blockType ? (
         <WorkflowBlockIcon
           workflowBlockType={identity.blockType}
@@ -173,7 +173,7 @@ function UpdatedAgoFooter({ blockId }: Readonly<{ blockId: string }>) {
   return (
     <footer
       data-testid="block-config-sidebar-updated-footer"
-      className="border-t border-border px-4 py-2 text-xs text-slate-400"
+      className="border-t border-border px-4 py-2 text-xs text-muted-foreground"
     >
       {formatUpdatedAgo(updatedAt, now)}
     </footer>
@@ -184,7 +184,7 @@ function SubLabel() {
   const hasInteracted = useHasInteractedThisSession();
   if (hasInteracted) return null;
   return (
-    <p className="mt-0.5 truncate text-xs text-slate-400">
+    <p className="mt-0.5 truncate text-xs text-muted-foreground">
       Edit settings here · saves automatically
     </p>
   );
@@ -216,7 +216,7 @@ function EditableBlockTitle({
 
   if (!editable) {
     return (
-      <h2 className="truncate text-sm font-medium text-slate-100">{label}</h2>
+      <h2 className="truncate text-sm font-medium text-foreground">{label}</h2>
     );
   }
 
@@ -225,8 +225,8 @@ function EditableBlockTitle({
       value={label}
       editable
       onChange={handleLabelChange}
-      titleClassName="text-sm font-medium text-slate-100"
-      inputClassName="text-sm font-medium text-slate-100"
+      titleClassName="text-sm font-medium text-foreground"
+      inputClassName="text-sm font-medium text-foreground"
     />
   );
 }
@@ -249,7 +249,7 @@ function BlockConfigSidebarBody({
           ) : null}
           <div className="min-w-0">
             {identity.isStart ? (
-              <h2 className="truncate text-sm font-medium text-slate-100">
+              <h2 className="truncate text-sm font-medium text-foreground">
                 {identity.label}
               </h2>
             ) : (
@@ -261,7 +261,7 @@ function BlockConfigSidebarBody({
             )}
             {identity.blockType ? (
               <p
-                className="truncate text-xs text-slate-400"
+                className="truncate text-xs text-muted-foreground"
                 title={workflowBlockTitle[identity.blockType]}
               >
                 {workflowBlockTitle[identity.blockType]}
@@ -274,7 +274,7 @@ function BlockConfigSidebarBody({
           type="button"
           onClick={onClose}
           aria-label="Close block configuration"
-          className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-slate-700"
         >
           <Cross2Icon className="h-4 w-4" />
         </button>
@@ -301,14 +301,14 @@ function BlockLibrarySidebarBody({
     <>
       <header className="flex h-20 items-center justify-between gap-3 border-b border-border px-6">
         <div className="flex min-w-0 items-center gap-3">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-600">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
             <PlusIcon className="size-4" />
           </div>
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-medium text-slate-100">
+            <h2 className="truncate text-sm font-medium text-foreground">
               Block Library
             </h2>
-            <p className="mt-0.5 truncate text-xs text-slate-400">
+            <p className="mt-0.5 truncate text-xs text-muted-foreground">
               Click on the block type you want to add
             </p>
           </div>
@@ -317,7 +317,7 @@ function BlockLibrarySidebarBody({
           type="button"
           onClick={onClose}
           aria-label="Close block library"
-          className="rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100"
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-slate-700"
         >
           <Cross2Icon className="h-4 w-4" />
         </button>

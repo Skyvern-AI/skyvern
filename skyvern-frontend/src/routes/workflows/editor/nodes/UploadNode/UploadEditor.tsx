@@ -24,7 +24,7 @@ function UploadEditorBody({ node }: { node: UploadNode }) {
     <div data-testid="upload-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <Label className="text-sm text-slate-400">File Path</Label>
+          <Label className="text-sm text-muted-foreground">File Path</Label>
           <HelpTooltip content={helpTooltips["upload"]["path"]} />
         </div>
         <Input value={path} disabled className="nopan text-xs" />

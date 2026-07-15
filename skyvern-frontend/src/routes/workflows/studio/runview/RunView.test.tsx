@@ -11,6 +11,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
@@ -45,6 +46,11 @@ vi.mock("../../workflowRun/WorkflowRunCode", () => ({
 }));
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: () => null,
+}));
+vi.mock("@/routes/tasks/components/tagging/RunTagsEditor", () => ({
+  RunTagsEditor: ({ workflowRunId }: { workflowRunId: string }) => (
+    <div data-testid="run-tags-editor" data-workflow-run-id={workflowRunId} />
+  ),
 }));
 // Radix ScrollArea needs ResizeObserver, which jsdom doesn't provide.
 vi.mock("@/components/ui/scroll-area", () => ({
@@ -265,6 +271,13 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
+  test("does not render run tags in Studio Overview", () => {
+    seedCompletedRun();
+    const { queryByTestId } = renderRunView();
+
+    expect(queryByTestId("run-tags-editor")).toBeNull();
+  });
+
   test("defaults to the Timeline view with the timeline and step detail", () => {
     seedForLoopRun();
     const { container } = renderRunView();
@@ -570,6 +583,64 @@ describe("RunView iteration selection", () => {
   }, 20_000);
 });
 
+describe("RunView timeline → editor jump", () => {
+  function seedRunWithBlock(label: string) {
+    mocks.timeline = [
+      buildBlockItem(buildBlock({ workflow_run_block_id: "wrb_jump", label })),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  function registerHandle() {
+    const focusBlock = vi.fn();
+    useWorkflowBlockSearchStore.getState().registerHandle({
+      getTargets: () => [
+        { nodeId: "node-jump", label: "jump-target-block", blockType: null },
+      ],
+      focusBlock,
+    });
+    return focusBlock;
+  }
+
+  function clickBlock(container: HTMLElement) {
+    const [blockButton] = within(container).getAllByText("jump-target-block");
+    if (!blockButton) {
+      throw new Error("timeline block did not render");
+    }
+    fireEvent.click(blockButton);
+  }
+
+  afterEach(() => {
+    useWorkflowBlockSearchStore.getState().registerHandle(null);
+  });
+
+  test("clicking a timeline block jumps the editor when the editor pane is open", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=editor,overview");
+    clickBlock(container);
+
+    expect(focusBlock).toHaveBeenCalledWith("node-jump");
+  });
+
+  test("clicking a timeline block does not jump when the editor pane is closed", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=overview");
+    clickBlock(container);
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
+});
+
 describe("RunView output signals", () => {
   test("surfaces run errors, error codes, and rich downloaded files", () => {
     seedCompletedRun({
@@ -612,6 +683,24 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("confidence_float")).toBeNull();
     expect(scope.getByText("Downloaded files")).not.toBeNull();
     expect(scope.getByText("report.pdf")).not.toBeNull();
+  });
+
+  test("surfaces the full agent run outputs below extracted information", () => {
+    seedCompletedRun({
+      outputs: {
+        extracted_information: { answer: 42 },
+        additional_output: "full-run-only",
+      },
+    });
+
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    // This run has outputs, so the toggle name carries the new-output suffix.
+    fireEvent.click(scope.getByRole("button", { name: /^Outputs/ }));
+
+    expect(scope.getByText("Extracted information")).not.toBeNull();
+    expect(scope.getByText("Agent run outputs")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {

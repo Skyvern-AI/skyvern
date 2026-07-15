@@ -15,6 +15,7 @@ import {
   TurnNarrativeState,
   TurnSummary,
   computeTurnSummary,
+  condenseActivityEntries,
   effectiveMode,
   formatElapsed,
   isBlockOk,
@@ -36,37 +37,37 @@ interface BlockPalette {
 }
 
 const PALETTE_NAV: BlockPalette = {
-  fg: "text-blue-300",
+  fg: "text-blue-700 dark:text-blue-300",
   bg: "bg-blue-500/15",
   border: "border-blue-400/60",
   glyph: "→",
 };
 const PALETTE_CRED: BlockPalette = {
-  fg: "text-amber-300",
+  fg: "text-amber-700 dark:text-amber-300",
   bg: "bg-amber-500/15",
   border: "border-amber-400/60",
   glyph: "⌬",
 };
 const PALETTE_LOOP: BlockPalette = {
-  fg: "text-sky-300",
+  fg: "text-sky-700 dark:text-sky-300",
   bg: "bg-sky-500/15",
   border: "border-sky-400/60",
   glyph: "↻",
 };
 const PALETTE_ACTION: BlockPalette = {
-  fg: "text-emerald-300",
+  fg: "text-emerald-700 dark:text-emerald-300",
   bg: "bg-emerald-500/15",
   border: "border-emerald-400/60",
   glyph: "✦",
 };
 const PALETTE_EXTRACTION: BlockPalette = {
-  fg: "text-sky-300",
+  fg: "text-sky-700 dark:text-sky-300",
   bg: "bg-sky-500/15",
   border: "border-sky-400/60",
   glyph: "↓",
 };
 const PALETTE_TASK: BlockPalette = {
-  fg: "text-slate-300",
+  fg: "text-tertiary-foreground",
   bg: "bg-slate-500/15",
   border: "border-slate-500/60",
   glyph: "✦",
@@ -124,7 +125,7 @@ function FProse({
     <div
       className={[
         "py-0.5 pl-9 pr-0 text-[13px] leading-[1.55]",
-        muted ? "text-slate-400" : "text-slate-200",
+        muted ? "text-muted-foreground" : "text-foreground dark:text-slate-200",
         italic ? "italic" : "",
       ]
         .filter(Boolean)
@@ -151,7 +152,7 @@ function FSubRow({
   return (
     <div className="flex items-start gap-2 py-px">
       <span
-        className={`mt-[2px] flex w-3.5 shrink-0 justify-center text-[11px] font-bold ${glyphClass ?? "text-slate-400"}`}
+        className={`mt-[2px] flex w-3.5 shrink-0 justify-center text-[11px] font-bold ${glyphClass ?? "text-muted-foreground"}`}
         aria-hidden="true"
       >
         {glyph}
@@ -159,7 +160,9 @@ function FSubRow({
       <div
         className={[
           "min-w-0 flex-1 text-[11.5px] leading-[1.55]",
-          muted ? "text-slate-400" : "text-slate-200",
+          muted
+            ? "text-muted-foreground"
+            : "text-foreground dark:text-slate-200",
           italic ? "italic" : "",
         ]
           .filter(Boolean)
@@ -171,10 +174,25 @@ function FSubRow({
   );
 }
 
+function AttemptsBadge({ attempts }: { attempts?: number }) {
+  if (!attempts || attempts <= 1) return null;
+  return (
+    <span className="text-muted-foreground dark:text-slate-500">
+      {" "}
+      · ↻ {attempts} attempts
+    </span>
+  );
+}
+
 function ActivityRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
-      <FSubRow glyph="✦" glyphClass="text-sky-300" italic muted>
+      <FSubRow
+        glyph="✦"
+        glyphClass="text-sky-700 dark:text-sky-300"
+        italic
+        muted
+      >
         {entry.text}
       </FSubRow>
     );
@@ -183,9 +201,13 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
     const label =
       entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
     return (
-      <FSubRow glyph="▸" glyphClass="text-slate-400">
-        <span className="text-slate-200">{label}</span>
-        <span className="text-slate-500"> · calling…</span>
+      <FSubRow glyph="▸" glyphClass="text-muted-foreground">
+        <span className="text-foreground dark:text-slate-200">{label}</span>
+        <span className="text-muted-foreground dark:text-slate-500">
+          {" "}
+          · calling…
+        </span>
+        <AttemptsBadge attempts={entry.attempts} />
       </FSubRow>
     );
   }
@@ -193,11 +215,22 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
   return (
     <FSubRow
       glyph={ok ? "✓" : "✕"}
-      glyphClass={ok ? "text-emerald-300" : "text-rose-300"}
+      glyphClass={
+        ok
+          ? "text-emerald-700 dark:text-emerald-300"
+          : "text-rose-700 dark:text-rose-300"
+      }
     >
-      <span className={ok ? "text-slate-200" : "text-rose-200"}>
+      <span
+        className={
+          ok
+            ? "text-foreground dark:text-slate-200"
+            : "text-rose-700 dark:text-rose-200"
+        }
+      >
         {entry.text}
       </span>
+      <AttemptsBadge attempts={entry.attempts} />
     </FSubRow>
   );
 }
@@ -223,12 +256,18 @@ function FRecordedActionRow({
   const shimmerRef = useShimmerText<HTMLSpanElement>(revealing);
   if (revealing) {
     return (
-      <FSubRow glyph={<Spinner small />} glyphClass="text-blue-300">
-        <span ref={shimmerRef} className="text-slate-200">
+      <FSubRow
+        glyph={<Spinner small />}
+        glyphClass="text-blue-700 dark:text-blue-300"
+      >
+        <span ref={shimmerRef} className="text-foreground dark:text-slate-200">
           {action.label}
         </span>
         {action.summary ? (
-          <span className="text-slate-500"> · {action.summary}</span>
+          <span className="text-muted-foreground dark:text-slate-500">
+            {" "}
+            · {action.summary}
+          </span>
         ) : null}
       </FSubRow>
     );
@@ -241,15 +280,22 @@ function FRecordedActionRow({
   return (
     <FSubRow
       glyph={action.failed ? "✕" : "✓"}
-      glyphClass={action.failed ? "text-rose-300" : "text-emerald-300"}
+      glyphClass={
+        action.failed
+          ? "text-rose-700 dark:text-rose-300"
+          : "text-emerald-700 dark:text-emerald-300"
+      }
     >
       <span
-        className={`${action.failed ? "text-rose-200" : "text-slate-200"} ${flashClass}`}
+        className={`${action.failed ? "text-rose-700 dark:text-rose-200" : "text-foreground dark:text-slate-200"} ${flashClass}`}
       >
         {action.label}
       </span>
       {action.summary ? (
-        <span className="text-slate-500"> · {action.summary}</span>
+        <span className="text-muted-foreground dark:text-slate-500">
+          {" "}
+          · {action.summary}
+        </span>
       ) : null}
     </FSubRow>
   );
@@ -287,16 +333,16 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
           ? "border-rose-400/60"
           : "border-slate-500/60";
   const accentText = isRunning
-    ? "text-blue-300"
+    ? "text-blue-700 dark:text-blue-300"
     : isOk
-      ? "text-emerald-300"
+      ? "text-emerald-700 dark:text-emerald-300"
       : isOutcomeNotShown
-        ? "text-amber-300"
+        ? "text-amber-700 dark:text-amber-300"
         : isFail
-          ? "text-rose-300"
+          ? "text-rose-700 dark:text-rose-300"
           : isVerifying || isRanNeutral
-            ? "text-slate-300"
-            : "text-slate-400";
+            ? "text-tertiary-foreground"
+            : "text-muted-foreground";
   const puckBg = isRunning
     ? "bg-blue-500/15"
     : isOk
@@ -396,28 +442,30 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
             <span
               className={
                 uxV1
-                  ? "text-[12.5px] font-semibold text-slate-100"
-                  : "font-mono text-[12.5px] font-semibold text-slate-100"
+                  ? "text-[12.5px] font-semibold text-foreground"
+                  : "font-mono text-[12.5px] font-semibold text-foreground"
               }
               title={uxV1 ? block.label : undefined}
             >
               {displayLabel}
             </span>
-            <span className="text-[11px] text-slate-500">·</span>
+            <span className="text-[11px] text-muted-foreground dark:text-slate-500">
+              ·
+            </span>
             <span className={`font-mono text-[11px] font-medium ${accentText}`}>
               {statusText}
             </span>
-            <span className="text-[10.5px] text-slate-500">
+            <span className="text-[10.5px] text-muted-foreground dark:text-slate-500">
               · {block.blockType}
             </span>
           </div>
           {!open && isOk && block.activity.length > 0 ? (
-            <div className="mt-0.5 text-[12px] leading-[1.5] text-slate-400">
+            <div className="mt-0.5 text-[12px] leading-[1.5] text-muted-foreground">
               {block.activity[block.activity.length - 1]!.text}
             </div>
           ) : null}
           {!open && isOutcomeNotShown ? (
-            <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-200/80">
+            <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
               Outcome not confirmed — the run finished without showing the goal
               was met.
             </div>
@@ -425,7 +473,7 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
         </div>
         {toggleable ? (
           <span
-            className={`shrink-0 text-[12px] text-slate-500 transition-transform ${
+            className={`shrink-0 text-[12px] text-muted-foreground transition-transform dark:text-slate-500 ${
               open ? "rotate-90" : ""
             }`}
             aria-hidden="true"
@@ -436,16 +484,19 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
       </button>
 
       {open ? (
-        <div className="ml-9 flex flex-col gap-1.5 border-l border-slate-700/60 py-1.5 pl-3">
+        <div className="ml-9 flex flex-col gap-1.5 border-l border-border/60 py-1.5 pl-3">
           {isRunning ? (
-            <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-blue-400/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-300">
+            <span className="inline-flex w-fit items-center gap-1.5 rounded-full border border-blue-400/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-blue-300">
               <span className="h-[5px] w-[5px] animate-pulse rounded-full bg-blue-400" />
               Active in Live Browser
             </span>
           ) : null}
           {block.activity.length === 0 && isRunning ? (
-            <FSubRow glyph={<Spinner small />} glyphClass="text-blue-300">
-              <span className="text-slate-400">Working…</span>
+            <FSubRow
+              glyph={<Spinner small />}
+              glyphClass="text-blue-700 dark:text-blue-300"
+            >
+              <span className="text-muted-foreground">Working…</span>
             </FSubRow>
           ) : null}
           {block.activity.map((entry) => (
@@ -468,8 +519,10 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
             : null}
           {isFail ? (
             <div className="mt-1 flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
-              <span className="text-[11px] font-bold text-rose-300">✕</span>
-              <div className="text-[12px] leading-[1.5] text-rose-200/90">
+              <span className="text-[11px] font-bold text-rose-700 dark:text-rose-300">
+                ✕
+              </span>
+              <div className="text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200/90">
                 {block.activity.find((e) => e.kind === "tool_result")?.text ??
                   "Halted — see run details."}
               </div>
@@ -477,8 +530,10 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
           ) : null}
           {isOutcomeNotShown ? (
             <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
-              <span className="text-[11px] font-bold text-amber-300">!</span>
-              <div className="text-[12px] leading-[1.5] text-amber-200/90">
+              <span className="text-[11px] font-bold text-amber-700 dark:text-amber-300">
+                !
+              </span>
+              <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
                 {block.outcomeReason ??
                   "The step ran, but the run did not demonstrate the goal was met."}
               </div>
@@ -521,28 +576,28 @@ function FDesignRow({ done, blockLabels, activity, uxV1 }: FDesignRowProps) {
         onClick={() => setUserOpen((v) => !(v === null ? !done : v))}
       >
         <span
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/15 text-[11px] font-bold text-sky-300"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/15 text-[11px] font-bold text-sky-700 dark:text-sky-300"
           aria-hidden="true"
         >
           {done ? "✓" : <Spinner />}
         </span>
         <div className="flex flex-1 items-baseline gap-2 text-left">
-          <span className="text-[12.5px] font-semibold text-slate-100">
+          <span className="text-[12.5px] font-semibold text-foreground">
             {title}
           </span>
           {summary.length ? (
-            <span className="text-[11px] text-slate-400">
+            <span className="text-[11px] text-muted-foreground">
               · {summary.join(" · ")}
             </span>
           ) : null}
           {!done ? (
-            <span className="text-[10.5px] uppercase tracking-wide text-blue-300">
+            <span className="text-[10.5px] uppercase tracking-wide text-blue-700 dark:text-blue-300">
               live
             </span>
           ) : null}
         </div>
         <span
-          className={`shrink-0 text-[12px] text-slate-500 transition-transform ${
+          className={`shrink-0 text-[12px] text-muted-foreground transition-transform dark:text-slate-500 ${
             open ? "rotate-90" : ""
           }`}
           aria-hidden="true"
@@ -551,15 +606,21 @@ function FDesignRow({ done, blockLabels, activity, uxV1 }: FDesignRowProps) {
         </span>
       </button>
       {open ? (
-        <div className="ml-9 flex flex-col gap-1 border-l border-slate-700/60 py-1.5 pl-3">
+        <div className="ml-9 flex flex-col gap-1 border-l border-border/60 py-1.5 pl-3">
           {activity.map((entry) => (
             <ActivityRow key={entry.id} entry={entry} />
           ))}
           {blockLabels.map((label) => (
-            <FSubRow key={label} glyph="✦" glyphClass="text-emerald-300">
-              <span className="text-slate-400">Drafted </span>
+            <FSubRow
+              key={label}
+              glyph="✦"
+              glyphClass="text-emerald-700 dark:text-emerald-300"
+            >
+              <span className="text-muted-foreground">Drafted </span>
               <span
-                className={uxV1 ? "text-slate-100" : "font-mono text-slate-100"}
+                className={
+                  uxV1 ? "text-foreground" : "font-mono text-foreground"
+                }
                 title={uxV1 ? label : undefined}
               >
                 {uxV1 ? humanizeBlockLabel(label) : label}
@@ -576,10 +637,10 @@ function FWorkingHeader() {
   return (
     <div className="flex items-center gap-2 px-1 py-1">
       <Spinner />
-      <span className="text-[12.5px] font-semibold text-slate-100">
+      <span className="text-[12.5px] font-semibold text-foreground">
         Working…
       </span>
-      <span className="text-[11px] text-slate-400">
+      <span className="text-[11px] text-muted-foreground">
         · building your workflow
       </span>
     </div>
@@ -602,11 +663,11 @@ function phaseGlyph(status: PhaseStatus): ReactNode {
 function phasePuckClasses(status: PhaseStatus): string {
   switch (status) {
     case "done":
-      return "border-emerald-400/60 bg-emerald-500/15 text-emerald-300";
+      return "border-emerald-400/60 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
     case "fail":
-      return "border-rose-400/60 bg-rose-500/15 text-rose-300";
+      return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
     case "active":
-      return "border-blue-400/60 bg-blue-500/15 text-blue-300";
+      return "border-blue-400/60 bg-blue-500/15 text-blue-700 dark:text-blue-300";
     default:
       return "border-slate-500/60 bg-slate-elevation3 text-slate-600";
   }
@@ -615,14 +676,14 @@ function phasePuckClasses(status: PhaseStatus): string {
 function phaseLabelClasses(status: PhaseStatus): string {
   switch (status) {
     case "active":
-      return "font-semibold text-slate-100";
+      return "font-semibold text-foreground";
     case "fail":
-      return "text-rose-300";
+      return "text-rose-700 dark:text-rose-300";
     case "pending":
     case "notrun":
-      return "text-slate-500";
+      return "text-muted-foreground dark:text-slate-500";
     default:
-      return "text-slate-400";
+      return "text-muted-foreground";
   }
 }
 
@@ -659,11 +720,11 @@ function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
       }`
     : "Writing the workflow code…";
   return (
-    <FSubRow glyph="▸" glyphClass="text-slate-400">
+    <FSubRow glyph="▸" glyphClass="text-muted-foreground">
       <span
         ref={shimmerRef}
         title={text}
-        className="block truncate text-slate-400"
+        className="block truncate text-muted-foreground"
       >
         {text}
       </span>
@@ -685,6 +746,14 @@ function FPhaseChecklist({
   uxV1,
 }: FPhaseChecklistProps) {
   const rows = useMemo(() => derivePhases(turn), [turn]);
+  const condensedBlocks = useMemo(
+    () =>
+      turn.blocks.map((b) => ({
+        ...b,
+        activity: condenseActivityEntries(b.activity),
+      })),
+    [turn.blocks],
+  );
   const [openPhases, setOpenPhases] = useState<Set<CopilotPhaseId>>(
     () => new Set(),
   );
@@ -722,7 +791,9 @@ function FPhaseChecklist({
             {row.stub ? (
               <span
                 className={`text-[11px] tabular-nums ${
-                  row.status === "fail" ? "text-rose-400" : "text-slate-500"
+                  row.status === "fail"
+                    ? "text-rose-700 dark:text-rose-400"
+                    : "text-muted-foreground dark:text-slate-500"
                 }`}
               >
                 {row.stub}
@@ -730,7 +801,7 @@ function FPhaseChecklist({
             ) : null}
             {hasNest ? (
               <span
-                className={`shrink-0 text-[12px] text-slate-500 transition-transform ${
+                className={`shrink-0 text-[12px] text-muted-foreground transition-transform dark:text-slate-500 ${
                   open ? "rotate-90" : ""
                 }`}
                 aria-hidden="true"
@@ -771,7 +842,7 @@ function FPhaseChecklist({
               </div>
             )}
             {open ? (
-              <div className="ml-[25px] flex flex-col gap-1.5 rounded-lg border border-slate-700/60 bg-slate-elevation1 px-3 py-2">
+              <div className="ml-[25px] flex flex-col gap-1.5 rounded-lg border border-border/60 bg-slate-elevation1 px-3 py-2">
                 {row.id === "draft" ? (
                   <>
                     {row.entries.map((entry) => (
@@ -781,12 +852,14 @@ function FPhaseChecklist({
                       <FSubRow
                         key={label}
                         glyph="✦"
-                        glyphClass="text-emerald-300"
+                        glyphClass="text-emerald-700 dark:text-emerald-300"
                       >
-                        <span className="text-slate-400">Drafted </span>
+                        <span className="text-muted-foreground">Drafted </span>
                         <span
                           className={
-                            uxV1 ? "text-slate-100" : "font-mono text-slate-100"
+                            uxV1
+                              ? "text-foreground"
+                              : "font-mono text-foreground"
                           }
                           title={uxV1 ? label : undefined}
                         >
@@ -801,7 +874,7 @@ function FPhaseChecklist({
                     {row.entries.map((entry) => (
                       <ActivityRow key={entry.id} entry={entry} />
                     ))}
-                    {turn.blocks.map((b) => (
+                    {condensedBlocks.map((b) => (
                       <FBlockRun
                         key={b.workflowRunBlockId || b.label}
                         block={b}
@@ -827,12 +900,12 @@ function FPhaseChecklist({
 
 function accentBg(accent: TurnSummary["accent"]): string {
   if (accent === "fail") {
-    return "border-rose-400/60 bg-rose-500/15 text-rose-300";
+    return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
   }
   if (accent === "qa") {
-    return "border-sky-400/60 bg-sky-500/15 text-sky-300";
+    return "border-sky-400/60 bg-sky-500/15 text-sky-700 dark:text-sky-300";
   }
-  return "border-emerald-400/60 bg-emerald-500/15 text-emerald-300";
+  return "border-emerald-400/60 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300";
 }
 
 interface TurnHeadProps {
@@ -860,11 +933,11 @@ function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
       </span>
       <div className="min-w-0 flex-1">
         <div className="mb-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className="text-[14px] font-semibold tracking-tight text-slate-100">
+          <span className="text-[14px] font-semibold tracking-tight text-foreground">
             {summary.headline}
           </span>
           {summary.stats.length ? (
-            <span className="text-[11.5px] text-slate-400">
+            <span className="text-[11.5px] text-muted-foreground">
               {summary.stats.join(" · ")}
             </span>
           ) : null}
@@ -872,7 +945,7 @@ function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
         {subtitle}
       </div>
       <span
-        className={`mt-1 shrink-0 text-[14px] text-slate-500 transition-transform ${
+        className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
           expanded ? "rotate-90" : ""
         }`}
         aria-hidden="true"
@@ -907,7 +980,7 @@ function RollupCard({
   const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
 
   return (
-    <div className="overflow-hidden rounded-xl border border-slate-700/60 bg-slate-elevation2">
+    <div className="overflow-hidden rounded-xl border border-border/60 bg-slate-elevation2">
       <TurnHead
         summary={summary}
         expanded={false}
@@ -917,8 +990,8 @@ function RollupCard({
             <div
               className={`mt-0.5 text-[12.5px] leading-[1.5] ${
                 summary.isFail && !summary.isStoppedWithDraft
-                  ? "text-rose-200/90"
-                  : "text-slate-400"
+                  ? "text-rose-700 dark:text-rose-200/90"
+                  : "text-muted-foreground"
               }`}
             >
               {closing}
@@ -940,7 +1013,7 @@ function RollupCard({
 
       {showCommit ? (
         <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-slate-500">
+          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground dark:text-slate-500">
             What changed
           </div>
           <ul className="m-0 flex list-none flex-col gap-1 p-0">
@@ -949,7 +1022,7 @@ function RollupCard({
               return (
                 <li
                   key={b.label}
-                  className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-slate-200"
+                  className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-foreground dark:text-slate-200"
                 >
                   <span
                     className={`w-3.5 shrink-0 text-center text-[11px] font-bold ${palette.fg}`}
@@ -960,15 +1033,15 @@ function RollupCard({
                   <span
                     className={
                       uxV1
-                        ? "text-[11px] text-slate-400"
-                        : "font-mono text-[11px] text-slate-400"
+                        ? "text-[11px] text-muted-foreground"
+                        : "font-mono text-[11px] text-muted-foreground"
                     }
                     title={uxV1 ? b.label : undefined}
                   >
                     {uxV1 ? humanizeBlockLabel(b.label) : b.label}
                   </span>
                   <span className="text-slate-600">·</span>
-                  <span className="text-[11.5px] text-slate-200">
+                  <span className="text-[11.5px] text-foreground dark:text-slate-200">
                     {b.blockType}
                   </span>
                 </li>
@@ -980,17 +1053,17 @@ function RollupCard({
 
       {failed.length > 0 ? (
         <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
-          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-rose-400">
+          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-rose-700 dark:text-rose-400">
             Halted
           </div>
           <ul className="m-0 flex list-none flex-col gap-1 p-0">
             {failed.map((b) => (
               <li
                 key={b.label}
-                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-rose-200"
+                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200"
               >
                 <span
-                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-rose-300"
+                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-rose-700 dark:text-rose-300"
                   aria-hidden="true"
                 >
                   ✕
@@ -998,8 +1071,8 @@ function RollupCard({
                 <span
                   className={
                     uxV1
-                      ? "text-[11px] text-rose-300/80"
-                      : "font-mono text-[11px] text-rose-300/80"
+                      ? "text-[11px] text-rose-700 dark:text-rose-300/80"
+                      : "font-mono text-[11px] text-rose-700 dark:text-rose-300/80"
                   }
                   title={uxV1 ? b.label : undefined}
                 >
@@ -1048,7 +1121,7 @@ function DetailView({
           type="button"
           onClick={onCollapse}
           aria-label="Collapse turn"
-          className="flex w-full items-center justify-end gap-1.5 px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500 hover:text-slate-300"
+          className="flex w-full items-center justify-end gap-1.5 px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground hover:text-tertiary-foreground dark:text-slate-500"
         >
           <span>Collapse</span>
           <span aria-hidden="true" className="rotate-90 text-[13px]">
@@ -1098,13 +1171,13 @@ function DetailView({
       !designStarted &&
       !turn.terminal &&
       !["docs_answer", "refuse", "clarify"].includes(effectiveMode(turn)) ? (
-        <div className="pl-9 text-[12px] italic text-slate-500">
+        <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
           Waiting for the first block to start…
         </div>
       ) : null}
 
       {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
-        <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-slate-200">
+        <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
           {turn.narrativeSummary?.trim() || turn.terminalMessage?.trim()}
         </div>
       ) : null}

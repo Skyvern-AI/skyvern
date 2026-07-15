@@ -60,6 +60,7 @@ BuildTestOutcomeReasonCode = Literal[
     "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
+    "definition_contract_unsatisfied",
     "fallback_floor_turn_unsatisfiable",
     "output_source_unobservable",
     "actuation_exhausted",
@@ -344,6 +345,7 @@ def _binding_frontier_facet(outcome: RecordedBuildTestOutcome) -> BindingFrontie
         "sandbox_unresolved_name",
         "synthesized_parameter_binding_ambiguous",
         "required_input_unbound",
+        "definition_contract_unsatisfied",
     }:
         return "amend_in_place"
     if outcome.reason_code in {"outcome_not_demonstrated", "no_meaningful_output", "runtime_missing_output_dependency"}:
@@ -465,6 +467,8 @@ def recorded_outcome_grounding_requires_current_page(ctx: object) -> bool:
     requirement = getattr(ctx, "recorded_outcome_grounding_requirement", None)
     if not isinstance(requirement, RecordedOutcomeGroundingRequirement) or requirement.satisfied:
         return False
+    if requirement.phase == "author_time_reject":
+        return True
     if isinstance(requirement.workflow_run_id, str) and requirement.workflow_run_id:
         return True
     evidence = getattr(ctx, "composition_page_evidence", None)

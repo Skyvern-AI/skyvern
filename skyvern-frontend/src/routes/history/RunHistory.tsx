@@ -59,6 +59,7 @@ import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import {
@@ -77,6 +78,21 @@ import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingStat
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
+import { useRunTagsBatchQuery } from "@/routes/tasks/hooks/useRunTagsBatchQuery";
+import { useRunTagSuggestionsQuery } from "@/routes/tasks/hooks/useRunTagSuggestionsQuery";
+import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
+import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
+import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
+import { TagFilterControl } from "@/routes/workflows/components/tagging/TagFilterControl";
+import { useRunTagFilterParam } from "@/routes/workflows/hooks/useRunTagFilterParam";
+import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import {
+  SelectionCheckboxCell,
+  SelectionHeaderCheckboxCell,
+} from "@/components/SelectionCheckbox";
+import { useRowSelection } from "@/hooks/useRowSelection";
+import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
+import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
 
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
@@ -183,17 +199,33 @@ function RunHistory() {
     () => runTypeGroups.flatMap((group) => runTypeGroupToRunTypes[group]),
     [runTypeGroups],
   );
+  const { tagTerms, tagsParam, writeTagsParam } = useRunTagFilterParam(
+    searchParams,
+    setSearchParams,
+  );
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  // A stale ?tags= URL param would 403 the request when tagging is disabled.
+  const effectiveTagsParam = taggingEnabled ? tagsParam : undefined;
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
 
-  const effectiveSearch = workflowPermanentIdFilter || debouncedSearch;
+  // The /runs search_key requires min 3 chars (trigram index); shorter queries 422.
+  const trimmedSearch = debouncedSearch.trim();
+  const textSearch = trimmedSearch.length >= 3 ? trimmedSearch : "";
+  const effectiveSearch = workflowPermanentIdFilter || textSearch;
 
-  const { data: rawRuns, isFetching } = useRunsQuery({
+  const {
+    data: rawRuns,
+    isFetching,
+    isError,
+    refetch,
+  } = useRunsQuery({
     page,
     pageSize: itemsPerPage,
     statusFilters,
     runTypeFilters,
     search: effectiveSearch,
+    tags: effectiveTagsParam,
   });
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
@@ -204,6 +236,7 @@ function RunHistory() {
     statusFilters,
     runTypeFilters,
     search: effectiveSearch,
+    tags: effectiveTagsParam,
     enabled: rawRuns?.length === itemsPerPage,
   });
 
@@ -233,6 +266,75 @@ function RunHistory() {
 
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
+
+  const runIds = useMemo(
+    () =>
+      (runs ?? [])
+        .filter((run) => run.task_run_type === TaskRunType.WorkflowRun)
+        .map((run) => run.run_id),
+    [runs],
+  );
+  const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
+    enabled: taggingEnabled,
+  });
+  const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
+  const tagDescriptions = useMemo(
+    () =>
+      new Map(
+        tagKeys.map((tagKey): [string, string | null] => [
+          tagKey.key,
+          tagKey.description,
+        ]),
+      ),
+    [tagKeys],
+  );
+  const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
+  const { data: runTagSuggestions } = useRunTagSuggestionsQuery({
+    enabled: taggingEnabled,
+  });
+  const tagFilterKeys = useMemo(
+    () =>
+      (runTagSuggestions?.keys ?? []).map((key) => ({
+        key,
+        description: null,
+        workflow_count: 0,
+      })),
+    [runTagSuggestions?.keys],
+  );
+  const selectableRuns = useMemo(
+    () =>
+      taggingEnabled
+        ? (runs ?? []).filter(
+            (run) => run.task_run_type === TaskRunType.WorkflowRun,
+          )
+        : [],
+    [runs, taggingEnabled],
+  );
+  const showCheckbox = selectableRuns.length > 0;
+  const columnCount = showCheckbox ? 7 : 6;
+  const {
+    selectedItems: selectedRuns,
+    isSelected,
+    allSelected,
+    someSelected,
+    indexById: selectableIndexById,
+    handleSelect,
+    toggleSelectAll,
+    clearSelection,
+  } = useRowSelection({
+    items: selectableRuns,
+    getId: (run) => run.run_id,
+    resetKey: JSON.stringify([
+      page,
+      statusFilters,
+      runTypeGroups,
+      tagsParam,
+      workflowPermanentIdFilter,
+      textSearch,
+      taggingEnabled,
+    ]),
+    anchorResetKey: itemsPerPage,
+  });
 
   const { matchesParameter } = useKeywordSearch(debouncedSearch);
   const { expandedRows, toggleExpanded: toggleParametersExpanded } =
@@ -271,16 +373,38 @@ function RunHistory() {
     if (isFetching) {
       return Array.from({ length: 10 }).map((_, index) => (
         <TableRow key={`row-${index}`}>
-          <TableCell colSpan={6}>
+          <TableCell colSpan={columnCount}>
             <Skeleton className="h-4 w-full" />
           </TableCell>
         </TableRow>
       ));
     }
 
+    // Failed to load runs
+    if (isError) {
+      return (
+        <TableMessageRow colSpan={columnCount}>
+          <div className="flex items-center justify-center gap-3">
+            <span>Failed to load runs.</span>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                refetch();
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        </TableMessageRow>
+      );
+    }
+
     // No runs found
     if (runs?.length === 0) {
-      return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
+      return (
+        <TableMessageRow colSpan={columnCount}>No runs found</TableMessageRow>
+      );
     }
 
     return runs?.map((run, index) => {
@@ -292,6 +416,10 @@ function RunHistory() {
       const isExpanded = isWorkflowRun && expandedRows.has(run.run_id);
       const navPath = getRunNavigationPath(run, studioEnabled);
       const triggerType = inferTriggerType(run);
+      const runTags = runTagsMap[run.run_id];
+      const selectableIndex = selectableIndexById.get(run.run_id) ?? -1;
+      const isRowSelected = isSelected(run.run_id);
+      const taggable = taggingEnabled && isWorkflowRun;
 
       const titleContent =
         triggerType || run.script_run || run.workflow_deleted ? (
@@ -320,77 +448,121 @@ function RunHistory() {
           (run.title ?? "")
         );
 
+      const mainRow = (
+        <TableRow
+          className="group/row cursor-pointer select-none"
+          data-state={isRowSelected ? "selected" : undefined}
+          data-hint={index === 0 ? "run-recording" : undefined}
+          onClick={(event) => {
+            handleNavigate(event, navPath);
+          }}
+        >
+          {showCheckbox &&
+            (taggable ? (
+              <SelectionCheckboxCell
+                index={selectableIndex}
+                checked={isRowSelected}
+                hasSelection={selectedRuns.length > 0}
+                onSelect={handleSelect}
+                ariaLabel={`Select ${run.title ?? run.run_id}`}
+              />
+            ) : (
+              <TableCell />
+            ))}
+          <TableCell className="max-w-0 truncate" title={run.run_id}>
+            <HighlightText text={run.run_id} query={textSearch} />
+          </TableCell>
+          <TableCell
+            className="max-w-0 truncate"
+            title={run.title ?? undefined}
+          >
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="min-w-0 truncate">{titleContent}</div>
+              {taggingEnabled && runTags && runTags.length > 0 ? (
+                <TagChipList
+                  tags={runTags}
+                  descriptions={tagDescriptions}
+                  colors={tagColors}
+                  maxVisible={2}
+                  hideSystemTags
+                  compact
+                  className="shrink-0"
+                />
+              ) : null}
+            </div>
+          </TableCell>
+          <TableCell>
+            {isKnownStatus(run.status) ? (
+              <StatusBadge status={run.status} />
+            ) : (
+              <span className="text-sm text-neutral-600 dark:text-slate-400">
+                {run.status}
+              </span>
+            )}
+          </TableCell>
+          <TableCell
+            className="max-w-0 truncate"
+            title={basicTimeFormat(run.created_at)}
+          >
+            {basicLocalTimeFormat(run.created_at)}
+          </TableCell>
+          <TableCell className="text-neutral-600 dark:text-slate-400">
+            {executionTime ?? "-"}
+          </TableCell>
+          <TableCell>
+            {isWorkflowRun ? (
+              <div className="flex justify-end">
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleParametersExpanded(run.run_id);
+                        }}
+                        className={cn(
+                          "text-muted-foreground hover:text-foreground",
+                          isExpanded && "text-blue-400",
+                        )}
+                      >
+                        <MixerHorizontalIcon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {isExpanded ? "Hide Inputs" : "Show Inputs"}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+            ) : null}
+          </TableCell>
+        </TableRow>
+      );
+
       return (
         <React.Fragment key={run.task_run_id}>
-          <TableRow
-            className="cursor-pointer"
-            data-hint={index === 0 ? "run-recording" : undefined}
-            onClick={(event) => {
-              handleNavigate(event, navPath);
-            }}
-          >
-            <TableCell className="max-w-0 truncate" title={run.run_id}>
-              <HighlightText text={run.run_id} query={debouncedSearch} />
-            </TableCell>
-            <TableCell
-              className="max-w-0 truncate"
-              title={run.title ?? undefined}
+          {taggable ? (
+            <RunRowContextMenu
+              workflowRunId={run.run_id}
+              runPath={navPath}
+              currentTags={runTags ?? []}
+              tagKeys={tagFilterKeys}
+              labelSuggestions={runTagSuggestions?.labels ?? []}
+              valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+              selectedCount={selectedRuns.length}
+              onNavigate={navigate}
             >
-              {titleContent}
-            </TableCell>
-            <TableCell>
-              {isKnownStatus(run.status) ? (
-                <StatusBadge status={run.status} />
-              ) : (
-                <span className="text-sm text-neutral-600 dark:text-slate-400">
-                  {run.status}
-                </span>
-              )}
-            </TableCell>
-            <TableCell
-              className="max-w-0 truncate"
-              title={basicTimeFormat(run.created_at)}
-            >
-              {basicLocalTimeFormat(run.created_at)}
-            </TableCell>
-            <TableCell className="text-neutral-600 dark:text-slate-400">
-              {executionTime ?? "-"}
-            </TableCell>
-            <TableCell>
-              {isWorkflowRun ? (
-                <div className="flex justify-end">
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleParametersExpanded(run.run_id);
-                          }}
-                          className={cn(
-                            "text-muted-foreground hover:text-foreground",
-                            isExpanded && "text-blue-400",
-                          )}
-                        >
-                          <MixerHorizontalIcon className="h-4 w-4" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        {isExpanded ? "Hide Inputs" : "Show Inputs"}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                </div>
-              ) : null}
-            </TableCell>
-          </TableRow>
-
+              {mainRow}
+            </RunRowContextMenu>
+          ) : (
+            mainRow
+          )}
           {isExpanded && run.workflow_permanent_id && (
             <TableRow key={`${run.run_id}-params`}>
               <TableCell
-                colSpan={6}
+                colSpan={columnCount}
                 className="bg-slate-50 dark:bg-slate-900/50"
               >
                 <WorkflowRunParametersInline
@@ -417,7 +589,8 @@ function RunHistory() {
   const hasActiveFilters =
     statusFilters.length > 0 ||
     runTypeGroups.length > 0 ||
-    !!debouncedSearch ||
+    tagTerms.length > 0 ||
+    !!textSearch ||
     !!workflowPermanentIdFilter;
   const showOnboardingEmpty =
     !isFetching &&
@@ -471,22 +644,34 @@ function RunHistory() {
             </div>
           ) : null}
           <div className="flex items-center justify-between gap-4">
-            <TableSearchInput
-              value={search}
-              onChange={(value) => {
-                setSearch(value);
-                const params = new URLSearchParams(searchParams);
-                params.set("page", "1");
-                setSearchParams(params, { replace: true });
-              }}
-              placeholder={
-                workflowPermanentIdFilter
-                  ? "Clear the agent filter above to search"
-                  : "Search by run ID or input..."
-              }
-              disabled={!!workflowPermanentIdFilter}
-              className="w-48 lg:w-72"
-            />
+            <div className="flex items-center gap-2">
+              <TableSearchInput
+                value={search}
+                onChange={(value) => {
+                  setSearch(value);
+                  const params = new URLSearchParams(searchParams);
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+                placeholder={
+                  workflowPermanentIdFilter
+                    ? "Clear the agent filter above to search"
+                    : "Search by run ID or input..."
+                }
+                disabled={!!workflowPermanentIdFilter}
+                className="w-48 lg:w-72"
+              />
+              {taggingEnabled ? (
+                <TagFilterControl
+                  tagKeys={tagFilterKeys}
+                  labelSuggestions={runTagSuggestions?.labels}
+                  valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                  value={tagTerms}
+                  onChange={writeTagsParam}
+                  colors={tagColors}
+                />
+              ) : null}
+            </div>
             <div className="flex items-center gap-2">
               <RunTypeFilterDropdown
                 values={runTypeGroups}
@@ -519,7 +704,17 @@ function RunHistory() {
           <div className="overflow-hidden rounded-lg border border-border">
             <Table className="sm:table-fixed">
               <TableHeader>
-                <TableRow>
+                <TableRow className="group/header">
+                  {showCheckbox && (
+                    <SelectionHeaderCheckboxCell
+                      allSelected={allSelected}
+                      someSelected={someSelected}
+                      hasSelection={selectedRuns.length > 0}
+                      onToggleAll={toggleSelectAll}
+                      ariaLabel="Select all workflow runs"
+                      className="w-10"
+                    />
+                  )}
                   <TableHead className="w-[20%]">Run ID</TableHead>
                   <TableHead className="w-[20%]">Detail</TableHead>
                   <TableHead className="w-[16%]">Status</TableHead>
@@ -530,6 +725,16 @@ function RunHistory() {
               </TableHeader>
               <TableBody>{displayTableBody()}</TableBody>
             </Table>
+            {taggingEnabled && selectedRuns.length > 0 ? (
+              <RunBulkActionBar
+                selectedRunIds={selectedRuns.map((run) => run.run_id)}
+                runTagsMap={runTagsMap}
+                tagKeys={tagFilterKeys}
+                labelSuggestions={runTagSuggestions?.labels ?? []}
+                valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                onClearSelection={clearSelection}
+              />
+            ) : null}
             <div className="relative px-3 py-3">
               <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
                 <span className="text-neutral-600 dark:text-slate-400">

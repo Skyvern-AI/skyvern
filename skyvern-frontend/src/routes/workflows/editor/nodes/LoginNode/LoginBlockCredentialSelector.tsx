@@ -458,7 +458,7 @@ function LoginBlockCredentialSelector({
                           <div className="flex min-w-0 items-center gap-2">
                             <span className="truncate">{option.label}</span>
                             {option.hasBrowserProfile ? (
-                              <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
+                              <span className="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900/40 dark:text-green-400">
                                 saved-profile
                               </span>
                             ) : null}
@@ -481,17 +481,17 @@ function LoginBlockCredentialSelector({
             {selectedRotationCredentials.map((credential, index) => (
               <div
                 key={credential.value}
-                className="flex items-center gap-2 rounded-md border border-slate-700/60 bg-slate-900/40 px-2 py-1.5"
+                className="flex items-center gap-2 rounded-md border border-border/60 bg-slate-elevation1/40 px-2 py-1.5"
               >
-                <span className="flex size-5 shrink-0 items-center justify-center rounded bg-slate-800 text-[10px] text-slate-300">
+                <span className="flex size-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] text-tertiary-foreground">
                   {index + 1}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-slate-200">
+                <span className="min-w-0 flex-1 truncate text-xs text-foreground dark:text-slate-200">
                   {credential.label}
                 </span>
                 {credential.hasBrowserProfile ? (
                   <span
-                    className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400"
+                    className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
                     title="Has a saved browser profile - runs with this account keep its logged-in session"
                   >
                     Profile
@@ -499,7 +499,7 @@ function LoginBlockCredentialSelector({
                 ) : null}
                 <button
                   type="button"
-                  className="text-slate-500 transition-colors hover:text-slate-200 disabled:pointer-events-none disabled:opacity-50"
+                  className="text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500 dark:hover:text-slate-200"
                   disabled={!editable || selectedRotationCredentials.length < 2}
                   onClick={() => toggleRotationCredential(credential.value)}
                   aria-label={`Remove ${credential.label}`}
@@ -511,10 +511,10 @@ function LoginBlockCredentialSelector({
           </div>
 
           {rotationCredentialIds.length > 1 ? (
-            <div className="flex items-start gap-2 text-xs text-slate-400">
+            <div className="flex items-start gap-2 text-xs text-muted-foreground">
               <div className="space-y-0.5">
                 <span>Disable parallel runs</span>
-                <p className="text-[11px] leading-4 text-slate-500">
+                <p className="text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
                   Queues this workflow's runs one at a time so rotated accounts
                   never log in simultaneously.
                 </p>
@@ -534,7 +534,7 @@ function LoginBlockCredentialSelector({
 
           <button
             type="button"
-            className="text-xs text-slate-400 transition-colors hover:text-slate-200 disabled:pointer-events-none disabled:opacity-50"
+            className="text-xs text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none disabled:opacity-50 dark:hover:text-slate-200"
             disabled={!editable}
             onClick={disableRotation}
           >
@@ -705,7 +705,7 @@ function LoginBlockCredentialSelector({
                 <span>{option.label}</span>
                 {"hasBrowserProfile" in option && option.hasBrowserProfile && (
                   <>
-                    <span className="rounded bg-green-900/40 px-1.5 py-0.5 text-[10px] text-green-400">
+                    <span className="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900/40 dark:text-green-400">
                       saved-profile
                     </span>
                     {option.browserProfileUrl && (
@@ -726,7 +726,7 @@ function LoginBlockCredentialSelector({
       !isCredentialMissing ? (
         <button
           type="button"
-          className="mt-2 inline-flex items-center gap-1 text-xs text-slate-400 transition-colors hover:text-slate-200 disabled:pointer-events-none disabled:opacity-50"
+          className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none disabled:opacity-50 dark:hover:text-slate-200"
           disabled={!editable}
           onClick={() => setRotationDraft(true)}
         >

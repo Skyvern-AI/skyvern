@@ -95,8 +95,8 @@ function ScriptFixInput({
       )}
       {/* Expanded input panel */}
       {isOpen && (
-        <div className="flex w-full flex-col gap-2 rounded-md border border-slate-700 bg-slate-elevation2 p-3">
-          <div className="flex items-center gap-2 text-xs font-medium text-slate-300">
+        <div className="flex w-full flex-col gap-2 rounded-md border border-border bg-slate-elevation2 p-3">
+          <div className="flex items-center gap-2 text-xs font-medium text-tertiary-foreground">
             <MagicWandIcon className="h-3.5 w-3.5" />
             Describe what to fix
           </div>
@@ -115,7 +115,7 @@ function ScriptFixInput({
             }}
           />
           <div className="flex items-center justify-between">
-            <span className="text-[10px] text-slate-500">
+            <span className="text-[10px] text-muted-foreground dark:text-slate-500">
               {isPending ? "Reviewing script..." : "Cmd/Ctrl+Enter to submit"}
             </span>
             <div className="flex gap-2">

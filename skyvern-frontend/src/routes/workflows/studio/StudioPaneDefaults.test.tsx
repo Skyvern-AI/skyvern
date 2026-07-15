@@ -82,19 +82,19 @@ beforeEach(() => {
 });
 
 describe("cold-entry default panes (the four contexts)", () => {
-  test("an empty agent starts on Copilot + Browser", () => {
+  test("an empty agent starts on Editor + Browser", () => {
     renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("copilot,browser");
+    expect(panesText()).toBe("editor,browser");
   });
 
-  test("a built agent starts on Copilot + Browser + Editor", () => {
+  test("a built agent also starts on Editor + Browser", () => {
     renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("copilot,browser,editor");
+    expect(panesText()).toBe("editor,browser");
   });
 
-  test("a run in the URL lands on Copilot + Browser + Overview", () => {
+  test("a run in the URL lands on Browser + Overview", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
-    expect(panesText()).toBe("copilot,browser,overview");
+    expect(panesText()).toBe("browser,overview");
   });
 
   test("a block-run deep link lands on Editor + Browser + Overview", () => {
@@ -104,7 +104,7 @@ describe("cold-entry default panes (the four contexts)", () => {
 
   test("a blocks signal that changes after mount does not reshuffle the panes", () => {
     const { rerender } = renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("copilot,browser");
+    expect(panesText()).toBe("editor,browser");
     rerender(
       <MemoryRouter initialEntries={["/workflows/wpid_1/studio"]}>
         <StudioPaneDefaultsProvider hasBlocks={true}>
@@ -112,7 +112,7 @@ describe("cold-entry default panes (the four contexts)", () => {
         </StudioPaneDefaultsProvider>
       </MemoryRouter>,
     );
-    expect(panesText()).toBe("copilot,browser");
+    expect(panesText()).toBe("editor,browser");
   });
 
   test("an explicit ?panes= is never overridden by the state default", () => {
@@ -127,8 +127,8 @@ describe("cold-entry default panes (the four contexts)", () => {
 
   test("toggling from the state default writes the default plus the change", () => {
     renderStudio({ hasBlocks: false });
-    fireEvent.click(screen.getByText("open-editor"));
-    expect(panesText()).toBe("copilot,browser,editor");
+    fireEvent.click(screen.getByText("toggle-overview"));
+    expect(panesText()).toBe("editor,browser,overview");
   });
 });
 
@@ -233,9 +233,8 @@ describe("gesture learning — edit-class writes reach the store", () => {
   test("a gesture toggle on an edit URL learns the resulting layout", () => {
     renderGestureStudio();
     fireEvent.click(screen.getByText("gesture-toggle-editor"));
-    // default built-agent: copilot,browser,editor → toggle closes editor → copilot,browser
+    // default built-agent: editor,browser → toggle closes editor → browser
     expect(useStudioShellStore.getState().paneLayouts["edit"]).toEqual([
-      "copilot",
       "browser",
     ]);
   });
@@ -268,18 +267,20 @@ describe("gesture learning — edit-class writes reach the store", () => {
 
 describe("restore from learned edit layout", () => {
   test("a built agent restores the last learned edit layout", () => {
-    // Pre-seed the store as if the user previously arranged their panes.
-    useStudioShellStore.getState().setPaneLayout("edit", ["editor", "browser"]);
+    // Pre-seed a layout distinct from the factory default so the restore is provable.
+    useStudioShellStore.getState().setPaneLayout("edit", ["browser", "editor"]);
 
     renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("editor,browser");
+    expect(panesText()).toBe("browser,editor");
   });
 
   test("an empty agent ignores the learned layout and always shows factory default", () => {
-    useStudioShellStore.getState().setPaneLayout("edit", ["editor", "browser"]);
+    useStudioShellStore
+      .getState()
+      .setPaneLayout("edit", ["overview", "browser"]);
 
     renderStudio({ hasBlocks: false });
-    expect(panesText()).toBe("copilot,browser");
+    expect(panesText()).toBe("editor,browser");
   });
 
   test("an explicit ?panes= beats the learned layout", () => {
@@ -293,7 +294,7 @@ describe("restore from learned edit layout", () => {
     useStudioShellStore.getState().setPaneLayout("edit", ["editor", "browser"]);
 
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1" });
-    expect(panesText()).toBe("copilot,browser,overview");
+    expect(panesText()).toBe("browser,overview");
   });
 
   test("a learned layout with an unknown pane id is sanitized to known ids only", () => {
@@ -314,7 +315,7 @@ describe("restore from learned edit layout", () => {
     });
 
     renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("copilot,browser,editor");
+    expect(panesText()).toBe("editor,browser");
   });
 
   test("a corrupted non-array learned layout falls back without throwing", () => {
@@ -323,6 +324,6 @@ describe("restore from learned edit layout", () => {
     });
 
     renderStudio({ hasBlocks: true });
-    expect(panesText()).toBe("copilot,browser,editor");
+    expect(panesText()).toBe("editor,browser");
   });
 });

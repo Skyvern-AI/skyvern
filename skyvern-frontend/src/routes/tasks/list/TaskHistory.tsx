@@ -183,14 +183,17 @@ function TaskHistory() {
                       className="w-1/4 cursor-pointer"
                       onClick={(event) => handleNavigate(event, task.task_id)}
                     >
-                      <div className="flex min-w-0 flex-col gap-1">
-                        <span>{task.task_id}</span>
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="min-w-0 truncate">{task.task_id}</span>
                         {taggingEnabled && runTags && runTags.length > 0 ? (
                           <TagChipList
                             tags={runTags}
                             descriptions={tagDescriptions}
                             colors={tagColors}
                             maxVisible={2}
+                            hideSystemTags
+                            compact
+                            className="shrink-0"
                           />
                         ) : null}
                       </div>

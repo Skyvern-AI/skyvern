@@ -46,61 +46,123 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
 )
 
 
+_JS_TEXT_HELPER = "const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
+
+_JS_IS_EDITABLE_HELPER = (
+    "const isEditable = (node) => {"
+    "  const tag = (node.tagName || '').toLowerCase();"
+    "  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;"
+    "  return node.isContentEditable === true;"
+    "};"
+)
+
+_JS_IMPLICIT_ROLE_HELPER = (
+    "const implicitRole = (node) => {"
+    "  const tag = (node.tagName || '').toLowerCase();"
+    "  const type = (node.getAttribute('type') || '').toLowerCase();"
+    "  if (tag === 'a' && node.hasAttribute('href')) return 'link';"
+    "  if (tag === 'button') return 'button';"
+    "  if (tag === 'select') return 'combobox';"
+    "  if (tag === 'textarea') return 'textbox';"
+    "  if (tag === 'input') {"
+    "    if (['button', 'submit', 'reset'].includes(type)) return 'button';"
+    "    if (type === 'checkbox') return 'checkbox';"
+    "    if (type === 'radio') return 'radio';"
+    "    if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
+    "  }"
+    "  if (/^h[1-6]$/.test(tag)) return 'heading';"
+    "  return '';"
+    "};"
+)
+
+# ARIA roles whose accessible name is computed from the element's own text content (ARIA name-from-content).
+# Editable roles (textbox/combobox/searchbox/spinbutton/listbox) are deliberately absent so a typed-into
+# control never leaks its value as an accessible name.
+_JS_NAME_FROM_CONTENT_ROLES = (
+    "const nameFromContentRoles = new Set(["
+    "'button', 'link', 'checkbox', 'radio', 'heading', 'tab', 'menuitem', "
+    "'menuitemcheckbox', 'menuitemradio', 'option', 'switch', 'treeitem', "
+    "'cell', 'gridcell', 'columnheader', 'rowheader', 'row', 'tooltip'"
+    "]);"
+)
+
+_JS_ACCESSIBLE_NAME_HELPER = (
+    "const accessibleName = (node, role) => {"
+    "  const aria = text(node.getAttribute('aria-label'));"
+    "  if (aria) return aria;"
+    "  const labelledby = node.getAttribute('aria-labelledby');"
+    "  if (labelledby) {"
+    "    const parts = labelledby.split(/\\s+/).map((id) => {"
+    "      const ref = document.getElementById(id);"
+    "      return ref ? text(ref.textContent) : '';"
+    "    }).filter(Boolean);"
+    "    if (parts.length) return text(parts.join(' '));"
+    "  }"
+    "  const id = node.getAttribute('id');"
+    "  if (id) {"
+    "    let lab = null;"
+    "    try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
+    "    if (lab) { const t = text(lab.textContent); if (t) return t; }"
+    "  }"
+    "  const parentLabel = node.closest ? node.closest('label') : null;"
+    "  if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
+    "  const title = text(node.getAttribute('title'));"
+    "  if (title) return title;"
+    "  const placeholder = text(node.getAttribute('placeholder'));"
+    "  if (placeholder) return placeholder;"
+    "  if (role && nameFromContentRoles.has(role) && !isEditable(node)) {"
+    "    const content = text(node.textContent);"
+    "    if (content) return content;"
+    "  }"
+    "  return '';"
+    "};"
+)
+
+
 # Given a CSS selector, return the element's ARIA role and accessible name so the code-block
-# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The
-# name is read only from true label sources, never the element's own textContent/value.
+# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The name
+# follows the ARIA algorithm: label sources first, then name-from-content for content-named roles only.
 def scout_accessible_role_name_expression(css_selector: str) -> str:
     sel = json.dumps(css_selector)
     return (
         "(() => {"
         f"  const el = document.querySelector({sel});"
         "  if (!el) return null;"
-        "  const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
-        "  const implicitRole = (node) => {"
-        "    const tag = (node.tagName || '').toLowerCase();"
-        "    const type = (node.getAttribute('type') || '').toLowerCase();"
-        "    if (tag === 'a' && node.hasAttribute('href')) return 'link';"
-        "    if (tag === 'button') return 'button';"
-        "    if (tag === 'select') return 'combobox';"
-        "    if (tag === 'textarea') return 'textbox';"
-        "    if (tag === 'input') {"
-        "      if (['button', 'submit', 'reset'].includes(type)) return 'button';"
-        "      if (type === 'checkbox') return 'checkbox';"
-        "      if (type === 'radio') return 'radio';"
-        "      if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
-        "    }"
-        "    if (/^h[1-6]$/.test(tag)) return 'heading';"
-        "    return '';"
-        "  };"
-        "  const accessibleName = (node) => {"
-        "    const aria = text(node.getAttribute('aria-label'));"
-        "    if (aria) return aria;"
-        "    const labelledby = node.getAttribute('aria-labelledby');"
-        "    if (labelledby) {"
-        "      const parts = labelledby.split(/\\s+/).map((id) => {"
-        "        const ref = document.getElementById(id);"
-        "        return ref ? text(ref.textContent) : '';"
-        "      }).filter(Boolean);"
-        "      if (parts.length) return text(parts.join(' '));"
-        "    }"
-        "    const id = node.getAttribute('id');"
-        "    if (id) {"
-        "      let lab = null;"
-        "      try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
-        "      if (lab) { const t = text(lab.textContent); if (t) return t; }"
-        "    }"
-        "    const parentLabel = node.closest ? node.closest('label') : null;"
-        "    if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
-        # textContent/value are never name sources: for a typed-into textbox/contenteditable
-        # they would leak the raw typed value as accessible_name.
-        "    const title = text(node.getAttribute('title'));"
-        "    if (title) return title;"
-        "    const placeholder = text(node.getAttribute('placeholder'));"
-        "    if (placeholder) return placeholder;"
-        "    return '';"
-        "  };"
+        f"  {_JS_TEXT_HELPER}"
+        f"  {_JS_IS_EDITABLE_HELPER}"
+        f"  {_JS_IMPLICIT_ROLE_HELPER}"
+        f"  {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"  {_JS_ACCESSIBLE_NAME_HELPER}"
         "  const role = text(el.getAttribute('role')) || implicitRole(el);"
-        "  return { role: role, accessible_name: accessibleName(el) };"
+        "  return { role: role, accessible_name: accessibleName(el, role) };"
+        "})()"
+    )
+
+
+# Count elements whose computed ARIA role and accessible name exactly match, so a scout-ambiguous
+# selector's get_by_role(role, name, exact=True) re-anchor is only trusted when it resolves uniquely.
+def role_name_match_count_expression(role: str, name: str) -> str:
+    target_role = json.dumps(role)
+    target_name = json.dumps(name)
+    return (
+        "(() => {"
+        "  try {"
+        f"    {_JS_TEXT_HELPER}"
+        f"    {_JS_IS_EDITABLE_HELPER}"
+        f"    {_JS_IMPLICIT_ROLE_HELPER}"
+        f"    {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"    {_JS_ACCESSIBLE_NAME_HELPER}"
+        f"    const targetRole = {target_role};"
+        f"    const targetName = {target_name};"
+        "    let count = 0;"
+        "    const nodes = document.querySelectorAll('*');"
+        "    for (const el of nodes) {"
+        "      const role = text(el.getAttribute('role')) || implicitRole(el);"
+        "      if (role !== targetRole) continue;"
+        "      if (accessibleName(el, role) === targetName) { count++; if (count > 1) break; }"
+        "    }"
+        "    return count;"
+        "  } catch (e) { return -1; }"
         "})()"
     )
 

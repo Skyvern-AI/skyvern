@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import CallerType
+from skyvern.forge.sdk.workflow.models.validators import TAG_COLOR_PALETTE
 
 ORG_ID = "o_test"
 OTHER_ORG_ID = "o_other"
@@ -1036,6 +1037,47 @@ def test_patch_tag_value_invalid_color_returns_422(client: TestClient) -> None:
 def test_patch_tag_value_reserved_prefix_returns_400(client: TestClient) -> None:
     resp = client.patch("/v1/tag-values/skyvern.system", json={"value": "prod", "color": "blue"})
     assert resp.status_code == 400
+
+
+# ----------------------------- POST /tag-values ------------------------------------
+
+
+def test_create_tag_value_registers_label(client: TestClient) -> None:
+    resp = client.post("/v1/tag-values", json={"key": "env", "value": "prod", "color": "blue"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"key": "env", "value": "prod", "color": "blue", "workflow_count": 0}
+    values = client.get("/v1/tag-values").json()
+    assert [(v["key"], v["value"], v["color"], v["workflow_count"]) for v in values] == [("env", "prod", "blue", 0)]
+    # The group is registered for pickers even before any workflow uses it.
+    keys = client.get("/v1/tag-keys").json()
+    assert [k["key"] for k in keys] == ["env"]
+
+
+def test_create_tag_value_409_when_already_registered(client: TestClient) -> None:
+    client.post("/v1/tag-values", json={"key": "env", "value": "prod", "color": "blue"})
+    resp = client.post("/v1/tag-values", json={"key": "env", "value": "prod", "color": "red"})
+    assert resp.status_code == 409
+
+
+def test_create_tag_value_reserved_key_returns_422(client: TestClient) -> None:
+    resp = client.post("/v1/tag-values", json={"key": "skyvern.platform", "value": "web", "color": "blue"})
+    assert resp.status_code == 422
+
+
+def test_create_tag_value_invalid_color_returns_422(client: TestClient) -> None:
+    resp = client.post("/v1/tag-values", json={"key": "env", "value": "prod", "color": "chartreuse"})
+    assert resp.status_code == 422
+
+
+def test_create_tag_value_defaults_color_when_omitted(client: TestClient) -> None:
+    resp = client.post("/v1/tag-values", json={"key": "env", "value": "prod"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["color"] in TAG_COLOR_PALETTE
+
+
+def test_create_tag_value_legacy_route_works(client: TestClient) -> None:
+    resp = client.post("/api/v1/tag-values", json={"key": "env", "value": "prod", "color": "blue"})
+    assert resp.status_code == 200, resp.text
 
 
 # ----------------------------- GET /tag-values workflow_count ----------------------

@@ -81,6 +81,7 @@ import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecove
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isFirstFailedRunRecoveryEligible } from "@/util/onboarding/rolloutGating";
+import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
 
 function WorkflowRunRightColumn({
   activeItem,
@@ -127,7 +128,7 @@ function WorkflowRunRightColumn({
         </div>
       }
       bottom={
-        <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
+        <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
           <WorkflowRunBlockDetail
             activeItem={activeItem}
             activeIteration={activeIteration}
@@ -391,7 +392,7 @@ function WorkflowRun() {
         />
       )}
       {shouldShowFinallyNote && (
-        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-200">
+        <div className="mt-2 flex items-center gap-2 rounded bg-amber-500/20 px-3 py-2 text-sm text-amber-700 dark:text-amber-200">
           <span className="font-medium">Note:</span>
           <span>
             "Execute on any outcome" block ({finallyBlockLabel}){" "}
@@ -570,6 +571,9 @@ function WorkflowRun() {
             <h2 className="text-2xl text-neutral-600 dark:text-slate-400">
               {workflowRunId}
             </h2>
+            {workflowRunId ? (
+              <RunTagsEditor workflowRunId={workflowRunId} />
+            ) : null}
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||

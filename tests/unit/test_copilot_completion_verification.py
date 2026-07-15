@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
+    is_registered_download_completion_criterion,
     only_degraded_blocking,
     registered_download_completion_criterion,
     run_plane_all_no_evidence,
@@ -9903,6 +9904,13 @@ def test_snapshot_summarizes_registered_download_outputs() -> None:
     assert "RecordingLocator" not in rendered and "Download" not in rendered and "secret" not in rendered
 
 
+_REGISTERED_DOWNLOAD_OUTPUT: dict[str, Any] = {
+    "downloaded_files": [{"filename": "statement.pdf"}],
+    "downloaded_file_urls": [],
+    "downloaded_file_artifact_ids": [],
+}
+
+
 def _download_result(output: dict[str, Any]) -> dict:
     return {
         "ok": True,
@@ -10428,6 +10436,118 @@ def test_download_reconciliation_does_not_mutate_request_policy() -> None:
 
     assert [criterion.id for criterion in reconciled] == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
     assert ctx.request_policy.completion_criteria == []
+
+
+def test_reconciliation_carries_requested_output_identity_for_minted_ask() -> None:
+    ctx = _run_ctx()
+    minted = _criterion(
+        "c_download",
+        "The finished workflow produces the downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=[minted])
+
+    reconciled = _reconcile_download_completion_criterion(ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), [minted])
+
+    carried = [criterion for criterion in reconciled if is_registered_download_completion_criterion(criterion)]
+    assert [criterion.output_path for criterion in reconciled] == [None]
+    assert len(carried) == 1
+    assert carried[0].requested_output_path_mint_source == "classifier_default"
+
+
+def test_reconciliation_incidental_download_stays_uncounted() -> None:
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    reconciled = _reconcile_download_completion_criterion(ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), [])
+
+    carried = [criterion for criterion in reconciled if is_registered_download_completion_criterion(criterion)]
+    assert len(carried) == 1
+    assert carried[0].requested_output_path_mint_source is None
+
+
+@pytest.mark.asyncio
+async def test_minted_download_ask_counts_as_requested_output_and_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    minted = _criterion(
+        "c_download",
+        "The finished workflow produces the downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria_from_json(criteria_to_json([minted]))))
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.requested_output_criteria_count == 1
+    assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is False
+
+
+@pytest.mark.asyncio
+async def test_incidental_download_without_ask_stays_credit_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.criterion_ids == [REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.requested_output_criteria_count == 0
+    assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is True
+
+
+@pytest.mark.asyncio
+async def test_predeploy_persisted_download_ask_is_undercredited_until_reminted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_handler(**_: object) -> object:
+        raise AssertionError("registered download evidence must bypass the judge")
+
+    _patch_completion_handler(monkeypatch, fail_handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    minted = _criterion(
+        "c_download",
+        "The finished workflow produces the downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+    )
+    predeploy_json = criteria_to_json([minted])
+    del predeploy_json[0]["requested_output_path_mint_source"]
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria_from_json(predeploy_json)))
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.requested_output_criteria_count == 0
+    assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is True
 
 
 def test_download_grader_requires_non_empty_registered_surface() -> None:

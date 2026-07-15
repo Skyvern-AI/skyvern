@@ -12,6 +12,7 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { isRecord } from "@/util/utils";
 
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
@@ -42,6 +43,7 @@ import {
 } from "./RunOutputsSection";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunSummaryStrip } from "./RunSummaryStrip";
+import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -337,7 +339,6 @@ export function RunView({
         <WorkflowRunVerificationCodeForm
           workflowRunId={workflowRun.workflow_run_id}
         />
-
         {provisioning ? (
           <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-slate-elevation2 px-3 py-1.5 text-xs text-muted-foreground">
             <ClockIcon className="h-3.5 w-3.5 shrink-0" />
@@ -406,6 +407,19 @@ export function RunView({
                     }}
                     onBlockItemSelected={(block) => {
                       pinFrame(block.workflow_run_block_id);
+                      const handle =
+                        useWorkflowBlockSearchStore.getState().handle;
+                      if (!handle) {
+                        return;
+                      }
+                      const nodeId = resolveTimelineBlockJumpNodeId({
+                        editorOpen: studioPanes.includes("editor"),
+                        targets: handle.getTargets(),
+                        label: block.label,
+                      });
+                      if (nodeId) {
+                        handle.focusBlock(nodeId);
+                      }
                     }}
                     onThoughtItemSelected={(thought) => {
                       pinFrame(thought.thought_id);
@@ -453,6 +467,7 @@ export function RunView({
               <RunOutputsSection
                 workflowRunId={workflowRun.workflow_run_id}
                 workflowTitle={workflowRun.workflow?.title}
+                outputs={workflowRun.outputs}
                 extractedInformation={extractedInformation}
                 files={downloadedFiles}
                 errors={runErrors}

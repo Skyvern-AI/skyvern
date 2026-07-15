@@ -69,6 +69,16 @@ vi.mock("./hooks/useWorkflowTagsBatchQuery", () => ({
   useWorkflowTagsBatchQuery: () => ({ data: {} }),
 }));
 
+vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
+  useRunTagsBatchQuery: () => ({ data: {} }),
+}));
+
+vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
+  useRunTagSuggestionsQuery: () => ({
+    data: { keys: [], valuesByKey: new Map(), labels: [] },
+  }),
+}));
+
 vi.mock("./hooks/useTagKeysQuery", () => ({
   useTagKeysQuery: () => ({ data: [] }),
 }));

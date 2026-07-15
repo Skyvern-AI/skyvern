@@ -250,6 +250,41 @@ class TagValue(BaseModel):
     )
 
 
+class TagValueCreate(BaseModel):
+    """Body for ``POST /v1/tag-values``: register a grouped label before any
+    workflow uses it. The label shows a zero workflow count until applied."""
+
+    key: str = Field(description="Tag key (group) for the new label.")
+    value: str = Field(description="Tag value (label) to register under the key.")
+    color: str | None = Field(
+        None, description="Palette color name for the label; a random palette color when omitted."
+    )
+
+    @field_validator("key", mode="before")
+    @classmethod
+    def _normalize_key(cls, v: object) -> str:
+        key = normalize_optional_tag_key(v)
+        if key is None:
+            raise ValueError("tag key is required")
+        return key
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _normalize_value(cls, v: object) -> str:
+        value = normalize_tag_value(v)
+        # Grouped values reserve '*' as the group filter wildcard (mirrors TagInput).
+        if value == "*":
+            raise ValueError("grouped tag values must not be exactly '*' (reserved as the group filter wildcard)")
+        return value
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def _normalize_color(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        return normalize_tag_color(v)
+
+
 class TagValueUpdate(BaseModel):
     """Body for ``PATCH /v1/tag-values/{key}``. The value rides in the body, not the
     path, so values containing ``/`` stay addressable."""
@@ -368,3 +403,17 @@ class RunTagsBatchResponse(BaseModel):
     Runs outside the caller's org are silently absent (no leakage)."""
 
     run_tags: dict[str, list[TagItem]]
+
+
+class RunTagSuggestionsResponse(BaseModel):
+    """Response for ``GET /v1/run-tag-suggestions``: distinct (key, value) pairs
+    ever set on a run for the org, sourced from the event log rather than the
+    tag-key/tag-value registry so reserved ``skyvern.*`` system keys (never
+    registered) reach the pickers too."""
+
+    keys: list[str] = Field(default_factory=list, description="Distinct grouped tag keys seen on runs.")
+    values_by_key: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Values seen for each grouped key.",
+    )
+    labels: list[str] = Field(default_factory=list, description="Distinct standalone (keyless) labels seen on runs.")

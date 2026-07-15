@@ -1141,6 +1141,10 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
+    async def post_code_block_execution(self, task: Task, step: Step) -> None:
+        """Billing seam for a code block's container task; called only after a successful execution."""
+        return
+
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None

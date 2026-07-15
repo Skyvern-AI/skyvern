@@ -102,6 +102,84 @@ describe("derivePhases — bucket split", () => {
   });
 });
 
+describe("derivePhases — condenses each phase's entries (SKY-11971)", () => {
+  it("folds a failed-then-retried tool_call/tool_result pair in the explore bucket into one row", () => {
+    const t = turn({
+      designActivity: [
+        entry({
+          id: "tc-1",
+          kind: "tool_call",
+          toolName: "evaluate",
+        }),
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: false,
+        }),
+        entry({
+          id: "tc-2",
+          kind: "tool_call",
+          toolName: "evaluate",
+        }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: true,
+        }),
+      ],
+    });
+    const rows = derivePhases(t);
+    const exploreEntries = phase(rows, "explore").entries;
+    expect(exploreEntries).toHaveLength(1);
+    expect(exploreEntries[0]).toMatchObject({
+      id: "tr-2",
+      success: true,
+      attempts: 2,
+    });
+  });
+
+  it("REGRESSION PIN: the explore 'N steps' stub matches the condensed row count, not the raw event count (Claude catch)", () => {
+    const t = turn({
+      terminal: "response",
+      designActivity: [
+        entry({ id: "tc-1", kind: "tool_call", toolName: "evaluate" }),
+        entry({
+          id: "tr-1",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: false,
+        }),
+        entry({ id: "tc-2", kind: "tool_call", toolName: "evaluate" }),
+        entry({
+          id: "tr-2",
+          kind: "tool_result",
+          toolName: "evaluate",
+          success: true,
+        }),
+      ],
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "explore").entries).toHaveLength(1);
+    expect(phase(rows, "explore").stub).toBe("1 step");
+  });
+
+  it("leaves the earlier bucket-routing test's un-paired hand-rolled ids unaffected", () => {
+    // Regression pin: short test ids ("1"/"2"/"3"/"4") don't collide with
+    // the tc-/tr- correlation convention, so condensing is a no-op there.
+    const t = turn({
+      designActivity: [
+        entry({ id: "1", kind: "tool_call", toolName: "navigate_browser" }),
+        entry({ id: "2", kind: "tool_call", toolName: "update_workflow" }),
+      ],
+      designEnded: true,
+    });
+    const rows = derivePhases(t);
+    expect(phase(rows, "draft").entries.map((e) => e.id)).toEqual(["2"]);
+  });
+});
+
 describe("derivePhases — live progression", () => {
   it("explore is active before any authoring activity", () => {
     const t = turn({

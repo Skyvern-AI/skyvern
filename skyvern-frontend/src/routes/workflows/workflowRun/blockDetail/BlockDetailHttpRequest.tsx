@@ -12,7 +12,9 @@ function BlockDetailHttpRequest({ block }: Props) {
       <BlockDetailFailure block={block} />
       {block.url && (
         <Section title="URL">
-          <span className="break-all text-xs text-slate-300">{block.url}</span>
+          <span className="break-all text-xs text-tertiary-foreground">
+            {block.url}
+          </span>
         </Section>
       )}
       {block.output !== null && block.output !== undefined && (

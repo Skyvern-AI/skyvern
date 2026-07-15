@@ -157,7 +157,7 @@ export function EditorOverflowMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={requestTour}>
           <span className="flex-1">Take a tour</span>
-          <kbd className="ml-4 text-xs text-slate-400">Shift+?</kbd>
+          <kbd className="ml-4 text-xs text-muted-foreground">Shift+?</kbd>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

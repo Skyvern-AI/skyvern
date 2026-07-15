@@ -67,7 +67,9 @@ function PrintPageEditorBody({
     <div data-testid="print-page-block-form" className="space-y-4">
       <div className="space-y-4">
         <div className="flex items-center justify-between">
-          <Label className="text-xs text-slate-300">Page Format</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            Page Format
+          </Label>
           <Select
             value={format}
             onValueChange={(value) => update({ format: value })}
@@ -86,7 +88,9 @@ function PrintPageEditorBody({
         </div>
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Print Background</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Print Background
+            </Label>
             <HelpTooltip content="Include CSS background colors and images in the PDF" />
           </div>
           <Switch
@@ -97,7 +101,7 @@ function PrintPageEditorBody({
         </div>
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs font-normal text-slate-300">
+            <Label className="text-xs font-normal text-tertiary-foreground">
               Headers & Footers
             </Label>
             <HelpTooltip content="Adds date, title, URL, and page numbers to the PDF" />
@@ -125,7 +129,7 @@ function PrintPageEditorBody({
                 }}
               />
               <div className="space-y-2">
-                <Label className="text-xs text-slate-300">
+                <Label className="text-xs text-tertiary-foreground">
                   Custom Filename
                 </Label>
                 <Input
@@ -137,7 +141,7 @@ function PrintPageEditorBody({
                 />
               </div>
               <div className="flex items-center justify-between">
-                <Label className="text-xs font-normal text-slate-300">
+                <Label className="text-xs font-normal text-tertiary-foreground">
                   Landscape
                 </Label>
                 <Switch

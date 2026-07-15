@@ -4,6 +4,8 @@ import { EditorState } from "@codemirror/state";
 import { python } from "@codemirror/lang-python";
 import { unifiedMergeView } from "@codemirror/merge";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
+import { tokyoNightDay } from "@uiw/codemirror-theme-tokyo-night-day";
+import { useThemeAsDarkOrLight } from "@/components/useThemeAsDarkOrLight";
 
 function ScriptDiffViewer({
   original,
@@ -14,6 +16,7 @@ function ScriptDiffViewer({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const themeMode = useThemeAsDarkOrLight();
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -32,7 +35,7 @@ function ScriptDiffViewer({
           EditorState.readOnly.of(true),
           lineNumbers(),
           python(),
-          tokyoNightStorm,
+          themeMode === "dark" ? tokyoNightStorm : tokyoNightDay,
           unifiedMergeView({
             original,
             highlightChanges: true,
@@ -54,7 +57,7 @@ function ScriptDiffViewer({
       view.destroy();
       viewRef.current = null;
     };
-  }, [original, modified]);
+  }, [original, modified, themeMode]);
 
   return <div ref={containerRef} />;
 }

@@ -108,7 +108,7 @@ function MicrosoftOAuthCredentialSelector({
           <button
             type="button"
             onClick={handleUseAccountPicker}
-            className="text-xs text-slate-400 underline hover:text-slate-300"
+            className="text-xs text-muted-foreground underline hover:text-tertiary-foreground"
           >
             Use account picker
           </button>
@@ -116,7 +116,7 @@ function MicrosoftOAuthCredentialSelector({
       ) : (
         <>
           {value && hasCredentials && !isKnownCredential ? (
-            <p className="rounded-md border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-[0.7rem] text-amber-200">
+            <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
               Saved Microsoft account is no longer connected. Pick another
               below.
             </p>
@@ -133,7 +133,7 @@ function MicrosoftOAuthCredentialSelector({
                     <p className="text-sm font-medium">
                       <SelectItemText>{cred.credential_name}</SelectItemText>
                     </p>
-                    <p className="text-xs text-slate-400">{cred.id}</p>
+                    <p className="text-xs text-muted-foreground">{cred.id}</p>
                   </div>
                 </CustomSelectItem>
               ))}
