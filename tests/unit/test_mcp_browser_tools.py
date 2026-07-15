@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 
+from skyvern.cli.core import browser_ops
+from skyvern.cli.core.browser_ops import (
+    CustomSelectClassifyError,
+    CustomSelectMatchError,
+    CustomSelectOpenError,
+    CustomSelectPasswordError,
+    do_select_option,
+)
 from skyvern.cli.core.result import BrowserContext, set_concise_responses
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
-from tests.unit._mcp_browser_fakes import make_probe_locator, make_real_wait_for_timeout
+from tests.unit._mcp_browser_fakes import (
+    make_probe_locator,
+    make_real_wait_for_timeout,
+    make_select_like_page,
+    make_select_option_page,
+    make_skyvern_page,
+)
 
 
 @pytest.mark.asyncio
@@ -236,7 +250,8 @@ async def test_run_task_schema_description_demotes_autonomous_trial() -> None:
 
 def _click_page(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     click = AsyncMock(return_value="#resolved")
-    page = SimpleNamespace(click=click)
+    page = make_skyvern_page(MagicMock())
+    page.click = click
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return click
@@ -291,6 +306,19 @@ async def test_skyvern_click_selector_is_resilient_by_default(monkeypatch: pytes
     assert result["ok"] is True
     assert click.await_args.kwargs.get("mode") != "direct"
     assert click.await_args.kwargs["_skip_element_prep"] is True
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_page_adapter_never_receives_private_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = AsyncMock(return_value="#resolved")
+    page = SimpleNamespace(page=MagicMock(), click=click)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_click(selector="#submit")
+
+    assert result["ok"] is True
+    assert "_skip_element_prep" not in click.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -640,8 +668,12 @@ async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.M
     assert click.await_args.kwargs.get("mode") != "direct"
 
 
-def _action_page(monkeypatch: pytest.MonkeyPatch, **methods: AsyncMock) -> None:
-    page = SimpleNamespace(**methods)
+def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> None:
+    page = make_skyvern_page(MagicMock()) if skyvern_page else SimpleNamespace(page=MagicMock())
+    if skyvern_page:
+        page.evaluate = AsyncMock(return_value=False)
+    for name, method in methods.items():
+        setattr(page, name, method)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -676,11 +708,11 @@ def _native_option_page(
 @pytest.mark.asyncio
 async def test_skyvern_type_selector_is_resilient_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     fill = AsyncMock(return_value="Noor")
-    _action_page(monkeypatch, fill=fill)
+    _action_page(monkeypatch, skyvern_page=True, fill=fill)
 
     result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor")
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert fill.await_args.kwargs.get("mode") != "direct"
     assert fill.await_args.kwargs["_skip_element_prep"] is True
 
@@ -703,12 +735,38 @@ async def test_skyvern_type_selector_only_append_skips_skyvern_page_prep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     type_text = AsyncMock(return_value="Noor")
-    _action_page(monkeypatch, type=type_text)
+    _action_page(monkeypatch, skyvern_page=True, type=type_text)
 
     result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor", clear=False)
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert type_text.await_args.kwargs["_skip_element_prep"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear", [True, False], ids=["fill", "type"])
+@pytest.mark.parametrize("page_kind", ["adapter", "raw"])
+async def test_skyvern_type_page_adapter_never_receives_private_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+    clear: bool,
+    page_kind: str,
+) -> None:
+    action = AsyncMock(return_value="Noor")
+    method = "fill" if clear else "type"
+    if page_kind == "adapter":
+        _action_page(monkeypatch, **{method: action})
+    else:
+        page = MagicMock()
+        page.page = page
+        page.evaluate = AsyncMock(return_value=False)
+        setattr(page, method, action)
+        context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor", clear=clear)
+
+    assert result["ok"] is True
+    assert "_skip_element_prep" not in action.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -1008,6 +1066,1181 @@ async def test_skyvern_select_option_selector_mode_direct_is_deterministic(monke
 
     assert result["ok"] is True
     assert select.await_args.kwargs["ai"] is None
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_routes_custom_widget_through_core_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    do_select_option = AsyncMock(return_value="Music")
+    monkeypatch.setattr(mcp_browser, "do_select_option", do_select_option, raising=False)
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category",
+        value="music",
+        selector_mode="direct",
+        timeout=4321,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["sdk_equivalent"] == (
+        "# No single SDK method -- open/filter '#category', then click exact observed option 'Music'"
+    )
+    do_select_option.assert_awaited_once_with(
+        page.page,
+        "#category",
+        "music",
+        by_label=False,
+        timeout=4321,
+        restore_value_on_failure=False,
+        fail_closed_on_unknown=False,
+    )
+    native_select_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_routes_custom_widget_through_working_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = MagicMock()
+    page, native_select_option = make_select_option_page(locator_scope=frame)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    custom_select = AsyncMock(return_value="Music")
+    monkeypatch.setattr(mcp_browser, "do_select_option", custom_select)
+
+    result = await mcp_browser.skyvern_select_option(selector="#category", value="music", timeout=4321)
+
+    assert result["ok"] is True
+    custom_select.assert_awaited_once_with(
+        frame,
+        "#category",
+        "music",
+        by_label=False,
+        timeout=4321,
+        restore_value_on_failure=False,
+        fail_closed_on_unknown=False,
+    )
+    native_select_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_keeps_native_select_on_existing_path() -> None:
+    page, control = make_select_like_page({"tag": "select", "role": "combobox", "haspopup": False, "editable": False})
+
+    result = await do_select_option(page, "#region", "east", timeout=1)
+
+    assert result is None
+    control.click.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_defers_password_input_without_mutating_it() -> None:
+    page, control = make_select_like_page(
+        {
+            "tag": "input",
+            "type": "password",
+            "isPassword": True,
+            "role": "textbox",
+            "haspopup": False,
+            # Defense in depth must reject even a bad classifier payload.
+            "editable": True,
+        }
+    )
+
+    with pytest.raises(CustomSelectPasswordError):
+        await do_select_option(page, "#secret", "hunter2", timeout=100)
+
+    # Only the classification probe ran — no fill/click, value untouched.
+    assert control.evaluate.await_count == 1
+    control.fill.assert_not_awaited()
+    control.fill.assert_not_awaited()
+    control.click.assert_not_awaited()
+    page.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"tag": "div", "role": "combobox", "haspopup": False, "editable": False},
+        {"tag": "div", "role": "listbox", "haspopup": False, "editable": False},
+        {"tag": "button", "role": "", "haspopup": True, "editable": False},
+    ],
+)
+async def test_do_select_option_recognizes_aria_custom_selects(
+    monkeypatch: pytest.MonkeyPatch,
+    target: dict[str, object],
+) -> None:
+    page, control = make_select_like_page(target)
+    dom_options = [{"selector": "#music", "role": "option", "name": "Music"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#music", "label": "Music", "value": "music"}],
+        {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
+        {"text": "Music", "value": "", "dataValues": ["music"], "expanded": "false", "optionSelected": False},
+    ]
+
+    result = await do_select_option(page, "#category", "music", timeout=100)
+
+    assert result == "Music"
+    assert control.click.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_scan_observed_control_uses_widened_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {
+        "tag": "button",
+        "role": "",
+        "haspopup": False,
+        "editable": False,
+        "selectlike": False,
+        "optionish": True,
+        "related": False,
+    }
+    page, control = make_select_like_page(target)
+    dom_options = [
+        {"selector": "#category", "role": "button", "name": "Category"},
+        {"selector": "#music", "role": "option", "name": "Music"},
+    ]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    control.evaluate.side_effect = [
+        target,
+        True,
+        [{"selector": "#music", "label": "Music", "value": "music"}],
+        {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
+        {"text": "Music", "value": "", "dataValues": ["music"], "expanded": "false", "optionSelected": False},
+    ]
+
+    result = await do_select_option(page, "#category", "music", timeout=100)
+
+    assert result == "Music"
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_matches_observed_accessible_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    dom_options = [{"selector": "#us", "role": "option", "name": "United States"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#us", "label": "US", "value": "us"}],
+        {"text": "Choose", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
+        {"text": "US", "value": "", "dataValues": ["us"], "expanded": "false", "optionSelected": False},
+    ]
+
+    result = await do_select_option(page, "#country", "United States", by_label=True, timeout=100)
+
+    assert result == "United States"
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_rejects_substring_value_false_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    dom_options = [{"selector": "#oregon", "role": "option", "name": "OR"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    before = {
+        "text": "Choose OR state",
+        "value": "",
+        "dataValues": ["north"],
+        "expanded": "true",
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#oregon", "label": "OR", "value": "OR"}],
+        before,
+        {**before, "expanded": "false"},
+    ]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="did not commit 'OR'"):
+        await do_select_option(page, "#state", "or", timeout=100)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_accepts_idempotent_exact_committed_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#oregon", "role": "option", "name": "OR"}]),
+    )
+    committed = {
+        "text": "Oregon",
+        "value": "OR",
+        "dataValues": [],
+        "expanded": "false",
+        "optionVisible": False,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#oregon", "label": "OR", "value": "OR"}],
+        committed,
+        committed,
+    ]
+
+    assert await do_select_option(page, "#state", "or", timeout=100) == "OR"
+    assert control.click.await_count == 2
+    assert control.evaluate.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_rejects_toggle_deselect_of_requested_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#oregon", "role": "option", "name": "OR"}]),
+    )
+    # Coincidental static data-value="OR" that never changes, while the matched option stays
+    # present and its aria-selected flips true->false — the deselection veto must reject.
+    before = {
+        "text": "OR",
+        "value": "",
+        "dataValue": "OR",
+        "expanded": "true",
+        "optionVisible": True,
+        "optionPresent": True,
+        "optionSelected": True,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#oregon", "label": "OR", "value": "OR"}],
+        before,
+        {**before, "optionVisible": False, "optionPresent": True, "optionSelected": False},
+    ]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="did not commit 'OR'"):
+        await do_select_option(page, "#state", "or", timeout=100)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_ignores_unrelated_stable_data_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#oregon", "role": "option", "name": "OR"}]),
+    )
+    before = {
+        "text": "Choose state",
+        "value": "",
+        "dataValue": "",
+        "dataValues": ["OR"],
+        "expanded": "true",
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#oregon", "label": "OR", "value": "OR"}],
+        before,
+        {**before, "optionVisible": False},
+    ]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="did not commit 'OR'"):
+        await do_select_option(page, "#state", "or", timeout=100)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("editable", [False, True])
+async def test_do_select_option_uses_writable_target_action(
+    monkeypatch: pytest.MonkeyPatch,
+    editable: bool,
+) -> None:
+    target = {"tag": "input", "role": "combobox", "haspopup": True, "editable": editable}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#west", "role": "option", "name": "West"}]),
+    )
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#west", "label": "West", "value": "west"}],
+        {"text": "", "value": "", "dataValues": [], "expanded": "true", "optionSelected": False},
+        {"text": "West", "value": "west", "dataValues": [], "expanded": "false", "optionSelected": False},
+    ]
+
+    assert await do_select_option(page, "#state", "west", timeout=100) == "West"
+    assert control.fill.await_count == int(editable)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_scan_observed_bare_input_uses_typeahead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "input", "role": "textbox", "haspopup": False, "editable": True, "selectlike": False}
+    page, control = make_select_like_page(target)
+    dom_elements = [{"selector": "#town", "role": "textbox", "name": "Town"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_elements))
+    monkeypatch.setattr(
+        browser_ops,
+        "_scoped_custom_options",
+        AsyncMock(return_value=[{"selector": "#fairview", "role": "option", "name": "Fairview", "label": "Fairview"}]),
+    )
+    control.evaluate.side_effect = [
+        target,
+        True,
+        {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": False},
+        {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": True},
+    ]
+
+    assert await do_select_option(page, "#town", "Fairview", timeout=100) == "Fairview"
+    control.fill.assert_awaited_once_with("Fairview", timeout=100)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_bare_input_rejects_preexisting_neighbor_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {
+        "tag": "input",
+        "role": "textbox",
+        "haspopup": False,
+        "editable": True,
+        "selectlike": False,
+        "related": False,
+    }
+    page, control = make_select_like_page(target)
+    dom_elements = [
+        {"selector": "#town", "role": "textbox", "name": "Town"},
+        {"selector": "#neighbor-fairview", "role": "option", "name": "Fairview"},
+    ]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_elements))
+    scoped_options = AsyncMock(return_value=[])
+    monkeypatch.setattr(browser_ops, "_scoped_custom_options", scoped_options)
+    control.evaluate.side_effect = [target, True]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(CustomSelectMatchError):
+        await do_select_option(page, "#town", "Fairview", timeout=100)
+
+    assert scoped_options.await_args.kwargs["before_option_selectors"] == {"#neighbor-fairview"}
+    assert scoped_options.await_args.kwargs["bare_input"] is True
+    control.fill.assert_awaited_once_with("Fairview", timeout=100)
+    assert control.click.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_bare_input_fill_value_does_not_verify_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {
+        "tag": "input",
+        "role": "textbox",
+        "haspopup": False,
+        "editable": True,
+        "selectlike": False,
+        "related": False,
+    }
+    page, control = make_select_like_page(target)
+    dom_elements = [{"selector": "#town", "role": "textbox", "name": "Town"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_elements))
+    monkeypatch.setattr(
+        browser_ops,
+        "_scoped_custom_options",
+        AsyncMock(return_value=[{"selector": "#fairview", "role": "option", "name": "Fairview"}]),
+    )
+    before = {
+        "text": "Searching",
+        "value": "Fairview",
+        "dataValues": [],
+        "expanded": None,
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [target, True, before, {**before, "text": "Idle"}]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="did not commit 'Fairview'"):
+        await do_select_option(page, "#town", "Fairview", timeout=100)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_editable_list_close_requires_absent_container_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "input", "role": "combobox", "haspopup": True, "editable": True}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#lakewood", "role": "option", "name": "Lakewood"}]),
+    )
+    before = {
+        "text": "",
+        "value": "Lakewood",
+        "dataValue": "",
+        "dataValues": [],
+        "containerChannels": [{"key": "#city-value:value", "value": ""}],
+        "expanded": "true",
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#lakewood", "label": "Lakewood", "value": "Lakewood"}],
+        before,
+        {**before, "expanded": "false", "optionVisible": False},
+    ]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="did not commit 'Lakewood'"):
+        await do_select_option(page, "#city", "Lakewood", timeout=100)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed_value", ["Lakewood", "city-123"], ids=["requested", "matched-option-value"])
+async def test_do_select_option_accepts_editable_container_channel_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    committed_value: str,
+) -> None:
+    target = {"tag": "input", "role": "combobox", "haspopup": True, "editable": True}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#lakewood", "role": "option", "name": "Lakewood"}]),
+    )
+    before = {
+        "text": "",
+        "value": "Lakewood",
+        "dataValue": "",
+        "dataValues": [],
+        "containerChannels": [{"key": "#city-value:value", "value": ""}],
+        "expanded": "true",
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#lakewood", "label": "Lakewood", "value": committed_value}],
+        before,
+        {
+            **before,
+            "containerChannels": [{"key": "#city-value:value", "value": committed_value}],
+        },
+    ]
+
+    assert await do_select_option(page, "#city", "Lakewood", by_label=True, timeout=100) == "Lakewood"
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_rejects_new_unrelated_container_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "input", "role": "combobox", "haspopup": True, "editable": True}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#lakewood", "role": "option", "name": "Lakewood"}]),
+    )
+    before = {
+        "text": "",
+        "value": "Lakewood",
+        "dataValue": "",
+        "dataValues": [],
+        "containerChannels": [{"key": "input:hidden:city:value", "value": ""}],
+        "expanded": "true",
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#lakewood", "label": "Lakewood", "value": "Lakewood"}],
+        before,
+        {
+            **before,
+            "containerChannels": [
+                {"key": "input:hidden:city:value", "value": ""},
+                {"key": "#city-widget:data-loading", "value": "true"},
+            ],
+            "expanded": "false",
+            "optionVisible": False,
+        },
+    ]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="did not commit 'Lakewood'"):
+        await do_select_option(page, "#city", "Lakewood", timeout=100)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_keeps_editable_list_close_as_channel_free_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {"tag": "input", "role": "combobox", "haspopup": True, "editable": True}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#lakewood", "role": "option", "name": "Lakewood"}]),
+    )
+    before = {
+        "text": "",
+        "value": "Lakewood",
+        "dataValue": "",
+        "dataValues": [],
+        "containerChannels": [],
+        "expanded": "true",
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#lakewood", "label": "Lakewood", "value": "Lakewood"}],
+        before,
+        {**before, "expanded": "false", "optionVisible": False},
+    ]
+
+    assert await do_select_option(page, "#city", "Lakewood", timeout=100) == "Lakewood"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bare_input", [False, True], ids=["aria", "bare"])
+async def test_do_select_option_retries_editable_with_real_key_events_when_fill_has_no_options(
+    monkeypatch: pytest.MonkeyPatch,
+    bare_input: bool,
+) -> None:
+    target = {
+        "tag": "input",
+        "role": "textbox" if bare_input else "combobox",
+        "haspopup": not bare_input,
+        "editable": True,
+        "selectlike": False,
+        "related": not bare_input,
+    }
+    page, control = make_select_like_page(target)
+    control.press_sequentially = AsyncMock()
+    dom_elements = [{"selector": "#city", "role": target["role"], "name": "City"}]
+    observe = AsyncMock(return_value=dom_elements)
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", observe)
+    option = {"selector": "#lakewood", "role": "option", "name": "Lakewood", "label": "Lakewood"}
+    scoped_options = AsyncMock(side_effect=[[], [], [], [option]])
+    monkeypatch.setattr(browser_ops, "_scoped_custom_options", scoped_options)
+    before = {
+        "text": "",
+        "value": "Lakewood",
+        "dataValue": "",
+        "dataValues": [],
+        "containerChannels": [],
+        "expanded": "true",
+        "optionVisible": True,
+        "optionSelected": False,
+    }
+    evaluate_results: list[object] = [target]
+    if bare_input:
+        evaluate_results.append(True)
+    evaluate_results.extend([before, {**before, "optionSelected": True}])
+    control.evaluate.side_effect = evaluate_results
+    monkeypatch.setattr(
+        browser_ops,
+        "time",
+        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0.5, 1.01, 1.02, 1.03])),
+    )
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    assert await do_select_option(page, "#city", "Lakewood", timeout=2000) == "Lakewood"
+    assert control.fill.await_args_list == [call("Lakewood", timeout=2000), call("", timeout=2000)]
+    control.press_sequentially.assert_awaited_once_with("Lakewood", timeout=2000)
+    assert observe.await_count == (2 if bare_input else 1)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_retry_failure_restores_original_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {
+        "tag": "input",
+        "role": "combobox",
+        "haspopup": True,
+        "editable": True,
+        "related": True,
+    }
+    page, control = make_select_like_page(target)
+    control.press_sequentially = AsyncMock(side_effect=RuntimeError("keydown failed"))
+    control.evaluate.side_effect = [target, "Original city", "Original city"]
+    monkeypatch.setattr(browser_ops, "_scoped_custom_options", AsyncMock(side_effect=[[], []]))
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        browser_ops,
+        "time",
+        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1.01])),
+    )
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(CustomSelectOpenError, match="keydown failed"):
+        await do_select_option(
+            page,
+            "#city",
+            "Lakewood",
+            timeout=2000,
+            restore_value_on_failure=True,
+        )
+
+    assert control.fill.await_args_list == [
+        call("Lakewood", timeout=2000),
+        call("", timeout=2000),
+        call("Original city", timeout=1000),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_retry_restore_failure_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {
+        "tag": "input",
+        "role": "combobox",
+        "haspopup": True,
+        "editable": True,
+        "related": True,
+    }
+    page, control = make_select_like_page(target)
+    control.press_sequentially = AsyncMock(side_effect=RuntimeError("keydown failed"))
+    control.fill.side_effect = [None, None, RuntimeError("restore blocked")]
+    control.evaluate.side_effect = [target, "Original city"]
+    monkeypatch.setattr(browser_ops, "_scoped_custom_options", AsyncMock(side_effect=[[], []]))
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        browser_ops,
+        "time",
+        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1.01])),
+    )
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(browser_ops.CustomSelectRestoreError, match="restore original value"):
+        await do_select_option(
+            page,
+            "#city",
+            "Lakewood",
+            timeout=2000,
+            restore_value_on_failure=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_scoped_custom_options_scans_all_owned_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    control = MagicMock()
+    control.evaluate = AsyncMock(return_value=[{"selector": "#second-option", "label": "Second", "value": "second"}])
+    observe = AsyncMock(
+        side_effect=[
+            [],
+            [{"selector": "#second-option", "role": "option", "name": "Second"}],
+        ]
+    )
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", observe)
+
+    options = await browser_ops._scoped_custom_options(
+        page,
+        control,
+        scan_selectors=["#first-root", "#second-root"],
+    )
+
+    assert options == [
+        {"selector": "#second-option", "role": "option", "name": "Second", "label": "Second", "value": "second"}
+    ]
+    assert [item.args[1] for item in observe.await_args_list] == ["#first-root", "#second-root"]
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_surfaces_option_click_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = {"tag": "button", "role": "combobox", "haspopup": True, "editable": False}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#west", "role": "option", "name": "West"}]),
+    )
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#west", "label": "West", "value": "west"}],
+        {"text": "Choose", "value": "", "dataValues": [], "expanded": "true", "optionSelected": False},
+    ]
+    control.click.side_effect = [None, RuntimeError("click intercepted by overlay")]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    with pytest.raises(RuntimeError, match="click intercepted by overlay"):
+        await do_select_option(page, "#state", "west", timeout=100)
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_scan_observed_control_without_options_uses_bounded_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = {
+        "tag": "button",
+        "role": "",
+        "haspopup": False,
+        "editable": False,
+        "selectlike": True,
+        "optionish": False,
+        "related": True,
+    }
+    page, control = make_select_like_page(target)
+    dom_elements = [{"selector": "#empty", "role": "button", "name": "Empty"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_elements))
+    scoped_options = AsyncMock(return_value=[])
+    monkeypatch.setattr(browser_ops, "_scoped_custom_options", scoped_options)
+    control.evaluate.side_effect = [target, True]
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 4])))
+    monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+
+    result = await do_select_option(page, "#empty", "anything", timeout=30000)
+
+    assert result is None
+    scoped_options.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_no_match_preserves_structured_option_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    observed_options = ["Books", "Music", "Games"]
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_select_option",
+        AsyncMock(side_effect=CustomSelectMatchError("#category", "podcasts", observed_options)),
+        raising=False,
+    )
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category",
+        value="podcasts",
+        selector_mode="direct",
+        timeout=4321,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["details"] == {
+        "element_state": "no_unambiguous_match",
+        "selector": "#category",
+        "requested_option": "podcasts",
+        "observed_options": observed_options,
+    }
+    assert result["error"]["hint"]
+    native_select_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_custom_failure_preserves_hybrid_ai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_select_option",
+        AsyncMock(side_effect=CustomSelectMatchError("#category", "podcasts", ["Music"])),
+    )
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="podcasts"
+    )
+
+    assert result["ok"] is True
+    native_select_option.assert_awaited_once_with(
+        selector="#category", value="podcasts", prompt="the category dropdown", ai="fallback", timeout=30000
+    )
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_kill_switch_skips_custom_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    do_select = AsyncMock(side_effect=AssertionError("custom path must not run when disabled"))
+    monkeypatch.setattr(mcp_browser, "do_select_option", do_select)
+    monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="music"
+    )
+
+    assert result["ok"] is True
+    do_select.assert_not_awaited()
+    native_select_option.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_open_failure_preserves_hybrid_ai_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_select_option",
+        AsyncMock(side_effect=CustomSelectOpenError("click intercepted")),
+    )
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="music"
+    )
+
+    assert result["ok"] is True
+    native_select_option.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_open_failure_terminal_for_direct_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_select_option",
+        AsyncMock(side_effect=CustomSelectOpenError("click intercepted")),
+    )
+
+    result = await mcp_browser.skyvern_select_option(selector="#category", value="music", selector_mode="direct")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["message"] == "click intercepted"
+    native_select_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_open_click_failure_raises_open_error() -> None:
+    page, control = make_select_like_page({"tag": "div", "role": "combobox", "haspopup": True, "editable": False})
+    control.click = AsyncMock(side_effect=RuntimeError("intercepted"))
+
+    with pytest.raises(CustomSelectOpenError):
+        await do_select_option(page, "#x", "music", timeout=500)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_credential_intent_rejected_before_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page must not run for a credential intent"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_select_option(intent="select the account password", value="s3cr3t")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_classify_error_fails_closed_for_hybrid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(mcp_browser, "do_select_option", AsyncMock(side_effect=CustomSelectClassifyError("#x")))
+
+    # Hybrid selector+intent: a mid-probe detach must not forward the value to the AI fallback.
+    hybrid = await mcp_browser.skyvern_select_option(selector="#x", intent="the dropdown", value="leak-me")
+    assert hybrid["ok"] is False
+    assert hybrid["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    native_select_option.assert_not_awaited()
+
+    # Direct call defers to the native SDK (which cannot forward the value to an LLM).
+    monkeypatch.setattr(mcp_browser, "do_select_option", AsyncMock(side_effect=CustomSelectClassifyError("#x")))
+    direct = await mcp_browser.skyvern_select_option(selector="#x", value="east", selector_mode="direct")
+    assert direct["ok"] is True
+    native_select_option.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_password_target_never_reaches_native_or_ai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_select_option",
+        AsyncMock(side_effect=CustomSelectPasswordError("#pw")),
+    )
+
+    # Non-credential intent so this exercises the do_select_option CustomSelectPasswordError
+    # wrapper (a password TARGET), not the earlier credential-intent preflight.
+    result = await mcp_browser.skyvern_select_option(selector="#pw", intent="the flavor dropdown", value="s3cr3t")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    native_select_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_post_option_failure_skips_hybrid_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    do_select = AsyncMock(side_effect=RuntimeError("Custom select did not commit 'podcasts'"))
+    monkeypatch.setattr(mcp_browser, "do_select_option", do_select)
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="podcasts"
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["message"] == "Custom select did not commit 'podcasts'"
+    native_select_option.assert_not_awaited()
+    assert do_select.await_args.kwargs["restore_value_on_failure"] is True
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_restore_failure_skips_hybrid_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, native_select_option = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_select_option",
+        AsyncMock(side_effect=browser_ops.CustomSelectRestoreError("Could not restore original value")),
+    )
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="podcasts"
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["message"] == "Could not restore original value"
+    native_select_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_direct_call_does_not_request_value_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, _ = make_select_option_page()
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    do_select = AsyncMock(return_value="Music")
+    monkeypatch.setattr(mcp_browser, "do_select_option", do_select)
+
+    result = await mcp_browser.skyvern_select_option(selector="#category", value="music", selector_mode="direct")
+
+    assert result["ok"] is True
+    assert do_select.await_args.kwargs["restore_value_on_failure"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disable_custom", [False, True], ids=["classifier-none", "kill-switch"])
+async def test_skyvern_select_option_pure_native_timing_matches_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    disable_custom: bool,
+) -> None:
+    class FakeTimer:
+        clock_ms = 0
+
+        def __init__(self) -> None:
+            self.started_ms = 0
+            self.marks: dict[str, int] = {}
+
+        def __enter__(self) -> FakeTimer:
+            self.started_ms = self.clock_ms
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.marks["total"] = self.clock_ms - self.started_ms
+
+        def mark(self, name: str) -> None:
+            self.marks[name] = self.clock_ms - self.started_ms
+
+        @property
+        def timing_ms(self) -> dict[str, int]:
+            return self.marks.copy()
+
+    async def classify_native(*_args: object, **_kwargs: object) -> None:
+        FakeTimer.clock_ms += 100
+        return None
+
+    async def select_native(*_args: object, **_kwargs: object) -> str:
+        FakeTimer.clock_ms += 200
+        return "east"
+
+    page, _ = make_select_option_page()
+    page.select_option = AsyncMock(side_effect=select_native)
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    custom_select = AsyncMock(side_effect=classify_native)
+    monkeypatch.setattr(mcp_browser, "do_select_option", custom_select)
+    monkeypatch.setattr(mcp_browser, "Timer", FakeTimer)
+    if disable_custom:
+        monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
+    else:
+        monkeypatch.delenv("SKYVERN_DISABLE_CUSTOM_SELECT", raising=False)
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#region",
+        value="east",
+        selector_mode="direct",
+    )
+
+    assert result["ok"] is True
+    assert result["timing_ms"] == {"sdk": 200, "total": 200}
+
+    async def reject_native(*_args: object, **_kwargs: object) -> None:
+        FakeTimer.clock_ms += 200
+        raise RuntimeError("invalid native option")
+
+    FakeTimer.clock_ms = 0
+    page.select_option = AsyncMock(side_effect=reject_native)
+    failed = await mcp_browser.skyvern_select_option(
+        selector="#region",
+        value="missing",
+        selector_mode="direct",
+    )
+
+    assert failed["ok"] is False
+    assert failed["timing_ms"] == {}
+    if disable_custom:
+        custom_select.assert_not_awaited()
+    else:
+        assert custom_select.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_hybrid_timing_includes_custom_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTimer:
+        clock_ms = 0
+
+        def __init__(self) -> None:
+            self.started_ms = 0
+            self.marks: dict[str, int] = {}
+
+        def __enter__(self) -> FakeTimer:
+            self.started_ms = self.clock_ms
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.marks["total"] = self.clock_ms - self.started_ms
+
+        def mark(self, name: str) -> None:
+            self.marks[name] = self.clock_ms - self.started_ms
+
+        @property
+        def timing_ms(self) -> dict[str, int]:
+            return self.marks.copy()
+
+    async def fail_custom(*_args: object, **_kwargs: object) -> None:
+        FakeTimer.clock_ms += 100
+        raise CustomSelectMatchError("#category", "podcasts", ["Music"])
+
+    async def select_fallback(*_args: object, **_kwargs: object) -> str:
+        FakeTimer.clock_ms += 200
+        return "podcasts"
+
+    page, _ = make_select_option_page()
+    page.select_option = AsyncMock(side_effect=select_fallback)
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="cloud_session", session_id="pbs_test"))),
+    )
+    monkeypatch.setattr(mcp_browser, "do_select_option", AsyncMock(side_effect=fail_custom))
+    monkeypatch.setattr(mcp_browser, "Timer", FakeTimer)
+
+    result = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="podcasts"
+    )
+
+    assert result["ok"] is True
+    assert result["timing_ms"]["total"] == 300
+
+    async def fail_fallback(*_args: object, **_kwargs: object) -> None:
+        FakeTimer.clock_ms += 200
+        raise RuntimeError("fallback failed")
+
+    FakeTimer.clock_ms = 0
+    page.select_option = AsyncMock(side_effect=fail_fallback)
+    failed = await mcp_browser.skyvern_select_option(
+        selector="#category", intent="the category dropdown", value="podcasts"
+    )
+
+    assert failed["ok"] is False
+    assert failed["timing_ms"]["total"] == 300
 
 
 @pytest.mark.asyncio

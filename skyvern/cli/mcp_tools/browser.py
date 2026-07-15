@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Callable, Literal
@@ -14,6 +15,10 @@ from pydantic import Field
 from skyvern.cli.core.browser_ops import (
     _ALLOWED_EXECUTE_TOOLS,
     MAX_EXECUTE_STEPS,
+    CustomSelectClassifyError,
+    CustomSelectMatchError,
+    CustomSelectOpenError,
+    CustomSelectPasswordError,
     ExecuteStep,
     ObserveFrameError,
     ToolStepError,
@@ -27,6 +32,7 @@ from skyvern.cli.core.browser_ops import (
     do_navigate,
     do_observe,
     do_screenshot,
+    do_select_option,
     parse_extract_schema,
     ref_map_from_elements,
     ref_to_selector,
@@ -44,6 +50,7 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.schemas.run_blocks import CredentialType
 
 from ._common import (
@@ -92,6 +99,10 @@ def _blank_to_none(value: str | None) -> str | None:
     """Treat a blank/whitespace string as omitted: MCP clients serialize an omitted optional
     selector/intent as "", and a "" target would route a deterministic action onto nothing."""
     return value if value is None or value.strip() else None
+
+
+def _add_timing_prefix(timing_ms: dict[str, int], elapsed_ms: int) -> dict[str, int]:
+    return {name: elapsed_ms + duration for name, duration in timing_ms.items()}
 
 
 def _truncate_error_message(message: str) -> str:
@@ -367,7 +378,9 @@ async def skyvern_click(
                 resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
             else:
                 assert selector is not None
-                resolved = await page.click(selector=selector, _skip_element_prep=skip_element_prep, **kwargs)
+                if isinstance(page, SkyvernPage):
+                    kwargs["_skip_element_prep"] = skip_element_prep
+                resolved = await page.click(selector=selector, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
@@ -907,7 +920,10 @@ async def skyvern_type(
                     await page.fill(selector=selector, value=text, prompt=intent, ai=ai_mode, timeout=action_timeout)  # type: ignore[arg-type]
                 else:
                     assert selector is not None
-                    await page.fill(selector, text, timeout=action_timeout, _skip_element_prep=skip_element_prep)
+                    fill_kwargs: dict[str, Any] = {"timeout": action_timeout}
+                    if isinstance(page, SkyvernPage):
+                        fill_kwargs["_skip_element_prep"] = skip_element_prep
+                    await page.fill(selector, text, **fill_kwargs)
             else:
                 kwargs: dict[str, Any] = {"timeout": action_timeout}
                 if delay is not None:
@@ -919,7 +935,9 @@ async def skyvern_type(
                     await loc.type(text, **kwargs)
                 else:
                     assert selector is not None
-                    await page.type(selector, text, _skip_element_prep=skip_element_prep, **kwargs)
+                    if isinstance(page, SkyvernPage):
+                        kwargs["_skip_element_prep"] = skip_element_prep
+                    await page.type(selector, text, **kwargs)
             timer.mark("sdk")
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
@@ -1156,6 +1174,9 @@ async def skyvern_select_option(
     """Select an option from a dropdown menu. Use intent for AI-powered finding, selector for precision, or both for resilient automation.
 
     For free-text input fields, use skyvern_type instead. For non-dropdown buttons or links, use skyvern_click.
+    Targeting a plain text input types the value while probing for suggestions and fails closed if none appear;
+    hybrid calls restore the original value before the AI fallback runs, direct calls leave the typed value.
+    The deterministic attempt and each SDK fallback stage get their own timeout budget rather than one shared deadline.
     """
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
@@ -1171,6 +1192,18 @@ async def skyvern_select_option(
             ),
         )
 
+    # Credential-intent guard (parity with skyvern_type/skyvern_act): a password/credential
+    # intent must not reach the AI fallback, even with no selector or a stale one.
+    try:
+        if intent is not None:
+            check_password_prompt(intent)
+    except GuardError as e:
+        return make_result(
+            "skyvern_select_option",
+            ok=False,
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+        )
+
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -1179,6 +1212,158 @@ async def skyvern_select_option(
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
+
+    # Credential safety runs OUTSIDE the custom-select gate and the kill switch: a password
+    # target must never be filled or have its value forwarded to the AI-fallback LLM payload.
+    # When the target type cannot be determined, fail closed for the value-bearing AI path.
+    password_target: bool | None = False
+    if selector is not None:
+        scope: Any = getattr(page, "_locator_scope", None) or getattr(page, "page", page)
+        try:
+            password_target = bool(
+                await scope.locator(selector).first.evaluate(
+                    "el => el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'",
+                    timeout=min(action_timeout, 1000),
+                )
+            )
+        except Exception:
+            password_target = None
+    if password_target or (password_target is None and ai_mode is not None and not deterministic):
+        return make_result(
+            "skyvern_select_option",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Cannot select an option on a password field",
+                CREDENTIAL_HINT,
+            ),
+        )
+
+    # Operational kill switch: restores the exact pre-custom-select behavior
+    # (native <select> only, no classification probe) without a code rollback.
+    custom_select_disabled = os.environ.get("SKYVERN_DISABLE_CUSTOM_SELECT", "").strip().lower() in ("1", "true", "yes")
+    custom_attempt_ms = 0
+    if selector is not None and not custom_select_disabled:
+        custom_selection = None
+        custom_fallback_attempted = False
+        with Timer() as custom_timer:
+            try:
+                custom_selection = await do_select_option(
+                    getattr(page, "_locator_scope", None) or getattr(page, "page", page),
+                    selector,
+                    value,
+                    by_label=by_label,
+                    timeout=action_timeout,
+                    restore_value_on_failure=ai_mode == "fallback" and not deterministic,
+                    fail_closed_on_unknown=ai_mode is not None and not deterministic,
+                )
+                if custom_selection is not None:
+                    custom_timer.mark("sdk")
+            except CustomSelectPasswordError:
+                # Terminal for every call shape (direct AND hybrid): a password value must
+                # never reach the native SDK fill or the AI-fallback LLM payload.
+                return make_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=custom_timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.INVALID_INPUT,
+                        "Cannot select an option on a password field",
+                        CREDENTIAL_HINT,
+                    ),
+                )
+            except CustomSelectClassifyError:
+                # Target detached/navigated mid-probe (TOCTOU after the boundary check). Fail
+                # closed for the value-bearing AI path; a direct call defers to the native
+                # SDK, which cannot forward the value to an LLM.
+                if ai_mode is not None and not deterministic:
+                    return make_result(
+                        "skyvern_select_option",
+                        ok=False,
+                        browser_context=ctx,
+                        timing_ms=custom_timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.INVALID_INPUT,
+                            "Could not verify the target before AI selection",
+                            "Re-observe the element and retry with a stable selector",
+                        ),
+                    )
+            except CustomSelectMatchError as e:
+                if deterministic or ai_mode != "fallback":
+                    observed = ", ".join(e.observed_options) or "none"
+                    return make_result(
+                        "skyvern_select_option",
+                        ok=False,
+                        browser_context=ctx,
+                        timing_ms=custom_timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.ACTION_FAILED,
+                            f"No unambiguous option matched {e.requested_option!r}",
+                            f"Retry with one of the observed options: {observed}",
+                            details={
+                                "element_state": "no_unambiguous_match",
+                                "selector": e.selector,
+                                "requested_option": e.requested_option,
+                                "observed_options": e.observed_options,
+                            },
+                        ),
+                    )
+                custom_fallback_attempted = True
+            except CustomSelectOpenError as e:
+                # The widget never opened (click intercepted, fill timeout) — nothing was
+                # acted on, so hybrid calls may still recover through the AI fallback.
+                if deterministic or ai_mode != "fallback":
+                    return make_result(
+                        "skyvern_select_option",
+                        ok=False,
+                        browser_context=ctx,
+                        timing_ms=custom_timer.timing_ms,
+                        error=make_error(
+                            ErrorCode.ACTION_FAILED,
+                            _exception_message(e),
+                            "Could not open the dropdown to inspect its options",
+                            details=_exception_details(e),
+                        ),
+                    )
+                custom_fallback_attempted = True
+            except Exception as e:
+                # Post-option-click failures (an option was clicked but did not verifiably
+                # commit) leave the widget in an unknown state — replaying through the AI
+                # fallback could double-act, so these are terminal even for hybrid calls.
+                # Only the pre-option branches above may fall through.
+                return make_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=custom_timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.ACTION_FAILED,
+                        _exception_message(e),
+                        "The custom dropdown selection could not be verified",
+                        details=_exception_details(e),
+                    ),
+                )
+        if custom_fallback_attempted:
+            custom_attempt_ms = custom_timer.timing_ms.get("total", 0)
+        if custom_selection is not None:
+            return make_result(
+                "skyvern_select_option",
+                browser_context=ctx,
+                data={
+                    "selector": selector,
+                    "intent": intent,
+                    "ai_mode": ai_mode,
+                    "value": value,
+                    "selected_option": {"label": custom_selection},
+                    "sdk_equivalent": (
+                        f"# No single SDK method -- open/filter {selector!r}, "
+                        f"then click exact observed option {custom_selection!r}"
+                    ),
+                },
+                timing_ms=custom_timer.timing_ms,
+            )
 
     with Timer() as timer:
         try:
@@ -1208,6 +1393,20 @@ async def skyvern_select_option(
                     "skyvern_select_option", ctx, timer, page, selector, e, action_timeout
                 )
             code = ErrorCode.AI_FALLBACK_FAILED if (ai_mode and not deterministic) else ErrorCode.ACTION_FAILED
+            if custom_attempt_ms:
+                timer.mark("total")
+                return make_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
+                    error=make_error(
+                        code,
+                        _exception_message(e),
+                        "Check selector and available options",
+                        details=_exception_details(e),
+                    ),
+                )
             return make_result(
                 "skyvern_select_option",
                 ok=False,
@@ -1225,6 +1424,20 @@ async def skyvern_select_option(
             if direct_action and selector is not None and is_pointer_interception_error(e):
                 return await _direct_failure_result(
                     "skyvern_select_option", ctx, timer, page, selector, e, action_timeout
+                )
+            if custom_attempt_ms:
+                timer.mark("total")
+                return make_result(
+                    "skyvern_select_option",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
+                    error=make_error(
+                        code,
+                        _exception_message(e),
+                        "Check selector and available options",
+                        details=_exception_details(e),
+                    ),
                 )
             return make_result(
                 "skyvern_select_option",
@@ -1250,6 +1463,13 @@ async def skyvern_select_option(
         data["sdk_equivalent"] = f'await page.select_option(prompt="{intent}", value="{value}")'
     elif selector:
         data["sdk_equivalent"] = f'await page.select_option("{selector}", value="{value}")'
+    if custom_attempt_ms:
+        return make_result(
+            "skyvern_select_option",
+            browser_context=ctx,
+            data=data,
+            timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
+        )
     return make_result(
         "skyvern_select_option",
         browser_context=ctx,
