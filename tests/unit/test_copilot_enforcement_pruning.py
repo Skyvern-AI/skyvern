@@ -144,6 +144,7 @@ class _Ctx:
         self.synthesized_goal_complete_landed = False
         self.impose_synthesized_code_block = False
         self.scouted_output_covered_paths: set[str] = set()
+        self.scout_observed_terminal_criterion_ids: set[str] = set()
         self.scout_observation_contract: object | None = None
         self.flow_evidence: list[dict[str, object]] = []
         self.copilot_config: CopilotConfig | None = None

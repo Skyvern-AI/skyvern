@@ -131,6 +131,7 @@ def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleN
         copilot_config=None,
         scout_observation_contract=None,
         scouted_output_covered_paths=set(),
+        scout_observed_terminal_criterion_ids=set(),
     )
 
 
@@ -1613,3 +1614,97 @@ class TestScoutPageObservationSignal:
         scouting_module._record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#name"}]}]})
 
         assert ctx.last_scout_observation_has_password_control is False
+
+
+class TestTerminalActionObservationStampSeam:
+    _PORTAL_URL = "https://portal.example.test/login"
+    _BUSINESS_URL = "https://portal.example.test/business/start-service"
+
+    @staticmethod
+    def _terminal_action_criterion(*, method_mandated: bool = False) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="start_service_request",
+            outcome="the business start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+            method_mandated=method_mandated,
+        )
+
+    def _ctx_with(self, *criteria: CompletionCriterion) -> AgentContext:
+        ctx = AgentContext(
+            organization_id="o_1",
+            workflow_id="w_1",
+            workflow_permanent_id="wpid_1",
+            workflow_yaml="",
+            browser_session_id="pbs_1",
+            stream=MagicMock(),
+        )
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+                "selector": "#password",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "input[type='submit']",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "textbox",
+                "accessible_name": "Service Address",
+                "trajectory_index": 2,
+            },
+        ]
+        return ctx
+
+    def test_commit_past_login_stamps_terminal_action_observation(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        with capture_logs() as logs:
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="click",
+                selector="#find-address",
+                source_url=self._BUSINESS_URL,
+                role="button",
+                accessible_name="Find Address",
+            )
+        assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
+        assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
+
+    def test_login_only_commit_stamps_nothing(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+                "selector": "#password",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 0,
+            },
+        ]
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="input[type='submit']", source_url=self._PORTAL_URL
+        )
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+
+    def test_method_mandated_criterion_is_not_stamped(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion(method_mandated=True))
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector="#find-address",
+            source_url=self._BUSINESS_URL,
+            role="button",
+            accessible_name="Find Address",
+        )
+        assert ctx.scout_observed_terminal_criterion_ids == set()
