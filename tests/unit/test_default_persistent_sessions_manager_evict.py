@@ -4,6 +4,7 @@ are orphaned and the subsequent ``close_session()`` finds nothing to clean up, s
 artifact/profile/video sync never runs on the dropped session.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -66,4 +67,19 @@ async def test_evict_swallows_target_closed_during_close(
     await manager.evict_cached_browser_state("pbs_dead", "org_local")
 
     assert "pbs_dead" not in manager._browser_sessions
+    browser_state.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_evict_does_not_swallow_cancellation(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    browser_state = MagicMock()
+    browser_state.close = AsyncMock(side_effect=asyncio.CancelledError())
+    manager._browser_sessions["pbs_cancelled"] = BrowserSession(browser_state=browser_state)
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.evict_cached_browser_state("pbs_cancelled", "org_local")
+
+    assert "pbs_cancelled" not in manager._browser_sessions
     browser_state.close.assert_awaited_once()

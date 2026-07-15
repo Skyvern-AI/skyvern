@@ -675,7 +675,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         **message_channel.identity,
                     )
                     return
-                vnc_channel.interactor = "agent"
+                await vnc_channel.set_interactor_and_persist("agent")
 
             case MessageKind.CLEAR_ALL_DATA:
                 try:
@@ -878,7 +878,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         **message_channel.identity,
                     )
                     return
-                vnc_channel.interactor = "user"
+                await vnc_channel.set_interactor_and_persist("user")
 
             case MessageKind.TAKE_SCREENSHOT:
                 try:

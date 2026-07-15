@@ -11,6 +11,7 @@ import pytest_asyncio
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
@@ -569,6 +570,76 @@ async def test_get_last_queued_workflow_run_can_include_browser_session_rows(sql
     assert default_result is None
     assert included_result is not None
     assert included_result.workflow_run_id == "wr_forced_prior"
+
+
+@pytest.mark.asyncio
+async def test_claim_workflow_run_browser_session_is_organization_scoped_and_first_writer_wins(
+    sqlite_db: AgentDB,
+) -> None:
+    created_at = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _persistent_browser_session_model(persistent_browser_session_id="pbs_first"),
+                _persistent_browser_session_model(persistent_browser_session_id="pbs_loser"),
+                _workflow_run_model(workflow_run_id="wr_claim", queued_at=created_at),
+            ]
+        )
+        await session.commit()
+
+    with pytest.raises(WorkflowRunNotFound):
+        await sqlite_db.workflow_runs.claim_workflow_run_browser_session(
+            workflow_run_id="wr_claim",
+            organization_id="org_other",
+            candidate_browser_session_id="pbs_loser",
+        )
+    first_writer = await sqlite_db.workflow_runs.claim_workflow_run_browser_session(
+        workflow_run_id="wr_claim",
+        organization_id="org_test",
+        candidate_browser_session_id="pbs_first",
+    )
+    losing_writer = await sqlite_db.workflow_runs.claim_workflow_run_browser_session(
+        workflow_run_id="wr_claim",
+        organization_id="org_test",
+        candidate_browser_session_id="pbs_loser",
+    )
+
+    persisted = await sqlite_db.workflow_runs.get_workflow_run("wr_claim", organization_id="org_test")
+    assert first_writer.browser_session_id == "pbs_first"
+    assert first_writer.installed is True
+    assert losing_writer.browser_session_id == "pbs_first"
+    assert losing_writer.installed is False
+    assert persisted is not None
+    assert persisted.browser_session_id == "pbs_first"
+
+
+@pytest.mark.asyncio
+async def test_claim_workflow_run_browser_session_treats_empty_row_value_as_unclaimed(sqlite_db: AgentDB) -> None:
+    created_at = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _persistent_browser_session_model(persistent_browser_session_id="pbs_first"),
+                _workflow_run_model(
+                    workflow_run_id="wr_empty_claim",
+                    browser_session_id="",
+                    queued_at=created_at,
+                ),
+            ]
+        )
+        await session.commit()
+
+    claim = await sqlite_db.workflow_runs.claim_workflow_run_browser_session(
+        workflow_run_id="wr_empty_claim",
+        organization_id="org_test",
+        candidate_browser_session_id="pbs_first",
+    )
+
+    persisted = await sqlite_db.workflow_runs.get_workflow_run("wr_empty_claim", organization_id="org_test")
+    assert claim.browser_session_id == "pbs_first"
+    assert claim.installed is True
+    assert persisted is not None
+    assert persisted.browser_session_id == "pbs_first"
 
 
 @pytest.mark.asyncio

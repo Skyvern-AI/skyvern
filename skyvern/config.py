@@ -653,6 +653,9 @@ class Settings(BaseSettings):
     listening.
     """
 
+    SKYVERN_DEFAULT_DISPLAY: int = 99
+    """The default X display number for a persistent browser."""
+
     PYLON_IDENTITY_VERIFICATION_SECRET: str | None = None
     """
     The secret used to sign the email/identity of the user.

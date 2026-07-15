@@ -12,6 +12,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.run_enums import RunType
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
+from skyvern.webeye.vnc_manager import VncManager, VncTeardownError
 
 MODULE = "skyvern.webeye.default_persistent_sessions_manager"
 
@@ -400,7 +401,7 @@ async def test_start_reaper_is_noop_when_no_in_process_browsers() -> None:
     # Neither trigger for an in-process browser launch: nothing to reap, so don't start the loop.
     manager = _make_manager([])
     with patch(f"{MODULE}.settings") as mock_settings:
-        mock_settings.BROWSER_STREAMING_MODE = "vnc"
+        mock_settings.BROWSER_STREAMING_MODE = "other"
         mock_settings.BROWSER_TYPE = "chromium-headful"
         mock_settings.PERSISTENT_SESSIONS_REAPER_INTERVAL_SECONDS = 60
         manager.start_reaper()
@@ -423,6 +424,7 @@ async def test_start_reaper_is_noop_when_interval_disabled() -> None:
     "streaming_mode, browser_type",
     [
         ("cdp", "chromium-headful"),  # cdp streaming launches in-process browsers
+        ("vnc", "chromium-headful"),  # vnc streaming owns Chromium plus its VNC process stack
         ("vnc", "cdp-connect"),  # cdp-connect launches even without cdp streaming
     ],
 )
@@ -443,6 +445,37 @@ async def test_start_reaper_starts_once_when_in_process_browsers_launch(streamin
         await first_task
     except BaseException:
         pass
+
+
+@pytest.mark.asyncio
+async def test_reaper_treats_vnc_stack_as_process_local_ownership() -> None:
+    sessions = [_session("pbs_vnc_only", started_minutes_ago=30, timeout_minutes=20)]
+    manager = _make_manager(sessions, owned_ids=[])
+    manager.close_session = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.settings.BROWSER_STREAMING_MODE", "vnc"),
+        patch(f"{MODULE}.VncManager.has_session", return_value=True),
+    ):
+        await manager.reap_expired_sessions()
+
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_vnc_only")
+
+
+@pytest.mark.asyncio
+async def test_cdp_reaper_does_not_consult_vnc_ownership() -> None:
+    sessions = [_session("pbs_cdp_other", started_minutes_ago=30, timeout_minutes=20)]
+    manager = _make_manager(sessions, owned_ids=[])
+    manager.close_session = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.settings.BROWSER_STREAMING_MODE", "cdp"),
+        patch(f"{MODULE}.VncManager.has_session", return_value=True) as has_vnc_session,
+    ):
+        await manager.reap_expired_sessions()
+
+    has_vnc_session.assert_not_called()
+    manager.close_session.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +626,84 @@ async def test_reconcile_reclaims_missing_row_without_a_second_db_close() -> Non
 
     browser_state.close.assert_awaited_once()
     assert "pbs_gone" not in manager._browser_sessions
+    manager.database.browser_sessions.close_persistent_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_present", [True, False])
+async def test_vnc_reconcile_finishes_local_teardown_under_lock_without_a_second_db_close(
+    row_present: bool,
+) -> None:
+    manager = _make_manager([], owned_ids=[])
+    browser_state = _hold_local_session(manager, "pbs_vnc_done", real_state=True)
+    manager.database.browser_sessions.get_persistent_browser_session = AsyncMock(
+        return_value=_completed_row("pbs_vnc_done") if row_present else None
+    )
+    manager.database.browser_sessions.close_persistent_browser_session = AsyncMock()
+    session_lock = manager._get_session_lock("pbs_vnc_done")
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def close_browser() -> None:
+        assert session_lock.locked()
+        close_started.set()
+        await release_close.wait()
+
+    async def stop_vnc(*_args: object, **_kwargs: object) -> None:
+        assert session_lock.locked()
+
+    browser_state.close.side_effect = close_browser
+
+    with (
+        patch(f"{MODULE}.settings.BROWSER_STREAMING_MODE", "vnc"),
+        patch.object(VncManager, "stop_vnc_for_session", new=AsyncMock(side_effect=stop_vnc)) as stop_vnc_mock,
+    ):
+        reconcile = asyncio.create_task(manager.reconcile_local_sessions())
+        await close_started.wait()
+        reconcile.cancel()
+        await asyncio.sleep(0)
+        reconcile.cancel()
+        await asyncio.sleep(0)
+        assert not reconcile.done()
+        assert "pbs_vnc_done" in manager._browser_sessions
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await reconcile
+
+    browser_state.close.assert_awaited_once()
+    stop_vnc_mock.assert_awaited_once_with("pbs_vnc_done", organization_id="org_test")
+    assert "pbs_vnc_done" not in manager._browser_sessions
+    assert not session_lock.locked()
+    manager.database.browser_sessions.close_persistent_browser_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vnc_reconcile_retains_cache_after_stop_failure_then_retries() -> None:
+    manager = _make_manager([], owned_ids=[])
+    browser_state = _hold_local_session(manager, "pbs_vnc_retry", real_state=True)
+    manager.database.browser_sessions.get_persistent_browser_session = AsyncMock(
+        return_value=_completed_row("pbs_vnc_retry")
+    )
+    manager.database.browser_sessions.close_persistent_browser_session = AsyncMock()
+    teardown_error = VncTeardownError("pbs_vnc_retry", survivors=("Xvfb",))
+
+    with (
+        patch(f"{MODULE}.settings.BROWSER_STREAMING_MODE", "vnc"),
+        patch.object(
+            VncManager,
+            "stop_vnc_for_session",
+            new=AsyncMock(side_effect=[teardown_error, teardown_error, None]),
+        ) as stop_vnc,
+    ):
+        await manager.reconcile_local_sessions()
+        assert "pbs_vnc_retry" in manager._browser_sessions
+
+        await manager.reconcile_local_sessions()
+
+    assert browser_state.close.await_count == 2
+    assert stop_vnc.await_count == 3
+    assert "pbs_vnc_retry" not in manager._browser_sessions
     manager.database.browser_sessions.close_persistent_browser_session.assert_not_awaited()
 
 

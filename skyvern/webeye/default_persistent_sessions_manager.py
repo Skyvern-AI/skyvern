@@ -24,11 +24,13 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.async_utils import await_to_terminal_state
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _release_cdp_port
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.session_cookies import persist_session_cookies
+from skyvern.webeye.vnc_manager import VncManager, VncStartupError, VncTeardownError
 
 LOG = structlog.get_logger()
 
@@ -191,6 +193,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     _browser_sessions: dict[str, BrowserSession] = dict()
     _background_tasks: set[asyncio.Task[None]] = set()
     _reaper_task: asyncio.Task[None] | None = None
+    _session_locks: dict[str, asyncio.Lock] = {}
     database: AgentDB
 
     def __new__(cls, database: AgentDB) -> DefaultPersistentSessionsManager:
@@ -216,6 +219,33 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         # and leaves the session uncacheable for the rest of its lifetime, which also
         # breaks profile/video cleanup at ``close_session``.
         return False
+
+    def requires_local_vnc_display(self) -> bool:
+        """Whether this manager owns a local X display for each browser session."""
+
+        return settings.BROWSER_STREAMING_MODE == "vnc"
+
+    def owns_local_vnc_stack(
+        self,
+        *,
+        session_id: str,
+        organization_id: str,
+        display_number: int,
+        vnc_port: int,
+    ) -> bool:
+        """Return whether this OSS process owns the session's exact ready VNC stack."""
+
+        return self.requires_local_vnc_display() and VncManager.owns_ready_stack(
+            session_id,
+            organization_id=organization_id,
+            display_number=display_number,
+            vnc_port=vnc_port,
+        )
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        # Locks intentionally live for the manager lifetime so waiters can never
+        # retain a different lock for the same session.
+        return self._session_locks.setdefault(session_id, asyncio.Lock())
 
     async def begin_session(
         self,
@@ -301,13 +331,107 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     async def get_browser_state(self, session_id: str, organization_id: str | None = None) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
+        if (
+            browser_session is not None
+            and self.requires_local_vnc_display()
+            and organization_id is not None
+            and browser_session.organization_id != organization_id
+        ):
+            LOG.warning(
+                "Skipping cached browser state lookup for organization mismatch",
+                session_id=session_id,
+                organization_id=organization_id,
+                cached_organization_id=browser_session.organization_id,
+            )
+            return None
         return browser_session.browser_state if browser_session else None
 
     async def set_browser_state(
         self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
     ) -> None:
+        if self.requires_local_vnc_display():
+            if organization_id is None:
+                await self._close_rejected_browser_state(session_id, organization_id, browser_state)
+                raise VncStartupError(
+                    f"Persistent browser session {session_id} cannot register a VNC browser without an organization"
+                )
+            await self.compare_and_install_browser_state(session_id, browser_state, organization_id)
+            return
+
         browser_session = BrowserSession(browser_state=browser_state, organization_id=organization_id)
         self._browser_sessions[session_id] = browser_session
+
+    async def compare_and_install_browser_state(
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str,
+    ) -> BrowserState:
+        """Atomically install a local-VNC browser or return the existing winner."""
+
+        if not self.requires_local_vnc_display():
+            raise VncStartupError("Compare-and-install is only available for local VNC browser sessions")
+
+        async with self._get_session_lock(session_id):
+            winner = await self._compare_and_install_browser_state_locked(
+                session_id,
+                browser_state,
+                organization_id,
+            )
+            if winner is None:
+                await self._close_rejected_browser_state(session_id, organization_id, browser_state)
+                raise BrowserSessionClosed(session_id)
+            if winner is not browser_state:
+                await self._close_rejected_browser_state(session_id, organization_id, browser_state)
+            return winner
+
+    async def _compare_and_install_browser_state_locked(
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str,
+    ) -> BrowserState | None:
+        """Compare and install while the caller owns ``session_id``'s VNC lock."""
+
+        session = await self.get_session(session_id, organization_id)
+        if session is None or is_final_status(session.status) or session.completed_at is not None:
+            return None
+
+        cached = self._browser_sessions.get(session_id)
+        if cached is not None:
+            if cached.organization_id != organization_id:
+                LOG.warning(
+                    "Rejecting VNC browser registration for organization mismatch",
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                    cached_organization_id=cached.organization_id,
+                )
+                return None
+            return cached.browser_state
+
+        self._browser_sessions[session_id] = BrowserSession(
+            browser_state=browser_state,
+            organization_id=organization_id,
+        )
+        return browser_state
+
+    async def _close_rejected_browser_state(
+        self,
+        session_id: str,
+        organization_id: str | None,
+        browser_state: BrowserState,
+    ) -> None:
+        try:
+            await await_to_terminal_state(browser_state.close())
+        except TargetClosedError:
+            pass
+        except Exception:
+            LOG.warning(
+                "Failed to close rejected browser without affecting the winning session",
+                browser_session_id=session_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
 
     async def evict_cached_browser_state(
         self,
@@ -338,6 +462,32 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+
+    async def _stop_vnc_safely(self, session_id: str, organization_id: str) -> bool:
+        try:
+            await VncManager.stop_vnc_for_session(session_id, organization_id=organization_id)
+            return True
+        except Exception:
+            LOG.warning(
+                "Failed to stop VNC process stack",
+                browser_session_id=session_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _finalize_failed_vnc_session(self, session_id: str, organization_id: str) -> None:
+        if not await self._stop_vnc_safely(session_id, organization_id):
+            return
+        try:
+            await self.update_status(session_id, organization_id, PersistentBrowserSessionStatus.failed)
+        except Exception:
+            LOG.warning(
+                "Failed to finalize browser session after VNC startup error",
+                browser_session_id=session_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
 
     async def create_session(
         self,
@@ -375,13 +525,37 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             inherit_profile_proxy=inherit_profile_proxy,
         )
 
-        # Launch the browser immediately for standalone sessions so the
-        # screencast/CDP input endpoints can connect. Triggered both by the
-        # in-process CDP streaming mode and by cdp-connect, which forwards to a
-        # remote browser and still needs a registered BrowserState locally.
-        should_launch = settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
+        session_id = session.persistent_browser_session_id
+        if settings.BROWSER_STREAMING_MODE == "vnc":
+            try:
+                display_number, vnc_port = await VncManager.start_vnc_for_session(
+                    session_id,
+                    organization_id=organization_id,
+                )
+                session = await self.database.browser_sessions.update_persistent_browser_session(
+                    session_id,
+                    organization_id=organization_id,
+                    display_number=display_number,
+                    vnc_port=vnc_port,
+                )
+            except BaseException as startup_error:
+                try:
+                    await await_to_terminal_state(self._finalize_failed_vnc_session(session_id, organization_id))
+                except BaseException as cleanup_error:
+                    LOG.warning(
+                        "VNC creation failure cleanup did not complete cleanly",
+                        browser_session_id=session_id,
+                        organization_id=organization_id,
+                        exc_info=True,
+                    )
+                    startup_error.add_note(f"VNC creation cleanup error: {cleanup_error!r}")
+                raise
+
+        # Launch the browser immediately for standalone sessions so streaming/input
+        # endpoints can connect. CDP and VNC stream local in-process browsers;
+        # cdp-connect still needs a registered BrowserState for its remote browser.
+        should_launch = settings.BROWSER_STREAMING_MODE in {"cdp", "vnc"} or settings.BROWSER_TYPE == "cdp-connect"
         if should_launch and runnable_id is None:
-            session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
                 self._launch_browser_for_session(session_id, organization_id, proxy_location, url)
             )
@@ -397,6 +571,26 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         proxy_location: ProxyLocationInput | None = None,
         url: str | None = None,
     ) -> None:
+        if self.requires_local_vnc_display():
+            async with self._get_session_lock(session_id):
+                await self._launch_browser_for_session_locked(session_id, organization_id, proxy_location, url)
+            return
+        await self._launch_browser_for_session_locked(session_id, organization_id, proxy_location, url)
+
+    async def _launch_browser_for_session_locked(
+        self,
+        session_id: str,
+        organization_id: str,
+        proxy_location: ProxyLocationInput | None = None,
+        url: str | None = None,
+    ) -> None:
+        if session_id in self._browser_sessions:
+            LOG.info("Session already has browser state, skipping duplicate launch", browser_session_id=session_id)
+            return
+
+        browser_state: BrowserState | None = None
+        duplicate_loser = False
+        requires_local_display = self.requires_local_vnc_display()
         try:
             session = await self.get_session(session_id, organization_id)
             if session is None or is_final_status(session.status) or session.completed_at is not None:
@@ -404,18 +598,31 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                     "Session closed before browser launch, skipping browser launch",
                     browser_session_id=session_id,
                 )
+                if requires_local_display:
+                    await self._stop_vnc_safely(session_id, organization_id)
                 return
 
             launch_proxy_location = session.proxy_location if session.proxy_location is not None else proxy_location
             extra_http_headers = app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(session.proxy_session_id)
-
-            browser_state = await RealBrowserManager._create_browser_state(
-                proxy_location=launch_proxy_location,
-                url=url,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                browser_profile_id=session.browser_profile_id,
-            )
+            if requires_local_display:
+                if session.display_number is None:
+                    raise VncStartupError(f"Persistent browser session {session_id} has no assigned VNC display")
+                browser_state = await RealBrowserManager._create_browser_state(
+                    proxy_location=launch_proxy_location,
+                    url=url,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    browser_profile_id=session.browser_profile_id,
+                    display_number=session.display_number,
+                )
+            else:
+                browser_state = await RealBrowserManager._create_browser_state(
+                    proxy_location=launch_proxy_location,
+                    url=url,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    browser_profile_id=session.browser_profile_id,
+                )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",
                 proxy_location=launch_proxy_location,
@@ -423,31 +630,57 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 extra_http_headers=extra_http_headers,
             )
 
-            session = await self.get_session(session_id, organization_id)
-            if session is None or is_final_status(session.status) or session.completed_at is not None:
-                LOG.info(
-                    "Session closed during browser launch, discarding browser",
-                    browser_session_id=session_id,
+            if requires_local_display:
+                winner = await self._compare_and_install_browser_state_locked(
+                    session_id,
+                    browser_state,
+                    organization_id,
                 )
-                await browser_state.close()
-                return
-
-            if session_id in self._browser_sessions:
-                LOG.info(
-                    "Session already has browser state, discarding duplicate",
-                    browser_session_id=session_id,
+                if winner is None:
+                    LOG.info(
+                        "Session closed during browser launch, discarding browser",
+                        browser_session_id=session_id,
+                    )
+                    await await_to_terminal_state(
+                        self._close_browser_then_vnc(browser_state, session_id, organization_id)
+                    )
+                    return
+                if winner is not browser_state:
+                    LOG.info(
+                        "Session already has browser state, discarding duplicate",
+                        browser_session_id=session_id,
+                    )
+                    duplicate_loser = True
+                    await self._close_rejected_browser_state(session_id, organization_id, browser_state)
+                    return
+            else:
+                session = await self.get_session(session_id, organization_id)
+                if session is None or is_final_status(session.status) or session.completed_at is not None:
+                    LOG.info(
+                        "Session closed during browser launch, discarding browser",
+                        browser_session_id=session_id,
+                    )
+                    await browser_state.close()
+                    return
+                if session_id in self._browser_sessions:
+                    LOG.info(
+                        "Session already has browser state, discarding duplicate",
+                        browser_session_id=session_id,
+                    )
+                    await browser_state.close()
+                    return
+                self._browser_sessions[session_id] = BrowserSession(
+                    browser_state=browser_state,
+                    organization_id=organization_id,
                 )
-                await browser_state.close()
-                return
-
-            self._browser_sessions[session_id] = BrowserSession(
-                browser_state=browser_state,
-                organization_id=organization_id,
-            )
 
             result = await self.update_status(session_id, organization_id, PersistentBrowserSessionStatus.running)
             if result is None:
-                self._browser_sessions.pop(session_id, None)
+                if requires_local_display:
+                    raise VncStartupError(f"Persistent browser session {session_id} closed before launch completed")
+                cached = self._browser_sessions.get(session_id)
+                if cached is not None and cached.browser_state is browser_state:
+                    self._browser_sessions.pop(session_id, None)
                 await browser_state.close()
                 return
             # Set started_at so renewal knows the browser is live
@@ -461,12 +694,110 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 browser_session_id=session_id,
                 organization_id=organization_id,
             )
-        except Exception:
-            LOG.exception(
-                "Failed to launch browser for standalone session",
+        except BaseException as launch_error:
+            if duplicate_loser:
+                raise
+            if isinstance(launch_error, Exception):
+                LOG.exception(
+                    "Failed to launch browser for standalone session",
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                )
+            else:
+                LOG.warning(
+                    "Standalone browser launch interrupted by control flow",
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                    error_type=type(launch_error).__name__,
+                )
+
+            cleanup_control_flow: BaseException | None = None
+            if requires_local_display:
+                try:
+                    await await_to_terminal_state(
+                        self._cleanup_failed_vnc_launch(session_id, organization_id, browser_state)
+                    )
+                except asyncio.CancelledError as cleanup_cancellation:
+                    cleanup_control_flow = cleanup_cancellation
+                except Exception:
+                    LOG.warning(
+                        "Failed to clean up standalone VNC launch",
+                        browser_session_id=session_id,
+                        organization_id=organization_id,
+                        exc_info=True,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_control_flow = cleanup_error
+
+            if not isinstance(launch_error, Exception):
+                raise
+            if cleanup_control_flow is not None:
+                raise cleanup_control_flow from launch_error
+
+    async def _close_browser_then_vnc(
+        self,
+        browser_state: BrowserState,
+        session_id: str,
+        organization_id: str,
+    ) -> None:
+        close_error: BaseException | None = None
+        try:
+            await browser_state.close()
+        except TargetClosedError:
+            pass
+        except BaseException as error:
+            close_error = error
+            LOG.warning(
+                "Failed to close discarded browser",
                 browser_session_id=session_id,
                 organization_id=organization_id,
+                exc_info=True,
             )
+        if self.requires_local_vnc_display():
+            await VncManager.stop_vnc_for_session(session_id, organization_id=organization_id)
+        if close_error is not None:
+            raise close_error
+
+    async def _cleanup_failed_vnc_launch(
+        self,
+        session_id: str,
+        organization_id: str,
+        browser_state: BrowserState | None,
+    ) -> None:
+        browser_control_flow: BaseException | None = None
+        if browser_state is not None:
+            try:
+                await browser_state.close()
+            except TargetClosedError:
+                pass
+            except Exception:
+                LOG.warning(
+                    "Failed to close browser after standalone VNC launch error",
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+            except BaseException as error:
+                browser_control_flow = error
+
+        cached = self._browser_sessions.get(session_id)
+        another_browser_won = cached is not None and cached.browser_state is not browser_state
+        if not another_browser_won:
+            stopped = await self._stop_vnc_safely(session_id, organization_id)
+            if stopped:
+                if cached is not None and cached.browser_state is browser_state:
+                    self._browser_sessions.pop(session_id, None)
+                try:
+                    await self.update_status(session_id, organization_id, PersistentBrowserSessionStatus.failed)
+                except Exception:
+                    LOG.warning(
+                        "Failed to finalize browser session after VNC launch error",
+                        browser_session_id=session_id,
+                        organization_id=organization_id,
+                        exc_info=True,
+                    )
+        if browser_control_flow is not None:
+            raise browser_control_flow
 
     async def occupy_browser_session(
         self,
@@ -529,7 +860,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         - bool (reconcile): the caller already resolved the opt-in from its own fresh, authoritative
           read of a terminal row, so honor it directly with no re-read — a soft-delete or error
           between the two reads can't flip the verdict into a fail-open export. True exports; False
-          skips the snapshot/upload entirely."""
+          skips the snapshot/upload entirely.
+
+        The caller must hold the per-session lock in VNC mode so teardown cannot race
+        browser launch or database finalization.
+        """
+        requires_local_display = self.requires_local_vnc_display()
         browser_session = self._browser_sessions.get(browser_session_id)
         if browser_session and browser_session.organization_id != organization_id:
             LOG.warning(
@@ -542,114 +878,170 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         if not browser_session:
             return False
 
-        LOG.info(
-            "Closing browser session",
-            organization_id=organization_id,
-            session_id=browser_session_id,
-        )
-        # Export session profile before closing (so it can be used to create browser profiles)
         browser_artifacts = browser_session.browser_state.browser_artifacts
-        if export_profile is not False and browser_artifacts and browser_artifacts.browser_session_dir:
-            # Export-eligible paths snapshot session cookies before store_browser_profile copies
-            # the dir; the later close() persist runs after this export, too late to land in the
-            # archive. export_profile=False intentionally skips both the cookie snapshot and the
-            # profile upload.
-            await persist_session_cookies(
-                browser_session.browser_state.browser_context, browser_artifacts.browser_session_dir
-            )
-            if export_profile is None:
-                # close_session: re-read the row to honor an update-while-alive opt-in toggle. Fail
-                # open on a missing/errored re-read so a transient blip never drops an opted-in /
-                # profile-reuse session's profile.
-                should_export = True
-                try:
-                    persisted_session = await self.database.browser_sessions.get_persistent_browser_session(
-                        browser_session_id, organization_id
-                    )
-                    should_export = persisted_session is None or persisted_session.should_export_profile()
-                except Exception:
-                    LOG.warning(
-                        "Failed to read browser session opt-in flag; exporting profile to be safe",
-                        browser_session_id=browser_session_id,
-                        organization_id=organization_id,
-                        exc_info=True,
-                    )
-            else:
-                # reconcile already resolved the opt-in from its own fresh, authoritative read of a
-                # terminal row; honor it directly with no re-read, so a soft-delete or transient error
-                # between the two reads can never flip the verdict into a fail-open export.
-                should_export = export_profile
-            if should_export:
-                try:
-                    await app.STORAGE.store_browser_profile(
-                        organization_id=organization_id,
-                        profile_id=browser_session_id,
-                        directory=browser_artifacts.browser_session_dir,
-                    )
-                    LOG.info(
-                        "Exported browser session profile",
-                        browser_session_id=browser_session_id,
-                        organization_id=organization_id,
-                    )
-                except Exception:
-                    LOG.exception(
-                        "Failed to export browser session profile",
-                        browser_session_id=browser_session_id,
-                        organization_id=organization_id,
-                    )
-            else:
-                LOG.info(
-                    "Skipping browser profile export; session did not opt into profile generation",
-                    browser_session_id=browser_session_id,
-                    organization_id=organization_id,
-                )
-
+        browser_close_attempted = False
+        vnc_stopped = False
+        vnc_stop_failed = False
         try:
-            await browser_session.browser_state.close()
-        except TargetClosedError:
             LOG.info(
-                "Browser context already closed",
+                "Closing browser session",
                 organization_id=organization_id,
                 session_id=browser_session_id,
             )
-        except Exception:
-            LOG.warning(
-                "Error while closing browser session",
-                organization_id=organization_id,
-                session_id=browser_session_id,
-                exc_info=True,
-            )
-
-        if browser_artifacts and browser_artifacts.video_artifacts:
-            for video_artifact in browser_artifacts.video_artifacts:
-                if video_artifact.video_path:
+            if export_profile is not False and browser_artifacts and browser_artifacts.browser_session_dir:
+                # Export-eligible paths snapshot session cookies before store_browser_profile copies
+                # the dir; the later close() persist runs after this export, too late to land in the
+                # archive. export_profile=False intentionally skips both the cookie snapshot and the
+                # profile upload.
+                await persist_session_cookies(
+                    browser_session.browser_state.browser_context,
+                    browser_artifacts.browser_session_dir,
+                )
+                if export_profile is None:
+                    # close_session re-reads the row to honor a live opt-in toggle. Fail open on a
+                    # missing/errored re-read so a transient blip never drops an opted-in profile.
+                    should_export = True
                     try:
-                        video_path = Path(video_artifact.video_path)
-                        if video_path.exists():
-                            date = video_path.parent.name
-                            await app.STORAGE.sync_browser_session_file(
-                                organization_id=organization_id,
-                                browser_session_id=browser_session_id,
-                                artifact_type="videos",
-                                local_file_path=str(video_path),
-                                remote_path=video_path.name,
-                                date=date,
-                            )
+                        persisted_session = await self.database.browser_sessions.get_persistent_browser_session(
+                            browser_session_id, organization_id
+                        )
+                        should_export = persisted_session is None or persisted_session.should_export_profile()
                     except Exception:
-                        LOG.exception(
-                            "Failed to sync video recording",
+                        LOG.warning(
+                            "Failed to read browser session opt-in flag; exporting profile to be safe",
                             browser_session_id=browser_session_id,
                             organization_id=organization_id,
-                            video_path=video_artifact.video_path,
+                            exc_info=True,
                         )
+                else:
+                    # reconcile already resolved opt-in from its authoritative read; never re-read
+                    # and turn a soft-deleted or opted-out row into a fail-open export.
+                    should_export = export_profile
+                if should_export:
+                    try:
+                        await app.STORAGE.store_browser_profile(
+                            organization_id=organization_id,
+                            profile_id=browser_session_id,
+                            directory=browser_artifacts.browser_session_dir,
+                        )
+                        LOG.info(
+                            "Exported browser session profile",
+                            browser_session_id=browser_session_id,
+                            organization_id=organization_id,
+                        )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to export browser session profile",
+                            browser_session_id=browser_session_id,
+                            organization_id=organization_id,
+                        )
+                else:
+                    LOG.info(
+                        "Skipping browser profile export; session did not opt into profile generation",
+                        browser_session_id=browser_session_id,
+                        organization_id=organization_id,
+                    )
 
-        self._browser_sessions.pop(browser_session_id, None)
-        if browser_session.cdp_port is not None:
-            _release_cdp_port(browser_session.cdp_port)
+            browser_close_attempted = True
+            try:
+                await browser_session.browser_state.close()
+            except TargetClosedError:
+                LOG.info(
+                    "Browser context already closed",
+                    organization_id=organization_id,
+                    session_id=browser_session_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Error while closing browser session",
+                    organization_id=organization_id,
+                    session_id=browser_session_id,
+                    exc_info=True,
+                )
+
+            if requires_local_display:
+                vnc_stopped = await self._stop_vnc_safely(browser_session_id, organization_id)
+                if not vnc_stopped:
+                    vnc_stop_failed = True
+                    raise VncTeardownError(
+                        browser_session_id,
+                        errors=("VNC stack remains tracked after close",),
+                    )
+
+            if browser_artifacts and browser_artifacts.video_artifacts:
+                for video_artifact in browser_artifacts.video_artifacts:
+                    if video_artifact.video_path:
+                        try:
+                            video_path = Path(video_artifact.video_path)
+                            if video_path.exists():
+                                date = video_path.parent.name
+                                await app.STORAGE.sync_browser_session_file(
+                                    organization_id=organization_id,
+                                    browser_session_id=browser_session_id,
+                                    artifact_type="videos",
+                                    local_file_path=str(video_path),
+                                    remote_path=video_path.name,
+                                    date=date,
+                                )
+                        except Exception:
+                            LOG.exception(
+                                "Failed to sync video recording",
+                                browser_session_id=browser_session_id,
+                                organization_id=organization_id,
+                                video_path=video_artifact.video_path,
+                            )
+
+            if not requires_local_display:
+                cached = self._browser_sessions.get(browser_session_id)
+                if cached is browser_session:
+                    self._browser_sessions.pop(browser_session_id, None)
+                    if browser_session.cdp_port is not None:
+                        _release_cdp_port(browser_session.cdp_port)
+        finally:
+            # Profile/cookie export errors must not leave Chromium running over a live X server.
+            if requires_local_display:
+                if not browser_close_attempted:
+                    browser_close_attempted = True
+                    try:
+                        await browser_session.browser_state.close()
+                    except TargetClosedError:
+                        LOG.info(
+                            "Browser context already closed",
+                            organization_id=organization_id,
+                            session_id=browser_session_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Error while closing browser session",
+                            organization_id=organization_id,
+                            session_id=browser_session_id,
+                            exc_info=True,
+                        )
+                if requires_local_display and not vnc_stopped:
+                    vnc_stopped = await self._stop_vnc_safely(browser_session_id, organization_id)
+                if browser_close_attempted and requires_local_display and vnc_stopped and not vnc_stop_failed:
+                    cached = self._browser_sessions.get(browser_session_id)
+                    if cached is browser_session:
+                        self._browser_sessions.pop(browser_session_id, None)
+                if requires_local_display and not vnc_stopped:
+                    raise VncTeardownError(
+                        browser_session_id,
+                        errors=("VNC stack remains tracked after close",),
+                    )
         return True
 
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
+        if self.requires_local_vnc_display():
+            async with self._get_session_lock(browser_session_id):
+                await await_to_terminal_state(self._close_session_impl(organization_id, browser_session_id))
+            return
+        await self._close_session_impl(organization_id, browser_session_id)
+
+    async def _close_session_impl(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
+        requires_local_display = self.requires_local_vnc_display()
+        cached = self._browser_sessions.get(browser_session_id)
+        organization_mismatch = cached is not None and cached.organization_id != organization_id
         released = await self._release_local_browser_session(organization_id, browser_session_id)
         if not released:
             LOG.info(
@@ -657,6 +1049,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 session_id=browser_session_id,
             )
+            if requires_local_display and not organization_mismatch:
+                if not await self._stop_vnc_safely(browser_session_id, organization_id):
+                    raise VncTeardownError(
+                        browser_session_id,
+                        errors=("VNC stack remains tracked after close",),
+                    )
 
         await self.database.browser_sessions.close_persistent_browser_session(browser_session_id, organization_id)
         if settings.BROWSER_STREAMING_MODE == "cdp":
@@ -695,7 +1093,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         """
         interval_seconds = settings.PERSISTENT_SESSIONS_REAPER_INTERVAL_SECONDS
         launches_in_process_browsers = (
-            settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
+            settings.BROWSER_STREAMING_MODE in {"cdp", "vnc"} or settings.BROWSER_TYPE == "cdp-connect"
         )
         if not launches_in_process_browsers or interval_seconds <= 0:
             return
@@ -755,7 +1153,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         sessions = await self.database.browser_sessions.get_uncompleted_persistent_browser_sessions()
         for db_session in sessions:
             # Only reap browsers this process holds; completing another process's row would hide its leak.
-            if db_session.persistent_browser_session_id not in self._browser_sessions:
+            owns_vnc_stack = settings.BROWSER_STREAMING_MODE == "vnc" and VncManager.has_session(
+                db_session.persistent_browser_session_id
+            )
+            if db_session.persistent_browser_session_id not in self._browser_sessions and not owns_vnc_stack:
                 continue
             # Leave sessions occupied by a still-live run to that run's own teardown. A run that died
             # before releasing occupancy leaves runnable_id set forever, so resolve the owner and let
@@ -858,9 +1259,21 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 # -> export. This never persists an unknown/opted-out session's data and closes the
                 # soft-delete race between reconcile's read and a second in-release read.
                 should_export_profile = db_session is not None and db_session.should_export_profile()
-                await self._release_local_browser_session(
-                    organization_id, session_id, export_profile=should_export_profile
-                )
+                if self.requires_local_vnc_display():
+                    async with self._get_session_lock(session_id):
+                        await await_to_terminal_state(
+                            self._release_local_browser_session(
+                                organization_id,
+                                session_id,
+                                export_profile=should_export_profile,
+                            )
+                        )
+                else:
+                    await self._release_local_browser_session(
+                        organization_id,
+                        session_id,
+                        export_profile=should_export_profile,
+                    )
             except Exception:
                 LOG.exception(
                     "Failed to reclaim worker-local browser session",
@@ -872,8 +1285,19 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     async def close(cls) -> None:
         """Close all browser sessions across all organizations."""
         LOG.info("Closing PersistentSessionsManager")
-        if cls.instance:
-            active_sessions = await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
-            for db_session in active_sessions:
-                await cls.instance.close_session(db_session.organization_id, db_session.persistent_browser_session_id)
+        try:
+            if cls.instance:
+                # Deployment boundary: multi-worker VNC is unsupported. This DB-wide
+                # shutdown can finalize a peer worker's row, while VncManager can stop
+                # only stacks tracked by this process; cross-worker enforcement is deferred.
+                active_sessions = (
+                    await cls.instance.database.browser_sessions.get_all_active_persistent_browser_sessions()
+                )
+                for db_session in active_sessions:
+                    await cls.instance.close_session(
+                        db_session.organization_id, db_session.persistent_browser_session_id
+                    )
+        finally:
+            if settings.BROWSER_STREAMING_MODE == "vnc":
+                await VncManager.stop_all()
         LOG.info("PersistentSessionsManager is closed")

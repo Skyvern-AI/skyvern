@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 from typing import cast as typing_cast
@@ -69,6 +70,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, ProxyLocationInput, RunType
 
 LOG = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class WorkflowRunBrowserSessionClaim:
+    browser_session_id: str
+    installed: bool
 
 
 def _merge_script_run(
@@ -351,6 +358,60 @@ class WorkflowRunsRepository(BaseRepository):
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    @db_operation("claim_workflow_run_browser_session")
+    async def claim_workflow_run_browser_session(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        candidate_browser_session_id: str,
+    ) -> WorkflowRunBrowserSessionClaim:
+        """Atomically install a workflow browser session or return the existing winner."""
+        if not candidate_browser_session_id:
+            raise ValueError("candidate_browser_session_id must be non-empty")
+
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.organization_id == organization_id,
+                    or_(
+                        WorkflowRunModel.browser_session_id.is_(None),
+                        WorkflowRunModel.browser_session_id == "",
+                    ),
+                )
+                .values(browser_session_id=candidate_browser_session_id)
+                .returning(WorkflowRunModel.browser_session_id)
+            )
+            installed_browser_session_id = result.scalar_one_or_none()
+            await session.commit()
+
+            if installed_browser_session_id is not None:
+                return WorkflowRunBrowserSessionClaim(
+                    browser_session_id=installed_browser_session_id,
+                    installed=True,
+                )
+
+            workflow_run = (
+                await session.scalars(
+                    select(WorkflowRunModel).where(
+                        WorkflowRunModel.workflow_run_id == workflow_run_id,
+                        WorkflowRunModel.organization_id == organization_id,
+                    )
+                )
+            ).first()
+            if workflow_run is None:
+                raise WorkflowRunNotFound(workflow_run_id)
+            if not workflow_run.browser_session_id:
+                raise RuntimeError(
+                    f"Workflow run {workflow_run_id} has no browser session after a missed session claim"
+                )
+            return WorkflowRunBrowserSessionClaim(
+                browser_session_id=workflow_run.browser_session_id,
+                installed=False,
+            )
 
     @db_operation("increment_workflow_run_credits")
     async def increment_workflow_run_credits(

@@ -71,6 +71,9 @@ class PersistentBrowserSession(BaseModel):
     runnable_type: str | None = None
     runnable_id: str | None = None
     browser_address: str | None = None
+    display_number: int | None = None
+    vnc_port: int | None = None
+    interactor: str | None = "agent"
     ip_address: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None

@@ -30,6 +30,7 @@ async def test_execute_workflow_resolves_by_run_workflow_id(monkeypatch: pytest.
     workflow_run = SimpleNamespace(
         workflow_permanent_id="wpid_1",
         workflow_id="w_v7",
+        browser_session_id=None,
         status=WorkflowRunStatus.queued,
     )
     service = WorkflowService()
@@ -61,6 +62,7 @@ async def test_execute_workflow_canceled_run_skips_resolution(monkeypatch: pytes
     workflow_run = SimpleNamespace(
         workflow_permanent_id="wpid_1",
         workflow_id="w_deleted",
+        browser_session_id=None,
         status=WorkflowRunStatus.canceled,
     )
     service = WorkflowService()

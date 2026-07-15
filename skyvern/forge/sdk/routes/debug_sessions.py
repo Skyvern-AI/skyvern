@@ -300,7 +300,10 @@ async def new_debug_session(
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
         vnc_streaming_supported=(
-            settings.ENV == "local" or bool(new_browser_session.ip_address or new_browser_session.browser_address)
+            settings.ENV == "local"
+            or bool(
+                new_browser_session.ip_address or new_browser_session.browser_address or new_browser_session.vnc_port
+            )
         ),
     )
 

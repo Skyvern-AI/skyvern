@@ -5,6 +5,7 @@ import subprocess
 import structlog
 import typer
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
@@ -42,12 +43,14 @@ async def run() -> None:
                 ]:
                     continue
                 file_name = f"{workflow_run_id}.png"
+                runnable_id = workflow_run_id
 
             elif task_id:
                 task = await app.DATABASE.tasks.get_task(task_id=task_id, organization_id=organization_id)
                 if not task or task.status.is_final():
                     continue
                 file_name = f"{task_id}.png"
+                runnable_id = task_id
             else:
                 continue
         except Exception:
@@ -59,13 +62,35 @@ async def run() -> None:
             )
             continue
 
+        display_number = settings.SKYVERN_DEFAULT_DISPLAY
+        if settings.BROWSER_STREAMING_MODE == "vnc":
+            try:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+                    runnable_id=runnable_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to get browser session while taking streaming screenshot in worker",
+                    runnable_id=runnable_id,
+                    organization_id=organization_id,
+                )
+                continue
+
+            if browser_session is not None and browser_session.display_number is not None:
+                display_number = browser_session.display_number
+
         # create f"{get_skyvern_temp_dir()}/{organization_id}" directory if it does not exists
         os.makedirs(f"{get_skyvern_temp_dir()}/{organization_id}", exist_ok=True)
         png_file_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
 
         # run subprocess to take screenshot
+        subprocess_env = os.environ.copy()
+        subprocess_env["DISPLAY"] = f":{display_number}"
         subprocess.run(
-            f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}", shell=True, env={"DISPLAY": ":99"}
+            f"xwd -root | xwdtopnm 2>/dev/null | pnmtopng > {png_file_path}",
+            shell=True,
+            env=subprocess_env,
         )
 
         try:

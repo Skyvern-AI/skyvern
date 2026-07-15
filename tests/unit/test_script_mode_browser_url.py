@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -142,3 +143,45 @@ async def test_script_page_selects_proxy_url_without_navigating() -> None:
             browser_profile_id="bp_1",
             navigate=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_script_page_preserves_browser_manager_protocol_call_shape_for_local_vnc() -> None:
+    from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+
+    ctx = MagicMock()
+    ctx.workflow_run_id = None
+    ctx.organization_id = "org_1"
+
+    with (
+        patch("skyvern.core.script_generations.script_skyvern_page.app") as mock_app,
+        patch("skyvern.core.script_generations.script_skyvern_page.skyvern_context") as mock_context,
+    ):
+        mock_context.current.return_value = ctx
+        mock_app.PERSISTENT_SESSIONS_MANAGER = SimpleNamespace(requires_local_vnc_display=MagicMock(return_value=True))
+        mock_app.BROWSER_MANAGER.get_or_create_for_script = AsyncMock()
+
+        await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_1")
+
+        mock_app.BROWSER_MANAGER.get_or_create_for_script.assert_awaited_once_with(browser_session_id="pbs_1")
+
+
+@pytest.mark.asyncio
+async def test_script_page_preserves_legacy_manager_call_shape_without_local_vnc_capability() -> None:
+    from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+
+    ctx = MagicMock()
+    ctx.workflow_run_id = None
+    ctx.organization_id = "org_1"
+
+    with (
+        patch("skyvern.core.script_generations.script_skyvern_page.app") as mock_app,
+        patch("skyvern.core.script_generations.script_skyvern_page.skyvern_context") as mock_context,
+    ):
+        mock_context.current.return_value = ctx
+        mock_app.PERSISTENT_SESSIONS_MANAGER = SimpleNamespace()
+        mock_app.BROWSER_MANAGER.get_or_create_for_script = AsyncMock()
+
+        await ScriptSkyvernPage._get_or_create_browser_state(browser_session_id="pbs_1")
+
+        mock_app.BROWSER_MANAGER.get_or_create_for_script.assert_awaited_once_with(browser_session_id="pbs_1")

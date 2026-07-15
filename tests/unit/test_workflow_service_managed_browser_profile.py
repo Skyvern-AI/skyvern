@@ -61,6 +61,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
         browser_profile_id="bp_managed",
+        browser_session_id=None,
         browser_address=None,
         status=status,
         failure_reason=None,

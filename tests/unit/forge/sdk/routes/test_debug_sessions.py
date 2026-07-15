@@ -30,6 +30,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         persistent_browser_session_id="pbs_new",
         ip_address=None,
         browser_address=None,
+        vnc_port=None,
         browser_profile_id=None,
     )
 
@@ -160,6 +161,7 @@ async def test_new_debug_session_response_carries_pbs_browser_profile_id() -> No
         persistent_browser_session_id="pbs_new",
         ip_address=None,
         browser_address=None,
+        vnc_port=None,
         browser_profile_id="bp_seeded",
     )
 
@@ -185,6 +187,45 @@ async def test_new_debug_session_response_carries_pbs_browser_profile_id() -> No
 
     assert result is created_debug_session
     assert created_debug_session.pbs_browser_profile_id == "bp_seeded"
+
+
+@pytest.mark.asyncio
+async def test_new_debug_session_supports_addressless_session_with_vnc_port() -> None:
+    created_debug_session = SimpleNamespace(debug_session_id="ds_new", pbs_browser_profile_id=None)
+    new_browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_new",
+        ip_address=None,
+        browser_address=None,
+        vnc_port=6087,
+        browser_profile_id=None,
+    )
+
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.debug.complete_debug_sessions = AsyncMock(return_value=[])
+    app_mock.DATABASE.debug.create_debug_session = AsyncMock(return_value=created_debug_session)
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
+
+    with (
+        patch.object(debug_sessions_mod, "app", app_mock),
+        patch.object(debug_sessions_mod.settings, "ENV", "production"),
+    ):
+        await debug_sessions_mod.new_debug_session(
+            "wpid_test",
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
+        browser_session_id="pbs_new",
+        organization_id="org_123",
+        user_id="user_123",
+        workflow_permanent_id="wpid_test",
+        vnc_streaming_supported=True,
+    )
 
 
 # ─── login-block-compatibility endpoint ────────────────────────────────────
