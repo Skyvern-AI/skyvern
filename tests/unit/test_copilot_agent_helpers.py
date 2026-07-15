@@ -105,6 +105,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentMode,
     TurnIntentReasonCode,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -2661,6 +2662,30 @@ class TestTranslateToAgentResultGating:
         assert ctx.last_workflow is None
         assert agent_result.updated_workflow is None
         assert "confirm and i'll apply" in agent_result.user_response.lower()
+
+    def test_inline_replace_workflow_suppressed_on_runtime_self_heal_turn(self, monkeypatch) -> None:
+        def _must_not_process(**kwargs):
+            raise AssertionError("inline REPLACE_WORKFLOW was processed on runtime self-heal")
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", _must_not_process)
+        ctx = _ctx(turn_origin=TurnOrigin.runtime_self_heal)
+        result = _fake_run_result(
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "here is a replacement",
+                "workflow_yaml": "new: yaml",
+            }
+        )
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.response_type == "REPLY"
+        assert ctx.last_workflow is None
+        assert agent_result.updated_workflow is None
+        assert "runtime self-heal" in agent_result.user_response.lower()
 
     def test_inline_replace_workflow_rejects_stale_block_metadata(self, monkeypatch) -> None:
         # Inline REPLACE_WORKFLOW bypasses _update_workflow, so it must also
