@@ -9,7 +9,7 @@ import keyword
 import re
 import textwrap
 import tokenize
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import structlog
 import yaml
+from jinja2 import TemplateSyntaxError
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.forge import app
@@ -28,6 +29,7 @@ from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_sta
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
+    build_definition_contract_unsatisfied_blocker_signal,
     build_output_source_unobservable_blocker_signal,
     clear_terminal_evidence_on_workflow_edit,
     stash_blocker_signal,
@@ -36,9 +38,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
+    RecordedOutcomeGroundingRequirement,
     _stable_hash,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
+    latest_recorded_build_test_outcome_repeated,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
@@ -80,6 +84,8 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     build_input_templated_locator,
     credential_scout_gap,
     freeze_requested_output_extraction_candidate,
+    grounded_parameter_key_is_safe,
+    grounded_submit_rung_binding_fingerprint,
     input_correspondences_for_interaction,
     locator_selector_literals,
     missing_rung_text,
@@ -95,6 +101,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     uncovered_required_emitted_interactions,
     uncovered_rung_records,
 )
+from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     composition_page_evidence_error,
@@ -164,7 +171,9 @@ from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_produ
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     AuthorTimeGateAblationPayload,
+    ScoutedFieldParameterBinding,
     ScoutedInteraction,
+    ScoutedSubmitRungBinding,
     copilot_author_time_gate_log_only_enabled,
     record_author_time_gate_ablation_event,
 )
@@ -181,7 +190,12 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_repair_ceiling_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.turn_ownership import TurnClaimant, claim_turn, current_turn_owner
+from skyvern.forge.sdk.copilot.turn_ownership import (
+    TurnClaimant,
+    claim_and_stash_blocker_signal,
+    claim_turn,
+    current_turn_owner,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     credential_param_ids,
     parse_workflow_yaml,
@@ -194,6 +208,7 @@ from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS,
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.templating import get_missing_variables
 
 from ._shared import (
     BLOCK_RUNNING_TOOLS,
@@ -1713,6 +1728,601 @@ def _active_completion_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     if request_policy is None:
         return []
     return request_policy.graded_completion_criteria()
+
+
+class _DefinitionPlaneReject(NamedTuple):
+    criterion_ids: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    unreferenced_parameter_keys: tuple[str, ...]
+
+
+def _expression_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
+    if isinstance(expression, ast.Name) and isinstance(expression.ctx, ast.Load):
+        return set(bindings.get(expression.id, set()))
+    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        local_bindings = {name: set(sources) for name, sources in bindings.items()}
+        comprehension_sources: set[str] = set()
+        for generator in expression.generators:
+            comprehension_sources.update(_expression_parameter_sources(generator.iter, local_bindings))
+            _bind_parameter_sources(generator.target, set(), local_bindings)
+            for condition in generator.ifs:
+                comprehension_sources.update(_expression_parameter_sources(condition, local_bindings))
+        if isinstance(expression, ast.DictComp):
+            comprehension_sources.update(_expression_parameter_sources(expression.key, local_bindings))
+            comprehension_sources.update(_expression_parameter_sources(expression.value, local_bindings))
+        else:
+            comprehension_sources.update(_expression_parameter_sources(expression.elt, local_bindings))
+        return comprehension_sources
+    if isinstance(expression, ast.Lambda):
+        local_bindings = {name: set(sources) for name, sources in bindings.items()}
+        for argument in (*expression.args.posonlyargs, *expression.args.args, *expression.args.kwonlyargs):
+            local_bindings[argument.arg] = set()
+        if expression.args.vararg is not None:
+            local_bindings[expression.args.vararg.arg] = set()
+        if expression.args.kwarg is not None:
+            local_bindings[expression.args.kwarg.arg] = set()
+        return _expression_parameter_sources(expression.body, local_bindings)
+    if isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return set()
+    sources: set[str] = set()
+    for child in ast.iter_child_nodes(expression):
+        sources.update(_expression_parameter_sources(child, bindings))
+    return sources
+
+
+def _awaited_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
+    if isinstance(expression, ast.Await):
+        return _expression_parameter_sources(expression.value, bindings)
+    if isinstance(expression, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return set()
+    sources: set[str] = set()
+    for child in ast.iter_child_nodes(expression):
+        sources.update(_awaited_parameter_sources(child, bindings))
+    return sources
+
+
+def _bind_parameter_sources(target: ast.expr, sources: set[str], bindings: dict[str, set[str]]) -> None:
+    if isinstance(target, ast.Name):
+        bindings[target.id] = set(sources)
+        return
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _bind_parameter_sources(element, sources, bindings)
+
+
+def _merge_parameter_bindings(left: Mapping[str, set[str]], right: Mapping[str, set[str]]) -> dict[str, set[str]]:
+    return {name: set(left.get(name, set())) | set(right.get(name, set())) for name in set(left) | set(right)}
+
+
+def _loop_body_has_reachable_break(statements: Sequence[ast.stmt]) -> bool:
+    for statement in statements:
+        if isinstance(statement, ast.Break):
+            return True
+        if isinstance(
+            statement, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            if not _statements_can_fall_through([statement]):
+                return False
+            continue
+        if isinstance(statement, ast.If):
+            if isinstance(statement.test, ast.Constant):
+                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
+                if _loop_body_has_reachable_break(selected_branch):
+                    return True
+            elif _loop_body_has_reachable_break(statement.body) or _loop_body_has_reachable_break(statement.orelse):
+                return True
+        elif isinstance(statement, (ast.Try, ast.TryStar)):
+            if statement.finalbody:
+                if _loop_body_has_reachable_break(statement.finalbody):
+                    return True
+                if not _statements_can_fall_through(statement.finalbody):
+                    return False
+            branches = [statement.body, statement.orelse]
+            branches.extend(handler.body for handler in statement.handlers)
+            if any(_loop_body_has_reachable_break(branch) for branch in branches):
+                return True
+        elif isinstance(statement, (ast.With, ast.AsyncWith)) and _loop_body_has_reachable_break(statement.body):
+            return True
+        elif isinstance(statement, ast.Match) and any(
+            _loop_body_has_reachable_break(case.body) for case in statement.cases
+        ):
+            return True
+        if not _statements_can_fall_through([statement]):
+            return False
+    return False
+
+
+def _statements_can_fall_through(statements: Sequence[ast.stmt]) -> bool:
+    for statement in statements:
+        if isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            return False
+        if isinstance(statement, ast.If):
+            if isinstance(statement.test, ast.Constant):
+                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
+                if not _statements_can_fall_through(selected_branch):
+                    return False
+                continue
+            if statement.orelse:
+                if not _statements_can_fall_through(statement.body) and not _statements_can_fall_through(
+                    statement.orelse
+                ):
+                    return False
+        if (
+            isinstance(statement, ast.While)
+            and isinstance(statement.test, ast.Constant)
+            and bool(statement.test.value)
+            and not _loop_body_has_reachable_break(statement.body)
+        ):
+            return False
+        if isinstance(statement, (ast.Try, ast.TryStar)):
+            if statement.finalbody and not _statements_can_fall_through(statement.finalbody):
+                return False
+            normal_falls_through = _statements_can_fall_through(statement.body) and _statements_can_fall_through(
+                statement.orelse
+            )
+            handler_falls_through = any(_statements_can_fall_through(handler.body) for handler in statement.handlers)
+            if not normal_falls_through and not handler_falls_through:
+                return False
+    return True
+
+
+def _statement_parameter_dataflow(
+    statements: Sequence[ast.stmt], bindings: dict[str, set[str]]
+) -> tuple[set[str], dict[str, set[str]]]:
+    consumed: set[str] = set()
+    current = {name: set(sources) for name, sources in bindings.items()}
+    for statement in statements:
+        if isinstance(statement, ast.Assign):
+            consumed.update(_awaited_parameter_sources(statement.value, current))
+            sources = _expression_parameter_sources(statement.value, current)
+            for target in statement.targets:
+                _bind_parameter_sources(target, sources, current)
+            continue
+        if isinstance(statement, ast.AnnAssign):
+            value = statement.value
+            sources = _expression_parameter_sources(value, current) if value is not None else set()
+            if value is not None:
+                consumed.update(_awaited_parameter_sources(value, current))
+            _bind_parameter_sources(statement.target, sources, current)
+            continue
+        if isinstance(statement, ast.AugAssign):
+            sources = _expression_parameter_sources(statement.target, current)
+            sources.update(_expression_parameter_sources(statement.value, current))
+            consumed.update(_awaited_parameter_sources(statement.value, current))
+            _bind_parameter_sources(statement.target, sources, current)
+            continue
+        if isinstance(statement, ast.Expr):
+            consumed.update(_awaited_parameter_sources(statement.value, current))
+            continue
+        if isinstance(statement, ast.Return):
+            if statement.value is not None:
+                consumed.update(_expression_parameter_sources(statement.value, current))
+            break
+        if isinstance(statement, ast.Raise):
+            if statement.exc is not None:
+                consumed.update(_expression_parameter_sources(statement.exc, current))
+            break
+        if isinstance(statement, ast.If):
+            consumed.update(_expression_parameter_sources(statement.test, current))
+            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
+                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.orelse, current)
+                consumed.update(branch_consumed)
+                current = branch_bindings
+                continue
+            if isinstance(statement.test, ast.Constant) and statement.test.value is True:
+                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.body, current)
+                consumed.update(branch_consumed)
+                current = branch_bindings
+                continue
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
+            consumed.update(body_consumed)
+            consumed.update(else_consumed)
+            body_falls_through = _statements_can_fall_through(statement.body)
+            else_falls_through = _statements_can_fall_through(statement.orelse)
+            if body_falls_through and else_falls_through:
+                current = _merge_parameter_bindings(body_bindings, else_bindings)
+            elif body_falls_through:
+                current = body_bindings
+            elif else_falls_through:
+                current = else_bindings
+            else:
+                break
+            continue
+        if isinstance(statement, (ast.For, ast.AsyncFor)):
+            consumed.update(_expression_parameter_sources(statement.iter, current))
+            loop_bindings = {name: set(sources) for name, sources in current.items()}
+            _bind_parameter_sources(statement.target, set(), loop_bindings)
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, loop_bindings)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
+            consumed.update(body_consumed)
+            consumed.update(else_consumed)
+            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
+            continue
+        if isinstance(statement, ast.While):
+            consumed.update(_expression_parameter_sources(statement.test, current))
+            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
+                else_consumed, current = _statement_parameter_dataflow(statement.orelse, current)
+                consumed.update(else_consumed)
+                continue
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
+            consumed.update(body_consumed)
+            consumed.update(else_consumed)
+            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
+            continue
+        if isinstance(statement, (ast.Try, ast.TryStar)):
+            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
+            consumed.update(body_consumed)
+            merged = body_bindings
+            for handler in statement.handlers:
+                handler_bindings = {name: set(sources) for name, sources in current.items()}
+                if handler.name:
+                    handler_bindings[handler.name] = set()
+                handler_consumed, handler_bindings = _statement_parameter_dataflow(handler.body, handler_bindings)
+                consumed.update(handler_consumed)
+                merged = _merge_parameter_bindings(merged, handler_bindings)
+            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, body_bindings)
+            consumed.update(else_consumed)
+            merged = _merge_parameter_bindings(merged, else_bindings)
+            final_consumed, current = _statement_parameter_dataflow(statement.finalbody, merged)
+            consumed.update(final_consumed)
+            continue
+        if isinstance(statement, (ast.With, ast.AsyncWith)):
+            with_bindings = {name: set(sources) for name, sources in current.items()}
+            for item in statement.items:
+                consumed.update(_expression_parameter_sources(item.context_expr, current))
+                if item.optional_vars is not None:
+                    _bind_parameter_sources(item.optional_vars, set(), with_bindings)
+            body_consumed, current = _statement_parameter_dataflow(statement.body, with_bindings)
+            consumed.update(body_consumed)
+            continue
+        if isinstance(statement, ast.Match):
+            consumed.update(_expression_parameter_sources(statement.subject, current))
+            merged = {name: set(sources) for name, sources in current.items()}
+            for case in statement.cases:
+                if case.guard is not None:
+                    consumed.update(_expression_parameter_sources(case.guard, current))
+                case_consumed, case_bindings = _statement_parameter_dataflow(case.body, current)
+                consumed.update(case_consumed)
+                merged = _merge_parameter_bindings(merged, case_bindings)
+            current = merged
+            continue
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function_bindings = {name: set(sources) for name, sources in current.items()}
+            for argument in (
+                *statement.args.posonlyargs,
+                *statement.args.args,
+                *statement.args.kwonlyargs,
+            ):
+                function_bindings[argument.arg] = set()
+            if statement.args.vararg is not None:
+                function_bindings[statement.args.vararg.arg] = set()
+            if statement.args.kwarg is not None:
+                function_bindings[statement.args.kwarg.arg] = set()
+            function_consumed, _ = _statement_parameter_dataflow(statement.body, function_bindings)
+            current[statement.name] = function_consumed
+            continue
+        if isinstance(statement, ast.ClassDef):
+            current[statement.name] = set()
+            continue
+        consumed.update(_expression_parameter_sources(statement, current))
+    return consumed, current
+
+
+def _code_runtime_parameter_sources(code: str, parameter_keys: set[str]) -> set[str] | None:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    initial_bindings = {key: {key} for key in parameter_keys}
+    consumed, _ = _statement_parameter_dataflow(tree.body, initial_bindings)
+    return consumed
+
+
+def _value_template_parameter_sources(value: Any, parameter_keys: set[str], depth: int = 0) -> set[str]:
+    if depth > 12:
+        return set()
+    if isinstance(value, str):
+        try:
+            return get_missing_variables(value, {}) & parameter_keys
+        except TemplateSyntaxError:
+            return set()
+    if isinstance(value, Mapping):
+        sources: set[str] = set()
+        raw_keys = value.get("parameter_keys")
+        if isinstance(raw_keys, list):
+            sources.update(key for key in raw_keys if key in parameter_keys)
+        for child in value.values():
+            sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
+        return sources
+    if isinstance(value, list):
+        list_sources: set[str] = set()
+        for child in value:
+            list_sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
+        return list_sources
+    return set()
+
+
+def _non_code_runtime_parameter_sources(parsed: Mapping[str, Any], parameter_keys: set[str]) -> set[str]:
+    definition = parsed.get("workflow_definition")
+    blocks = definition.get("blocks") if isinstance(definition, Mapping) else None
+    sources: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, Mapping):
+            return
+        is_block = "block_type" in value
+        if is_block and _enum_or_string_name(value.get("block_type")) != BlockType.CODE.value:
+            own_fields = {
+                key: child
+                for key, child in value.items()
+                if key not in {*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS}
+            }
+            sources.update(_value_template_parameter_sources(own_fields, parameter_keys))
+        for key in (*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS):
+            visit(value.get(key))
+
+    visit(blocks)
+    return sources
+
+
+def _workflow_runtime_parameter_sources(parsed: dict[str, Any]) -> set[str] | None:
+    parameter_keys = _declared_string_workflow_parameter_keys(parsed)
+    sources: set[str] = set()
+    for block in _workflow_code_blocks(parsed):
+        raw_parameter_keys = block.get("parameter_keys")
+        block_parameter_keys = (
+            {key for key in raw_parameter_keys if isinstance(key, str) and key}
+            if isinstance(raw_parameter_keys, list)
+            else set()
+        )
+        block_sources = _code_runtime_parameter_sources(str(block.get("code") or ""), block_parameter_keys)
+        if block_sources is None:
+            return None
+        sources.update(block_sources)
+    sources.update(_non_code_runtime_parameter_sources(parsed, parameter_keys))
+    return sources
+
+
+def _definition_plane_preflight_reject(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    *,
+    enforce_untagged_declared_inputs: bool = False,
+) -> _DefinitionPlaneReject | None:
+    definition_criteria = [
+        criterion for criterion in _active_completion_criteria(ctx) if criterion.level == "definition"
+    ]
+    code_only_browser = _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    if not definition_criteria and not (code_only_browser and enforce_untagged_declared_inputs):
+        return None
+    unreferenced_parameter_keys: tuple[str, ...] = ()
+    runtime_sources: set[str] | None = None
+    if code_only_browser:
+        parsed = parse_workflow_yaml(workflow_yaml)
+        if isinstance(parsed, dict):
+            runtime_sources = _workflow_runtime_parameter_sources(parsed)
+            if runtime_sources is None:
+                return None
+            parameter_keys = _declared_string_workflow_parameter_keys(parsed)
+            unreferenced_parameter_keys = tuple(sorted(parameter_keys - runtime_sources))
+    unsatisfied = [
+        verdict
+        for verdict in grade_definition_criteria(definition_criteria, workflow_yaml)
+        if verdict.state == "unsatisfied"
+    ]
+    if runtime_sources is not None and not unreferenced_parameter_keys:
+        unsatisfied = [
+            verdict for verdict in unsatisfied if verdict.reason_code != "definition_parameters_unreferenced"
+        ]
+    if not unsatisfied and not unreferenced_parameter_keys:
+        return None
+    return _DefinitionPlaneReject(
+        criterion_ids=tuple(verdict.criterion_id for verdict in unsatisfied)
+        or tuple(criterion.id for criterion in definition_criteria),
+        reason_codes=tuple(verdict.reason_code for verdict in unsatisfied)
+        or (("definition_parameters_unreferenced",) if unreferenced_parameter_keys else ()),
+        unreferenced_parameter_keys=unreferenced_parameter_keys,
+    )
+
+
+def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
+    if rejection.unreferenced_parameter_keys:
+        keys = ", ".join(f"`{key}`" for key in rejection.unreferenced_parameter_keys)
+        return f"The submitted workflow declares reusable parameters that no block references: {keys}."
+    return "The submitted workflow does not satisfy its active definition-level requirements."
+
+
+def _record_definition_plane_reject(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    rejection: _DefinitionPlaneReject,
+    *,
+    code_artifact_metadata: object = None,
+) -> None:
+    authored_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
+    block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
+    _record_author_time_reject_outcome(
+        ctx,
+        reason_code="definition_contract_unsatisfied",
+        summary=_definition_plane_reject_error(rejection),
+        structural_payload={
+            "reason_code": "definition_contract_unsatisfied",
+            "criterion_ids": rejection.criterion_ids,
+            "definition_reason_codes": rejection.reason_codes,
+            "unreferenced_parameter_keys": rejection.unreferenced_parameter_keys,
+            "authored_structure_signature": authored_signature,
+        },
+        authored_structure_signature=authored_signature,
+        block_labels=block_labels,
+    )
+
+
+def _stash_unresolved_recorded_outcome_grounding_halt(
+    ctx: AgentContext,
+    unresolved_parameter_keys: Iterable[str],
+) -> bool:
+    requirement = ctx.recorded_outcome_grounding_requirement
+    constraint = ctx.recorded_outcome_binding_constraint
+    latest = ctx.latest_recorded_build_test_outcome
+    if (
+        not isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        or requirement.phase != "author_time_reject"
+        or not requirement.satisfied
+        or not isinstance(constraint, RecordedOutcomeBindingConstraint)
+        or constraint.repeated_structural_key != requirement.structural_key
+        or not isinstance(latest, RecordedBuildTestOutcome)
+        or latest.structural_key != requirement.structural_key
+        or latest_recorded_build_test_outcome_repeated(ctx) is not True
+    ):
+        return False
+    keys = sorted(set(unresolved_parameter_keys))
+    if not keys:
+        return False
+    signal = build_definition_contract_unsatisfied_blocker_signal(
+        unresolved_parameter_keys=keys,
+        grounding_unresolved=True,
+    )
+    claim_and_stash_blocker_signal(ctx, TurnClaimant.GENUINELY_TERMINAL, signal, force_stash=True)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="recorded_outcome_regrounding")
+    LOG.info(
+        "copilot recorded outcome regrounding halted before reauthor",
+        structural_key=requirement.structural_key,
+        unresolved_parameter_keys=keys,
+    )
+    return True
+
+
+def _trajectory_with_grounded_submit_rung_binding(
+    ctx: AgentContext,
+    parsed: Mapping[str, Any],
+    runtime_parameters: Mapping[str, Any] | None,
+) -> tuple[ScoutedInteraction, ...] | None:
+    requirement = ctx.recorded_outcome_grounding_requirement
+    constraint = ctx.recorded_outcome_binding_constraint
+    if (
+        not isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        or not requirement.satisfied
+        or requirement.payload is None
+        or requirement.payload.source_tool != "inspect_page_for_composition"
+        or requirement.payload.target_url != "current_page"
+        or not isinstance(constraint, RecordedOutcomeBindingConstraint)
+        or constraint.repeated_structural_key != requirement.structural_key
+    ):
+        return None
+    declared_keys = _declared_string_workflow_parameter_keys(parsed)
+    if not declared_keys or any(not grounded_parameter_key_is_safe(key) for key in declared_keys):
+        return None
+    supplied = runtime_parameters if isinstance(runtime_parameters, Mapping) else {}
+    definition = parsed.get("workflow_definition")
+    rows = definition.get("parameters") if isinstance(definition, Mapping) else None
+    defaults = (
+        {str(row.get("key") or "").strip(): row.get("default_value") for row in rows if isinstance(row, Mapping)}
+        if isinstance(rows, list)
+        else {}
+    )
+    values: dict[str, str] = {}
+    for key in sorted(declared_keys):
+        value = supplied.get(key, defaults.get(key))
+        if not isinstance(value, str) or not value:
+            return None
+        values[key] = value
+
+    evidence = ctx.composition_page_evidence
+    forms = evidence.get("forms") if isinstance(evidence, Mapping) else None
+    current_url = str(evidence.get("current_url") or "").strip() if isinstance(evidence, Mapping) else ""
+    if not isinstance(forms, list) or not current_url or requirement.payload.source_url != current_url:
+        return None
+    captured_clicks: list[tuple[int, int, str, str]] = []
+    for fallback_index, interaction in enumerate(ctx.scout_trajectory):
+        if not isinstance(interaction, Mapping) or interaction.get("tool_name") != "click":
+            continue
+        raw_index = interaction.get("trajectory_index")
+        trajectory_index = raw_index if isinstance(raw_index, int) and raw_index >= 0 else fallback_index
+        captured_clicks.append(
+            (
+                fallback_index,
+                trajectory_index,
+                str(interaction.get("selector") or "").strip(),
+                str(interaction.get("source_url") or "").strip(),
+            )
+        )
+
+    candidates: list[tuple[int, int, ScoutedSubmitRungBinding]] = []
+    for form in forms:
+        if not isinstance(form, Mapping):
+            continue
+        fields = [field for field in form.get("fields") or [] if isinstance(field, Mapping)]
+        controls = [control for control in form.get("submit_controls") or [] if isinstance(control, Mapping)]
+        submit_matches: set[tuple[int, int, str]] = set()
+        for control in controls:
+            submit_selector = str(control.get("selector") or "").strip()
+            if control.get("disabled") is True or not submit_selector:
+                continue
+            matching_clicks = [
+                click for click in captured_clicks if click[2] == submit_selector and click[3] == current_url
+            ]
+            if len(matching_clicks) == 1:
+                submit_matches.add((matching_clicks[0][0], matching_clicks[0][1], submit_selector))
+        if len(submit_matches) != 1:
+            continue
+        submit_position, submit_trajectory_index, submit_selector = next(iter(submit_matches))
+        bindings: list[ScoutedFieldParameterBinding] = []
+        used_selectors: set[str] = set()
+        for key, value in values.items():
+            matching_fields = [
+                field
+                for field in fields
+                if field.get("disabled") is not True
+                and str(field.get("selector") or "").strip()
+                and field.get("value") == value
+            ]
+            if len(matching_fields) != 1:
+                bindings = []
+                break
+            selector = str(matching_fields[0].get("selector") or "").strip()
+            if selector in used_selectors:
+                bindings = []
+                break
+            used_selectors.add(selector)
+            bindings.append({"parameter_key": key, "field_selector": selector})
+        if len(bindings) == len(values):
+            fingerprint = grounded_submit_rung_binding_fingerprint(
+                repeated_structural_key=constraint.repeated_structural_key,
+                source_url=current_url,
+                submit_selector=submit_selector,
+                submit_trajectory_index=submit_trajectory_index,
+                field_bindings=bindings,
+            )
+            candidates.append(
+                (
+                    submit_position,
+                    submit_trajectory_index,
+                    {
+                        "repeated_structural_key": constraint.repeated_structural_key,
+                        "fingerprint": fingerprint,
+                        "field_bindings": bindings,
+                    },
+                )
+            )
+    if len(candidates) != 1:
+        return None
+    submit_position, submit_trajectory_index, submit_rung_binding = candidates[0]
+    derived = [cast(ScoutedInteraction, dict(interaction)) for interaction in ctx.scout_trajectory]
+    derived[submit_position]["submit_rung_binding"] = submit_rung_binding
+    LOG.info(
+        "copilot recorded outcome submit rung bound",
+        binding_fingerprint=submit_rung_binding["fingerprint"],
+        parameter_keys=[binding["parameter_key"] for binding in submit_rung_binding["field_bindings"]],
+        binding_count=len(submit_rung_binding["field_bindings"]),
+        submit_trajectory_index=submit_trajectory_index,
+    )
+    return tuple(derived)
 
 
 def _judgment_output_paths(ctx: AgentContext) -> set[str]:
@@ -4368,13 +4978,54 @@ def _metadata_contract_run_preflight_reject(
     ctx: AgentContext,
     workflow_yaml: str,
     raw_code_artifact_metadata: object,
+    runtime_parameters: Mapping[str, Any] | None = None,
+    *,
+    enforce_untagged_declared_inputs: bool = False,
 ) -> dict[str, Any] | None:
+    definition_reject = (
+        _definition_plane_preflight_reject(
+            ctx,
+            workflow_yaml,
+            enforce_untagged_declared_inputs=enforce_untagged_declared_inputs,
+        )
+        if isinstance(ctx, AgentContext)
+        else None
+    )
+    parsed = parse_workflow_yaml(workflow_yaml)
+    grounded_binding_available = (
+        isinstance(ctx, AgentContext)
+        and isinstance(parsed, Mapping)
+        and _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters) is not None
+    )
+    if definition_reject is not None and (enforce_untagged_declared_inputs or not grounded_binding_available):
+        halted = _stash_unresolved_recorded_outcome_grounding_halt(
+            ctx,
+            definition_reject.unreferenced_parameter_keys,
+        )
+        if not halted:
+            _record_definition_plane_reject(
+                ctx,
+                workflow_yaml,
+                definition_reject,
+                code_artifact_metadata=raw_code_artifact_metadata,
+            )
+        return {
+            "ok": False,
+            "error": _definition_plane_reject_error(definition_reject),
+            "user_facing_summary": _compiled_authoring_user_summary(),
+            "data": {
+                "reason_code": "definition_contract_unsatisfied",
+                "definition_criterion_ids": list(definition_reject.criterion_ids),
+                "definition_reason_codes": list(definition_reject.reason_codes),
+                "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+            },
+        }
     convergence_reject = _recorded_outcome_convergence_reject(
         ctx,
         workflow_yaml=workflow_yaml,
         code_artifact_metadata=raw_code_artifact_metadata,
     )
-    if convergence_reject is not None:
+    if convergence_reject is not None and not grounded_binding_available:
         block_labels = sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml))
         _record_author_time_reject_outcome(
             ctx,
@@ -7728,7 +8379,8 @@ def _stub_with_raw_prompt_violation(ctx: AgentContext, parsed: Mapping[str, Any]
 
 
 def _code_references_parameter(code: str, key: str) -> bool:
-    return re.search(rf"\b{re.escape(key)}\b", code) is not None
+    sources = _code_runtime_parameter_sources(code, {key})
+    return sources is not None and key in sources
 
 
 def _orphan_minted_parameter_violation(parsed: Mapping[str, Any], minted_keys: list[str]) -> str | None:
@@ -8401,7 +9053,11 @@ def _co_computed_metadata_repair_contract(
     )
 
 
-def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
+def _maybe_impose_synthesized_code_block(
+    workflow_yaml: str,
+    ctx: AgentContext,
+    runtime_parameters: Mapping[str, Any] | None = None,
+) -> _SynthesizedCodeImpositionResult:
     ctx.pending_goal_complete_landing = False
     ctx.pending_requested_output_extraction_candidate = None
     ctx.spine_imposition_owned_attempt = False
@@ -8430,6 +9086,24 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     parsed = parse_workflow_yaml(workflow_yaml)
     if not isinstance(parsed, dict):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    grounded_trajectory = _trajectory_with_grounded_submit_rung_binding(ctx, parsed, runtime_parameters)
+    requirement = ctx.recorded_outcome_grounding_requirement
+    constraint = ctx.recorded_outcome_binding_constraint
+    declared_keys = _declared_string_workflow_parameter_keys(parsed)
+    if (
+        grounded_trajectory is None
+        and declared_keys
+        and isinstance(requirement, RecordedOutcomeGroundingRequirement)
+        and requirement.satisfied
+        and isinstance(constraint, RecordedOutcomeBindingConstraint)
+        and constraint.repeated_structural_key == requirement.structural_key
+        and _stash_unresolved_recorded_outcome_grounding_halt(ctx, declared_keys)
+    ):
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: current-page parameter binding is unresolved."],
+        )
+    synthesis_trajectory: Sequence[Mapping[str, Any]] = grounded_trajectory or scout_trajectory
     code_blocks = _workflow_code_blocks(parsed)
     prior_source, prior_yaml = _prior_yaml_source(ctx)
     code_block = _select_synthesized_imposition_code_block(
@@ -8465,14 +9139,14 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     ) or requested_output_extraction_plan_changed(ctx, extraction_plan)
     synthesized = (
         synthesize_code_block_with_extraction(
-            scout_trajectory,
+            synthesis_trajectory,
             extraction_plan,
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
         )
         if extraction_plan is not None
         else synthesize_code_block(
-            scout_trajectory,
+            synthesis_trajectory,
             strict_selectors=True,
             reached_download_target=ctx.reached_download_target,
         )
@@ -8481,6 +9155,14 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
             violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
+        )
+    if synthesized.diagnostics.grounded_submit_binding_fingerprints:
+        LOG.info(
+            "copilot recorded outcome binding consumed by synthesizer",
+            structural_key=requirement.structural_key
+            if isinstance(requirement, RecordedOutcomeGroundingRequirement)
+            else None,
+            binding_fingerprints=synthesized.diagnostics.grounded_submit_binding_fingerprints,
         )
     imposed_candidate: FrozenRequestedOutputExtractionCandidate | None = None
     if extraction_plan is not None:
@@ -9971,7 +10653,12 @@ async def _update_workflow(
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     _enrich_scout_trajectory_input_correspondences(workflow_yaml, ctx)
-    imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+    runtime_parameters = params.get("parameters")
+    imposition = _maybe_impose_synthesized_code_block(
+        workflow_yaml,
+        ctx,
+        runtime_parameters if isinstance(runtime_parameters, Mapping) else None,
+    )
     # Consume the one-shot credential-scout reopen before the gate below so a fresh reject can re-arm it.
     ctx.synthesized_block_reopened_for_credential_scout = False
     if imposition.violations:
@@ -10058,6 +10745,29 @@ async def _update_workflow(
             error="\n".join(final_structural_violations),
             user_facing_summary=_compiled_authoring_user_summary(),
             data=_code_repair_progress_data(),
+        )
+    definition_reject = _definition_plane_preflight_reject(ctx, workflow_yaml)
+    if definition_reject is not None:
+        halted = _stash_unresolved_recorded_outcome_grounding_halt(
+            ctx,
+            definition_reject.unreferenced_parameter_keys,
+        )
+        if not halted:
+            _record_definition_plane_reject(
+                ctx,
+                workflow_yaml,
+                definition_reject,
+                code_artifact_metadata=ctx.raw_code_artifact_metadata,
+            )
+        return reject(
+            error=_definition_plane_reject_error(definition_reject),
+            user_facing_summary=_compiled_authoring_user_summary(),
+            data={
+                "reason_code": "definition_contract_unsatisfied",
+                "definition_criterion_ids": list(definition_reject.criterion_ids),
+                "definition_reason_codes": list(definition_reject.reason_codes),
+                "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+            },
         )
     params["workflow_yaml"] = workflow_yaml
     metadata_scrubbed_by_imposition = False

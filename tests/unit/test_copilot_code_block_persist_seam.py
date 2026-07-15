@@ -6,6 +6,8 @@ OSS-synced: only example.* / RFC-2606 placeholder targets and synthetic labels.
 from __future__ import annotations
 
 import ast
+import hashlib
+import inspect
 import json
 import textwrap
 from types import SimpleNamespace
@@ -19,6 +21,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import code_block_synthesis as code_block_synthesis_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
     CopilotToolBlockerSignal,
@@ -28,9 +31,11 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     RecordedBuildTestOutcome,
     RecordedOutcomeBindingConstraint,
+    arm_recorded_outcome_grounding_requirement,
     authored_block_signatures_from_workflow,
     authored_structure_signature_from_workflow,
     latest_recorded_build_test_outcome_repeated,
+    maybe_satisfy_recorded_outcome_grounding_requirement,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
     recorded_outcome_from_authoring_repair_context,
@@ -444,6 +449,44 @@ def _single_code_block(parsed: dict[str, object]) -> dict[str, object]:
     blocks = [block for block in workflow_blocks(parsed) if str(block.get("block_type") or "").lower() == "code"]
     assert len(blocks) == 1
     return blocks[0]
+
+
+_UNREFERENCED_DEFINITION_YAML = _yaml(
+    """
+    title: Submit reusable service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+      - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+      - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+      - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+      blocks:
+      - block_type: code
+        label: submit_service_request
+        parameter_keys: []
+        code: |
+          await page.locator("#open").click()
+          await page.locator("#submit").click()
+    """
+)
+
+
+def _definition_contract_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            CompletionCriterion(
+                id="c0",
+                outcome=(
+                    "The workflow uses business name, contact email, service address, and desired start date "
+                    "as reusable inputs."
+                ),
+                level="definition",
+                output_path="workflow.parameters",
+            )
+        ]
+    )
+    return ctx
 
 
 @pytest.mark.parametrize(
@@ -1227,6 +1270,927 @@ class TestCodeSafetySeam:
 
 
 class TestCodeRepairProgressClassification:
+    def test_output_safety_clamp_byte_parity(self) -> None:
+        source = inspect.getsource(workflow_update_module._extraction_code_with_required_static_return)
+
+        assert hashlib.sha256(source.encode()).hexdigest() == (
+            "32d1a9443d6dae7e8f6367cbe52902d7aaeb270e78c0275a66648d6013f24f9d"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_workflow_rejects_unreferenced_definition_before_persistence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _definition_contract_ctx()
+        prior_yaml = ctx.workflow_yaml
+
+        for _ in range(2):
+            result = await _update_workflow(
+                {"workflow_yaml": _UNREFERENCED_DEFINITION_YAML},
+                ctx,
+                allow_missing_credentials=True,
+                allow_static_output_uncertainty=True,
+            )
+            assert result["ok"] is False
+            assert result["data"]["reason_code"] == "definition_contract_unsatisfied"
+
+        assert ctx.workflow_yaml == prior_yaml
+        assert ctx.has_staged_proposal is False
+        assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+        assert latest_recorded_build_test_outcome_repeated(ctx) is True
+        requirement = arm_recorded_outcome_grounding_requirement(ctx)
+        assert requirement is not None
+        assert requirement.required_target_url == "current_page"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason_code", ["definition_contract_unsatisfied", "metadata_reject"])
+    async def test_recut_binding_changes_candidate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        reason_code: BuildTestOutcomeReasonCode,
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        for _ in range(2):
+            rejected = await _update_workflow({"workflow_yaml": _UNREFERENCED_DEFINITION_YAML}, ctx)
+            assert rejected["ok"] is False
+        assert arm_recorded_outcome_grounding_requirement(ctx) is not None
+        source_url = "https://example.com/utility"
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#open", "source_url": source_url, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "#submit", "source_url": source_url, "trajectory_index": 1},
+        ]
+        runtime_parameters = {
+            "business_name": "Example Co",
+            "contact_email": "ops@example.com",
+            "service_address": "1 Example Way",
+            "desired_start_date": "2026-08-01",
+        }
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": source_url,
+            "page_title": "Utility request",
+            "forms": [
+                {
+                    "fields": [
+                        {"selector": "#company", "value": runtime_parameters["business_name"]},
+                        {"selector": "#email", "value": runtime_parameters["contact_email"]},
+                        {"selector": "#address", "value": runtime_parameters["service_address"]},
+                        {"selector": "#date", "value": runtime_parameters["desired_start_date"]},
+                    ],
+                    "submit_controls": [{"selector": "#submit"}],
+                }
+            ],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+            "anti_bot_indicators": [],
+            "observed_after_workflow_run": False,
+        }
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+        requirement = ctx.recorded_outcome_grounding_requirement
+        constraint = ctx.recorded_outcome_binding_constraint
+        assert requirement is not None
+        assert constraint is not None
+        ctx.recorded_outcome_grounding_requirement = requirement.model_copy(update={"reason_code": reason_code})
+        ctx.recorded_outcome_binding_constraint = constraint.model_copy(update={"reason_code": reason_code})
+
+        with capture_logs() as logs:
+            result = await _update_workflow(
+                {"workflow_yaml": _UNREFERENCED_DEFINITION_YAML, "parameters": runtime_parameters},
+                ctx,
+                allow_missing_credentials=True,
+            )
+
+        assert result["ok"] is True
+        bound = next(log for log in logs if log["event"] == "copilot recorded outcome submit rung bound")
+        consumed = next(
+            log for log in logs if log["event"] == "copilot recorded outcome binding consumed by synthesizer"
+        )
+        assert consumed["binding_fingerprints"] == [bound["binding_fingerprint"]]
+        assert all("submit_rung_binding" not in interaction for interaction in ctx.scout_trajectory)
+        code = str(_single_code_block(parse_workflow_yaml(ctx.workflow_yaml))["code"])
+        for selector, key in (
+            ("#company", "business_name"),
+            ("#email", "contact_email"),
+            ("#address", "service_address"),
+            ("#date", "desired_start_date"),
+        ):
+            assert f'page.locator("{selector}").fill(str({key}))' in code
+            assert code.index(f'page.locator("{selector}").fill') < code.index('page.locator("#submit").click()')
+
+    @pytest.mark.asyncio
+    async def test_public_update_and_run_consumes_regrounding_in_synthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        initial_arguments = json.dumps(
+            {
+                "workflow_yaml": _UNREFERENCED_DEFINITION_YAML,
+                "block_labels": ["submit_service_request"],
+            }
+        )
+        for _ in range(2):
+            result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+                initial_arguments,
+            )
+            assert json.loads(result)["data"]["reason_code"] == "definition_contract_unsatisfied"
+        requirement = ctx.recorded_outcome_grounding_requirement
+        assert requirement is not None
+        assert requirement.phase == "author_time_reject"
+        source_url = "https://example.com/utility"
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#open", "source_url": source_url, "trajectory_index": 0},
+            {"tool_name": "click", "selector": "#submit", "source_url": source_url, "trajectory_index": 1},
+        ]
+        runtime_parameters = {
+            "business_name": "Example Co",
+            "contact_email": "ops@example.com",
+            "service_address": "1 Example Way",
+            "desired_start_date": "2026-08-01",
+        }
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": source_url,
+            "page_title": "Utility request",
+            "forms": [
+                {
+                    "fields": [
+                        {"selector": "#company", "value": runtime_parameters["business_name"]},
+                        {"selector": "#email", "value": runtime_parameters["contact_email"]},
+                        {"selector": "#address", "value": runtime_parameters["service_address"]},
+                        {"selector": "#date", "value": runtime_parameters["desired_start_date"]},
+                    ],
+                    "submit_controls": [{"selector": "#submit"}],
+                }
+            ],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+            "anti_bot_indicators": [],
+            "observed_after_workflow_run": False,
+        }
+
+        async def _no_prior_definition(_ctx: CopilotContext) -> None:
+            return None
+
+        dispatched_candidates: list[str] = []
+
+        async def _run(_params: object, run_ctx: CopilotContext, **_kwargs: object) -> dict[str, object]:
+            dispatched_candidates.append(run_ctx.workflow_yaml or "")
+            return {"ok": False, "error": "stop after exact candidate"}
+
+        async def _verification(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", _no_prior_definition)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *_args: (["submit_service_request"], {}, None))
+        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *_args: None)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _run)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", _verification)
+        monkeypatch.setattr(tools_module, "_tool_visible_result_after_completion_verification", lambda _c, r, _v: r)
+        with capture_logs() as logs:
+            await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+                json.dumps(
+                    {
+                        "workflow_yaml": _UNREFERENCED_DEFINITION_YAML,
+                        "block_labels": ["submit_service_request"],
+                        "parameters": runtime_parameters,
+                    }
+                ),
+            )
+
+        bound = next(log for log in logs if log["event"] == "copilot recorded outcome submit rung bound")
+        consumed = next(
+            log for log in logs if log["event"] == "copilot recorded outcome binding consumed by synthesizer"
+        )
+        assert consumed["binding_fingerprints"] == [bound["binding_fingerprint"]]
+        code = str(_single_code_block(parse_workflow_yaml(ctx.workflow_yaml))["code"])
+        assert 'page.locator("#company").fill(str(business_name))' in code
+        assert 'page.locator("#date").fill(str(desired_start_date))' in code
+        assert dispatched_candidates == [ctx.workflow_yaml]
+        assert workflow_update_module._definition_plane_preflight_reject(ctx, dispatched_candidates[0]) is None
+
+    @pytest.mark.asyncio
+    async def test_recut_unbindable_regrounding_halts_before_reauthor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        for _ in range(2):
+            assert (await _update_workflow({"workflow_yaml": _UNREFERENCED_DEFINITION_YAML}, ctx))["ok"] is False
+        assert arm_recorded_outcome_grounding_requirement(ctx) is not None
+        ctx.blocker_signal = ctx.turn_halt = ctx.turn_ownership = None
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#submit", "source_url": "https://example.com/utility"}
+        ]
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": "https://example.com/utility",
+            "forms": [],
+        }
+        assert maybe_satisfy_recorded_outcome_grounding_requirement(ctx) is True
+        synthesize = Mock(side_effect=AssertionError("must halt before an identical re-author"))
+        monkeypatch.setattr(workflow_update_module, "synthesize_code_block_with_extraction", synthesize)
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(
+            _UNREFERENCED_DEFINITION_YAML,
+            ctx,
+            {
+                "business_name": "Example Co",
+                "contact_email": "ops@example.com",
+                "service_address": "1 Example Way",
+                "desired_start_date": "2026-08-01",
+            },
+        )
+
+        assert result.workflow_yaml == _UNREFERENCED_DEFINITION_YAML
+        assert result.violations
+        synthesize.assert_not_called()
+        assert ctx.blocker_signal.extra["unresolved_parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+        assert "safely connect the current page fields" in ctx.blocker_signal.user_facing_reason
+
+    @pytest.mark.asyncio
+    async def test_public_update_and_run_halts_active_author_reject_before_third_identical_author(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _definition_contract_ctx()
+        _enable_imposition(ctx)
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        arguments = json.dumps(
+            {
+                "workflow_yaml": _UNREFERENCED_DEFINITION_YAML,
+                "block_labels": ["submit_service_request"],
+                "parameters": {
+                    "business_name": "Example Co",
+                    "contact_email": "ops@example.com",
+                    "service_address": "1 Example Way",
+                    "desired_start_date": "2026-08-01",
+                },
+            }
+        )
+        for _ in range(2):
+            result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+                arguments,
+            )
+            assert json.loads(result)["data"]["reason_code"] == "definition_contract_unsatisfied"
+        requirement = ctx.recorded_outcome_grounding_requirement
+        assert requirement is not None
+        assert requirement.phase == "author_time_reject"
+        active_structural_key = requirement.structural_key
+        ctx.blocker_signal = ctx.turn_halt = ctx.turn_ownership = None
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#submit", "source_url": "https://example.com/utility"}
+        ]
+        ctx.composition_page_evidence = {
+            "source_tool": "inspect_page_for_composition",
+            "current_url": "https://example.com/utility",
+            "forms": [],
+            "observed_after_workflow_run": False,
+        }
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            arguments,
+        )
+
+        assert json.loads(result)["ok"] is False
+        assert ctx.latest_recorded_build_test_outcome.structural_key == active_structural_key
+        assert ctx.blocker_signal.internal_reason_code == "definition_contract_unsatisfied"
+        assert ctx.blocker_signal.extra["unresolved_parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+        assert ctx.turn_halt is not None
+        assert ctx.turn_halt.kind.value == "definition_contract_unsatisfied"
+
+    @pytest.mark.asyncio
+    async def test_definition_reject_stays_repairable_at_both_exact_gates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        update_ctx = _definition_contract_ctx()
+
+        update_result = await _update_workflow({"workflow_yaml": _UNREFERENCED_DEFINITION_YAML}, update_ctx)
+
+        assert update_result["ok"] is False
+        assert update_result["data"]["unreferenced_parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+        assert update_ctx.blocker_signal is None
+        assert update_ctx.turn_halt is None
+
+        dispatch_ctx = _definition_contract_ctx()
+        dispatch_result = workflow_update_module._metadata_contract_run_preflight_reject(
+            dispatch_ctx,
+            _UNREFERENCED_DEFINITION_YAML,
+            [],
+        )
+
+        assert dispatch_result is not None
+        assert dispatch_result["ok"] is False
+        assert dispatch_result["data"]["reason_code"] == "definition_contract_unsatisfied"
+        assert dispatch_ctx.blocker_signal is None
+        assert dispatch_ctx.turn_halt is None
+
+    @pytest.mark.asyncio
+    async def test_public_update_and_run_definition_reject_returns_to_repair_loop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _definition_contract_ctx()
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        arguments = json.dumps(
+            {
+                "workflow_yaml": _UNREFERENCED_DEFINITION_YAML,
+                "block_labels": ["submit_service_request"],
+            }
+        )
+
+        for _ in range(2):
+            result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+                arguments,
+            )
+
+            parsed = json.loads(result)
+            assert parsed["ok"] is False
+            assert parsed["data"]["reason_code"] == "definition_contract_unsatisfied"
+            assert ctx.blocker_signal is None
+            assert ctx.turn_halt is None
+
+        assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "definition_contract_unsatisfied"
+        assert ctx.recorded_outcome_grounding_requirement is not None
+
+        third_result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            arguments,
+        )
+
+        assert json.loads(third_result)["ok"] is False
+        assert ctx.blocker_signal.internal_reason_code == "recorded_outcome_grounding_required"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grounded_binding_available", [False, True])
+    async def test_public_update_and_run_rejects_unbound_declared_inputs_without_definition_tag(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        grounded_binding_available: bool,
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[CompletionCriterion(id="run", outcome="The service request is submitted.")]
+        )
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        dispatched = False
+        updated = False
+        real_update = tools_module._update_workflow
+
+        async def _observed_update(*args: object, **kwargs: object) -> dict[str, object]:
+            nonlocal updated
+            result = await real_update(*args, **kwargs)
+            updated = bool(result.get("ok"))
+            return result
+
+        async def _unexpected_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal dispatched
+            dispatched = True
+            return {"ok": True}
+
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _unexpected_dispatch)
+        monkeypatch.setattr(tools_module, "_update_workflow", _observed_update)
+        if grounded_binding_available:
+            monkeypatch.setattr(
+                workflow_update_module,
+                "_trajectory_with_grounded_submit_rung_binding",
+                lambda *_args, **_kwargs: [{"tool_name": "click", "selector": "#submit"}],
+            )
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps(
+                {
+                    "workflow_yaml": _UNREFERENCED_DEFINITION_YAML,
+                    "block_labels": ["submit_service_request"],
+                }
+            ),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed["data"]["reason_code"] == "definition_contract_unsatisfied"
+        assert parsed["data"]["unreferenced_parameter_keys"] == [
+            "business_name",
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+        assert updated is True
+        assert dispatched is False
+
+    @pytest.mark.asyncio
+    async def test_public_initial_preflight_preserves_code_safety_precedence_for_untagged_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[CompletionCriterion(id="run", outcome="The service request is submitted.")]
+        )
+        unsafe_yaml = _UNREFERENCED_DEFINITION_YAML.replace(
+            'await page.locator("#open").click()',
+            'import requests\n      await page.locator("#open").click()',
+        )
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": unsafe_yaml, "block_labels": ["submit_service_request"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed.get("data", {}).get("reason_code") != "definition_contract_unsatisfied"
+        assert "sandbox safety check" in parsed["error"]
+
+    def test_recut_dispatch_controls_preserve_passing_and_zero_input_candidates(self) -> None:
+        ctx = _definition_contract_ctx()
+        ctx.output_contract_actuation_by_signature["p5-advisory"] = OutputContractAdvisoryState.GRANTED
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, _UNREFERENCED_DEFINITION_YAML, [])
+
+        assert result is not None
+        assert result["data"]["reason_code"] == "definition_contract_unsatisfied"
+        assert isinstance(ctx.latest_recorded_build_test_outcome, RecordedBuildTestOutcome)
+        assert ctx.blocker_signal is None
+        assert ctx.turn_halt is None
+
+        passing_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name, contact_email, service_address, desired_start_date]
+                code: |
+                  await page.locator("#company").fill(str(business_name))
+                  await page.locator("#email").fill(str(contact_email))
+                  await page.locator("#address").fill(str(service_address))
+                  await page.locator("#date").fill(str(desired_start_date))
+                  await page.locator("#submit").click()
+            """
+        )
+        passing_ctx = _definition_contract_ctx()
+        assert workflow_update_module._metadata_contract_run_preflight_reject(passing_ctx, passing_yaml, []) is None
+
+        zero_input_ctx = _code_only_ctx()
+        zero_input_ctx.request_policy = RequestPolicy(
+            completion_criteria=[CompletionCriterion(id="run", outcome="The request is submitted.")]
+        )
+        zero_input_yaml = _yaml(
+            """
+            title: Open status page
+            workflow_definition:
+              parameters: []
+              blocks:
+              - block_type: code
+                label: open_status
+                parameter_keys: []
+                code: |
+                  await page.goto("https://example.com/status")
+            """
+        )
+        assert (
+            workflow_update_module._metadata_contract_run_preflight_reject(zero_input_ctx, zero_input_yaml, []) is None
+        )
+
+    def test_definition_preflight_rejects_partial_parameter_references(self) -> None:
+        ctx = _definition_contract_ctx()
+        partially_referenced_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  await page.locator("#company").fill(str(business_name))
+                  await page.locator("#submit").click()
+            """
+        )
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, partially_referenced_yaml, [])
+
+        assert result is not None
+        assert result["data"]["unreferenced_parameter_keys"] == [
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+
+    def test_definition_preflight_ignores_parameter_names_in_comments_and_string_literals(self) -> None:
+        ctx = _definition_contract_ctx()
+        lexical_only_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name, contact_email, service_address, desired_start_date]
+                code: |
+                  # contact_email and service_address are not executable references.
+                  note = "desired_start_date"
+                  await page.locator("#company").fill(str(business_name))
+                  await page.locator("#submit").click()
+            """
+        )
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, lexical_only_yaml, [])
+
+        assert result is not None
+        assert result["data"]["unreferenced_parameter_keys"] == [
+            "contact_email",
+            "desired_start_date",
+            "service_address",
+        ]
+
+    def test_definition_preflight_requires_live_parameter_dataflow(self) -> None:
+        ctx = _definition_contract_ctx()
+        dead_or_shadowed_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name, contact_email]
+                code: |
+                  if False:
+                      await page.locator("#company").fill(str(business_name))
+                  contact_email = "fixed@example.com"
+                  await page.locator("#email").fill(str(contact_email))
+                  await page.locator("#submit").click()
+            """
+        )
+
+        result = workflow_update_module._metadata_contract_run_preflight_reject(ctx, dead_or_shadowed_yaml, [])
+
+        assert result is not None
+        assert result["data"]["unreferenced_parameter_keys"] == ["business_name", "contact_email"]
+
+    def test_definition_preflight_accepts_parameter_alias_dataflow(self) -> None:
+        ctx = _definition_contract_ctx()
+        alias_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  company = str(business_name)
+                  await page.locator("#company").fill(company)
+                  await page.locator("#submit").click()
+            """
+        )
+
+        assert workflow_update_module._metadata_contract_run_preflight_reject(ctx, alias_yaml, []) is None
+
+    def test_definition_preflight_tracks_live_control_flow_dataflow(self) -> None:
+        ctx = _definition_contract_ctx()
+        control_flow_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name, contact_email]
+                code: |
+                  company = business_name
+                  if page.url:
+                      company = company.strip()
+                  else:
+                      company = company.upper()
+                  for selector in ["#company"]:
+                      await page.locator(selector).fill(company)
+                  try:
+                      await page.locator("#email").fill(contact_email)
+                  except Exception:
+                      raise
+            """
+        )
+
+        assert workflow_update_module._metadata_contract_run_preflight_reject(ctx, control_flow_yaml, []) is None
+
+    def test_definition_preflight_drops_bindings_from_non_fallthrough_branch(self) -> None:
+        ctx = _definition_contract_ctx()
+        terminal_branch_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  if page.url.endswith("/done"):
+                      company = business_name
+                      if True:
+                          return {"already_done": True}
+                  else:
+                      company = "fixed"
+                  await page.locator("#company").fill(company)
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, terminal_branch_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    @pytest.mark.parametrize(
+        "terminal_test", ["if 1:\n    return {'already_done': True}", "while True:\n    return {'already_done': True}"]
+    )
+    def test_definition_preflight_drops_bindings_from_constant_terminal_control(self, terminal_test: str) -> None:
+        ctx = _definition_contract_ctx()
+        indented_terminal = textwrap.indent(terminal_test, "          ")
+        workflow_yaml = _yaml(
+            "title: Submit reusable service request\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: submit_service_request\n"
+            "    parameter_keys: [business_name]\n"
+            "    code: |\n"
+            "      if page.url.endswith('/done'):\n"
+            "          company = business_name\n"
+            f"{indented_terminal}\n"
+            "      else:\n"
+            "          company = 'fixed'\n"
+            "      await page.locator('#company').fill(company)\n"
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, workflow_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    def test_definition_preflight_ignores_break_in_unreachable_constant_branch(self) -> None:
+        ctx = _definition_contract_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  if page.url.endswith("/done"):
+                      company = business_name
+                      while True:
+                          if False:
+                              break
+                          return {"already_done": True}
+                  else:
+                      company = "fixed"
+                  await page.locator("#company").fill(company)
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, workflow_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    def test_definition_preflight_ignores_break_overridden_by_terminal_finally(self) -> None:
+        ctx = _definition_contract_ctx()
+        workflow_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  if page.url.endswith("/done"):
+                      company = business_name
+                      while True:
+                          try:
+                              break
+                          finally:
+                              return {"already_done": True}
+                  else:
+                      company = "fixed"
+                  await page.locator("#company").fill(company)
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, workflow_yaml)
+
+        assert result is not None
+        assert result.unreferenced_parameter_keys == ("business_name",)
+
+    @pytest.mark.parametrize(
+        ("code", "expected_unreferenced"),
+        [
+            (
+                "values = [business_name for business_name in ['fixed']]\n"
+                "await page.locator('#company').fill(values[0])",
+                ["business_name"],
+            ),
+            (
+                "async def fill_company():\n"
+                "    await page.locator('#company').fill(str(business_name))\n"
+                "await fill_company()",
+                [],
+            ),
+        ],
+    )
+    def test_definition_preflight_honors_python_scopes(self, code: str, expected_unreferenced: list[str]) -> None:
+        ctx = _definition_contract_ctx()
+        indented_code = textwrap.indent(code, "      ")
+        scoped_yaml = _yaml(
+            "title: Submit reusable service request\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "  - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}\n"
+            "  blocks:\n"
+            "  - block_type: code\n"
+            "    label: submit_service_request\n"
+            "    parameter_keys: [business_name]\n"
+            "    code: |\n"
+            f"{indented_code}\n"
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, scoped_yaml)
+
+        if expected_unreferenced:
+            assert result is not None
+            assert list(result.unreferenced_parameter_keys) == expected_unreferenced
+        else:
+            assert result is None
+
+    def test_definition_preflight_counts_allowed_non_code_parameter_consumption(self) -> None:
+        ctx = _definition_contract_ctx()
+        mixed_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              blocks:
+              - block_type: navigation
+                label: open_customer
+                url: "https://example.com/customer/{{ business_name }}"
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [contact_email]
+                code: |
+                  await page.locator("#email").fill(contact_email)
+                  await page.locator("#submit").click()
+            """
+        )
+
+        assert workflow_update_module._metadata_contract_run_preflight_reject(ctx, mixed_yaml, []) is None
+
+    @pytest.mark.parametrize(
+        ("template", "is_consumed"),
+        [
+            ('{{ "business_name" }}', False),
+            ("{% if business_name %}/customer{% endif %}", True),
+        ],
+    )
+    def test_definition_preflight_uses_jinja_semantics(self, template: str, is_consumed: bool) -> None:
+        ctx = _definition_contract_ctx()
+        templated_yaml = _yaml(
+            f"""
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {{parameter_type: workflow, key: business_name, workflow_parameter_type: string}}
+              blocks:
+              - block_type: navigation
+                label: open_customer
+                url: {json.dumps(template)}
+            """
+        )
+
+        result = workflow_update_module._definition_plane_preflight_reject(ctx, templated_yaml)
+
+        assert (result is None) is is_consumed
+
+    @pytest.mark.asyncio
+    async def test_definition_preflight_defers_to_repairable_syntax_error(self) -> None:
+        ctx = _definition_contract_ctx()
+        malformed_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              blocks:
+              - block_type: code
+                label: submit_service_request
+                parameter_keys: [business_name]
+                code: |
+                  await page.locator("#company").fill(str(business_name)
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": malformed_yaml}, ctx)
+
+        assert result["ok"] is False
+        assert "not valid Python" in result["error"]
+        assert result.get("data", {}).get("reason_code") != "definition_contract_unsatisfied"
+
+    def test_definition_preflight_is_code_first_only(self) -> None:
+        ctx = _definition_contract_ctx()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+        standard_yaml = _yaml(
+            """
+            title: Submit reusable service request
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, key: business_name, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: contact_email, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: service_address, workflow_parameter_type: string}
+              - {parameter_type: workflow, key: desired_start_date, workflow_parameter_type: string}
+              blocks:
+              - block_type: task
+                label: submit_service_request
+                url: "{{business_name}}/{{contact_email}}/{{service_address}}/{{desired_start_date}}"
+            """
+        )
+
+        assert (
+            workflow_update_module._metadata_contract_run_preflight_reject(
+                ctx,
+                standard_yaml,
+                [],
+            )
+            is None
+        )
+
     @pytest.mark.asyncio
     async def test_code_safety_seam_reject_carries_progress_surface_kind(self) -> None:
         ctx = _code_only_ctx()

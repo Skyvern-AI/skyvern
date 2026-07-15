@@ -250,7 +250,9 @@ _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
 # Evidence sources confirmable only after a run — excluded from the pre-run scout-coverage gate.
-_PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset({"registered_output_parameter", "registered_artifact_content"})
+_PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
+    {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
+)
 # OpenAI detail=high cost per resized image. If we support other providers,
 # pull from model config — this value will silently over/undercount otherwise.
 # See screenshot_utils.resize_screenshot_b64 for the dimension contract this
@@ -2318,9 +2320,10 @@ def _active_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion,
 
 def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
     """Completion criteria whose requested output is observable before a run. A criterion whose
-    evidence lives in a registered output parameter or artifact content is only confirmable
-    post-run, so gating the scout window on it would demand an unsatisfiable pre-run observation.
-    The persist scaffold still demands those paths at author time — that gate is SKY-11591's."""
+    evidence comes from an independent run, registered output parameter, or artifact content is
+    only confirmable post-run, so gating the scout window on it would demand an unsatisfiable
+    pre-run observation. The persist scaffold still demands those paths at author time — that gate
+    is SKY-11591's."""
     return tuple(
         criterion
         for criterion in _active_completion_criteria(ctx)
@@ -2329,7 +2332,8 @@ def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCri
 
 
 def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
-    paths = set(requested_output_paths(_pre_run_gated_completion_criteria(ctx)))
+    pre_run_gated_paths = set(requested_output_paths(_pre_run_gated_completion_criteria(ctx)))
+    paths = set(pre_run_gated_paths)
     repair_context = ctx.last_code_authoring_repair_context
     if repair_context is not None:
         paths.update(
@@ -2337,6 +2341,19 @@ def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
             for raw in repair_context.required_goal_value_paths
             if isinstance(raw, str) and raw
         )
+    active_criteria = _active_completion_criteria(ctx)
+    independent_run_evidence_paths = {
+        _canonical_output_path(criterion.output_path)
+        for criterion in active_criteria
+        if criterion.requested_output_evidence_source == "independent_run_evidence" and criterion.output_path
+    }
+    non_independent_evidence_paths = {
+        _canonical_output_path(criterion.output_path)
+        for criterion in active_criteria
+        if criterion.requested_output_evidence_source != "independent_run_evidence" and criterion.output_path
+    }
+    independent_only_paths = independent_run_evidence_paths - non_independent_evidence_paths
+    paths.difference_update(independent_only_paths)
     return paths
 
 

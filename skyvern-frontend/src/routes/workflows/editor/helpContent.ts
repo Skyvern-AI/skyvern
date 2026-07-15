@@ -66,6 +66,19 @@ export const helpTooltips = {
     ...baseHelpTooltipContent,
     navigationGoal:
       "Give Skyvern an objective that describes how to download the file.",
+    download_target:
+      "Choose whether to keep downloaded files in Skyvern or send them to S3, Azure Blob Storage, Google Drive, or SFTP.",
+    path: "The path of the destination folder to send the files to.",
+    prompt:
+      "Optionally describe which downloaded files should be sent (e.g. only certain file names). Leave empty to send all files.",
+    s3_bucket: "The S3 bucket to send the file to.",
+    aws_access_key_id: "The AWS access key ID to use to send the file to S3.",
+    aws_secret_access_key:
+      "The AWS secret access key to use to send the file to S3.",
+    region_name: "The AWS region",
+    azure_storage_account_name: "The Azure Storage Account Name.",
+    azure_storage_account_key: "The Azure Storage Account Key.",
+    azure_blob_container_name: "The Azure Blob Container Name.",
   },
   validation: baseHelpTooltipContent,
   textPrompt: {
