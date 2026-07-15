@@ -81,6 +81,8 @@ from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    CriterionKind,
+    CriterionLevel,
     JudgmentTruthCondition,
     RequestedOutputEvidenceSource,
     RequestPolicy,
@@ -110,6 +112,24 @@ from skyvern.forge.sdk.copilot.turn_halt import (
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+
+
+def _typed_completion_criterion(
+    *,
+    id: str,
+    output_path: str,
+    level: CriterionLevel,
+    method_mandated: bool,
+    kind: CriterionKind,
+) -> CompletionCriterion:
+    return CompletionCriterion(
+        id=id,
+        outcome=f"The run returns {output_path}.",
+        output_path=output_path,
+        level=level,
+        method_mandated=method_mandated,
+        kind=kind,
+    )
 
 
 def _yaml(body: str) -> str:
@@ -3846,21 +3866,21 @@ class TestCodeRepairProgressClassification:
         label = "lookup_entry"
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.npi",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_locations",
                     output_path="output.locations",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_statuses",
                     output_path="output.statuses",
                     level="run",
@@ -3931,7 +3951,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -4110,14 +4130,14 @@ class TestCodeRepairProgressClassification:
         required_paths = {"output.account_number", "output.confirmation_number"}
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_account",
                     output_path="output.account_number",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_confirmation",
                     output_path="output.confirmation_number",
                     level="run",
@@ -4451,7 +4471,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -4641,7 +4661,7 @@ class TestCodeRepairProgressClassification:
         ctx.turn_id = "stable-contract-key"
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -4701,7 +4721,7 @@ class TestCodeRepairProgressClassification:
             ctx.turn_id = turn_id
             ctx.request_policy = RequestPolicy(
                 completion_criteria=[
-                    SimpleNamespace(
+                    _typed_completion_criterion(
                         id="requested_value",
                         output_path=output_path,
                         level="run",
@@ -4732,14 +4752,14 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_flags",
                     output_path="output.flags",
                     level="run",
@@ -4785,7 +4805,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.npi",
                     level="run",
@@ -4849,7 +4869,7 @@ class TestCodeRepairProgressClassification:
         child_paths = ["output.npi"]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.npi",
                     level="run",
@@ -4978,7 +4998,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_account",
                     output_path="output.account_number",
                     level="run",
@@ -5178,7 +5198,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.requested_value",
                     level="run",
@@ -6175,7 +6195,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.requested_value",
                     level="run",
@@ -6603,14 +6623,14 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_flags",
                     output_path="output.flags",
                     level="run",
@@ -6658,7 +6678,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -6717,7 +6737,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_npi",
                     output_path="output.npi",
                     level="run",
@@ -6792,7 +6812,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -6862,7 +6882,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -6932,7 +6952,7 @@ class TestCodeRepairProgressClassification:
         ]
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -7001,7 +7021,7 @@ class TestCodeRepairProgressClassification:
         ctx.scout_trajectory = []
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.record_id",
                     level="run",
@@ -7058,7 +7078,7 @@ class TestCodeRepairProgressClassification:
         )
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id=f"requested_{index}",
                     output_path=path,
                     level="run",
@@ -7108,14 +7128,14 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.npi",
                     level="run",
                     method_mandated=False,
                     kind="outcome",
                 ),
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_statuses",
                     output_path="output.statuses",
                     level="run",
@@ -7263,7 +7283,7 @@ class TestCodeRepairProgressClassification:
         ctx = _code_only_ctx()
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_value",
                     output_path="output.requested_only",
                     level="run",
@@ -8018,7 +8038,7 @@ def _spine_actuation_ctx() -> CopilotContext:
     ]
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
-            SimpleNamespace(
+            _typed_completion_criterion(
                 id="requested_value",
                 output_path="output.record_id",
                 level="run",
@@ -13293,7 +13313,7 @@ class TestWholeTrajectoryImposition:
         )
         ctx.request_policy = RequestPolicy(
             completion_criteria=[
-                SimpleNamespace(
+                _typed_completion_criterion(
                     id="requested_npi",
                     output_path="output.npi",
                     level="run",

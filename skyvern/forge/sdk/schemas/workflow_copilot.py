@@ -29,7 +29,7 @@ class WorkflowCopilotCompletionCriteriaSet(BaseModel):
     workflow_copilot_chat_id: str
     goal_epoch: int
     status: str
-    criteria: list[dict]
+    criteria: list[dict[str, Any]]
     source_turn_id: str | None = None
     source_goal_text: str | None = None
     consecutive_all_no_evidence: int = 0

@@ -323,8 +323,8 @@ class CompletionCriterion:
     judgment_truth_condition: JudgmentTruthCondition | None = None
     requested_output_floor_rekeyed: bool = False
     floor_rekeyed_from_path: str | None = None
-    # Fresh request-slot contract metadata. Defaults keep versionless criteria on
-    # the byte-identical legacy path and are excluded from identity/dedup keys.
+    # Typed request-slot metadata. Assertion identity, deduplication, and reconciliation
+    # intentionally exclude these fields.
     request_slot_id: str | None = None
     pinability: Pinability | None = None
     mint_disposition: MintDisposition = "decidable"
@@ -366,7 +366,6 @@ class RequestPolicy:
     classifier_retry_count: int = 0
     classifier_non_runtime_requested_output_evidence_sources: list[str] = field(default_factory=list)
     completion_contract_status: str = "absent"
-    classifier_contract_version: int | None = None
     request_slot_failure_kind: str | None = None
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
@@ -413,10 +412,8 @@ class RequestPolicy:
             criterion for criterion in self.graded_completion_criteria() if criterion.output_path is not None
         ]
         data["requested_output_criteria_count"] = len(requested_output_criteria)
-        if self.classifier_contract_version is not None:
-            data["classifier_contract_version"] = self.classifier_contract_version
-            if self.request_slot_failure_kind is not None:
-                data["request_slot_failure_kind"] = self.request_slot_failure_kind
+        if self.request_slot_failure_kind is not None:
+            data["request_slot_failure_kind"] = self.request_slot_failure_kind
         for index, criterion in enumerate(requested_output_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
             prefix = f"requested_output_criterion_{index}"
             data[f"{prefix}_id"] = criterion.id
@@ -425,13 +422,12 @@ class RequestPolicy:
             data[f"{prefix}_has_exact_value"] = criterion.expected_output_value is not None
             if criterion.mint_degrade is not None:
                 data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
+            data[f"{prefix}_mint_disposition"] = criterion.mint_disposition
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
-            if self.classifier_contract_version is not None:
-                data[f"{prefix}_mint_disposition"] = criterion.mint_disposition
-                if criterion.request_slot_id is not None:
-                    data[f"{prefix}_request_slot_id"] = criterion.request_slot_id
-                if criterion.pinability is not None:
-                    data[f"{prefix}_pinability"] = criterion.pinability
+            if criterion.request_slot_id is not None:
+                data[f"{prefix}_request_slot_id"] = criterion.request_slot_id
+            if criterion.pinability is not None:
+                data[f"{prefix}_pinability"] = criterion.pinability
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
         mint_degraded_criteria = [
@@ -526,6 +522,21 @@ def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | Non
 def _is_judgment_boolean_criterion(criterion: CompletionCriterion) -> bool:
     return (
         isinstance(criterion.expected_output_value, bool) or criterion.expected_output_shape == "goal_judgment_boolean"
+    )
+
+
+def is_judgment_finalization_candidate(criterion: CompletionCriterion) -> bool:
+    """Whether accepted-artifact evidence must decide or degrade this criterion."""
+    if criterion.pinability in {"shapeless_valid", "unpinnable"}:
+        return False
+    return (
+        criterion.judgment_truth_condition is not None
+        or _is_judgment_boolean_criterion(criterion)
+        or (
+            criterion.kind == "validation_classification"
+            and criterion.classification_output_key is not None
+            and (isinstance(criterion.expected_classification, bool) or criterion.mint_disposition == "pending")
+        )
     )
 
 
@@ -1025,22 +1036,21 @@ def _classification_from_raw(
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
     evidence_raw = raw.get("raw_secret_evidence")
     raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
-    has_contract_version = "contract_version" in raw
-    version_raw = raw.get("contract_version")
-    contract_version = (
-        version_raw if isinstance(version_raw, int) and not isinstance(version_raw, bool) and version_raw == 1 else None
+    raw_criteria = raw.get("completion_criteria")
+    claims_request_slots = isinstance(raw_criteria, list) and any(
+        isinstance(item, dict) and _item_claims_request_slot(item) for item in raw_criteria
     )
-    if contract_version == 1 and request_slot_request is not None and request_slot_contract is not None:
+    if request_slot_request is not None and request_slot_contract is not None:
         completion_criteria = _parse_fresh_request_slot_criteria(
-            raw.get("completion_criteria"),
+            raw_criteria,
             request_slot_request=request_slot_request,
             request_slot_contract=request_slot_contract,
         )
-    elif has_contract_version:
-        completion_criteria = _fresh_request_slot_failure_criteria(raw.get("completion_criteria"))
-        request_slot_failure_kind = request_slot_failure_kind or "unsupported_contract_version"
+    elif claims_request_slots:
+        completion_criteria = _fresh_request_slot_failure_criteria(raw_criteria)
+        request_slot_failure_kind = request_slot_failure_kind or "missing_request_slot_contract"
     else:
-        completion_criteria = _parse_completion_criteria(raw.get("completion_criteria"))
+        completion_criteria = _parse_completion_criteria(raw_criteria)
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
         authoring_intent=authoring_intent if authoring_intent in _AUTHORING_INTENTS else "author_now",
@@ -1055,9 +1065,6 @@ def _classification_from_raw(
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
         classifier_status="success",
         classifier_failure_kind="none",
-        classifier_contract_version=contract_version
-        if contract_version is not None
-        else (-1 if has_contract_version else None),
         request_slot_failure_kind=request_slot_failure_kind,
     )
     if policy.credential_input_kind == "raw_secret":
@@ -1157,11 +1164,20 @@ def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], 
             if kind == "validation_classification"
             else None
         )
+        boolean_classification = kind == "validation_classification" and (
+            isinstance(expected_classification, bool)
+            or (expected_classification is None and expected_output_shape == "goal_judgment_boolean")
+        )
         if kind == "validation_classification":
+            if boolean_classification and classification_output_key is not None:
+                outcome = f"The run classifies whether {classification_output_key.replace('_', ' ')}."
+                expected_classification = None
             output_path = None
             expected_output_value = None
-            expected_output_shape = None
-            requested_output_evidence_source = "runtime_output"
+            expected_output_shape = "goal_judgment_boolean" if boolean_classification else None
+            requested_output_evidence_source = (
+                "independent_run_evidence" if boolean_classification else "runtime_output"
+            )
         elif isinstance(expected_output_value, bool) or expected_output_shape == "goal_judgment_boolean":
             requested_output_evidence_source = "independent_run_evidence"
         requested_output_path_mint_source: RequestedOutputPathMintSource | None = None
@@ -1221,6 +1237,15 @@ def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], 
                     classification_output_key=classification_output_key,
                     expected_classification=expected_classification,
                     judgment_truth_condition=judgment_truth_condition,
+                    mint_disposition=(
+                        "pending"
+                        if (
+                            isinstance(expected_output_value, bool)
+                            or expected_output_shape == "goal_judgment_boolean"
+                            or boolean_classification
+                        )
+                        else "decidable"
+                    ),
                 ),
             )
         )
@@ -1617,6 +1642,18 @@ def _requested_output_criterion_id(output_path: str) -> str:
     return f"{_REQUESTED_OUTPUT_CRITERION_ID_PREFIX}{slug}"
 
 
+def _requested_output_mint_state(
+    expected_value: ExpectedOutputValue | None,
+    expected_shape: ExpectedOutputShape | None,
+    judgment_condition: JudgmentTruthCondition | None,
+) -> tuple[MintDisposition, MintDegrade | None]:
+    if isinstance(expected_value, bool) or expected_shape == "goal_judgment_boolean" or judgment_condition is not None:
+        return "pending", None
+    if expected_shape == "status_label" or (expected_value is None and expected_shape is not None):
+        return "degraded", "undecidable_judgment"
+    return "decidable", None
+
+
 def _generic_completion_criterion(criterion: CompletionCriterion) -> bool:
     key = normalized_criterion_outcome_key(criterion.outcome)
     if is_fallback_floor_criterion(criterion):
@@ -1734,21 +1771,31 @@ def _source_requested_output_corroborator(
     requested_fields: list[str],
     requested_output_paths: set[str],
 ) -> CompletionCriterion | None:
-    for criterion in criteria:
-        if criterion.level != "run" or criterion.kind != "outcome" or criterion.method_mandated:
-            continue
-        if _validation_classification_output_path(criterion.output_path):
-            continue
-        if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
-            criterion, requested_fields
-        ):
-            return replace(
-                criterion,
-                output_path=None,
-                expected_output_value=None,
-                expected_output_shape=None,
-                requested_output_corroborator=True,
-            )
+    if len(requested_output_paths) == 1:
+        for criterion in criteria:
+            if (
+                criterion.level != "run"
+                or criterion.kind != "outcome"
+                or criterion.method_mandated
+                or criterion.output_path is None
+            ):
+                continue
+            if is_judgment_finalization_candidate(criterion):
+                continue
+            if criterion.requested_output_evidence_source == "independent_run_evidence":
+                continue
+            if _validation_classification_output_path(criterion.output_path):
+                continue
+            if criterion.output_path in requested_output_paths or _criterion_text_covers_any_requested_output(
+                criterion, requested_fields
+            ):
+                return replace(
+                    criterion,
+                    output_path=None,
+                    expected_output_value=None,
+                    expected_output_shape=None,
+                    requested_output_corroborator=True,
+                )
     for criterion in criteria:
         if is_fallback_floor_base_criterion(criterion):
             return replace(criterion, requested_output_corroborator=True)
@@ -1775,7 +1822,9 @@ def _apply_classifier_typed_requested_output_corroborators(policy: RequestPolicy
         and criterion.kind == "outcome"
         and not criterion.method_mandated
         and criterion.output_path is not None
+        and criterion.requested_output_evidence_source != "independent_run_evidence"
         and not _validation_classification_output_path(criterion.output_path)
+        and not is_judgment_finalization_candidate(criterion)
         and not criterion.id.startswith(_REQUESTED_OUTPUT_CRITERION_ID_PREFIX)
     ]
     if not source_criteria:
@@ -1885,23 +1934,34 @@ def _apply_requested_output_completion_criteria(
             forbidden_output_paths,
         )
     ]
-    canonical_requested_criteria = [
-        CompletionCriterion(
-            id=_requested_output_criterion_id(output_path),
-            outcome=f"The returned record includes {field_label}.",
-            level="run",
-            output_path=output_path,
-            expected_output_value=value_by_output_path.get(output_path),
-            expected_output_shape=shape_by_output_path.get(output_path),
-            requested_output_evidence_source=source_by_output_path.get(output_path, "runtime_output"),
-            contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
-            contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
-            deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
-            declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
-            judgment_truth_condition=judgment_condition_by_output_path.get(output_path),
+    canonical_requested_criteria: list[CompletionCriterion] = []
+    for _field_name, output_path, field_label in requested_specs:
+        expected_value = value_by_output_path.get(output_path)
+        expected_shape = shape_by_output_path.get(output_path)
+        judgment_condition = judgment_condition_by_output_path.get(output_path)
+        mint_disposition, mint_degrade = _requested_output_mint_state(
+            expected_value,
+            expected_shape,
+            judgment_condition,
         )
-        for _field_name, output_path, field_label in requested_specs
-    ]
+        canonical_requested_criteria.append(
+            CompletionCriterion(
+                id=_requested_output_criterion_id(output_path),
+                outcome=f"The returned record includes {field_label}.",
+                level="run",
+                output_path=output_path,
+                expected_output_value=expected_value,
+                expected_output_shape=expected_shape,
+                requested_output_evidence_source=source_by_output_path.get(output_path, "runtime_output"),
+                contingent_on=metadata_by_output_path.get(output_path, (None, None, None))[0],
+                contingent_antecedent_output_path=metadata_by_output_path.get(output_path, (None, None, None))[1],
+                deliverable_kind=metadata_by_output_path.get(output_path, (None, None, None))[2],
+                declared_deliverable_kind=declared_kind_by_output_path.get(output_path),
+                judgment_truth_condition=judgment_condition,
+                mint_degrade=mint_degrade,
+                mint_disposition=mint_disposition,
+            )
+        )
     criteria = preserved_criteria + canonical_requested_criteria
     if not any(_non_requested_output_run_corroborator(criterion) for criterion in criteria):
         corroborator = _source_requested_output_corroborator(
@@ -1942,18 +2002,22 @@ def _apply_validation_classification_completion_criteria(policy: RequestPolicy) 
         target = _validation_classification_target_for_legacy_criterion(criterion)
         if target is not None:
             output_key, expected = target
+            boolean_classification = isinstance(expected, bool)
             criterion = replace(
                 criterion,
                 kind="validation_classification",
                 output_path=None,
                 expected_output_value=None,
-                expected_output_shape=None,
-                requested_output_evidence_source="runtime_output",
+                expected_output_shape="goal_judgment_boolean" if boolean_classification else None,
+                requested_output_evidence_source=(
+                    "independent_run_evidence" if boolean_classification else "runtime_output"
+                ),
                 deliverable_kind=None,
                 declared_deliverable_kind=None,
                 terminal_action_family=None,
                 classification_output_key=output_key,
                 expected_classification=expected,
+                mint_disposition="pending" if boolean_classification else "decidable",
             )
         if criterion.kind == "validation_classification":
             target_key = (
@@ -2021,10 +2085,6 @@ def is_turn_unsatisfiable_fallback_degraded(criterion: CompletionCriterion) -> b
 
 def is_contingent_missing_antecedent_degraded(criterion: CompletionCriterion) -> bool:
     return criterion.mint_degrade == "contingent_missing_antecedent"
-
-
-def is_undecidable_judgment_degraded(criterion: CompletionCriterion) -> bool:
-    return criterion.mint_degrade == "undecidable_judgment"
 
 
 def resolve_mint_degrade(
@@ -2422,7 +2482,7 @@ async def _classify_request(
         return _classifier_fallback_policy(
             ids,
             raw_secret_present=raw_secret_present,
-            failure_kind="provider_error",
+            failure_kind=failure_kind if failure_kind != "none" else "provider_error",
             retry_count=retry_count,
             user_message=user_message,
             requested_output_path_aliases=requested_output_path_aliases,
@@ -2430,32 +2490,26 @@ async def _classify_request(
 
     request_slot_contract: RequestSlotContractV1 | None = None
     request_slot_failure_kind: str | None = None
-    version_raw = raw_payload.get("contract_version")
-    if isinstance(version_raw, int) and not isinstance(version_raw, bool) and version_raw == 1:
-        raw_criteria = raw_payload.get("completion_criteria")
-        declared_request_slots = isinstance(raw_criteria, list) and any(
-            isinstance(item, dict) and _request_slot_anchor(item) is not None for item in raw_criteria
-        )
-        if declared_request_slots:
-            # This validation hop is deliberately sequential: the request-policy
-            # classifier first declares which criteria are request-owned slots, then
-            # the independent producer types their identity, plane, and pinability.
-            request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
-            if request_slot_result.status == "success":
-                request_slot_contract = request_slot_result.contract
-            else:
-                request_slot_failure_kind = (
-                    request_slot_result.failure_kind.value
-                    if request_slot_result.failure_kind is not None
-                    else "unknown"
-                )
-                LOG.warning(
-                    "request-policy request-slot producer failed",
-                    failure_kind=request_slot_failure_kind,
-                    attempts=request_slot_result.attempts,
-                )
+    raw_criteria = raw_payload.get("completion_criteria")
+    declared_request_slots = isinstance(raw_criteria, list) and any(
+        isinstance(item, dict) and _request_slot_anchor(item) is not None for item in raw_criteria
+    )
+    if declared_request_slots:
+        # This validation hop is deliberately sequential: the request-policy
+        # classifier first declares which criteria are request-owned slots, then
+        # the independent producer types their identity, plane, and pinability.
+        request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
+        if request_slot_result.status == "success":
+            request_slot_contract = request_slot_result.contract
         else:
-            request_slot_failure_kind = "no_declared_slots"
+            request_slot_failure_kind = (
+                request_slot_result.failure_kind.value if request_slot_result.failure_kind is not None else "unknown"
+            )
+            LOG.warning(
+                "request-policy request-slot producer failed",
+                failure_kind=request_slot_failure_kind,
+                attempts=request_slot_result.attempts,
+            )
     policy = _classification_from_raw(
         raw_payload,
         request_slot_request=request_slot_request,
@@ -2514,13 +2568,6 @@ async def _classify_request(
         policy.clarification_reason = "none"
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
-    if policy.classifier_contract_version is None:
-        # Legacy corroborators are inference-based compatibility behavior. A fresh
-        # contract remains fail-closed even when its request-slot producer fails:
-        # fresh criteria degrade above instead of re-entering legacy guessing.
-        _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
-        _apply_validation_classification_completion_criteria(policy)
-        _apply_classifier_typed_requested_output_corroborators(policy)
     _degrade_pathless_contingent_criteria(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"

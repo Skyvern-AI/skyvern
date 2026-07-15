@@ -68,7 +68,6 @@ def _envelope() -> RequestSlotEnvelopeV1:
 
 def _fresh_payload() -> dict[str, Any]:
     return {
-        "contract_version": 1,
         "testing_intent": "require_test",
         "credential_input_kind": "none",
         "requires_user_clarification": False,
@@ -109,7 +108,6 @@ def test_fresh_contract_consumes_declared_pinability_without_guessed_polarity() 
         request_slot_contract=contract,
     )
 
-    assert policy.classifier_contract_version == 1
     assert [criterion.request_slot_id for criterion in policy.completion_criteria] == [
         slot.slot_id for slot in contract.slots
     ]
@@ -276,14 +274,12 @@ def test_followup_source_digest_change_adopts_stored_semantic_criteria() -> None
     assert decision.superseded_set_id is None
 
 
-def test_invalid_fresh_version_fails_safe_without_entering_legacy_minting() -> None:
+def test_unbound_typed_criteria_fail_safe_without_entering_legacy_minting() -> None:
     payload = _fresh_payload()
-    payload["contract_version"] = "1"
 
     policy = _classification_from_raw(payload)
 
-    assert policy.classifier_contract_version == -1
-    assert policy.request_slot_failure_kind == "unsupported_contract_version"
+    assert policy.request_slot_failure_kind == "missing_request_slot_contract"
     assert all(criterion.output_path is None for criterion in policy.completion_criteria)
     assert all(criterion.expected_output_value is None for criterion in policy.completion_criteria)
     assert all(criterion.expected_classification is None for criterion in policy.completion_criteria)
@@ -293,7 +289,6 @@ def test_invalid_fresh_version_fails_safe_without_entering_legacy_minting() -> N
 def test_fresh_slot_failure_preserves_non_output_outcome() -> None:
     policy = _classification_from_raw(
         {
-            "contract_version": 1,
             "completion_criteria": [{"outcome": "The application is submitted."}],
         },
         request_slot_failure_kind="invalid_output",
@@ -348,7 +343,6 @@ async def test_request_slot_producer_failure_degrades_without_legacy_guessing() 
     policy = await _classify_request(P9_REQUEST, "", [], "", handler)
 
     assert calls == ["workflow-copilot-request-policy", *([REQUEST_SLOT_PROMPT_NAME] * 4)]
-    assert policy.classifier_contract_version == 1
     assert policy.request_slot_failure_kind == "invalid_output"
     assert all(criterion.output_path is None for criterion in policy.completion_criteria)
     assert all(criterion.expected_output_value is None for criterion in policy.completion_criteria)
@@ -357,7 +351,7 @@ async def test_request_slot_producer_failure_degrades_without_legacy_guessing() 
 
 
 @pytest.mark.asyncio
-async def test_versionless_classifier_payload_never_invokes_request_slot_producer() -> None:
+async def test_classifier_payload_without_request_slots_does_not_invoke_request_slot_producer() -> None:
     calls: list[str] = []
 
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
@@ -369,9 +363,8 @@ async def test_versionless_classifier_payload_never_invokes_request_slot_produce
             "completion_criteria": [{"outcome": "The requested workflow is complete."}],
         }
 
-    policy = await _classify_request("Build the workflow.", "", [], "", handler)
+    await _classify_request("Build the workflow.", "", [], "", handler)
 
-    assert policy.classifier_contract_version is None
     assert calls == ["workflow-copilot-request-policy"]
 
 
@@ -382,7 +375,6 @@ async def test_fresh_non_output_request_does_not_invoke_request_slot_producer() 
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
         return {
-            "contract_version": 1,
             "testing_intent": "require_test",
             "credential_input_kind": "none",
             "requires_user_clarification": False,
@@ -391,7 +383,7 @@ async def test_fresh_non_output_request_does_not_invoke_request_slot_producer() 
 
     policy = await _classify_request("Submit the application.", "", [], "", handler)
 
-    assert policy.request_slot_failure_kind == "no_declared_slots"
+    assert policy.request_slot_failure_kind is None
     assert policy.completion_criteria[0].outcome == "The application is submitted."
     assert policy.completion_criteria[0].mint_degrade is None
     assert calls == ["workflow-copilot-request-policy"]
