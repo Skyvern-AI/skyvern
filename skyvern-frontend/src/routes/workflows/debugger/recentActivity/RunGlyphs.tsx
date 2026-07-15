@@ -36,7 +36,10 @@ export function RunStatusGlyph({
   if (kind === "running") {
     return (
       <ReloadIcon
-        className={cn("shrink-0 animate-spin text-sky-400", className)}
+        className={cn(
+          "shrink-0 animate-spin text-sky-700 dark:text-sky-400",
+          className,
+        )}
       />
     );
   }
@@ -44,7 +47,7 @@ export function RunStatusGlyph({
     <span
       className={cn("flex shrink-0 items-center justify-center", className)}
     >
-      <span className="size-2 rounded-full border border-slate-500" />
+      <span className="size-2 rounded-full border border-border dark:border-slate-500" />
     </span>
   );
 }
@@ -58,7 +61,12 @@ export function RunBlockGlyph({
 }) {
   if (!blockType) {
     return (
-      <DotFilledIcon className={cn("shrink-0 text-slate-500", className)} />
+      <DotFilledIcon
+        className={cn(
+          "shrink-0 text-muted-foreground dark:text-slate-500",
+          className,
+        )}
+      />
     );
   }
   return (

@@ -91,6 +91,7 @@ VISION_FALLBACK_PROMPT_NAMES = {
     "anthropic-cua",
     "css-shape-convert",
     "extract-text-from-image",
+    "solve-arithmetic-captcha",
     "ui-tars-system-prompt",
 }
 

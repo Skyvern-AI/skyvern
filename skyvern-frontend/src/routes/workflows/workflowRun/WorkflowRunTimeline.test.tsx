@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ReactNode } from "react";
 
@@ -365,9 +371,13 @@ describe("WorkflowRunTimeline", () => {
       buildBlockItem(conditional, [buildBlockItem(takenChild)]),
     ];
 
-    renderTimeline(null);
+    const { container } = renderTimeline(null);
 
-    expect(screen.getByText("B • Else If")).toBeDefined();
+    const branchType = within(container).getByText("B • Else If");
+    expect(branchType.className).toContain("text-muted-foreground");
+    expect(branchType.className).not.toMatch(
+      /\b(?:rounded|border(?:-\S+)?|bg-\S+|p[xy]-\S+)\b/,
+    );
     expect(screen.getByText("· Use alternate path")).toBeDefined();
     expect(screen.getByText("condition false")).toBeDefined();
     expect(screen.getByText("1 block")).toBeDefined();

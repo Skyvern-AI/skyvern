@@ -129,13 +129,15 @@ function GoogleSheetsWriteEditorBody({
   return (
     <div data-testid="google-sheets-write-block-form" className="space-y-4">
       <div className="space-y-3">
-        <div className="text-xs font-medium uppercase tracking-wider text-slate-400">
+        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Connection
         </div>
 
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Google Account</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Google Account
+            </Label>
             <HelpTooltip
               content={
                 helpTooltips["google_sheets_write"]?.["credentialId"] ??
@@ -154,7 +156,7 @@ function GoogleSheetsWriteEditorBody({
               href="/integrations"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 rounded-full border border-amber-600/50 bg-amber-900/30 px-2 py-0.5 text-[0.7rem] text-amber-200 hover:bg-amber-900/50"
+              className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[0.7rem] text-amber-700 hover:bg-amber-100 dark:border-amber-600/50 dark:bg-amber-900/30 dark:text-amber-200 dark:hover:bg-amber-900/50"
             >
               Reconnect this Google account
             </a>
@@ -163,7 +165,9 @@ function GoogleSheetsWriteEditorBody({
 
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Spreadsheet</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Spreadsheet
+            </Label>
             <HelpTooltip
               content={
                 helpTooltips["google_sheets_write"]?.["spreadsheetUrl"] ??
@@ -210,14 +214,16 @@ function GoogleSheetsWriteEditorBody({
           <AccordionContent className="pl-6 pr-1 pt-4">
             <div className="space-y-3">
               {!data.credentialId || !data.spreadsheetUrl ? (
-                <div className="rounded-md border border-dashed border-slate-700 bg-slate-900/30 p-2 text-[0.7rem] text-slate-400">
+                <div className="rounded-md border border-dashed border-border bg-slate-elevation1/30 p-2 text-[0.7rem] text-muted-foreground">
                   Pick a Google account and spreadsheet to continue.
                 </div>
               ) : null}
 
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Write Mode</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Write Mode
+                  </Label>
                   <HelpTooltip
                     content={
                       helpTooltips["google_sheets_write"]?.["writeMode"] ??
@@ -255,12 +261,12 @@ function GoogleSheetsWriteEditorBody({
                         className={cn(
                           "nopan flex flex-col gap-1 rounded-md border px-3 py-2 text-left text-xs transition-colors",
                           selected
-                            ? "border-slate-300 bg-slate-800 text-slate-100"
-                            : "border-slate-700 bg-slate-900/60 text-slate-300 hover:border-slate-500",
+                            ? "border-slate-300 bg-muted text-foreground"
+                            : "border-border bg-slate-elevation1/60 text-tertiary-foreground hover:border-border dark:hover:border-slate-500",
                         )}
                       >
                         <span className="font-medium">{opt.title}</span>
-                        <span className="text-[0.7rem] text-slate-400">
+                        <span className="text-[0.7rem] text-muted-foreground">
                           {opt.body}
                         </span>
                       </button>
@@ -271,7 +277,9 @@ function GoogleSheetsWriteEditorBody({
 
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Sheet Name</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Sheet Name
+                  </Label>
                   <HelpTooltip
                     content={
                       helpTooltips["google_sheets_write"]?.["sheetName"] ??
@@ -292,10 +300,10 @@ function GoogleSheetsWriteEditorBody({
                   onSelect={(tabName) => update({ sheetName: tabName })}
                 />
                 {dimensionsQuery.data ? (
-                  <div className="space-y-1 rounded-md border border-slate-700 bg-slate-900/40 px-2 py-1.5 text-[0.7rem] text-slate-300">
+                  <div className="space-y-1 rounded-md border border-border bg-slate-elevation1/40 px-2 py-1.5 text-[0.7rem] text-tertiary-foreground">
                     <div>
                       Sheet{" "}
-                      <span className="font-medium text-slate-100">
+                      <span className="font-medium text-foreground">
                         "{dimensionsQuery.data.title}"
                       </span>{" "}
                       - {dimensionsQuery.data.column_count} columns (last is{" "}
@@ -305,7 +313,7 @@ function GoogleSheetsWriteEditorBody({
                       ) x {dimensionsQuery.data.row_count} rows.
                     </div>
                     {dimensionsQuery.data.headers.length > 0 ? (
-                      <details className="text-slate-400">
+                      <details className="text-muted-foreground">
                         <summary className="cursor-pointer">
                           {dimensionsQuery.data.headers.length} header
                           {dimensionsQuery.data.headers.length === 1
@@ -316,7 +324,7 @@ function GoogleSheetsWriteEditorBody({
                         <ul className="mt-1 grid grid-cols-2 gap-x-3 pl-2">
                           {dimensionsQuery.data.headers.map((h) => (
                             <li key={h.letter}>
-                              <span className="font-mono text-slate-500">
+                              <span className="font-mono text-muted-foreground dark:text-slate-500">
                                 {h.letter}
                               </span>{" "}
                               {h.name}
@@ -326,7 +334,7 @@ function GoogleSheetsWriteEditorBody({
                       </details>
                     ) : null}
                     {overflowingMappings.length > 0 ? (
-                      <div className="rounded border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-amber-200">
+                      <div className="rounded border border-amber-300 bg-amber-100 px-2 py-1 text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
                         Column mapping writes past column{" "}
                         <span className="font-mono">
                           {dimensionsQuery.data.last_column_letter}
@@ -345,7 +353,9 @@ function GoogleSheetsWriteEditorBody({
               {data.writeMode === "update" ? (
                 <div className="space-y-2">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">Range</Label>
+                    <Label className="text-xs text-tertiary-foreground">
+                      Range
+                    </Label>
                     <HelpTooltip
                       content={
                         helpTooltips["google_sheets_write"]?.["range"] ??
@@ -365,7 +375,9 @@ function GoogleSheetsWriteEditorBody({
 
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Values</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Values
+                  </Label>
                   <HelpTooltip
                     content={
                       helpTooltips["google_sheets_write"]?.["values"] ??
@@ -393,7 +405,7 @@ function GoogleSheetsWriteEditorBody({
                     return null;
                   } catch {
                     return (
-                      <div className="rounded-md border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-[0.7rem] text-amber-200">
+                      <div className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
                         This needs to be a JSON array, or a reference to a
                         previous block like {"{{ block_1.output }}"}.
                       </div>
@@ -404,7 +416,7 @@ function GoogleSheetsWriteEditorBody({
 
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Column Mapping
                     {(() => {
                       try {
@@ -459,7 +471,7 @@ function GoogleSheetsWriteEditorBody({
                     })
                   }
                 />
-                <Label className="text-xs text-slate-300">
+                <Label className="text-xs text-tertiary-foreground">
                   Create sheet if missing
                 </Label>
                 <HelpTooltip content="Auto-create the target sheet tab before writing. Required when looping with a dynamic sheet name like sheet_{{ current_index }}." />

@@ -10,6 +10,18 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({ data: [], isLoading: false }),
 }));
+vi.mock("../hooks/useRunHealEpisodesQuery", () => ({
+  useRunHealEpisodesQuery: () => ({
+    data: {
+      episodes: [],
+      summary: {
+        blocks_healed: 0,
+        blocks_outcome_risk: [],
+        blocks_with_heal_attempt: 0,
+      },
+    },
+  }),
+}));
 vi.mock("./WorkflowRunHumanInteraction", () => ({
   WorkflowRunHumanInteraction: () => null,
 }));

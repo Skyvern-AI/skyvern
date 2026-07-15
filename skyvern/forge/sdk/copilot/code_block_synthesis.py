@@ -33,7 +33,7 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     output_path_segments,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
-from skyvern.forge.sdk.copilot.runtime import ScoutedInputCorrespondence
+from skyvern.forge.sdk.copilot.runtime import ScoutedFieldParameterBinding, ScoutedInputCorrespondence
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -81,7 +81,15 @@ _CREDENTIAL_FIELD_ACCESS_RE = re.compile(
     r"\b(?P<parameter>[A-Za-z_][A-Za-z0-9_]*)\.(?:(?P<field>username|password|totp)\b|(?P<otp_method>otp)\s*\()"
 )
 _CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
-_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
+
+
+def _is_submit_interaction(interaction: Mapping[str, Any]) -> bool:
+    """A submit is a click, or an Enter keypress; other keys (Tab between fields) are not submits, so
+    both the synthesis submit boundary and the persist-time credential-scout gate share one definition."""
+    tool_name = str(interaction.get("tool_name") or "").strip()
+    if tool_name == "click":
+        return True
+    return tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter"
 
 
 class CredentialFieldAccess(NamedTuple):
@@ -127,7 +135,7 @@ def first_matched_post_fill_submit_index(
     for index, interaction in enumerate(trajectory):
         if index <= latest_fill_index:
             continue
-        if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+        if not _is_submit_interaction(interaction):
             continue
         source_url = str(interaction.get("source_url") or "").strip()
         if matched_source_urls and source_url not in matched_source_urls:
@@ -292,6 +300,7 @@ class SynthesisDiagnostics:
     # (trajectory enumerate index -> minted type_text parameter key); diagnostics-only, never serialized.
     # Recovers the key for a typed field whose value was withheld from default_value (typed_value == "").
     typed_param_bindings: list[tuple[int, str]] = field(default_factory=list)
+    grounded_submit_binding_fingerprints: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -305,6 +314,86 @@ class SynthesizedCodeBlock:
     extraction_code: str = ""
     extraction_fingerprint: str = ""
     extraction_plan_identity: str = ""
+
+
+def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
+    return (
+        parameter_key.isidentifier()
+        and not keyword.iskeyword(parameter_key)
+        and not parameter_key.startswith("__")
+        and parameter_key not in _RESERVED_PARAM_NAMES
+    )
+
+
+def grounded_submit_rung_binding_fingerprint(
+    *,
+    repeated_structural_key: str,
+    source_url: str,
+    submit_selector: str,
+    submit_trajectory_index: int,
+    field_bindings: Sequence[ScoutedFieldParameterBinding],
+) -> str:
+    payload = {
+        "repeated_structural_key": repeated_structural_key,
+        "source_url": source_url,
+        "submit_selector": submit_selector,
+        "submit_trajectory_index": submit_trajectory_index,
+        "field_bindings": [
+            {
+                "parameter_key": binding["parameter_key"],
+                "field_selector": binding["field_selector"],
+            }
+            for binding in field_bindings
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validated_submit_rung_binding(
+    interaction: Mapping[str, Any], trajectory_index: int
+) -> tuple[str, tuple[tuple[str, str], ...]] | None:
+    raw = interaction.get("submit_rung_binding")
+    if not isinstance(raw, Mapping) or str(interaction.get("tool_name") or "") != "click":
+        return None
+    repeated_structural_key = str(raw.get("repeated_structural_key") or "").strip()
+    fingerprint = str(raw.get("fingerprint") or "").strip()
+    raw_fields = raw.get("field_bindings")
+    if not repeated_structural_key or not fingerprint or not isinstance(raw_fields, list) or not raw_fields:
+        return None
+    fields: list[ScoutedFieldParameterBinding] = []
+    parameter_keys: set[str] = set()
+    field_selectors: set[str] = set()
+    for raw_field in raw_fields:
+        if not isinstance(raw_field, Mapping):
+            return None
+        parameter_key = str(raw_field.get("parameter_key") or "").strip()
+        field_selector = str(raw_field.get("field_selector") or "").strip()
+        if (
+            not grounded_parameter_key_is_safe(parameter_key)
+            or not field_selector
+            or parameter_key in parameter_keys
+            or field_selector in field_selectors
+        ):
+            return None
+        parameter_keys.add(parameter_key)
+        field_selectors.add(field_selector)
+        fields.append({"parameter_key": parameter_key, "field_selector": field_selector})
+    if [field["parameter_key"] for field in fields] != sorted(parameter_keys):
+        return None
+    submit_selector = str(interaction.get("selector") or "").strip()
+    source_url = str(interaction.get("source_url") or "").strip()
+    if not submit_selector or not source_url:
+        return None
+    expected = grounded_submit_rung_binding_fingerprint(
+        repeated_structural_key=repeated_structural_key,
+        source_url=source_url,
+        submit_selector=submit_selector,
+        submit_trajectory_index=trajectory_index,
+        field_bindings=fields,
+    )
+    if fingerprint != expected:
+        return None
+    return fingerprint, tuple((field["parameter_key"], field["field_selector"]) for field in fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -819,6 +908,7 @@ def _locator_expr(
     selector = str(interaction.get("selector") or "").strip()
     role = str(interaction.get("role") or "").strip()
     name = str(interaction.get("accessible_name") or "").strip()
+    scout_ambiguous = bool(interaction.get("ambiguous"))
 
     templated = _maybe_input_templated_locator(interaction, diagnostics=diagnostics, trajectory_index=trajectory_index)
     if templated is not None:
@@ -838,7 +928,7 @@ def _locator_expr(
             return ""
         parsed_strict = _parse_role_name(selector)
         ambiguous_role = parsed_strict is not None and not parsed_strict[1]
-        if ambiguous_role or _is_bare_ambiguous_selector(selector):
+        if ambiguous_role or scout_ambiguous or _is_bare_ambiguous_selector(selector):
             if role and name:
                 expr = _get_by_role_expr_strict(role, name)
                 if diagnostics is not None:
@@ -895,6 +985,20 @@ def _locator_expr(
         if _is_positional_selector(selector):
             notes.append(f"low-confidence locator: positional selector {selector!r} with no role/name to anchor on")
             return f"page.locator({_py_str(selector)})"
+        if scout_ambiguous and role and name:
+            return _get_by_role_expr(role, name)
+        if scout_ambiguous:
+            notes.append(f"disambiguated a scout-ambiguous {selector!r} selector to .first from scout document order")
+            if diagnostics is not None:
+                diagnostics.locator_provenance.append(
+                    {
+                        "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                        "selector": selector,
+                        "emitted_literal": selector,
+                        "source": "first_fallback",
+                    }
+                )
+            return f"page.locator({_py_str(selector)}).first"
         if _is_bare_ambiguous_selector(selector):
             if role and name:
                 return _get_by_role_expr(role, name)
@@ -1138,7 +1242,7 @@ def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict
 
     submit_index = -1
     for index in range(last_credential_index + 1, len(trajectory)):
-        if str(trajectory[index].get("tool_name") or "") == "click":
+        if _is_submit_interaction(trajectory[index]):
             submit_index = index
             break
     if submit_index < 0:
@@ -1193,6 +1297,9 @@ def synthesize_code_block(
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
     used_download_vars: set[str] = set()
+    grounded_binding_count = sum(1 for interaction in trajectory if "submit_rung_binding" in interaction)
+    if grounded_binding_count > 1:
+        return None
     compile_download_target = (
         reached_download_target is not None
         and not reached_download_target.already_registered
@@ -1210,6 +1317,8 @@ def synthesize_code_block(
                 anchor=reached_download_target.trajectory_anchor,
                 dropped_trailing_count=dropped_trailing,
             )
+    if grounded_binding_count != sum(1 for interaction in trajectory if "submit_rung_binding" in interaction):
+        return None
     diagnostics.retained_trajectory_indices = list(range(len(trajectory)))
 
     input_templated_keys, input_templated_needs_month = _prescan_input_templating(trajectory)
@@ -1271,6 +1380,7 @@ def synthesize_code_block(
     entry_replay_condition_active = False
     entry_replay_start_index = 0
     entry_post_auth_resume_index = 0
+    login_only_presence_guard_active = False
     for index, interaction in enumerate(trajectory):
         candidate = str(interaction.get("source_url") or "").strip()
         if candidate:
@@ -1339,6 +1449,22 @@ def synthesize_code_block(
                     entry_recovery_clicks.append((recovery_index, recovery_locator))
             if entry_recovery_clicks:
                 notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
+        login_only_presence_guard_active = bool(
+            entry_target
+            and not entry_replay_condition_active
+            and not entry_post_auth_resume_index
+            and not entry_replay_start_index
+            and not entry_recovery_clicks
+            and any(
+                str(interaction.get("tool_name") or "") == CREDENTIAL_FILL_TOOL_NAME
+                and str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS
+                for interaction in entry_trajectory
+            )
+        )
+        if login_only_presence_guard_active:
+            notes.append(
+                "login rung fills only when the credential form is present, so an authenticated replay skips it"
+            )
         line_start = len(lines) + 1
         if entry_target:
             if entry_replay_condition_active:
@@ -1402,7 +1528,7 @@ def synthesize_code_block(
                         lane="entry_recovery",
                     )
                 lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
-            else:
+            elif not login_only_presence_guard_active:
                 lines.append(f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
         else:
             lines.append(
@@ -1417,6 +1543,8 @@ def synthesize_code_block(
         elif entry_post_auth_resume_index:
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
+        if login_only_presence_guard_active:
+            lines.append(f"{_INDENT}if await {_ENTRY_TARGET_VAR}.count() == 1:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
@@ -1429,6 +1557,8 @@ def synthesize_code_block(
                 return _INDENT * 3
             return _INDENT * 2
         if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
+            return _INDENT * 2
+        if login_only_presence_guard_active:
             return _INDENT * 2
         return _INDENT
 
@@ -1507,6 +1637,23 @@ def synthesize_code_block(
 
         line_start = len(lines) + 1
         if tool_name == "click":
+            captured_index = interaction.get("trajectory_index")
+            submit_trajectory_index = (
+                captured_index if isinstance(captured_index, int) and captured_index >= 0 else trajectory_index
+            )
+            if "submit_rung_binding" in interaction:
+                grounded_binding = _validated_submit_rung_binding(interaction, submit_trajectory_index)
+                if grounded_binding is None:
+                    return None
+                binding_fingerprint, field_bindings = grounded_binding
+                for parameter_key, field_selector in field_bindings:
+                    if parameter_key not in used_param_keys:
+                        used_param_keys.add(parameter_key)
+                        parameters.append({"key": parameter_key})
+                    lines.append(
+                        f"{action_indent}await page.locator({_py_str(field_selector)}).fill(str({parameter_key}))"
+                    )
+                diagnostics.grounded_submit_binding_fingerprints.append(binding_fingerprint)
             reclassify_terminal_required = (
                 trajectory_index == terminal_action_index
                 and _is_anonymous_structural_dismissal_click(interaction)
@@ -1635,6 +1782,9 @@ def synthesize_code_block(
     ):
         lines.append(f"{_INDENT * 2}pass")
 
+    if login_only_presence_guard_active and (emitted - len(deferred_readonly_assertions)) == 0:
+        lines.append(f"{_INDENT * 2}pass")
+
     if deferred_readonly_assertions:
         deferred_base = _INDENT
         if entry_replay_condition_active:
@@ -1716,6 +1866,8 @@ def synthesize_code_block(
         lines.append(f"{_INDENT}}}")
 
     if not lines:
+        return None
+    if len(diagnostics.grounded_submit_binding_fingerprints) != grounded_binding_count:
         return None
     emitted_code = "\n".join(lines)
     for scout_var in _INTERNAL_SCOUT_VARS:

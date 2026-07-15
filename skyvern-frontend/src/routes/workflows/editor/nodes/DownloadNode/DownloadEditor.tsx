@@ -24,7 +24,7 @@ function DownloadEditorBody({ node }: { node: DownloadNode }) {
     <div data-testid="download-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <Label className="text-sm text-slate-400">File Path</Label>
+          <Label className="text-sm text-muted-foreground">File Path</Label>
           <HelpTooltip content={helpTooltips["download"]["url"]} />
         </div>
         <Input value={url} disabled className="nopan text-xs" />

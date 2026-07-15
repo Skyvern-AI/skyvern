@@ -177,7 +177,9 @@ function WorkflowTriggerEditorBody({
     <div data-testid="workflow-trigger-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Target Agent</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            Target Agent
+          </Label>
           <HelpTooltip content={workflowPermanentIdTooltip} />
         </div>
         <WorkflowSelector
@@ -195,7 +197,7 @@ function WorkflowTriggerEditorBody({
       <Separator />
       <div className="space-y-4">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Payload</Label>
+          <Label className="text-xs text-tertiary-foreground">Payload</Label>
           <HelpTooltip content={payloadTooltip} />
         </div>
         {hasWorkflowSelected ? (
@@ -207,7 +209,7 @@ function WorkflowTriggerEditorBody({
             isLoading={isLoadingParams}
           />
         ) : (
-          <p className="text-xs text-slate-500">
+          <p className="text-xs text-muted-foreground dark:text-slate-500">
             Select a target agent to configure its inputs here.
           </p>
         )}
@@ -216,12 +218,14 @@ function WorkflowTriggerEditorBody({
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Browser Session</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Browser Session
+            </Label>
             <HelpTooltip content={browserSessionTooltip} />
           </div>
           <button
             type="button"
-            className="text-xs text-blue-400 hover:underline"
+            className="text-xs text-blue-700 hover:underline dark:text-blue-400"
             onClick={() => {
               const next = !useDynamicBrowserSession;
               setUseDynamicBrowserSession(next);
@@ -259,7 +263,9 @@ function WorkflowTriggerEditorBody({
       </div>
       <div className="flex items-center justify-between">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Wait for Completion</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            Wait for Completion
+          </Label>
           <HelpTooltip content={waitForCompletionTooltip} />
         </div>
         <div className="w-52">
@@ -270,7 +276,7 @@ function WorkflowTriggerEditorBody({
         </div>
       </div>
       {!waitForCompletion && !useDynamicBrowserSession && (
-        <p className="text-xs text-slate-400">
+        <p className="text-xs text-muted-foreground">
           &quot;Continue in the same session&quot; is disabled because the
           parent agent may close its browser before the triggered agent
           finishes.
