@@ -5,6 +5,7 @@ import {
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
 import {
+  constructCacheKeyValueFromParameters,
   getInitialParameters,
   skyvernCredentialToParameterYAML,
 } from "./utils";
@@ -154,5 +155,54 @@ describe("skyvernCredentialToParameterYAML", () => {
       key: "credentials",
       description: null,
     });
+  });
+});
+
+describe("constructCacheKeyValueFromParameters", () => {
+  test("substitutes a single parameter reference", () => {
+    expect(
+      constructCacheKeyValueFromParameters({
+        codeKey: "{{a}}",
+        parameters: { a: "x" },
+      }),
+    ).toBe("x");
+  });
+
+  test("substitutes distinct parameters", () => {
+    expect(
+      constructCacheKeyValueFromParameters({
+        codeKey: "{{a}}-{{b}}",
+        parameters: { a: "1", b: "2" },
+      }),
+    ).toBe("1-2");
+  });
+
+  test("replaces every occurrence of a repeated parameter", () => {
+    // Regression: String.replace only swapped the first "{{a}}", leaving the
+    // second, so the trailing "{" guard discarded the whole key.
+    expect(
+      constructCacheKeyValueFromParameters({
+        codeKey: "{{a}}/{{a}}",
+        parameters: { a: "x" },
+      }),
+    ).toBe("x/x");
+  });
+
+  test("returns empty string when a placeholder is left unresolved", () => {
+    expect(
+      constructCacheKeyValueFromParameters({
+        codeKey: "{{a}}-{{missing}}",
+        parameters: { a: "x" },
+      }),
+    ).toBe("");
+  });
+
+  test("skips null, undefined, and empty-string parameter values", () => {
+    expect(
+      constructCacheKeyValueFromParameters({
+        codeKey: "static-key",
+        parameters: { a: null, b: undefined, c: "" },
+      }),
+    ).toBe("static-key");
   });
 });
