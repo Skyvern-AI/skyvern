@@ -17,6 +17,14 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+from skyvern.forge.sdk.copilot.request_slots import (
+    CanonicalRequestSlotV1,
+    RequestSlotContractV1,
+    RequestSlotProducerInputV1,
+    produce_request_slots,
+    request_slot_source_text,
+    request_slot_sources,
+)
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     contains_email_password_pair,
@@ -209,8 +217,14 @@ RequestedOutputEvidenceSource = Literal[
     "registered_artifact_content",
 ]
 JudgmentPredicate = Literal["login_gate_blocks_target"]
+MintDisposition = Literal["pending", "decidable", "degraded"]
+Pinability = Literal["pinned", "shapeless_valid", "unpinnable"]
 _JUDGMENT_PREDICATES: frozenset[str] = frozenset(get_args(JudgmentPredicate))
-MintDegrade = Literal["turn_unsatisfiable_fallback", "contingent_missing_antecedent"]
+MintDegrade = Literal[
+    "turn_unsatisfiable_fallback",
+    "contingent_missing_antecedent",
+    "undecidable_judgment",
+]
 MINT_DEGRADE_VALUES: frozenset[str] = frozenset(get_args(MintDegrade))
 _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "validation_classification"})
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
@@ -309,6 +323,11 @@ class CompletionCriterion:
     judgment_truth_condition: JudgmentTruthCondition | None = None
     requested_output_floor_rekeyed: bool = False
     floor_rekeyed_from_path: str | None = None
+    # Fresh request-slot contract metadata. Defaults keep versionless criteria on
+    # the byte-identical legacy path and are excluded from identity/dedup keys.
+    request_slot_id: str | None = None
+    pinability: Pinability | None = None
+    mint_disposition: MintDisposition = "decidable"
 
 
 @dataclass
@@ -347,6 +366,8 @@ class RequestPolicy:
     classifier_retry_count: int = 0
     classifier_non_runtime_requested_output_evidence_sources: list[str] = field(default_factory=list)
     completion_contract_status: str = "absent"
+    classifier_contract_version: int | None = None
+    request_slot_failure_kind: str | None = None
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -392,6 +413,10 @@ class RequestPolicy:
             criterion for criterion in self.graded_completion_criteria() if criterion.output_path is not None
         ]
         data["requested_output_criteria_count"] = len(requested_output_criteria)
+        if self.classifier_contract_version is not None:
+            data["classifier_contract_version"] = self.classifier_contract_version
+            if self.request_slot_failure_kind is not None:
+                data["request_slot_failure_kind"] = self.request_slot_failure_kind
         for index, criterion in enumerate(requested_output_criteria[:_MAX_TRACE_COMPLETION_CRITERIA]):
             prefix = f"requested_output_criterion_{index}"
             data[f"{prefix}_id"] = criterion.id
@@ -401,6 +426,12 @@ class RequestPolicy:
             if criterion.mint_degrade is not None:
                 data[f"{prefix}_mint_degrade"] = criterion.mint_degrade
             data[f"{prefix}_evidence_source"] = criterion.requested_output_evidence_source
+            if self.classifier_contract_version is not None:
+                data[f"{prefix}_mint_disposition"] = criterion.mint_disposition
+                if criterion.request_slot_id is not None:
+                    data[f"{prefix}_request_slot_id"] = criterion.request_slot_id
+                if criterion.pinability is not None:
+                    data[f"{prefix}_pinability"] = criterion.pinability
             if criterion.expected_output_shape:
                 data[f"{prefix}_expected_output_shape"] = criterion.expected_output_shape
         mint_degraded_criteria = [
@@ -789,7 +820,201 @@ def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     return raw
 
 
-def _classification_from_raw(raw: Any) -> RequestPolicy:
+def _request_slot_anchor(item: dict[str, Any]) -> tuple[str, str] | None:
+    source_id = item.get("request_slot_source_id")
+    source_quote = item.get("request_slot_source_quote")
+    if not isinstance(source_id, str) or not isinstance(source_quote, str) or not source_quote:
+        return None
+    return source_id, source_quote
+
+
+def _request_slot_has_exact_requirement(criterion: CompletionCriterion) -> bool:
+    if criterion.kind == "validation_classification":
+        return criterion.expected_classification is not None
+    return criterion.expected_output_value is not None or criterion.expected_output_shape is not None
+
+
+def _degrade_unbound_request_slot_criterion(criterion: CompletionCriterion) -> CompletionCriterion:
+    return replace(
+        criterion,
+        output_path=None,
+        expected_output_value=None,
+        expected_output_shape=None,
+        classification_output_key=None,
+        expected_classification=None,
+        judgment_truth_condition=None,
+        kind="outcome",
+        mint_disposition="degraded",
+        mint_degrade="undecidable_judgment",
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path=criterion.output_path,
+    )
+
+
+def _item_claims_request_slot(item: dict[str, Any]) -> bool:
+    return _request_slot_anchor(item) is not None or any(
+        item.get(field) is not None
+        for field in (
+            "output_path",
+            "classification_output_key",
+            "expected_output_value",
+            "expected_output_shape",
+            "expected_classification",
+        )
+    )
+
+
+def _request_slot_for_anchor(
+    anchor: tuple[str, str] | None,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+) -> CanonicalRequestSlotV1 | None:
+    if anchor is None:
+        return None
+    source_id, source_quote = anchor
+    source = next((item for item in request_slot_sources(request_slot_request) if item.source_id == source_id), None)
+    if source is None:
+        return None
+    start = source.text.find(source_quote)
+    if start < 0 or source.text.find(source_quote, start + 1) >= 0:
+        return None
+    end = start + len(source_quote)
+    matches = [
+        slot
+        for slot in request_slot_contract.slots
+        if slot.source_id == source_id and slot.source_start < end and start < slot.source_end
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _bind_criterion_to_request_slot(
+    criterion: CompletionCriterion,
+    *,
+    slot: CanonicalRequestSlotV1,
+    source_quote: str,
+) -> CompletionCriterion:
+    pinability = cast(Pinability, slot.pinability.value)
+    has_exact_requirement = _request_slot_has_exact_requirement(criterion)
+    degraded = pinability == "unpinnable" or (pinability == "pinned" and not has_exact_requirement)
+    rekeyed = degraded or pinability == "shapeless_valid"
+
+    expected_output_value = criterion.expected_output_value
+    expected_output_shape = criterion.expected_output_shape
+    expected_classification = criterion.expected_classification
+    kind = criterion.kind
+    classification_output_key = criterion.classification_output_key
+    judgment_truth_condition = criterion.judgment_truth_condition
+    original_output_path = criterion.output_path or (
+        f"output.{classification_output_key}" if classification_output_key is not None else None
+    )
+    if pinability != "pinned" or degraded:
+        expected_output_value = None
+        expected_output_shape = None
+        expected_classification = None
+        judgment_truth_condition = None
+    if rekeyed and kind == "validation_classification":
+        kind = "outcome"
+        classification_output_key = None
+    output_path = None if rekeyed else criterion.output_path
+
+    pending = pinability == "pinned" and (
+        isinstance(expected_output_value, bool)
+        or expected_output_shape == "goal_judgment_boolean"
+        or isinstance(expected_classification, bool)
+        or judgment_truth_condition is not None
+    )
+    return replace(
+        criterion,
+        id=slot.slot_id,
+        outcome=criterion.outcome or source_quote,
+        level=cast(CriterionLevel, slot.plane.value),
+        output_path=output_path,
+        expected_output_value=expected_output_value,
+        expected_output_shape=expected_output_shape,
+        kind=kind,
+        classification_output_key=classification_output_key,
+        expected_classification=expected_classification,
+        judgment_truth_condition=judgment_truth_condition,
+        request_slot_id=slot.slot_id,
+        pinability=pinability,
+        mint_disposition="degraded" if degraded else ("pending" if pending else "decidable"),
+        mint_degrade="undecidable_judgment" if degraded else None,
+        requested_output_floor_rekeyed=rekeyed,
+        floor_rekeyed_from_path=original_output_path if rekeyed else None,
+    )
+
+
+def _parse_fresh_request_slot_criteria(
+    raw: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+    request_slot_contract: RequestSlotContractV1,
+) -> list[CompletionCriterion]:
+    if request_slot_contract.version != "1" or not isinstance(raw, list):
+        return []
+    bound_by_slot_id: dict[str, CompletionCriterion] = {}
+    non_slot_criteria: list[CompletionCriterion] = []
+    for item, criterion in _parse_completion_criterion_entries(raw):
+        anchor = _request_slot_anchor(item)
+        slot = _request_slot_for_anchor(
+            anchor,
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+        )
+        if anchor is None or slot is None:
+            if _item_claims_request_slot(item):
+                criterion = _degrade_unbound_request_slot_criterion(criterion)
+            non_slot_criteria.append(
+                replace(
+                    criterion,
+                    id=f"c{len(non_slot_criteria)}",
+                )
+            )
+            continue
+        if slot.slot_id in bound_by_slot_id:
+            # The producer owns slot membership and one slot can yield only one criterion.
+            # Preserve the first classifier row in source order; later aliases cannot widen
+            # or replace the already-bound contract member.
+            continue
+        bound_by_slot_id[slot.slot_id] = _bind_criterion_to_request_slot(
+            criterion,
+            slot=slot,
+            source_quote=anchor[1],
+        )
+
+    for slot in request_slot_contract.slots:
+        if slot.slot_id in bound_by_slot_id:
+            continue
+        source_quote = request_slot_source_text(request_slot_request, slot)
+        bound_by_slot_id[slot.slot_id] = _bind_criterion_to_request_slot(
+            CompletionCriterion(id="c0", outcome=source_quote),
+            slot=slot,
+            source_quote=source_quote,
+        )
+    return ([bound_by_slot_id[slot.slot_id] for slot in request_slot_contract.slots] + non_slot_criteria)[
+        :_MAX_COMPLETION_CRITERIA
+    ]
+
+
+def _fresh_request_slot_failure_criteria(raw: Any) -> list[CompletionCriterion]:
+    if not isinstance(raw, list):
+        return []
+    criteria: list[CompletionCriterion] = []
+    for item, criterion in _parse_completion_criterion_entries(raw):
+        if _item_claims_request_slot(item):
+            criterion = _degrade_unbound_request_slot_criterion(criterion)
+        criteria.append(replace(criterion, id=f"c{len(criteria)}"))
+    return criteria
+
+
+def _classification_from_raw(
+    raw: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1 | None = None,
+    request_slot_contract: RequestSlotContractV1 | None = None,
+    request_slot_failure_kind: str | None = None,
+) -> RequestPolicy:
     raw = _coerce_classifier_payload(raw)
     if raw is None:
         return RequestPolicy()
@@ -800,6 +1025,22 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
     evidence_raw = raw.get("raw_secret_evidence")
     raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
+    has_contract_version = "contract_version" in raw
+    version_raw = raw.get("contract_version")
+    contract_version = (
+        version_raw if isinstance(version_raw, int) and not isinstance(version_raw, bool) and version_raw == 1 else None
+    )
+    if contract_version == 1 and request_slot_request is not None and request_slot_contract is not None:
+        completion_criteria = _parse_fresh_request_slot_criteria(
+            raw.get("completion_criteria"),
+            request_slot_request=request_slot_request,
+            request_slot_contract=request_slot_contract,
+        )
+    elif has_contract_version:
+        completion_criteria = _fresh_request_slot_failure_criteria(raw.get("completion_criteria"))
+        request_slot_failure_kind = request_slot_failure_kind or "unsupported_contract_version"
+    else:
+        completion_criteria = _parse_completion_criteria(raw.get("completion_criteria"))
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
         authoring_intent=authoring_intent if authoring_intent in _AUTHORING_INTENTS else "author_now",
@@ -808,12 +1049,16 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
-        completion_criteria=_parse_completion_criteria(raw.get("completion_criteria")),
+        completion_criteria=completion_criteria,
         raw_secret_evidence=raw_secret_evidence,
         raw_secret_handling=_coerce_raw_secret_handling(raw.get("raw_secret_handling")),
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
         classifier_status="success",
         classifier_failure_kind="none",
+        classifier_contract_version=contract_version
+        if contract_version is not None
+        else (-1 if has_contract_version else None),
+        request_slot_failure_kind=request_slot_failure_kind,
     )
     if policy.credential_input_kind == "raw_secret":
         policy.clarification_reason = "raw_secret"
@@ -844,7 +1089,7 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
     return None
 
 
-def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
+def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], CompletionCriterion]]:
     """Build outcome criteria from the classifier output.
 
     IDs are assigned server-side by index after de-duplication; any id the
@@ -853,7 +1098,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
     """
     if not isinstance(raw, list):
         return []
-    criteria: list[CompletionCriterion] = []
+    entries: list[tuple[dict[str, Any], CompletionCriterion]] = []
     seen: set[tuple[str, ...]] = set()
     registered_download_item_count = sum(
         1
@@ -933,7 +1178,7 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 "copilot_registered_download_requested_output_minted",
                 output_path=output_path,
                 requested_output_path_mint_source=requested_output_path_mint_source,
-                criterion_id=f"c{len(criteria)}",
+                criterion_id=f"c{len(entries)}",
             )
         key = (
             contingent_on or "",
@@ -951,29 +1196,32 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
             continue
         seen.add(key)
         level_raw = item.get("level")
-        criteria.append(
-            CompletionCriterion(
-                id=f"c{len(criteria)}",
-                outcome=outcome,
-                contingent_on=contingent_on,
-                contingent_antecedent_output_path=contingent_antecedent_output_path,
-                deliverable_kind=deliverable_kind,
-                declared_deliverable_kind=deliverable_kind,
-                implicit=bool(item.get("implicit")),
-                method_mandated=bool(item.get("method_mandated")),
-                level=cast(CriterionLevel, level_raw)
-                if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
-                else "run",
-                output_path=output_path,
-                expected_output_value=expected_output_value,
-                expected_output_shape=expected_output_shape,
-                requested_output_evidence_source=requested_output_evidence_source,
-                requested_output_path_mint_source=requested_output_path_mint_source,
-                kind=kind,
-                terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
-                classification_output_key=classification_output_key,
-                expected_classification=expected_classification,
-                judgment_truth_condition=judgment_truth_condition,
+        entries.append(
+            (
+                item,
+                CompletionCriterion(
+                    id=f"c{len(entries)}",
+                    outcome=outcome,
+                    contingent_on=contingent_on,
+                    contingent_antecedent_output_path=contingent_antecedent_output_path,
+                    deliverable_kind=deliverable_kind,
+                    declared_deliverable_kind=deliverable_kind,
+                    implicit=bool(item.get("implicit")),
+                    method_mandated=bool(item.get("method_mandated")),
+                    level=cast(CriterionLevel, level_raw)
+                    if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
+                    else "run",
+                    output_path=output_path,
+                    expected_output_value=expected_output_value,
+                    expected_output_shape=expected_output_shape,
+                    requested_output_evidence_source=requested_output_evidence_source,
+                    requested_output_path_mint_source=requested_output_path_mint_source,
+                    kind=kind,
+                    terminal_action_family=_coerce_terminal_action_family(item.get("terminal_action_family"), kind),
+                    classification_output_key=classification_output_key,
+                    expected_classification=expected_classification,
+                    judgment_truth_condition=judgment_truth_condition,
+                ),
             )
         )
         if judgment_truth_condition is not None:
@@ -982,11 +1230,15 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
                 mint_source="classifier",
                 predicate=judgment_truth_condition.predicate,
                 polarity_when_holds=judgment_truth_condition.polarity_when_holds,
-                criterion_id=criteria[-1].id,
+                criterion_id=entries[-1][1].id,
             )
-        if len(criteria) >= _MAX_COMPLETION_CRITERIA:
+        if len(entries) >= _MAX_COMPLETION_CRITERIA:
             break
-    return criteria
+    return entries
+
+
+def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
+    return [criterion for _item, criterion in _parse_completion_criterion_entries(raw)]
 
 
 def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
@@ -1771,6 +2023,10 @@ def is_contingent_missing_antecedent_degraded(criterion: CompletionCriterion) ->
     return criterion.mint_degrade == "contingent_missing_antecedent"
 
 
+def is_undecidable_judgment_degraded(criterion: CompletionCriterion) -> bool:
+    return criterion.mint_degrade == "undecidable_judgment"
+
+
 def resolve_mint_degrade(
     stored_value: object,
     contingent_on: str | None,
@@ -2108,6 +2364,24 @@ async def _classify_request(
     safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
     safe_global_llm_context = sanitize_global_llm_context_for_prompt(global_llm_context)
     transcript = build_transcript_context(chat_history, safe_user_message)
+    request_slot_request = RequestSlotProducerInputV1(
+        version="1",
+        latest_request=safe_user_message[:16_384],
+        workflow_context=workflow_yaml[:32_768],
+        earliest_user_turn=""
+        if transcript.earliest_user_turn == _EMPTY_SLOT_SENTINEL
+        else transcript.earliest_user_turn,
+        latest_prior_user_turn=(
+            "" if transcript.latest_prior_user_turn == _EMPTY_SLOT_SENTINEL else transcript.latest_prior_user_turn
+        ),
+        latest_assistant_turn=(
+            "" if transcript.latest_assistant_turn == _EMPTY_SLOT_SENTINEL else transcript.latest_assistant_turn
+        ),
+        retained_history=(
+            () if transcript.retained_history == _EMPTY_SLOT_SENTINEL else (transcript.retained_history,)
+        ),
+        global_context=safe_global_llm_context[:32_768],
+    )
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=escape_code_fences(safe_user_message),
@@ -2119,6 +2393,16 @@ async def _classify_request(
         retained_history=transcript.retained_history,
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(safe_global_llm_context)[:2048]),
         active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
+        request_slot_sources=json.dumps(
+            # The classifier needs the same bounded, byte-exact source set as the
+            # producer so it can nominate an unambiguous source ID + quote. This is
+            # intentionally repeated alongside the role-labelled transcript context;
+            # the latter supplies conversational meaning, while this block supplies
+            # server-verifiable identity.
+            [source.model_dump(mode="json") for source in request_slot_sources(request_slot_request)],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
     )
     raw, failure_kind, retry_count = await _run_request_policy_classifier(handler, prompt)
     if raw is None:
@@ -2144,7 +2428,40 @@ async def _classify_request(
             requested_output_path_aliases=requested_output_path_aliases,
         )
 
-    policy = _classification_from_raw(raw_payload)
+    request_slot_contract: RequestSlotContractV1 | None = None
+    request_slot_failure_kind: str | None = None
+    version_raw = raw_payload.get("contract_version")
+    if isinstance(version_raw, int) and not isinstance(version_raw, bool) and version_raw == 1:
+        raw_criteria = raw_payload.get("completion_criteria")
+        declared_request_slots = isinstance(raw_criteria, list) and any(
+            isinstance(item, dict) and _request_slot_anchor(item) is not None for item in raw_criteria
+        )
+        if declared_request_slots:
+            # This validation hop is deliberately sequential: the request-policy
+            # classifier first declares which criteria are request-owned slots, then
+            # the independent producer types their identity, plane, and pinability.
+            request_slot_result = await produce_request_slots(request=request_slot_request, handler=handler)
+            if request_slot_result.status == "success":
+                request_slot_contract = request_slot_result.contract
+            else:
+                request_slot_failure_kind = (
+                    request_slot_result.failure_kind.value
+                    if request_slot_result.failure_kind is not None
+                    else "unknown"
+                )
+                LOG.warning(
+                    "request-policy request-slot producer failed",
+                    failure_kind=request_slot_failure_kind,
+                    attempts=request_slot_result.attempts,
+                )
+        else:
+            request_slot_failure_kind = "no_declared_slots"
+    policy = _classification_from_raw(
+        raw_payload,
+        request_slot_request=request_slot_request,
+        request_slot_contract=request_slot_contract,
+        request_slot_failure_kind=request_slot_failure_kind,
+    )
     policy.classifier_retry_count = retry_count
     policy.classifier_non_runtime_requested_output_evidence_sources = sorted(
         {
@@ -2197,9 +2514,13 @@ async def _classify_request(
         policy.clarification_reason = "none"
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
-    _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
-    _apply_validation_classification_completion_criteria(policy)
-    _apply_classifier_typed_requested_output_corroborators(policy)
+    if policy.classifier_contract_version is None:
+        # Legacy corroborators are inference-based compatibility behavior. A fresh
+        # contract remains fail-closed even when its request-slot producer fails:
+        # fresh criteria degrade above instead of re-entering legacy guessing.
+        _apply_requested_output_completion_criteria(policy, user_message, requested_output_path_aliases)
+        _apply_validation_classification_completion_criteria(policy)
+        _apply_classifier_typed_requested_output_corroborators(policy)
     _degrade_pathless_contingent_criteria(policy)
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
