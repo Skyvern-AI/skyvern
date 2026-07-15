@@ -69,11 +69,13 @@ jobs:
               echo "Author $PR_AUTHOR is not in the approved list"
               ;;
           esac
-      - name: Auto-merge PR
+      - name: Enable auto-merge
         env:
           GH_TOKEN: ${{ steps.set-token.outputs.GH_PAT }}
         run: |
+          # Branch protection requires approval and strict status checks; let GitHub
+          # merge once those requirements are satisfied instead of bypassing them.
           gh pr merge ${{ github.event.pull_request.number }} \
             --squash \
-            --admin \
+            --auto \
             --repo "${{ github.repository }}"
