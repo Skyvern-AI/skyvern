@@ -4632,9 +4632,9 @@ async def wrapper({default_args}):
             block_label=self.label,
         )
 
-        # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
-        # the standard action/artifact timeline and the agent can later take over on failure.
-        # Promptless blocks have no task and persist neither actions nor screenshots.
+        # Every code block gets a container task v1 + step so its recorded calls render through
+        # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
+        # task also seats a later agent takeover on failure.
         recorder = CodeBlockActionRecording(
             code_block=self,
             page=page,
