@@ -51,7 +51,7 @@ function WorkflowRunRecording() {
           key={index} // presigned URLs change on refetch; list order is stable
           className="flex flex-col gap-2"
         >
-          <div className="text-sm text-slate-400">
+          <div className="text-sm text-muted-foreground">
             Recording {index + 1} of {recordingUrls.length}
           </div>
           <video

@@ -19,6 +19,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_scout_act_observe_hollow,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    role_name_match_count_expression as _role_name_match_count_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -251,6 +254,35 @@ async def _selector_live_match_count(
     return value
 
 
+async def _role_name_match_count(
+    ctx: AgentContext, role: str, name: str, *, timeout_seconds: float = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+) -> int | None:
+    """Live count of elements whose computed ARIA role and accessible name exactly match, or None when
+    the page read is unavailable; lets the ambiguity guard tell a uniquely-resolvable re-anchor apart from
+    a name-degenerate one before trusting get_by_role(role, name, exact=True)."""
+    if not role or not name:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None or timeout_seconds <= 0:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _role_name_match_count_expression(role, name)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
     """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
 
@@ -285,6 +317,43 @@ def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selecto
     if stashed_selector != _selector_text(selector):
         return "", ""
     return role, name
+
+
+async def _capture_scout_ambiguity(ctx: AgentContext, selector: str | None) -> None:
+    """Stash whether a click/select selector is ambiguous (>1 match) on its source page, read before the
+    action dispatches so the count reflects the source rather than a post-navigation landing; a captured
+    (role, name) re-anchor is kept only when get_by_role(role, name, exact=True) resolves uniquely, so a
+    name-degenerate selector fails closed to the scout-the-step drop instead of a strict-mode failure."""
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    count = await _selector_live_match_count(ctx, selector)
+    if count is None or count <= 1:
+        return
+    ctx.pending_scout_ambiguous = (selector, True)
+    captured = await _capture_accessible_role_name(
+        ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+    )
+    if captured is None:
+        return
+    role, name = captured
+    if not role or not name:
+        return
+    if await _role_name_match_count(ctx, role, name) == 1:
+        ctx.pending_scout_reanchor = (selector, role, name)
+
+
+def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: str) -> bool:
+    """Return the stashed ambiguity verdict only when the recorded selector matches the probed one, so a
+    navigating click's verdict is never applied to a different element."""
+    if pending is None:
+        return False
+    stashed_selector, ambiguous = pending
+    if stashed_selector != _selector_text(selector):
+        return False
+    return ambiguous
 
 
 async def _resolve_scout_role_name(
@@ -362,6 +431,7 @@ def _record_scouted_interaction(
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
+    ambiguous: bool = False,
 ) -> None:
     selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -406,6 +476,8 @@ def _record_scouted_interaction(
         artifact["credential_field"] = credential_field
     if credential_name:
         artifact["credential_name"] = credential_name
+    if ambiguous:
+        artifact["ambiguous"] = True
     interactions = [
         item
         for item in ctx.scouted_interactions

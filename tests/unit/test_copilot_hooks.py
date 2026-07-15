@@ -18,7 +18,12 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-from skyvern.forge.sdk.copilot.tools import _click_post_hook, _click_pre_hook
+from skyvern.forge.sdk.copilot.tools import (
+    _capture_scout_ambiguity,
+    _click_post_hook,
+    _click_pre_hook,
+    _prenav_ambiguity_for_selector,
+)
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
 
 
@@ -1029,6 +1034,8 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_typed_value=None,
             pending_scout_role_name=None,
             pending_scout_click_selector=None,
+            pending_scout_ambiguous=None,
+            pending_scout_reanchor=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1063,6 +1070,8 @@ class TestBrowserInteractionObservationHooks:
             pending_scout_typed_value=None,
             pending_scout_role_name=None,
             pending_scout_click_selector=None,
+            pending_scout_ambiguous=None,
+            pending_scout_reanchor=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -1118,6 +1127,8 @@ class TestScoutedInteractionCapture:
             pending_scout_typed_value=None,
             pending_scout_role_name=None,
             pending_scout_click_selector=None,
+            pending_scout_ambiguous=None,
+            pending_scout_reanchor=None,
             discovery_mcp_server=None,
             browser_session_id=None,
             scouted_interactions=[],
@@ -1456,6 +1467,116 @@ class TestScoutedInteractionCapture:
         assert entry["reached_via"] == "interaction"
         assert entry["evidence"]["interaction_selector"] == "#sort"
         assert result["data"]["observation_step"] == entry["step"]
+
+    def _ctx_with_count(self, count: int) -> SimpleNamespace:
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(return_value={"ok": True, "data": {"result": count}})
+        ctx = self._ctx(source_url="https://example.com/portal")
+        ctx.discovery_mcp_server = server
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_marks_multi_match_selector(self) -> None:
+        ctx = self._ctx_with_count(3)
+        await _capture_scout_ambiguity(ctx, "button[data-action='orderDocuments']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='orderDocuments']", True)
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_does_not_mark_unique_selector(self) -> None:
+        ctx = self._ctx_with_count(1)
+        await _capture_scout_ambiguity(ctx, "#unique")
+        assert ctx.pending_scout_ambiguous is None
+
+    @pytest.mark.asyncio
+    async def test_click_cycle_records_scout_ambiguous_multi_match(self) -> None:
+        ctx = self._ctx_with_count(2)
+        await _click_pre_hook({"selector": "button[data-action='orderDocuments']"}, ctx)
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "button[data-action='orderDocuments']"}},
+            {"browser_context": {"url": "https://example.com/portal", "title": "Portal"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions[-1].get("ambiguous") is True
+
+    def _ctx_with_scripted_reads(
+        self, *, selector_count: int, role_name: tuple[str, str], match_count: int
+    ) -> SimpleNamespace:
+        async def call(_tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            expression = args["expression"]
+            if "accessible_name:" in expression:
+                role, name = role_name
+                return {"ok": True, "data": {"result": {"role": role, "accessible_name": name}}}
+            if "targetRole" in expression:
+                return {"ok": True, "data": {"result": match_count}}
+            return {"ok": True, "data": {"result": selector_count}}
+
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(side_effect=call)
+        ctx = self._ctx(source_url="https://example.com/portal")
+        ctx.discovery_mcp_server = server
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_stashes_unique_reanchor(self) -> None:
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2, role_name=("button", "I AM A BUSINESS CUSTOMER"), match_count=1
+        )
+        await _capture_scout_ambiguity(ctx, "button[data-action='businessToggle']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
+        assert ctx.pending_scout_reanchor == (
+            "button[data-action='businessToggle']",
+            "button",
+            "I AM A BUSINESS CUSTOMER",
+        )
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_withholds_name_degenerate_reanchor(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Toggle"), match_count=2)
+        await _capture_scout_ambiguity(ctx, "button[data-action='businessToggle']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_ambiguity_withholds_nameless_reanchor(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", ""), match_count=1)
+        await _capture_scout_ambiguity(ctx, "button[data-action='businessToggle']")
+        assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_click_records_validated_reanchor_role_name(self) -> None:
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2, role_name=("button", "I AM A BUSINESS CUSTOMER"), match_count=1
+        )
+        await _click_pre_hook({"selector": "button[data-action='businessToggle']"}, ctx)
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "button[data-action='businessToggle']"}},
+            {"browser_context": {"url": "https://example.com/portal", "title": "Portal"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[-1]
+        assert recorded.get("ambiguous") is True
+        assert recorded.get("role") == "button"
+        assert recorded.get("accessible_name") == "I AM A BUSINESS CUSTOMER"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_click_without_unique_reanchor_records_no_role_name(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Toggle"), match_count=2)
+        await _click_pre_hook({"selector": "button[data-action='businessToggle']"}, ctx)
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "button[data-action='businessToggle']"}},
+            {"browser_context": {"url": "https://example.com/portal", "title": "Portal"}},
+            ctx,
+        )
+        recorded = ctx.scouted_interactions[-1]
+        assert recorded.get("ambiguous") is True
+        assert "role" not in recorded
+        assert "accessible_name" not in recorded
+
+    def test_prenav_ambiguity_ignores_mismatched_selector(self) -> None:
+        assert _prenav_ambiguity_for_selector(("button", True), "a") is False
+        assert _prenav_ambiguity_for_selector(("button", True), "button") is True
+        assert _prenav_ambiguity_for_selector(None, "button") is False
 
     @pytest.mark.asyncio
     async def test_intent_click_uses_resolved_selector_when_raw_selector_is_none(self) -> None:

@@ -66,7 +66,7 @@ function ViewAllFoldersDialog({
         </DialogHeader>
 
         <div className="relative mb-4">
-          <MagnifyingGlassIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <MagnifyingGlassIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             type="text"
             placeholder="Search folders..."
@@ -106,7 +106,7 @@ function ViewAllFoldersDialog({
               ))}
             </div>
           ) : folders.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-slate-400">
+            <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
               <p>No folders found</p>
             </div>
           ) : (
@@ -124,14 +124,14 @@ function ViewAllFoldersDialog({
               {isFetchingNextPage && (
                 <div className="mt-4 flex items-center justify-center py-4">
                   <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                  <span className="text-sm text-slate-400">
+                  <span className="text-sm text-muted-foreground">
                     Loading more folders...
                   </span>
                 </div>
               )}
               {!hasNextPage && folders.length > 20 && (
                 <div className="mt-4 flex items-center justify-center py-4">
-                  <span className="text-sm text-slate-400">
+                  <span className="text-sm text-muted-foreground">
                     All folders loaded
                   </span>
                 </div>

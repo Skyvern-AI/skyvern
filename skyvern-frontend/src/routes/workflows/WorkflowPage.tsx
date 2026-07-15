@@ -57,6 +57,8 @@ import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { TagChipList } from "./components/tagging/TagChipList";
+import { TagFilterControl } from "./components/tagging/TagFilterControl";
+import { useRunTagFilterParam } from "./hooks/useRunTagFilterParam";
 import { WorkflowActions } from "./WorkflowActions";
 import { useDebounce } from "use-debounce";
 import {
@@ -87,6 +89,8 @@ import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingStat
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { usePageSlots } from "@/store/PageSlots";
 import { resolveRunWindow } from "./resolveRunWindow";
+import { useRunTagsBatchQuery } from "@/routes/tasks/hooks/useRunTagsBatchQuery";
+import { useRunTagSuggestionsQuery } from "@/routes/tasks/hooks/useRunTagSuggestionsQuery";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -118,6 +122,14 @@ function WorkflowPage() {
   const { expandedRows, toggleExpanded: toggleParametersExpanded } =
     useParameterExpansion();
 
+  const { tagTerms, tagsParam, writeTagsParam } = useRunTagFilterParam(
+    searchParams,
+    setSearchParams,
+  );
+
+  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
+  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
     statusFilters,
@@ -126,6 +138,8 @@ function WorkflowPage() {
     search: debouncedSearch,
     createdAtStart: runWindow.createdAtStart,
     createdAtEnd: runWindow.createdAtEnd,
+    // A stale ?tags= URL param would 403 the request when tagging is disabled.
+    tags: taggingEnabled ? tagsParam : undefined,
     refetchOnMount: "always",
   });
 
@@ -141,8 +155,6 @@ function WorkflowPage() {
     workflowPermanentId,
   });
 
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
     { enabled: taggingEnabled },
@@ -162,6 +174,25 @@ function WorkflowPage() {
     [tagKeys],
   );
   const { data: tagColors } = useTagValuesQuery({ enabled: taggingEnabled });
+  const runIds = useMemo(
+    () => (workflowRuns ?? []).map((r) => r.workflow_run_id),
+    [workflowRuns],
+  );
+  const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
+    enabled: taggingEnabled,
+  });
+  const { data: runTagSuggestions } = useRunTagSuggestionsQuery({
+    enabled: taggingEnabled,
+  });
+  const tagFilterKeys = useMemo(
+    () =>
+      (runTagSuggestions?.keys ?? []).map((key) => ({
+        key,
+        description: null,
+        workflow_count: 0,
+      })),
+    [runTagSuggestions?.keys],
+  );
 
   const {
     workflowAnalyticsPanel: WorkflowAnalyticsPanel,
@@ -253,6 +284,7 @@ function WorkflowPage() {
         {!isLoading &&
         workflowRuns?.length === 0 &&
         statusFilters.length === 0 &&
+        tagTerms.length === 0 &&
         !debouncedSearch &&
         isNewUser &&
         onboardingState?.first_run_at === null &&
@@ -295,6 +327,16 @@ function WorkflowPage() {
               <div className="flex items-center gap-2">
                 {WorkflowRunsFilterControls ? (
                   <WorkflowRunsFilterControls />
+                ) : null}
+                {taggingEnabled ? (
+                  <TagFilterControl
+                    tagKeys={tagFilterKeys}
+                    labelSuggestions={runTagSuggestions?.labels}
+                    valueSuggestionsByKey={runTagSuggestions?.valuesByKey}
+                    value={tagTerms}
+                    onChange={writeTagsParam}
+                    colors={tagColors}
+                  />
                 ) : null}
                 <StatusFilterDropdown
                   values={statusFilters}
@@ -340,6 +382,8 @@ function WorkflowPage() {
                         workflowRun.workflow_run_id,
                       );
 
+                      const runTags = runTagsMap[workflowRun.workflow_run_id];
+
                       return (
                         <React.Fragment key={workflowRun.workflow_run_id}>
                           {/* Main run row */}
@@ -365,7 +409,17 @@ function WorkflowPage() {
                             className="cursor-pointer"
                           >
                             <TableCell className="font-mono text-xs text-muted-foreground">
-                              {workflowRunId}
+                              <div className="flex flex-col gap-1">
+                                {workflowRunId}
+                                {taggingEnabled && runTags?.length ? (
+                                  <TagChipList
+                                    tags={runTags}
+                                    descriptions={tagDescriptions}
+                                    colors={tagColors}
+                                    maxVisible={2}
+                                  />
+                                ) : null}
+                              </div>
                             </TableCell>
                             <TableCell>
                               <StatusBadge status={workflowRun.status} />
@@ -399,7 +453,7 @@ function WorkflowPage() {
                                         }}
                                         className={cn(
                                           isExpanded
-                                            ? "text-blue-400"
+                                            ? "text-blue-700 dark:text-blue-400"
                                             : "text-muted-foreground hover:text-foreground",
                                         )}
                                       >
@@ -452,7 +506,7 @@ function WorkflowPage() {
               />
               <div className="relative px-3 py-3">
                 <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-                  <span className="text-slate-400">Items per page</span>
+                  <span className="text-muted-foreground">Items per page</span>
                   <Select
                     value={String(pageSize)}
                     onValueChange={(size) => {
@@ -580,7 +634,7 @@ function WorkflowRunParameters({
 
   if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
+      <div className="ml-8 py-4 text-sm text-muted-foreground">
         No inputs for this run
       </div>
     );

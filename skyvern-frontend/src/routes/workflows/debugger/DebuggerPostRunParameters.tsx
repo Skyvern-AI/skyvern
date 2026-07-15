@@ -228,7 +228,7 @@ function DebuggerPostRunParameters() {
                     checked={activeBlock.executed_branch_result}
                     disabled
                   />
-                  <span className="text-sm text-slate-400">
+                  <span className="text-sm text-muted-foreground">
                     {activeBlock.executed_branch_result ? "True" : "False"}
                   </span>
                 </div>

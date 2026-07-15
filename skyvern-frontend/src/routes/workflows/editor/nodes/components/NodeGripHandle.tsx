@@ -62,8 +62,9 @@ const NodeGripHandle = forwardRef<HTMLButtonElement, NodeGripHandleProps>(
           // before dnd-kit's PointerSensor can activate. Every other
           // interactive element inside an RF node in this codebase carries
           // these classes — the grip handle shipped without them.
-          "nodrag nopan flex h-[2.75rem] w-5 shrink-0 cursor-grab items-center justify-center rounded text-slate-500 opacity-0 transition-[opacity,colors] hover:bg-muted hover:text-slate-300 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring active:cursor-grabbing group-hover:opacity-100 data-[dragging=true]:opacity-100",
-          effectiveIsDragging && "cursor-grabbing text-slate-200",
+          "nodrag nopan flex h-[2.75rem] w-5 shrink-0 cursor-grab items-center justify-center rounded text-muted-foreground opacity-0 transition-[opacity,colors] hover:bg-muted hover:text-tertiary-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring active:cursor-grabbing group-hover:opacity-100 data-[dragging=true]:opacity-100 dark:text-slate-500",
+          effectiveIsDragging &&
+            "cursor-grabbing text-foreground dark:text-slate-200",
           disabled &&
             "pointer-events-none cursor-not-allowed text-slate-700 opacity-50 hover:bg-transparent hover:text-slate-700 active:cursor-not-allowed",
           className,

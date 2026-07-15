@@ -55,8 +55,8 @@ function RecentActivityRow({
           "flex w-full flex-col gap-1 rounded-md px-2 py-1.5 text-left outline-none transition-colors",
           isWorkflowRunning
             ? "cursor-not-allowed opacity-50"
-            : "hover:bg-white/5 focus-visible:ring-1 focus-visible:ring-white/40",
-          isCurrent && "bg-white/10",
+            : "hover:bg-muted focus-visible:ring-1 focus-visible:ring-foreground/40 dark:hover:bg-white/5",
+          isCurrent && "bg-accent dark:bg-white/10",
         )}
       >
         <div className="flex items-center gap-2">
@@ -67,25 +67,25 @@ function RecentActivityRow({
           />
           <RunBlockGlyph
             blockType={blockType}
-            className="size-3.5 text-slate-300"
+            className="size-3.5 text-tertiary-foreground"
           />
-          <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-100">
+          <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
             {run.block_label}
           </span>
           {ago && (
             <span
               title={absoluteTime ?? undefined}
-              className="shrink-0 text-[10px] tabular-nums text-slate-500"
+              className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500"
             >
               {ago}
             </span>
           )}
         </div>
         <div className="flex items-center gap-1.5 pl-[1.625rem]">
-          <span className="rounded bg-slate-700/70 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+          <span className="rounded bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-tertiary-foreground dark:bg-slate-700/70">
             {getBlockTypeTitle(blockType)}
           </span>
-          <span className="rounded border border-white/10 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+          <span className="rounded border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground dark:border-white/10">
             {getRunModeLabel(run)}
           </span>
           <span
@@ -97,7 +97,7 @@ function RecentActivityRow({
             {getRunStatusLabel(run.status)}
           </span>
           {duration && (
-            <span className="ml-auto shrink-0 text-[10px] tabular-nums text-slate-500">
+            <span className="ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
               {duration}
             </span>
           )}
@@ -124,12 +124,12 @@ function RecentActivityList({
   const ordered = [...runs].reverse();
 
   return (
-    <div className="flex w-[26rem] max-w-[80vw] flex-col overflow-hidden rounded-lg border border-white/10 bg-[#0b0b0b] text-slate-200 shadow-xl">
-      <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
-        <span className="text-xs font-medium text-slate-300">
+    <div className="flex w-[26rem] max-w-[80vw] flex-col overflow-hidden rounded-lg border border-border bg-background text-foreground shadow-xl dark:border-white/10 dark:bg-[#0b0b0b] dark:text-slate-200">
+      <div className="flex items-center justify-between border-b border-border px-3 py-2 dark:border-white/10">
+        <span className="text-xs font-medium text-tertiary-foreground">
           Recent activity
         </span>
-        <span className="text-[10px] tabular-nums text-slate-500">
+        <span className="text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
           {runs.length} {runs.length === 1 ? "run" : "runs"}
         </span>
       </div>

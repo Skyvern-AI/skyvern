@@ -34,6 +34,8 @@ const workflowRun: TaskRunListItem = {
 const runsData = [workflowRun];
 const runsQueryResult = { data: runsData, isFetching: false };
 
+const { useRunsQuerySpy } = vi.hoisted(() => ({ useRunsQuerySpy: vi.fn() }));
+
 vi.mock("use-debounce", () => ({
   useDebounce: <T,>(value: T): [T] => [value],
 }));
@@ -47,6 +49,7 @@ const runsQueryCalls: Array<Record<string, unknown>> = [];
 
 vi.mock("@/hooks/useRunsQuery", () => ({
   useRunsQuery: (props: Record<string, unknown>) => {
+    useRunsQuerySpy(props);
     runsQueryCalls.push(props);
     return runsQueryResult;
   },
@@ -54,6 +57,22 @@ vi.mock("@/hooks/useRunsQuery", () => ({
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
+}));
+
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => true,
+}));
+
+vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
+  useRunTagsBatchQuery: () => ({ data: {} }),
+}));
+
+vi.mock("@/routes/workflows/hooks/useTagKeysQuery", () => ({
+  useTagKeysQuery: () => ({ data: [] }),
+}));
+
+vi.mock("@/routes/workflows/hooks/useTagValuesQuery", () => ({
+  useTagValuesQuery: () => ({ data: new Map() }),
 }));
 
 vi.mock("@/routes/workflows/hooks/useGlobalWorkflowsQuery", () => ({
@@ -160,6 +179,37 @@ afterEach(() => {
   runsQueryCalls.length = 0;
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("RunHistory search highlighting", () => {
+  it("does not highlight the run id for a sub-3-char query", () => {
+    const { container } = renderRunHistory();
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: "12" },
+    });
+
+    expect(container.innerHTML).not.toContain("bg-blue-500/30");
+  });
+
+  it("highlights the run id once the query reaches 3 chars", () => {
+    const { container } = renderRunHistory();
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: "123" },
+    });
+
+    expect(container.innerHTML).toContain("bg-blue-500/30");
+  });
+
+  it("sends a trimmed search value to the runs query, not just a trimmed length check", () => {
+    renderRunHistory();
+    fireEvent.change(screen.getByLabelText("search-runs"), {
+      target: { value: " 123" },
+    });
+
+    const calls = useRunsQuerySpy.mock.calls;
+    const lastCall = calls[calls.length - 1]?.[0] as { search?: string };
+    expect(lastCall.search).toBe("123");
+  });
 });
 
 describe("RunHistory inputs during filtering", () => {

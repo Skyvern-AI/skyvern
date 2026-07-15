@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import Exists, and_, exists, func, select, text, update
+from sqlalchemy import Exists, and_, exists, func, or_, select, text, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +38,11 @@ MAX_TAGS_PER_RUN = RUN_METADATA_MAX_KEYS
 MAX_SYSTEM_TAGS_PER_WORKFLOW = RUN_METADATA_MAX_KEYS
 MAX_SYSTEM_TAGS_PER_RUN = RUN_METADATA_MAX_KEYS
 SYSTEM_TAG_CALLER_ID = "system"
+
+# Cap on distinct values surfaced per grouped key in get_run_tag_suggestions, so a
+# single high-cardinality key (one distinct value per run) can't fill the whole limit
+# and starve keys that sort after it. Standalone labels (key is None) stay uncapped.
+SUGGESTIONS_VALUES_PER_KEY = 3
 
 
 class TagCountLimitExceeded(ValueError):
@@ -791,6 +796,46 @@ class TagsRepository(BaseRepository):
             stmt = stmt.order_by(TagValueModel.key.asc(), TagValueModel.value.asc())
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    @db_operation("get_run_tag_suggestions")
+    async def get_run_tag_suggestions(
+        self,
+        organization_id: str,
+        limit: int = 1000,
+        key_prefix: str | None = None,
+    ) -> list[tuple[str | None, str | None]]:
+        """Distinct (key, value) pairs from active run-tag SET events for the org,
+        including reserved ``skyvern.*`` system keys (the registry-backed
+        ``list_tag_keys``/``list_tag_values`` never see these, so this is their only
+        surfacing path for pickers). Each grouped key contributes at most
+        ``SUGGESTIONS_VALUES_PER_KEY`` values so no single high-cardinality key can
+        consume the whole ``limit`` and starve keys that sort after it. When
+        ``key_prefix`` is provided, filtering happens before ranking and limiting."""
+        async with self.Session() as session:
+            distinct_pairs_stmt = (
+                select(WorkflowRunTagEventModel.key, WorkflowRunTagEventModel.value)
+                .where(WorkflowRunTagEventModel.organization_id == organization_id)
+                .where(WorkflowRunTagEventModel.superseded_at.is_(None))
+                .where(WorkflowRunTagEventModel.event_type == TagEventType.SET.value)
+            )
+            if key_prefix is not None:
+                distinct_pairs_stmt = distinct_pairs_stmt.where(WorkflowRunTagEventModel.key.startswith(key_prefix))
+            distinct_pairs = distinct_pairs_stmt.distinct().subquery()
+            ranked = select(
+                distinct_pairs.c.key,
+                distinct_pairs.c.value,
+                func.row_number()
+                .over(partition_by=distinct_pairs.c.key, order_by=distinct_pairs.c.value.asc())
+                .label("rn"),
+            ).subquery()
+            stmt = (
+                select(ranked.c.key, ranked.c.value)
+                .where(or_(ranked.c.key.is_(None), ranked.c.rn <= SUGGESTIONS_VALUES_PER_KEY))
+                .order_by(ranked.c.key.asc(), ranked.c.value.asc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return [(key, value) for key, value in result]
 
     @db_operation("recolor_tag_value")
     async def recolor_tag_value(

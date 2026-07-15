@@ -10,9 +10,11 @@ import {
   BlockState,
   RUN_TOOLS,
   TurnNarrativeState,
+  condenseActivityEntries,
   formatElapsed,
   latestBlocksByLabel,
   parseUtcIsoMs,
+  toolCallIdOf,
 } from "./narrativeState";
 
 export { AUTHORING_TOOLS, RUN_TOOLS };
@@ -61,9 +63,9 @@ function hasPendingToolCall(designActivity: ActivityEntry[]): boolean {
   const pending = new Set<string>();
   for (const entry of designActivity) {
     if (entry.kind === "tool_call") {
-      pending.add(entry.id.slice(3)); // "tc-<tool_call_id>"
+      pending.add(toolCallIdOf(entry) ?? "");
     } else if (entry.kind === "tool_result") {
-      pending.delete(entry.id.slice(3)); // "tr-<tool_call_id>"
+      pending.delete(toolCallIdOf(entry) ?? "");
     }
   }
   return pending.size > 0;
@@ -266,13 +268,26 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
     return "done";
   }
 
+  // Condensed for display only — stubFor/redrafting/activitySeq above all
+  // read the raw explore/draftEntries/test closures, not this map.
+  const entriesFor: Record<CopilotPhaseId, ActivityEntry[]> = {
+    explore: condenseActivityEntries(explore),
+    draft: condenseActivityEntries(draftEntries),
+    test: condenseActivityEntries(test),
+    done: [],
+  };
+
   function stubFor(id: CopilotPhaseId, status: PhaseStatus): string | null {
     if (id === "done") return null;
     if (id === "explore") {
       if (status !== "done" && status !== "fail" && status !== "stopped") {
         return null;
       }
-      const n = explore.filter((e) => e.kind === "tool_call").length;
+      // Condensed count, not raw: a folded retry now renders as one row,
+      // so the stub must match what expanding the row actually shows.
+      const n = entriesFor.explore.filter(
+        (e) => e.toolName !== undefined,
+      ).length;
       return n > 0 ? pluralize(n, "step") : null;
     }
     if (id === "draft") {
@@ -282,6 +297,10 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
       if (!turn.draft) return null;
       const base = pluralize(turn.draft.blockCount, "block");
       if (!isTerminal) return base;
+      // Intentionally a raw authoring-attempt count, not a rendered-row
+      // count: it spans update_workflow (draft bucket) AND
+      // update_and_run_blocks (test bucket), so there's no single
+      // condensed bucket to count against the way the explore stub does.
       const drafts = countAuthoringToolCalls(turn.designActivity);
       return drafts >= 2 ? `${base} · ${drafts} drafts` : base;
     }
@@ -302,13 +321,6 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
       ? `${pluralize(latestBlocks.length, "block")} · ${elapsed}`
       : pluralize(latestBlocks.length, "block");
   }
-
-  const entriesFor: Record<CopilotPhaseId, ActivityEntry[]> = {
-    explore,
-    draft: draftEntries,
-    test,
-    done: [],
-  };
 
   return (["explore", "draft", "test", "done"] as const).map((id) => {
     const status = statusFor(id);

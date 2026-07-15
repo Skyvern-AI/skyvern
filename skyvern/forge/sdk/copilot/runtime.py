@@ -207,6 +207,9 @@ class ScoutedInteraction(TypedDict):
     control_value_satisfied: NotRequired[bool]
     trajectory_index: NotRequired[int]
     carried: NotRequired[bool]
+    # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
+    # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
+    ambiguous: NotRequired[bool]
     # Credential fills carry references and metadata only — never secret values.
     credential_id: NotRequired[str]
     credential_field: NotRequired[str]
@@ -453,6 +456,9 @@ class AgentContext:
     # Imposition answered this persist attempt on a goal-complete trajectory, so the persist-seam under-build
     # guard (the fallback for a non-rewriting imposition) must not also answer for it.
     spine_imposition_owned_attempt: bool = False
+    # Label of the code block the imposition attempt owns this call (carrier), including on no-op early
+    # returns. The freehand persist-seam surface leg exempts exactly this label and gates its siblings.
+    spine_imposition_carrier_label: str | None = None
     synthesized_block_reopened_after_failed_run: bool = False
     synthesized_block_reopened_for_output_coverage: bool = False
     synthesized_block_reopened_for_credential_scout: bool = False
@@ -483,6 +489,13 @@ class AgentContext:
     # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
     # settle re-perception on whether that selector still resolves to a live element.
     pending_scout_click_selector: str | None = None
+    # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
+    # interaction only when the post-action resolved selector matches the probed one.
+    pending_scout_ambiguous: tuple[str, bool] | None = None
+    # (selector, role, accessible_name) captured pre-dispatch for an ambiguous selector only when the
+    # get_by_role(role, name, exact=True) re-anchor resolves to exactly one live element on the source
+    # page; a non-unique or nameless ambiguous selector leaves this None so synthesis drops the interaction.
+    pending_scout_reanchor: tuple[str, str, str] | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.
