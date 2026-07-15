@@ -47,6 +47,11 @@ vi.mock("../../workflowRun/WorkflowRunCode", () => ({
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: () => null,
 }));
+vi.mock("@/routes/tasks/components/tagging/RunTagsEditor", () => ({
+  RunTagsEditor: ({ workflowRunId }: { workflowRunId: string }) => (
+    <div data-testid="run-tags-editor" data-workflow-run-id={workflowRunId} />
+  ),
+}));
 // Radix ScrollArea needs ResizeObserver, which jsdom doesn't provide.
 vi.mock("@/components/ui/scroll-area", () => ({
   ScrollArea: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
@@ -266,6 +271,13 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
+  test("renders the shared run tag editor", () => {
+    seedCompletedRun();
+    const { getByTestId } = renderRunView();
+
+    expect(getByTestId("run-tags-editor").dataset.workflowRunId).toBe("wr_1");
+  });
+
   test("defaults to the Timeline view with the timeline and step detail", () => {
     seedForLoopRun();
     const { container } = renderRunView();
@@ -671,6 +683,24 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("confidence_float")).toBeNull();
     expect(scope.getByText("Downloaded files")).not.toBeNull();
     expect(scope.getByText("report.pdf")).not.toBeNull();
+  });
+
+  test("surfaces the full agent run outputs below extracted information", () => {
+    seedCompletedRun({
+      outputs: {
+        extracted_information: { answer: 42 },
+        additional_output: "full-run-only",
+      },
+    });
+
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    // This run has outputs, so the toggle name carries the new-output suffix.
+    fireEvent.click(scope.getByRole("button", { name: /^Outputs/ }));
+
+    expect(scope.getByText("Extracted information")).not.toBeNull();
+    expect(scope.getByText("Agent run outputs")).not.toBeNull();
   });
 
   test("does not treat a user output parameter named errors as run errors", () => {
