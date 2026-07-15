@@ -282,6 +282,26 @@ describe("WorkflowPage run tags", () => {
 
     expect(screen.queryByLabelText(/^Select /)).toBeNull();
   });
+
+  it("shift-selects runs and exposes bulk tag actions", () => {
+    renderWorkflowPage();
+
+    const first = screen.getByRole("checkbox", { name: "Select wr_1" });
+    const second = screen.getByRole("checkbox", { name: "Select wr_2" });
+    fireEvent.click(first.parentElement!);
+    fireEvent.click(second.parentElement!, { shiftKey: true });
+
+    expect(
+      screen.getByRole("toolbar", { name: "Bulk actions" }).textContent,
+    ).toContain("2 selected");
+  });
+
+  it("hides selection when workflow tagging is disabled", () => {
+    flagState.taggingEnabled = false;
+    renderWorkflowPage();
+
+    expect(screen.queryByLabelText(/^Select /)).toBeNull();
+  });
 });
 
 describe("WorkflowPage tag filter control", () => {
