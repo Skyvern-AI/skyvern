@@ -4,8 +4,17 @@ import re
 
 from email_validator import EmailNotValidError, validate_email
 
+# The `token` keyword is guarded by negative lookbehinds so pagination cursors
+# (next_token, page_token, continuation_token, ...), which are not credentials,
+# aren't matched as secrets by either detection or redaction.
 SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
-    r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I
+    r"(?:^|(?<=[^A-Za-z0-9]))(?:[A-Za-z0-9]+_){0,8}"
+    r"(?:password|passcode|api[_ -]?key|secret|bearer|authorization"
+    r"|(?<!next_)(?<!prev_)(?<!previous_)(?<!page_)(?<!continuation_)(?<!cursor_)token)"
+    # Consume an optional auth scheme word so `Authorization: Bearer <token>`
+    # redacts the token, not just the scheme.
+    r"\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?\S+",
+    re.I,
 )
 RAW_SECRET_PATTERNS = (
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,

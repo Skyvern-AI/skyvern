@@ -1,12 +1,16 @@
+import _thread
 import asyncio
 import atexit
 import json
 import logging
 import os
+import select
 import shutil
+import signal
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Annotated, List, Literal, Optional
+import threading
+from typing import TYPE_CHECKING, Annotated, Any, List, Literal, Optional, cast
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
@@ -35,6 +39,14 @@ from skyvern.utils.env_paths import (
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 _mcp_cleanup_done = False
+_mcp_cleanup_in_progress = False
+_mcp_eof_shutdown_requested = False
+_MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS = 5.0
+_MCP_PROCESS_KILL_TIMEOUT_SECONDS = 2.0
+_MCP_NATIVE_EOF_GRACE_SECONDS = 0.25
+# The EOF watcher's os._exit(0) preempts cleanup unconditionally, so this must exceed
+# the cloud path's graceful join plus process-kill wait.
+_MCP_EOF_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
 def _default_host() -> str:
@@ -57,31 +69,196 @@ async def _cleanup_mcp_resources() -> None:
 
 
 def _cleanup_mcp_resources_blocking() -> None:
-    global _mcp_cleanup_done
-    if _mcp_cleanup_done:
+    global _mcp_cleanup_done, _mcp_cleanup_in_progress
+    # CPython runs signal handlers on the main thread, and all callers stay on that thread.
+    if _mcp_cleanup_done or _mcp_cleanup_in_progress:
         return
+    _mcp_cleanup_in_progress = True
 
     try:
-        asyncio.run(_cleanup_mcp_resources())
+        logger = logging.getLogger(__name__)
+        try:
+            local_browser_identity = _current_local_browser_identity()
+        except Exception:
+            logger.warning("Failed to identify the local MCP browser", exc_info=True)
+            local_browser_identity = None
+        # In stdio, this main-thread read and a cleanup thread both resolve _global_session because
+        # ContextVars are not inherited. The exclusive mode means local identity cannot hide a cloud close.
+        if local_browser_identity is not None:
+            try:
+                # Playwright objects belong to mcp.run's closed loop; a fresh-loop close hangs forever.
+                # The owned profile is an anonymous mkdtemp throwaway, so clean it up directly.
+                try:
+                    _kill_local_browser_process_tree(local_browser_identity[0], local_browser_identity[1])
+                finally:
+                    if local_browser_identity[2] and local_browser_identity[1]:
+                        shutil.rmtree(local_browser_identity[1], ignore_errors=True)
+            except Exception:
+                logger.warning("MCP local browser cleanup failed", exc_info=True)
+        else:
+            cleanup_errors: list[BaseException] = []
+
+            def run_cleanup() -> None:
+                try:
+                    asyncio.run(_cleanup_mcp_resources())
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+            cleanup_thread = threading.Thread(target=run_cleanup, name="skyvern-mcp-cleanup", daemon=True)
+            cleanup_thread.start()
+            cleanup_thread.join(_MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS)
+            if cleanup_thread.is_alive():
+                logger.warning("MCP graceful cleanup timed out")
+            elif cleanup_errors:
+                error = cleanup_errors[0]
+                logger.warning("MCP graceful cleanup failed", exc_info=(type(error), error, error.__traceback__))
+    finally:
         _mcp_cleanup_done = True
-    except Exception:
-        logging.getLogger(__name__).warning("MCP cleanup failed", exc_info=True)
+        _mcp_cleanup_in_progress = False
 
 
 def _cleanup_mcp_resources_sync() -> None:
-    """Atexit callback for MCP cleanup. Skips if an event loop is still running
-    because asyncio.run() cannot be called inside a running loop. This means
-    cleanup is best-effort for signal-based exits (e.g. SIGTERM) that fire atexit
-    while the MCP server's loop is still alive -- the finally block in run_mcp()
-    handles normal shutdown instead."""
-    logger = logging.getLogger(__name__)
+    """Atexit callback for MCP cleanup."""
+    _cleanup_mcp_resources_blocking()
+
+
+def _current_local_browser_identity() -> tuple[int | None, str | None, bool] | None:
+    from skyvern.cli.core.session_manager import get_current_session  # noqa: PLC0415
+
+    current = get_current_session()
+    if current.context is None or current.context.mode != "local" or current.browser is None:
+        return None
+    return (
+        current.browser.local_cdp_port,
+        current.browser.local_user_data_dir,
+        current.browser.local_user_data_dir_owned,
+    )
+
+
+def _find_local_browser_processes(port: int | None, user_data_dir: str | None) -> list[psutil.Process]:
+    if user_data_dir is None:
+        return []
+
+    processes: dict[int, psutil.Process] = {}
+    user_data_arg = f"--user-data-dir={user_data_dir}"
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        _cleanup_mcp_resources_blocking()
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                if user_data_arg in ((process.info or {}).get("cmdline") or []):
+                    processes[process.pid] = process
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+    except Exception:
+        logging.getLogger(__name__).warning("Failed to inspect local browser processes", exc_info=True)
+    return list(processes.values())
+
+
+def _local_browser_process_tree(port: int | None, user_data_dir: str | None) -> list[psutil.Process]:
+    processes: dict[int, psutil.Process] = {}
+    # The Playwright node driver is Chromium's parent, not its descendant; stdin EOF reaps that driver.
+    for root in _find_local_browser_processes(port, user_data_dir):
+        processes[root.pid] = root
+        try:
+            processes.update({process.pid: process for process in root.children(recursive=True)})
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return list(processes.values())
+
+
+def _kill_local_browser_process_tree(
+    port: int | None,
+    user_data_dir: str | None,
+    *,
+    known_processes: list[psutil.Process] | None = None,
+) -> None:
+    if user_data_dir is None:
         return
 
-    logger.debug("Skipping MCP cleanup because event loop is still running")
+    processes = {process.pid: process for process in known_processes or []}
+    processes.update({process.pid: process for process in _local_browser_process_tree(port, user_data_dir)})
+
+    for process in processes.values():
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    if processes:
+        psutil.wait_procs(list(processes.values()), timeout=_MCP_PROCESS_KILL_TIMEOUT_SECONDS)
+
+
+def _watch_stdin_eof(
+    stop: threading.Event,
+    shutdown_complete: threading.Event,
+    *,
+    stdin_fd: int | None = None,
+    request_shutdown: Any | None = None,
+    force_exit: Any | None = None,
+    native_eof_grace: float = _MCP_NATIVE_EOF_GRACE_SECONDS,
+    shutdown_timeout: float = _MCP_EOF_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    def request_bounded_shutdown() -> None:
+        global _mcp_eof_shutdown_requested
+        if shutdown_complete.wait(native_eof_grace) or stop.is_set():
+            return
+        _mcp_eof_shutdown_requested = True
+        (request_shutdown or _thread.interrupt_main)()
+        if shutdown_complete.wait(shutdown_timeout):
+            return
+        try:
+            local_browser_identity = _current_local_browser_identity()
+            if local_browser_identity is not None:
+                try:
+                    _kill_local_browser_process_tree(local_browser_identity[0], local_browser_identity[1])
+                finally:
+                    if local_browser_identity[2] and local_browser_identity[1]:
+                        shutil.rmtree(local_browser_identity[1], ignore_errors=True)
+        except Exception:
+            logging.getLogger(__name__).warning("MCP EOF fallback cleanup failed", exc_info=True)
+        (force_exit or os._exit)(0)
+
+    try:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            shutdown_events = select.POLLHUP | select.POLLERR | select.POLLNVAL
+            poller.register(sys.stdin.fileno() if stdin_fd is None else stdin_fd, shutdown_events)
+            while not stop.is_set():
+                if any(event & shutdown_events for _fd, event in poller.poll(100)):
+                    if not stop.is_set():
+                        request_bounded_shutdown()
+                    return
+            return
+
+        peek = cast(Any, sys.stdin.buffer).peek
+        while not stop.is_set():  # pragma: no cover - Windows pipe fallback
+            if not peek(1):
+                if not stop.is_set():
+                    request_bounded_shutdown()
+                return
+            stop.wait(0.05)
+    except (AttributeError, OSError, ValueError):
+        logging.getLogger(__name__).warning("MCP stdin EOF watcher failed", exc_info=True)
+
+
+def _start_stdin_eof_watcher() -> tuple[threading.Event, threading.Event]:
+    stop, shutdown_complete = threading.Event(), threading.Event()
+    threading.Thread(
+        target=_watch_stdin_eof,
+        args=(stop, shutdown_complete),
+        name="skyvern-mcp-stdin-eof",
+        daemon=True,
+    ).start()
+    return stop, shutdown_complete
+
+
+def _handle_mcp_shutdown_signal(_signum: int, _frame: Any) -> None:
+    if _mcp_cleanup_in_progress:
+        return
+    try:
+        _cleanup_mcp_resources_blocking()
+    finally:
+        # Exit 0 only for the EOF watcher's synthetic SIGINT; a real SIGTERM keeps 143.
+        eof_initiated = _mcp_eof_shutdown_requested and _signum == signal.SIGINT
+        os._exit(0 if eof_initiated else 128 + _signum)
 
 
 def get_pids_on_port(port: int) -> List[int]:
@@ -449,6 +626,8 @@ def run_mcp(
     ] = False,
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
+    global _mcp_eof_shutdown_requested
+    _mcp_eof_shutdown_requested = False
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
     from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
@@ -458,14 +637,18 @@ def run_mcp(
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
     configure_mcp_telemetry_runtime(server_mode="local_cli", transport=transport)
-    # atexit covers signal-based exits (SIGTERM); finally covers normal
-    # mcp.run() completion or unhandled exceptions. Both are needed because
-    # atexit doesn't fire on normal return and finally doesn't fire on signals.
+    # EOF dispatches the SIGINT cleanup handler; finally covers normal returns, with atexit as the last backstop.
     atexit.register(_cleanup_mcp_resources_sync)
     set_stateless_http_mode(stateless_http_enabled)
     set_concise_responses(not verbose)
+    eof_watcher_stop: threading.Event | None = None
+    shutdown_complete: threading.Event | None = None
+    original_signal_handlers: dict[signal.Signals, Any] = {}
     try:
         if transport == "stdio":
+            original_signal_handlers[signal.SIGINT] = signal.signal(signal.SIGINT, _handle_mcp_shutdown_signal)
+            original_signal_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, _handle_mcp_shutdown_signal)
+            eof_watcher_stop, shutdown_complete = _start_stdin_eof_watcher()
             mcp.run(transport="stdio")
             return
 
@@ -482,9 +665,17 @@ def run_mcp(
             stateless_http=stateless_http_enabled,
         )
     finally:
-        set_stateless_http_mode(False)
-        set_concise_responses(False)
-        _cleanup_mcp_resources_blocking()
+        if eof_watcher_stop is not None:
+            eof_watcher_stop.set()
+        try:
+            set_stateless_http_mode(False)
+            set_concise_responses(False)
+            _cleanup_mcp_resources_blocking()
+        finally:
+            for handled_signal, original_handler in original_signal_handlers.items():
+                signal.signal(handled_signal, original_handler)
+            if shutdown_complete is not None:
+                shutdown_complete.set()
 
 
 def _normalize_mcp_path(path: str) -> str:

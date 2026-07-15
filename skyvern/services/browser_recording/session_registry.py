@@ -12,6 +12,8 @@ from skyvern.services.browser_recording.types import RecordingDraftStep
 
 LOG = structlog.get_logger(__name__)
 
+# Also bounds the draft-inheritance window: an unfinished session abandoned
+# without Done/Discard (tab closed, network drop) stays reusable this long.
 SESSION_TTL_SECONDS = 60 * 30
 
 
@@ -32,18 +34,34 @@ class RecordingInterpretationSessionRegistry:
     ) -> None:
         self._prune_expired_sessions()
         existing = self._sessions.get(browser_session_id)
-        # Reuse the cached session only for a reconnect to the SAME recording. A
-        # new recording sends a different recording_attempt_id, so its events must
-        # not be appended to the prior session's already-consumed state machines
-        # (which would emit zero new draft steps). Clients that omit the id keep
-        # the legacy reuse behavior.
+        # Reuse the cached session for any reconnect to the same unfinished
+        # recording, even under a different recording_attempt_id. The client mints
+        # the id once per recording and keeps it stable across reconnects and
+        # stream remounts, so a differing id here means the client lost its
+        # in-memory state (e.g. page reload) — wiping would drop every accumulated
+        # draft (SKY-12429). Continuing is safe: emit_snapshot resyncs the fresh
+        # client, and a completed recording never hits this branch because
+        # Done/Discard both end exfiltration, which pops the session. Deliberate
+        # trade-off: a recording abandoned WITHOUT Done/Discard reaching the
+        # backend stays inheritable for SESSION_TTL_SECONDS, so a new recording on
+        # the same browser session + workflow within that window resumes the
+        # abandoned drafts (recovery) rather than starting empty; the user can
+        # discard them, which now clears this cache.
         if (
             existing is not None
             and existing.workflow_permanent_id == workflow_permanent_id
             and existing.organization_id == organization_id
             and not existing.finalized
-            and (recording_attempt_id is None or existing.recording_attempt_id == recording_attempt_id)
         ):
+            if recording_attempt_id is not None and existing.recording_attempt_id != recording_attempt_id:
+                LOG.info(
+                    "Continuing recording interpretation session under a new attempt id",
+                    browser_session_id=browser_session_id,
+                    previous_recording_attempt_id=existing.recording_attempt_id,
+                    recording_attempt_id=recording_attempt_id,
+                    accumulated_step_count=len(existing.steps),
+                )
+                existing.recording_attempt_id = recording_attempt_id
             existing.on_update = on_update
             existing.set_deltas_enabled(deltas_enabled)
             self._last_seen[browser_session_id] = time.monotonic()

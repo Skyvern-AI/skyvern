@@ -1,10 +1,13 @@
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
+import type { ReactNode } from "react";
 
 import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
 import {
   Accordion,
   AccordionContent,
@@ -13,8 +16,16 @@ import {
 } from "@/components/ui/accordion";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -41,6 +52,24 @@ const urlPlaceholder = "https://";
 const navigationGoalTooltip =
   "Give Skyvern an objective that describes how to download the file.";
 const navigationGoalPlaceholder = "Tell Skyvern which file to download.";
+
+type DestinationFieldProps = {
+  label: string;
+  help: string;
+  children: ReactNode;
+};
+
+function DestinationField({ label, help, children }: DestinationFieldProps) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Label className="text-sm text-slate-400">{label}</Label>
+        <HelpTooltip content={help} />
+      </div>
+      {children}
+    </div>
+  );
+}
 
 function FileDownloadEditor({ blockId }: { blockId: string }) {
   // Subscribe to this node's data slice. The sidebar mount lives outside the
@@ -77,6 +106,26 @@ function FileDownloadEditorBody({
     downloadSuffix,
     totpIdentifier,
     totpVerificationUrl,
+    downloadTarget,
+    path,
+    prompt,
+    s3Bucket,
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    regionName,
+    azureStorageAccountName,
+    azureStorageAccountKey,
+    azureBlobContainerName,
+    googleCredentialId,
+    googleDriveFolderId,
+    sftpHost,
+    sftpPort,
+    sftpUsername,
+    sftpPassword,
+    sftpPrivateKey,
+    sftpPrivateKeyPassphrase,
+    sftpRemotePath,
+    sftpHostKey,
   } = data;
 
   const nodes = useNodes<AppNode>();
@@ -97,6 +146,295 @@ function FileDownloadEditorBody({
   return (
     <div data-testid="file-download-block-form" className="space-y-4">
       <div className="space-y-4">
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label className="text-sm text-slate-400">Download Target</Label>
+            <HelpTooltip
+              content={helpTooltips["fileDownload"]["download_target"]}
+            />
+          </div>
+          <Select
+            value={downloadTarget}
+            onValueChange={(value) =>
+              value &&
+              update({
+                downloadTarget: value as
+                  | "website"
+                  | "s3"
+                  | "azure"
+                  | "google_drive"
+                  | "sftp",
+              })
+            }
+            disabled={!editable}
+          >
+            <SelectTrigger className="nopan text-xs">
+              <SelectValue placeholder="Select download target" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="website">Website</SelectItem>
+              <SelectItem value="s3">AWS S3</SelectItem>
+              <SelectItem value="azure">Azure Blob Storage</SelectItem>
+              <SelectItem value="google_drive">Google Drive</SelectItem>
+              <SelectItem value="sftp">SFTP</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        {downloadTarget !== "website" && (
+          <DestinationField
+            label="Prompt"
+            help={helpTooltips["fileDownload"]["prompt"]}
+          >
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ prompt: value })}
+              value={prompt ?? ""}
+              placeholder={
+                'e.g. Only send the PDF files whose names contain "invoice"'
+              }
+              className="nopan text-xs"
+            />
+            <p className="text-xs text-slate-400">
+              Optional. Leave empty to send all downloaded files.
+            </p>
+          </DestinationField>
+        )}
+
+        {downloadTarget === "s3" && (
+          <>
+            <DestinationField
+              label="AWS Access Key ID"
+              help={helpTooltips["fileDownload"]["aws_access_key_id"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ awsAccessKeyId: value })}
+                value={awsAccessKeyId as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="AWS Secret Access Key"
+              help={helpTooltips["fileDownload"]["aws_secret_access_key"]}
+            >
+              <WorkflowBlockInput
+                nodeId={blockId}
+                type="password"
+                value={awsSecretAccessKey as string}
+                className="nopan text-xs"
+                onChange={(value) => update({ awsSecretAccessKey: value })}
+              />
+            </DestinationField>
+            <DestinationField
+              label="S3 Bucket"
+              help={helpTooltips["fileDownload"]["s3_bucket"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ s3Bucket: value })}
+                value={s3Bucket as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="Region Name"
+              help={helpTooltips["fileDownload"]["region_name"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ regionName: value })}
+                value={regionName as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="(Optional) Folder Path"
+              help={helpTooltips["fileDownload"]["path"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ path: value })}
+                value={path as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+          </>
+        )}
+
+        {downloadTarget === "azure" && (
+          <>
+            <DestinationField
+              label="Storage Account Name"
+              help={helpTooltips["fileDownload"]["azure_storage_account_name"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ azureStorageAccountName: value })}
+                value={azureStorageAccountName as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="Storage Account Key"
+              help={helpTooltips["fileDownload"]["azure_storage_account_key"]}
+            >
+              <WorkflowBlockInput
+                nodeId={blockId}
+                type="password"
+                value={azureStorageAccountKey as string}
+                className="nopan text-xs"
+                onChange={(value) => update({ azureStorageAccountKey: value })}
+              />
+            </DestinationField>
+            <DestinationField
+              label="Blob Container Name"
+              help={helpTooltips["fileDownload"]["azure_blob_container_name"]}
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ azureBlobContainerName: value })}
+                value={azureBlobContainerName as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="(Optional) Folder Path"
+              help="Optional folder path within the blob container. Defaults to {{ workflow_run_id }} if not specified."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ path: value })}
+                value={path as string}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+          </>
+        )}
+
+        {downloadTarget === "google_drive" && (
+          <>
+            <DestinationField
+              label="Google Account"
+              help="The connected Google account used for Drive uploads."
+            >
+              <GoogleOAuthCredentialSelector
+                nodeId={blockId}
+                value={googleCredentialId ?? ""}
+                onChange={(value) => update({ googleCredentialId: value })}
+                requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              />
+            </DestinationField>
+            <DestinationField
+              label="Google Drive Folder ID (Required)"
+              help="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ googleDriveFolderId: value })}
+                value={googleDriveFolderId ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+          </>
+        )}
+
+        {downloadTarget === "sftp" && (
+          <>
+            <DestinationField
+              label="SFTP Host"
+              help="The SFTP host to upload files to."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ sftpHost: value })}
+                value={sftpHost ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="Port"
+              help="Numeric only — template values are not supported. Defaults to 22 if left blank."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) =>
+                  update({ sftpPort: value.replace(/[^0-9]/g, "") })
+                }
+                value={sftpPort ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField label="Username" help="The SFTP username.">
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ sftpUsername: value })}
+                value={sftpUsername ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="Password"
+              help="Password auth. Leave blank if using a private key. Reference a secret parameter for security."
+            >
+              <WorkflowBlockInput
+                nodeId={blockId}
+                type="password"
+                onChange={(value) => update({ sftpPassword: value })}
+                value={sftpPassword ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="Private Key"
+              help="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ sftpPrivateKey: value })}
+                value={sftpPrivateKey ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="Private Key Passphrase (Optional)"
+              help="Optional passphrase for the private key."
+            >
+              <WorkflowBlockInput
+                nodeId={blockId}
+                type="password"
+                onChange={(value) =>
+                  update({ sftpPrivateKeyPassphrase: value })
+                }
+                value={sftpPrivateKeyPassphrase ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="(Optional) Remote Directory"
+              help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ sftpRemotePath: value })}
+                value={sftpRemotePath ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+            <DestinationField
+              label="(Optional) Host Key"
+              help="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
+            >
+              <WorkflowBlockInputTextarea
+                nodeId={blockId}
+                onChange={(value) => update({ sftpHostKey: value })}
+                value={sftpHostKey ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+          </>
+        )}
+
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-tertiary-foreground">URL</Label>

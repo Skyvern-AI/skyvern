@@ -1,5 +1,6 @@
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Protocol
 
 import structlog
@@ -57,7 +58,9 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_block_outputs,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
+    RequestedOutputPathMintSource,
     _is_judgment_boolean_criterion,
     is_fallback_floor_criterion,
 )
@@ -94,6 +97,12 @@ _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # and observation flag cannot be traversed as observed page content.
 _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
 _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+_CLASSIFIER_DEFAULT_MINT_SOURCE: RequestedOutputPathMintSource = "classifier_default"
+if REQUESTED_OUTPUT_PATH_MINT_SOURCES != {_CLASSIFIER_DEFAULT_MINT_SOURCE}:
+    raise RuntimeError(
+        "RequestedOutputPathMintSource gained a member; the reconciled registered-download "
+        "requested-output identity carry must be revisited before this equality can stay strict."
+    )
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
@@ -169,6 +178,29 @@ def _registered_download_requested_output_criterion(criterion: CompletionCriteri
     )
 
 
+def _is_minted_registered_download_requested_output(criterion: CompletionCriterion) -> bool:
+    return (
+        _registered_download_requested_output_criterion(criterion)
+        and criterion.requested_output_path_mint_source == _CLASSIFIER_DEFAULT_MINT_SOURCE
+    )
+
+
+def _registered_download_criterion_carrying_requested_output(*, carries_requested_output: bool) -> CompletionCriterion:
+    criterion = registered_download_completion_criterion()
+    if carries_requested_output:
+        return replace(criterion, requested_output_path_mint_source=_CLASSIFIER_DEFAULT_MINT_SOURCE)
+    return criterion
+
+
+def _minted_registered_download_requested_output_count(criteria: list[CompletionCriterion]) -> int:
+    return sum(
+        1
+        for criterion in criteria
+        if is_registered_download_completion_criterion(criterion)
+        and criterion.requested_output_path_mint_source == _CLASSIFIER_DEFAULT_MINT_SOURCE
+    )
+
+
 def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool:
     if _is_typed_download_target(_ctx_reached_download_target(copilot_ctx)):
         return True
@@ -181,6 +213,9 @@ def _reconcile_download_completion_criterion(
     copilot_ctx: Any, result: dict[str, Any], criteria: list[CompletionCriterion]
 ) -> list[CompletionCriterion]:
     has_registered_download_evidence = _result_has_registered_download_block_output(result)
+    stripped_minted_requested_output = has_registered_download_evidence and any(
+        _is_minted_registered_download_requested_output(criterion) for criterion in criteria
+    )
     reconciled = (
         [criterion for criterion in criteria if not _registered_download_requested_output_criterion(criterion)]
         if has_registered_download_evidence
@@ -190,7 +225,12 @@ def _reconcile_download_completion_criterion(
         return reconciled
     if not _has_typed_download_signal(copilot_ctx, result):
         return reconciled
-    return [*reconciled, registered_download_completion_criterion()]
+    return [
+        *reconciled,
+        _registered_download_criterion_carrying_requested_output(
+            carries_requested_output=stripped_minted_requested_output
+        ),
+    ]
 
 
 def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
@@ -1353,6 +1393,9 @@ async def _completion_verification_from_run_result(
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
     run_structural_unfired_ids = structural_unfired_contingent_criterion_ids(run_criteria, snapshot)
     requested_output_criteria, judgeable_run_criteria = split_requested_output_criteria(run_criteria)
+    requested_output_criteria_count = len(
+        requested_output_criteria
+    ) + _minted_registered_download_requested_output_count(run_criteria)
     requested_output_verdicts = (
         grade_requested_output_criteria(copilot_ctx, requested_output_criteria, snapshot)
         if requested_output_criteria
@@ -1386,7 +1429,7 @@ async def _completion_verification_from_run_result(
                 contingent_criterion_ids=contingent_ids,
                 contingent_on_by_criterion_id=contingent_on_by_id,
                 contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
-                requested_output_criteria_count=len(requested_output_criteria),
+                requested_output_criteria_count=requested_output_criteria_count,
             )
         if not definition_verdicts:
             return None
@@ -1449,7 +1492,7 @@ async def _completion_verification_from_run_result(
                         contingent_criterion_ids=contingent_ids,
                         contingent_on_by_criterion_id=contingent_on_by_id,
                         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
-                        requested_output_criteria_count=len(requested_output_criteria),
+                        requested_output_criteria_count=requested_output_criteria_count,
                     )
                 return CompletionVerificationResult(
                     status="unavailable",
@@ -1480,7 +1523,7 @@ async def _completion_verification_from_run_result(
                         contingent_criterion_ids=contingent_ids,
                         contingent_on_by_criterion_id=contingent_on_by_id,
                         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
-                        requested_output_criteria_count=len(requested_output_criteria),
+                        requested_output_criteria_count=requested_output_criteria_count,
                     )
                 return CompletionVerificationResult(
                     status="unavailable",
@@ -1542,7 +1585,7 @@ async def _completion_verification_from_run_result(
         contingent_criterion_ids=contingent_ids,
         contingent_on_by_criterion_id=contingent_on_by_id,
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
-        requested_output_criteria_count=len(requested_output_criteria),
+        requested_output_criteria_count=requested_output_criteria_count,
     )
 
 
