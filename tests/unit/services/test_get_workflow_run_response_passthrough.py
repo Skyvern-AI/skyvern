@@ -74,3 +74,49 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.step_count == 4
     assert resp.run_request is not None
     assert resp.run_request.browser_session_id == "pbs_123"
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_run_response_handles_paused_status() -> None:
+    """WorkflowRunStatus.paused is a real, non-terminal status (set while a workflow run is
+    waiting on human-in-the-loop input, e.g. TOTP verification). RunStatus must be able to
+    represent it or this raises ValueError instead of returning a response."""
+    now = datetime.now(timezone.utc)
+    workflow_run = WorkflowRun(
+        workflow_run_id="wr_123",
+        workflow_id="w_123",
+        workflow_permanent_id="wpid_123",
+        organization_id="o_123",
+        status=WorkflowRunStatus.paused,
+        created_at=now,
+        modified_at=now,
+    )
+
+    status_resp = MagicMock(
+        outputs=None,
+        downloaded_files=None,
+        recording_url=None,
+        screenshot_urls=None,
+        failure_reason=None,
+        workflow_title="Test",
+        parameters={},
+        errors=None,
+        total_steps=1,
+    )
+
+    with (
+        patch(
+            "skyvern.services.workflow_service.app.DATABASE.workflow_runs.get_workflow_run",
+            new_callable=AsyncMock,
+            return_value=workflow_run,
+        ),
+        patch(
+            "skyvern.services.workflow_service.app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id",
+            new_callable=AsyncMock,
+            return_value=status_resp,
+        ),
+    ):
+        resp = await get_workflow_run_response("wr_123", organization_id="o_123")
+
+    assert resp is not None
+    assert resp.status == RunStatus.paused
