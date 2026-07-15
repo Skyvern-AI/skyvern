@@ -13023,6 +13023,8 @@ def _auto_act_scout_ctx() -> AgentContext:
     ctx.browser_session_id = None
     ctx.scouted_interactions = []
     ctx.scout_trajectory = []
+    ctx.scout_observed_terminal_criterion_ids = set()
+    ctx.completion_criteria_turn_state = None
     ctx.discovery_mcp_server = _AutoActClickServer()
     return ctx
 
@@ -14564,6 +14566,99 @@ class TestCredentialScoutGatePredicateCoherence:
         errors = workflow_update_module._credentialed_code_block_scout_gate_errors(self._TWO_FIELD_LOGIN_YAML, ctx)
         assert errors
         assert "password" in errors[0]
+
+
+class TestTerminalActionScoutGate:
+    _BUSINESS_URL = "https://portal.example.test/business/start-service"
+
+    @staticmethod
+    def _terminal_action_criterion(*, method_mandated: bool = False) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="start_service_request",
+            outcome="the business start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+            method_mandated=method_mandated,
+        )
+
+    def _login_prefix_ctx(self, *criteria: CompletionCriterion) -> CopilotContext:
+        helper = TestCredentialScoutGapMatcher
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._click(helper._PAGE_ONE),
+            helper._fill("cred_1", "password", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username", "password"})}
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        return ctx
+
+    def _business_spine(self) -> list[dict[str, object]]:
+        return [
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "textbox",
+                "accessible_name": "Service Address",
+                "trajectory_index": 4,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#find-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "button",
+                "accessible_name": "Find Address",
+                "trajectory_index": 5,
+            },
+        ]
+
+    def test_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_login_is_the_whole_goal_stays_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx()
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_method_mandated_terminal_action_criterion_does_not_gate(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion(method_mandated=True))
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_scout_observed_terminal_action_releases_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_observed_terminal_criterion_ids = {"start_service_request"}
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_credential_business_spine_records_terminal_action_observation(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + self._business_spine()
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_login_only_trajectory_records_no_terminal_action_observation(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+
+    def test_mfa_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            helper._fill("cred_1", "totp", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {
+            "cred_1": frozenset({"username", "password", "totp"})
+        }
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
 
 
 class TestCredentialScoutReopenSeam:

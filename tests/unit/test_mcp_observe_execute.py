@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.cli.core import session_manager
+from skyvern.cli.core import browser_ops, session_manager
 from skyvern.cli.core.browser_ops import (
     _OBSERVE_INTERACTABLES_JS,
     ExecuteStep,
@@ -25,6 +25,7 @@ from skyvern.cli.core.session_manager import scoped_session
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.client.errors import InternalServerError
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from tests.unit._mcp_browser_fakes import make_real_wait_for_timeout, make_session_state
 
 # ---------------------------------------------------------------------------
@@ -54,6 +55,7 @@ def _make_a11y_tree(**overrides: Any) -> dict[str, Any]:
 def _make_page(a11y_tree: dict[str, Any] | None = None) -> AsyncMock:
     """Create a mock page with accessibility.snapshot()."""
     page = AsyncMock()
+    page._working_frame = None
     page.url = "https://example.com/login"
     page.title = AsyncMock(return_value="Login Page")
 
@@ -253,6 +255,141 @@ class TestDoObserve:
         result = await do_observe(page, selector="form#login")
         page.accessibility.snapshot.assert_awaited_once_with(root=mock_handle)
         assert result.element_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selector", [None, "#frame-form"])
+    async def test_working_frame_uses_dom_only_and_reports_frame_url(
+        self,
+        selector: str | None,
+    ) -> None:
+        main_tree = _make_a11y_tree(children=[{"role": "button", "name": "Parent action"}])
+        page = _make_page(main_tree)
+        page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "role": "button",
+                    "name": "Parent action",
+                    "tag": "button",
+                    "selector": "#parent-action",
+                }
+            ]
+        )
+        locator = MagicMock()
+        locator.first.element_handle = AsyncMock(return_value=MagicMock())
+        page.locator = MagicMock(return_value=locator)
+
+        frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            title=AsyncMock(return_value="Payment Frame"),
+            evaluate=AsyncMock(
+                return_value=[
+                    {
+                        "role": "button",
+                        "name": "Frame action",
+                        "tag": "button",
+                        "selector": "#frame-action",
+                    }
+                ]
+            ),
+        )
+        page._working_frame = frame
+
+        result = await do_observe(page, selector=selector)
+
+        frame.evaluate.assert_awaited_once_with(
+            _OBSERVE_INTERACTABLES_JS,
+            {"scopeSelector": selector, "includeValues": False},
+        )
+        page.evaluate.assert_not_awaited()
+        page.accessibility.snapshot.assert_not_awaited()
+        assert {element.name for element in result.elements} == {"Frame action"}
+        assert result.url == frame.url
+        assert result.title == "Payment Frame"
+        frame.title.assert_awaited_once()
+        page.title.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_detached_working_frame_raises_before_evaluate(self) -> None:
+        page = _make_page()
+        frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            is_detached=lambda: True,
+            evaluate=AsyncMock(),
+        )
+        page._working_frame = frame
+
+        with pytest.raises(browser_ops.ObserveFrameError) as exc_info:
+            await do_observe(page)
+
+        assert exc_info.value.frame_name == frame.name
+        assert exc_info.value.frame_url == frame.url
+        frame.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_frame_switch_index_zero_uses_main_frame_accessibility_snapshot(self) -> None:
+        main_frame = SimpleNamespace(name="", url="https://example.com/login")
+        raw_page = SimpleNamespace(frames=[main_frame], main_frame=main_frame)
+        snapshot = AsyncMock(return_value=_make_a11y_tree(children=[{"role": "button", "name": "Main"}]))
+        page = SimpleNamespace(
+            page=raw_page,
+            _working_frame=SimpleNamespace(),
+            url=main_frame.url,
+            title=AsyncMock(return_value="Main Page"),
+            accessibility=SimpleNamespace(snapshot=snapshot),
+            evaluate=AsyncMock(return_value=[]),
+        )
+
+        switched = await SkyvernBrowserPage.frame_switch(page, index=0)
+        observed = await do_observe(page)
+
+        assert switched["url"] == main_frame.url
+        assert page._working_frame is None
+        snapshot.assert_awaited_once_with()
+        assert {element.name for element in observed.elements} == {"Main"}
+
+    @pytest.mark.asyncio
+    async def test_working_frame_evaluate_failure_raises_typed_error(self) -> None:
+        page = _make_page()
+        page.evaluate = AsyncMock(return_value=[])
+        page.accessibility = None
+        page._working_frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            evaluate=AsyncMock(side_effect=RuntimeError("Execution context was destroyed")),
+        )
+
+        with pytest.raises(browser_ops.ObserveFrameError) as exc_info:
+            await do_observe(page)
+
+        error = str(exc_info.value)
+        assert page._working_frame.name in error
+
+    @pytest.mark.asyncio
+    async def test_working_frame_on_different_page_raises_typed_error(self) -> None:
+        page = _make_page()
+        page.page = object()
+        page._working_frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            page=object(),
+            evaluate=AsyncMock(return_value=[]),
+        )
+
+        with pytest.raises(browser_ops.ObserveFrameError) as exc_info:
+            await do_observe(page)
+
+        assert "different page" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_main_frame_evaluate_failure_remains_best_effort(self) -> None:
+        page = _make_page()
+        page.evaluate = AsyncMock(side_effect=RuntimeError("Execution context was destroyed"))
+
+        result = await do_observe(page)
+
+        assert "Sign In" in {element.name for element in result.elements}
 
     @pytest.mark.asyncio
     async def test_combobox_options(self) -> None:
@@ -553,6 +690,29 @@ class TestDoExecute:
         assert call_log == ["navigate", "click"]
 
     @pytest.mark.asyncio
+    async def test_failed_observe_clears_batch_local_refs(self) -> None:
+        seen_ref_maps: list[dict[str, Any]] = []
+
+        async def dispatch(step: ExecuteStep, ref_map: dict) -> dict[str, Any] | None:
+            if step.tool == "click":
+                seen_ref_maps.append(dict(ref_map))
+                return None
+            if step.params.get("fail"):
+                raise RuntimeError("frame lost")
+            return {"elements": [{"ref": "e0", "role": "button", "name": "X", "tag": "button", "selector": "#x"}]}
+
+        steps = [
+            ExecuteStep(tool="observe", params={}),
+            ExecuteStep(tool="observe", params={"fail": True}),
+            ExecuteStep(tool="click", params={"ref": "e0"}),
+        ]
+        result = await do_execute(dispatch, steps, stop_on_error=False)
+
+        assert result.results[0].ok is True
+        assert result.results[1].ok is False
+        assert seen_ref_maps == [{}]
+
+    @pytest.mark.asyncio
     async def test_stop_on_error_true(self) -> None:
         async def dispatch(step: ExecuteStep, ref_map: dict) -> dict[str, Any] | None:
             if step.tool == "click":
@@ -781,6 +941,37 @@ class TestSkyvernObserveMCP:
         result = await mcp_browser.skyvern_observe()
         assert result["ok"] is False
 
+    @pytest.mark.asyncio
+    async def test_non_evaluable_working_frame_returns_structured_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_page()
+        page.evaluate = AsyncMock(return_value=[])
+        page.accessibility = None
+        frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            evaluate=AsyncMock(side_effect=RuntimeError("Execution context was destroyed")),
+        )
+        page._working_frame = frame
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"page_key": (1, 2, "old", "old-frame"), "refs": {"e0": {"ref": "e0"}}}
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_observe()
+
+        assert result["ok"] is False
+        error = result["error"]
+        assert error["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+        assert error["details"]["frame_name"] == frame.name
+        assert error["details"]["frame_url"] == frame.url
+        assert frame.name in error["message"] or frame.url in error["message"]
+        assert any(action in error["hint"] for action in ("skyvern_frame_main", "skyvern_frame_list", "selector"))
+        assert state._observed_refs == {}
+
 
 # ---------------------------------------------------------------------------
 # MCP tool tests: skyvern_execute
@@ -881,6 +1072,35 @@ class TestSkyvernExecuteMCP:
         observe.assert_awaited_once_with(page, include_values=True)
 
     @pytest.mark.asyncio
+    async def test_execute_observe_returns_structured_frame_error_and_clears_refs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_page()
+        frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            is_detached=lambda: True,
+            evaluate=AsyncMock(),
+        )
+        page._working_frame = frame
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        state._observed_refs = {"page_key": (1, 2, "old", "old-frame"), "refs": {"e0": {"ref": "e0"}}}
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        async with scoped_session(state):
+            result = await mcp_browser.skyvern_execute(steps=[{"tool": "observe", "params": {}}])
+
+        error = result["data"]["results"][0]["error"]
+        assert result["ok"] is False
+        assert error["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+        assert error["details"] == {"frame_name": frame.name, "frame_url": frame.url}
+        assert "skyvern_frame_main" in error["hint"]
+        assert state._observed_refs == {}
+        frame.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_execute_resolves_ref_from_prior_observe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_test")
@@ -971,6 +1191,47 @@ class TestSkyvernExecuteMCP:
             execute_result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"ref": ref}}])
 
         assert execute_result["data"]["results"][0]["error"] == (
+            f"Unknown ref '{ref}' — call observe first or check ref exists"
+        )
+        click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_iframe_ref_is_stale_after_frame_navigation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = _make_page()
+        frame = SimpleNamespace(
+            name="payment",
+            url="https://example.com/payment-frame",
+            title=AsyncMock(return_value="Payment"),
+            evaluate=AsyncMock(
+                return_value=[
+                    {
+                        "role": "button",
+                        "name": "Frame action",
+                        "tag": "button",
+                        "selector": "#frame-action",
+                    }
+                ]
+            ),
+        )
+
+        async def goto(url: str) -> None:
+            frame.url = url
+
+        frame.goto = AsyncMock(side_effect=goto)
+        page._working_frame = frame
+        ctx = BrowserContext(mode="local")
+        state = make_session_state(context=ctx)
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        click = AsyncMock(return_value={"ok": True, "data": None})
+        monkeypatch.setattr(mcp_browser, "skyvern_click", click)
+
+        async with scoped_session(state):
+            observed = await mcp_browser.skyvern_observe()
+            ref = observed["data"]["elements"][0]["ref"]
+            await frame.goto("https://example.com/replacement-frame")
+            result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"ref": ref}}])
+
+        assert result["data"]["results"][0]["error"] == (
             f"Unknown ref '{ref}' — call observe first or check ref exists"
         )
         click.assert_not_awaited()
