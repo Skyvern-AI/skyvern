@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from skyvern.forge.sdk.copilot.completion_output_grounding import split_requested_output_criteria
 from skyvern.forge.sdk.copilot.completion_verification import (
@@ -56,8 +56,8 @@ TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
 _CRITERION_KINDS = ("outcome", "terminal_action", "validation_classification")
 _TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
-_PINABILITY_VALUES = ("pinned", "shapeless_valid", "unpinnable")
-_MINT_DISPOSITION_VALUES = ("pending", "decidable", "degraded")
+_MINT_DISPOSITIONS = frozenset(get_args(MintDisposition))
+_PINABILITIES = frozenset(get_args(Pinability))
 
 
 @dataclass(frozen=True)
@@ -221,9 +221,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             else None
         )
         pinability_raw = item.get("pinability")
-        pinability = pinability_raw if pinability_raw in _PINABILITY_VALUES else None
+        pinability = pinability_raw if pinability_raw in _PINABILITIES else None
         mint_disposition_raw = item.get("mint_disposition")
-        mint_disposition = mint_disposition_raw if mint_disposition_raw in _MINT_DISPOSITION_VALUES else "decidable"
+        mint_disposition = mint_disposition_raw if mint_disposition_raw in _MINT_DISPOSITIONS else "decidable"
         stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
         stored_expected_output_value = _coerce_expected_output_value(expected_output_value)
         stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
@@ -237,8 +237,18 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         if kind == "validation_classification":
             stored_output_path = None
             stored_expected_output_value = None
-            stored_expected_output_shape = None
-            requested_output_evidence_source = "runtime_output"
+            # Typed boolean classifications carry their own validated mint metadata. Rows without
+            # it carry no reliable shape, so retain the historical normalization for those rows.
+            is_typed_boolean_classification = (
+                stored_expected_output_shape == "goal_judgment_boolean"
+                and pinability == "pinned"
+                and mint_disposition == "pending"
+            )
+            if is_typed_boolean_classification:
+                requested_output_evidence_source = "independent_run_evidence"
+            else:
+                stored_expected_output_shape = None
+                requested_output_evidence_source = "runtime_output"
         elif isinstance(stored_expected_output_value, bool) or stored_expected_output_shape == "goal_judgment_boolean":
             requested_output_evidence_source = "independent_run_evidence"
         criteria.append(
@@ -281,7 +291,6 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     deliverable_kind_key = (
         f"{criterion.deliverable_kind or ''}\x1fdeclared:{criterion.declared_deliverable_kind or ''}"
-        f"\x1fmint_degrade:{criterion.mint_degrade or ''}"
         f"\x1fjudgment:{judgment_truth_condition_key(criterion.judgment_truth_condition)}"
     )
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
@@ -480,14 +489,25 @@ def reconcile_completion_criteria(
             return ReconcileDecision(action="none", reason="no_criteria", epoch=0, criteria=())
         if not actionable:
             return ReconcileDecision(action="none", reason="not_actionable", epoch=0, criteria=tuple(fresh))
-        return ReconcileDecision(action="create", reason="first", epoch=next_epoch, criteria=tuple(fresh))
+        return ReconcileDecision(
+            action="create",
+            reason="first",
+            epoch=next_epoch,
+            criteria=tuple(fresh),
+        )
     if not fresh:
         return ReconcileDecision(
-            action="adopt_stored", reason="empty_fresh", epoch=stored.goal_epoch, criteria=stored.criteria
+            action="adopt_stored",
+            reason="empty_fresh",
+            epoch=stored.goal_epoch,
+            criteria=stored.criteria,
         )
     if _outcome_key_set(fresh) <= _outcome_key_set(stored.criteria):
         return ReconcileDecision(
-            action="adopt_stored", reason="kept", epoch=stored.goal_epoch, criteria=stored.criteria
+            action="adopt_stored",
+            reason="kept",
+            epoch=stored.goal_epoch,
+            criteria=stored.criteria,
         )
     if _fresh_generic_rephrase_lacks_stored_requested_outputs(
         stored.criteria,
@@ -495,11 +515,17 @@ def reconcile_completion_criteria(
         requested_output_path_aliases=requested_output_path_aliases,
     ):
         return ReconcileDecision(
-            action="adopt_stored", reason="kept", epoch=stored.goal_epoch, criteria=stored.criteria
+            action="adopt_stored",
+            reason="kept",
+            epoch=stored.goal_epoch,
+            criteria=stored.criteria,
         )
     if not actionable:
         return ReconcileDecision(
-            action="adopt_stored", reason="not_actionable", epoch=stored.goal_epoch, criteria=stored.criteria
+            action="adopt_stored",
+            reason="not_actionable",
+            epoch=stored.goal_epoch,
+            criteria=stored.criteria,
         )
     return ReconcileDecision(
         action="create",
