@@ -269,6 +269,75 @@ class TestRawSecretBackstop:
         assert "AnotherFakePass456" not in redacted
         assert redacted.count("[REDACTED_SECRET]") == 2
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "access_token=abc123DEF",
+            "client_secret=xyz789",
+            "refresh_token=r_1.2.3",
+            "id_token=eyJabc.def.ghi",
+        ],
+    )
+    def test_oauth_style_underscore_prefixed_keyword_assignments_are_redacted(self, message: str) -> None:
+        redacted = redact_raw_secrets_for_prompt(message)
+        secret_value = message.split("=", 1)[1]
+
+        assert secret_value not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "token=abc",
+            "password: hunter2",
+            "api_key = k3y",
+            "authorization: Bearer zzz",
+        ],
+    )
+    def test_existing_keyword_assignment_cases_still_redact(self, message: str) -> None:
+        redacted = redact_raw_secrets_for_prompt(message)
+        secret_value = message.split(":", 1)[1] if ":" in message else message.split("=", 1)[1]
+
+        assert secret_value.strip() not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "tokenizer = Tokenizer()",
+            "password_reset_flow()",
+            "the secretary emailed me",
+            "secretariat won",
+        ],
+    )
+    def test_non_secret_text_is_not_over_redacted(self, message: str) -> None:
+        assert redact_raw_secrets_for_prompt(message) == message
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "next_token=abc123",
+            "continuation_token=xyz789",
+            "page_token=p_1",
+            "next_page_token=np_2",
+        ],
+    )
+    def test_pagination_cursor_tokens_are_not_over_redacted(self, message: str) -> None:
+        assert redact_raw_secrets_for_prompt(message) == message
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "authorization: Bearer zzz_opaque_value",
+            "Authorization: Basic dXNlcjpwYXNzd29yZA",
+        ],
+    )
+    def test_scheme_prefixed_authorization_values_are_redacted(self, message: str) -> None:
+        redacted = redact_raw_secrets_for_prompt(message)
+        opaque_value = message.split()[-1]
+        assert opaque_value not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+
 
 class TestRawSecretRefusalSentinelConsistency:
     """Transcript redaction recognizes a prior raw-secret refusal by the sentinel

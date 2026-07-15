@@ -1133,6 +1133,8 @@ class TestScoutedInteractionCapture:
             browser_session_id=None,
             scouted_interactions=[],
             scout_trajectory=[],
+            scout_observed_terminal_criterion_ids=set(),
+            completion_criteria_turn_state=None,
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
             prior_fill_carry=[],
