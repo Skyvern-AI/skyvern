@@ -162,6 +162,11 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    SENSITIVE_DESTINATION_FIELDS,
+    decrypt_secret_field_value,
+    is_encrypted_secret,
+)
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, OutputObligation
 from skyvern.schemas.workflows import (
@@ -169,6 +174,7 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
     BlockType,
+    FileDownloadTarget,
     FileStorageType,
     FileType,
     FileUploadDestination,
@@ -874,7 +880,8 @@ class Block(BaseModel, abc.ABC):
         description = None
         try:
             block_data = self.model_dump(
-                exclude={
+                exclude=SENSITIVE_DESTINATION_FIELDS
+                | {
                     "workflow_run_block_id",
                     "organization_id",
                     "task_id",
@@ -5610,12 +5617,11 @@ class UploadToS3Block(Block):
         )
 
 
-class FileUploadBlock(Block):
-    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
-    # Parameter 1 of Literal[...] cannot be of type "Any"
-    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+class UnsupportedStorageTypeError(Exception):
+    pass
 
-    storage_type: FileStorageType = FileStorageType.S3
+
+class FileDestinationBlock(Block):
     s3_bucket: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
@@ -5647,11 +5653,7 @@ class FileUploadBlock(Block):
         ),
     )
 
-    def get_all_parameters(
-        self,
-        workflow_run_id: str,
-    ) -> list[PARAMETER_TYPE]:
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+    def _get_destination_parameters(self, workflow_run_context: WorkflowRunContext) -> list[PARAMETER_TYPE]:
         parameters = []
 
         if self.path and workflow_run_context.has_parameter(self.path):
@@ -5707,7 +5709,7 @@ class FileUploadBlock(Block):
 
         return parameters
 
-    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+    def _format_destination_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
 
@@ -5777,7 +5779,38 @@ class FileUploadBlock(Block):
                 self.sftp_host_key, workflow_run_context
             )
 
-        self._apply_workflow_system_prompt(workflow_run_context)
+    def _validate_destination_fields(self, storage_type: FileStorageType) -> list[str]:
+        missing_parameters = []
+        if storage_type == FileStorageType.S3:
+            if not self.s3_bucket:
+                missing_parameters.append("s3_bucket")
+            if not self.aws_access_key_id:
+                missing_parameters.append("aws_access_key_id")
+            if not self.aws_secret_access_key:
+                missing_parameters.append("aws_secret_access_key")
+        elif storage_type == FileStorageType.AZURE:
+            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
+                missing_parameters.append("azure_storage_account_name")
+            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
+                missing_parameters.append("azure_storage_account_key")
+            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
+                missing_parameters.append("azure_blob_container_name")
+        elif storage_type == FileStorageType.GOOGLE_DRIVE:
+            if not self.google_credential_id:
+                missing_parameters.append("google_credential_id")
+            if not self.google_drive_folder_id:
+                missing_parameters.append("google_drive_folder_id")
+        elif storage_type == FileStorageType.SFTP:
+            if not self.sftp_host:
+                missing_parameters.append("sftp_host")
+            if not self.sftp_username:
+                missing_parameters.append("sftp_username")
+            if not self.sftp_password and not self.sftp_private_key:
+                missing_parameters.append("sftp_password or sftp_private_key")
+        else:
+            raise UnsupportedStorageTypeError(storage_type)
+
+        return missing_parameters
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
@@ -5797,8 +5830,21 @@ class FileUploadBlock(Block):
         folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
         return folder_path + "/" + blob_name
 
-    def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
+    @staticmethod
+    def _validate_azure_storage_account_name(azure_storage_account_name: str) -> None:
+        if re.fullmatch(r"[a-z0-9]{3,24}", azure_storage_account_name) is None:
+            raise AzureConfigurationError("Azure Storage account name must match ^[a-z0-9]{3,24}$")
+
+    def _get_azure_blob_uri(
+        self,
+        workflow_run_id: str,
+        blob_name: str,
+        azure_storage_account_name: str,
+    ) -> str:
+        self._validate_azure_storage_account_name(azure_storage_account_name)
+        return (
+            f"https://{azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
+        )
 
     def _build_s3_destination(
         self,
@@ -5831,7 +5877,7 @@ class FileUploadBlock(Block):
         azure_storage_account_key: str,
     ) -> FileUploadDestination:
         blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
-        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
+        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name, azure_storage_account_name)
         sdk_uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
         return FileUploadDestination(
             storage_type=FileStorageType.AZURE,
@@ -5886,6 +5932,187 @@ class FileUploadBlock(Block):
             sftp_remote_path=remote_path,
             sftp_host_key=host_key,
         )
+
+    @staticmethod
+    async def _resolve_sensitive_destination_credential(
+        workflow_run_context: WorkflowRunContext,
+        value: str | None,
+        field_name: str,
+    ) -> str | None:
+        if not value:
+            return None
+        if is_encrypted_secret(value):
+            return await decrypt_secret_field_value(
+                value,
+                organization_id=workflow_run_context.organization_id,
+                field_name=field_name,
+            )
+        resolved_value = workflow_run_context.get_original_secret_value_or_none(value)
+        if resolved_value is not None:
+            return resolved_value
+        return value
+
+    async def _dispatch_files_to_storage(
+        self,
+        *,
+        storage_type: FileStorageType,
+        files_to_upload: list[str],
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+    ) -> list[str]:
+        uploaded_uris: list[str] = []
+        if not files_to_upload:
+            return uploaded_uris
+        if storage_type == FileStorageType.S3:
+            actual_aws_secret_access_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.aws_secret_access_key,
+                "aws_secret_access_key",
+            )
+            actual_aws_access_key_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id) or self.aws_access_key_id
+            )
+            if (
+                not isinstance(actual_aws_access_key_id, str)
+                or not actual_aws_access_key_id.strip()
+                or not isinstance(actual_aws_secret_access_key, str)
+                or not actual_aws_secret_access_key.strip()
+            ):
+                raise ValueError("S3 is not configured: resolved AWS credentials are empty")
+            for file_path in files_to_upload:
+                destination = self._build_s3_destination(
+                    workflow_run_id=workflow_run_id,
+                    file_path=file_path,
+                    aws_access_key_id=actual_aws_access_key_id,
+                    aws_secret_access_key=actual_aws_secret_access_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to S3 customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.AZURE:
+            actual_azure_storage_account_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.azure_storage_account_key,
+                "azure_storage_account_key",
+            )
+            resolved_azure_storage_account_name = workflow_run_context.get_original_secret_value_or_none(
+                self.azure_storage_account_name
+            )
+            actual_azure_storage_account_name = (
+                self.azure_storage_account_name
+                if resolved_azure_storage_account_name is None
+                else resolved_azure_storage_account_name
+            )
+            if (
+                not isinstance(actual_azure_storage_account_name, str)
+                or not actual_azure_storage_account_name.strip()
+                or not isinstance(actual_azure_storage_account_key, str)
+                or not actual_azure_storage_account_key.strip()
+            ):
+                raise AzureConfigurationError("Azure Storage is not configured")
+            self._validate_azure_storage_account_name(actual_azure_storage_account_name)
+
+            for file_path in files_to_upload:
+                LOG.info("Uploading file to Azure Blob Storage customer storage", file_path=file_path)
+                destination = self._build_azure_destination(
+                    workflow_run_id=workflow_run_id,
+                    file_path=file_path,
+                    azure_storage_account_name=actual_azure_storage_account_name,
+                    azure_storage_account_key=actual_azure_storage_account_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to Azure Blob Storage customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.GOOGLE_DRIVE:
+            org_id = organization_id or workflow_run_context.organization_id
+            if not org_id:
+                raise ValueError("organization_id is required for Google Drive uploads")
+            google_credential_id = (
+                workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
+                or self.google_credential_id
+            )
+            if not google_credential_id:
+                raise ValueError("Google credential id is required")
+
+            google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+                organization_id=org_id,
+                credential_id=google_credential_id,
+                required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+            )
+            if not google_credentials or not google_credentials.token:
+                raise ValueError("Google Drive credential is not connected or is missing required scopes")
+
+            folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
+            for file_path in files_to_upload:
+                LOG.info("Uploading file to Google Drive customer storage", file_path=file_path)
+                destination = self._build_google_drive_destination(
+                    access_token=google_credentials.token,
+                    folder_id=folder_id,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=org_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to Google Drive customer storage", file_path=self.path)
+        elif storage_type == FileStorageType.SFTP:
+            actual_sftp_password = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_password,
+                "sftp_password",
+            )
+            actual_sftp_private_key = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_private_key,
+                "sftp_private_key",
+            )
+            actual_sftp_passphrase = await self._resolve_sensitive_destination_credential(
+                workflow_run_context,
+                self.sftp_private_key_passphrase,
+                "sftp_private_key_passphrase",
+            )
+            actual_sftp_username = (
+                workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
+            )
+            sftp_port = 22 if self.sftp_port is None else self.sftp_port
+            for file_path in files_to_upload:
+                destination = self._build_sftp_destination(
+                    file_path=file_path,
+                    host=self.sftp_host or "",
+                    port=sftp_port,
+                    username=actual_sftp_username or "",
+                    password=actual_sftp_password,
+                    private_key=actual_sftp_private_key,
+                    private_key_passphrase=actual_sftp_passphrase,
+                    remote_path=self.sftp_remote_path,
+                    host_key=self.sftp_host_key,
+                )
+                customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                    file_path=file_path,
+                    destination=destination,
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+                uploaded_uris.append(customer_uri)
+            LOG.info("Uploaded file(s) to SFTP customer storage", file_path=self.path)
+        else:
+            raise ValueError(f"Unsupported storage type: {storage_type}")
+
+        return uploaded_uris
 
     @staticmethod
     def _candidate_download_signal_run_ids(
@@ -6192,6 +6419,24 @@ class FileUploadBlock(Block):
 
         return registered_downloaded_files
 
+
+class FileUploadBlock(FileDestinationBlock):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        return self._get_destination_parameters(self.get_workflow_run_context(workflow_run_id))
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self._format_destination_template_parameters(workflow_run_context)
+        self._apply_workflow_system_prompt(workflow_run_context)
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -6204,34 +6449,9 @@ class FileUploadBlock(Block):
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         # get all parameters into a dictionary
         # data validate before uploading
-        missing_parameters = []
-        if self.storage_type == FileStorageType.S3:
-            if not self.s3_bucket:
-                missing_parameters.append("s3_bucket")
-            if not self.aws_access_key_id:
-                missing_parameters.append("aws_access_key_id")
-            if not self.aws_secret_access_key:
-                missing_parameters.append("aws_secret_access_key")
-        elif self.storage_type == FileStorageType.AZURE:
-            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
-                missing_parameters.append("azure_storage_account_name")
-            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
-                missing_parameters.append("azure_storage_account_key")
-            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
-                missing_parameters.append("azure_blob_container_name")
-        elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
-            if not self.google_credential_id:
-                missing_parameters.append("google_credential_id")
-            if not self.google_drive_folder_id:
-                missing_parameters.append("google_drive_folder_id")
-        elif self.storage_type == FileStorageType.SFTP:
-            if not self.sftp_host:
-                missing_parameters.append("sftp_host")
-            if not self.sftp_username:
-                missing_parameters.append("sftp_username")
-            if not self.sftp_password and not self.sftp_private_key:
-                missing_parameters.append("sftp_password or sftp_private_key")
-        else:
+        try:
+            missing_parameters = self._validate_destination_fields(self.storage_type)
+        except UnsupportedStorageTypeError:
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Unsupported storage type: {self.storage_type}",
@@ -6390,131 +6610,14 @@ class FileUploadBlock(Block):
                         organization_id=organization_id,
                     )
 
-            if self.storage_type == FileStorageType.S3:
-                actual_aws_access_key_id = (
-                    workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id)
-                    or self.aws_access_key_id
-                )
-                actual_aws_secret_access_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
-                    or self.aws_secret_access_key
-                )
-                for file_path in files_to_upload:
-                    destination = self._build_s3_destination(
-                        workflow_run_id=workflow_run_id,
-                        file_path=file_path,
-                        aws_access_key_id=actual_aws_access_key_id,
-                        aws_secret_access_key=actual_aws_secret_access_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to S3", file_path=self.path)
-            elif self.storage_type == FileStorageType.AZURE:
-                actual_azure_storage_account_name = (
-                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_name)
-                    or self.azure_storage_account_name
-                )
-                actual_azure_storage_account_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
-                    or self.azure_storage_account_key
-                )
-                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
-                    raise AzureConfigurationError("Azure Storage is not configured")
-
-                for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock Uploading file to Azure Blob Storage", file_path=file_path)
-                    destination = self._build_azure_destination(
-                        workflow_run_id=workflow_run_id,
-                        file_path=file_path,
-                        azure_storage_account_name=actual_azure_storage_account_name,
-                        azure_storage_account_key=actual_azure_storage_account_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
-            elif self.storage_type == FileStorageType.GOOGLE_DRIVE:
-                org_id = organization_id or workflow_run_context.organization_id
-                if not org_id:
-                    raise ValueError("organization_id is required for Google Drive uploads")
-                google_credential_id = (
-                    workflow_run_context.get_original_secret_value_or_none(self.google_credential_id)
-                    or self.google_credential_id
-                )
-                if not google_credential_id:
-                    raise ValueError("Google credential id is required")
-
-                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                    organization_id=org_id,
-                    credential_id=google_credential_id,
-                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
-                )
-                if not google_credentials or not google_credentials.token:
-                    raise ValueError("Google Drive credential is not connected or is missing required scopes")
-
-                folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id or "")
-                for file_path in files_to_upload:
-                    LOG.info("FileUploadBlock Uploading file to Google Drive", file_path=file_path)
-                    destination = self._build_google_drive_destination(
-                        access_token=google_credentials.token,
-                        folder_id=folder_id,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=org_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to Google Drive", file_path=self.path)
-            elif self.storage_type == FileStorageType.SFTP:
-                actual_sftp_username = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_username) or self.sftp_username
-                )
-                actual_sftp_password = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_password) or self.sftp_password
-                )
-                actual_sftp_private_key = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key)
-                    or self.sftp_private_key
-                )
-                actual_sftp_passphrase = (
-                    workflow_run_context.get_original_secret_value_or_none(self.sftp_private_key_passphrase)
-                    or self.sftp_private_key_passphrase
-                )
-                sftp_port = 22 if self.sftp_port is None else self.sftp_port
-                for file_path in files_to_upload:
-                    destination = self._build_sftp_destination(
-                        file_path=file_path,
-                        host=self.sftp_host or "",
-                        port=sftp_port,
-                        username=actual_sftp_username or "",
-                        password=actual_sftp_password,
-                        private_key=actual_sftp_private_key,
-                        private_key_passphrase=actual_sftp_passphrase,
-                        remote_path=self.sftp_remote_path,
-                        host_key=self.sftp_host_key,
-                    )
-                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
-                        file_path=file_path,
-                        destination=destination,
-                        organization_id=organization_id,
-                        run_id=workflow_run_id,
-                    )
-                    uploaded_uris.append(customer_uri)
-                LOG.info("FileUploadBlock File(s) uploaded to SFTP", file_path=self.path)
-            else:
-                # This case should ideally be caught by the initial validation
-                raise ValueError(f"Unsupported storage type: {self.storage_type}")
+            uploaded_uris = await self._dispatch_files_to_storage(
+                storage_type=self.storage_type,
+                files_to_upload=files_to_upload,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+            )
 
         except Exception as e:
             LOG.exception("FileUploadBlock Failed to upload file", file_path=self.path, storage_type=self.storage_type)
@@ -8574,10 +8677,246 @@ class LoginBlock(BaseTaskBlock):
     skip_saved_profile: bool = False
 
 
-class FileDownloadBlock(BaseTaskBlock):
+class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
+    download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        parameters = super().get_all_parameters(workflow_run_id)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        existing_keys = {p.key for p in parameters}
+        for destination_param in self._get_destination_parameters(workflow_run_context):
+            if destination_param.key not in existing_keys:
+                parameters.append(destination_param)
+                existing_keys.add(destination_param.key)
+        return parameters
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        download_files_path = ""
+        baseline_unknown = False
+        pre_names: set[str] = set()
+        pre_hashes: dict[str, str] = {}
+        pre_mtimes: dict[str, int] = {}
+        colliding_normalized_names: set[str] = set()
+        if self.download_target != FileDownloadTarget.WEBSITE:
+            # Fail fast on a misconfigured destination before running the (expensive) browser
+            # download, so a missing required field does not waste a download that cannot be delivered.
+            early_storage_type = FileStorageType(self.download_target.value)
+            early_context = self.get_workflow_run_context(workflow_run_id)
+            try:
+                early_missing_parameters = self._validate_destination_fields(early_storage_type)
+            except UnsupportedStorageTypeError as e:
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to send downloaded file(s) to {early_storage_type}: {e}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            if early_missing_parameters:
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        f"Required block values are missing in the FileDownloadBlock (label: {self.label}): "
+                        f"{', '.join(early_missing_parameters)}"
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            context = skyvern_context.current()
+            run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+            download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
+            try:
+                pre_download_filenames = os.listdir(download_files_path)
+            except FileNotFoundError:
+                pre_download_filenames = []
+            except OSError:
+                baseline_unknown = True
+                pre_download_filenames = []
+            for filename in pre_download_filenames:
+                local_file = os.path.join(download_files_path, filename)
+                if not os.path.isfile(local_file):
+                    continue
+                normalized_filename = unicodedata.normalize("NFC", filename)
+                if normalized_filename in pre_names:
+                    colliding_normalized_names.add(normalized_filename)
+                pre_names.add(normalized_filename)
+                try:
+                    pre_hashes[normalized_filename] = calculate_sha256_for_file(local_file)
+                    pre_mtimes[filename] = os.stat(local_file).st_mtime_ns
+                except OSError:
+                    continue
+            if baseline_unknown:
+                # Fail fast before the download: the baseline scan failed, so delivery would be
+                # refused anyway (to avoid leaking earlier files) — do not download customer data.
+                await self.record_output_parameter_value(early_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=(
+                        "Could not establish the pre-download baseline; refusing to deliver files to "
+                        f"{early_storage_type} to avoid leaking earlier files."
+                    ),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+        result = await super().execute(
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+        if self.download_target == FileDownloadTarget.WEBSITE:
+            return result
+        if not result.success:
+            return result
+
+        storage_type = FileStorageType(self.download_target.value)
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            self._format_destination_template_parameters(workflow_run_context)
+            max_file_count = (
+                MAX_UPLOAD_FILE_COUNT
+                if storage_type in {FileStorageType.S3, FileStorageType.GOOGLE_DRIVE, FileStorageType.SFTP}
+                else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+            )
+            try:
+                post_download_filenames = os.listdir(download_files_path)
+            except FileNotFoundError:
+                post_download_filenames = []
+            except OSError as e:
+                # Symmetric with the pre-download baseline: a real post-download scan failure (not a
+                # missing directory) must fail closed rather than report success without delivering.
+                raise RuntimeError("Could not scan the download directory after the download completed") from e
+
+            files_to_upload: list[str] = []
+            for filename in post_download_filenames:
+                local_file = os.path.join(download_files_path, filename)
+                try:
+                    if not os.path.isfile(local_file):
+                        if os.path.isdir(local_file):
+                            LOG.warning("FileDownloadBlock skipping directory", file=filename)
+                        continue
+                    normalized_filename = unicodedata.normalize("NFC", filename)
+                except OSError:
+                    continue
+
+                if normalized_filename in colliding_normalized_names:
+                    # Multiple byte-distinct directory entries normalized to this name at baseline,
+                    # so neither content hash nor write time can be attributed to a single entry;
+                    # fail closed rather than risk delivering an earlier block's file.
+                    continue
+
+                if normalized_filename not in pre_names:
+                    files_to_upload.append(local_file)
+                    continue
+                if normalized_filename not in pre_hashes:
+                    continue
+                try:
+                    current_hash = calculate_sha256_for_file(local_file)
+                except OSError:
+                    continue
+                if current_hash != pre_hashes[normalized_filename]:
+                    files_to_upload.append(local_file)
+                    continue
+                # Identical content means hashing cannot distinguish a genuine re-download
+                # from an earlier block's leftover; fall back to write time, keyed by the raw
+                # directory-entry name so Unicode-normalization-equivalent names never share a
+                # baseline. Deliver only if this block rewrote this exact entry in its own window.
+                baseline_mtime_ns = pre_mtimes.get(filename)
+                if baseline_mtime_ns is None:
+                    continue
+                try:
+                    current_mtime_ns = os.stat(local_file).st_mtime_ns
+                except OSError:
+                    continue
+                if current_mtime_ns > baseline_mtime_ns:
+                    files_to_upload.append(local_file)
+
+            if not files_to_upload:
+                return result
+
+            if len(files_to_upload) > max_file_count:
+                raise ValueError(f"Too many scoped downloaded files to upload. Max: {max_file_count}")
+
+            if files_to_upload and self.prompt and self.prompt.strip():
+                candidate_count = len(files_to_upload)
+                files_to_upload, selection_reasoning = await self._select_files_to_upload_with_prompt(
+                    prompt=self.prompt,
+                    files_to_upload=files_to_upload,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                selected_count = len(files_to_upload)
+                LOG.info(
+                    "FileDownloadBlock prompt selection completed",
+                    block_label=self.label,
+                    candidate_count=candidate_count,
+                    selected_count=selected_count,
+                )
+
+                if not files_to_upload:
+                    LOG.warning(
+                        "FileDownloadBlock prompt selected no files; treating as no-op",
+                        block_label=self.label,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        candidate_count=candidate_count,
+                        selected_count=selected_count,
+                        reasoning=selection_reasoning,
+                    )
+                    return result
+
+            uploaded_uris = await self._dispatch_files_to_storage(
+                storage_type=storage_type,
+                files_to_upload=files_to_upload,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                workflow_run_context=workflow_run_context,
+            )
+        except Exception as e:
+            LOG.exception(
+                "FileDownloadBlock failed to send downloaded file(s)",
+                block_label=self.label,
+                storage_type=storage_type,
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to send downloaded file(s) to {storage_type}: {e}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        LOG.info(
+            "FileDownloadBlock sent downloaded file(s) to customer storage",
+            block_label=self.label,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            storage_type=storage_type,
+            uploaded_file_count=len(uploaded_uris),
+        )
+        return result
 
 
 class UrlBlock(BaseTaskBlock):

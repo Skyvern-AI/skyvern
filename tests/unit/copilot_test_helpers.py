@@ -175,6 +175,7 @@ def make_completion_criterion(
     expected_output_value: str | None = None,
     expected_output_shape: str | None = None,
     requested_output_evidence_source: str = "runtime_output",
+    requested_output_path_mint_source: str | None = None,
     classification_output_key: str | None = None,
     expected_classification: str | bool | None = None,
     requested_output_corroborator: bool = False,
@@ -194,6 +195,7 @@ def make_completion_criterion(
         expected_output_value=expected_output_value,
         expected_output_shape=expected_output_shape,  # type: ignore[arg-type]
         requested_output_evidence_source=requested_output_evidence_source,  # type: ignore[arg-type]
+        requested_output_path_mint_source=requested_output_path_mint_source,  # type: ignore[arg-type]
         classification_output_key=classification_output_key,
         expected_classification=expected_classification,
         requested_output_corroborator=requested_output_corroborator,

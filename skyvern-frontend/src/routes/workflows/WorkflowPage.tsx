@@ -347,21 +347,18 @@ function WorkflowPage() {
         ) : (
           <>
             <div className="flex items-center justify-between gap-4">
-              <TableSearchInput
-                value={search}
-                onChange={(value) => {
-                  setSearch(value);
-                  const params = new URLSearchParams(searchParams);
-                  params.set("page", "1");
-                  setSearchParams(params, { replace: true });
-                }}
-                placeholder="Search runs by input..."
-                className="w-48 lg:w-72"
-              />
               <div className="flex items-center gap-2">
-                {WorkflowRunsFilterControls ? (
-                  <WorkflowRunsFilterControls />
-                ) : null}
+                <TableSearchInput
+                  value={search}
+                  onChange={(value) => {
+                    setSearch(value);
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page", "1");
+                    setSearchParams(params, { replace: true });
+                  }}
+                  placeholder="Search runs by input..."
+                  className="w-48 lg:w-72"
+                />
                 {taggingEnabled ? (
                   <TagFilterControl
                     tagKeys={tagFilterKeys}
@@ -371,6 +368,11 @@ function WorkflowPage() {
                     onChange={writeTagsParam}
                     colors={tagColors}
                   />
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2">
+                {WorkflowRunsFilterControls ? (
+                  <WorkflowRunsFilterControls />
                 ) : null}
                 <StatusFilterDropdown
                   values={statusFilters}
@@ -468,14 +470,19 @@ function WorkflowPage() {
                             />
                           )}
                           <TableCell className="font-mono text-xs text-muted-foreground">
-                            <div className="flex flex-col gap-1">
-                              {workflowRunId}
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="min-w-0 truncate">
+                                {workflowRunId}
+                              </span>
                               {taggingEnabled && runTags?.length ? (
                                 <TagChipList
                                   tags={runTags}
                                   descriptions={tagDescriptions}
                                   colors={tagColors}
                                   maxVisible={2}
+                                  hideSystemTags
+                                  compact
+                                  className="shrink-0 font-sans"
                                 />
                               ) : null}
                             </div>

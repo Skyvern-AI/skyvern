@@ -27,17 +27,14 @@ import {
   useUpdateScheduleMutation,
 } from "./useScheduleActions";
 import {
-  CRON_PRESETS,
   cronToHumanReadable,
   formatNextRun,
-  getNextRuns,
-  getTimezones,
   isValidCron,
   meetsMinCronInterval,
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
-import { cn } from "@/util/utils";
 import { getErrorDetail } from "@/util/getErrorDetail";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConfigFields";
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
 import {
   buildScheduleParametersPayload,
@@ -47,8 +44,6 @@ import {
 } from "@/routes/workflows/components/scheduleParameters";
 import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
 import type { Parameter } from "@/routes/workflows/types/workflowTypes";
-
-const allTimezones = getTimezones();
 
 function ScheduleDetailPage() {
   const navigate = useNavigate();
@@ -78,9 +73,6 @@ function ScheduleDetailPage() {
   const [editing, setEditing] = useState(false);
   const [editCron, setEditCron] = useState("");
   const [editTimezone, setEditTimezone] = useState("");
-  // TODO - Create shared util
-  const [timezoneFilter, setTimezoneFilter] = useState<string | null>(null);
-
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
 
@@ -99,19 +91,9 @@ function ScheduleDetailPage() {
     data?.schedule.parameters ?? null,
   );
 
-  const filteredTimezones = useMemo(() => {
-    if (timezoneFilter === null) return allTimezones;
-    if (!timezoneFilter) return allTimezones;
-    const lower = timezoneFilter.toLowerCase();
-    return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
-  }, [timezoneFilter]);
-  // ! end TODO
-
   const editValid = isValidCron(editCron);
   const editIntervalTooShort = editValid && !meetsMinCronInterval(editCron);
   const editCronAccepted = editValid && !editIntervalTooShort;
-  const editHumanReadable = editValid ? cronToHumanReadable(editCron) : null;
-  const editNextRuns = editValid ? getNextRuns(editCron, editTimezone, 5) : [];
 
   if (isLoading) {
     return (
@@ -142,7 +124,6 @@ function ScheduleDetailPage() {
   function startEditing() {
     setEditCron(schedule.cron_expression);
     setEditTimezone(schedule.timezone);
-    setTimezoneFilter(null);
     setEditName(schedule.name ?? "");
     setEditDescription(schedule.description ?? "");
     resetParameters();
@@ -151,7 +132,6 @@ function ScheduleDetailPage() {
 
   function cancelEditing() {
     setEditing(false);
-    setTimezoneFilter(null);
     // Drop any in-progress parameter edits so they don't reappear on
     // re-entry; re-seed from the stored schedule values.
     resetParameters();
@@ -329,119 +309,14 @@ function ScheduleDetailPage() {
                 disabled={updateMutation.isPending}
               />
 
-              {/* Cron Presets */}
-              <div className="space-y-2">
-                <Label className="text-xs">Quick Presets</Label>
-                <div className="flex flex-wrap gap-1.5">
-                  {CRON_PRESETS.map((preset) => (
-                    <Button
-                      key={preset.label}
-                      variant={
-                        editCron === preset.expression ? "default" : "secondary"
-                      }
-                      size="sm"
-                      className="h-6 text-xs"
-                      onClick={() => setEditCron(preset.expression)}
-                    >
-                      {preset.label}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Cron Expression */}
-              <div className="space-y-1.5">
-                <Label className="text-xs">Cron Expression</Label>
-                <Input
-                  value={editCron}
-                  onChange={(e) => setEditCron(e.target.value)}
-                  placeholder="* * * * *"
-                  className={cn(
-                    "h-8 text-sm",
-                    editCron && !editCronAccepted && "border-destructive",
-                  )}
-                />
-                {editHumanReadable && (
-                  <p className="text-xs text-slate-400">{editHumanReadable}</p>
-                )}
-                {!editValid && editCron && (
-                  <p className="text-xs text-destructive">
-                    Invalid cron expression
-                  </p>
-                )}
-                {editIntervalTooShort && (
-                  <p className="text-xs text-destructive">
-                    Schedule runs must be at least 5 minutes apart.
-                  </p>
-                )}
-              </div>
-
-              {/* Timezone */}
-              <div className="space-y-1.5">
-                <Label className="text-xs">Timezone</Label>
-                <Input
-                  value={timezoneFilter ?? editTimezone}
-                  onChange={(e) => setTimezoneFilter(e.target.value)}
-                  onFocus={(e) => e.currentTarget.select()}
-                  onBlur={() => {
-                    if (
-                      filteredTimezones.length === 1 &&
-                      filteredTimezones[0] !== undefined
-                    ) {
-                      setEditTimezone(filteredTimezones[0]);
-                    }
-                    setTimezoneFilter(null);
-                  }}
-                  placeholder="Search timezones..."
-                  className="h-8 text-sm"
-                />
-                {timezoneFilter !== null && (
-                  <div className="max-h-32 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
-                    {filteredTimezones.slice(0, 15).map((tz) => (
-                      <button
-                        key={tz}
-                        type="button"
-                        className={cn(
-                          "w-full px-3 py-1 text-left text-xs hover:bg-slate-700",
-                          tz === editTimezone && "bg-slate-700 text-slate-50",
-                        )}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          setEditTimezone(tz);
-                          setTimezoneFilter(null);
-                        }}
-                      >
-                        {tz}
-                      </button>
-                    ))}
-                    {filteredTimezones.length === 0 && (
-                      <div className="px-3 py-1.5 text-xs text-slate-500">
-                        No timezones found
-                      </div>
-                    )}
-                  </div>
-                )}
-                <p className="text-xs text-slate-500">
-                  Current: {editTimezone}
-                </p>
-              </div>
-
-              {/* Preview next runs */}
-              {editNextRuns.length > 0 && (
-                <div className="space-y-1">
-                  <Label className="text-xs">Next Runs Preview</Label>
-                  <div className="space-y-0.5">
-                    {editNextRuns.map((run) => (
-                      <p
-                        key={run.toISOString()}
-                        className="text-xs text-slate-500"
-                      >
-                        {formatNextRun(run, editTimezone)}
-                      </p>
-                    ))}
-                  </div>
-                </div>
-              )}
+              <ScheduleConfigFields
+                size="compact"
+                cronExpression={editCron}
+                timezone={editTimezone}
+                onCronChange={setEditCron}
+                onTimezoneChange={setEditTimezone}
+                disabled={updateMutation.isPending}
+              />
 
               {/* Save / Cancel */}
               <div className="flex gap-2 pt-1">
