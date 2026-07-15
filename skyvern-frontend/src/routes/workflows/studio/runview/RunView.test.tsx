@@ -271,11 +271,11 @@ beforeEach(() => {
 });
 
 describe("RunView view toggles", () => {
-  test("renders the shared run tag editor", () => {
+  test("does not render run tags in Studio Overview", () => {
     seedCompletedRun();
-    const { getByTestId } = renderRunView();
+    const { queryByTestId } = renderRunView();
 
-    expect(getByTestId("run-tags-editor").dataset.workflowRunId).toBe("wr_1");
+    expect(queryByTestId("run-tags-editor")).toBeNull();
   });
 
   test("defaults to the Timeline view with the timeline and step detail", () => {
