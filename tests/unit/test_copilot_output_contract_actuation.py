@@ -1954,6 +1954,24 @@ def test_non_minted_registered_download_path_still_requires_author_coverage() ->
     assert wu._requested_output_child_paths(ctx) == {"output.downloaded_files"}
 
 
+def test_independent_validation_classification_is_post_run_only() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c1",
+            outcome="The run classifies whether the path is login-only.",
+            kind="validation_classification",
+            classification_output_key="login_only",
+            expected_classification=True,
+            expected_output_shape="goal_judgment_boolean",
+            requested_output_evidence_source="independent_run_evidence",
+            mint_disposition="pending",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).observation_paths == set()
+
+
 def test_runtime_repair_contract_carries_declaration_lane_with_stable_signature() -> None:
     ctx = _antecedent_ctx(
         CompletionCriterion(

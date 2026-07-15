@@ -2318,6 +2318,17 @@ def _active_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion,
     return turn_state.decision.criteria
 
 
+def _coverage_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    criteria = list(_active_completion_criteria(ctx))
+    policy = getattr(ctx, "request_policy", None)
+    if isinstance(policy, RequestPolicy):
+        known = {(criterion.id, criterion.output_path) for criterion in criteria}
+        criteria.extend(
+            criterion for criterion in policy.completion_criteria if (criterion.id, criterion.output_path) not in known
+        )
+    return tuple(criteria)
+
+
 def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
     """Completion criteria whose requested output is observable before a run. A criterion whose
     evidence comes from an independent run, registered output parameter, or artifact content is
@@ -2326,7 +2337,7 @@ def _pre_run_gated_completion_criteria(ctx: AgentContext) -> tuple[CompletionCri
     is SKY-11591's."""
     return tuple(
         criterion
-        for criterion in _active_completion_criteria(ctx)
+        for criterion in _coverage_completion_criteria(ctx)
         if criterion.requested_output_evidence_source not in _PRE_RUN_UNGATED_EVIDENCE_SOURCES
     )
 
@@ -2341,15 +2352,15 @@ def _requested_output_paths_for_ctx(ctx: AgentContext) -> set[str]:
             for raw in repair_context.required_goal_value_paths
             if isinstance(raw, str) and raw
         )
-    active_criteria = _active_completion_criteria(ctx)
+    coverage_criteria = _coverage_completion_criteria(ctx)
     independent_run_evidence_paths = {
         _canonical_output_path(criterion.output_path)
-        for criterion in active_criteria
+        for criterion in coverage_criteria
         if criterion.requested_output_evidence_source == "independent_run_evidence" and criterion.output_path
     }
     non_independent_evidence_paths = {
         _canonical_output_path(criterion.output_path)
-        for criterion in active_criteria
+        for criterion in coverage_criteria
         if criterion.requested_output_evidence_source != "independent_run_evidence" and criterion.output_path
     }
     independent_only_paths = independent_run_evidence_paths - non_independent_evidence_paths
@@ -2412,9 +2423,10 @@ def _requested_output_labels_by_path(ctx: AgentContext) -> dict[str, tuple[str, 
     requested_paths = _requested_output_paths_for_ctx(ctx)
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
-        if criterion.output_path in requested_paths and criterion.outcome.strip():
+        outcome = criterion.outcome.strip()
+        if criterion.output_path in requested_paths and outcome:
             labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+            labels_by_path[criterion.output_path] += (outcome,)
     return labels_by_path
 
 
@@ -2440,9 +2452,10 @@ def requested_scalar_output_extraction_plan(ctx: AgentContext) -> RequestedOutpu
         return None
     labels_by_path: dict[str, tuple[str, ...]] = {}
     for criterion in _pre_run_gated_completion_criteria(ctx):
-        if criterion.output_path in requested_paths and criterion.outcome.strip():
+        outcome = criterion.outcome.strip()
+        if criterion.output_path in requested_paths and outcome:
             labels_by_path.setdefault(criterion.output_path, ())
-            labels_by_path[criterion.output_path] += (criterion.outcome.strip(),)
+            labels_by_path[criterion.output_path] += (outcome,)
     if set(labels_by_path) != requested_paths:
         return None
     return derive_requested_output_extraction_plan(

@@ -94,6 +94,8 @@ class TestRequestPolicyPromptStructure:
             "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
             "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
         ) in rendered
+        assert "typed request-slot producer owns its final identity, path, plane, and pinability" in rendered
+        assert "Do not infer or emit pinability here" in rendered
         assert "never hide it in outcome prose" in rendered
         assert (
             "reference_code, numeric_identifier, date, address, status_label, money_amount, owner_label, "

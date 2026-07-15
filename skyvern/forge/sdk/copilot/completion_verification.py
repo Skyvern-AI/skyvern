@@ -28,8 +28,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     TerminalActionFamily,
     is_contingent_missing_antecedent_degraded,
     is_fallback_floor_base_criterion,
+    is_judgment_finalization_candidate,
     is_turn_unsatisfiable_fallback_degraded,
-    is_undecidable_judgment_degraded,
     redact_raw_secrets_for_prompt,
 )
 from skyvern.utils.strings import escape_code_fences
@@ -2457,6 +2457,21 @@ def floor_rekeyed_deliverable_credit(
     )
 
 
+def gradeable_completion_criteria(criteria: Iterable[CompletionCriterion]) -> list[CompletionCriterion]:
+    return [
+        criterion
+        for criterion in criteria
+        if criterion.mint_degrade != "undecidable_judgment"
+        and not (
+            is_judgment_finalization_candidate(criterion) and criterion.mint_disposition in {"pending", "degraded"}
+        )
+        and not (
+            criterion.requested_output_corroborator
+            and criterion.requested_output_evidence_source == "independent_run_evidence"
+        )
+    ]
+
+
 def carry_degraded_criterion_ids(
     result: CompletionVerificationResult,
     criteria: Iterable[CompletionCriterion],
@@ -2465,7 +2480,7 @@ def carry_degraded_criterion_ids(
     degraded = [
         criterion.id
         for criterion in criteria
-        if is_turn_unsatisfiable_fallback_degraded(criterion) or is_undecidable_judgment_degraded(criterion)
+        if criterion.mint_degrade is not None and not is_contingent_missing_antecedent_degraded(criterion)
     ]
     contingent_degraded = [
         criterion.id for criterion in criteria if is_contingent_missing_antecedent_degraded(criterion)

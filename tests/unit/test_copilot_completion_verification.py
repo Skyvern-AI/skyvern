@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_structured_record_criteria,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
+    gradeable_completion_criteria,
     is_registered_download_completion_criterion,
     only_degraded_blocking,
     registered_download_completion_criterion,
@@ -3388,6 +3389,38 @@ def test_zero_requested_output_criteria_credit_fires_only_with_payload() -> None
 
     assert zero_requested_output_criteria_credit(satisfied, has_meaningful_registered_output=True) is True
     assert zero_requested_output_criteria_credit(satisfied, has_meaningful_registered_output=False) is False
+
+
+def test_gradeable_completion_criteria_excludes_pending_and_degraded_judgments() -> None:
+    reached = CompletionCriterion(id="reached", outcome="The requested page is reached.")
+    pending_judgment = CompletionCriterion(
+        id="pending",
+        outcome="The pending requested judgment is returned.",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        mint_disposition="pending",
+    )
+    degraded_judgment = CompletionCriterion(
+        id="judgment",
+        outcome="The requested judgment is returned.",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        mint_degrade="undecidable_judgment",
+        mint_disposition="degraded",
+    )
+    pending_classification = CompletionCriterion(
+        id="classification",
+        outcome="The requested classification is returned.",
+        kind="validation_classification",
+        classification_output_key="login_only",
+        mint_disposition="pending",
+    )
+
+    assert gradeable_completion_criteria([reached, pending_judgment, degraded_judgment, pending_classification]) == [
+        reached
+    ]
+    assert gradeable_completion_criteria([pending_judgment]) == []
+    assert gradeable_completion_criteria([degraded_judgment]) == []
 
 
 def test_zero_requested_output_criteria_credit_ignored_when_criteria_formed() -> None:

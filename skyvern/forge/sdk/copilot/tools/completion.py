@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     grade_terminal_goal_record_corroboration,
     grade_terminal_goal_record_criteria,
     grade_validation_classification_criteria,
+    gradeable_completion_criteria,
     is_fallback_floor_base_criterion,
     is_registered_download_completion_criterion,
     only_degraded_blocking,
@@ -237,15 +238,24 @@ def _completion_verification_criteria(copilot_ctx: Any) -> list[CompletionCriter
     policy = _completion_request_policy(copilot_ctx)
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
-    criteria = policy.graded_completion_criteria() if policy is not None else []
+    formed_criteria = policy.graded_completion_criteria() if policy is not None else []
+    criteria = gradeable_completion_criteria(formed_criteria)
     authored_output_criteria = _authored_output_contract_criteria(copilot_ctx)
-    if authored_output_criteria and (not criteria or all(is_fallback_floor_criterion(c) for c in criteria)):
+    if authored_output_criteria and (
+        not formed_criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)
+    ):
         return authored_output_criteria
     if _accepted_staged_output_contract_missing(copilot_ctx) and (
-        not criteria or all(is_fallback_floor_criterion(c) for c in criteria)
+        not formed_criteria or all(is_fallback_floor_criterion(c) for c in formed_criteria)
     ):
         return [_authored_output_contract_missing_criterion()]
     return criteria
+
+
+def _carry_degraded_ids(copilot_ctx: Any, verification: CompletionVerificationResult) -> CompletionVerificationResult:
+    policy = _completion_request_policy(copilot_ctx)
+    formed_criteria = policy.graded_completion_criteria() if policy is not None else []
+    return carry_degraded_criterion_ids(verification, formed_criteria)
 
 
 def _authored_output_contract_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
@@ -459,7 +469,7 @@ async def _maybe_run_completion_verification_from_page_observation(
     )
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
-        verification = carry_degraded_criterion_ids(verification, criteria)
+        verification = _carry_degraded_ids(copilot_ctx, verification)
         verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
         copilot_ctx.completion_verification_result = verification
         record_completion_verification(copilot_ctx, verification)
@@ -616,7 +626,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                 requested_output_criteria_count=len(requested_output_criteria),
             )
 
-    verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = _carry_degraded_ids(copilot_ctx, verification)
     verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     if (
         isinstance(existing, CompletionVerificationResult)
@@ -1355,7 +1365,7 @@ async def _maybe_run_completion_verification(
     verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
     if verification is None:
         return None
-    verification = carry_degraded_criterion_ids(verification, criteria)
+    verification = _carry_degraded_ids(copilot_ctx, verification)
     verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     run_data = result.get("data")
     return _carry_floor_rekeyed_backing(

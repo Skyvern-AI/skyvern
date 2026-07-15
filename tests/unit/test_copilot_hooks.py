@@ -443,6 +443,7 @@ class TestMCPFailedStepLoopDetection:
             last_code_authoring_repair_context=None,
             scouted_output_covered_paths=set(),
             reached_download_target=None,
+            request_policy=None,
         )
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),

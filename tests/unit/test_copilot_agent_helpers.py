@@ -17,6 +17,7 @@ from structlog.testing import capture_logs
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _VERIFIED_WORKFLOW_SUCCESS_REPLY,
@@ -72,6 +73,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     CompletionCriterion,
+    JudgmentTruthCondition,
     RequestPolicy,
     _classifier_fallback_policy,
     _classify_request,
@@ -84,6 +86,7 @@ from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REA
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
+    _carry_degraded_ids,
     _completion_verification_criteria,
     _maybe_run_completion_verification,
 )
@@ -3911,6 +3914,28 @@ class TestRequestPolicyCredentialResolution:
         assert policy.completion_contract_status == "present"
 
     @pytest.mark.asyncio
+    async def test_request_policy_classifier_malformed_payload_preserves_timeout_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def malformed_after_timeout(*_args: object, **_kwargs: object) -> tuple[str, str, int]:
+            return "not-json", "timeout", 1
+
+        monkeypatch.setattr(request_policy_module, "_run_request_policy_classifier", malformed_after_timeout)
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=AsyncMock(),
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "timeout"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
     async def test_request_policy_classifier_retries_transient_error_then_succeeds(self) -> None:
         class RateLimitError(Exception):
             __module__ = "openai"
@@ -6511,6 +6536,89 @@ class TestClassifierFallbackCompletionFloor:
 
         assert policy.completion_criteria
         assert _completion_verification_criteria(ctx) == [policy.completion_criteria[0]]
+
+    def test_degraded_judgment_does_not_hide_contradictory_required_outputs(self) -> None:
+        reached = CompletionCriterion(id="c0", outcome="the requested page is reached")
+        degraded_judgment = CompletionCriterion(
+            id="public_form_exists",
+            outcome="the public-form judgment is returned",
+            mint_degrade="undecidable_judgment",
+        )
+        required_output = CompletionCriterion(id="visible_page_path_label", outcome="the visible path is returned")
+        contradiction = "evidence_contradicts"
+        verification = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=[reached.id, required_output.id],
+            verdicts=[
+                CriterionVerdict(criterion_id=reached.id, state="satisfied", reason_code="evidence_confirms"),
+                CriterionVerdict(criterion_id=required_output.id, state="unsatisfied", reason_code=contradiction),
+            ],
+        )
+
+        carried = _carry_degraded_ids(
+            SimpleNamespace(
+                request_policy=RequestPolicy(completion_criteria=[reached, degraded_judgment, required_output])
+            ),
+            verification,
+        )
+        assert carried.degraded_criterion_ids == [degraded_judgment.id]
+        assert carried.is_fully_satisfied() is False
+
+        judgment_only = _carry_degraded_ids(
+            SimpleNamespace(request_policy=RequestPolicy(completion_criteria=[reached, degraded_judgment])),
+            CompletionVerificationResult(
+                status="evaluated", criterion_ids=[reached.id], verdicts=verification.verdicts[:1]
+            ),
+        )
+        assert judgment_only.degraded_criterion_ids == [degraded_judgment.id]
+        assert judgment_only.is_fully_satisfied() is True
+
+    def test_p9_degraded_judgments_suppress_their_generic_corroborator(self) -> None:
+        reached = CompletionCriterion(id="c2", outcome="the visible page path label is returned")
+        degraded = [
+            CompletionCriterion(
+                id=criterion_id,
+                outcome=outcome,
+                kind="validation_classification",
+                classification_output_key=output_key,
+                judgment_truth_condition=truth_condition,
+                mint_degrade="undecidable_judgment",
+                mint_disposition="degraded",
+            )
+            for criterion_id, outcome, output_key, truth_condition in (
+                ("c0", "whether a public form exists", "public_form_exists", None),
+                (
+                    "c1",
+                    "whether the path is login-only",
+                    "login_only",
+                    JudgmentTruthCondition(predicate="login_gate_blocks_target", polarity_when_holds=True),
+                ),
+            )
+        ]
+        judgment_corroborator = CompletionCriterion(
+            id="c3",
+            outcome="the recommended next action is returned",
+            requested_output_evidence_source="independent_run_evidence",
+            requested_output_corroborator=True,
+        )
+        policy = RequestPolicy(completion_criteria=[*degraded, reached, judgment_corroborator])
+        ctx = SimpleNamespace(request_policy=policy)
+
+        assert _completion_verification_criteria(ctx) == [reached]
+
+        carried = _carry_degraded_ids(
+            ctx,
+            CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=[reached.id],
+                verdicts=[
+                    CriterionVerdict(criterion_id=reached.id, state="satisfied", reason_code="evidence_confirms"),
+                ],
+            ),
+        )
+
+        assert carried.degraded_criterion_ids == ["c0", "c1"]
+        assert carried.is_fully_satisfied() is True
 
     def test_credential_aware_floor_adds_one_run_plane_criterion(self) -> None:
         base = build_classifier_fallback_floor([])

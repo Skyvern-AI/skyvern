@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
+    JudgmentTruthCondition,
     RequestPolicy,
     _parse_completion_criteria,
     normalized_criterion_outcome_key,
@@ -313,6 +314,118 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_typed_criteria_list_round_trip_preserves_grading_metadata() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The visible page path label is returned.",
+        output_path="output.visible_page_path_label",
+        expected_output_value="Public start-service path",
+        pinability="unpinnable",
+        mint_degrade="undecidable_judgment",
+        mint_disposition="degraded",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert isinstance(raw, list)
+    assert raw[0]["pinability"] == "unpinnable"
+    assert criteria_from_json(raw) == (criterion,)
+
+
+def test_typed_boolean_validation_classification_round_trip_preserves_shape_and_evidence() -> None:
+    """Typed boolean classifications persist goal_judgment_boolean / independent_run_evidence."""
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The run classifies whether a public form exists.",
+        kind="validation_classification",
+        classification_output_key="public_form_exists",
+        expected_output_shape="goal_judgment_boolean",
+        requested_output_evidence_source="independent_run_evidence",
+        judgment_truth_condition=JudgmentTruthCondition(
+            predicate="login_gate_blocks_target", polarity_when_holds=False
+        ),
+        pinability="pinned",
+        mint_disposition="pending",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert raw[0]["expected_output_shape"] == "goal_judgment_boolean"
+    assert raw[0]["requested_output_evidence_source"] == "independent_run_evidence"
+    reloaded = criteria_from_json(raw)
+    assert reloaded == (criterion,)
+    assert reloaded[0].expected_output_shape == "goal_judgment_boolean"
+    assert reloaded[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+def test_untyped_boolean_validation_classification_reload_normalizes_shape_and_evidence() -> None:
+    """Rows without typed mint metadata carry no reliable shape/evidence markers."""
+    legacy = {
+        "id": "c0",
+        "outcome": "The run classifies whether a public form exists.",
+        "kind": "validation_classification",
+        "classification_output_key": "public_form_exists",
+        "expected_output_shape": "goal_judgment_boolean",
+        "requested_output_evidence_source": "independent_run_evidence",
+    }
+
+    reloaded = criteria_from_json([legacy])
+
+    assert reloaded[0].expected_output_shape is None
+    assert reloaded[0].requested_output_evidence_source == "runtime_output"
+
+
+def test_typed_metadata_is_self_describing_without_a_storage_version() -> None:
+    legacy = {"id": "c0", "outcome": "done", "output_path": "output.done"}
+    decorated = {
+        **legacy,
+        "pinability": "unpinnable",
+        "mint_disposition": "degraded",
+    }
+
+    assert criteria_from_json([legacy]) == (CompletionCriterion(id="c0", outcome="done", output_path="output.done"),)
+    assert criteria_from_json([decorated]) == (
+        CompletionCriterion(
+            id="c0",
+            outcome="done",
+            output_path="output.done",
+            pinability="unpinnable",
+            mint_disposition="degraded",
+        ),
+    )
+
+
+def test_reconciliation_identity_ignores_pinability_and_derived_mint_state() -> None:
+    stored = StoredCriteriaSet(
+        set_id="wccs_1",
+        goal_epoch=1,
+        criteria=(
+            CompletionCriterion(
+                id="s0",
+                outcome="done",
+                output_path="output.done",
+                expected_output_value=True,
+                pinability="pinned",
+            ),
+        ),
+    )
+    fresh = CompletionCriterion(
+        id="f0",
+        outcome="done",
+        output_path="output.done",
+        expected_output_value=True,
+        pinability="unpinnable",
+        mint_degrade="undecidable_judgment",
+        mint_disposition="degraded",
+    )
+
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2), [fresh], actionable=True
+    )
+
+    assert decision.action == "adopt_stored"
 
 
 def test_criteria_from_json_degrades_stored_pathless_contingent() -> None:
@@ -1157,6 +1270,17 @@ def test_reconcile_on_context_adopts_stored_criteria_onto_policy() -> None:
     assert ctx.completion_criteria_turn_state is not None
     assert ctx.completion_criteria_turn_state.decision is not None
     assert ctx.completion_criteria_turn_state.decision.reason == "kept"
+
+
+def test_reconcile_on_context_creates_typed_criteria_without_a_contract_version() -> None:
+    policy = RequestPolicy(completion_criteria=[_criterion("c0", "the item is in the cart")])
+    ctx = _ctx()
+
+    _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(StoredCriteriaSnapshot()))
+
+    plan = plan_persistence(ctx.completion_criteria_turn_state)
+    assert plan is not None
+    assert plan.create_criteria == tuple(policy.completion_criteria)
 
 
 def test_reconcile_on_context_skips_without_snapshot() -> None:
