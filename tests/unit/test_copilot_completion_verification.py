@@ -12604,6 +12604,25 @@ _NON_ABSTAINING_CONTINGENT_CRITERIA: dict[str, tuple[CompletionCriterion, RunEvi
 }
 
 
+def test_undecidable_judgment_degrade_cannot_earn_completion_credit() -> None:
+    delivered = _criterion("delivered", "A real output is delivered.")
+    undecidable = _criterion(
+        "undecidable",
+        "Whether a public path exists is returned.",
+        mint_degrade="undecidable_judgment",
+    )
+    result = _graded_result(
+        [delivered, undecidable],
+        RunEvidenceSnapshot(),
+        {undecidable.id},
+        unsatisfied_state="unknown",
+        unsatisfied_reason_code="no_evidence",
+    )
+
+    assert result.degraded_criterion_ids == [undecidable.id]
+    assert result.is_fully_satisfied() is False
+
+
 @pytest.mark.parametrize("arm", sorted(_NON_ABSTAINING_CONTINGENT_CRITERIA))
 @pytest.mark.parametrize(
     "unsatisfied_state, unsatisfied_reason_code",
