@@ -196,6 +196,39 @@ def build_output_source_unobservable_blocker_signal(
     )
 
 
+def build_definition_contract_unsatisfied_blocker_signal(
+    *, unresolved_parameter_keys: Iterable[str], grounding_unresolved: bool = False
+) -> CopilotToolBlockerSignal:
+    parameter_keys = sorted({str(key).strip() for key in unresolved_parameter_keys if str(key).strip()})
+    if parameter_keys:
+        key_text = ", ".join(f"`{key}`" for key in parameter_keys)
+        user_facing = (
+            f"I kept the workflow draft, but I could not safely connect the current page fields to these reusable "
+            f"inputs: {key_text}. No workflow run was started."
+            if grounding_unresolved
+            else f"I kept the workflow draft, but it cannot run because these reusable inputs are not used: "
+            f"{key_text}. Connect each input to the workflow before trying again."
+        )
+    else:
+        user_facing = (
+            "I kept the workflow draft, but it does not yet satisfy the required workflow definition. "
+            "Complete the missing definition requirements before trying again."
+        )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            "The exact candidate failed its definition contract before execution. Preserve the draft, stop this "
+            "turn, and explain the unresolved reusable inputs without dispatching the candidate."
+        ),
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
+        extra={"unresolved_parameter_keys": parameter_keys, "grounding_unresolved": grounding_unresolved},
+    )
+
+
 def build_llm_tool_error_payload(signal: CopilotToolBlockerSignal) -> str:
     return signal.agent_steering_text
 
@@ -344,6 +377,7 @@ _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budge
 SYNTHESIZED_BLOCK_PERSISTENCE_REASON_CODE = "tool_error_synthesized_block_persistence_required"
 UNCOVERED_OUTPUT_RESCOUT_STEER_REASON_CODE = "tool_error_uncovered_output_rescout_steer"
 RECORDED_OUTCOME_GROUNDING_REASON_CODE = "recorded_outcome_grounding_required"
+DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE = "definition_contract_unsatisfied"
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 _OUTPUT_CONTRACT_TERMINAL_REASON_CODES = frozenset(
     {OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE, OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE}
@@ -363,6 +397,7 @@ GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
         "advisory_dispatch_stalled",
+        DEFINITION_CONTRACT_UNSATISFIED_REASON_CODE,
         "repair_ceiling_reached",
     }
 )

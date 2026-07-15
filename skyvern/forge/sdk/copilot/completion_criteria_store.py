@@ -18,10 +18,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     run_plane_all_no_evidence,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
     CriterionKind,
     ExpectedOutputShape,
     RequestedOutputEvidenceSource,
+    RequestedOutputPathMintSource,
     TerminalActionFamily,
     _canonical_bool_string,
     _coerce_classification_output_key,
@@ -151,6 +153,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
         }
         if criterion.requested_output_corroborator:
             item["requested_output_corroborator"] = True
+        if criterion.requested_output_path_mint_source is not None:
+            item["requested_output_path_mint_source"] = criterion.requested_output_path_mint_source
         if criterion.mint_degrade is not None:
             item["mint_degrade"] = criterion.mint_degrade
         if criterion.judgment_truth_condition is not None:
@@ -193,6 +197,11 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         terminal_action_family = (
             family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
         )
+        mint_source_raw = item.get("requested_output_path_mint_source")
+        requested_output_path_mint_source = cast(
+            RequestedOutputPathMintSource | None,
+            mint_source_raw if mint_source_raw in REQUESTED_OUTPUT_PATH_MINT_SOURCES else None,
+        )
         stored_output_path = output_path.strip() if isinstance(output_path, str) and output_path.strip() else None
         stored_expected_output_value = _coerce_expected_output_value(expected_output_value)
         stored_expected_output_shape = cast(ExpectedOutputShape | None, expected_output_shape)
@@ -225,6 +234,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 expected_output_value=stored_expected_output_value,
                 expected_output_shape=stored_expected_output_shape,
                 requested_output_evidence_source=cast(RequestedOutputEvidenceSource, requested_output_evidence_source),
+                requested_output_path_mint_source=requested_output_path_mint_source,
                 kind=cast(CriterionKind, kind),
                 terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
                 classification_output_key=classification_output_key,
