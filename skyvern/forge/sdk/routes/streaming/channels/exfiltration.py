@@ -557,8 +557,16 @@ class ExfiltrationChannel(CdpChannel):
 
         LOG.info(f"{self.class_name} removing decoration from page.", url=page.url)
 
-        await page.add_init_script(self.js("undecorate"))
-        await page.evaluate(self.js("undecorate"))
+        # Best-effort cleanup: the page's target can close mid-recording (take-control
+        # swaps, navigations, bot-detection pages), and Playwright then raises
+        # TargetClosedError here. Swallowing it keeps teardown from crashing the whole
+        # message-channel loop, which would drop capture and yield empty recordings.
+        try:
+            await page.add_init_script(self.js("undecorate"))
+            await page.evaluate(self.js("undecorate"))
+        except Exception:
+            LOG.debug(f"{self.class_name} failed to remove decoration from page", url=page.url, exc_info=True)
+            return self
 
         LOG.info(f"{self.class_name} decoration removed from page.", url=page.url)
 

@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.context import FillCarry
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     mint_scout_observation_contract_for_ctx,
+    record_reached_terminal_action_observation,
     record_scouted_output_coverage,
     register_no_progress_interaction_click,
     reset_no_progress_interaction_count,
@@ -506,6 +507,7 @@ def _record_scouted_interaction(
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
+    record_reached_terminal_action_observation(ctx)
 
 
 def _page_evidence_has_selector(value: Any, selector: str) -> bool:

@@ -152,9 +152,11 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     code_is_download_intent,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
+    REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
     JudgmentPredicate,
     RequestedOutputEvidenceSource,
+    RequestedOutputPathMintSource,
     _coerce_requested_output_evidence_source,
     _is_judgment_boolean_criterion,
 )
@@ -229,6 +231,13 @@ from .guardrails import (
 )
 
 LOG = structlog.get_logger()
+
+_CLASSIFIER_DEFAULT_MINT_SOURCE: RequestedOutputPathMintSource = "classifier_default"
+if REQUESTED_OUTPUT_PATH_MINT_SOURCES != {_CLASSIFIER_DEFAULT_MINT_SOURCE}:
+    raise RuntimeError(
+        "RequestedOutputPathMintSource gained a member; the requested-output author-exclusion "
+        "must be revisited before this equality can stay strict."
+    )
 
 
 class BlockObservationRef(BaseModel):
@@ -1659,6 +1668,8 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return set()
     paths: set[str] = set()
+    # Criteria at this seam are polymorphic (typed CompletionCriterion plus lighter duck-typed
+    # shapes), so read fields via getattr — a non-model criterion must still contribute its path.
     for criterion in _active_completion_criteria(ctx):
         if isinstance(criterion, CompletionCriterion) and _is_judgment_boolean_criterion(criterion):
             continue
@@ -1669,6 +1680,8 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
         if getattr(criterion, "kind", None) == "validation_classification":
             continue
         if getattr(criterion, "mint_degrade", None) is not None:
+            continue
+        if getattr(criterion, "requested_output_path_mint_source", None) == _CLASSIFIER_DEFAULT_MINT_SOURCE:
             continue
         path = _canonical_requested_output_path(getattr(criterion, "output_path", None))
         if path and _output_path_has_child(path):
@@ -3033,6 +3046,54 @@ def _apply_metadata_contract_scaffold(
     return items
 
 
+def _scaffold_metadata_from_owned_carrier_produced_output(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_code_artifact_metadata: object,
+) -> tuple[object, bool]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return raw_code_artifact_metadata, False
+    if not ctx.spine_imposition_owned_attempt:
+        return raw_code_artifact_metadata, False
+    carrier_label = str(ctx.spine_imposition_carrier_label or "").strip()
+    if not carrier_label:
+        return raw_code_artifact_metadata, False
+    if carrier_label not in _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_code_artifact_metadata):
+        return raw_code_artifact_metadata, False
+    carrier_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(carrier_label)
+    if carrier_block is None:
+        return raw_code_artifact_metadata, False
+    produced_paths = {
+        path
+        for path in _code_block_produced_output_paths(str(carrier_block.get("code") or ""))
+        if _output_path_has_child(path)
+    } - _judgment_output_paths(ctx)
+    if not produced_paths:
+        return raw_code_artifact_metadata, False
+    schema_text = _schema_template_text_for_required_paths(produced_paths)
+    items = [
+        copy.deepcopy(item)
+        for item in _code_artifact_metadata_items(raw_code_artifact_metadata)
+        if _raw_metadata_item_mapping(item) is not None
+    ]
+    target_index: int | None = None
+    for index, raw_item in enumerate(items):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is not None and str(item.get("block_label") or "").strip() == carrier_label:
+            target_index = index
+            break
+    if target_index is None:
+        target: dict[str, Any] = {"block_label": carrier_label}
+        items.append(target)
+    else:
+        target = dict(items[target_index])
+        items[target_index] = target
+    target["block_label"] = carrier_label
+    target["artifact_id"] = _artifact_id_for_block_label(carrier_label)
+    _ensure_metadata_contract_rows(target, goal_value_paths=produced_paths, schema_text=schema_text)
+    return items, True
+
+
 def _scaffold_metadata_contract_for_update(
     ctx: AgentContext,
     workflow_yaml: str,
@@ -3040,7 +3101,7 @@ def _scaffold_metadata_contract_for_update(
 ) -> tuple[object, bool]:
     contract = _output_contract_required_paths_source(ctx)
     if not contract.union:
-        return raw_code_artifact_metadata, False
+        return _scaffold_metadata_from_owned_carrier_produced_output(ctx, workflow_yaml, raw_code_artifact_metadata)
     signature = _output_contract_signature(
         ctx=ctx,
         workflow_yaml=workflow_yaml,
@@ -5452,6 +5513,7 @@ class _SynthesizedCodeImpositionResult:
     scrubbed_selected_metadata_label: str | None = None
     selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
     minted_parameter_keys: list[str] = dataclass_field(default_factory=list)
+    metadata_repair_contract: dict[str, object] | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -8181,13 +8243,6 @@ def _reconcile_synthesized_parameters(
             parameters.append(_string_parameter_row(synthesized_default, key))
             continue
 
-        if len(non_credential_synthesized) != 1:
-            add_binding_violation(
-                key,
-                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
-            )
-            continue
-
         typed_length = typed_length or scout_typed_length or (typed_lengths[0] if len(typed_lengths) == 1 else None)
         direct_fill_usage = _submitted_direct_fill_type_usage(submitted_code, key)
         if direct_fill_usage.matched and direct_fill_usage.mismatched:
@@ -8198,6 +8253,17 @@ def _reconcile_synthesized_parameters(
                 "fill in the code block, or declare explicit workflow parameters/defaults for the other filled values.",
             )
             continue
+
+        if len(non_credential_synthesized) != 1:
+            if matched_scout is not None or direct_fill_usage.matched:
+                parameters.append(_required_string_parameter_row(key))
+                continue
+            add_binding_violation(
+                key,
+                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous.",
+            )
+            continue
+
         if direct_fill_usage.matched:
             parameters.append(_required_string_parameter_row(key))
             continue
@@ -8314,6 +8380,25 @@ def _split_selected_output_owner_into_browser_stages(
     code_block.pop("parameter_keys", None)
     blocks[selected_index : selected_index + 1] = [*stage_blocks, code_block]
     return []
+
+
+def _co_computed_metadata_repair_contract(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    raw_metadata: object,
+) -> dict[str, object] | None:
+    # Derive the missing-metadata block labels the same way the save-path reject does, so the repair
+    # hint names the actually-uncovered block(s) rather than the imposed carrier in a multi-block workflow.
+    missing_labels = _missing_code_artifact_metadata_labels(workflow_yaml, ctx, raw_metadata)
+    if not missing_labels:
+        return None
+    required_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
+    return _metadata_repair_contract(
+        block_labels=missing_labels,
+        required_paths=required_paths,
+        source=source,
+        reason_code=reason_code,
+    )
 
 
 def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
@@ -8569,6 +8654,7 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     violations.extend(parameter_reconciliation.violations)
     if repair_context is None:
         repair_context = parameter_reconciliation.repair_context
+    raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
     if violations:
         persisted_calls = ctx.persisted_draft_browser_calls
         if ambiguous_reject_present and ctx.update_workflow_called and persisted_calls is not None:
@@ -8580,9 +8666,9 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
             workflow_yaml=workflow_yaml,
             violations=violations,
             repair_context=repair_context,
+            metadata_repair_contract=_co_computed_metadata_repair_contract(ctx, workflow_yaml, raw_metadata),
         )
 
-    raw_metadata = getattr(ctx, "raw_code_artifact_metadata", None)
     metadata_declares_goal_values = bool(raw_metadata) and _raw_metadata_declares_goal_values_for_block(
         raw_metadata, str(code_block.get("label") or "")
     )
@@ -9915,7 +10001,10 @@ async def _update_workflow(
         return reject(
             error="\n".join(imposition.violations),
             user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(imposition.repair_context),
+            data=_code_repair_progress_data(
+                imposition.repair_context,
+                metadata_repair_contract=imposition.metadata_repair_contract,
+            ),
             repair_context=imposition.repair_context,
         )
     workflow_yaml = imposition.workflow_yaml
