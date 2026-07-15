@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import copy
 import csv
+import hashlib
 import html
 import json
 import keyword
@@ -13,6 +14,7 @@ import os
 import re
 import shutil
 import smtplib
+import socket
 import textwrap
 import unicodedata
 import uuid
@@ -3715,11 +3717,20 @@ class CodeBlock(Block):
         }
 
     def generate_async_user_function(
-        self, code: str, page: Page | RecordingPage, parameters: dict[str, Any] | None = None
+        self,
+        code: str,
+        page: Page | RecordingPage,
+        parameters: dict[str, Any] | None = None,
+        *,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
         self.is_safe_code(code)
+        code_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        code_len = len(code)
         code = textwrap.indent(textwrap.dedent(code), "    ")
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
@@ -3741,6 +3752,19 @@ async def wrapper({default_args}):
         safe_vars["__param_defaults"] = parameter_defaults
         # Compile under a recognizable filename so tracebacks map back to user code lines.
         compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        inline_exec_context = skyvern_context.current()
+        LOG.info(
+            "codeblock.inline_exec_entered",
+            code_sha256=code_sha256,
+            code_len=code_len,
+            in_process=True,
+            pid=os.getpid(),
+            hostname=socket.gethostname(),
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            trace_id=inline_exec_context.request_id if inline_exec_context else None,
+        )
         exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
         if not parameter_defaults:
@@ -4698,7 +4722,22 @@ async def wrapper({default_args}):
                         secure_code_block_result.block_result.output_parameter_value,
                     )
                     return secure_code_block_result.block_result
-            user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
+                LOG.warning(
+                    "codeblock.secure_runner_downgrade",
+                    selection_reason="override_returned_none",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    block_label=self.label,
+                )
+            user_function = self.generate_async_user_function(
+                self.code,
+                recording_page,
+                parameter_values,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
