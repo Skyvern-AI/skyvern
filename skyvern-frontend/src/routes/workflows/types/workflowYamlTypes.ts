@@ -294,6 +294,7 @@ export type LoginBlockYAML = BlockYAMLBase & {
   disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  include_action_history_in_verification: boolean;
   engine: RunEngine | null;
 };
 

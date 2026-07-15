@@ -881,6 +881,8 @@ function convertToNode(
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          includeActionHistoryInVerification:
+            block.include_action_history_in_verification ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
@@ -3058,6 +3060,8 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
+        include_action_history_in_verification:
+          node.data.includeActionHistoryInVerification,
         engine: node.data.engine,
       };
     }
@@ -4463,6 +4467,8 @@ function convertBlocksToBlockYAML(
           disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
+          include_action_history_in_verification:
+            block.include_action_history_in_verification,
           engine: block.engine,
         };
         return blockYaml;

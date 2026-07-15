@@ -15,6 +15,7 @@ export type LoginNodeData = NodeBaseData & {
   disableCache: boolean;
   completeCriterion: string;
   terminateCriterion: string;
+  includeActionHistoryInVerification: boolean;
   engine: RunEngine | null;
 };
 
@@ -37,6 +38,7 @@ export const loginNodeDefaultData: LoginNodeData = {
   disableCache: false,
   completeCriterion: "",
   terminateCriterion: "",
+  includeActionHistoryInVerification: false,
   engine: RunEngine.SkyvernV1,
   model: null,
   ignoreWorkflowSystemPrompt: false,
