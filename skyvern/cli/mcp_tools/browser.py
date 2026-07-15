@@ -15,6 +15,7 @@ from skyvern.cli.core.browser_ops import (
     _ALLOWED_EXECUTE_TOOLS,
     MAX_EXECUTE_STEPS,
     ExecuteStep,
+    ObserveFrameError,
     ToolStepError,
     do_act,
     do_execute,
@@ -2258,6 +2259,17 @@ async def skyvern_clipboard_write(
 # ---------------------------------------------------------------------------
 
 
+def _observe_frame_error(error: ObserveFrameError) -> dict[str, Any]:
+    frame_id = error.frame_name or error.frame_url or "<unnamed>"
+    return make_error(
+        ErrorCode.ACTION_FAILED,
+        f"Failed to observe frame {frame_id!r}",
+        "Use skyvern_frame_list to verify the frame, skyvern_frame_main to leave it, "
+        "or switch again before retrying selector-based click/type tools",
+        details={"frame_name": error.frame_name, "frame_url": error.frame_url},
+    )
+
+
 async def skyvern_observe(
     selector: Annotated[
         str | None,
@@ -2305,6 +2317,15 @@ async def skyvern_observe(
                 include_values=include_values,
             )
             timer.mark("sdk")
+        except ObserveFrameError as e:
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+            return make_result(
+                "skyvern_observe",
+                ok=False,
+                browser_context=ctx,
+                timing_ms=timer.timing_ms,
+                error=_observe_frame_error(e),
+            )
         except Exception as e:
             return make_result(
                 "skyvern_observe",
@@ -2386,8 +2407,8 @@ async def _dispatch_step(
     ref_map: dict[str, dict[str, Any]],
     session_id: str | None,
     cdp_url: str | None,
-    page_key: tuple[int, int | None, str] | None = None,
-    on_observe_page: Callable[[tuple[int, int | None, str]], None] | None = None,
+    page_key: tuple[int, int | None, str, str | None] | None = None,
+    on_observe_page: Callable[[tuple[int, int | None, str, str | None]], None] | None = None,
 ) -> dict[str, Any] | None:
     """Route a step to the appropriate handler, resolving refs to selectors."""
     params = dict(step.params)
@@ -2414,7 +2435,11 @@ async def _dispatch_step(
             on_observe_page(page_ref_key(page))
         accepted = {"selector", "interactive_only", "max_elements", "include_values"}
         filtered = {k: v for k, v in params.items() if k in accepted}
-        result = await _do_observe(page, **filtered)
+        try:
+            result = await _do_observe(page, **filtered)
+        except ObserveFrameError as e:
+            clear_session_ref_map(session_id=session_id, cdp_url=cdp_url)
+            raise ToolStepError(_observe_frame_error(e)) from e
         return {
             "elements": serialize_elements(result.elements),
             "element_count": result.element_count,
@@ -2527,9 +2552,9 @@ async def skyvern_execute(
     # Generation captured before each observe dispatch so a snapshot that raced
     # a concurrent navigation/context switch is discarded, not committed.
     observe_generation: dict[str, int] = {}
-    observe_page_key: tuple[int, int | None, str] | None = None
+    observe_page_key: tuple[int, int | None, str, str | None] | None = None
 
-    def capture_observe_page_key(page_key: tuple[int, int | None, str]) -> None:
+    def capture_observe_page_key(page_key: tuple[int, int | None, str, str | None]) -> None:
         nonlocal observe_page_key
         observe_page_key = page_key
 
