@@ -554,3 +554,52 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     expect(recovered.workflowSystemPrompt).toBe("always double-check totals");
   });
 });
+
+describe("login block configuration round trip", () => {
+  test("preserves Include Action History through load and save", () => {
+    const loginBlock = {
+      label: "login",
+      block_type: "login",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("login"),
+      url: "https://example.test/login",
+      title: "Login",
+      navigation_goal: "Log in",
+      error_code_mapping: null,
+      max_retries: 0,
+      max_steps_per_run: null,
+      parameters: [],
+      totp_verification_url: null,
+      totp_identifier: null,
+      disable_cache: false,
+      complete_criterion: null,
+      terminate_criterion: null,
+      engine: null,
+      include_action_history_in_verification: true,
+    } as unknown as WorkflowBlock;
+
+    const { nodes, edges } = getElements([loginBlock], DEFAULT_SETTINGS, true);
+    const loginNode = nodes.find((node) => node.type === "login");
+
+    expect(loginNode).toBeDefined();
+    expect(
+      (
+        loginNode!.data as unknown as {
+          includeActionHistoryInVerification?: boolean;
+        }
+      ).includeActionHistoryInVerification,
+    ).toBe(true);
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(
+      (
+        saved[0] as unknown as {
+          include_action_history_in_verification?: boolean;
+        }
+      ).include_action_history_in_verification,
+    ).toBe(true);
+  });
+});

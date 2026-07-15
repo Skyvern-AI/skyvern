@@ -1069,6 +1069,7 @@ class LoginBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
+    include_action_history_in_verification: bool = False
     skip_saved_profile: bool = False
 
 

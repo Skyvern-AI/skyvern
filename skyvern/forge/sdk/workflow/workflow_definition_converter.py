@@ -816,6 +816,7 @@ def block_yaml_to_block(
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
+            include_action_history_in_verification=block_yaml.include_action_history_in_verification,
             skip_saved_profile=block_yaml.skip_saved_profile,
         )
 
