@@ -1416,6 +1416,64 @@ async def test_date_qualified_download_preserves_classifier_typed_value_and_shap
 
 
 @pytest.mark.parametrize(
+    ("raw_criteria", "expected_count"),
+    [
+        pytest.param(
+            [
+                {
+                    "outcome": "The returned record includes the requested bill.",
+                    "output_path": "output.downloaded_file_artifact_ids",
+                    "expected_output_value": "May 2026",
+                    "expected_output_shape": "date",
+                    "deliverable_kind": "registered_download",
+                }
+            ],
+            1,
+            id="typed_value_single_download_stays_pathed",
+        ),
+        pytest.param(
+            [
+                {"outcome": "The first requested download is returned.", "deliverable_kind": "registered_download"},
+                {"outcome": "The second requested download is returned.", "deliverable_kind": "registered_download"},
+            ],
+            0,
+            id="multi_file_download_stays_pathless",
+        ),
+        pytest.param(
+            [{"outcome": "The task completes successfully."}],
+            0,
+            id="incidental_no_ask_earns_no_requested_output",
+        ),
+        pytest.param(
+            [{"outcome": "The requested download is returned.", "deliverable_kind": "registered_download"}],
+            1,
+            id="lone_presence_only_download_mints_requested_output",
+        ),
+    ],
+)
+def test_registered_download_shape_matrix_stays_fail_closed(
+    raw_criteria: list[dict[str, Any]], expected_count: int
+) -> None:
+    policy = RequestPolicy(completion_criteria=_parse_completion_criteria(raw_criteria))
+
+    trace = policy.to_trace_data()
+
+    assert trace["requested_output_criteria_count"] == expected_count
+    if expected_count == 0:
+        assert all(criterion.output_path is None for criterion in policy.completion_criteria)
+
+
+def test_lone_presence_only_download_defaults_downloaded_files_path() -> None:
+    criteria = _parse_completion_criteria(
+        [{"outcome": "The requested download is returned.", "deliverable_kind": "registered_download"}]
+    )
+
+    assert len(criteria) == 1
+    assert criteria[0].output_path == "output.downloaded_files"
+    assert criteria[0].expected_output_value is None
+
+
+@pytest.mark.parametrize(
     ("criterion_kwargs", "expected"),
     [
         pytest.param(
@@ -1608,6 +1666,48 @@ def test_criteria_json_rehydrates_validation_classification_without_requested_ou
     assert restored[0].output_path is None
     assert restored[0].expected_output_value is None
     assert restored[0].expected_output_shape is None
+
+
+def _minted_download_criterion() -> CompletionCriterion:
+    return _criterion(
+        "c0",
+        "The finished workflow produces the downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+    )
+
+
+def test_store_round_trip_preserves_requested_output_path_mint_source() -> None:
+    criteria = (_minted_download_criterion(),)
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored[0].requested_output_path_mint_source == "classifier_default"
+    assert restored == criteria
+
+
+def test_criteria_from_json_without_mint_source_key_loads_none() -> None:
+    restored = criteria_from_json(
+        [
+            {
+                "id": "c0",
+                "outcome": "The finished workflow produces the downloaded file.",
+                "output_path": "output.downloaded_files",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+
+    assert len(restored) == 1
+    assert restored[0].requested_output_path_mint_source is None
+
+
+def test_requested_output_path_mint_source_excluded_from_reconcile_key() -> None:
+    minted = _minted_download_criterion()
+    persisted_twin = replace(minted, requested_output_path_mint_source=None)
+
+    assert _criterion_reconcile_key(minted) == _criterion_reconcile_key(persisted_twin)
 
 
 def test_request_policy_trace_exposes_requested_output_grounding_contract_without_values() -> None:

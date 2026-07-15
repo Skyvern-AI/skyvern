@@ -13023,6 +13023,8 @@ def _auto_act_scout_ctx() -> AgentContext:
     ctx.browser_session_id = None
     ctx.scouted_interactions = []
     ctx.scout_trajectory = []
+    ctx.scout_observed_terminal_criterion_ids = set()
+    ctx.completion_criteria_turn_state = None
     ctx.discovery_mcp_server = _AutoActClickServer()
     return ctx
 
@@ -14566,6 +14568,99 @@ class TestCredentialScoutGatePredicateCoherence:
         assert "password" in errors[0]
 
 
+class TestTerminalActionScoutGate:
+    _BUSINESS_URL = "https://portal.example.test/business/start-service"
+
+    @staticmethod
+    def _terminal_action_criterion(*, method_mandated: bool = False) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="start_service_request",
+            outcome="the business start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+            method_mandated=method_mandated,
+        )
+
+    def _login_prefix_ctx(self, *criteria: CompletionCriterion) -> CopilotContext:
+        helper = TestCredentialScoutGapMatcher
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._click(helper._PAGE_ONE),
+            helper._fill("cred_1", "password", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username", "password"})}
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        return ctx
+
+    def _business_spine(self) -> list[dict[str, object]]:
+        return [
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "textbox",
+                "accessible_name": "Service Address",
+                "trajectory_index": 4,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#find-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "button",
+                "accessible_name": "Find Address",
+                "trajectory_index": 5,
+            },
+        ]
+
+    def test_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    def test_login_is_the_whole_goal_stays_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx()
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_method_mandated_terminal_action_criterion_does_not_gate(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion(method_mandated=True))
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_scout_observed_terminal_action_releases_goal_complete(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_observed_terminal_criterion_ids = {"start_service_request"}
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_credential_business_spine_records_terminal_action_observation(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + self._business_spine()
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_login_only_trajectory_records_no_terminal_action_observation(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+
+    def test_mfa_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            helper._fill("cred_1", "totp", helper._PAGE_TWO),
+            helper._click(helper._PAGE_TWO),
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {
+            "cred_1": frozenset({"username", "password", "totp"})
+        }
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert ctx.scout_observed_terminal_criterion_ids == set()
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+
 class TestCredentialScoutReopenSeam:
     @pytest.mark.asyncio
     async def test_pure_credential_reject_arms_then_same_identity_does_not_re_arm(self) -> None:
@@ -16097,6 +16192,394 @@ def test_reconcile_scout_interaction_positional_map_skips_witness_rows() -> None
     )
     assert account is not None and account["selector"] == "#account"
     assert period is not None and period["selector"] == "#period"
+
+
+class TestSynthesizedParameterMultiFillReconciliation:
+    def _reconcile(
+        self,
+        *,
+        submitted_code: str,
+        synthesized_parameters: list[dict[str, str]],
+        scout_trajectory: list[dict[str, object]],
+    ) -> tuple[dict[str, object], object]:
+        parsed: dict[str, object] = {"workflow_definition": {"parameters": [], "blocks": []}}
+        code_block: dict[str, object] = {"label": "search_directory", "code": submitted_code}
+        reconciliation = workflow_update_module._reconcile_synthesized_parameters(
+            parsed=parsed,
+            code_block=code_block,
+            submitted_code=submitted_code,
+            synthesized_parameters=synthesized_parameters,
+            scout_trajectory=scout_trajectory,
+        )
+        return parsed, reconciliation
+
+    def test_divergent_names_auto_declare_reusable_required_rows(self) -> None:
+        parsed, reconciliation = self._reconcile(
+            submitted_code='await page.locator("#submit").click()',
+            synthesized_parameters=[
+                {"key": "address_city_county_or_zip_code"},
+                {"key": "provider_specialty"},
+            ],
+            scout_trajectory=[
+                {"tool_name": "type_text", "selector": "#location", "typed_length": 7},
+                {"tool_name": "type_text", "selector": "#specialty", "typed_length": 10},
+            ],
+        )
+
+        assert reconciliation.violations == []
+        assert reconciliation.repair_context is None
+        assert reconciliation.parameter_keys == ["address_city_county_or_zip_code", "provider_specialty"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "address_city_county_or_zip_code",
+            },
+            {"parameter_type": "workflow", "workflow_parameter_type": "string", "key": "provider_specialty"},
+        ]
+
+    def test_duplicate_key_multi_fill_still_fails_closed(self) -> None:
+        parsed, reconciliation = self._reconcile(
+            submitted_code='await page.locator("#submit").click()',
+            synthesized_parameters=[
+                {"key": "address_city_county_or_zip_code"},
+                {"key": "address_city_county_or_zip_code"},
+            ],
+            scout_trajectory=[
+                {"tool_name": "type_text", "selector": "#location", "typed_length": 7},
+                {"tool_name": "type_text", "selector": "#location_again", "typed_length": 7},
+            ],
+        )
+
+        assert any("literal binding is ambiguous" in violation for violation in reconciliation.violations)
+        assert parsed["workflow_definition"]["parameters"] == []
+        assert reconciliation.repair_context is not None
+        assert reconciliation.repair_context.reason_code == "synthesized_parameter_binding_ambiguous"
+
+    @pytest.mark.asyncio
+    async def test_relaxed_multi_fill_binding_still_fails_closed_on_empty_envelope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#location",
+                "source_url": "https://example.com/directory",
+                "typed_length": 7,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#specialty",
+                "source_url": "https://example.com/directory",
+                "typed_length": 10,
+                "role": "textbox",
+                "accessible_name": "Provider Specialty",
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#search",
+                "source_url": "https://example.com/directory",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 2,
+            },
+        ]
+        submitted = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: directory_result}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  await page.locator("#location").fill("Raleigh")
+                  await page.locator("#specialty").fill("Cardiology")
+                  await page.locator("#search").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is False
+        assert "synthesized_parameter_binding_ambiguous" not in json.dumps(result)
+        assert "must pass `code_artifact_metadata`" in result["error"]
+        assert ctx.workflow_yaml == ""
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+
+    def _directory_output_intent_yaml(self) -> str:
+        return _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: directory_result}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  await page.locator("#search").click()
+            """
+        )
+
+    def test_co_computed_metadata_contract_surfaces_when_output_contract_deficient(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c1", outcome="return the provider npi", output_path="provider.npi")
+            ]
+        )
+
+        contract = workflow_update_module._co_computed_metadata_repair_contract(
+            ctx, self._directory_output_intent_yaml(), None
+        )
+
+        assert contract is not None
+        assert contract["block_label"] == "search_directory"
+        assert any(path == "provider.npi" for path in contract["required_goal_value_paths"])
+
+    def test_co_computed_metadata_contract_is_none_without_output_intent(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c1", outcome="return the provider npi", output_path="provider.npi")
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: open_directory
+                code: |
+                  await page.goto("https://example.com/directory")
+            """
+        )
+
+        contract = workflow_update_module._co_computed_metadata_repair_contract(ctx, workflow_yaml, None)
+
+        assert contract is None
+
+    def test_co_computed_metadata_contract_labels_output_intent_block_in_multi_block(self) -> None:
+        # In a multi-block workflow the metadata-missing block is not necessarily the imposed carrier;
+        # the repair hint must point at the block that actually owns the output, derived from the yaml.
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                CompletionCriterion(id="c1", outcome="return the provider npi", output_path="provider.npi")
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: output, key: directory_result}
+              blocks:
+              - block_type: code
+                label: open_directory
+                code: |
+                  await page.goto("https://example.com/directory")
+              - block_type: code
+                label: read_provider
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  npi = (await page.locator("#npi").inner_text()).strip()
+                  return {"provider": {"npi": npi}}
+            """
+        )
+
+        contract = workflow_update_module._co_computed_metadata_repair_contract(ctx, workflow_yaml, None)
+
+        assert contract is not None
+        assert contract["block_label"] == "read_provider"
+
+    def _owned_carrier_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        ctx.spine_imposition_owned_attempt = True
+        ctx.spine_imposition_carrier_label = "search_directory"
+        return ctx
+
+    def _carrier_yaml(self, code: str) -> str:
+        return _yaml(
+            f"""
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {{parameter_type: output, key: directory_result}}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  {code}
+            """
+        )
+
+    def test_owned_carrier_keyed_output_forms_goal_value_paths_when_union_empty(self) -> None:
+        ctx = self._owned_carrier_ctx()
+        workflow_yaml = self._carrier_yaml(
+            'npi = (await page.locator("#npi").inner_text()).strip()\n'
+            '                  return {"provider": {"npi": npi}}'
+        )
+
+        scaffolded, scaffold_applied = workflow_update_module._scaffold_metadata_contract_for_update(
+            ctx, workflow_yaml, None
+        )
+
+        assert scaffold_applied is True
+        assert json.dumps(scaffolded).count("provider.npi") > 0
+        assert workflow_update_module._missing_code_artifact_metadata_error(workflow_yaml, ctx, scaffolded) is None
+
+    def test_owned_carrier_without_keyed_output_stays_fail_closed(self) -> None:
+        ctx = self._owned_carrier_ctx()
+        workflow_yaml = self._carrier_yaml('await page.locator("#search").click()')
+
+        scaffolded, scaffold_applied = workflow_update_module._scaffold_metadata_contract_for_update(
+            ctx, workflow_yaml, None
+        )
+
+        assert scaffold_applied is False
+        assert scaffolded is None
+        assert workflow_update_module._missing_code_artifact_metadata_error(workflow_yaml, ctx, scaffolded) is not None
+
+    def test_non_owned_carrier_does_not_form_metadata(self) -> None:
+        ctx = self._owned_carrier_ctx()
+        ctx.spine_imposition_owned_attempt = False
+        workflow_yaml = self._carrier_yaml(
+            'npi = (await page.locator("#npi").inner_text()).strip()\n'
+            '                  return {"provider": {"npi": npi}}'
+        )
+
+        scaffolded, scaffold_applied = workflow_update_module._scaffold_metadata_contract_for_update(
+            ctx, workflow_yaml, None
+        )
+
+        assert scaffold_applied is False
+        assert workflow_update_module._missing_code_artifact_metadata_error(workflow_yaml, ctx, scaffolded) is not None
+
+    def _divergent_multi_fill_scout(self) -> list[dict[str, object]]:
+        return [
+            {
+                "tool_name": "type_text",
+                "selector": "#location",
+                "source_url": "https://example.com/directory",
+                "typed_length": 7,
+                "role": "textbox",
+                "accessible_name": "Address City County or Zip Code",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#specialty",
+                "source_url": "https://example.com/directory",
+                "typed_length": 10,
+                "role": "textbox",
+                "accessible_name": "Provider Specialty",
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#search",
+                "source_url": "https://example.com/directory",
+                "role": "button",
+                "accessible_name": "Search",
+                "trajectory_index": 2,
+            },
+        ]
+
+    def _divergent_multi_fill_yaml(self, *, keyed_return: bool) -> str:
+        tail = (
+            '\n                  npi = (await page.locator("#npi").inner_text()).strip()'
+            '\n                  return {"provider": {"npi": npi}}'
+            if keyed_return
+            else ""
+        )
+        return _yaml(
+            f"""
+            title: Directory lookup
+            workflow_definition:
+              parameters:
+              - {{parameter_type: output, key: directory_result}}
+              blocks:
+              - block_type: code
+                label: search_directory
+                prompt: Search the directory and return structured provider result data.
+                code: |
+                  await page.locator("#location").fill("Raleigh")
+                  await page.locator("#specialty").fill("Cardiology")
+                  await page.locator("#search").click(){tail}
+            """
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_repair_rounds_never_realternate_to_binding_reject(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = self._divergent_multi_fill_scout()
+
+        first = await _update_workflow({"workflow_yaml": self._divergent_multi_fill_yaml(keyed_return=False)}, ctx)
+
+        assert first["ok"] is False
+        assert "synthesized_parameter_binding_ambiguous" not in json.dumps(first)
+        assert "must pass `code_artifact_metadata`" in first["error"]
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code == "metadata_reject"
+
+        schema = workflow_update_module._schema_template_text_for_required_paths({"provider.npi"})
+        repaired_metadata = [
+            {
+                "block_label": "search_directory",
+                "declared_goal": "return the provider npi",
+                "claimed_outcomes": [
+                    {
+                        "id": "claim:search_directory",
+                        "scope": "outcome",
+                        "text": "return the provider npi",
+                        "status": "observed_not_verified",
+                        "goal_value_paths": ["provider.npi"],
+                        "extraction_schema": schema,
+                    }
+                ],
+                "terminal_verifier_expectations": [
+                    {
+                        "id": "expectation:search_directory",
+                        "text": "return the provider npi",
+                        "goal_value_paths": ["provider.npi"],
+                        "extraction_schema": schema,
+                    }
+                ],
+            }
+        ]
+
+        second = await _update_workflow(
+            {
+                "workflow_yaml": self._divergent_multi_fill_yaml(keyed_return=True),
+                "code_artifact_metadata": repaired_metadata,
+            },
+            ctx,
+        )
+
+        assert "synthesized_parameter_binding_ambiguous" not in json.dumps(second)
+        assert ctx.latest_recorded_build_test_outcome is not None
+        assert ctx.latest_recorded_build_test_outcome.reason_code != "synthesized_parameter_binding_ambiguous"
+        # The two author-time rejects no longer alternate. This block's code fills hardcoded literals
+        # rather than the synthesized parameters, so it terminates with a single honest fail-closed
+        # reject (literal grounding is out of this ticket's plane); it does not oscillate to the ceiling.
+        assert second["ok"] is False
 
 
 def _goal_reaching_freehand_ctx(*, credential: bool = False) -> CopilotContext:
