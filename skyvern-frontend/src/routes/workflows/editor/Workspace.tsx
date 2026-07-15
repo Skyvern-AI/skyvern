@@ -173,6 +173,7 @@ import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { copilotRunId } from "./copilotRunId";
 import {
+  shouldOpenCopilotPaneForHandoff,
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
@@ -402,6 +403,24 @@ function Workspace({
     location.search,
     navigate,
   ]);
+  // A handoff (Discover or the onboarding CTA) lands with the prompt seeded but
+  // only the default editor+browser panes open; open the Copilot pane once on
+  // mount so the handed-off prompt is visible (the non-embedded editor opens
+  // Copilot via isCopilotOpen's initializer below instead). Thread the handoff
+  // route state through the pane-open navigation: the CTA seeds the prompt via
+  // location.state alone (Discover also has a sessionStorage fallback), so a
+  // state-wiping open would drop it before the Copilot consumes it.
+  useMountEffect(() => {
+    if (
+      shouldOpenCopilotPaneForHandoff({
+        embedded,
+        hasInitialCopilotMessage: Boolean(initialCopilotMessage),
+        copilotPaneOpen: studioCopilotOpen,
+      })
+    ) {
+      openStudioPane("copilot", { state: location.state });
+    }
+  });
   const cacheKeyValueParam = searchParams.get("cache-key-value");
   const headlessTurnDrainEnabled = ["1", "true"].includes(
     (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),

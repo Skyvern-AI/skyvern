@@ -2,12 +2,14 @@
 
 import { useLayoutEffect, useMemo } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 import { useStudioShellStore } from "@/store/StudioShellStore";
 
+import { shouldOpenCopilotPaneForHandoff } from "../discoverCopilotHandoff";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioPanes } from "./useStudioPanes";
@@ -129,6 +131,114 @@ describe("cold-entry default panes (the four contexts)", () => {
     renderStudio({ hasBlocks: false });
     fireEvent.click(screen.getByText("toggle-overview"));
     expect(panesText()).toBe("editor,browser,overview");
+  });
+});
+
+// Mirrors Workspace's mount-effect wiring for the handoff into the studio shell:
+// open the Copilot pane once when a seeded prompt lands, threading the handoff
+// route state through so the pane-open navigation does not wipe it. `threadState`
+// lets a test reproduce the pre-fix bug where the state was dropped.
+function HandoffProbe({
+  embedded = true,
+  hasInitialCopilotMessage = true,
+  threadState = true,
+}: {
+  embedded?: boolean;
+  hasInitialCopilotMessage?: boolean;
+  threadState?: boolean;
+}) {
+  const location = useLocation();
+  const { panes, openPane } = useStudioPanes();
+  const copilotPaneOpen = panes.includes("copilot");
+  const copilotMessage = (location.state as { copilotMessage?: string } | null)
+    ?.copilotMessage;
+  useMountEffect(() => {
+    if (
+      shouldOpenCopilotPaneForHandoff({
+        embedded,
+        hasInitialCopilotMessage,
+        copilotPaneOpen,
+      })
+    ) {
+      openPane("copilot", threadState ? { state: location.state } : undefined);
+    }
+  });
+  return (
+    <div>
+      <output data-testid="panes">{panes.join(",")}</output>
+      <output data-testid="copilot-message">{copilotMessage ?? ""}</output>
+    </div>
+  );
+}
+
+function renderHandoff(
+  props: {
+    embedded?: boolean;
+    hasInitialCopilotMessage?: boolean;
+    threadState?: boolean;
+  } = {},
+  entry: string | { pathname: string; search?: string; state?: unknown } = {
+    pathname: "/workflows/wpid_1/studio",
+    search: "?via=discover",
+  },
+) {
+  return render(
+    <MemoryRouter initialEntries={[entry]}>
+      <StudioPaneDefaultsProvider hasBlocks={false}>
+        <HandoffProbe {...props} />
+      </StudioPaneDefaultsProvider>
+    </MemoryRouter>,
+  );
+}
+
+function messageText(): string {
+  return screen.getByTestId("copilot-message").textContent ?? "";
+}
+
+describe("Discover → Studio handoff opens the Copilot pane", () => {
+  test("a seeded handoff opens Copilot on top of the default editor+browser", () => {
+    renderHandoff();
+    expect(panesText()).toBe("editor,browser,copilot");
+  });
+
+  test("no handoff prompt leaves the default panes untouched", () => {
+    renderHandoff({ hasInitialCopilotMessage: false });
+    expect(panesText()).toBe("editor,browser");
+  });
+
+  test("an explicit ?panes=copilot handoff is left as-is (no duplicate open)", () => {
+    renderHandoff(
+      {},
+      {
+        pathname: "/workflows/wpid_1/studio",
+        search: "?via=discover&panes=copilot",
+      },
+    );
+    expect(panesText()).toBe("copilot");
+  });
+
+  test("the pane-open navigation preserves the handoff route state (CTA has no sessionStorage fallback)", () => {
+    renderHandoff(
+      {},
+      {
+        pathname: "/workflows/wpid_1/studio",
+        state: { copilotMessage: "Fill out the contact form" },
+      },
+    );
+    expect(panesText()).toBe("editor,browser,copilot");
+    expect(messageText()).toBe("Fill out the contact form");
+  });
+
+  test("a state-wiping open would drop the seeded prompt (regression guard)", () => {
+    renderHandoff(
+      { threadState: false },
+      {
+        pathname: "/workflows/wpid_1/studio",
+        state: { copilotMessage: "Fill out the contact form" },
+      },
+    );
+    expect(panesText()).toBe("editor,browser,copilot");
+    expect(messageText()).toBe("");
   });
 });
 
