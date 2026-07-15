@@ -107,6 +107,13 @@ class Artifact(BaseModel):
         return getattr(self, key)
 
 
+class ArtifactSignedUrl(BaseModel):
+    artifact_id: str
+    signed_url: str
+    expires_at: int | None = None
+    """Unix seconds when signed_url stops working; None when the backing store controls expiry."""
+
+
 class LogEntityType(StrEnum):
     STEP = "step"
     TASK = "task"
