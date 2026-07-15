@@ -5,6 +5,7 @@ the feature flag disables custom strategies at runtime.
 """
 
 import structlog
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page
 
 from skyvern.config import settings
@@ -52,7 +53,19 @@ class DefaultInputStrategy(InputEventStrategy):
             await page.keyboard.type(text)
 
     async def clear_field(self, page: Page, locator: Locator, char_count: int) -> None:
-        await locator.clear(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        try:
+            await locator.clear(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        except PlaywrightError as e:
+            # Clearing a non-editable element is a no-op by definition -- swallow only
+            # Playwright's exact validation diagnostic. Match the full phrase, not just
+            # "contenteditable": a genuine clear() timeout embeds the resolved element
+            # (e.g. <div contenteditable="true">) in its call log, and swallowing that
+            # would leave stale text for the next type() to append onto. Real failures
+            # (timeout, detached, target closed) still propagate. SKY-12337.
+            if "is not an <input>, <textarea> or [contenteditable] element" in str(e):
+                LOG.info("Skip clearing a non-editable element")
+                return
+            raise
 
 
 class DefaultScrollStrategy(ScrollEventStrategy):

@@ -449,6 +449,15 @@ def _all_page_frames(page: Page) -> list[Frame]:
     return frames
 
 
+def is_browser_crashed_error(exc: BaseException) -> bool:
+    """True for an environmental renderer/target crash or a closed page/context/browser
+    (e.g. ``Page.content: Target crashed``, ``Target closed``). These are not Skyvern
+    defects and every ``get_content`` caller already degrades gracefully, so they warrant
+    a warning rather than an error in tracking. SKY-12344."""
+    msg = str(exc).lower()
+    return "target crashed" in msg or "page crashed" in msg or "target closed" in msg or "has been closed" in msg
+
+
 class SkyvernFrame:
     @staticmethod
     async def evaluate(

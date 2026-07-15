@@ -8,7 +8,9 @@ from random import uniform
 from urllib.parse import urljoin, urlparse
 
 import structlog
-from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import ElementHandle
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR
@@ -34,6 +36,14 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
+
+
+def _is_detached_frame_error(exc: PlaywrightError) -> bool:
+    """A Playwright error meaning the element/iframe left the DOM mid-resolution
+    ("Element is not attached to the DOM", "Frame was detached"). Distinct from a
+    closed/crashed target (``TargetClosedError``), which must NOT be swallowed."""
+    msg = str(exc).lower()
+    return "not attached to the dom" in msg or "detached" in msg
 
 
 def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
@@ -71,11 +81,21 @@ async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css:
     while len(iframe_path) > 0:
         child_frame = iframe_path.pop()
 
-        frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
-        if frame_handler is None:
-            raise NoneFrameError(frame_id=child_frame)
-
-        content_frame = await frame_handler.content_frame()
+        try:
+            frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+            if frame_handler is None:
+                raise NoneFrameError(frame_id=child_frame)
+            content_frame = await frame_handler.content_frame()
+        except PlaywrightError as e:
+            # A detached iframe -- at query_selector on an already-detached parent
+            # frame, or at content_frame if it detaches in between (navigation /
+            # re-render) -- is the same "frame is gone" condition NoneFrameError
+            # signals. Normalize only that; re-raise anything else (e.g. a closed
+            # target/browser) so a real failure is not masked as a DOM race.
+            # SKY-12186.
+            if _is_detached_frame_error(e):
+                raise NoneFrameError(frame_id=child_frame) from e
+            raise
         if content_frame is None:
             raise NoneFrameError(frame_id=child_frame)
         current_frame = content_frame

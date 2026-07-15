@@ -29,7 +29,7 @@ from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_wi
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
-from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame, is_browser_crashed_error
 
 LOG = structlog.get_logger()
 
@@ -311,11 +311,17 @@ class RealBrowserState(BrowserState):
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=page)
             html = await skyvern_frame.get_content()
-        except Exception:
-            LOG.error(
-                "Error happened while getting the first page content",
-                exc_info=True,
-            )
+        except Exception as e:
+            # A crashed/closed target correctly means "context not usable" -- returning
+            # False triggers recovery. Log the environmental crash as a warning instead
+            # of an error; genuine content-read failures stay loud. SKY-12344.
+            if is_browser_crashed_error(e):
+                LOG.warning("Browser crashed/closed while validating page content; treating context as invalid")
+            else:
+                LOG.error(
+                    "Error happened while getting the first page content",
+                    exc_info=True,
+                )
             return False
 
         if "Bad gateway error" in html:
