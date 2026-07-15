@@ -59,6 +59,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
+    TagValueAlreadyExists,
     TagValueRenameCollision,
     TagValueRenameResult,
 )
@@ -170,6 +171,7 @@ from skyvern.schemas.tags import (
     TagResponse,
     TagsResponse,
     TagValue,
+    TagValueCreate,
     TagValueDelete,
     TagValueDeleteResponse,
     TagValueRename,
@@ -2239,6 +2241,41 @@ async def list_tag_values(
         )
         for row in rows
     ]
+
+
+@legacy_base_router.post("/tag-values", response_model=TagValue, tags=["agent"], include_in_schema=False)
+@legacy_base_router.post("/tag-values/", response_model=TagValue, include_in_schema=False)
+@base_router.post(
+    "/tag-values",
+    response_model=TagValue,
+    tags=["Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "create_tag_value"},
+    description="Register a grouped tag (key, value) with a palette color before any workflow uses it. "
+    "The label shows a zero workflow count until applied to a workflow.",
+    summary="Create tag value",
+    responses={
+        200: {"description": "Successfully registered tag value"},
+        409: {"description": "Tag value already exists"},
+        422: {"description": "Invalid key, value, or color"},
+    },
+)
+@base_router.post("/tag-values/", response_model=TagValue, include_in_schema=False)
+async def create_tag_value(
+    data: TagValueCreate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValue:
+    analytics.capture("skyvern-oss-tag-value-create")
+    try:
+        row = await app.DATABASE.tags.register_tag_value(
+            organization_id=current_org.organization_id,
+            key=data.key,
+            value=data.value,
+            color=data.color,
+        )
+    except TagValueAlreadyExists as e:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=0)
 
 
 @legacy_base_router.patch("/tag-values/{key}", response_model=TagValue, tags=["agent"], include_in_schema=False)
