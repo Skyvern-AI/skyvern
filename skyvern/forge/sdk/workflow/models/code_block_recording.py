@@ -66,9 +66,7 @@ class CodeBlockActionRecording:
         return self.recording_page.last_recorded_exception()
 
     async def create_task_and_step(self) -> None:
-        """Create the task/step that can anchor recorded actions for prompt-bearing blocks."""
-        if not self._code_block.prompt:
-            return
+        """Create the container task/step that anchors recorded actions (promptless blocks included)."""
         try:
             self._task, self._step = await app.agent.create_task_and_step_from_code_block(
                 code_block=self._code_block,
@@ -189,5 +187,18 @@ class CodeBlockActionRecording:
             LOG.warning(
                 "Failed to finalize code block task status",
                 workflow_run_block_id=self._workflow_run_block_id,
+                exc_info=True,
+            )
+        if not success or self._step is None:
+            return
+        # Billing counts the action rows persist() wrote, so this must stay after persist on every
+        # success path; best-effort like the rest of recording — never change the block outcome.
+        try:
+            await app.AGENT_FUNCTION.post_code_block_execution(self._task, self._step)
+        except Exception:
+            LOG.warning(
+                "Code block billing hook failed",
+                workflow_run_block_id=self._workflow_run_block_id,
+                task_id=self._task.task_id,
                 exc_info=True,
             )
