@@ -239,21 +239,6 @@ class ExecutionChannel(CdpChannel):
             return ""
         return f"{parsed.scheme}://{parsed.netloc}"
 
-    async def close(self) -> None:
-        LOG.info(f"{self.class_name} closing connection", **self.identity)
-
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
-            self.browser_context = None
-            self.page = None
-
-        if self.pw:
-            await self.pw.stop()
-            self.pw = None
-
-        LOG.info(f"{self.class_name} closed", **self.identity)
-
 
 class LocalExecutionChannel(ExecutionChannel):
     def __init__(self, *, page: Page) -> None:  # type: ignore[override]
@@ -360,4 +345,6 @@ async def execution_channel(vnc_channel: VncChannel) -> t.AsyncIterator[Executio
 
         yield channel
     finally:
-        await channel.close()
+        # stop(), not close(): a bare close() fires the browser "disconnected" event and
+        # the reconnect callback resurrects a driver nothing will ever release (SKY-12524).
+        await channel.stop()

@@ -185,21 +185,35 @@ class CdpChannel:
     async def close(self) -> None:
         LOG.info(f"{self.class_name} closing connection", **self.identity)
 
-        if self.browser:
-            try:
-                await self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
+        try:
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+        finally:
+            # Release the driver even when browser.close() raised on a dead target;
+            # a skipped stop() orphans the node subprocess for the process lifetime.
+            if self.pw:
+                try:
+                    await self.pw.stop()
+                except Exception:
+                    LOG.warning(f"{self.class_name} failed to stop playwright driver", **self.identity, exc_info=True)
+                self.pw = None
 
-        if self.pw:
-            await self.pw.stop()
-            self.pw = None
-
-        self.browser_context = None
-        self.page = None
+            self.browser_context = None
+            self.page = None
 
         LOG.info(f"{self.class_name} closed", **self.identity)
+
+    async def stop(self) -> t.Self:
+        """Terminal close: unlike close() (which connect() reuses to recycle a dropped
+        connection), stop() marks the channel closing so the browser "disconnected"
+        callback registered in connect() cannot resurrect a fresh driver."""
+        self._closing = True
+        await self.close()
+        return self
 
     async def evaluate_js(
         self,
