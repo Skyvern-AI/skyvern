@@ -839,6 +839,197 @@ def _request_slot_anchor(item: dict[str, Any]) -> tuple[str, str] | None:
     return source_id, source_quote
 
 
+def _item_claims_request_slot_fields(item: dict[str, Any]) -> bool:
+    return any(
+        item.get(field) is not None
+        for field in (
+            "output_path",
+            "classification_output_key",
+            "expected_output_value",
+            "expected_output_shape",
+            "expected_classification",
+        )
+    )
+
+
+def _item_claims_request_slot(item: dict[str, Any]) -> bool:
+    return any(item.get(field) is not None for field in ("request_slot_source_id", "request_slot_source_quote")) or (
+        _item_claims_request_slot_fields(item)
+    )
+
+
+def _request_slot_anchor_is_valid(
+    item: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    anchor = _request_slot_anchor(item)
+    if anchor is None:
+        return False
+    source_id, source_quote = anchor
+    source = next(
+        (source for source in request_slot_sources(request_slot_request) if source.source_id == source_id),
+        None,
+    )
+    if source is None:
+        return False
+    start = source.text.find(source_quote)
+    return start >= 0 and source.text.find(source_quote, start + 1) < 0
+
+
+def _request_slot_anchor_matches_criterion_datum(item: dict[str, Any]) -> bool:
+    anchor = _request_slot_anchor(item)
+    if anchor is None:
+        return False
+    _source_id, source_quote = anchor
+    quote_tokens = re.findall(r"[a-z0-9]+", source_quote.casefold())
+    for field_name in ("output_path", "classification_output_key"):
+        value = item.get(field_name)
+        if not isinstance(value, str) or not value:
+            continue
+        datum = value.rsplit(".", 1)[-1]
+        datum_tokens = re.findall(r"[a-z0-9]+", datum.casefold())
+        if not datum_tokens:
+            continue
+        width = len(datum_tokens)
+        return any(
+            quote_tokens[index : index + width] == datum_tokens for index in range(len(quote_tokens) - width + 1)
+        )
+    return True
+
+
+def _request_slot_anchor_is_admissible(
+    item: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    return _request_slot_anchor_is_valid(
+        item,
+        request_slot_request=request_slot_request,
+    ) and _request_slot_anchor_matches_criterion_datum(item)
+
+
+def _request_slot_claims_need_anchor_correction(
+    raw_criteria: Any,
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> bool:
+    return isinstance(raw_criteria, list) and any(
+        isinstance(item, dict)
+        and _item_claims_request_slot(item)
+        and not _request_slot_anchor_is_admissible(item, request_slot_request=request_slot_request)
+        for item in raw_criteria
+    )
+
+
+def _accept_request_slot_anchor_correction(
+    original: dict[str, Any],
+    corrected: dict[str, Any],
+    *,
+    request_slot_request: RequestSlotProducerInputV1,
+) -> dict[str, Any] | None:
+    original_criteria = original.get("completion_criteria")
+    corrected_criteria = corrected.get("completion_criteria")
+    if not isinstance(original_criteria, list) or not isinstance(corrected_criteria, list):
+        return None
+    if len(original_criteria) != len(corrected_criteria):
+        return None
+
+    anchor_fields = {"request_slot_source_id", "request_slot_source_quote"}
+    if _classifier_payload_semantics(original) != _classifier_payload_semantics(corrected):
+        return None
+    original_semantic_criteria = [
+        {key: value for key, value in item.items() if key not in anchor_fields}
+        for item in original_criteria
+        if isinstance(item, dict)
+    ]
+    corrected_semantic_criteria = [
+        {key: value for key, value in item.items() if key not in anchor_fields}
+        for item in corrected_criteria
+        if isinstance(item, dict)
+    ]
+    if _parse_completion_criteria(original_semantic_criteria, emit_mint_events=False) != _parse_completion_criteria(
+        corrected_semantic_criteria, emit_mint_events=False
+    ):
+        return None
+
+    accepted_criteria: list[dict[str, Any]] = []
+    for original_item, corrected_item in zip(original_criteria, corrected_criteria, strict=True):
+        if not isinstance(original_item, dict) or not isinstance(corrected_item, dict):
+            return None
+        original_without_anchors = {key: value for key, value in original_item.items() if key not in anchor_fields}
+        corrected_without_anchors = {key: value for key, value in corrected_item.items() if key not in anchor_fields}
+        if _classifier_criterion_semantics(original_without_anchors) != _classifier_criterion_semantics(
+            corrected_without_anchors
+        ):
+            return None
+        accepted_item = dict(original_item)
+        if _item_claims_request_slot(original_item):
+            original_quote = original_item.get("request_slot_source_quote")
+            corrected_anchor = _request_slot_anchor(corrected_item)
+            if corrected_anchor is None:
+                return None
+            corrected_source_id, corrected_quote = corrected_anchor
+            if isinstance(original_quote, str) and original_quote:
+                corrected_source_for_original_quote = {
+                    **original_item,
+                    "request_slot_source_id": corrected_source_id,
+                }
+                if not _request_slot_anchor_is_admissible(
+                    corrected_source_for_original_quote,
+                    request_slot_request=request_slot_request,
+                ):
+                    return None
+                accepted_item["request_slot_source_id"] = corrected_source_id
+            else:
+                if not _item_claims_request_slot_fields(original_item):
+                    return None
+                corrected_anchor_for_original_datum = {
+                    **original_item,
+                    "request_slot_source_id": corrected_source_id,
+                    "request_slot_source_quote": corrected_quote,
+                }
+                if not _request_slot_anchor_is_admissible(
+                    corrected_anchor_for_original_datum,
+                    request_slot_request=request_slot_request,
+                ):
+                    return None
+                accepted_item["request_slot_source_id"] = corrected_source_id
+                accepted_item["request_slot_source_quote"] = corrected_quote
+        elif any(corrected_item.get(field) != original_item.get(field) for field in anchor_fields):
+            return None
+        accepted_criteria.append(accepted_item)
+    return {**original, "completion_criteria": accepted_criteria}
+
+
+def _classifier_payload_semantics(payload: dict[str, Any]) -> RequestPolicy:
+    return _classification_from_raw({**payload, "completion_criteria": []})
+
+
+def _classifier_criterion_semantics(item: dict[str, Any]) -> CompletionCriterion | None:
+    entries = _parse_completion_criterion_entries([item], emit_mint_events=False)
+    return entries[0][1] if entries else None
+
+
+def _request_slot_anchor_correction_prompt(
+    prompt: str,
+    *,
+    raw_payload: dict[str, Any],
+) -> str:
+    correction = {
+        "instruction": (
+            "Return the same JSON object with identical criterion count and identical non-anchor fields. "
+            "For each criterion that already has request_slot_source_quote, preserve that quote byte-for-byte "
+            "and only add or replace request_slot_source_id with the source containing that exact unique quote. "
+            "For a criterion with structured requested-output fields but no request_slot_source_quote, add "
+            "request_slot_source_id and one exact unique source quote that contains the full datum named by its "
+            "output_path or classification_output_key. Do not add anchors to any other criterion."
+        ),
+        "original_payload": raw_payload,
+    }
+    return f"{prompt}\n\nREQUEST SLOT ANCHOR CORRECTION (one pass):\n{json.dumps(correction, ensure_ascii=True, separators=(',', ':'))}"
+
+
 def _request_slot_has_exact_requirement(criterion: CompletionCriterion) -> bool:
     if criterion.kind == "validation_classification":
         return criterion.expected_classification is not None
@@ -859,19 +1050,6 @@ def _degrade_unbound_request_slot_criterion(criterion: CompletionCriterion) -> C
         mint_degrade="undecidable_judgment",
         requested_output_floor_rekeyed=True,
         floor_rekeyed_from_path=criterion.output_path,
-    )
-
-
-def _item_claims_request_slot(item: dict[str, Any]) -> bool:
-    return _request_slot_anchor(item) is not None or any(
-        item.get(field) is not None
-        for field in (
-            "output_path",
-            "classification_output_key",
-            "expected_output_value",
-            "expected_output_shape",
-            "expected_classification",
-        )
     )
 
 
@@ -916,8 +1094,10 @@ def _bind_criterion_to_request_slot(
     kind = criterion.kind
     classification_output_key = criterion.classification_output_key
     judgment_truth_condition = criterion.judgment_truth_condition
-    original_output_path = criterion.output_path or (
-        f"output.{classification_output_key}" if classification_output_key is not None else None
+    original_output_path = (
+        criterion.output_path
+        or (f"output.{classification_output_key}" if classification_output_key is not None else None)
+        or slot.canonical_path
     )
     if pinability != "pinned" or degraded:
         expected_output_value = None
@@ -968,10 +1148,14 @@ def _parse_fresh_request_slot_criteria(
     non_slot_criteria: list[CompletionCriterion] = []
     for item, criterion in _parse_completion_criterion_entries(raw):
         anchor = _request_slot_anchor(item)
-        slot = _request_slot_for_anchor(
-            anchor,
-            request_slot_request=request_slot_request,
-            request_slot_contract=request_slot_contract,
+        slot = (
+            _request_slot_for_anchor(
+                anchor,
+                request_slot_request=request_slot_request,
+                request_slot_contract=request_slot_contract,
+            )
+            if _request_slot_anchor_is_admissible(item, request_slot_request=request_slot_request)
+            else None
         )
         if anchor is None or slot is None:
             if _item_claims_request_slot(item):
@@ -1096,7 +1280,11 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
     return None
 
 
-def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], CompletionCriterion]]:
+def _parse_completion_criterion_entries(
+    raw: Any,
+    *,
+    emit_mint_events: bool = True,
+) -> list[tuple[dict[str, Any], CompletionCriterion]]:
     """Build outcome criteria from the classifier output.
 
     IDs are assigned server-side by index after de-duplication; any id the
@@ -1190,12 +1378,13 @@ def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], 
         ):
             output_path = _LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH
             requested_output_path_mint_source = "classifier_default"
-            LOG.info(
-                "copilot_registered_download_requested_output_minted",
-                output_path=output_path,
-                requested_output_path_mint_source=requested_output_path_mint_source,
-                criterion_id=f"c{len(entries)}",
-            )
+            if emit_mint_events:
+                LOG.info(
+                    "copilot_registered_download_requested_output_minted",
+                    output_path=output_path,
+                    requested_output_path_mint_source=requested_output_path_mint_source,
+                    criterion_id=f"c{len(entries)}",
+                )
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
@@ -1249,7 +1438,7 @@ def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], 
                 ),
             )
         )
-        if judgment_truth_condition is not None:
+        if judgment_truth_condition is not None and emit_mint_events:
             LOG.info(
                 "copilot_judgment_truth_condition_minted",
                 mint_source="classifier",
@@ -1262,8 +1451,10 @@ def _parse_completion_criterion_entries(raw: Any) -> list[tuple[dict[str, Any], 
     return entries
 
 
-def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
-    return [criterion for _item, criterion in _parse_completion_criterion_entries(raw)]
+def _parse_completion_criteria(raw: Any, *, emit_mint_events: bool = True) -> list[CompletionCriterion]:
+    return [
+        criterion for _item, criterion in _parse_completion_criterion_entries(raw, emit_mint_events=emit_mint_events)
+    ]
 
 
 def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
@@ -2491,8 +2682,47 @@ async def _classify_request(
     request_slot_contract: RequestSlotContractV1 | None = None
     request_slot_failure_kind: str | None = None
     raw_criteria = raw_payload.get("completion_criteria")
-    declared_request_slots = isinstance(raw_criteria, list) and any(
-        isinstance(item, dict) and _request_slot_anchor(item) is not None for item in raw_criteria
+    if _request_slot_claims_need_anchor_correction(
+        raw_criteria,
+        request_slot_request=request_slot_request,
+    ):
+        correction_prompt = _request_slot_anchor_correction_prompt(
+            prompt,
+            raw_payload=raw_payload,
+        )
+        corrected_raw, correction_failure_kind, correction_retry_count = await _run_request_policy_classifier(
+            handler,
+            correction_prompt,
+        )
+        retry_count += correction_retry_count
+        corrected_payload = _coerce_classifier_payload(corrected_raw)
+        accepted_payload = (
+            _accept_request_slot_anchor_correction(
+                raw_payload,
+                corrected_payload,
+                request_slot_request=request_slot_request,
+            )
+            if corrected_payload is not None
+            else None
+        )
+        if accepted_payload is not None:
+            raw_payload = accepted_payload
+            raw_criteria = raw_payload.get("completion_criteria")
+        else:
+            request_slot_failure_kind = "invalid_anchor_correction"
+            LOG.warning(
+                "request-policy request-slot anchor correction failed",
+                failure_kind=correction_failure_kind,
+            )
+    declared_request_slots = (
+        request_slot_failure_kind is None
+        and isinstance(raw_criteria, list)
+        and any(
+            isinstance(item, dict)
+            and _item_claims_request_slot(item)
+            and _request_slot_anchor_is_admissible(item, request_slot_request=request_slot_request)
+            for item in raw_criteria
+        )
     )
     if declared_request_slots:
         # This validation hop is deliberately sequential: the request-policy
