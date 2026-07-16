@@ -1558,13 +1558,21 @@ async def _select_deterministic_normal_option(
     return action_result
 
 
-async def _verify_normal_select_option(
+async def _normal_select_readback_contradicts(
     *,
     locator: Locator,
     matched_index: int,
     matched_label: str | None,
     matched_value: str | None,
 ) -> bool:
+    """True only when a readable read-back disagrees with the deterministic selection.
+
+    An unreadable read-back is not a contradiction. select_option has already reported the value
+    committed, and a select's own change event can rerender or navigate the page away, detaching the
+    element; re-running the LLM fallback against that stale locator only fails again by value, label,
+    and index. Same reasoning as `is_post_dispatch_click_timeout`: the side effect landed, so a
+    timed-out post-action read must not trigger a duplicating fallback chain.
+    """
     try:
         selection = await locator.evaluate(
             r"""
@@ -1580,11 +1588,12 @@ async def _verify_normal_select_option(
                     value: option ? normalize(option.value) : normalize(select.value),
                 };
             }
-            """
+            """,
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
     except Exception:
         LOG.info(
-            "Failed to read normal select option after deterministic selection",
+            "Failed to read normal select option after deterministic selection; keeping select_option success",
             expected_index=matched_index,
             expected_label=matched_label,
             expected_value=matched_value,
@@ -1594,7 +1603,7 @@ async def _verify_normal_select_option(
 
     if not isinstance(selection, dict):
         LOG.info(
-            "Normal select read-back returned unexpected payload",
+            "Normal select read-back returned unexpected payload; keeping select_option success",
             expected_index=matched_index,
             expected_label=matched_label,
             expected_value=matched_value,
@@ -1602,26 +1611,32 @@ async def _verify_normal_select_option(
         )
         return False
 
+    # The read-back JS trims, but scraped option text does not: domUtils.removeMultipleSpaces()
+    # collapses whitespace runs without trimming, and returns early when there is no double
+    # space/tab/newline, so a single edge space survives verbatim into matched_label/matched_value.
+    expected_label = " ".join(matched_label.split()) if matched_label is not None else None
+    expected_value = " ".join(matched_value.split()) if matched_value is not None else None
+
     actual_index = selection.get("index")
     actual_value = selection.get("value")
     actual_label = selection.get("label") or actual_value
     if (
         actual_index == matched_index
-        and actual_label == matched_label
-        and (matched_value is None or actual_value == matched_value)
+        and actual_label == expected_label
+        and (expected_value is None or actual_value == expected_value)
     ):
-        return True
+        return False
 
     LOG.info(
         "Normal select read-back did not match deterministic option",
         expected_index=matched_index,
-        expected_label=matched_label,
-        expected_value=matched_value,
+        expected_label=expected_label,
+        expected_value=expected_value,
         actual_index=actual_index,
         actual_label=actual_label,
         actual_value=actual_value,
     )
-    return False
+    return True
 
 
 async def check_date_format(
@@ -7639,7 +7654,7 @@ async def normal_select(
                 matched_value=resolution.matched_value,
                 matched_index=resolution.matched_index,
             )
-            if _normal_select_successful(deterministic_result) and await _verify_normal_select_option(
+            if _normal_select_successful(deterministic_result) and not await _normal_select_readback_contradicts(
                 locator=locator,
                 matched_index=resolution.matched_index,
                 matched_label=resolution.matched_label,
