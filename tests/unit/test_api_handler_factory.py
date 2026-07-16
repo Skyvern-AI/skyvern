@@ -14,12 +14,86 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     EXTRACT_ACTION_PROMPT_NAME,
     GEMINI_SAFETY_SETTINGS,
     LLMAPIHandlerFactory,
+    LLMCaller,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import DummyLogger, FakeLLMResponse
+
+
+def _custom_llm_config(model_name: str, api_base: str = "https://llm.example.test/v1") -> LLMConfig:
+    return LLMConfig(model_name, [], False, False, {"api_key": "test-key", "api_base": api_base})
+
+
+@pytest.mark.parametrize(
+    ("model_name", "http_client_attribute"),
+    [("openai/example-model", "_client"), ("ollama_chat/example-model", "client")],
+)
+@pytest.mark.asyncio
+async def test_custom_llm_http_clients_do_not_follow_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    http_client_attribute: str,
+) -> None:
+    llm_config = _custom_llm_config(model_name)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory.SettingsManager.get_settings(), "ALLOW_CUSTOM_LLM_LOCAL_API_BASES", False, raising=False
+    )
+    validate_api_base = MagicMock(return_value="https://llm.example.test/v1")
+    monkeypatch.setattr(api_handler_factory, "validate_fetch_url", validate_api_base)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda **_: 0.0)
+
+    completion = AsyncMock(return_value=FakeLLMResponse(model_name))
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", completion)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("CUSTOM_LLM_redirect_test")
+    await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    client = completion.await_args.kwargs["client"]
+    http_client = getattr(client, http_client_attribute)
+    assert http_client.follow_redirects is False
+    assert http_client.is_closed is True
+    validate_api_base.assert_called_once_with("https://llm.example.test/v1")
+    if http_client_attribute == "client":
+        retry_client = client.create_client(timeout=None, event_hooks=None)
+        assert retry_client.follow_redirects is False
+        await retry_client.aclose()
+
+
+@pytest.mark.parametrize("request_error", [None, RuntimeError("provider failed")], ids=["success", "failure"])
+@pytest.mark.asyncio
+async def test_custom_openrouter_client_is_scoped_to_request(
+    monkeypatch: pytest.MonkeyPatch, request_error: Exception | None
+) -> None:
+    llm_config = _custom_llm_config("openrouter/example-model", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    completion = MagicMock()
+    completion.model_dump.return_value = {}
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=completion, side_effect=request_error)
+    client.close = AsyncMock()
+    openai_client = MagicMock(return_value=client)
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", openai_client)
+    monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
+
+    caller = LLMCaller("CUSTOM_LLM_openrouter_redirect_test")
+    assert caller.openai_client is None
+    if request_error:
+        with pytest.raises(RuntimeError, match="provider failed"):
+            await caller._dispatch_llm_call(messages=[])
+    else:
+        await caller._dispatch_llm_call(messages=[])
+
+    assert openai_client.call_args.kwargs["http_client"].follow_redirects is False
+    client.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

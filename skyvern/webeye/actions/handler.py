@@ -114,6 +114,7 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements_tracked,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -4834,7 +4835,8 @@ async def handle_goto_url_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.goto(action.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
+    await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -4920,9 +4922,10 @@ async def handle_new_tab_action(
     browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
     if browser_state is None:
         return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
+    validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
     new_page = await browser_state.new_page()
     try:
-        await browser_state.navigate_to_url(page=new_page, url=action.url)
+        await browser_state.navigate_to_url(page=new_page, url=validated_url)
     except Exception as e:
         # Don't leave a blank/failed tab as the newest page — the next scrape would fail it.
         try:
