@@ -23,7 +23,21 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
+from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
+
+
+@pytest.fixture
+def fingerprint_secret_key(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Pin ``SECRET_KEY`` so ``diagnostic_fingerprint`` produces stable, keyed output in tests.
+
+    Patches the shared ``settings`` singleton, so it is seen wherever the helper reads it.
+    """
+    from skyvern.config import settings
+
+    monkeypatch.setattr(settings, "SECRET_KEY", FINGERPRINT_TEST_SECRET_KEY)
+    return FINGERPRINT_TEST_SECRET_KEY
+
 
 # Wire structlog through stdlib so caplog can capture log records in tests.
 structlog.configure(

@@ -106,6 +106,7 @@ from skyvern.forge.sdk.copilot.self_heal_recovery import SelfHealRecoveryResult,
 from skyvern.forge.sdk.copilot.turn_origin import HealAdoptionFailed, TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -1122,6 +1123,12 @@ class BaseTaskBlock(Block):
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
+            LOG.info(
+                "download_suffix_rendered",
+                block_label=self.label,
+                current_index=workflow_run_context.get_block_metadata(self.label).get("current_index"),
+                download_suffix_fp=diagnostic_fingerprint(self.download_suffix),
+            )
 
         if self.navigation_goal:
             self.navigation_goal = self.format_block_parameter_template_from_workflow_run_context(
