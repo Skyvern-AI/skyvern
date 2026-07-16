@@ -1,6 +1,6 @@
 import structlog
 from fastapi import Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router
@@ -13,7 +13,7 @@ from skyvern.schemas.self_heal import (
     WorkflowReliability,
     summarize_run_heals,
 )
-from skyvern.services.self_heal_reliability_service import get_workflow_reliability
+from skyvern.services.self_heal_reliability_service import get_workflow_reliability, get_workflows_reliability
 
 LOG = structlog.get_logger()
 
@@ -21,6 +21,14 @@ LOG = structlog.get_logger()
 class RunHealEpisodesResponse(BaseModel):
     episodes: list[HealEpisodeView]
     summary: RunHealSummary
+
+
+class WorkflowsReliabilityRequest(BaseModel):
+    workflow_permanent_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class WorkflowsReliabilityResponse(BaseModel):
+    reliabilities: dict[str, WorkflowReliability]
 
 
 @base_router.get(
@@ -76,3 +84,17 @@ async def get_workflow_reliability_route(
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowReliability:
     return await get_workflow_reliability(organization.organization_id, workflow_permanent_id)
+
+
+@base_router.post(
+    "/workflows/reliability/batch",
+    response_model=WorkflowsReliabilityResponse,
+    include_in_schema=False,
+)
+async def get_workflows_reliability_route(
+    request: WorkflowsReliabilityRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowsReliabilityResponse:
+    workflow_permanent_ids = list(dict.fromkeys(request.workflow_permanent_ids))
+    reliabilities = await get_workflows_reliability(organization.organization_id, workflow_permanent_ids)
+    return WorkflowsReliabilityResponse(reliabilities=reliabilities)

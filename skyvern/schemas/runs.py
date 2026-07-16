@@ -191,9 +191,16 @@ class TaskRunRequest(BaseModel):
             return None
         return normalize_run_with(v)
 
-    @field_validator("url", "webhook_url", "totp_url")
+    @field_validator("url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_task_url(cls, url: str | None) -> str | None:
+        if not url:
+            return url
+        return validate_url(url)
+
+    @field_validator("webhook_url", "totp_url")
+    @classmethod
+    def validate_callback_urls(cls, url: str | None) -> str | None:
         """
         Validates that URLs provided to Skyvern are properly formatted.
 

@@ -9,8 +9,9 @@ import urllib.parse
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, TypedDict
+from typing import Any, Awaitable, Callable, List, NamedTuple, TypedDict
 
 import structlog
 from cachetools import TTLCache
@@ -113,6 +114,7 @@ from skyvern.utils.prompt_engine import (
     load_prompt_with_elements_tracked,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -175,6 +177,31 @@ COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
 # Cross-process re-resolution is deterministic under stable flag config.
 _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, ttl=86_400)
+
+
+class _CollapseGateResult(NamedTuple):
+    family_enabled: bool
+    assigned: bool | None
+    gate_error: bool
+
+
+class CustomSelectFamilyOutcome(StrEnum):
+    llm_fallback_gate_error = "llm_fallback_gate_error"
+    llm_fallback_eval_error = "llm_fallback_eval_error"
+    llm_fallback_family_off = "llm_fallback_family_off"
+    llm_fallback_control = "llm_fallback_control"
+    llm_fallback_no_match = "llm_fallback_no_match"
+    llm_fallback_match_unactionable = "llm_fallback_match_unactionable"
+    llm_fallback_pre_click_error = "llm_fallback_pre_click_error"
+    llm_fallback_reset_verified = "llm_fallback_reset_verified"
+    llm_fallback_post_click_unverified = "llm_fallback_post_click_unverified"
+    success_precommit = "success_precommit"
+    success_verified = "success_verified"
+    terminal_post_click_exception = "terminal_post_click_exception"
+    terminal_unverified_reset = "terminal_unverified_reset"
+    terminal_unverified_click = "terminal_unverified_click"
+    terminal_unverified_toggle = "terminal_unverified_toggle"
+
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
@@ -1214,31 +1241,39 @@ async def _resolve_collapse_xp_assignment(
     return assignment
 
 
-async def _is_collapse_fanout_enabled(task: Task, family_flag: str, log_label: str) -> bool:
+async def _resolve_collapse_gate(task: Task, family_flag: str, log_label: str) -> _CollapseGateResult:
     organization_id = task.organization_id
     if not organization_id:
-        return False
+        return _CollapseGateResult(False, None, False)
     experimentation_provider = getattr(app, "EXPERIMENTATION_PROVIDER", None)
     if not experimentation_provider:
-        return False
+        return _CollapseGateResult(False, None, False)
     try:
-        family_enabled = await experimentation_provider.is_feature_enabled_cached(
-            family_flag,
-            organization_id,
-            properties={"organization_id": organization_id},
+        family_enabled = bool(
+            await experimentation_provider.is_feature_enabled_cached(
+                family_flag,
+                organization_id,
+                properties={"organization_id": organization_id},
+            )
         )
         if not family_enabled:
-            return False
+            return _CollapseGateResult(False, None, False)
         # PostHog hashes per flag key, so this umbrella is the only randomization source.
         # Family flags are kill switches and must never use percentage rollouts.
-        return await _resolve_collapse_xp_assignment(experimentation_provider, task, organization_id)
+        assigned = await _resolve_collapse_xp_assignment(experimentation_provider, task, organization_id)
+        return _CollapseGateResult(True, assigned, False)
     except Exception:
         LOG.warning(
             f"Failed to evaluate {log_label} flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
-        return False
+        return _CollapseGateResult(False, None, True)
+
+
+async def _is_collapse_fanout_enabled(task: Task, family_flag: str, log_label: str) -> bool:
+    gate = await _resolve_collapse_gate(task, family_flag, log_label)
+    return gate.family_enabled and bool(gate.assigned)
 
 
 async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
@@ -2894,6 +2929,7 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
+        entry_action_type="click",
         scraped_page_after_open=scraped_page_after_open,
         new_interactable_element_ids=new_interactable_element_ids,
     )
@@ -3244,7 +3280,14 @@ async def handle_input_text_action(
             action=action,
         )
         action.set_has_mini_agent()
-        return await handle_select_option_action(select_action, page, scraped_page, task, step)
+        return await handle_select_option_action(
+            select_action,
+            page,
+            scraped_page,
+            task,
+            step,
+            entry_action_type="input_text_converted",
+        )
 
     select_action = SelectOptionAction(
         reasoning=action.reasoning,
@@ -3353,6 +3396,7 @@ async def handle_input_text_action(
                     step=step,
                     task=task,
                     target_value=text,
+                    entry_action_type="input_text",
                 )
 
                 if select_result is not None:
@@ -3703,6 +3747,7 @@ async def handle_input_text_action(
                         task=task,
                         force_select=True,
                         target_value=text,
+                        entry_action_type="input_text",
                     )
                     if select_result and select_result.action_result and select_result.action_result.success:
                         auto_complete_hacky_flag = False
@@ -3741,6 +3786,7 @@ async def handle_input_text_action(
                         task=task,
                         force_select=True,
                         target_value=text,
+                        entry_action_type="input_text",
                     )
                     if select_result and select_result.action_result and select_result.action_result.success:
                         auto_complete_hacky_flag = False
@@ -4040,6 +4086,7 @@ async def handle_select_option_action(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    entry_action_type: str = "select_option",
 ) -> list[ActionResult]:
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
@@ -4286,6 +4333,7 @@ async def handle_select_option_action(
                     scraped_page=scraped_page,
                     task=task,
                     step=step,
+                    entry_action_type=entry_action_type,
                 )
             )
             return results
@@ -4304,6 +4352,7 @@ async def handle_select_option_action(
             task=task,
             force_select=True,
             target_value=action.option.label or action.option.value or "",
+            entry_action_type=entry_action_type,
         )
         # force_select won't return None result
         assert result is not None
@@ -4786,7 +4835,8 @@ async def handle_goto_url_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await page.goto(action.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
+    await page.goto(validated_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
     # Navigation invalidates the current scraped page's element ids; stop the batch so the
     # next step re-scrapes before any later actions run against the new DOM.
     result = ActionSuccess()
@@ -4872,9 +4922,10 @@ async def handle_new_tab_action(
     browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
     if browser_state is None:
         return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
+    validated_url = await asyncio.to_thread(validate_fetch_url, action.url)
     new_page = await browser_state.new_page()
     try:
-        await browser_state.navigate_to_url(page=new_page, url=action.url)
+        await browser_state.navigate_to_url(page=new_page, url=validated_url)
     except Exception as e:
         # Don't leave a blank/failed tab as the newest page — the next scrape would fail it.
         try:
@@ -6228,6 +6279,7 @@ async def sequentially_select_from_dropdown(
     force_select: bool = False,
     target_value: str = "",
     continue_until_close: bool = False,
+    entry_action_type: str = "select_option",
 ) -> CustomSingleSelectResult | None:
     """
     TODO: support to return all values retrieved from the sequentially select
@@ -6247,6 +6299,7 @@ async def sequentially_select_from_dropdown(
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
     single_select_result: CustomSingleSelectResult | None = None
+    selection_group_id = str(uuid.uuid4())
 
     check_filter_funcs: list[CheckFilterOutElementIDFunc] = [check_existed_but_not_option_element_in_dom_factory(dom)]
     for i in range(max_depth):
@@ -6263,6 +6316,8 @@ async def sequentially_select_from_dropdown(
             select_history=select_history,
             force_select=force_select,
             target_value=target_value,
+            entry_action_type=entry_action_type,
+            selection_group_id=selection_group_id,
         )
         assert single_select_result is not None
         select_history.append(single_select_result)
@@ -6899,31 +6954,95 @@ async def _select_deterministic_custom_option(
     get_skyvern_element: Callable[[str], Awaitable[SkyvernElement]],
     get_readback_scope_element: Callable[[], Awaitable[SkyvernElement | None]] | None = None,
     task: Task,
+    step: Step | None = None,
+    entry_action_type: str = "select_option",
+    selection_group_id: str | None = None,
+    select_depth: int = 0,
 ) -> tuple[ActionResult, str | None] | None:
+    started_at = time.monotonic()
+    selection_group_id = selection_group_id or str(uuid.uuid4())
+    option_count: int | None = None
+    eligible = False
+    match_tier: str | None = None
+    attempted = False
+    click_attempted = False
+
+    def emit(outcome: CustomSelectFamilyOutcome) -> None:
+        try:
+            LOG.info(
+                "custom_select_family_outcome",
+                family="custom_select",
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                step_id=getattr(step, "step_id", None),
+                entry_action_type=entry_action_type,
+                selection_group_id=selection_group_id,
+                select_depth=select_depth,
+                family_gate_enabled=gate.family_enabled,
+                assigned=gate.assigned,
+                gate_error=gate.gate_error,
+                encountered=True,
+                eligible=eligible,
+                match_tier=match_tier,
+                option_count=option_count,
+                attempted=attempted,
+                click_attempted=click_attempted,
+                verified_success=outcome
+                in {CustomSelectFamilyOutcome.success_precommit, CustomSelectFamilyOutcome.success_verified},
+                outcome=outcome.value,
+                llm_fallback_requested=outcome.value.startswith("llm_fallback_"),
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+        except Exception:
+            LOG.debug("custom_select_family_outcome failed", exc_info=True)
+
     if not target_value:
         return None
     if isinstance(field_context, dict) and field_context.get("is_date_related") is True:
         return None
-    if not await _is_collapse_custom_select_fanout_enabled(task):
-        return None
 
-    option_candidates = get_option_candidates()
-    if not option_candidates:
-        return None
-
-    option_labels = [str(candidate.get("label") or "") for candidate in option_candidates]
-    option_values = [candidate.get("value") for candidate in option_candidates]
-    resolution = await app.AGENT_FUNCTION.resolve_field_option(
-        target_value=target_value,
-        option_labels=option_labels,
-        option_values=option_values,
-        field_context=field_context,
-        url=task.url,
-        organization_id=task.organization_id,
+    gate = await _resolve_collapse_gate(
+        task,
+        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
+        "collapse-custom-select-fanout",
     )
+    if gate.gate_error:
+        emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)
+        return None
+
+    try:
+        option_candidates = get_option_candidates()
+        if not option_candidates:
+            return None
+        option_labels = [str(candidate.get("label") or "") for candidate in option_candidates]
+        option_values = [candidate.get("value") for candidate in option_candidates]
+        resolution = await app.AGENT_FUNCTION.resolve_field_option(
+            target_value=target_value,
+            option_labels=option_labels,
+            option_values=option_values,
+            field_context=field_context,
+            url=task.url,
+            organization_id=task.organization_id,
+        )
+    except Exception:
+        emit(CustomSelectFamilyOutcome.llm_fallback_eval_error)
+        return None
+
+    option_count = len(option_candidates)
+    eligible = not resolution.fallback_to_llm and resolution.matched_index is not None
+    match_tier = getattr(resolution, "matched_tier", None)
+    if not gate.family_enabled:
+        emit(CustomSelectFamilyOutcome.llm_fallback_family_off)
+        return None
+    if gate.assigned is False:
+        emit(CustomSelectFamilyOutcome.llm_fallback_control)
+        return None
     if resolution.fallback_to_llm or resolution.matched_index is None:
+        emit(CustomSelectFamilyOutcome.llm_fallback_no_match)
         return None
     if resolution.matched_index >= len(option_candidates):
+        emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
         return None
 
     matched_candidate = option_candidates[resolution.matched_index]
@@ -6933,6 +7052,7 @@ async def _select_deterministic_custom_option(
     # that are not necessarily present on the resolved element itself.
     matched_option_is_choice_input = matched_candidate["is_choice_input"]
     if not element_id:
+        emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
         return None
 
     readback_scope_element: SkyvernElement | None = None
@@ -6940,8 +7060,10 @@ async def _select_deterministic_custom_option(
     try:
         selected_element = await get_skyvern_element(element_id)
         if await selected_element.get_attr("role") == "listbox":
+            emit(CustomSelectFamilyOutcome.llm_fallback_match_unactionable)
             return None
 
+        attempted = True
         matched_state = await _read_custom_select_matched_state(selected_element)
         live_role = str((matched_state or {}).get("role") or "").lower()
         live_toggle_shaped = (
@@ -6962,6 +7084,7 @@ async def _select_deterministic_custom_option(
         expected_label = _normalize_select_shadow_text(matched_label)
         if expected_label:
             if _custom_select_matched_state_confirms_pre_click(matched_state, expected_label):
+                emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
             if await _custom_select_scope_confirms_committed(
                 readback_scope_element=readback_scope_element,
@@ -6971,9 +7094,11 @@ async def _select_deterministic_custom_option(
                 expected_label=expected_label,
                 allow_aria_selected_option_tokens=False,
             ):
+                emit(CustomSelectFamilyOutcome.success_precommit)
                 return ActionSuccess(), matched_label
 
         await selected_element.scroll_into_view()
+        click_attempted = True
         await selected_element.click(page=page)
         verified = await _verify_custom_select_option_with_settle(
             matched_element=selected_element,
@@ -6983,6 +7108,7 @@ async def _select_deterministic_custom_option(
             matched_label=matched_label,
         )
         if verified:
+            emit(CustomSelectFamilyOutcome.success_verified)
             return ActionSuccess(), matched_label
     except Exception:
         LOG.info(
@@ -6992,17 +7118,27 @@ async def _select_deterministic_custom_option(
             matched_label=matched_label,
             exc_info=True,
         )
+        emit(
+            CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
+            if click_attempted
+            else CustomSelectFamilyOutcome.llm_fallback_pre_click_error
+        )
         return None
 
     if anchor_is_combobox_input:
         # Text-input comboboxes can be safely reset, so an unconfirmed read-back routes to the LLM
         # mini-agent (which clears/reopens the field) instead of hard-failing the whole action.
-        await _reset_custom_select_combobox_input(readback_scope_element, page)
+        reset_verified = await _reset_custom_select_combobox_input(readback_scope_element, page)
         LOG.info(
             "Deterministic custom-select read-back inconclusive on combobox input; routing to LLM fallback",
             target_value=target_value,
             matched_element_id=element_id,
             matched_label=matched_label,
+        )
+        emit(
+            CustomSelectFamilyOutcome.llm_fallback_reset_verified
+            if reset_verified
+            else CustomSelectFamilyOutcome.llm_fallback_post_click_unverified
         )
         return None
 
@@ -7015,6 +7151,7 @@ async def _select_deterministic_custom_option(
             matched_element_id=element_id,
             matched_label=matched_label,
         )
+        emit(CustomSelectFamilyOutcome.llm_fallback_post_click_unverified)
         return None
 
     LOG.info(
@@ -7030,21 +7167,24 @@ async def _select_deterministic_custom_option(
         )
     )
     action_failure.skip_remaining_actions = True
+    emit(CustomSelectFamilyOutcome.terminal_unverified_toggle)
     return action_failure, matched_label
 
 
-async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> None:
+async def _reset_custom_select_combobox_input(element: SkyvernElement | None, page: Page) -> bool:
     if element is None:
-        return
+        return False
     try:
         locator = element.get_locator()
         await locator.fill("")
         await element.click(page=page)
+        return await get_input_value(element.get_tag_name(), locator) == ""
     except Exception:
         LOG.info(
             "Failed to reset custom-select combobox input before LLM fallback",
             exc_info=True,
         )
+        return False
 
 
 def _no_match_exception_for_dropdown(
@@ -7097,6 +7237,7 @@ async def select_from_emerging_elements(
     scraped_page: ScrapedPage,
     step: Step,
     task: Task,
+    entry_action_type: str = "select_option",
     scraped_page_after_open: ScrapedPage | None = None,
     new_interactable_element_ids: list[str] | None = None,
 ) -> ActionResult:
@@ -7105,6 +7246,7 @@ async def select_from_emerging_elements(
     Currently mainly used for the dropdown menu selection.
     """
 
+    selection_group_id = str(uuid.uuid4())
     # TODO: support to handle the case when options are loaded by scroll
     scraped_page_after_open = scraped_page_after_open or await scraped_page.generate_scraped_page_without_screenshots()
     new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
@@ -7172,6 +7314,10 @@ async def select_from_emerging_elements(
         get_skyvern_element=dom_after_open.get_skyvern_element_by_id,
         get_readback_scope_element=get_readback_scope_element,
         task=task,
+        step=step,
+        entry_action_type=entry_action_type,
+        selection_group_id=selection_group_id,
+        select_depth=0,
     )
     if deterministic_result is not None:
         action_result, _matched_label = deterministic_result
@@ -7280,6 +7426,8 @@ async def select_from_dropdown(
     select_history: list[CustomSingleSelectResult] | None = None,
     force_select: bool = False,
     target_value: str = "",
+    entry_action_type: str = "select_option",
+    selection_group_id: str | None = None,
 ) -> CustomSingleSelectResult:
     """
     force_select: is used to choose an element to click even there's no dropdown menu;
@@ -7337,6 +7485,10 @@ async def select_from_dropdown(
         get_skyvern_element=lambda element_id: SkyvernElement.create_from_incremental(incremental_scraped, element_id),
         get_readback_scope_element=_readback_scope_element_provider(skyvern_element),
         task=task,
+        step=step,
+        entry_action_type=entry_action_type,
+        selection_group_id=selection_group_id or str(uuid.uuid4()),
+        select_depth=len(select_history),
     )
     if deterministic_result is not None:
         action_result, matched_label = deterministic_result
