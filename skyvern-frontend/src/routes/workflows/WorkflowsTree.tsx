@@ -71,6 +71,7 @@ import { useInfiniteFoldersQuery } from "./hooks/useInfiniteFoldersQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
+import { useWorkflowsReliabilityBatchQuery } from "./hooks/useWorkflowsReliabilityBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
 import {
@@ -403,6 +404,8 @@ function WorkflowsTree() {
       enabled: taggingEnabled,
     },
   );
+  const { data: workflowReliabilityMap = {} } =
+    useWorkflowsReliabilityBatchQuery(workflowIds);
 
   // Tags observed on the page for editor/filter suggestions: grouped values per
   // key plus standalone labels. Maps avoid prototype-key collisions.
@@ -700,6 +703,7 @@ function WorkflowsTree() {
     selectedCount: selectedWorkflows.length,
     foldersMap,
     workflowTagsMap,
+    workflowReliabilityMap,
     tagDescriptions,
     tagColors,
     tagKeys,
