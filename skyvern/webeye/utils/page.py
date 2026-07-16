@@ -21,6 +21,7 @@ from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
 if TYPE_CHECKING:
@@ -104,9 +105,13 @@ async def _dispatch_evaluate(frame: Page | Frame, expression: str, arg: Any | No
     # Page + prefix + JSON-safe arg → main-world hook (preserves the marker).
     # Iframe Frames and non-JSON args fall back to per-frame evaluate so iframe
     # contexts and Playwright handle-marshalling keep working.
-    if not isinstance(frame, Page):
+    if not is_page_like(frame):
         return await frame.evaluate(expression=expression, arg=arg)
-    if get_main_world_prefix(frame.context) is None:
+    context = frame.context
+    # A page whose context is None (an engine's pre-attach/edge state) can't key
+    # the prefix WeakKeyDictionary — get_main_world_prefix(None) would raise
+    # instead of returning the no-prefix fallback, so take direct evaluate here.
+    if context is None or get_main_world_prefix(context) is None:
         return await frame.evaluate(expression=expression, arg=arg)
     if arg is not None and not _is_json_inlinable(arg):
         return await frame.evaluate(expression=expression, arg=arg)
