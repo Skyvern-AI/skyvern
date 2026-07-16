@@ -4,6 +4,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .code_block_step_yaml import CodeBlockStepYaml
 
 
 class CodeBlockYaml(UniversalBaseModel):
@@ -23,6 +24,8 @@ class CodeBlockYaml(UniversalBaseModel):
     next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
+    prompt: typing.Optional[str] = None
+    steps: typing.Optional[typing.List[CodeBlockStepYaml]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

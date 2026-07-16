@@ -4,4 +4,6 @@ export interface CredentialParameterYaml {
     key: string;
     description?: string;
     credential_id: string;
+    credential_ids?: string[];
+    selection_strategy?: string;
 }
