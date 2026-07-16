@@ -10,7 +10,7 @@ import hashlib
 import inspect
 import json
 import textwrap
-from types import SimpleNamespace
+from types import EllipsisType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -94,6 +94,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _detect_stale_block_metadata,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
@@ -4096,7 +4097,7 @@ class TestCodeRepairProgressClassification:
               - block_type: code
                 label: extract_entry_output
                 code: |
-                  return build_output()
+                  return {"output": build_output()}
             """
         )
 
@@ -4167,13 +4168,7 @@ class TestCodeRepairProgressClassification:
                   await page.get_by_role("button", name="Submit").click()
             """
         )
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
-            required_paths=required_paths,
-        )
+        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=required_paths)
         workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
 
         evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
@@ -4253,13 +4248,7 @@ class TestCodeRepairProgressClassification:
             """
         )
         ctx.turn_id = "run-static-return-gap"
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
-            required_paths={"output.record_id"},
-        )
+        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths={"output.record_id"})
         workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
 
         result = await _update_workflow(
@@ -4498,7 +4487,7 @@ class TestCodeRepairProgressClassification:
 
         assert result is not None
         assert result["ok"] is False
-        assert result["data"]["reason_code"] == "output_contract_required"
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
         assert result["data"]["output_contract_reject_count"] == 4
         assert result["data"]["canonical_required_child_paths"] == ["output.record_id"]
 
@@ -4507,43 +4496,16 @@ class TestCodeRepairProgressClassification:
         ctx.turn_id = "contract-scope-a"
         first = workflow_update_module._output_contract_signature(
             ctx=ctx,
-            workflow_yaml=_yaml(
-                """
-                title: First draft title
-                workflow_definition:
-                  blocks: []
-                """
-            ),
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
             required_paths={"output.locations[].address", "output.statuses"},
         )
         second = workflow_update_module._output_contract_signature(
             ctx=ctx,
-            workflow_yaml=_yaml(
-                """
-                title: Changed draft title
-                workflow_definition:
-                  blocks: []
-                """
-            ),
-            source="runtime_output_repair",
-            reason_code="runtime_output_repair_required",
             required_paths={"output.statuses", "output.locations[].address"},
         )
         other_ctx = _code_only_ctx()
         other_ctx.turn_id = "contract-scope-b"
         other_scope = workflow_update_module._output_contract_signature(
             ctx=other_ctx,
-            workflow_yaml=_yaml(
-                """
-                title: Changed draft title
-                workflow_definition:
-                  blocks: []
-                """
-            ),
-            source="runtime_output_repair",
-            reason_code="runtime_output_repair_required",
             required_paths={"output.statuses", "output.locations[].address"},
         )
 
@@ -4578,13 +4540,7 @@ class TestCodeRepairProgressClassification:
             reject_family="declared_output_return_shape",
         )
 
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml="title: Any\nworkflow_definition:\n  blocks: []\n",
-            source="different",
-            reason_code="different",
-            required_paths=required_paths,
-        )
+        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=required_paths)
         assert (first, second, third) == (1, 2, 3)
         assert ctx.output_contract_reject_count_by_signature[signature] == 3
 
@@ -4954,7 +4910,7 @@ class TestCodeRepairProgressClassification:
         assert result is not None
         assert result["ok"] is False
         assert result["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert result["data"]["output_contract_reason_code"] == "output_contract_required"
+        assert result["data"]["output_contract_reason_code"] == "value_bearing_output_required"
         assert result["data"]["block_label"] == "extract_entry_output"
         assert result["data"]["canonical_required_child_paths"] == ["output.flags", "output.record_id"]
         assert result["data"]["missing_goal_value_paths"] == ["output.flags", "output.record_id"]
@@ -5099,7 +5055,7 @@ class TestCodeRepairProgressClassification:
         assert results[0] is not None
         assert results[0]["ok"] is False
         assert results[0]["data"]["reason_code"] == "metadata_contract_required_before_run"
-        assert results[0]["data"]["output_contract_reason_code"] == "output_contract_required"
+        assert results[0]["data"]["output_contract_reason_code"] == "value_bearing_output_required"
         assert results[0]["data"]["output_contract_reject_count"] == 1
         assert results[-1] is not None
         assert results[-1]["data"]["output_contract_reject_count"] == 4
@@ -8555,17 +8511,11 @@ class TestSeparatedSpineImpositionRunEligibility:
             ctx, workflow_yaml, []
         )
         contract = workflow_update_module._output_contract_required_paths_source(ctx)
-        required_paths, source, reason_code = contract.union, contract.source, contract.reason_code
+        required_paths = contract.union
         read_label, _owner_labels = workflow_update_module._target_output_contract_block_label(
             ctx, workflow_yaml, scaffolded_metadata, required_paths
         )
-        read_signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source=source,
-            reason_code=reason_code,
-            required_paths=required_paths,
-        )
+        read_signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=required_paths)
         read_key = workflow_update_module._output_contract_spine_directive_attempt_key(
             signature=read_signature, block_label=read_label, workflow_yaml=workflow_yaml
         )
@@ -14040,23 +13990,344 @@ def _declaration_stamp_ctx() -> CopilotContext:
     return ctx
 
 
-class TestDeclarationContractStamp:
-    def test_zero_output_block_persists_declared_blocker_on_first_contact(self) -> None:
-        ctx = _declaration_stamp_ctx()
-        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")')
+def _degraded_declaration_stamp_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.turn_id = "t-degraded-decl"
+    ctx.scout_trajectory = []
+    requested_paths = (
+        "output.confirmation_number",
+        "output.account_number",
+        "output.start_date",
+        "output.deposit_amount",
+        "output.next_owner",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            *[
+                CompletionCriterion(
+                    id=f"slot_{index}",
+                    outcome=f"The returned record includes {path}.",
+                    request_slot_id=f"slot_{index}",
+                    pinability="unpinnable",
+                    mint_disposition="degraded",
+                    mint_degrade="undecidable_judgment",
+                    requested_output_floor_rekeyed=True,
+                    floor_rekeyed_from_path=path,
+                )
+                for index, path in enumerate(requested_paths)
+            ],
+            CompletionCriterion(
+                id="c_blocker",
+                outcome="A blocker is reported when the site blocks submission.",
+                contingent_on="the site blocks submission",
+                contingent_antecedent_output_path="output.blocker",
+            ),
+        ]
+    )
+    return ctx
 
-        new_yaml, _metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
-            ctx, workflow_yaml, []
+
+class TestDeclarationContractStamp:
+    @pytest.mark.parametrize("empty_value", ["None", "''", "'   '", "[]", "{}", "[None]", "[{}]", "{'a': None}"])
+    def test_static_empty_observation_value_is_non_run_eligible(self, empty_value: str) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(f'return {{"output": {{"record_id": {empty_value}, "blocker": None}}}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
         )
 
+        assert evaluation is not None
+        assert evaluation.missing_metadata_paths == []
+        assert evaluation.missing_schema_paths == []
+        assert evaluation.missing_return_paths == []
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+
+    @pytest.mark.parametrize("value", ["0", "False", "'record-123'", "[None, 'x']", "{'a': 'x'}"])
+    def test_static_value_bearing_observation_remains_run_eligible(self, value: str) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(f'return {{"output": {{"record_id": {value}, "blocker": None}}}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+        )
+
+        assert evaluation is not None
+        assert evaluation.has_deficiencies is False
+
+    def test_full_metadata_advisory_rejects_declaration_only_return(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        required_paths = {"output.record_id", "output.blocker"}
+        signature = workflow_update_module._stable_output_contract_key(
+            workflow_update_module._output_contract_scope_key(ctx), required_paths
+        )
+        workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
+        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")\nreturn {"output": {"blocker": None}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            metadata,
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
+        )
+
+        assert evaluation is not None
+        assert evaluation.missing_metadata_paths == []
+        assert evaluation.missing_schema_paths == []
+        assert evaluation.missing_return_paths == ["output.record_id"]
+        assert evaluation.payload["static_return_advisory_paths"] == []
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+
+    @pytest.mark.asyncio
+    async def test_full_metadata_declaration_only_contract_rejects_at_persist_seam(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")\nreturn {"output": {"blocker": None}}')
+        metadata = [
+            workflow_update_module._metadata_contract_template(
+                block_label="extract_record",
+                required_paths={"output.record_id"},
+                source="requested_output_contract",
+                reason_code="requested_output_contract_missing_output_coverage",
+                declaration_paths={"output.blocker"},
+            )
+        ]
+
+        result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml, "code_artifact_metadata": metadata},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert result["data"]["contract_liveness"] == "value_required"
+        assert result["data"]["missing_goal_value_paths"] == []
+        assert result["data"]["missing_extraction_schema_paths"] == []
+        assert result["data"]["missing_code_return_paths"] == ["output.record_id"]
+
+    def test_grant_preflight_rejects_declaration_only_return(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            [],
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
+        )
+        assert evaluation is not None
+        workflow_update_module._grant_output_contract_advisory_run(ctx, evaluation.canonical_signature)
+
+        preflight = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+        assert preflight is not None
+        assert preflight["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert (
+            workflow_update_module._output_contract_advisory_state(ctx, evaluation.canonical_signature)
+            == OutputContractAdvisoryState.UNUSED
+        )
+        assert evaluation.canonical_signature not in ctx.output_contract_pending_run_evidence
+
+    def test_degraded_requested_slots_make_declaration_only_contract_non_run_eligible(self) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+
+        formed_yaml, metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            formed_yaml,
+            metadata,
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
+        )
+
+        assert applied is False
+        assert formed_yaml == workflow_yaml
+        assert evaluation is not None
+        signature = evaluation.canonical_signature
+        assert ctx.output_contract_armed_directive_fingerprint_by_signature.get(
+            signature
+        ) == workflow_update_module._output_contract_structural_fingerprint(workflow_yaml, signature)
+        assert evaluation.payload["contract_liveness"] == "degraded_empty"
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+        assert [row["request_slot_id"] for row in evaluation.payload["degraded_request_slots"]] == [
+            "slot_0",
+            "slot_1",
+            "slot_2",
+            "slot_3",
+            "slot_4",
+        ]
+        assert [row["floor_rekeyed_from_path"] for row in evaluation.payload["degraded_request_slots"]] == [
+            "output.confirmation_number",
+            "output.account_number",
+            "output.start_date",
+            "output.deposit_amount",
+            "output.next_owner",
+        ]
+
+    def test_degraded_declaration_only_directive_arm_is_idempotent(self) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+
+        first_yaml, _, first_applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        second_yaml, _, second_applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, first_yaml, []
+        )
+
+        assert first_applied is False
+        assert second_applied is False
+        assert first_yaml == workflow_yaml
+        assert second_yaml == workflow_yaml
+        assert len(ctx.output_contract_armed_directive_fingerprint_by_signature) == 1
+
+    def test_second_run_request_slot_producer_failure_rejects_blocker_only_return(self) -> None:
+        requested_paths = (
+            "output.confirmation_number",
+            "output.account_number",
+            "output.start_date",
+            "output.deposit_amount",
+            "output.next_owner",
+        )
+        ctx = _code_only_ctx()
+        ctx.turn_id = "t-request-slot-producer-failure"
+        ctx.scout_trajectory = []
+        ctx.request_policy = request_policy_module._classification_from_raw(
+            {
+                "completion_criteria": [
+                    {
+                        "outcome": f"The returned record includes {path}.",
+                        "output_path": path,
+                        "request_slot_source_id": "latest_request",
+                        "request_slot_source_quote": path,
+                    }
+                    for path in requested_paths
+                ]
+            },
+            request_slot_failure_kind="invalid_output",
+        )
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+            ctx,
+            workflow_yaml,
+            [],
+            allow_static_return_advisory=True,
+            enforce_value_bearing_liveness=True,
+        )
+        preflight = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+
+        assert ctx.request_policy.request_slot_failure_kind == "invalid_output"
+        assert all(criterion.output_path is None for criterion in ctx.request_policy.completion_criteria)
+        assert all(criterion.mint_disposition == "degraded" for criterion in ctx.request_policy.completion_criteria)
+        assert evaluation is not None
+        assert evaluation.payload["contract_liveness"] == "degraded_empty"
+        assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+        assert evaluation.can_attempt_run is False
+        assert [row["floor_rekeyed_from_path"] for row in evaluation.payload["degraded_request_slots"]] == sorted(
+            requested_paths
+        )
+        assert {row["request_slot_failure_kind"] for row in evaluation.payload["degraded_request_slots"]} == {
+            "invalid_output"
+        }
+        assert preflight is not None
+        assert preflight["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+
+    @pytest.mark.asyncio
+    async def test_degraded_declaration_only_contract_never_persists_or_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+        persisted = False
+        dispatched = False
+
+        async def _unexpected_update(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal persisted
+            persisted = True
+            return {"ok": True}
+
+        async def _unexpected_dispatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal dispatched
+            dispatched = True
+            return {"ok": True}
+
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(tools_module, "_update_workflow", _unexpected_update)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", _unexpected_dispatch)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["extract_entry_output"]}),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed["data"]["reason_code"] == "metadata_contract_required_before_run"
+        assert parsed["data"]["output_contract_reason_code"] == "value_bearing_output_required"
+        assert parsed["data"]["contract_liveness"] == "degraded_empty"
+        assert persisted is False
+        assert dispatched is False
+
+    def test_mixed_value_and_declaration_return_remains_valid(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(
+            'record_id = await page.locator("#record-id").text_content()\nreturn {"output": {"record_id": record_id}}'
+        )
+
+        formed_yaml, metadata, applied = workflow_update_module._impose_output_contract_envelope_after_steering(
+            ctx, workflow_yaml, []
+        )
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, formed_yaml, metadata)
+
         assert applied is True
-        code = str(workflow_blocks(parse_workflow_yaml(new_yaml))[0].get("code") or "")
-        produced = workflow_update_module._code_block_produced_output_paths(code)
-        assert "output.blocker" in produced  # nosemgrep: incomplete-url-substring-sanitization
-        assert "output.record_id" not in produced
+        assert evaluation is not None
+        assert evaluation.has_deficiencies is False
+        code = str(workflow_blocks(parse_workflow_yaml(formed_yaml))[0].get("code") or "")
+        assert '"record_id": record_id' in code
         assert '"blocker": None' in code
 
-    def test_stamp_applies_before_output_contract_actuation(self) -> None:
+    def test_formation_does_not_create_declaration_only_scaffold(self) -> None:
         ctx = _declaration_stamp_ctx()
         workflow_yaml = _collapsed_spine_yaml('await page.click("#submit")\nreturn {}')
 
@@ -14065,8 +14336,12 @@ class TestDeclarationContractStamp:
         )
 
         assert applied is True
+        assert new_yaml == workflow_yaml
         code = str(workflow_blocks(parse_workflow_yaml(new_yaml))[0].get("code") or "")
-        assert 'return {"output": {"blocker": None}}' in code
+        assert "blocker" not in code
+        evaluation = workflow_update_module._evaluate_output_contract_for_code_block(ctx, new_yaml, _metadata)
+        assert evaluation is not None
+        assert evaluation.can_attempt_run is False
 
     def test_stamp_is_idempotent_across_calls(self) -> None:
         ctx = _declaration_stamp_ctx()
@@ -14103,6 +14378,589 @@ class TestDeclarationContractStamp:
 
         assert applied is False
         assert new_yaml == workflow_yaml
+
+    def test_stamp_refused_for_statically_empty_observation_code(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml('return {"output": {"record_id": None}}')
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        stamped_yaml, applied = workflow_update_module._stamp_declaration_contract_defaults(
+            ctx, workflow_yaml, [], contract, "sig-declaration-stamp"
+        )
+
+        assert applied is False
+        assert stamped_yaml == workflow_yaml
+
+    def test_stamp_applies_for_runtime_populated_observation_code(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        workflow_yaml = _collapsed_spine_yaml(
+            'record_id = await page.inner_text("#record")\nreturn {"output": {"record_id": record_id}}'
+        )
+        contract = workflow_update_module._output_contract_required_paths_source(ctx)
+
+        stamped_yaml, applied = workflow_update_module._stamp_declaration_contract_defaults(
+            ctx, workflow_yaml, [], contract, "sig-declaration-stamp"
+        )
+
+        assert applied is True
+        code = str(workflow_blocks(parse_workflow_yaml(stamped_yaml))[0].get("code") or "")
+        assert '"blocker": None' in code
+
+
+def test_static_return_synthesis_refuses_statically_none_observation_local() -> None:
+    code = "record_id = None"
+
+    keyed, violations = workflow_update_module._extraction_code_with_value_bearing_static_return(
+        code, required_paths={"output.record_id"}, declaration_paths={"output.blocker"}
+    )
+
+    assert violations
+    assert keyed == code
+
+
+def test_static_return_synthesis_accepts_runtime_populated_observation_local() -> None:
+    code = 'record_id = await page.inner_text("#record")'
+
+    keyed, violations = workflow_update_module._extraction_code_with_value_bearing_static_return(
+        code, required_paths={"output.record_id"}, declaration_paths={"output.blocker"}
+    )
+
+    assert violations == []
+    assert {"output.record_id", "output.blocker"} <= workflow_update_module._code_block_produced_output_paths(keyed)
+
+
+def test_static_return_synthesis_refuses_covered_statically_empty_return() -> None:
+    code = 'return {"output": {"record_id": None, "blocker": None}}'
+
+    _, violations = workflow_update_module._extraction_code_with_value_bearing_static_return(
+        code, required_paths={"output.record_id"}, declaration_paths={"output.blocker"}
+    )
+
+    assert violations
+
+
+def test_value_bearing_lattice_unpack_after_empty_literal_is_fail_open() -> None:
+    code = 'extra = await collect()\nreturn {"output": {"record_id": None, **extra}}'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+
+
+def test_value_bearing_lattice_top_level_unpack_after_output_key_is_fail_open() -> None:
+    code = 'extra = await collect()\nreturn {"output": {"record_id": None}, **extra}'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+
+
+def test_value_bearing_lattice_empty_literal_after_unpack_stays_refused() -> None:
+    code = 'extra = await collect()\nreturn {"output": {**extra, "record_id": None}}'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "payload, extra = await split()",
+        "*rest, payload = await split()",
+        'with open("audit.log") as payload:\n    pass',
+        "try:\n    pass\nexcept ValueError as payload:\n    pass",
+        "if (payload := await build()):\n    pass",
+        'payload["output"]["record_id"] = await fetch()',
+        'payload["output"].update(await fetch())',
+        'for item in await rows():\n    payload["output"]["items"].append(item)',
+        "populate(payload)",
+        "payload.output = await fetch()",
+        'alias = payload\nalias["output"]["record_id"] = await fetch()',
+        'alias = payload\nalias["output"].update(await fetch())',
+        'inner = payload["output"]\ninner["record_id"] = await fetch()',
+        "alias = payload\npopulate(alias)",
+        "first = payload\nsecond = first\nsecond.output = await fetch()",
+    ],
+)
+def test_value_bearing_lattice_mutated_literal_is_fail_open(mutation: str) -> None:
+    code = f'payload = {{"output": {{"record_id": None}}}}\n{mutation}\nreturn payload'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+    assert workflow_update_module._statically_valueless_return_envelope(code) is False
+
+
+def test_value_bearing_lattice_unmutated_literal_stays_refused() -> None:
+    code = 'payload = {"output": {"record_id": None}}\nother = await fetch()\nreturn payload'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is True
+    assert workflow_update_module._statically_valueless_return_envelope(code) is True
+
+
+def test_value_bearing_lattice_unmutated_alias_stays_refused() -> None:
+    code = 'payload = {"output": {"record_id": None}}\nalias = payload\nreturn payload'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is True
+    assert workflow_update_module._statically_valueless_return_envelope(code) is True
+
+
+@pytest.mark.parametrize(
+    "aliasing",
+    [
+        'holder = {}\nholder["slot"] = payload',
+        'holder = {}\nholder["slot"] = payload\nholder["slot"]["output"]["record_id"] = await fetch()',
+        'holder = {}\nholder["slot"] = payload\nholder["slot"]["output"].update(await fetch())',
+        'holder = obj()\nholder.slot = payload\nholder.slot["output"]["record_id"] = await fetch()',
+    ],
+)
+def test_value_bearing_lattice_alias_into_container_target_is_fail_open(aliasing: str) -> None:
+    # Assigning payload into a subscript/attribute target aliases it, so a mutation through the
+    # container could make the return value-bearing; the value name must taint (fail-open), not
+    # resolve to its pre-alias empty literal.
+    code = f'payload = {{"output": {{"record_id": None}}}}\n{aliasing}\nreturn payload'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+    assert workflow_update_module._statically_valueless_return_envelope(code) is False
+
+
+def test_value_bearing_lattice_nul_byte_source_is_fail_open() -> None:
+    code = 'return {"output": {"record_id": None}}\x00'
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+    assert workflow_update_module._statically_valueless_return_envelope(code) is False
+
+
+def test_value_bearing_lattice_deep_alias_chain_is_fail_open() -> None:
+    lines = ['v0 = {"output": {"record_id": None}}']
+    lines.extend(f"v{index} = v{index - 1}" for index in range(1, 1500))
+    lines.append("return v1499")
+    code = "\n".join(lines)
+
+    assert workflow_update_module._statically_lacks_value_bearing_observation_paths(code, {"output.record_id"}) is False
+    assert workflow_update_module._statically_valueless_return_envelope(code) is False
+
+
+def test_canonical_output_contract_signature_is_single_keyed_under_degraded_slots() -> None:
+    ctx = _degraded_declaration_stamp_ctx()
+    workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+    evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        [],
+        allow_static_return_advisory=True,
+        enforce_value_bearing_liveness=True,
+    )
+    assert evaluation is not None
+    contract = workflow_update_module._output_contract_required_paths_source(ctx)
+    signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=contract.union)
+
+    assert evaluation.canonical_signature == signature
+    assert evaluation.payload["canonical_output_contract_signature"] == signature
+    assert workflow_update_module._output_contract_pin_key(ctx, workflow_yaml, contract.union) == signature
+    structural = workflow_update_module._output_contract_author_time_structural_payload(ctx, contract.union)
+    assert structural is not None
+    assert structural["canonical_output_contract_signature"] == signature
+    workflow_update_module._record_output_contract_family_reject(
+        ctx, contract.union, reject_family="value_bearing_output_required"
+    )
+    assert ctx.output_contract_reject_count_by_signature == {signature: 1}
+    workflow_update_module._record_output_contract_deferral(ctx, contract.union)
+    assert ctx.output_contract_deferral_count_by_signature == {signature: 1}
+    identity_free = workflow_update_module._stable_output_contract_key(
+        workflow_update_module._output_contract_scope_key(ctx), contract.union
+    )
+    assert signature != identity_free
+
+
+def test_non_value_deficiency_keeps_granted_advisory_arming_at_preflight() -> None:
+    ctx = _declaration_stamp_ctx()
+    workflow_yaml = _collapsed_spine_yaml(
+        'record_id = await page.locator("#record-id").text_content()\n'
+        'return {"output": {"record_id": record_id, "blocker": None}}'
+    )
+    evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        [],
+        allow_static_return_advisory=True,
+        enforce_value_bearing_liveness=True,
+    )
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is True
+    assert evaluation.can_attempt_run is False
+    assert "value_bearing_output_required" not in evaluation.shape_violations
+    workflow_update_module._grant_output_contract_advisory_run(ctx, evaluation.canonical_signature)
+
+    preflight = workflow_update_module._metadata_contract_run_preflight_reject(ctx, workflow_yaml, [])
+
+    assert preflight is None
+    assert evaluation.canonical_signature in ctx.output_contract_pending_run_evidence
+    assert (
+        workflow_update_module._output_contract_advisory_state(ctx, evaluation.canonical_signature)
+        == OutputContractAdvisoryState.GRANTED
+    )
+
+
+def test_degraded_criteria_reject_steers_to_criteria_not_code_repair() -> None:
+    ctx = _degraded_declaration_stamp_ctx()
+    workflow_yaml = _collapsed_spine_yaml('return {"output": {"blocker": None}}')
+    evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        [],
+        allow_static_return_advisory=True,
+        enforce_value_bearing_liveness=True,
+    )
+    assert evaluation is not None
+    assert evaluation.payload["contract_liveness"] == "degraded_empty"
+
+    result = workflow_update_module._output_contract_reject_result(evaluation)
+
+    assert result["ok"] is False
+    assert result["data"]["reason_code"] == "value_bearing_output_required"
+    assert "requested value-bearing output" in result["error"]
+    assert "code_artifact_metadata" not in result["error"]
+    assert "return skeleton" not in result["error"]
+
+
+def test_hollow_code_under_live_contract_keeps_code_repair_steering() -> None:
+    ctx = _declaration_stamp_ctx()
+    workflow_yaml = _collapsed_spine_yaml('return {"output": {"record_id": None, "blocker": None}}')
+    evaluation = workflow_update_module._evaluate_output_contract_for_code_block(
+        ctx,
+        workflow_yaml,
+        [],
+        allow_static_return_advisory=True,
+        enforce_value_bearing_liveness=True,
+    )
+    assert evaluation is not None
+    assert evaluation.payload["reason_code"] == "value_bearing_output_required"
+
+    result = workflow_update_module._output_contract_reject_result(evaluation)
+
+    assert "code_artifact_metadata" in result["error"]
+
+
+def _saved_code_workflow(
+    code: str, label: str = "finalize_service", extra: dict[str, str] | None = None
+) -> SimpleNamespace:
+    blocks = [{"label": label, "block_type": "code", "code": code}]
+    blocks.extend(
+        {"label": extra_label, "block_type": "code", "code": extra_code}
+        for extra_label, extra_code in (extra or {}).items()
+    )
+    labels = {str(block["label"]) for block in blocks}
+    return SimpleNamespace(
+        workflow_id="w",
+        workflow_definition={"parameters": [], "blocks": blocks},
+        get_output_parameter=lambda requested: SimpleNamespace(label=requested) if requested in labels else None,
+    )
+
+
+class TestValueBearingDispatchPreflight:
+    @staticmethod
+    def _guarded_app(monkeypatch: pytest.MonkeyPatch, *, organization: None | EllipsisType = ...) -> AsyncMock:
+        if organization is ...:
+            get_organization = AsyncMock(side_effect=AssertionError("org lookup called"))
+        else:
+            get_organization = AsyncMock(return_value=organization)
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "DATABASE",
+            SimpleNamespace(organizations=SimpleNamespace(get_organization=get_organization)),
+        )
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow),
+        )
+        return prepare_workflow
+
+    @pytest.mark.asyncio
+    async def test_dispatch_of_saved_degraded_blocker_only_workflow_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow('return {"output": {"blocker": None}}')
+        prepare_workflow = self._guarded_app(monkeypatch)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert result["data"]["contract_liveness"] == "degraded_empty"
+        assert result["data"]["can_attempt_run"] is False
+        assert [row["floor_rekeyed_from_path"] for row in result["data"]["degraded_request_slots"]] == [
+            "output.confirmation_number",
+            "output.account_number",
+            "output.start_date",
+            "output.deposit_amount",
+            "output.next_owner",
+        ]
+        assert result["user_facing_summary"]
+        assert ctx.last_executed_block_labels == []
+        prepare_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_of_statically_hollow_code_under_value_contract_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow('return {"output": {"blocker": None}}')
+        prepare_workflow = self._guarded_app(monkeypatch)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert result["data"]["contract_liveness"] == "value_required"
+        assert result["data"]["canonical_required_child_paths"] == ["output.blocker", "output.record_id"]
+        prepare_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_of_mixed_contract_workflow_passes_preflight(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'record_id = await page.locator("#record-id").text_content()\n'
+            'return {"output": {"record_id": record_id, "blocker": None}}'
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_without_output_contract_passes_preflight_for_value_bearing_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'record_id = await page.locator("#record-id").text_content()\nreturn {"output": {"record_id": record_id}}'
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_owner_excluded_subset_run_dispatches_when_saved_workflow_bears_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'return {"logged_in": True}',
+            label="login",
+            extra={
+                "extract_record": (
+                    'record_id = await page.locator("#record-id").text_content()\n'
+                    'return {"output": {"record_id": record_id, "blocker": None}}'
+                )
+            },
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_solo_empty_setup_block_dispatches_in_value_bearing_workflow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+        ctx.staged_workflow = _saved_code_workflow(
+            "return {}",
+            label="setup",
+            extra={"extract_record": 'value = await fetch()\nreturn {"output": {"record_id": value}}'},
+        )
+        self._guarded_app(monkeypatch, organization=None)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["setup"], "parameters": {}}, ctx
+        )
+
+        assert result == {"ok": False, "error": "Organization not found"}
+
+    @pytest.mark.asyncio
+    async def test_all_hollow_workflow_is_refused_on_any_selected_subset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.staged_workflow = _saved_code_workflow(
+            'return {"output": {"blocker": None}}',
+            label="finalize_service",
+            extra={"extract_record": 'return {"output": {"record_id": None}}'},
+        )
+        prepare_workflow = self._guarded_app(monkeypatch)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["extract_record"], "parameters": {}}, ctx
+        )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert ctx.last_executed_block_labels == []
+        prepare_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_with_drifted_empty_criteria_source_refuses_hollow_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+        ctx.staged_workflow = _saved_code_workflow('return {"output": {"blocker": None}}')
+        prepare_workflow = self._guarded_app(monkeypatch)
+
+        result = await run_execution_module._run_blocks_and_collect_debug(
+            {"block_labels": ["finalize_service"], "parameters": {}}, ctx
+        )
+
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "value_bearing_output_required"
+        assert result["data"]["contract_liveness"] == "absent"
+        assert result["data"]["statically_empty_return_envelope"] is True
+        assert result["data"]["can_attempt_run"] is False
+        assert result["user_facing_summary"]
+        prepare_workflow.assert_not_called()
+
+    def test_run_reject_fails_open_for_standard_policy(self) -> None:
+        ctx = _declaration_stamp_ctx()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx, {"finalize_service": 'return {"output": {"blocker": None}}'}
+        )
+
+        assert reject is None
+
+    def test_run_reject_fails_open_for_runtime_populated_code(self) -> None:
+        ctx = _declaration_stamp_ctx()
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx,
+            {"finalize_service": 'record_id = await fetch()\nreturn {"output": {"record_id": record_id}}'},
+        )
+
+        assert reject is None
+
+    def test_run_reject_fails_open_when_any_selected_block_may_bear_value(self) -> None:
+        ctx = _declaration_stamp_ctx()
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx,
+            {
+                "finalize_service": 'return {"output": {"blocker": None}}',
+                "extract_record": 'record_id = await fetch()\nreturn {"output": {"record_id": record_id}}',
+            },
+        )
+
+        assert reject is None
+
+    def test_run_reject_refuses_when_every_selected_block_is_statically_hollow(self) -> None:
+        ctx = _declaration_stamp_ctx()
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx,
+            {
+                "finalize_service": 'return {"output": {"blocker": None}}',
+                "extract_record": 'return {"output": {"record_id": None, "blocker": None}}',
+            },
+        )
+
+        assert reject is not None
+        assert reject["ok"] is False
+        assert reject["data"]["reason_code"] == "value_bearing_output_required"
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'return {"output": {"blocker": None}}',
+            'return {"output": {}}',
+            'return {"output": None, "note": ""}',
+            'payload = {"output": {"blocker": None}}\nreturn payload',
+        ],
+    )
+    def test_run_reject_refuses_statically_empty_envelope_with_zero_criteria(self, code: str) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(ctx, {"finalize_service": code})
+
+        assert reject is not None
+        assert reject["data"]["reason_code"] == "value_bearing_output_required"
+        assert reject["data"]["statically_empty_return_envelope"] is True
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'return {"output": {"confirmation_number": "CN-1042"}}',
+            'value = await fetch()\nreturn {"output": {"confirmation_number": value}}',
+            "return await collect()",
+            'await page.goto("https://example.com/plans")',
+        ],
+    )
+    def test_run_reject_fails_open_with_zero_criteria_when_code_may_bear_value(self, code: str) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(ctx, {"finalize_service": code})
+
+        assert reject is None
+
+    def test_run_reject_fails_open_with_zero_criteria_when_any_block_may_bear_value(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx,
+            {
+                "finalize_service": 'return {"output": {"blocker": None}}',
+                "extract_record": 'value = await fetch()\nreturn {"output": {"record_id": value}}',
+            },
+        )
+
+        assert reject is None
+
+    def test_run_reject_degraded_criteria_message_names_criteria_side_cause(self) -> None:
+        ctx = _degraded_declaration_stamp_ctx()
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx, {"finalize_service": 'return {"output": {"blocker": None}}'}
+        )
+
+        assert reject is not None
+        assert "requested value-bearing output" in reject["error"]
+        assert "Revise the owning code block" not in reject["error"]
+        assert reject["data"]["reason_code"] == "value_bearing_output_required"
+
+    def test_run_reject_zero_criteria_message_never_references_a_contract(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(completion_criteria=[])
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx, {"finalize_service": 'return {"output": {}}'}
+        )
+
+        assert reject is not None
+        assert "output contract" not in reject["error"]
+        assert "statically returns no values" in reject["error"]
+        assert reject["data"]["reason_code"] == "value_bearing_output_required"
+
+    def test_run_reject_hollow_code_under_live_contract_keeps_code_side_steering(self) -> None:
+        ctx = _declaration_stamp_ctx()
+
+        reject = workflow_update_module.output_contract_value_bearing_run_reject(
+            ctx, {"finalize_service": 'return {"output": {"record_id": None, "blocker": None}}'}
+        )
+
+        assert reject is not None
+        assert "Revise the owning code block" in reject["error"]
 
 
 def _gate_blocks(sibling_code: str) -> list[dict[str, object]]:

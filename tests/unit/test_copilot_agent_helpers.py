@@ -2213,13 +2213,7 @@ workflow_definition:
             last_code_authoring_repair_context=repair_context,
         )
         ctx.turn_id = "metadata-contract-run-preflight"
-        signature = workflow_update_module._output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source="requested_output_contract",
-            reason_code="requested_output_contract_missing_output_coverage",
-            required_paths=required_paths,
-        )
+        signature = workflow_update_module._output_contract_signature(ctx=ctx, required_paths=required_paths)
         workflow_update_module._grant_output_contract_advisory_run(ctx, signature)
         captured: dict[str, object] = {}
 

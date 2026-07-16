@@ -12,6 +12,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import enforcement
@@ -33,7 +34,16 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     classify_output_contract_bail_family,
     resolve_output_contract_actuation,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    RequestPolicy,
+    _bind_criterion_to_request_slot,
+)
+from skyvern.forge.sdk.copilot.request_slots import (
+    CanonicalRequestSlotV1,
+    RequestSlotPinability,
+    RequestSlotPlane,
+)
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_composition_evidence_from_page
 from skyvern.forge.sdk.copilot.runtime import (
     output_contract_ladder_unresolved,
@@ -471,6 +481,7 @@ def test_option_a_falls_through_on_two_mapping_locals() -> None:
 def _counter_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         turn_id="turn_example",
+        request_policy=None,
         output_contract_reject_count_by_signature={},
         output_contract_last_reject_fingerprint_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
@@ -527,6 +538,7 @@ def _advisory_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         turn_ownership=None,
         blocker_signal_claimant=None,
+        request_policy=None,
         gate_precedence_conflict_events=[],
         output_contract_reject_count_by_signature={},
         output_contract_imposed_since_last_reject_by_signature={},
@@ -911,6 +923,33 @@ def test_advisory_grant_is_not_consumed_without_workflow_run_id() -> None:
 
     assert consumed == []
     assert ctx.output_contract_actuation_by_signature[signature] == OutputContractAdvisoryState.GRANTED
+
+
+def test_reject_shaped_run_result_suppresses_missing_run_id_warning() -> None:
+    signature = "sig_reject_shape"
+    ctx = _arm_static_return_advisory_ctx(signature)
+    reject = {"ok": False, "error": "refused", "data": {"reason_code": "value_bearing_output_required"}}
+
+    with capture_logs() as logs:
+        consumed = wu.consume_output_contract_advisory_grant_for_run_result(ctx, reject)
+
+    assert consumed == []
+    assert not [
+        log for log in logs if log["event"] == "copilot_output_contract_advisory_run_result_missing_workflow_run_id"
+    ]
+
+
+def test_non_reject_run_result_missing_run_id_still_warns() -> None:
+    signature = "sig_missing_run_id"
+    ctx = _arm_static_return_advisory_ctx(signature)
+
+    with capture_logs() as logs:
+        consumed = wu.consume_output_contract_advisory_grant_for_run_result(ctx, {"ok": True, "data": {"note": "x"}})
+
+    assert consumed == []
+    assert [
+        log for log in logs if log["event"] == "copilot_output_contract_advisory_run_result_missing_workflow_run_id"
+    ]
 
 
 def test_advisory_grant_arms_pending_run_output_evidence() -> None:
@@ -1924,6 +1963,44 @@ def test_face_c_degraded_mint_preserves_satisfiable_value_bearing_authoring_path
     assert contract.union != {"output.blocker"}
     assert skeleton == 'return {"output": {"visible_action_label": visible_action_label}}'
     assert "None" not in skeleton
+
+
+def test_canonically_bound_shapeless_valid_criterion_stays_dispatchable() -> None:
+    slot_hash = "a" * 48
+    slot = CanonicalRequestSlotV1(
+        slot_id="a" * 64,
+        canonical_path=f"output.request_slot_{slot_hash}_00",
+        path_segments=("output", f"request_slot_{slot_hash}_00"),
+        ordinal=0,
+        source_id="u0",
+        source_start=0,
+        source_end=10,
+        plane=RequestSlotPlane.RUN,
+        pinability=RequestSlotPinability.SHAPELESS_VALID,
+    )
+    bound = _bind_criterion_to_request_slot(
+        CompletionCriterion(
+            id="c1",
+            outcome="The visible action label is returned.",
+            output_path="output.visible_action_label",
+        ),
+        slot=slot,
+        source_quote="visible action label",
+    )
+
+    assert bound.request_slot_id == slot.slot_id
+    assert bound.output_path is None
+    assert bound.floor_rekeyed_from_path == "output.visible_action_label"
+    assert bound.mint_disposition != "degraded"
+    assert bound.mint_degrade is None
+
+    ctx = _antecedent_ctx(bound)
+    contract = wu._output_contract_required_paths_source(ctx)
+
+    assert contract.degraded_request_slots == ()
+    assert contract.liveness is not wu._OutputContractLiveness.DEGRADED_EMPTY
+    code = 'label = await page.inner_text("#action")\nreturn {"output": {"visible_action_label": label}}\n'
+    assert wu.output_contract_value_bearing_run_reject(ctx, {"b1": code}) is None
 
 
 def test_classifier_minted_download_path_excluded_from_author_coverage() -> None:
