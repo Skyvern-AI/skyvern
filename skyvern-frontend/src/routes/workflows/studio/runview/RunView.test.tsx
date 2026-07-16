@@ -357,6 +357,33 @@ describe("RunView view toggles", () => {
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
   });
+
+  test("definition block prompts count as run inputs", () => {
+    seedCompletedRun({
+      workflow: {
+        workflow_definition: {
+          blocks: [
+            {
+              block_type: "navigation",
+              label: "navigation block",
+              navigation_goal: "Navigate to the next synthetic step",
+            },
+          ],
+          finally_block_label: null,
+        },
+      },
+    });
+    const { container } = renderRunView();
+    const scope = within(container);
+
+    fireEvent.click(scope.getByRole("button", { name: "Inputs" }));
+
+    expect(scope.queryByText("navigation block")).not.toBeNull();
+    expect(
+      scope.queryByText("Navigate to the next synthetic step"),
+    ).not.toBeNull();
+    expect(scope.queryByText("No inputs for this run")).toBeNull();
+  });
 });
 
 describe("RunView cold-open selection", () => {

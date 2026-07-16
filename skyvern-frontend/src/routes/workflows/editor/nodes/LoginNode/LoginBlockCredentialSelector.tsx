@@ -12,14 +12,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
@@ -34,9 +26,9 @@ import {
   ChevronDownIcon,
   Cross2Icon,
   ExclamationTriangleIcon,
-  PlusIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
+import type { CredentialApiResponse } from "@/api/types";
 import { getHostname } from "@/util/getHostname";
 import {
   CredentialModalTypes,
@@ -60,6 +52,17 @@ import {
   computeWrappedCredentialIds,
 } from "../../types";
 import { cn } from "@/util/utils";
+import { keepPreviousData } from "@tanstack/react-query";
+import { useDebounce } from "use-debounce";
+import {
+  isCredentialNotFoundError,
+  useCredentialQuery,
+} from "@/routes/workflows/hooks/useCredentialQuery";
+import {
+  CredentialCombobox,
+  type CredentialComboboxSelection,
+  type SelectedValueState,
+} from "@/routes/workflows/components/CredentialCombobox";
 
 const ROTATION_SELECTION_STRATEGY = "round_robin" as const;
 
@@ -76,6 +79,64 @@ type Props = {
   /** Current login-goal value, checked against computeLoginGoalPrefill's guard */
   currentInstructions?: string;
 };
+
+type RotationCredentialRowProps = {
+  credentialId: string;
+  credential: CredentialApiResponse | undefined;
+  index: number;
+  editable: boolean;
+  canRemove: boolean;
+  onRemove: () => void;
+};
+
+function RotationCredentialRow({
+  credentialId,
+  credential,
+  index,
+  editable,
+  canRemove,
+  onRemove,
+}: RotationCredentialRowProps) {
+  const detailQuery = useCredentialQuery(credentialId, {
+    enabled: !credential,
+  });
+  const resolvedCredential = credential ?? detailQuery.data;
+  const label =
+    resolvedCredential?.name ??
+    (detailQuery.isPending
+      ? "Loading credential..."
+      : isCredentialNotFoundError(detailQuery.error)
+        ? "Credential not found"
+        : "Couldn't load credential.");
+
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-border/60 bg-slate-elevation1/40 px-2 py-1.5">
+      <span className="flex size-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] text-tertiary-foreground">
+        {index + 1}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-xs text-foreground dark:text-slate-200">
+        {label}
+      </span>
+      {resolvedCredential?.browser_profile_id ? (
+        <span
+          className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+          title="Has a saved browser profile - runs with this account keep its logged-in session"
+        >
+          Profile
+        </span>
+      ) : null}
+      <button
+        type="button"
+        className="text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500 dark:hover:text-slate-200"
+        disabled={!editable || !canRemove}
+        onClick={onRemove}
+        aria-label={`Remove ${label}`}
+      >
+        <Cross2Icon className="size-3.5" />
+      </button>
+    </div>
+  );
+}
 
 // Function to generate a unique credential parameter key
 function generateDefaultCredentialParameterKey(existingKeys: string[]): string {
@@ -109,6 +170,8 @@ function LoginBlockCredentialSelector({
   const nodes = useNodes<AppNode>();
   const { updateNodeData } = useReactFlow<AppNode>();
   const [rotationDraft, setRotationDraft] = useState(false);
+  const [rotationQuery, setRotationQuery] = useState("");
+  const [debouncedRotationQuery] = useDebounce(rotationQuery, 300);
   const {
     parameters: workflowParameters,
     setParameters: setWorkflowParameters,
@@ -127,12 +190,6 @@ function LoginBlockCredentialSelector({
     enabled: isCloud,
     page_size: 100,
   });
-
-  // Get the set of credential IDs that are in the vault
-  const credentialIdsInVault = useMemo(
-    () => new Set(credentials.map((c) => c.credential_id)),
-    [credentials],
-  );
 
   const selectedSkyvernCredentialParameter = useMemo(() => {
     if (!value) return undefined;
@@ -176,10 +233,32 @@ function LoginBlockCredentialSelector({
     return undefined;
   }, [value, credentialParameters, workflowParameters]);
 
+  const selectedCredentialFromList = useMemo(
+    () =>
+      credentials.find(
+        (credential) => credential.credential_id === selectedCredentialId,
+      ),
+    [credentials, selectedCredentialId],
+  );
+  const selectedCredentialQuery = useCredentialQuery(selectedCredentialId, {
+    enabled: isCloud && !selectedCredentialFromList,
+  });
+  const selectedCredential =
+    selectedCredentialFromList ?? selectedCredentialQuery.data;
+  const isCredentialMissing = isCredentialNotFoundError(
+    selectedCredentialQuery.error,
+  );
+  const credentialsWithSelected = useMemo(() => {
+    if (!selectedCredential || selectedCredentialFromList) {
+      return credentials;
+    }
+    return [...credentials, selectedCredential];
+  }, [credentials, selectedCredential, selectedCredentialFromList]);
+
   useLoginGoalAutoFill({
     editable,
     selectedCredentialId,
-    credentials,
+    credentials: credentialsWithSelected,
     currentGoal: currentInstructions ?? "",
     // Marks unsaved so a prefill isn't silently lost on navigation; skipped in read-only scope.
     onAutoFill: (goal) => {
@@ -206,6 +285,15 @@ function LoginBlockCredentialSelector({
   const rotationMode =
     Boolean(selectedSkyvernCredentialParameter) &&
     (rotationDraft || rotationIsSaved);
+  const {
+    data: rotationCredentials = [],
+    isFetching: rotationCredentialsAreFetching,
+  } = useCredentialsQuery({
+    enabled: isCloud && rotationMode,
+    page_size: 100,
+    search: debouncedRotationQuery.trim() || undefined,
+    placeholderData: keepPreviousData,
+  });
 
   const workflowStartNode = useMemo<
     { id: string; data: WorkflowStartNodeData } | undefined
@@ -216,12 +304,6 @@ function LoginBlockCredentialSelector({
     }
     return { id: node.id, data: node.data };
   }, [nodes]);
-
-  // Check if the selected credential is missing (deleted)
-  const isCredentialMissing = useMemo(() => {
-    if (!selectedCredentialId) return false;
-    return !credentialIdsInVault.has(selectedCredentialId);
-  }, [selectedCredentialId, credentialIdsInVault]);
 
   // User-authored credential variables (custom-key Skyvern params, or workflow
   // credential_id params) surface their variable name; auto-generated keys keep
@@ -240,12 +322,10 @@ function LoginBlockCredentialSelector({
         param.dataType === "credential_id");
     if (!isUserAuthored) return undefined;
 
-    const credentialName = credentials.find(
-      (c) => c.credential_id === selectedCredentialId,
-    )?.name;
+    const credentialName = selectedCredential?.name;
     if (!credentialName || credentialName === param.key) return undefined;
     return { key: param.key, credentialName };
-  }, [value, selectedCredentialId, workflowParameters, credentials]);
+  }, [value, selectedCredentialId, workflowParameters, selectedCredential]);
 
   const wrappedCredentialIds = useMemo(
     () => computeWrappedCredentialIds(credentialParameters),
@@ -256,30 +336,12 @@ function LoginBlockCredentialSelector({
     return <Skeleton className="h-8 w-full" />;
   }
 
-  const allCredentialOptions = credentials.map((credential) => ({
+  const rotationCredentialOptions = rotationCredentials.map((credential) => ({
     label: credential.name,
     value: credential.credential_id,
-    type: "credential" as const,
     hasBrowserProfile: !!credential.browser_profile_id,
     browserProfileUrl: credential.tested_url ?? null,
   }));
-
-  const credentialOptions = allCredentialOptions.filter(
-    (credential) => !wrappedCredentialIds.has(credential.value),
-  );
-
-  const selectedRotationCredentials = rotationCredentialIds.map(
-    (credentialId) => {
-      const option = allCredentialOptions.find(
-        (credential) => credential.value === credentialId,
-      );
-      return {
-        label: option?.label ?? credentialId,
-        value: credentialId,
-        hasBrowserProfile: option?.hasBrowserProfile ?? false,
-      };
-    },
-  );
 
   // Auto-generated Skyvern wrappers are hidden (they back a direct credential
   // pick); user-authored Skyvern params and external vault params are listed.
@@ -302,30 +364,14 @@ function LoginBlockCredentialSelector({
     .map((parameter) => ({
       label: parameter.key,
       value: parameter.key,
-      type: "parameter" as const,
     }));
 
-  const options = [...credentialOptions, ...credentialParameterOptions];
-
-  // When the active value is a param-key option (any user-authored param, incl.
-  // wrapped Skyvern credentials), the controlled value must be the key — not the
-  // resolved credentialId, whose row is filtered out of credentialOptions and so
-  // has no matching SelectItem. Keep this independent of selectedCredentialVariable,
-  // which is suppressed when key === credential name but still needs a valid value.
-  const valueIsParameterOption = options.some(
-    (option) => option.type === "parameter" && option.value === value,
+  const valueIsParameterOption = credentialParameterOptions.some(
+    (option) => option.value === value,
   );
-
-  // Always pass a defined string so Radix Select stays controlled; uncontrolled
-  // mode caches the picked value and silently skips re-firing onValueChange.
-  let selectValue: string;
-  if (isCredentialMissing) {
-    selectValue = "";
-  } else if (valueIsParameterOption) {
-    selectValue = value ?? "";
-  } else {
-    selectValue = selectedCredentialId ?? value ?? "";
-  }
+  const selectValue = valueIsParameterOption
+    ? (value ?? "")
+    : (selectedCredentialId ?? value ?? "");
 
   const writeRotationCredentialIds = (credentialIds: Array<string>) => {
     if (!selectedSkyvernCredentialParameter || credentialIds.length === 0) {
@@ -407,6 +453,113 @@ function LoginBlockCredentialSelector({
     setHasChanges(true);
   };
 
+  const handleCredentialChange = (
+    newValue: string,
+    selection: CredentialComboboxSelection,
+  ) => {
+    if (!editable) return;
+
+    let newParameters = [...workflowParameters];
+    const loginNodes = nodes
+      .filter((node) => node.id !== nodeId)
+      .filter(isLoginNode);
+    const currentParameter = workflowParameters.find((parameter) => {
+      if (parameter.parameterType !== "credential") return false;
+      if (!parameterIsSkyvernCredential(parameter)) return false;
+      if (!isAutoGeneratedCredentialKey(parameter.key)) return false;
+      return parameter.key === value;
+    });
+    const isUsedInOtherLoginNodes =
+      value &&
+      loginNodes.some((node) => node.data.parameterKeys.includes(value));
+
+    if (currentParameter && !isUsedInOtherLoginNodes) {
+      newParameters = newParameters.filter(
+        (parameter) => parameter.key !== value,
+      );
+    }
+
+    const selectedOptionCredential =
+      selection.type === "credential" ? selection.credential : undefined;
+    let parameterKeyToUse = newValue;
+
+    if (selectedOptionCredential) {
+      const existingParameter = newParameters.find((parameter) => {
+        return (
+          parameter.parameterType === "credential" &&
+          parameterIsSkyvernCredential(parameter) &&
+          parameter.credentialId === newValue &&
+          (parameter.credentialIds?.length ?? 0) < 2
+        );
+      });
+
+      if (existingParameter) {
+        parameterKeyToUse = existingParameter.key;
+      } else {
+        const existingKeys = newParameters.map((parameter) => parameter.key);
+        const newKey = generateDefaultCredentialParameterKey(existingKeys);
+        parameterKeyToUse = newKey;
+        newParameters = [
+          ...newParameters,
+          {
+            parameterType: "credential",
+            credentialId: newValue,
+            key: newKey,
+          },
+        ];
+      }
+    }
+
+    setWorkflowParameters(newParameters);
+    setHasChanges(true);
+    setRotationDraft(false);
+    onChange?.(parameterKeyToUse);
+
+    if (selectedOptionCredential?.tested_url && !currentUrl?.trim()) {
+      onUrlAutoFill?.(selectedOptionCredential.tested_url);
+    }
+  };
+
+  const renderCredentialItem = (credential: CredentialApiResponse) => (
+    <div className="flex items-center gap-2">
+      <span>{credential.name}</span>
+      {credential.browser_profile_id ? (
+        <>
+          <span className="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900/40 dark:text-green-400">
+            saved-profile
+          </span>
+          {credential.tested_url ? (
+            <span className="text-[10px] text-muted-foreground">
+              {getHostname(credential.tested_url)}
+            </span>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+
+  const renderSelectedValue = (state: SelectedValueState) => {
+    if (state.isNotFound) {
+      return (
+        <div className="flex items-center gap-2 text-red-500">
+          <ExclamationTriangleIcon className="size-4" />
+          <span>Credential not found</span>
+        </div>
+      );
+    }
+    if (selectedCredentialVariable) {
+      return (
+        <div className="flex min-w-0 flex-col items-start text-left">
+          <span className="truncate">{selectedCredentialVariable.key}</span>
+          <span className="truncate text-xs text-muted-foreground">
+            defaults to credential: {selectedCredentialVariable.credentialName}
+          </span>
+        </div>
+      );
+    }
+    return undefined;
+  };
+
   if (rotationMode) {
     return (
       <>
@@ -428,12 +581,22 @@ function LoginBlockCredentialSelector({
               </Button>
             </PopoverTrigger>
             <PopoverContent className="w-[28rem] p-0" align="start">
-              <Command>
-                <CommandInput placeholder="Search credentials..." />
+              <Command shouldFilter={false}>
+                <CommandInput
+                  placeholder="Search credentials..."
+                  value={rotationQuery}
+                  onValueChange={setRotationQuery}
+                />
                 <CommandList>
-                  <CommandEmpty>No credentials found.</CommandEmpty>
+                  {rotationCredentialOptions.length === 0 ? (
+                    <CommandEmpty>
+                      {rotationCredentialsAreFetching
+                        ? "Searching credentials..."
+                        : "No credentials found."}
+                    </CommandEmpty>
+                  ) : null}
                   <CommandGroup>
-                    {allCredentialOptions.map((option) => {
+                    {rotationCredentialOptions.map((option) => {
                       const isSelected = rotationCredentialIds.includes(
                         option.value,
                       );
@@ -478,35 +641,18 @@ function LoginBlockCredentialSelector({
           </Popover>
 
           <div className="space-y-1">
-            {selectedRotationCredentials.map((credential, index) => (
-              <div
-                key={credential.value}
-                className="flex items-center gap-2 rounded-md border border-border/60 bg-slate-elevation1/40 px-2 py-1.5"
-              >
-                <span className="flex size-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] text-tertiary-foreground">
-                  {index + 1}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-foreground dark:text-slate-200">
-                  {credential.label}
-                </span>
-                {credential.hasBrowserProfile ? (
-                  <span
-                    className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                    title="Has a saved browser profile - runs with this account keep its logged-in session"
-                  >
-                    Profile
-                  </span>
-                ) : null}
-                <button
-                  type="button"
-                  className="text-muted-foreground transition-colors hover:text-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500 dark:hover:text-slate-200"
-                  disabled={!editable || selectedRotationCredentials.length < 2}
-                  onClick={() => toggleRotationCredential(credential.value)}
-                  aria-label={`Remove ${credential.label}`}
-                >
-                  <Cross2Icon className="size-3.5" />
-                </button>
-              </div>
+            {rotationCredentialIds.map((credentialId, index) => (
+              <RotationCredentialRow
+                key={credentialId}
+                credentialId={credentialId}
+                credential={rotationCredentials.find(
+                  (credential) => credential.credential_id === credentialId,
+                )}
+                index={index}
+                editable={editable}
+                canRemove={rotationCredentialIds.length > 1}
+                onRemove={() => toggleRotationCredential(credentialId)}
+              />
             ))}
           </div>
 
@@ -565,161 +711,28 @@ function LoginBlockCredentialSelector({
 
   return (
     <>
-      <Select
+      <CredentialCombobox
         disabled={!editable}
-        key={value ?? "no-credential"}
         value={selectValue}
-        onValueChange={(newValue) => {
-          if (!editable) return;
-          if (newValue === "new") {
-            setIsOpen(true);
-            setType(CredentialModalTypes.PASSWORD);
-            return;
-          }
-
-          let newParameters = [...workflowParameters];
-
-          const loginNodes = nodes
-            .filter((node) => node.id !== nodeId)
-            .filter(isLoginNode);
-
-          // Only auto-gen wrappers are garbage-collected on switch; user-authored
-          // params are intentional named variables and must survive.
-          const currentParameter = workflowParameters.find((parameter) => {
-            if (parameter.parameterType !== "credential") return false;
-            if (!parameterIsSkyvernCredential(parameter)) return false;
-            if (!isAutoGeneratedCredentialKey(parameter.key)) return false;
-            return parameter.key === value;
-          });
-
-          const isUsedInOtherLoginNodes =
-            value &&
-            loginNodes.some((node) => node.data.parameterKeys.includes(value));
-
-          // Only delete old parameter if it's not used elsewhere
-          const deleteOldParameter =
-            currentParameter && !isUsedInOtherLoginNodes;
-
-          if (deleteOldParameter) {
-            newParameters = newParameters.filter(
-              (parameter) => parameter.key !== value,
-            );
-          }
-
-          // Check if user selected an actual credential (by credential_id)
-          const selectedCredential = credentialOptions.find(
-            (option) => option.value === newValue,
-          );
-
-          let parameterKeyToUse = newValue;
-
-          if (selectedCredential) {
-            // User selected an actual credential
-            const existingParameter = newParameters.find((parameter) => {
-              return (
-                parameter.parameterType === "credential" &&
-                parameterIsSkyvernCredential(parameter) &&
-                parameter.credentialId === newValue &&
-                (parameter.credentialIds?.length ?? 0) < 2
-              );
-            });
-
-            if (existingParameter) {
-              // Reuse the existing parameter
-              parameterKeyToUse = existingParameter.key;
-            } else {
-              // Create a new parameter for this credential
-              const existingKeys = newParameters.map((param) => param.key);
-              const newKey =
-                generateDefaultCredentialParameterKey(existingKeys);
-              parameterKeyToUse = newKey;
-
-              newParameters = [
-                ...newParameters,
-                {
-                  parameterType: "credential",
-                  credentialId: newValue,
-                  key: newKey,
-                },
-              ];
-            }
-          }
-          // If user selected a parameter (non-Skyvern credential or input)
-          // just use it directly (parameterKeyToUse is already set to newValue)
-
-          // Update Zustand store first, then call onChange
-          // This ensures workflowParameters is updated before the parent re-renders
-          // with the new value, so selectedCredentialId computes correctly
-          setWorkflowParameters(newParameters);
-          // Zustand mutation is invisible to the node-change listener, so the unsaved-changes blocker would miss this edit.
-          setHasChanges(true);
-          setRotationDraft(false);
-          onChange?.(parameterKeyToUse);
-
-          // Auto-fill the login block URL from the credential's tested_url
-          // when the URL field is empty.
-          if (
-            selectedCredential &&
-            !currentUrl?.trim() &&
-            selectedCredential.browserProfileUrl
-          ) {
-            onUrlAutoFill?.(selectedCredential.browserProfileUrl);
-          }
+        selectedCredentialId={selectedCredentialId}
+        onValueChange={handleCredentialChange}
+        extraOptions={credentialParameterOptions}
+        onAddNew={() => {
+          setIsOpen(true);
+          setType(CredentialModalTypes.PASSWORD);
         }}
-      >
-        <SelectTrigger
-          className={
-            isCredentialMissing
-              ? "h-auto min-h-10 w-full border-red-500 text-red-500"
-              : "h-auto min-h-10 w-full"
-          }
-        >
-          {isCredentialMissing ? (
-            <div className="flex items-center gap-2 text-red-500">
-              <ExclamationTriangleIcon className="size-4" />
-              <span>Credential not found</span>
-            </div>
-          ) : selectedCredentialVariable ? (
-            <div className="flex min-w-0 flex-col items-start text-left">
-              <span className="truncate">{selectedCredentialVariable.key}</span>
-              <span className="truncate text-xs text-muted-foreground">
-                defaults to credential:{" "}
-                {selectedCredentialVariable.credentialName}
-              </span>
-            </div>
-          ) : (
-            <SelectValue placeholder="Select a credential" />
-          )}
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="new">
-            <div className="flex items-center gap-2">
-              <PlusIcon className="size-4" />
-              <span>Add new credential</span>
-            </div>
-          </SelectItem>
-          {options.length > 0 && <SelectSeparator />}
-          {options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
-              <div className="flex items-center gap-2">
-                <span>{option.label}</span>
-                {"hasBrowserProfile" in option && option.hasBrowserProfile && (
-                  <>
-                    <span className="rounded bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900/40 dark:text-green-400">
-                      saved-profile
-                    </span>
-                    {option.browserProfileUrl && (
-                      <span className="text-[10px] text-muted-foreground">
-                        {getHostname(option.browserProfileUrl)}
-                      </span>
-                    )}
-                  </>
-                )}
-              </div>
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+        renderCredentialItem={renderCredentialItem}
+        renderSelectedValue={renderSelectedValue}
+        query={{
+          enabled: isCloud,
+          excludeCredentialIds: wrappedCredentialIds,
+        }}
+        triggerProps={{
+          className: isCredentialMissing
+            ? "h-auto min-h-10 w-full border-red-500 text-red-500"
+            : "h-auto min-h-10 w-full",
+        }}
+      />
       {!rotationMode &&
       selectedSkyvernCredentialParameter &&
       selectedCredentialId &&
