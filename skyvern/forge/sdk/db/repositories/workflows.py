@@ -508,9 +508,8 @@ class WorkflowsRepository(BaseRepository):
                 for subquery in workflow_tag_wpid_subqueries(workflow_tags, organization_id):
                     main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(subquery))
             if search_key:
-                search_like = f"%{search_key}%"
-                title_like = WorkflowModel.title.ilike(search_like)
-                folder_title_like = FolderModel.title.ilike(search_like)
+                title_like = WorkflowModel.title.icontains(search_key, autoescape=True)
+                folder_title_like = FolderModel.title.icontains(search_key, autoescape=True)
                 workflow_permanent_id_like = WorkflowModel.workflow_permanent_id.icontains(search_key, autoescape=True)
 
                 parameter_filters = [
@@ -522,9 +521,9 @@ class WorkflowsRepository(BaseRepository):
                         .where(WorkflowParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                WorkflowParameterModel.key.ilike(search_like),
-                                WorkflowParameterModel.description.ilike(search_like),
-                                WorkflowParameterModel.default_value.ilike(search_like),
+                                WorkflowParameterModel.key.icontains(search_key, autoescape=True),
+                                WorkflowParameterModel.description.icontains(search_key, autoescape=True),
+                                WorkflowParameterModel.default_value.icontains(search_key, autoescape=True),
                             )
                         )
                     ),
@@ -536,8 +535,8 @@ class WorkflowsRepository(BaseRepository):
                         .where(OutputParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                OutputParameterModel.key.ilike(search_like),
-                                OutputParameterModel.description.ilike(search_like),
+                                OutputParameterModel.key.icontains(search_key, autoescape=True),
+                                OutputParameterModel.description.icontains(search_key, autoescape=True),
                             )
                         )
                     ),
@@ -549,8 +548,8 @@ class WorkflowsRepository(BaseRepository):
                         .where(AWSSecretParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                AWSSecretParameterModel.key.ilike(search_like),
-                                AWSSecretParameterModel.description.ilike(search_like),
+                                AWSSecretParameterModel.key.icontains(search_key, autoescape=True),
+                                AWSSecretParameterModel.description.icontains(search_key, autoescape=True),
                             )
                         )
                     ),
@@ -562,8 +561,10 @@ class WorkflowsRepository(BaseRepository):
                         .where(BitwardenLoginCredentialParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                BitwardenLoginCredentialParameterModel.key.ilike(search_like),
-                                BitwardenLoginCredentialParameterModel.description.ilike(search_like),
+                                BitwardenLoginCredentialParameterModel.key.icontains(search_key, autoescape=True),
+                                BitwardenLoginCredentialParameterModel.description.icontains(
+                                    search_key, autoescape=True
+                                ),
                             )
                         )
                     ),
@@ -575,8 +576,10 @@ class WorkflowsRepository(BaseRepository):
                         .where(BitwardenSensitiveInformationParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                BitwardenSensitiveInformationParameterModel.key.ilike(search_like),
-                                BitwardenSensitiveInformationParameterModel.description.ilike(search_like),
+                                BitwardenSensitiveInformationParameterModel.key.icontains(search_key, autoescape=True),
+                                BitwardenSensitiveInformationParameterModel.description.icontains(
+                                    search_key, autoescape=True
+                                ),
                             )
                         )
                     ),
@@ -588,8 +591,10 @@ class WorkflowsRepository(BaseRepository):
                         .where(BitwardenCreditCardDataParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                BitwardenCreditCardDataParameterModel.key.ilike(search_like),
-                                BitwardenCreditCardDataParameterModel.description.ilike(search_like),
+                                BitwardenCreditCardDataParameterModel.key.icontains(search_key, autoescape=True),
+                                BitwardenCreditCardDataParameterModel.description.icontains(
+                                    search_key, autoescape=True
+                                ),
                             )
                         )
                     ),
@@ -601,8 +606,8 @@ class WorkflowsRepository(BaseRepository):
                         .where(OnePasswordCredentialParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                OnePasswordCredentialParameterModel.key.ilike(search_like),
-                                OnePasswordCredentialParameterModel.description.ilike(search_like),
+                                OnePasswordCredentialParameterModel.key.icontains(search_key, autoescape=True),
+                                OnePasswordCredentialParameterModel.description.icontains(search_key, autoescape=True),
                             )
                         )
                     ),
@@ -614,8 +619,8 @@ class WorkflowsRepository(BaseRepository):
                         .where(AzureVaultCredentialParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                AzureVaultCredentialParameterModel.key.ilike(search_like),
-                                AzureVaultCredentialParameterModel.description.ilike(search_like),
+                                AzureVaultCredentialParameterModel.key.icontains(search_key, autoescape=True),
+                                AzureVaultCredentialParameterModel.description.icontains(search_key, autoescape=True),
                             )
                         )
                     ),
@@ -627,8 +632,8 @@ class WorkflowsRepository(BaseRepository):
                         .where(CredentialParameterModel.deleted_at.is_(None))
                         .where(
                             or_(
-                                CredentialParameterModel.key.ilike(search_like),
-                                CredentialParameterModel.description.ilike(search_like),
+                                CredentialParameterModel.key.icontains(search_key, autoescape=True),
+                                CredentialParameterModel.description.icontains(search_key, autoescape=True),
                             )
                         )
                     ),

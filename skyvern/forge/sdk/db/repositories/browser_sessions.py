@@ -174,11 +174,10 @@ class BrowserSessionsRepository(BaseRepository):
             if managed is not None:
                 query = query.filter(BrowserProfileModel.is_managed.is_(managed))
             if search_key:
-                search_like = f"%{search_key}%"
                 query = query.filter(
                     or_(
-                        BrowserProfileModel.name.ilike(search_like),
-                        BrowserProfileModel.description.ilike(search_like),
+                        BrowserProfileModel.name.icontains(search_key, autoescape=True),
+                        BrowserProfileModel.description.icontains(search_key, autoescape=True),
                     )
                 )
             # The id tie-break only needs to be deterministic so pagination stays
