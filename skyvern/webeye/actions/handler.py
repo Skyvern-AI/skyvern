@@ -84,6 +84,7 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
@@ -642,7 +643,15 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
         # Name the file by the block-configured download_suffix so the watcher syncs the
         # request-based name instead of the site's suggested name.
         existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
-        return download_dir / download_filename_from_suffix(download_suffix, suffix, existing)
+        target_name = download_filename_from_suffix(download_suffix, suffix, existing)
+        LOG.info(
+            "download_suffix_target_named",
+            context_task_id=context.task_id if context else None,
+            context_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+            suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
+            desired_name_fp=diagnostic_fingerprint(target_name),
+        )
+        return download_dir / target_name
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
@@ -3101,6 +3110,40 @@ def _incremental_tree_contains_target_value(elements: list[dict], target_value: 
     return False
 
 
+def _incremental_tree_contains_option_with_target_value(elements: list[dict], target_value: str) -> bool:
+    # Match the target only against real option candidates (what the selector would click), unlike the
+    # broad search-bar helper above, so a "No results for <target>" banner cannot admit a selection.
+    normalized_target = _normalize_dropdown_match_text(target_value)
+    if not normalized_target:
+        return False
+    for candidate in _custom_select_candidates_from_elements(elements):
+        label = candidate.get("label")
+        if isinstance(label, str) and normalized_target in _normalize_dropdown_match_text(label):
+            return True
+    return False
+
+
+def _attr_indicates_aria_invalid(raw: object) -> bool:
+    # Compare as a normalized string so a literal False (bool or "false") reads as valid, not truthy;
+    # aria-invalid is "true"/"grammar"/"spelling" when rejected, "false"/absent when accepted.
+    if raw is None:
+        return False
+    return str(raw).strip().casefold() not in ("", "false")
+
+
+async def _is_commit_required_combobox(skyvern_element: SkyvernElement) -> bool:
+    role = await skyvern_element.get_attr("role")
+    aria_autocomplete = await skyvern_element.get_attr("aria-autocomplete")
+    is_combobox = str(role or "").strip().casefold() == "combobox" or str(
+        aria_autocomplete or ""
+    ).strip().casefold() in ("list", "both")
+    if not is_combobox:
+        return False
+    # aria-invalid is read live (dynamic) because it reflects post-input state, not the pre-input scrape.
+    aria_invalid = await skyvern_element.get_attr("aria-invalid", mode="dynamic")
+    return _attr_indicates_aria_invalid(aria_invalid)
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -3665,6 +3708,42 @@ async def handle_input_text_action(
                         auto_complete_hacky_flag = False
                         # A matching option was committed during this INPUT_TEXT. Stop the batch only when
                         # the next queued action would clobber it (a trailing Enter/Return); next step re-scrapes.
+                        if action.stop_batch_after_dropdown_select:
+                            select_result.action_result.skip_remaining_actions = True
+                        return [select_result.action_result]
+                elif (
+                    input_or_select_context is not None
+                    and not input_or_select_context.is_search_bar
+                    and not input_or_select_context.is_location_input
+                    and not is_secret_value
+                    and _incremental_tree_contains_option_with_target_value(incremental_element, text)
+                    and await _is_commit_required_combobox(skyvern_element)
+                ):
+                    # A role=combobox / aria-autocomplete field that is still aria-invalid after typing
+                    # only commits by picking a rendered option; the Tab hack below won't do that. Force one
+                    # deterministic selection against the surfaced option. This does not touch
+                    # is_auto_completion_input() or the speculative pre-input fanout.
+                    LOG.info(
+                        "Detected target-matching option after typing into an invalid combobox; committing selection",
+                        element_id=skyvern_element.get_id(),
+                        target_value=text,
+                    )
+                    action.set_has_mini_agent()
+                    select_result = await sequentially_select_from_dropdown(
+                        action=select_action,
+                        input_or_select_context=input_or_select_context,
+                        page=page,
+                        dom=dom,
+                        skyvern_element=skyvern_element,
+                        skyvern_frame=skyvern_frame,
+                        incremental_scraped=incremental_scraped,
+                        step=step,
+                        task=task,
+                        force_select=True,
+                        target_value=text,
+                    )
+                    if select_result and select_result.action_result and select_result.action_result.success:
+                        auto_complete_hacky_flag = False
                         if action.stop_batch_after_dropdown_select:
                             select_result.action_result.skip_remaining_actions = True
                         return [select_result.action_result]

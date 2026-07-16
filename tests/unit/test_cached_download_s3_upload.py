@@ -16,8 +16,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
+
+from tests.unit._fingerprint_expectations import expected_fingerprint
 
 MODULE = "skyvern.services.script_service"
+
+
+@pytest.fixture(autouse=True)
+def _keyed_fingerprint(fingerprint_secret_key: str) -> str:
+    return fingerprint_secret_key
 
 
 def _make_mock_app(storage):
@@ -525,6 +533,45 @@ async def test_download_suffix_rename_uses_file_path_directly(setup, tmp_path):
         await download(prompt="Download invoice", download_suffix="invoice", label="test_block")
 
         rename_mock.assert_called_once_with(abs_path, "invoice.pdf")
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_rename_emits_finalize_lineage(setup, tmp_path):
+    """The cached-script (run_with=code) rename path must emit the same download_suffix_finalize_rename
+    lineage as the agent path, tagged execution_path=cached_script, so a code-mode freeze is attributable."""
+    download_dir = tmp_path / "downloads"
+    abs_path = str(download_dir / "abc123.pdf")
+
+    rename_mock = MagicMock(return_value=str(download_dir / "invoice.pdf"))
+    refs = setup(
+        get_side_effect=[[], ["invoice.pdf"]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        with capture_logs() as cap:
+            await download(
+                prompt="Download invoice",
+                download_suffix="invoice",
+                label="test_block",
+                cache_key="bill_usage_download",
+            )
+
+        events = [e for e in cap if e.get("event") == "download_suffix_finalize_rename"]
+        assert len(events) == 1, "cached rename path did not emit download_suffix_finalize_rename"
+        event = events[0]
+        assert event["execution_path"] == "cached_script"
+        assert event["finalize_workflow_run_id"] == "wr_test_run"
+        assert event["finalize_task_id"] == "tsk_1"  # per-download-task attribution in cached mode
+        assert event["block_label"] == "bill_usage_download"  # persisted block label (= cache_key)
+        assert event["passed_download_suffix_fp"] == expected_fingerprint("invoice")
+        assert event["pre_rename_filename_fp"] == expected_fingerprint("abc123.pdf")
+        assert event["desired_name_fp"] == expected_fingerprint("invoice.pdf")
+        assert event["will_rename"] is True
     finally:
         _cleanup(refs)
 

@@ -45,6 +45,12 @@ class FakeWorkflowRunContext:
         else:
             self._blocks_metadata[label] = dict(metadata)
 
+    def resolve_effective_workflow_system_prompt(self) -> str | None:
+        return None
+
+    def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
+        return None
+
     def has_value(self, key: str) -> bool:
         return key in self.values
 

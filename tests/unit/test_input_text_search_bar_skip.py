@@ -19,6 +19,7 @@ from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
 from skyvern.webeye.actions.handler_utils import keys_include_enter, should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.responses import ActionSuccess
+from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
 
 _NOW = datetime.now(UTC)
@@ -80,36 +81,8 @@ def test_flag_is_transient_not_serialized() -> None:
 # --------------------------------------------------------------------------- #
 # handle_input_text_action — gated batch-stop behavior
 # --------------------------------------------------------------------------- #
-def _mock_search_input() -> MagicMock:
-    el = MagicMock()
-    el.get_id.return_value = "AADC"
-    el.get_tag_name.return_value = "input"
-    el.get_frame.return_value = MagicMock()
-    locator = MagicMock()
-    locator.focus = AsyncMock()
-    el.get_locator.return_value = locator
-    el.is_disabled = AsyncMock(return_value=False)
-    el.get_selectable = AsyncMock(return_value=False)
-    el.has_hidden_attr = AsyncMock(return_value=False)
-    el.is_readonly = AsyncMock(return_value=False)
-    el.get_attr = AsyncMock(return_value=None)
-    el.is_spinbtn_input = AsyncMock(return_value=False)
-    el.is_editable = AsyncMock(return_value=True)
-    el.supports_text_input = AsyncMock(return_value=True)
-    el.is_visible = AsyncMock(return_value=True)
-    el.is_raw_input = AsyncMock(return_value=False)
-    el.is_auto_completion_input = AsyncMock(return_value=False)
-    el.find_blocking_element = AsyncMock(return_value=(None, False))
-    el.get_element_handler = AsyncMock(return_value=MagicMock())
-    el.input_sequentially = AsyncMock()
-    el.input_clear = AsyncMock()
-    el.scroll_into_view = AsyncMock()
-    el.press_key = AsyncMock()
-    return el
-
-
 async def _run_search_bar_input(stop_flag: bool, incremental: list[dict]) -> list:
-    skyvern_el = _mock_search_input()
+    skyvern_el = make_input_element_mock(element_id="AADC")
     dom_instance = MagicMock()
     dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=skyvern_el)
 
