@@ -22,7 +22,6 @@ from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
-from .types.clear_organization_auth_token_response import ClearOrganizationAuthTokenResponse
 from .types.create_browser_profile_request_proxy_location import CreateBrowserProfileRequestProxyLocation
 from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
@@ -30,9 +29,6 @@ from .types.create_credential_request_proxy_location import CreateCredentialRequ
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.credential_vault_type import CredentialVaultType
-from .types.custom_llm_config import CustomLlmConfig
-from .types.custom_llm_list_response import CustomLlmListResponse
-from .types.custom_llm_response import CustomLlmResponse
 from .types.extensions import Extensions
 from .types.folder import Folder
 from .types.get_run_response import GetRunResponse
@@ -44,10 +40,6 @@ from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.run_status import RunStatus
-from .types.run_tag_history_response import RunTagHistoryResponse
-from .types.run_tags_batch_response import RunTagsBatchResponse
-from .types.run_tags_response import RunTagsResponse
-from .types.run_type import RunType
 from .types.run_webhook_replay_response import RunWebhookReplayResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
@@ -58,9 +50,6 @@ from .types.tag_history_response import TagHistoryResponse
 from .types.tag_input import TagInput
 from .types.tag_key import TagKey
 from .types.tag_key_delete_response import TagKeyDeleteResponse
-from .types.tag_value import TagValue
-from .types.tag_value_delete_response import TagValueDeleteResponse
-from .types.tag_value_rename_response import TagValueRenameResponse
 from .types.tags_response import TagsResponse
 from .types.task_run_list_item import TaskRunListItem
 from .types.task_run_request_input_data_extraction_schema import TaskRunRequestInputDataExtractionSchema
@@ -1338,301 +1327,6 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    def get_run_tags(
-        self, workflow_run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[RunTagsResponse]:
-        """
-        Get the current tag state for a workflow run.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunTagsResponse]
-            Successfully retrieved tags
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsResponse,
-                    parse_obj_as(
-                        type_=RunTagsResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def apply_run_tags(
-        self,
-        workflow_run_id: str,
-        *,
-        tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
-        tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[RunTagsResponse]:
-        """
-        Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        tags : typing.Optional[typing.Sequence[TagInput]]
-            Tags to set (overwrite). List of {key?, value} objects.
-
-        tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
-            Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunTagsResponse]
-            Successfully applied tag changes
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags",
-            method="POST",
-            json={
-                "tags": convert_and_respect_annotation_metadata(
-                    object_=tags, annotation=typing.Sequence[TagInput], direction="write"
-                ),
-                "tags_to_delete": convert_and_respect_annotation_metadata(
-                    object_=tags_to_delete, annotation=typing.Sequence[TagDeleteInput], direction="write"
-                ),
-                "colors": colors,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsResponse,
-                    parse_obj_as(
-                        type_=RunTagsResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def delete_run_tag(
-        self, workflow_run_id: str, key: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[RunTagsResponse]:
-        """
-        Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        key : str
-            Tag key to delete
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunTagsResponse]
-            Successfully deleted tag (or no-op if absent)
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags/{jsonable_encoder(key)}",
-            method="DELETE",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsResponse,
-                    parse_obj_as(
-                        type_=RunTagsResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def get_run_tag_history(
-        self,
-        workflow_run_id: str,
-        *,
-        limit: typing.Optional[int] = None,
-        since: typing.Optional[dt.datetime] = None,
-        key: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[RunTagHistoryResponse]:
-        """
-        Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        limit : typing.Optional[int]
-            Max events to return
-
-        since : typing.Optional[dt.datetime]
-            Only return events at or after this timestamp
-
-        key : typing.Optional[str]
-            Filter to events for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunTagHistoryResponse]
-            Successfully retrieved tag history
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags/history",
-            method="GET",
-            params={
-                "limit": limit,
-                "since": serialize_datetime(since) if since is not None else None,
-                "key": key,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagHistoryResponse,
-                    parse_obj_as(
-                        type_=RunTagHistoryResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
     def list_tag_keys(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> HttpResponse[typing.List[TagKey]]:
@@ -1816,291 +1510,6 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    def list_tag_values(
-        self, *, key: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[typing.List[TagValue]]:
-        """
-        List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.
-
-        Parameters
-        ----------
-        key : typing.Optional[str]
-            Filter to values for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[typing.List[TagValue]]
-            Successfully retrieved tag values
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/tag-values",
-            method="GET",
-            params={
-                "key": key,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.List[TagValue],
-                    parse_obj_as(
-                        type_=typing.List[TagValue],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def delete_tag_value(
-        self, key: str, *, value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[TagValueDeleteResponse]:
-        """
-        Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to soft-delete.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[TagValueDeleteResponse]
-            Successfully deleted tag value
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/tag-values/{jsonable_encoder(key)}",
-            method="DELETE",
-            json={
-                "value": value,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    TagValueDeleteResponse,
-                    parse_obj_as(
-                        type_=TagValueDeleteResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def update_tag_value(
-        self, key: str, *, value: str, color: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[TagValue]:
-        """
-        Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to recolor.
-
-        color : str
-            Palette color name to assign to this (key, value).
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[TagValue]
-            Successfully recolored tag value
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/tag-values/{jsonable_encoder(key)}",
-            method="PATCH",
-            json={
-                "value": value,
-                "color": color,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    TagValue,
-                    parse_obj_as(
-                        type_=TagValue,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def rename_tag_value(
-        self, key: str, *, value: str, new_value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[TagValueRenameResponse]:
-        """
-        Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Current tag value (label) under the key to rename.
-
-        new_value : str
-            New tag value (label) to rename it to.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[TagValueRenameResponse]
-            Successfully renamed tag value
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/tag-values/{jsonable_encoder(key)}/rename",
-            method="PATCH",
-            json={
-                "value": value,
-                "new_value": new_value,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    TagValueRenameResponse,
-                    parse_obj_as(
-                        type_=TagValueRenameResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 409:
-                raise ConflictError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
     def batch_get_workflow_tags(
         self,
         *,
@@ -2208,141 +1617,6 @@ class RawSkyvern:
                     WorkflowTagsBatchResponse,
                     parse_obj_as(
                         type_=WorkflowTagsBatchResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def batch_get_run_tags(
-        self, *, workflow_run_ids: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[RunTagsBatchResponse]:
-        """
-        Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[str]
-            Comma-separated workflow run IDs
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunTagsBatchResponse]
-            Successfully retrieved tags
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/run-tags",
-            method="GET",
-            params={
-                "workflow_run_ids": workflow_run_ids,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsBatchResponse,
-                    parse_obj_as(
-                        type_=RunTagsBatchResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def batch_get_run_tags_post(
-        self,
-        *,
-        workflow_run_ids: typing.Optional[typing.Sequence[str]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> HttpResponse[RunTagsBatchResponse]:
-        """
-        Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[typing.Sequence[str]]
-            Workflow run IDs to fetch tags for.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[RunTagsBatchResponse]
-            Successfully retrieved tags
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/run-tags",
-            method="POST",
-            json={
-                "workflow_run_ids": workflow_run_ids,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsBatchResponse,
-                    parse_obj_as(
-                        type_=RunTagsBatchResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -2611,7 +1885,6 @@ class RawSkyvern:
         page_size: typing.Optional[int] = None,
         status: typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]] = None,
         search_key: typing.Optional[str] = None,
-        run_type: typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[TaskRunListItem]]:
         """
@@ -2625,8 +1898,6 @@ class RawSkyvern:
 
         search_key : typing.Optional[str]
             Case-insensitive substring search (min 3 chars for trigram index).
-
-        run_type : typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2644,7 +1915,6 @@ class RawSkyvern:
                 "page_size": page_size,
                 "status": status,
                 "search_key": search_key,
-                "run_type": run_type,
             },
             request_options=request_options,
         )
@@ -2734,7 +2004,6 @@ class RawSkyvern:
         page_size: typing.Optional[int] = None,
         include_deleted: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
-        managed: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[BrowserProfile]]:
         """
@@ -2752,9 +2021,6 @@ class RawSkyvern:
         search_key : typing.Optional[str]
             Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
 
-        managed : typing.Optional[bool]
-            Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2771,7 +2037,6 @@ class RawSkyvern:
                 "page_size": page_size,
                 "include_deleted": include_deleted,
                 "search_key": search_key,
-                "managed": managed,
             },
             request_options=request_options,
         )
@@ -3195,7 +2460,6 @@ class RawSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
-        proxy_session_id: typing.Optional[str] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -3247,9 +2511,6 @@ class RawSkyvern:
             For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
-        proxy_session_id : typing.Optional[str]
-            Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
-
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
@@ -3278,7 +2539,6 @@ class RawSkyvern:
                 "proxy_location": convert_and_respect_annotation_metadata(
                     object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
                 ),
-                "proxy_session_id": proxy_session_id,
                 "extensions": extensions,
                 "browser_type": browser_type,
                 "browser_profile_id": browser_profile_id,
@@ -3376,17 +2636,6 @@ class RawSkyvern:
                 return HttpResponse(response=_response, data=_data)
             if _response.status_code == 403:
                 raise ForbiddenError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
                     headers=dict(_response.headers),
                     body=typing.cast(
                         typing.Optional[typing.Any],
@@ -4016,222 +3265,6 @@ class RawSkyvern:
                     CredentialResponse,
                     parse_obj_as(
                         type_=CredentialResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def list_custom_llms(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[CustomLlmListResponse]:
-        """
-        List the custom LLM configurations available to the current organization.
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[CustomLlmListResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/custom-llms",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CustomLlmListResponse,
-                    parse_obj_as(
-                        type_=CustomLlmListResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def create_custom_llm(
-        self, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[CustomLlmResponse]:
-        """
-        Create a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[CustomLlmResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            "v1/custom-llms",
-            method="POST",
-            json={
-                "config": convert_and_respect_annotation_metadata(
-                    object_=config, annotation=CustomLlmConfig, direction="write"
-                ),
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CustomLlmResponse,
-                    parse_obj_as(
-                        type_=CustomLlmResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def update_custom_llm(
-        self, custom_llm_id: str, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[CustomLlmResponse]:
-        """
-        Update a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[CustomLlmResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/custom-llms/{jsonable_encoder(custom_llm_id)}",
-            method="PUT",
-            json={
-                "config": convert_and_respect_annotation_metadata(
-                    object_=config, annotation=CustomLlmConfig, direction="write"
-                ),
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CustomLlmResponse,
-                    parse_obj_as(
-                        type_=CustomLlmResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return HttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    def delete_custom_llm(
-        self, custom_llm_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> HttpResponse[ClearOrganizationAuthTokenResponse]:
-        """
-        Delete a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        HttpResponse[ClearOrganizationAuthTokenResponse]
-            Successful Response
-        """
-        _response = self._client_wrapper.httpx_client.request(
-            f"v1/custom-llms/{jsonable_encoder(custom_llm_id)}",
-            method="DELETE",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    ClearOrganizationAuthTokenResponse,
-                    parse_obj_as(
-                        type_=ClearOrganizationAuthTokenResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -5039,7 +4072,6 @@ class RawSkyvern:
         *,
         tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
         tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[TagsResponse]:
         """
@@ -5055,9 +4087,6 @@ class RawSkyvern:
 
         tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
             Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5077,7 +4106,6 @@ class RawSkyvern:
                 "tags_to_delete": convert_and_respect_annotation_metadata(
                     object_=tags_to_delete, annotation=typing.Sequence[TagDeleteInput], direction="write"
                 ),
-                "colors": colors,
             },
             headers={
                 "content-type": "application/json",
@@ -5464,8 +4492,6 @@ class RawSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
-        created_at_start: typing.Optional[dt.datetime] = None,
-        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[WorkflowRun]]:
         """
@@ -5500,12 +4526,6 @@ class RawSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
-        created_at_start : typing.Optional[dt.datetime]
-            Only include runs created at or after this UTC timestamp (ISO 8601).
-
-        created_at_end : typing.Optional[dt.datetime]
-            Only include runs created strictly before this UTC timestamp (ISO 8601).
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -5523,8 +4543,6 @@ class RawSkyvern:
                 "status": status,
                 "search_key": search_key,
                 "error_code": error_code,
-                "created_at_start": serialize_datetime(created_at_start) if created_at_start is not None else None,
-                "created_at_end": serialize_datetime(created_at_end) if created_at_end is not None else None,
             },
             request_options=request_options,
         )
@@ -6928,301 +5946,6 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    async def get_run_tags(
-        self, workflow_run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[RunTagsResponse]:
-        """
-        Get the current tag state for a workflow run.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunTagsResponse]
-            Successfully retrieved tags
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsResponse,
-                    parse_obj_as(
-                        type_=RunTagsResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def apply_run_tags(
-        self,
-        workflow_run_id: str,
-        *,
-        tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
-        tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[RunTagsResponse]:
-        """
-        Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        tags : typing.Optional[typing.Sequence[TagInput]]
-            Tags to set (overwrite). List of {key?, value} objects.
-
-        tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
-            Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunTagsResponse]
-            Successfully applied tag changes
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags",
-            method="POST",
-            json={
-                "tags": convert_and_respect_annotation_metadata(
-                    object_=tags, annotation=typing.Sequence[TagInput], direction="write"
-                ),
-                "tags_to_delete": convert_and_respect_annotation_metadata(
-                    object_=tags_to_delete, annotation=typing.Sequence[TagDeleteInput], direction="write"
-                ),
-                "colors": colors,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsResponse,
-                    parse_obj_as(
-                        type_=RunTagsResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def delete_run_tag(
-        self, workflow_run_id: str, key: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[RunTagsResponse]:
-        """
-        Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        key : str
-            Tag key to delete
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunTagsResponse]
-            Successfully deleted tag (or no-op if absent)
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags/{jsonable_encoder(key)}",
-            method="DELETE",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsResponse,
-                    parse_obj_as(
-                        type_=RunTagsResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def get_run_tag_history(
-        self,
-        workflow_run_id: str,
-        *,
-        limit: typing.Optional[int] = None,
-        since: typing.Optional[dt.datetime] = None,
-        key: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[RunTagHistoryResponse]:
-        """
-        Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        limit : typing.Optional[int]
-            Max events to return
-
-        since : typing.Optional[dt.datetime]
-            Only return events at or after this timestamp
-
-        key : typing.Optional[str]
-            Filter to events for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunTagHistoryResponse]
-            Successfully retrieved tag history
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/runs/{jsonable_encoder(workflow_run_id)}/tags/history",
-            method="GET",
-            params={
-                "limit": limit,
-                "since": serialize_datetime(since) if since is not None else None,
-                "key": key,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagHistoryResponse,
-                    parse_obj_as(
-                        type_=RunTagHistoryResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
     async def list_tag_keys(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> AsyncHttpResponse[typing.List[TagKey]]:
@@ -7406,291 +6129,6 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
-    async def list_tag_values(
-        self, *, key: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[typing.List[TagValue]]:
-        """
-        List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.
-
-        Parameters
-        ----------
-        key : typing.Optional[str]
-            Filter to values for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[typing.List[TagValue]]
-            Successfully retrieved tag values
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/tag-values",
-            method="GET",
-            params={
-                "key": key,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    typing.List[TagValue],
-                    parse_obj_as(
-                        type_=typing.List[TagValue],  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def delete_tag_value(
-        self, key: str, *, value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[TagValueDeleteResponse]:
-        """
-        Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to soft-delete.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[TagValueDeleteResponse]
-            Successfully deleted tag value
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/tag-values/{jsonable_encoder(key)}",
-            method="DELETE",
-            json={
-                "value": value,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    TagValueDeleteResponse,
-                    parse_obj_as(
-                        type_=TagValueDeleteResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def update_tag_value(
-        self, key: str, *, value: str, color: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[TagValue]:
-        """
-        Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to recolor.
-
-        color : str
-            Palette color name to assign to this (key, value).
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[TagValue]
-            Successfully recolored tag value
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/tag-values/{jsonable_encoder(key)}",
-            method="PATCH",
-            json={
-                "value": value,
-                "color": color,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    TagValue,
-                    parse_obj_as(
-                        type_=TagValue,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def rename_tag_value(
-        self, key: str, *, value: str, new_value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[TagValueRenameResponse]:
-        """
-        Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Current tag value (label) under the key to rename.
-
-        new_value : str
-            New tag value (label) to rename it to.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[TagValueRenameResponse]
-            Successfully renamed tag value
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/tag-values/{jsonable_encoder(key)}/rename",
-            method="PATCH",
-            json={
-                "value": value,
-                "new_value": new_value,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    TagValueRenameResponse,
-                    parse_obj_as(
-                        type_=TagValueRenameResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 404:
-                raise NotFoundError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 409:
-                raise ConflictError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
     async def batch_get_workflow_tags(
         self,
         *,
@@ -7798,141 +6236,6 @@ class AsyncRawSkyvern:
                     WorkflowTagsBatchResponse,
                     parse_obj_as(
                         type_=WorkflowTagsBatchResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def batch_get_run_tags(
-        self, *, workflow_run_ids: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[RunTagsBatchResponse]:
-        """
-        Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[str]
-            Comma-separated workflow run IDs
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunTagsBatchResponse]
-            Successfully retrieved tags
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/run-tags",
-            method="GET",
-            params={
-                "workflow_run_ids": workflow_run_ids,
-            },
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsBatchResponse,
-                    parse_obj_as(
-                        type_=RunTagsBatchResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 400:
-                raise BadRequestError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def batch_get_run_tags_post(
-        self,
-        *,
-        workflow_run_ids: typing.Optional[typing.Sequence[str]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> AsyncHttpResponse[RunTagsBatchResponse]:
-        """
-        Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[typing.Sequence[str]]
-            Workflow run IDs to fetch tags for.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[RunTagsBatchResponse]
-            Successfully retrieved tags
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/run-tags",
-            method="POST",
-            json={
-                "workflow_run_ids": workflow_run_ids,
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    RunTagsBatchResponse,
-                    parse_obj_as(
-                        type_=RunTagsBatchResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -8201,7 +6504,6 @@ class AsyncRawSkyvern:
         page_size: typing.Optional[int] = None,
         status: typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]] = None,
         search_key: typing.Optional[str] = None,
-        run_type: typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[TaskRunListItem]]:
         """
@@ -8215,8 +6517,6 @@ class AsyncRawSkyvern:
 
         search_key : typing.Optional[str]
             Case-insensitive substring search (min 3 chars for trigram index).
-
-        run_type : typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -8234,7 +6534,6 @@ class AsyncRawSkyvern:
                 "page_size": page_size,
                 "status": status,
                 "search_key": search_key,
-                "run_type": run_type,
             },
             request_options=request_options,
         )
@@ -8324,7 +6623,6 @@ class AsyncRawSkyvern:
         page_size: typing.Optional[int] = None,
         include_deleted: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
-        managed: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[BrowserProfile]]:
         """
@@ -8342,9 +6640,6 @@ class AsyncRawSkyvern:
         search_key : typing.Optional[str]
             Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
 
-        managed : typing.Optional[bool]
-            Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -8361,7 +6656,6 @@ class AsyncRawSkyvern:
                 "page_size": page_size,
                 "include_deleted": include_deleted,
                 "search_key": search_key,
-                "managed": managed,
             },
             request_options=request_options,
         )
@@ -8785,7 +7079,6 @@ class AsyncRawSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
-        proxy_session_id: typing.Optional[str] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -8837,9 +7130,6 @@ class AsyncRawSkyvern:
             For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
-        proxy_session_id : typing.Optional[str]
-            Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
-
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
@@ -8868,7 +7158,6 @@ class AsyncRawSkyvern:
                 "proxy_location": convert_and_respect_annotation_metadata(
                     object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
                 ),
-                "proxy_session_id": proxy_session_id,
                 "extensions": extensions,
                 "browser_type": browser_type,
                 "browser_profile_id": browser_profile_id,
@@ -8966,17 +7255,6 @@ class AsyncRawSkyvern:
                 return AsyncHttpResponse(response=_response, data=_data)
             if _response.status_code == 403:
                 raise ForbiddenError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            if _response.status_code == 404:
-                raise NotFoundError(
                     headers=dict(_response.headers),
                     body=typing.cast(
                         typing.Optional[typing.Any],
@@ -9606,222 +7884,6 @@ class AsyncRawSkyvern:
                     CredentialResponse,
                     parse_obj_as(
                         type_=CredentialResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def list_custom_llms(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[CustomLlmListResponse]:
-        """
-        List the custom LLM configurations available to the current organization.
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[CustomLlmListResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/custom-llms",
-            method="GET",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CustomLlmListResponse,
-                    parse_obj_as(
-                        type_=CustomLlmListResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def create_custom_llm(
-        self, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[CustomLlmResponse]:
-        """
-        Create a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[CustomLlmResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            "v1/custom-llms",
-            method="POST",
-            json={
-                "config": convert_and_respect_annotation_metadata(
-                    object_=config, annotation=CustomLlmConfig, direction="write"
-                ),
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CustomLlmResponse,
-                    parse_obj_as(
-                        type_=CustomLlmResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def update_custom_llm(
-        self, custom_llm_id: str, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[CustomLlmResponse]:
-        """
-        Update a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[CustomLlmResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/custom-llms/{jsonable_encoder(custom_llm_id)}",
-            method="PUT",
-            json={
-                "config": convert_and_respect_annotation_metadata(
-                    object_=config, annotation=CustomLlmConfig, direction="write"
-                ),
-            },
-            headers={
-                "content-type": "application/json",
-            },
-            request_options=request_options,
-            omit=OMIT,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    CustomLlmResponse,
-                    parse_obj_as(
-                        type_=CustomLlmResponse,  # type: ignore
-                        object_=_response.json(),
-                    ),
-                )
-                return AsyncHttpResponse(response=_response, data=_data)
-            if _response.status_code == 422:
-                raise UnprocessableEntityError(
-                    headers=dict(_response.headers),
-                    body=typing.cast(
-                        typing.Optional[typing.Any],
-                        parse_obj_as(
-                            type_=typing.Optional[typing.Any],  # type: ignore
-                            object_=_response.json(),
-                        ),
-                    ),
-                )
-            _response_json = _response.json()
-        except JSONDecodeError:
-            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
-        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
-
-    async def delete_custom_llm(
-        self, custom_llm_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> AsyncHttpResponse[ClearOrganizationAuthTokenResponse]:
-        """
-        Delete a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        AsyncHttpResponse[ClearOrganizationAuthTokenResponse]
-            Successful Response
-        """
-        _response = await self._client_wrapper.httpx_client.request(
-            f"v1/custom-llms/{jsonable_encoder(custom_llm_id)}",
-            method="DELETE",
-            request_options=request_options,
-        )
-        try:
-            if 200 <= _response.status_code < 300:
-                _data = typing.cast(
-                    ClearOrganizationAuthTokenResponse,
-                    parse_obj_as(
-                        type_=ClearOrganizationAuthTokenResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -10629,7 +8691,6 @@ class AsyncRawSkyvern:
         *,
         tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
         tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[TagsResponse]:
         """
@@ -10645,9 +8706,6 @@ class AsyncRawSkyvern:
 
         tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
             Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -10667,7 +8725,6 @@ class AsyncRawSkyvern:
                 "tags_to_delete": convert_and_respect_annotation_metadata(
                     object_=tags_to_delete, annotation=typing.Sequence[TagDeleteInput], direction="write"
                 ),
-                "colors": colors,
             },
             headers={
                 "content-type": "application/json",
@@ -11054,8 +9111,6 @@ class AsyncRawSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
-        created_at_start: typing.Optional[dt.datetime] = None,
-        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[WorkflowRun]]:
         """
@@ -11090,12 +9145,6 @@ class AsyncRawSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
-        created_at_start : typing.Optional[dt.datetime]
-            Only include runs created at or after this UTC timestamp (ISO 8601).
-
-        created_at_end : typing.Optional[dt.datetime]
-            Only include runs created strictly before this UTC timestamp (ISO 8601).
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -11113,8 +9162,6 @@ class AsyncRawSkyvern:
                 "status": status,
                 "search_key": search_key,
                 "error_code": error_code,
-                "created_at_start": serialize_datetime(created_at_start) if created_at_start is not None else None,
-                "created_at_end": serialize_datetime(created_at_end) if created_at_end is not None else None,
             },
             request_options=request_options,
         )

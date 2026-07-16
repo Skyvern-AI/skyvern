@@ -36,7 +36,6 @@ class HttpRequestBlock(UniversalBaseModel):
     follow_redirects: typing.Optional[bool] = None
     download_filename: typing.Optional[str] = None
     save_response_as_file: typing.Optional[bool] = None
-    secret_response_paths: typing.Optional[typing.List[str]] = None
     parameters: typing.Optional[typing.List[HttpRequestBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:

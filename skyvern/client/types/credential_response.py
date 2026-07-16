@@ -5,7 +5,6 @@ import typing
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .credential_response_credential import CredentialResponseCredential
-from .credential_response_proxy_location import CredentialResponseProxyLocation
 from .credential_type_output import CredentialTypeOutput
 from .credential_vault_type import CredentialVaultType
 
@@ -63,16 +62,6 @@ class CredentialResponse(UniversalBaseModel):
     folder_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     ID of the credential folder this credential belongs to, if any
-    """
-
-    proxy_location: typing.Optional[CredentialResponseProxyLocation] = pydantic.Field(default=None)
-    """
-    Optional proxy location used for the credential's pinned proxy identity.
-    """
-
-    proxy_session_id: typing.Optional[str] = pydantic.Field(default=None)
-    """
-    Opaque Skyvern-managed proxy sticky-session id.
     """
 
     if IS_PYDANTIC_V2:
