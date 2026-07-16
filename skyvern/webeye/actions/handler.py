@@ -5294,13 +5294,45 @@ async def chain_click(
                     locator=locator,
                 )
 
+            # Only for a single click does "state unchanged" reliably mean "the
+            # click was a no-op": any repeated click toggles the checkbox more
+            # than once, so its final state is not a dependable no-op signal.
+            # Gate the checkbox verification on a single click and fold it into
+            # the shared coordinate -> JS ladder below instead of a parallel one.
+            verify_checkbox_toggle = click_count == 1 and await skyvern_element.is_checkbox()
+            checked_before = await skyvern_element.is_checked(timeout=timeout) if verify_checkbox_toggle else None
+
+            coordinate_error: Exception | None = None
             try:
                 await skyvern_element.coordinate_click(page=page, click_count=click_count)
+            except Exception as e:
+                coordinate_error = e
+
+            if verify_checkbox_toggle:
+                checked_after = await skyvern_element.is_checked(timeout=timeout)
+                state_known = checked_before is not None and checked_after is not None
+                if state_known and checked_after != checked_before:
+                    action_results.append(ActionSuccess())
+                    return action_results
+                if not state_known:
+                    # Unknown post-click state (detached/navigated): a second
+                    # click risks a double toggle, so never fall through to JS.
+                    if coordinate_error is None:
+                        action_results.append(ActionSuccess())
+                    else:
+                        action_results.append(
+                            ActionFailure(
+                                FailToClick(action.element_id, anchor="coordinate_click", msg=str(coordinate_error))
+                            )
+                        )
+                    return action_results
+                # State known and unchanged: a provable no-op, safe to JS-click.
+            elif coordinate_error is None:
                 action_results.append(ActionSuccess())
                 return action_results
-            except Exception as e:
+            else:
                 action_results.append(
-                    ActionFailure(FailToClick(action.element_id, anchor="coordinate_click", msg=str(e)))
+                    ActionFailure(FailToClick(action.element_id, anchor="coordinate_click", msg=str(coordinate_error)))
                 )
 
             LOG.info(
@@ -5311,11 +5343,26 @@ async def chain_click(
             )
             try:
                 await skyvern_element.click_in_javascript()
-                action_results.append(ActionSuccess())
-                return action_results
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
                 return action_results
+
+            if verify_checkbox_toggle:
+                checked_after_js = await skyvern_element.is_checked(timeout=timeout)
+                if checked_after_js is None or checked_after_js == checked_before:
+                    action_results.append(
+                        ActionFailure(
+                            FailToClick(
+                                action.element_id,
+                                anchor="self_js",
+                                msg="checkbox state unchanged after coordinate and JS click",
+                            )
+                        )
+                    )
+                    return action_results
+
+            action_results.append(ActionSuccess())
+            return action_results
 
         try:
             LOG.debug(

@@ -206,6 +206,14 @@ class SkyvernElement:
         button_type = await self.get_attr("type")
         return button_type == "radio"
 
+    async def is_checked(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool | None:
+        # Live checked state via the DOM property; None when it can't be read
+        # (e.g. the element detached after navigation). Never raises.
+        try:
+            return await self.get_locator().is_checked(timeout=timeout)
+        except Exception:
+            return None
+
     async def is_btn_input(self) -> bool:
         tag_name = self.get_tag_name()
         if tag_name != InteractiveElement.INPUT:
@@ -774,6 +782,16 @@ class SkyvernElement:
 
         return await dom.get_skyvern_element_by_id(unique_id)
 
+    @staticmethod
+    async def _label_click_forwards_to_descendant(label_locator: Locator) -> bool:
+        # HTML forwards a <label> click to its control only when the pointer does not
+        # land on interactive content nested inside; an <a href>/<button> descendant
+        # handles the click itself (navigating) instead of toggling the control.
+        try:
+            return await label_locator.locator("a[href], button").count() > 0
+        except Exception:
+            return False
+
     async def find_bound_label_by_attr_id(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> Locator | None:
         if self.get_tag_name() == "label":
             return None
@@ -785,6 +803,8 @@ class SkyvernElement:
         locator = self.get_frame().locator(f"label[for='{element_id}']")
         cnt = await locator.count()
         if cnt == 1:
+            if await self._label_click_forwards_to_descendant(locator):
+                return None
             return locator
 
         return None
@@ -807,6 +827,9 @@ class SkyvernElement:
                 return None
 
             if tag_name.lower() != "label":
+                return None
+
+            if await self._label_click_forwards_to_descendant(parent_locator):
                 return None
 
             return parent_locator
