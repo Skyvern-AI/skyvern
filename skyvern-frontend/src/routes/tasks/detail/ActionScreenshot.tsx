@@ -1,9 +1,8 @@
 import { getClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse, ArtifactType, Status } from "@/api/types";
-import { ZoomableImage } from "@/components/ZoomableImage";
+import { ArtifactImage } from "@/components/ArtifactImage";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { getImageURL } from "./artifactUtils";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { statusIsNotFinalized } from "../types";
 import { apiPathPrefix } from "@/util/env";
@@ -115,7 +114,7 @@ function ActionScreenshot({ artifactId, stepId, index, taskStatus }: Props) {
 
   return (
     <figure className="mx-auto flex max-w-full flex-col items-center gap-2 overflow-hidden rounded">
-      <ZoomableImage src={getImageURL(screenshot)} alt="llm-screenshot" />
+      <ArtifactImage artifact={screenshot} alt="llm-screenshot" />
     </figure>
   );
 }

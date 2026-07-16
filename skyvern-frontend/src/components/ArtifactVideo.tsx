@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getClient } from "@/api/AxiosClient";
 import {
   artifactIdFromContentUrl,
   expiryFromSignedUrl,
@@ -52,8 +51,7 @@ function ArtifactVideo({
       };
     }
     try {
-      const client = await getClient(credentialGetter);
-      const minted = await mintSignedArtifactUrl(client, artifactId);
+      const minted = await mintSignedArtifactUrl(credentialGetter, artifactId);
       setUrl(minted.signed_url);
     } catch {
       // Leave the current URL in place; the on-error backstop (or the next

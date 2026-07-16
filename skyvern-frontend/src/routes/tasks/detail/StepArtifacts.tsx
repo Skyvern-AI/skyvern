@@ -9,9 +9,8 @@ import { Label } from "@/components/ui/label";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ZoomableImage } from "@/components/ZoomableImage";
+import { ArtifactImage } from "@/components/ArtifactImage";
 import { Skeleton } from "@/components/ui/skeleton";
-import { getImageURL } from "./artifactUtils";
 import { Input } from "@/components/ui/input";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -70,9 +69,9 @@ function ScreenshotsTabContent({
       )}
       <div className={`grid ${gridCols} gap-4`}>
         {visible.map((artifact, index) => (
-          <ZoomableImage
+          <ArtifactImage
             key={index}
-            src={getImageURL(artifact)}
+            artifact={artifact}
             className="h-full w-full object-cover"
             alt="action-screenshot"
           />
