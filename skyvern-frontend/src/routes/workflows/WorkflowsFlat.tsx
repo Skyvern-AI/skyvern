@@ -93,7 +93,9 @@ import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
+import { useWorkflowsReliabilityBatchQuery } from "./hooks/useWorkflowsReliabilityBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
+import { WorkflowReliabilityBadge } from "./WorkflowReliabilityBadge";
 import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
 import {
@@ -429,6 +431,8 @@ function WorkflowsFlat() {
       enabled: taggingEnabled,
     },
   );
+  const { data: workflowReliabilityMap = {} } =
+    useWorkflowsReliabilityBatchQuery(workflowIds);
 
   // Tags observed on the page for editor/filter suggestions: grouped values per
   // key plus standalone labels. Maps avoid prototype-key collisions.
@@ -1041,6 +1045,13 @@ function WorkflowsFlat() {
                                       </Tooltip>
                                     </TooltipProvider>
                                   )}
+                                  <WorkflowReliabilityBadge
+                                    reliability={
+                                      workflowReliabilityMap[
+                                        workflow.workflow_permanent_id
+                                      ]
+                                    }
+                                  />
                                 </div>
                                 {taggingEnabled &&
                                 workflowTags &&

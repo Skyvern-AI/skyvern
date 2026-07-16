@@ -12,4 +12,12 @@ type WorkflowReliability = {
   outcome_risk_runs: number;
 };
 
-export type { WorkflowReliability, WorkflowReliabilityState };
+type WorkflowsReliabilityBatchResponse = {
+  reliabilities: Record<string, WorkflowReliability>;
+};
+
+export type {
+  WorkflowReliability,
+  WorkflowReliabilityState,
+  WorkflowsReliabilityBatchResponse,
+};

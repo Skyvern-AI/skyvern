@@ -25,6 +25,7 @@ import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
+import { WorkflowReliabilityBadge } from "../../WorkflowReliabilityBadge";
 import { WorkflowRowContextMenu } from "../WorkflowRowContextMenu";
 import { useWorkflowsListContext } from "./WorkflowsListContext";
 import { useNavigate } from "react-router-dom";
@@ -57,6 +58,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     selectedCount,
     foldersMap,
     workflowTagsMap,
+    workflowReliabilityMap,
     tagDescriptions,
     tagColors,
     tagKeys,
@@ -193,6 +195,11 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     </Tooltip>
                   </TooltipProvider>
                 )}
+                <WorkflowReliabilityBadge
+                  reliability={
+                    workflowReliabilityMap[workflow.workflow_permanent_id]
+                  }
+                />
               </div>
               {taggingEnabled && workflowTags && workflowTags.length > 0 ? (
                 <TagChipList
