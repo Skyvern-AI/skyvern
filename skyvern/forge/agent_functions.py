@@ -761,15 +761,15 @@ class AgentFunction:
         self,
         *,
         trigger_type: "WorkflowRunTriggerType | None",
-        organization_id: str,
+        organization: Organization,
         workflow_permanent_id: str,
         workflow_run_id: str,
     ) -> bool:
         """Decide whether a given workflow run is eligible for flex-tier LLM routing.
 
+        Receives the full Organization so implementations can gate on org attributes.
         Cloud overrides this to consult its experimentation provider; OSS has no flex
-        routers so the default returns False.
-        """
+        routers so the default returns False."""
         return False
 
     async def resolve_recording_video_size(

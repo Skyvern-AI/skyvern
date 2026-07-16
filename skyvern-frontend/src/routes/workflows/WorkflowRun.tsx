@@ -56,6 +56,7 @@ import {
   findActiveItem,
   parseActiveIterationParam,
 } from "./workflowRun/workflowTimelineUtils";
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { pickDownloadedFileFilename } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
@@ -765,12 +766,12 @@ function WorkflowRun() {
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
-                          <a
+                          <ArtifactDownloadLink
                             href={url}
                             className="underline underline-offset-4"
                           >
                             <span>{filename}</span>
-                          </a>
+                          </ArtifactDownloadLink>
                         </div>
                       );
                     })

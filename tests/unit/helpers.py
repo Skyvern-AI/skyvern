@@ -22,9 +22,16 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 
 
 class FakeLLMResponse:
-    def __init__(self, model: str, content: str | None = '{"actions": []}', finish_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        content: str | None = '{"actions": []}',
+        finish_reason: str | None = None,
+        hidden_params: dict[str, Any] | None = None,
+    ) -> None:
         self.model = model
         self._content = content
+        self._hidden_params = hidden_params or {}
         self.choices = [
             SimpleNamespace(
                 finish_reason=finish_reason,

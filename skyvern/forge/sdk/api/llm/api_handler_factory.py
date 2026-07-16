@@ -395,6 +395,17 @@ def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any
     return None
 
 
+def _primary_deployment_label(primary_model_dict: dict[str, Any] | None) -> str | None:
+    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-2.5-pro` -> `gemini-2.5-pro`)."""
+    if not primary_model_dict:
+        return None
+    litellm_params = primary_model_dict.get("litellm_params") or {}
+    model = litellm_params.get("model") if isinstance(litellm_params, dict) else None
+    if not isinstance(model, str) or not model:
+        return None
+    return model.split("/", 1)[-1]
+
+
 def _inject_gemini_safety_settings(model_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach safety_settings to Gemini deployments only, in place.
 
@@ -611,6 +622,31 @@ class LLMAPIHandlerFactory:
             return normalized[len("vertex-") :] if normalized.startswith("vertex-") else normalized
 
         return _normalize(left) == _normalize(right)
+
+    @staticmethod
+    def _served_model_group(router: Any, response: Any) -> str | None:
+        """Resolve the litellm deployment group that served a router response, or None
+        when unavailable (direct litellm.acompletion paths, test doubles)."""
+        hidden_params = getattr(response, "_hidden_params", None)
+        model_id = hidden_params.get("model_id") if isinstance(hidden_params, dict) else None
+        if not model_id:
+            return None
+        get_deployment = getattr(router, "get_deployment", None)
+        if get_deployment is None:
+            return None
+        # Never let identity resolution fail a completed request — the outer handler
+        # would convert a post-success exception into LLMProviderError.
+        try:
+            deployment = get_deployment(model_id=model_id)
+        except Exception as e:
+            LOG.info(
+                "Failed to resolve serving deployment from model_id",
+                sampling=True,
+                model_id=model_id,
+                error=str(e),
+            )
+            return None
+        return getattr(deployment, "model_name", None)
 
     @staticmethod
     def _extract_token_counts(response: ModelResponse | CustomStreamWrapper) -> tuple[int, int, int, int]:
@@ -1401,6 +1437,7 @@ class LLMAPIHandlerFactory:
 
                 try:
                     response: ModelResponse | None = None
+                    primary_served = False
                     if should_attach_vertex_cache and cache_resource_name:
                         try:
                             response, direct_model_used, llm_request_json = await _call_primary_with_vertex_cache(
@@ -1408,6 +1445,9 @@ class LLMAPIHandlerFactory:
                                 cache_variant,
                             )
                             model_used = response.model or direct_model_used
+                            # This path invokes the primary deployment directly, so a
+                            # successful response is primary-served by construction.
+                            primary_served = True
                         except CancelledError:
                             raise
                         except Exception as cache_error:
@@ -1424,7 +1464,21 @@ class LLMAPIHandlerFactory:
                         response, llm_request_json = await _call_router_without_cache()
                         response_model = response.model or main_model_group
                         model_used = response_model
-                        if not LLMAPIHandlerFactory._models_equivalent(response_model, main_model_group):
+                        served_group = LLMAPIHandlerFactory._served_model_group(router, response)
+                        if served_group is not None:
+                            primary_served = served_group == main_model_group
+                        else:
+                            # Provider labels can't distinguish deployments of the same model
+                            # (e.g. flex vs standard tier), so without the serving deployment's
+                            # identity, treat a primary-label match as primary-served.
+                            primary_label = _primary_deployment_label(primary_model_dict)
+                            primary_served = LLMAPIHandlerFactory._models_equivalent(
+                                response_model, main_model_group
+                            ) or (
+                                primary_label is not None
+                                and LLMAPIHandlerFactory._models_equivalent(response_model, primary_label)
+                            )
+                        if not primary_served:
                             LOG.info(
                                 "LLM router fallback succeeded",
                                 sampling=True,
@@ -1432,13 +1486,10 @@ class LLMAPIHandlerFactory:
                                 prompt_name=prompt_name,
                                 primary_model=main_model_group,
                                 fallback_model=response_model,
+                                served_model_group=served_group,
                             )
 
-                    if (
-                        is_truncated_response(response)
-                        and fallback_groups
-                        and LLMAPIHandlerFactory._models_equivalent(model_used, main_model_group)
-                    ):
+                    if is_truncated_response(response) and fallback_groups and primary_served:
                         fallback_model = fallback_groups[0]
                         _usage = response.usage if hasattr(response, "usage") and response.usage else None
                         LOG.warning(

@@ -1560,7 +1560,7 @@ class WorkflowService:
                 # owner of the flag name and property shape.
                 new_context.use_flex_llm_routing = await app.AGENT_FUNCTION.should_use_flex_llm_routing(
                     trigger_type=resolved_trigger_type,
-                    organization_id=organization.organization_id,
+                    organization=organization,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )

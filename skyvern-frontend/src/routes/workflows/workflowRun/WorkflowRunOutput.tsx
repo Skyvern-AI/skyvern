@@ -1,6 +1,7 @@
 import { FileIcon } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
 import { CodeEditor } from "../components/CodeEditor";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
@@ -363,9 +364,12 @@ function WorkflowRunOutput() {
                 return (
                   <div key={url} title={url} className="flex gap-2">
                     <FileIcon className="size-6" />
-                    <a href={url} className="underline underline-offset-4">
+                    <ArtifactDownloadLink
+                      href={url}
+                      className="underline underline-offset-4"
+                    >
                       <span>{filename}</span>
-                    </a>
+                    </ArtifactDownloadLink>
                   </div>
                 );
               })

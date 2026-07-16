@@ -1,10 +1,29 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import {
   artifactIdFromContentUrl,
   expiryFromSignedUrl,
+  freshArtifactUrl,
+  getWithMintRetry,
   refreshDelayMs,
 } from "./artifactUrls";
+
+const { axiosGetMock, clientGetMock, getClientMock } = vi.hoisted(() => {
+  const clientGetMock = vi.fn();
+  return {
+    axiosGetMock: vi.fn(),
+    clientGetMock,
+    getClientMock: vi.fn().mockResolvedValue({ get: clientGetMock }),
+  };
+});
+
+vi.mock("axios", () => ({
+  default: { get: axiosGetMock },
+}));
+
+vi.mock("@/api/AxiosClient", () => ({
+  getClient: getClientMock,
+}));
 
 describe("artifactIdFromContentUrl", () => {
   test("extracts the artifact id from a signed content URL", () => {
@@ -57,6 +76,69 @@ describe("expiryFromSignedUrl", () => {
       ),
     ).toBeNull();
     expect(expiryFromSignedUrl("not a url")).toBeNull();
+  });
+});
+
+describe("freshArtifactUrl", () => {
+  test("mints a fresh URL for artifact content URLs", async () => {
+    clientGetMock.mockResolvedValueOnce({
+      data: { artifact_id: "a_1", signed_url: "https://fresh", expires_at: 2 },
+    });
+    await expect(
+      freshArtifactUrl(
+        null,
+        "https://api.skyvern.com/v1/artifacts/a_1/content?expiry=1&kid=k&sig=s",
+      ),
+    ).resolves.toBe("https://fresh");
+    expect(clientGetMock).toHaveBeenCalledWith("/artifacts/a_1/signed-url");
+    // The signed-url route only exists on the `/v1` router (not `/api/v1`).
+    expect(getClientMock).toHaveBeenCalledWith(null, "sans-api-v1");
+  });
+
+  test("returns non-artifact URLs unchanged without minting", async () => {
+    clientGetMock.mockClear();
+    const presigned = "https://bucket.s3.amazonaws.com/f.pdf?X-Amz-Signature=x";
+    await expect(freshArtifactUrl(null, presigned)).resolves.toBe(presigned);
+    expect(clientGetMock).not.toHaveBeenCalled();
+  });
+
+  test("falls back to the original URL when minting fails", async () => {
+    clientGetMock.mockRejectedValueOnce(new Error("boom"));
+    const url =
+      "https://api.skyvern.com/v1/artifacts/a_1/content?expiry=1&kid=k&sig=s";
+    await expect(freshArtifactUrl(null, url)).resolves.toBe(url);
+  });
+});
+
+describe("getWithMintRetry", () => {
+  test("returns the first fetch when it succeeds", async () => {
+    axiosGetMock.mockResolvedValueOnce({ data: "body" });
+    await expect(getWithMintRetry("https://u1", "a_1", null)).resolves.toBe(
+      "body",
+    );
+    expect(axiosGetMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("retries once on a freshly minted URL when the fetch fails", async () => {
+    axiosGetMock.mockRejectedValueOnce(new Error("403"));
+    clientGetMock.mockResolvedValueOnce({
+      data: { artifact_id: "a_1", signed_url: "https://fresh", expires_at: 2 },
+    });
+    axiosGetMock.mockResolvedValueOnce({ data: "fresh-body" });
+
+    await expect(getWithMintRetry("https://u1", "a_1", null)).resolves.toBe(
+      "fresh-body",
+    );
+    expect(axiosGetMock).toHaveBeenLastCalledWith("https://fresh");
+  });
+
+  test("surfaces the original error when minting fails", async () => {
+    const original = new Error("original 403");
+    axiosGetMock.mockRejectedValueOnce(original);
+    clientGetMock.mockRejectedValueOnce(new Error("mint failed"));
+    await expect(getWithMintRetry("https://u1", "a_1", null)).rejects.toBe(
+      original,
+    );
   });
 });
 
