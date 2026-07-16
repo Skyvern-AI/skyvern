@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Literal
 
 import aiohttp
 import httpx
@@ -18,7 +18,7 @@ from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
-from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
+from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
 from skyvern.exceptions import (
     AzureConfigurationError,
     DisabledBlockExecutionError,
@@ -125,6 +125,7 @@ class FieldOptionResolution:
     matched_value: str | None
     confidence: float
     fallback_to_llm: bool
+    matched_tier: Literal["exact", "stem"] | None = None
 
 
 @dataclass
@@ -1906,7 +1907,7 @@ class AgentFunction:
         resolvable. A ``None`` match or ``fallback_to_llm=True`` means the
         caller must defer to the LLM path.
         """
-        matched_index = match_option_exact_or_stem(target_value, option_labels)
+        matched_index, matched_tier = match_option_exact_or_stem_with_tier(target_value, option_labels)
         if matched_index is None:
             return FieldOptionResolution(
                 matched_index=None,
@@ -1914,6 +1915,7 @@ class AgentFunction:
                 matched_value=None,
                 confidence=0.0,
                 fallback_to_llm=True,
+                matched_tier=None,
             )
 
         matched_value = option_values[matched_index] if matched_index < len(option_values) else None
@@ -1923,6 +1925,7 @@ class AgentFunction:
             matched_value=matched_value,
             confidence=1.0,
             fallback_to_llm=False,
+            matched_tier=matched_tier,
         )
 
     async def fill_custom_widget(
