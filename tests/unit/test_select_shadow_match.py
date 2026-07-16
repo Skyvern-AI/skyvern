@@ -8,7 +8,7 @@ import structlog.testing
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
-from skyvern.webeye.actions.actions import InputOrSelectContext, SelectOption, SelectOptionAction
+from skyvern.webeye.actions.actions import ClickAction, InputOrSelectContext, SelectOption, SelectOptionAction
 
 _SHADOW_OPTION = {
     "id": "matched-id",
@@ -565,3 +565,392 @@ async def test_dropdown_select_call_path_forwards_committed_value_to_shadow_matc
     assert len(events) == 1
     assert events[0]["prompt_name"] == "custom-select/dropdown"
     assert events[0]["match_agrees_with_llm"] is True
+
+
+_OUTCOME_TASK = SimpleNamespace(
+    workflow_run_id="wr",
+    task_id="task",
+    organization_id="org",
+    url="https://test",
+    navigation_goal="goal",
+    navigation_payload={},
+    llm_key=None,
+)
+
+
+async def _run_outcome_case(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    *,
+    family_enabled: bool = True,
+    assigned: bool = False,
+    entry_action_type: str = "select_option",
+    selection_group_id: str = "group-1",
+    select_depth: int = 0,
+) -> tuple[object, dict[str, object], SimpleNamespace, AsyncMock]:
+    handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+    family = (
+        AsyncMock(side_effect=RuntimeError("gate")) if case == "gate_error" else AsyncMock(return_value=family_enabled)
+    )
+    provider = SimpleNamespace(
+        is_feature_enabled_cached=family,
+        resolve_feature_enabled_unrecorded=AsyncMock(return_value=assigned),
+    )
+    resolution = SimpleNamespace(
+        fallback_to_llm=case == "no_match",
+        matched_index=None if case == "no_match" else 2 if case == "bad_index" else 0,
+        matched_label="Choice",
+        matched_tier=None if case == "no_match" else "exact",
+    )
+    resolver = AsyncMock(side_effect=RuntimeError("matcher") if case == "matcher_error" else None)
+    resolver.return_value = resolution
+    selected = SimpleNamespace(
+        get_attr=AsyncMock(return_value="listbox" if case == "listbox" else None),
+        scroll_into_view=AsyncMock(),
+        click=AsyncMock(side_effect=RuntimeError("after dispatch") if case == "post_click" else None),
+    )
+    monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
+    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", SimpleNamespace(resolve_field_option=resolver))
+    monkeypatch.setattr(
+        handler,
+        "_read_custom_select_matched_state",
+        AsyncMock(side_effect=RuntimeError("before click") if case == "pre_click" else None, return_value=None),
+    )
+    monkeypatch.setattr(handler, "_resolve_custom_select_readback_scope_element", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(handler, "_anchor_is_combobox_input", AsyncMock(return_value=case.startswith("reset")))
+    monkeypatch.setattr(
+        handler, "_custom_select_matched_state_confirms_pre_click", Mock(return_value=case == "precommit")
+    )
+    monkeypatch.setattr(handler, "_custom_select_scope_confirms_committed", AsyncMock(return_value=False))
+    monkeypatch.setattr(handler, "_verify_custom_select_option_with_settle", AsyncMock(return_value=case == "verified"))
+    monkeypatch.setattr(handler, "_reset_custom_select_combobox_input", AsyncMock(return_value=case == "reset_ok"))
+    candidates = (
+        Mock(side_effect=RuntimeError("walker"))
+        if case == "walker_error"
+        else Mock(
+            return_value=[
+                {
+                    "label": "Choice",
+                    "element_id": None if case == "no_element_id" else "choice-1",
+                    "value": "choice",
+                    "is_choice_input": case == "toggle",
+                }
+            ]
+        )
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await handler._select_deterministic_custom_option(
+            target_value="Choice",
+            get_option_candidates=candidates,
+            field_context={},
+            page=MagicMock(),
+            get_skyvern_element=AsyncMock(return_value=selected),
+            task=_OUTCOME_TASK,
+            step=SimpleNamespace(step_id="step"),
+            entry_action_type=entry_action_type,
+            selection_group_id=selection_group_id,
+            select_depth=select_depth,
+        )
+    events = [log for log in logs if log.get("event") == "custom_select_family_outcome"]
+    assert len(events) == 1
+    return result, events[0], provider, resolver
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_action_type", ["select_option", "input_text", "input_text_converted"])
+async def test_outcome_event_emitted_once_per_opportunity(
+    monkeypatch: pytest.MonkeyPatch, entry_action_type: str
+) -> None:
+    _, event, _, _ = await _run_outcome_case(monkeypatch, "control", entry_action_type=entry_action_type)
+    assert event["outcome"] == "llm_fallback_control"
+    assert event["entry_action_type"] == entry_action_type
+
+
+@pytest.mark.asyncio
+async def test_click_route_without_target_emits_nothing_and_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = AsyncMock()
+    monkeypatch.setattr(handler, "_resolve_collapse_gate", gate)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await handler._select_deterministic_custom_option(
+            target_value=None,
+            get_option_candidates=Mock(),
+            field_context={},
+            page=MagicMock(),
+            get_skyvern_element=AsyncMock(),
+            task=_OUTCOME_TASK,
+            entry_action_type="click",
+        )
+
+    assert result is None
+    assert [log for log in logs if log.get("event") == "custom_select_family_outcome"] == []
+    gate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_click_ingress_routes_no_target_and_emits_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    select_from_emerging_elements = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(handler, "select_from_emerging_elements", select_from_emerging_elements)
+    monkeypatch.setattr(handler, "_build_after_click_verify_prompt", AsyncMock(return_value="prompt"))
+    monkeypatch.setattr(
+        handler,
+        "resolve_check_user_goal_handler",
+        AsyncMock(
+            return_value=AsyncMock(
+                return_value={"thoughts": "continue", "user_goal_achieved": False, "should_terminate": False}
+            )
+        ),
+    )
+    monkeypatch.setattr(handler, "locate_dropdown_menu", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(
+        handler,
+        "_get_input_or_select_context",
+        AsyncMock(return_value=InputOrSelectContext(field="Field", is_required=True, is_date_related=False)),
+    )
+    monkeypatch.setattr(
+        handler,
+        "DomUtil",
+        Mock(
+            return_value=SimpleNamespace(
+                get_skyvern_element_by_id=AsyncMock(
+                    return_value=SimpleNamespace(is_interactable=Mock(return_value=True))
+                )
+            )
+        ),
+    )
+
+    scraped_page_after_open = SimpleNamespace(id_to_css_dict={"choice-id": "[data-id=choice-id]"})
+    scraped_page = SimpleNamespace(
+        url="https://test",
+        id_to_css_dict={},
+        generate_scraped_page_without_screenshots=AsyncMock(return_value=scraped_page_after_open),
+    )
+    incremental_scraped = SimpleNamespace(
+        get_incremental_elements_num=AsyncMock(return_value=1),
+        get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]),
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await handler.handle_sequential_click_for_dropdown(
+            action=ClickAction(element_id="field-id", reasoning="click", intention="choose"),
+            action_history=[],
+            anchor_element=MagicMock(get_id=Mock(return_value="field-id")),
+            dom=MagicMock(),
+            page=SimpleNamespace(url="https://test"),
+            skyvern_frame=SimpleNamespace(safe_wait_for_animation_end=AsyncMock()),
+            scraped_page=scraped_page,
+            incremental_scraped=incremental_scraped,
+            task=_OUTCOME_TASK,
+            step=SimpleNamespace(step_id="step"),
+        )
+
+    options = select_from_emerging_elements.await_args.kwargs["options"]
+    assert options.target_value is None
+    assert [log for log in logs if log.get("event") == "custom_select_family_outcome"] == []
+
+
+@pytest.mark.asyncio
+async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+    monkeypatch.setattr(
+        handler.app,
+        "EXPERIMENTATION_PROVIDER",
+        SimpleNamespace(
+            is_feature_enabled_cached=AsyncMock(return_value=True),
+            resolve_feature_enabled_unrecorded=AsyncMock(return_value=False),
+        ),
+    )
+    monkeypatch.setattr(
+        handler.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            resolve_field_option=AsyncMock(
+                return_value=SimpleNamespace(
+                    fallback_to_llm=False,
+                    matched_index=0,
+                    matched_label="Choice",
+                    matched_tier="exact",
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        handler.app,
+        "CUSTOM_SELECT_AGENT_LLM_API_HANDLER",
+        AsyncMock(return_value={"id": "matched-id", "value": "Choice", "action_type": "input_text"}),
+    )
+    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        handler, "get_actual_value_of_parameter_if_secret_with_task", Mock(side_effect=lambda _, value: value)
+    )
+
+    dropdown = MagicMock(
+        get_element_handler=AsyncMock(return_value=MagicMock()),
+        get_locator=Mock(return_value=MagicMock(count=AsyncMock(return_value=1))),
+    )
+    input_element = MagicMock(
+        get_tag_name=Mock(return_value="input"),
+        get_locator=Mock(return_value=MagicMock()),
+        scroll_into_view=AsyncMock(),
+        is_readonly=AsyncMock(return_value=False),
+        input_clear=AsyncMock(),
+        input_sequentially=AsyncMock(),
+    )
+    skyvern_frame = MagicMock(
+        safe_wait_for_animation_end=AsyncMock(),
+        get_element_scrollable=AsyncMock(return_value=False),
+        get_element_visible=AsyncMock(return_value=True),
+    )
+    incremental_scraped = MagicMock(get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]))
+    incremental_scraped.build_element_tree.return_value = "<div>Choice</div>"
+    monkeypatch.setattr(handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=dropdown))
+    monkeypatch.setattr(handler.SkyvernElement, "create_from_incremental", AsyncMock(return_value=input_element))
+
+    action = SelectOptionAction(
+        element_id="field-id",
+        option=SelectOption(label="Choice"),
+        input_or_select_context=InputOrSelectContext(field="Field"),
+    )
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        with structlog.testing.capture_logs() as logs:
+            await handler.sequentially_select_from_dropdown(
+                action=action,
+                input_or_select_context=InputOrSelectContext(field="Field"),
+                page=MagicMock(),
+                dom=MagicMock(),
+                skyvern_element=MagicMock(),
+                skyvern_frame=skyvern_frame,
+                incremental_scraped=incremental_scraped,
+                step=SimpleNamespace(step_id="step"),
+                task=_OUTCOME_TASK,
+                dropdown_menu_element=dropdown,
+                force_select=True,
+                target_value="Choice",
+            )
+
+    events = [log for log in logs if log.get("event") == "custom_select_family_outcome"]
+    assert len(events) == 3
+    assert [event["outcome"] for event in events] == ["llm_fallback_control"] * 3
+    assert events[0]["selection_group_id"]
+    assert len({event["selection_group_id"] for event in events}) == 1
+    assert [event["select_depth"] for event in events] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_outcome_event_family_off_emits_without_assignment_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, event, provider, resolver = await _run_outcome_case(monkeypatch, "family_off", family_enabled=False)
+    assert event["outcome"] == "llm_fallback_family_off"
+    assert (event["assigned"], event["eligible"], event["match_tier"]) == (None, True, "exact")
+    provider.resolve_feature_enabled_unrecorded.assert_not_awaited()
+    resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_outcome_event_key_allowlist_and_enum(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, event, _, _ = await _run_outcome_case(monkeypatch, "control")
+    expected_keys = set(
+        "event log_level family workflow_run_id task_id organization_id step_id entry_action_type selection_group_id "
+        "select_depth family_gate_enabled assigned gate_error encountered eligible match_tier option_count attempted "
+        "click_attempted verified_success outcome llm_fallback_requested duration_ms".split()
+    )
+    expected_outcomes = set(
+        "llm_fallback_gate_error llm_fallback_eval_error llm_fallback_family_off llm_fallback_control "
+        "llm_fallback_no_match llm_fallback_match_unactionable llm_fallback_pre_click_error "
+        "llm_fallback_reset_verified llm_fallback_post_click_unverified success_precommit success_verified "
+        "terminal_post_click_exception terminal_unverified_reset terminal_unverified_click "
+        "terminal_unverified_toggle".split()
+    )
+    assert event["outcome"] == "llm_fallback_control"
+    assert set(event) == expected_keys
+    assert {outcome.value for outcome in handler.CustomSelectFamilyOutcome} == expected_outcomes
+
+
+@pytest.mark.asyncio
+async def test_outcome_event_gate_error_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, event, _, _ = await _run_outcome_case(monkeypatch, "gate_error")
+    assert event["outcome"] == "llm_fallback_gate_error"
+    assert (event["option_count"], event["eligible"], event["match_tier"]) == (None, False, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "family_enabled", "assigned"),
+    [
+        (case, family, assigned)
+        for case in ("walker_error", "matcher_error")
+        for family, assigned in ((False, False), (True, False), (True, True))
+    ],
+)
+async def test_outcome_event_eval_error_emits_on_all_arms(
+    monkeypatch: pytest.MonkeyPatch, case: str, family_enabled: bool, assigned: bool
+) -> None:
+    result, event, _, _ = await _run_outcome_case(monkeypatch, case, family_enabled=family_enabled, assigned=assigned)
+    assert result is None
+    assert event["outcome"] == "llm_fallback_eval_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "outcome", "attempted"),
+    [
+        ("no_match", "llm_fallback_no_match", False),
+        ("bad_index", "llm_fallback_match_unactionable", False),
+        ("no_element_id", "llm_fallback_match_unactionable", False),
+        ("listbox", "llm_fallback_match_unactionable", False),
+        ("pre_click", "llm_fallback_pre_click_error", True),
+        ("precommit", "success_precommit", True),
+        ("verified", "success_verified", True),
+        ("nonchoice", "llm_fallback_post_click_unverified", True),
+        ("toggle", "terminal_unverified_toggle", True),
+    ],
+)
+async def test_outcome_event_exact_for_each_treatment_exit(
+    monkeypatch: pytest.MonkeyPatch, case: str, outcome: str, attempted: bool
+) -> None:
+    _, event, _, _ = await _run_outcome_case(monkeypatch, case, assigned=True)
+    assert event["outcome"] == outcome
+    assert event["attempted"] is attempted
+
+
+@pytest.mark.asyncio
+async def test_click_attempted_true_when_click_dispatches_then_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, event, _, _ = await _run_outcome_case(monkeypatch, "post_click", assigned=True)
+    assert result is None
+    assert event["outcome"] == "llm_fallback_post_click_unverified"
+    assert event["click_attempted"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "outcome"),
+    [("reset_ok", "llm_fallback_reset_verified"), ("reset_failed", "llm_fallback_post_click_unverified")],
+)
+async def test_reset_outcome_recorded_without_behavior_change(
+    monkeypatch: pytest.MonkeyPatch, case: str, outcome: str
+) -> None:
+    result, event, _, _ = await _run_outcome_case(monkeypatch, case, assigned=True)
+    assert result is None
+    assert event["outcome"] == outcome
+
+
+@pytest.mark.asyncio
+async def test_converted_route_reports_input_text_converted(monkeypatch: pytest.MonkeyPatch) -> None:
+    element = MagicMock(is_disabled=AsyncMock(return_value=False), get_selectable=AsyncMock(return_value=True))
+    element.get_tag_name.return_value, element.get_id.return_value = "input", "field"
+    monkeypatch.setattr(
+        handler, "DomUtil", Mock(return_value=MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element)))
+    )
+    monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock())
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    select = AsyncMock(return_value=[handler.ActionSuccess()])
+    monkeypatch.setattr(handler, "handle_select_option_action", select)
+    await handler.handle_input_text_action(
+        handler.InputTextAction(element_id="field", text="Choice"),
+        MagicMock(),
+        SimpleNamespace(id_to_element_dict={"field": {"tagName": "input"}}),
+        SimpleNamespace(workflow_run_id=None),
+        MagicMock(),
+    )
+    assert select.await_args.kwargs["entry_action_type"] == "input_text_converted"

@@ -226,6 +226,7 @@ async def test_invalid_combobox_commits_and_suppresses_tab() -> None:
     select_mock.assert_awaited_once()
     assert select_mock.await_args.kwargs["force_select"] is True
     assert select_mock.await_args.kwargs["target_value"] == _TARGET
+    assert select_mock.await_args.kwargs["entry_action_type"] == "input_text"
     assert "Tab" not in _pressed_keys(el)
     assert not results[0].skip_remaining_actions
 
