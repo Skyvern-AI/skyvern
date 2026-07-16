@@ -1046,23 +1046,21 @@ def _phone_digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
 
 
-def _nanp_readback_national_digits(digits: str) -> str | None:
-    if len(digits) == 10:
-        return digits
-    if len(digits) in {11, 12} and digits[:-10] == "1" * (len(digits) - 10):
-        return digits[-10:]
-    return None
-
-
-def _phone_readback_digits_match(expected_digits: str, actual_digits: str) -> bool:
+def _phone_readback_digits_match(
+    expected_digits: str,
+    actual_digits: str,
+    *,
+    allow_nanp_country_prefix: bool = False,
+) -> bool:
     if actual_digits == expected_digits:
         return True
-    if len(expected_digits) == 10 and actual_digits == f"1{expected_digits}":
-        return True
+    if not allow_nanp_country_prefix:
+        return False
+    return len(expected_digits) == 10 and actual_digits == f"1{expected_digits}"
 
-    expected_nanp_digits = _nanp_readback_national_digits(expected_digits)
-    actual_nanp_digits = _nanp_readback_national_digits(actual_digits)
-    return expected_nanp_digits is not None and expected_nanp_digits == actual_nanp_digits
+
+def _has_explicit_nanp_country_code(value: str | None) -> bool:
+    return re.match(r"\+1|1[ \-.(]", (value or "").strip()) is not None
 
 
 def _nanp_national_digits(value: str | None) -> str | None:
@@ -1073,7 +1071,7 @@ def _nanp_national_digits(value: str | None) -> str | None:
     digits = _phone_digits(text)
     # A leading 1 counts as a country code only when written as one (+1, or 1 set off by a
     # separator); bare 11-digit strings can be non-NANP numbers whose first digit is 1.
-    if re.fullmatch(r"1[0-9]{10}", digits) and re.match(r"\+1|1[ \-.(]", text):
+    if re.fullmatch(r"1[0-9]{10}", digits) and _has_explicit_nanp_country_code(text):
         national_digits = digits[-10:]
     elif re.fullmatch(
         r"\([0-9]{3}\) [0-9]{3}-[0-9]{4}|[0-9]{3}-[0-9]{3}-[0-9]{4}|"
@@ -1100,6 +1098,31 @@ def _tel_pattern_allows_bare_digits(pattern: str | None, bare_digits: str) -> bo
         return re.fullmatch(pattern, bare_digits) is not None
     except re.error:
         return True
+
+
+def _nanp_e164_fallback(value: str, *, pattern: str | None, maxlength: str | None) -> str | None:
+    """Return a canonical E.164 retry only with explicit +1 evidence and permissive field constraints."""
+    national_digits = _nanp_national_digits(value)
+    if national_digits is None or not _has_explicit_nanp_country_code(value):
+        return None
+    e164_value = f"+1{national_digits}"
+    if pattern:
+        try:
+            if re.fullmatch(pattern, e164_value) is None:
+                return None
+        except re.error:
+            # Unlike the required bare-digit first attempt, this optional +1 rewrite fails closed when
+            # the browser's pattern cannot be interpreted safely by Python.
+            return None
+
+    if maxlength:
+        try:
+            max_chars = int(maxlength)
+        except ValueError:
+            return None
+        if max_chars < 0 or len(e164_value) > max_chars:
+            return None
+    return e164_value
 
 
 def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | None) -> tuple[str, bool, bool]:
@@ -1229,12 +1252,22 @@ async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
     )
 
 
-async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected_value: str) -> None:
+async def verify_phone_input_digits(
+    *,
+    tag_name: str,
+    locator: Locator,
+    expected_value: str,
+    allow_nanp_country_prefix: bool = False,
+) -> None:
     # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator)
     expected_digits = _phone_digits(expected_value)
     actual_digits = _phone_digits(actual_value)
-    if not _phone_readback_digits_match(expected_digits, actual_digits):
+    if not _phone_readback_digits_match(
+        expected_digits,
+        actual_digits,
+        allow_nanp_country_prefix=allow_nanp_country_prefix,
+    ):
         raise PhoneNumberInputMismatch(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
@@ -1246,12 +1279,63 @@ async def verify_phone_input_digits(*, tag_name: str, locator: Locator, expected
     )
 
 
-async def _verify_tel_input_after_fill(*, skyvern_element: SkyvernElement, tag_name: str, expected_value: str) -> None:
+async def _verify_tel_input_after_fill(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    expected_value: str,
+    allow_nanp_country_prefix: bool,
+) -> None:
     await verify_phone_input_digits(
         tag_name=tag_name,
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
+        allow_nanp_country_prefix=allow_nanp_country_prefix,
     )
+
+
+async def _fill_nanp_tel_with_readback(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    national_digits: str,
+    e164_fallback: str | None,
+) -> PhoneNumberInputMismatch | None:
+    """Fill affirmative NANP digits and verify every attempt.
+    Retry atomically with national digits before constraint-safe E.164 for the least invasive recovery.
+    """
+    attempts = [("sequential_national", national_digits), ("atomic_national", national_digits)]
+    if e164_fallback is not None:
+        attempts.append(("atomic_e164", e164_fallback))
+
+    for attempt_index, (strategy, value) in enumerate(attempts):
+        if strategy == "sequential_national":
+            await skyvern_element.input_sequentially(text=value)
+        else:
+            await skyvern_element.input_clear()
+            await skyvern_element.input_fill(text=value)
+
+        try:
+            await _verify_tel_input_after_fill(
+                skyvern_element=skyvern_element,
+                tag_name=tag_name,
+                expected_value=national_digits,
+                allow_nanp_country_prefix=e164_fallback is not None,
+            )
+        except PhoneNumberInputMismatch as mismatch:
+            if attempt_index == len(attempts) - 1:
+                return mismatch
+            LOG.info(
+                "Phone input read-back mismatch; trying next fill strategy",
+                element_id=skyvern_element.get_id(),
+                failed_strategy=strategy,
+                next_strategy=attempts[attempt_index + 1][0],
+                expected_digit_count=mismatch.expected_digit_count,
+                actual_digit_count=mismatch.actual_digit_count,
+            )
+        else:
+            return None
+    return None
 
 
 async def _log_tel_fallback_fill_digit_counts(
@@ -3303,11 +3387,16 @@ async def handle_input_text_action(
     used_bare_nanp = False
     run_phone_format_check = False
     log_tel_fallback_readback = False
+    tel_pattern: str | None = None
+    tel_maxlength: str | None = None
+    tel_e164_fallback: str | None = None
     if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
         # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
         # byte-for-byte. Affirmative-NANP tel is typed as bare national digits (skipping the format-check
         # LLM) unless the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
         tel_pattern = await skyvern_element.get_attr("pattern")
+        tel_maxlength = await skyvern_element.get_attr("maxlength")
+        tel_e164_fallback = _nanp_e164_fallback(text, pattern=tel_pattern, maxlength=tel_maxlength)
         text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
             is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
         )
@@ -3488,7 +3577,8 @@ async def handle_input_text_action(
                     auto_complete_hacky_flag = False
                     return [result]
 
-        # Only the bare-digit NANP fill is read back to verify; other tel shapes are left unverified.
+        # Only the bare-digit NANP path uses the verified fallback ladder; other tel shapes remain
+        # observational to preserve flag-off behavior.
         verify_tel_input_after_fill = used_bare_nanp
 
         # SKY-11720: an auto-formatting card-number field (a space every 4 digits) restores its caret
@@ -3512,36 +3602,24 @@ async def handle_input_text_action(
                 )
                 if card_failure is not None:
                     return [card_failure]
+            elif verify_tel_input_after_fill:
+                phone_mismatch = await _fill_nanp_tel_with_readback(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    national_digits=text,
+                    e164_fallback=tel_e164_fallback,
+                )
+                if phone_mismatch is not None:
+                    LOG.warning(
+                        "Phone input read-back mismatch after retry",
+                        element_id=skyvern_element.get_id(),
+                        expected_digit_count=phone_mismatch.expected_digit_count,
+                        actual_digit_count=phone_mismatch.actual_digit_count,
+                    )
+                    return [ActionFailure(phone_mismatch)]
             else:
                 await skyvern_element.input_sequentially(text=text)
-                if verify_tel_input_after_fill:
-                    # Read the typed digits back; on mismatch, clear and retype once. A second mismatch
-                    # fails the action here rather than letting it surface as a silent wrong fill.
-                    try:
-                        await _verify_tel_input_after_fill(
-                            skyvern_element=skyvern_element,
-                            tag_name=tag_name,
-                            expected_value=text,
-                        )
-                    except PhoneNumberInputMismatch:
-                        await skyvern_element.input_clear()
-                        await skyvern_element.input_sequentially(text=text)
-                        try:
-                            await _verify_tel_input_after_fill(
-                                skyvern_element=skyvern_element,
-                                tag_name=tag_name,
-                                expected_value=text,
-                            )
-                        except PhoneNumberInputMismatch as mismatch:
-                            LOG.warning(
-                                "Phone input read-back mismatch after retry",
-                                action=action,
-                                element_id=skyvern_element.get_id(),
-                                expected_digit_count=mismatch.expected_digit_count,
-                                actual_digit_count=mismatch.actual_digit_count,
-                            )
-                            return [ActionFailure(mismatch)]
-                elif log_tel_fallback_readback:
+                if log_tel_fallback_readback:
                     await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
