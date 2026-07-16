@@ -15,7 +15,6 @@ from .types.artifact_type import ArtifactType
 from .types.browser_profile import BrowserProfile
 from .types.browser_session_response import BrowserSessionResponse
 from .types.bulk_cancel_runs_response import BulkCancelRunsResponse
-from .types.clear_organization_auth_token_response import ClearOrganizationAuthTokenResponse
 from .types.create_browser_profile_request_proxy_location import CreateBrowserProfileRequestProxyLocation
 from .types.create_browser_session_request_proxy_location import CreateBrowserSessionRequestProxyLocation
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
@@ -23,9 +22,6 @@ from .types.create_credential_request_proxy_location import CreateCredentialRequ
 from .types.create_script_response import CreateScriptResponse
 from .types.credential_response import CredentialResponse
 from .types.credential_vault_type import CredentialVaultType
-from .types.custom_llm_config import CustomLlmConfig
-from .types.custom_llm_list_response import CustomLlmListResponse
-from .types.custom_llm_response import CustomLlmResponse
 from .types.extensions import Extensions
 from .types.folder import Folder
 from .types.get_run_response import GetRunResponse
@@ -37,10 +33,6 @@ from .types.run_engine import RunEngine
 from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.run_status import RunStatus
-from .types.run_tag_history_response import RunTagHistoryResponse
-from .types.run_tags_batch_response import RunTagsBatchResponse
-from .types.run_tags_response import RunTagsResponse
-from .types.run_type import RunType
 from .types.run_webhook_replay_response import RunWebhookReplayResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
@@ -51,9 +43,6 @@ from .types.tag_history_response import TagHistoryResponse
 from .types.tag_input import TagInput
 from .types.tag_key import TagKey
 from .types.tag_key_delete_response import TagKeyDeleteResponse
-from .types.tag_value import TagValue
-from .types.tag_value_delete_response import TagValueDeleteResponse
-from .types.tag_value_rename_response import TagValueRenameResponse
 from .types.tags_response import TagsResponse
 from .types.task_run_list_item import TaskRunListItem
 from .types.task_run_request_input_data_extraction_schema import TaskRunRequestInputDataExtractionSchema
@@ -1052,183 +1041,6 @@ class Skyvern:
         )
         return _response.data
 
-    def get_run_tags(
-        self, workflow_run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> RunTagsResponse:
-        """
-        Get the current tag state for a workflow run.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsResponse
-            Successfully retrieved tags
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_run_tags(
-            workflow_run_id="wr_123",
-        )
-        """
-        _response = self._raw_client.get_run_tags(workflow_run_id, request_options=request_options)
-        return _response.data
-
-    def apply_run_tags(
-        self,
-        workflow_run_id: str,
-        *,
-        tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
-        tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunTagsResponse:
-        """
-        Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        tags : typing.Optional[typing.Sequence[TagInput]]
-            Tags to set (overwrite). List of {key?, value} objects.
-
-        tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
-            Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsResponse
-            Successfully applied tag changes
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.apply_run_tags(
-            workflow_run_id="wr_123",
-        )
-        """
-        _response = self._raw_client.apply_run_tags(
-            workflow_run_id, tags=tags, tags_to_delete=tags_to_delete, colors=colors, request_options=request_options
-        )
-        return _response.data
-
-    def delete_run_tag(
-        self, workflow_run_id: str, key: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> RunTagsResponse:
-        """
-        Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        key : str
-            Tag key to delete
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsResponse
-            Successfully deleted tag (or no-op if absent)
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.delete_run_tag(
-            workflow_run_id="wr_123",
-            key="env",
-        )
-        """
-        _response = self._raw_client.delete_run_tag(workflow_run_id, key, request_options=request_options)
-        return _response.data
-
-    def get_run_tag_history(
-        self,
-        workflow_run_id: str,
-        *,
-        limit: typing.Optional[int] = None,
-        since: typing.Optional[dt.datetime] = None,
-        key: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunTagHistoryResponse:
-        """
-        Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        limit : typing.Optional[int]
-            Max events to return
-
-        since : typing.Optional[dt.datetime]
-            Only return events at or after this timestamp
-
-        key : typing.Optional[str]
-            Filter to events for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagHistoryResponse
-            Successfully retrieved tag history
-
-        Examples
-        --------
-        import datetime
-
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.get_run_tag_history(
-            workflow_run_id="wr_123",
-            limit=1,
-            since=datetime.datetime.fromisoformat(
-                "2024-01-15 09:30:00+00:00",
-            ),
-            key="key",
-        )
-        """
-        _response = self._raw_client.get_run_tag_history(
-            workflow_run_id, limit=limit, since=since, key=key, request_options=request_options
-        )
-        return _response.data
-
     def list_tag_keys(self, *, request_options: typing.Optional[RequestOptions] = None) -> typing.List[TagKey]:
         """
         List all tag keys registered for the organization with their descriptions.
@@ -1328,160 +1140,6 @@ class Skyvern:
         _response = self._raw_client.update_tag_key(key, description=description, request_options=request_options)
         return _response.data
 
-    def list_tag_values(
-        self, *, key: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.List[TagValue]:
-        """
-        List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.
-
-        Parameters
-        ----------
-        key : typing.Optional[str]
-            Filter to values for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[TagValue]
-            Successfully retrieved tag values
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.list_tag_values(
-            key="key",
-        )
-        """
-        _response = self._raw_client.list_tag_values(key=key, request_options=request_options)
-        return _response.data
-
-    def delete_tag_value(
-        self, key: str, *, value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> TagValueDeleteResponse:
-        """
-        Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to soft-delete.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        TagValueDeleteResponse
-            Successfully deleted tag value
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.delete_tag_value(
-            key="env",
-            value="value",
-        )
-        """
-        _response = self._raw_client.delete_tag_value(key, value=value, request_options=request_options)
-        return _response.data
-
-    def update_tag_value(
-        self, key: str, *, value: str, color: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> TagValue:
-        """
-        Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to recolor.
-
-        color : str
-            Palette color name to assign to this (key, value).
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        TagValue
-            Successfully recolored tag value
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.update_tag_value(
-            key="env",
-            value="value",
-            color="color",
-        )
-        """
-        _response = self._raw_client.update_tag_value(key, value=value, color=color, request_options=request_options)
-        return _response.data
-
-    def rename_tag_value(
-        self, key: str, *, value: str, new_value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> TagValueRenameResponse:
-        """
-        Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Current tag value (label) under the key to rename.
-
-        new_value : str
-            New tag value (label) to rename it to.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        TagValueRenameResponse
-            Successfully renamed tag value
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.rename_tag_value(
-            key="env",
-            value="value",
-            new_value="new_value",
-        )
-        """
-        _response = self._raw_client.rename_tag_value(
-            key, value=value, new_value=new_value, request_options=request_options
-        )
-        return _response.data
-
     def batch_get_workflow_tags(
         self,
         *,
@@ -1553,77 +1211,6 @@ class Skyvern:
         """
         _response = self._raw_client.batch_get_workflow_tags_post(
             workflow_permanent_ids=workflow_permanent_ids, request_options=request_options
-        )
-        return _response.data
-
-    def batch_get_run_tags(
-        self, *, workflow_run_ids: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> RunTagsBatchResponse:
-        """
-        Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[str]
-            Comma-separated workflow run IDs
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsBatchResponse
-            Successfully retrieved tags
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.batch_get_run_tags(
-            workflow_run_ids="workflow_run_ids",
-        )
-        """
-        _response = self._raw_client.batch_get_run_tags(
-            workflow_run_ids=workflow_run_ids, request_options=request_options
-        )
-        return _response.data
-
-    def batch_get_run_tags_post(
-        self,
-        *,
-        workflow_run_ids: typing.Optional[typing.Sequence[str]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunTagsBatchResponse:
-        """
-        Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[typing.Sequence[str]]
-            Workflow run IDs to fetch tags for.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsBatchResponse
-            Successfully retrieved tags
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.batch_get_run_tags_post()
-        """
-        _response = self._raw_client.batch_get_run_tags_post(
-            workflow_run_ids=workflow_run_ids, request_options=request_options
         )
         return _response.data
 
@@ -1774,7 +1361,6 @@ class Skyvern:
         page_size: typing.Optional[int] = None,
         status: typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]] = None,
         search_key: typing.Optional[str] = None,
-        run_type: typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[TaskRunListItem]:
         """
@@ -1788,8 +1374,6 @@ class Skyvern:
 
         search_key : typing.Optional[str]
             Case-insensitive substring search (min 3 chars for trigram index).
-
-        run_type : typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1813,12 +1397,7 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_runs_v2(
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            run_type=run_type,
-            request_options=request_options,
+            page=page, page_size=page_size, status=status, search_key=search_key, request_options=request_options
         )
         return _response.data
 
@@ -1857,7 +1436,6 @@ class Skyvern:
         page_size: typing.Optional[int] = None,
         include_deleted: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
-        managed: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[BrowserProfile]:
         """
@@ -1874,9 +1452,6 @@ class Skyvern:
 
         search_key : typing.Optional[str]
             Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
-
-        managed : typing.Optional[bool]
-            Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1898,7 +1473,6 @@ class Skyvern:
             page_size=1,
             include_deleted=True,
             search_key="search_key",
-            managed=True,
         )
         """
         _response = self._raw_client.list_browser_profiles(
@@ -1906,7 +1480,6 @@ class Skyvern:
             page_size=page_size,
             include_deleted=include_deleted,
             search_key=search_key,
-            managed=managed,
             request_options=request_options,
         )
         return _response.data
@@ -2137,7 +1710,6 @@ class Skyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
-        proxy_session_id: typing.Optional[str] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -2189,9 +1761,6 @@ class Skyvern:
             For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
-        proxy_session_id : typing.Optional[str]
-            Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
-
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
@@ -2224,7 +1793,6 @@ class Skyvern:
         _response = self._raw_client.create_browser_session(
             timeout=timeout,
             proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
             extensions=extensions,
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
@@ -2695,141 +2263,6 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_credential(credential_id, request_options=request_options)
-        return _response.data
-
-    def list_custom_llms(self, *, request_options: typing.Optional[RequestOptions] = None) -> CustomLlmListResponse:
-        """
-        List the custom LLM configurations available to the current organization.
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CustomLlmListResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.list_custom_llms()
-        """
-        _response = self._raw_client.list_custom_llms(request_options=request_options)
-        return _response.data
-
-    def create_custom_llm(
-        self, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> CustomLlmResponse:
-        """
-        Create a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CustomLlmResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import CustomLlmConfig, Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.create_custom_llm(
-            config=CustomLlmConfig(
-                display_name="display_name",
-                provider="openai_compatible",
-                model_name="model_name",
-            ),
-        )
-        """
-        _response = self._raw_client.create_custom_llm(config=config, request_options=request_options)
-        return _response.data
-
-    def update_custom_llm(
-        self, custom_llm_id: str, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> CustomLlmResponse:
-        """
-        Update a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CustomLlmResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import CustomLlmConfig, Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.update_custom_llm(
-            custom_llm_id="custom_llm_id",
-            config=CustomLlmConfig(
-                display_name="display_name",
-                provider="openai_compatible",
-                model_name="model_name",
-            ),
-        )
-        """
-        _response = self._raw_client.update_custom_llm(custom_llm_id, config=config, request_options=request_options)
-        return _response.data
-
-    def delete_custom_llm(
-        self, custom_llm_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> ClearOrganizationAuthTokenResponse:
-        """
-        Delete a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        ClearOrganizationAuthTokenResponse
-            Successful Response
-
-        Examples
-        --------
-        from skyvern import Skyvern
-
-        client = Skyvern(
-            api_key="YOUR_API_KEY",
-        )
-        client.delete_custom_llm(
-            custom_llm_id="custom_llm_id",
-        )
-        """
-        _response = self._raw_client.delete_custom_llm(custom_llm_id, request_options=request_options)
         return _response.data
 
     def login(
@@ -3398,7 +2831,6 @@ class Skyvern:
         *,
         tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
         tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TagsResponse:
         """
@@ -3414,9 +2846,6 @@ class Skyvern:
 
         tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
             Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3438,11 +2867,7 @@ class Skyvern:
         )
         """
         _response = self._raw_client.apply_workflow_tags(
-            workflow_permanent_id,
-            tags=tags,
-            tags_to_delete=tags_to_delete,
-            colors=colors,
-            request_options=request_options,
+            workflow_permanent_id, tags=tags, tags_to_delete=tags_to_delete, request_options=request_options
         )
         return _response.data
 
@@ -3687,8 +3112,6 @@ class Skyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
-        created_at_start: typing.Optional[dt.datetime] = None,
-        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[WorkflowRun]:
         """
@@ -3723,12 +3146,6 @@ class Skyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
-        created_at_start : typing.Optional[dt.datetime]
-            Only include runs created at or after this UTC timestamp (ISO 8601).
-
-        created_at_end : typing.Optional[dt.datetime]
-            Only include runs created strictly before this UTC timestamp (ISO 8601).
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3739,8 +3156,6 @@ class Skyvern:
 
         Examples
         --------
-        import datetime
-
         from skyvern import Skyvern
 
         client = Skyvern(
@@ -3752,12 +3167,6 @@ class Skyvern:
             page_size=1,
             search_key="search_key",
             error_code="error_code",
-            created_at_start=datetime.datetime.fromisoformat(
-                "2024-01-15 09:30:00+00:00",
-            ),
-            created_at_end=datetime.datetime.fromisoformat(
-                "2024-01-15 09:30:00+00:00",
-            ),
         )
         """
         _response = self._raw_client.get_workflow_runs_by_id(
@@ -3767,8 +3176,6 @@ class Skyvern:
             status=status,
             search_key=search_key,
             error_code=error_code,
-            created_at_start=created_at_start,
-            created_at_end=created_at_end,
             request_options=request_options,
         )
         return _response.data
@@ -4973,214 +4380,6 @@ class AsyncSkyvern:
         )
         return _response.data
 
-    async def get_run_tags(
-        self, workflow_run_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> RunTagsResponse:
-        """
-        Get the current tag state for a workflow run.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsResponse
-            Successfully retrieved tags
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_run_tags(
-                workflow_run_id="wr_123",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_run_tags(workflow_run_id, request_options=request_options)
-        return _response.data
-
-    async def apply_run_tags(
-        self,
-        workflow_run_id: str,
-        *,
-        tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
-        tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunTagsResponse:
-        """
-        Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        tags : typing.Optional[typing.Sequence[TagInput]]
-            Tags to set (overwrite). List of {key?, value} objects.
-
-        tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
-            Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsResponse
-            Successfully applied tag changes
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.apply_run_tags(
-                workflow_run_id="wr_123",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.apply_run_tags(
-            workflow_run_id, tags=tags, tags_to_delete=tags_to_delete, colors=colors, request_options=request_options
-        )
-        return _response.data
-
-    async def delete_run_tag(
-        self, workflow_run_id: str, key: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> RunTagsResponse:
-        """
-        Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        key : str
-            Tag key to delete
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsResponse
-            Successfully deleted tag (or no-op if absent)
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.delete_run_tag(
-                workflow_run_id="wr_123",
-                key="env",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.delete_run_tag(workflow_run_id, key, request_options=request_options)
-        return _response.data
-
-    async def get_run_tag_history(
-        self,
-        workflow_run_id: str,
-        *,
-        limit: typing.Optional[int] = None,
-        since: typing.Optional[dt.datetime] = None,
-        key: typing.Optional[str] = None,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunTagHistoryResponse:
-        """
-        Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.
-
-        Parameters
-        ----------
-        workflow_run_id : str
-            Workflow run ID
-
-        limit : typing.Optional[int]
-            Max events to return
-
-        since : typing.Optional[dt.datetime]
-            Only return events at or after this timestamp
-
-        key : typing.Optional[str]
-            Filter to events for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagHistoryResponse
-            Successfully retrieved tag history
-
-        Examples
-        --------
-        import asyncio
-        import datetime
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.get_run_tag_history(
-                workflow_run_id="wr_123",
-                limit=1,
-                since=datetime.datetime.fromisoformat(
-                    "2024-01-15 09:30:00+00:00",
-                ),
-                key="key",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.get_run_tag_history(
-            workflow_run_id, limit=limit, since=since, key=key, request_options=request_options
-        )
-        return _response.data
-
     async def list_tag_keys(self, *, request_options: typing.Optional[RequestOptions] = None) -> typing.List[TagKey]:
         """
         List all tag keys registered for the organization with their descriptions.
@@ -5304,194 +4503,6 @@ class AsyncSkyvern:
         _response = await self._raw_client.update_tag_key(key, description=description, request_options=request_options)
         return _response.data
 
-    async def list_tag_values(
-        self, *, key: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> typing.List[TagValue]:
-        """
-        List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.
-
-        Parameters
-        ----------
-        key : typing.Optional[str]
-            Filter to values for a single tag key
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        typing.List[TagValue]
-            Successfully retrieved tag values
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.list_tag_values(
-                key="key",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.list_tag_values(key=key, request_options=request_options)
-        return _response.data
-
-    async def delete_tag_value(
-        self, key: str, *, value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> TagValueDeleteResponse:
-        """
-        Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to soft-delete.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        TagValueDeleteResponse
-            Successfully deleted tag value
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.delete_tag_value(
-                key="env",
-                value="value",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.delete_tag_value(key, value=value, request_options=request_options)
-        return _response.data
-
-    async def update_tag_value(
-        self, key: str, *, value: str, color: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> TagValue:
-        """
-        Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Tag value (label) under the key to recolor.
-
-        color : str
-            Palette color name to assign to this (key, value).
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        TagValue
-            Successfully recolored tag value
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.update_tag_value(
-                key="env",
-                value="value",
-                color="color",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.update_tag_value(
-            key, value=value, color=color, request_options=request_options
-        )
-        return _response.data
-
-    async def rename_tag_value(
-        self, key: str, *, value: str, new_value: str, request_options: typing.Optional[RequestOptions] = None
-    ) -> TagValueRenameResponse:
-        """
-        Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.
-
-        Parameters
-        ----------
-        key : str
-            Tag key (group)
-
-        value : str
-            Current tag value (label) under the key to rename.
-
-        new_value : str
-            New tag value (label) to rename it to.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        TagValueRenameResponse
-            Successfully renamed tag value
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.rename_tag_value(
-                key="env",
-                value="value",
-                new_value="new_value",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.rename_tag_value(
-            key, value=value, new_value=new_value, request_options=request_options
-        )
-        return _response.data
-
     async def batch_get_workflow_tags(
         self,
         *,
@@ -5579,93 +4590,6 @@ class AsyncSkyvern:
         """
         _response = await self._raw_client.batch_get_workflow_tags_post(
             workflow_permanent_ids=workflow_permanent_ids, request_options=request_options
-        )
-        return _response.data
-
-    async def batch_get_run_tags(
-        self, *, workflow_run_ids: typing.Optional[str] = None, request_options: typing.Optional[RequestOptions] = None
-    ) -> RunTagsBatchResponse:
-        """
-        Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[str]
-            Comma-separated workflow run IDs
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsBatchResponse
-            Successfully retrieved tags
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.batch_get_run_tags(
-                workflow_run_ids="workflow_run_ids",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.batch_get_run_tags(
-            workflow_run_ids=workflow_run_ids, request_options=request_options
-        )
-        return _response.data
-
-    async def batch_get_run_tags_post(
-        self,
-        *,
-        workflow_run_ids: typing.Optional[typing.Sequence[str]] = OMIT,
-        request_options: typing.Optional[RequestOptions] = None,
-    ) -> RunTagsBatchResponse:
-        """
-        Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).
-
-        Parameters
-        ----------
-        workflow_run_ids : typing.Optional[typing.Sequence[str]]
-            Workflow run IDs to fetch tags for.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        RunTagsBatchResponse
-            Successfully retrieved tags
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.batch_get_run_tags_post()
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.batch_get_run_tags_post(
-            workflow_run_ids=workflow_run_ids, request_options=request_options
         )
         return _response.data
 
@@ -5848,7 +4772,6 @@ class AsyncSkyvern:
         page_size: typing.Optional[int] = None,
         status: typing.Optional[typing.Union[RunStatus, typing.Sequence[RunStatus]]] = None,
         search_key: typing.Optional[str] = None,
-        run_type: typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[TaskRunListItem]:
         """
@@ -5862,8 +4785,6 @@ class AsyncSkyvern:
 
         search_key : typing.Optional[str]
             Case-insensitive substring search (min 3 chars for trigram index).
-
-        run_type : typing.Optional[typing.Union[RunType, typing.Sequence[RunType]]]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5895,12 +4816,7 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_runs_v2(
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            run_type=run_type,
-            request_options=request_options,
+            page=page, page_size=page_size, status=status, search_key=search_key, request_options=request_options
         )
         return _response.data
 
@@ -5949,7 +4865,6 @@ class AsyncSkyvern:
         page_size: typing.Optional[int] = None,
         include_deleted: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
-        managed: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[BrowserProfile]:
         """
@@ -5966,9 +4881,6 @@ class AsyncSkyvern:
 
         search_key : typing.Optional[str]
             Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
-
-        managed : typing.Optional[bool]
-            Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -5995,7 +4907,6 @@ class AsyncSkyvern:
                 page_size=1,
                 include_deleted=True,
                 search_key="search_key",
-                managed=True,
             )
 
 
@@ -6006,7 +4917,6 @@ class AsyncSkyvern:
             page_size=page_size,
             include_deleted=include_deleted,
             search_key=search_key,
-            managed=managed,
             request_options=request_options,
         )
         return _response.data
@@ -6277,7 +5187,6 @@ class AsyncSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
-        proxy_session_id: typing.Optional[str] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -6329,9 +5238,6 @@ class AsyncSkyvern:
             For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
              Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
 
-        proxy_session_id : typing.Optional[str]
-            Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
-
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
@@ -6372,7 +5278,6 @@ class AsyncSkyvern:
         _response = await self._raw_client.create_browser_session(
             timeout=timeout,
             proxy_location=proxy_location,
-            proxy_session_id=proxy_session_id,
             extensions=extensions,
             browser_type=browser_type,
             browser_profile_id=browser_profile_id,
@@ -6917,177 +5822,6 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_credential(credential_id, request_options=request_options)
-        return _response.data
-
-    async def list_custom_llms(
-        self, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> CustomLlmListResponse:
-        """
-        List the custom LLM configurations available to the current organization.
-
-        Parameters
-        ----------
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CustomLlmListResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.list_custom_llms()
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.list_custom_llms(request_options=request_options)
-        return _response.data
-
-    async def create_custom_llm(
-        self, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> CustomLlmResponse:
-        """
-        Create a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CustomLlmResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern, CustomLlmConfig
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.create_custom_llm(
-                config=CustomLlmConfig(
-                    display_name="display_name",
-                    provider="openai_compatible",
-                    model_name="model_name",
-                ),
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.create_custom_llm(config=config, request_options=request_options)
-        return _response.data
-
-    async def update_custom_llm(
-        self, custom_llm_id: str, *, config: CustomLlmConfig, request_options: typing.Optional[RequestOptions] = None
-    ) -> CustomLlmResponse:
-        """
-        Update a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        config : CustomLlmConfig
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        CustomLlmResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern, CustomLlmConfig
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.update_custom_llm(
-                custom_llm_id="custom_llm_id",
-                config=CustomLlmConfig(
-                    display_name="display_name",
-                    provider="openai_compatible",
-                    model_name="model_name",
-                ),
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.update_custom_llm(
-            custom_llm_id, config=config, request_options=request_options
-        )
-        return _response.data
-
-    async def delete_custom_llm(
-        self, custom_llm_id: str, *, request_options: typing.Optional[RequestOptions] = None
-    ) -> ClearOrganizationAuthTokenResponse:
-        """
-        Delete a custom LLM configuration for the current organization.
-
-        Parameters
-        ----------
-        custom_llm_id : str
-            The custom LLM id.
-
-        request_options : typing.Optional[RequestOptions]
-            Request-specific configuration.
-
-        Returns
-        -------
-        ClearOrganizationAuthTokenResponse
-            Successful Response
-
-        Examples
-        --------
-        import asyncio
-
-        from skyvern import AsyncSkyvern
-
-        client = AsyncSkyvern(
-            api_key="YOUR_API_KEY",
-        )
-
-
-        async def main() -> None:
-            await client.delete_custom_llm(
-                custom_llm_id="custom_llm_id",
-            )
-
-
-        asyncio.run(main())
-        """
-        _response = await self._raw_client.delete_custom_llm(custom_llm_id, request_options=request_options)
         return _response.data
 
     async def login(
@@ -7728,7 +6462,6 @@ class AsyncSkyvern:
         *,
         tags: typing.Optional[typing.Sequence[TagInput]] = OMIT,
         tags_to_delete: typing.Optional[typing.Sequence[TagDeleteInput]] = OMIT,
-        colors: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TagsResponse:
         """
@@ -7744,9 +6477,6 @@ class AsyncSkyvern:
 
         tags_to_delete : typing.Optional[typing.Sequence[TagDeleteInput]]
             Tags to soft-delete. List of {key?, value?} targets.
-
-        colors : typing.Optional[typing.Dict[str, typing.Optional[str]]]
-            Optional map of grouped tag key to palette color name for the value being set. Keys absent from this map keep their existing color or receive a random palette color.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -7776,11 +6506,7 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.apply_workflow_tags(
-            workflow_permanent_id,
-            tags=tags,
-            tags_to_delete=tags_to_delete,
-            colors=colors,
-            request_options=request_options,
+            workflow_permanent_id, tags=tags, tags_to_delete=tags_to_delete, request_options=request_options
         )
         return _response.data
 
@@ -8058,8 +6784,6 @@ class AsyncSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
-        created_at_start: typing.Optional[dt.datetime] = None,
-        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[WorkflowRun]:
         """
@@ -8094,12 +6818,6 @@ class AsyncSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
-        created_at_start : typing.Optional[dt.datetime]
-            Only include runs created at or after this UTC timestamp (ISO 8601).
-
-        created_at_end : typing.Optional[dt.datetime]
-            Only include runs created strictly before this UTC timestamp (ISO 8601).
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -8111,7 +6829,6 @@ class AsyncSkyvern:
         Examples
         --------
         import asyncio
-        import datetime
 
         from skyvern import AsyncSkyvern
 
@@ -8127,12 +6844,6 @@ class AsyncSkyvern:
                 page_size=1,
                 search_key="search_key",
                 error_code="error_code",
-                created_at_start=datetime.datetime.fromisoformat(
-                    "2024-01-15 09:30:00+00:00",
-                ),
-                created_at_end=datetime.datetime.fromisoformat(
-                    "2024-01-15 09:30:00+00:00",
-                ),
             )
 
 
@@ -8145,8 +6856,6 @@ class AsyncSkyvern:
             status=status,
             search_key=search_key,
             error_code=error_code,
-            created_at_start=created_at_start,
-            created_at_end=created_at_end,
             request_options=request_options,
         )
         return _response.data

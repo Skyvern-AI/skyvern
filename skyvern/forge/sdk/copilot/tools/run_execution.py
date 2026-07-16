@@ -206,7 +206,7 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_page_inspected, _mark_post_run_page_observed
-from .workflow_update import record_output_contract_run_output_evidence
+from .workflow_update import output_contract_value_bearing_run_reject, record_output_contract_run_output_evidence
 
 LOG = structlog.get_logger()
 
@@ -1544,6 +1544,23 @@ async def _run_blocks_and_collect_debug(
     if runtime_security_failure is not None:
         ctx.last_executed_block_labels = []
         return runtime_security_failure
+
+    # The lane asserts a saved-workflow property, so its evidence set is every saved code
+    # block, never just the selected subset (security lanes above stay selection-scoped).
+    value_bearing_reject = output_contract_value_bearing_run_reject(
+        ctx,
+        {
+            code_input.label: code_input.code
+            for code_input in _selected_code_security_inputs(
+                _workflow_definition_blocks_for_code_security(workflow.workflow_definition),
+                selected_labels=set(),
+                include_descendants=True,
+            )
+        },
+    )
+    if value_bearing_reject is not None:
+        ctx.last_executed_block_labels = []
+        return value_bearing_reject
 
     credential_ids = list(
         dict.fromkeys(

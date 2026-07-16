@@ -31,9 +31,6 @@ BlockType = typing.Union[
         "workflow_trigger",
         "google_sheets_read",
         "google_sheets_write",
-        "pdf_fill",
-        "split_pdf",
-        "email_inbox",
     ],
     typing.Any,
 ]

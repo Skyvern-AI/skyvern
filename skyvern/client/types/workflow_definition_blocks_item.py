@@ -14,9 +14,6 @@ from .ai_fallback_mode import AiFallbackMode
 from .aws_secret_parameter import AwsSecretParameter
 from .branch_condition import BranchCondition
 from .code_block_parameters_item import CodeBlockParametersItem
-from .code_block_step import CodeBlockStep
-from .email_inbox_block_email_client import EmailInboxBlockEmailClient
-from .email_inbox_block_parameters_item import EmailInboxBlockParametersItem
 from .extraction_block_data_schema import ExtractionBlockDataSchema
 from .extraction_block_parameters_item import ExtractionBlockParametersItem
 from .file_download_block_data_schema import FileDownloadBlockDataSchema
@@ -36,11 +33,8 @@ from .login_block_parameters_item import LoginBlockParametersItem
 from .navigation_block_data_schema import NavigationBlockDataSchema
 from .navigation_block_parameters_item import NavigationBlockParametersItem
 from .output_parameter import OutputParameter
-from .pdf_fill_block_parameters_item import PdfFillBlockParametersItem
-from .pdf_fill_block_payload import PdfFillBlockPayload
 from .print_page_block_parameters_item import PrintPageBlockParametersItem
 from .run_engine import RunEngine
-from .split_pdf_block_parameters_item import SplitPdfBlockParametersItem
 from .task_block_data_schema import TaskBlockDataSchema
 from .task_block_parameters_item import TaskBlockParametersItem
 from .text_prompt_block_parameters_item import TextPromptBlockParametersItem
@@ -109,8 +103,6 @@ class WorkflowDefinitionBlocksItem_Code(UniversalBaseModel):
     next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
-    prompt: typing.Optional[str] = None
-    steps: typing.Optional[typing.List[CodeBlockStep]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -155,37 +147,6 @@ class WorkflowDefinitionBlocksItem_DownloadToS3(UniversalBaseModel):
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: str
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-class WorkflowDefinitionBlocksItem_EmailInbox(UniversalBaseModel):
-    block_type: typing.Literal["email_inbox"] = "email_inbox"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    disable_cache: typing.Optional[bool] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    email_client: EmailInboxBlockEmailClient
-    credential_id: typing.Optional[str] = None
-    folder: typing.Optional[str] = None
-    prompt: typing.Optional[str] = None
-    sender: typing.Optional[str] = None
-    subject: typing.Optional[str] = None
-    newer_than_days: typing.Optional[int] = None
-    max_results: typing.Optional[int] = None
-    include_body: typing.Optional[bool] = None
-    parameters: typing.Optional[typing.List[EmailInboxBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -301,17 +262,7 @@ class WorkflowDefinitionBlocksItem_FileUpload(UniversalBaseModel):
     azure_blob_container_name: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
-    sftp_host: typing.Optional[str] = None
-    sftp_port: typing.Optional[int] = None
-    sftp_username: typing.Optional[str] = None
-    sftp_password: typing.Optional[str] = None
-    sftp_private_key: typing.Optional[str] = None
-    sftp_private_key_passphrase: typing.Optional[str] = None
-    sftp_remote_path: typing.Optional[str] = None
-    sftp_host_key: typing.Optional[str] = None
-    prompt: typing.Optional[str] = None
     path: typing.Optional[str] = None
-    continue_on_empty: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -494,7 +445,6 @@ class WorkflowDefinitionBlocksItem_HttpRequest(UniversalBaseModel):
     follow_redirects: typing.Optional[bool] = None
     download_filename: typing.Optional[str] = None
     save_response_as_file: typing.Optional[bool] = None
-    secret_response_paths: typing.Optional[typing.List[str]] = None
     parameters: typing.Optional[typing.List[HttpRequestBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
@@ -642,32 +592,6 @@ class WorkflowDefinitionBlocksItem_Navigation(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class WorkflowDefinitionBlocksItem_PdfFill(UniversalBaseModel):
-    block_type: typing.Literal["pdf_fill"] = "pdf_fill"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    disable_cache: typing.Optional[bool] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    file_url: str
-    prompt: str
-    payload: typing.Optional[PdfFillBlockPayload] = None
-    llm_key: typing.Optional[str] = None
-    parameters: typing.Optional[typing.List[PdfFillBlockParametersItem]] = None
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
 class WorkflowDefinitionBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
@@ -737,31 +661,6 @@ class WorkflowDefinitionBlocksItem_SendEmail(UniversalBaseModel):
     subject: str
     body: str
     file_attachments: typing.Optional[typing.List[str]] = None
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-class WorkflowDefinitionBlocksItem_SplitPdf(UniversalBaseModel):
-    block_type: typing.Literal["split_pdf"] = "split_pdf"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    disable_cache: typing.Optional[bool] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    file_url: str
-    prompt: str
-    llm_key: typing.Optional[str] = None
-    parameters: typing.Optional[typing.List[SplitPdfBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -920,7 +819,6 @@ class WorkflowDefinitionBlocksItem_Validation(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
     include_extracted_text: typing.Optional[bool] = None
-    without_page_information: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -1017,7 +915,6 @@ WorkflowDefinitionBlocksItem = typing.Union[
     WorkflowDefinitionBlocksItem_Code,
     WorkflowDefinitionBlocksItem_Conditional,
     WorkflowDefinitionBlocksItem_DownloadToS3,
-    WorkflowDefinitionBlocksItem_EmailInbox,
     WorkflowDefinitionBlocksItem_Extraction,
     WorkflowDefinitionBlocksItem_FileDownload,
     WorkflowDefinitionBlocksItem_FileUpload,
@@ -1030,11 +927,9 @@ WorkflowDefinitionBlocksItem = typing.Union[
     WorkflowDefinitionBlocksItem_HumanInteraction,
     WorkflowDefinitionBlocksItem_Login,
     WorkflowDefinitionBlocksItem_Navigation,
-    WorkflowDefinitionBlocksItem_PdfFill,
     WorkflowDefinitionBlocksItem_PdfParser,
     WorkflowDefinitionBlocksItem_PrintPage,
     WorkflowDefinitionBlocksItem_SendEmail,
-    WorkflowDefinitionBlocksItem_SplitPdf,
     WorkflowDefinitionBlocksItem_Task,
     WorkflowDefinitionBlocksItem_TaskV2,
     WorkflowDefinitionBlocksItem_TextPrompt,
@@ -1046,7 +941,6 @@ WorkflowDefinitionBlocksItem = typing.Union[
 ]
 update_forward_refs(WorkflowDefinitionBlocksItem_Action)
 update_forward_refs(WorkflowDefinitionBlocksItem_Code)
-update_forward_refs(WorkflowDefinitionBlocksItem_EmailInbox)
 update_forward_refs(WorkflowDefinitionBlocksItem_Extraction)
 update_forward_refs(WorkflowDefinitionBlocksItem_FileDownload)
 update_forward_refs(WorkflowDefinitionBlocksItem_ForLoop)
@@ -1057,9 +951,7 @@ update_forward_refs(WorkflowDefinitionBlocksItem_HttpRequest)
 update_forward_refs(WorkflowDefinitionBlocksItem_HumanInteraction)
 update_forward_refs(WorkflowDefinitionBlocksItem_Login)
 update_forward_refs(WorkflowDefinitionBlocksItem_Navigation)
-update_forward_refs(WorkflowDefinitionBlocksItem_PdfFill)
 update_forward_refs(WorkflowDefinitionBlocksItem_PrintPage)
-update_forward_refs(WorkflowDefinitionBlocksItem_SplitPdf)
 update_forward_refs(WorkflowDefinitionBlocksItem_Task)
 update_forward_refs(WorkflowDefinitionBlocksItem_TextPrompt)
 update_forward_refs(WorkflowDefinitionBlocksItem_Validation)
