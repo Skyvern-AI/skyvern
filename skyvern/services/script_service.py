@@ -40,6 +40,7 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     get_path_for_workflow_download_directory,
     list_files_in_directory,
+    recover_download_extension,
     rename_file,
     resolve_run_download_id,
 )
@@ -2322,6 +2323,14 @@ async def download(
                     # Skip incomplete downloads
                     if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                         continue
+                    if not file_extension:
+                        file_extension = recover_download_extension(file_path, download_suffix)
+                        if file_extension:
+                            LOG.info(
+                                "Recovered missing download file extension from file content",
+                                file=file_path,
+                                extension=file_extension,
+                            )
                     local_basename = Path(file_path).name
                     existing_names = {
                         Path(f).name
