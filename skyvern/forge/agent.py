@@ -78,6 +78,7 @@ from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
     list_files_in_directory,
+    recover_download_extension,
     rename_file,
     resolve_run_download_id,
     wait_for_download_finished,
@@ -536,6 +537,19 @@ class ForgeAgent:
                     workflow_run_id=task.workflow_run_id,
                 )
                 continue
+
+            if not file_extension:
+                file_extension = recover_download_extension(
+                    os.path.join(workflow_download_directory, local_file_name), download_suffix
+                )
+                if file_extension:
+                    LOG.info(
+                        "Recovered missing download file extension from file content",
+                        file=local_file_name,
+                        extension=file_extension,
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                    )
 
             if download_suffix:
                 # local_file_name is a bare basename for session (s3/gs) files but an absolute path for
