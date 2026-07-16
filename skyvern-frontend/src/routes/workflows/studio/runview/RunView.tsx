@@ -406,6 +406,7 @@ export function RunView({
                   <WorkflowRunTimeline
                     workflowRunId={workflowRunId}
                     hideLiveBadge
+                    enableSearch
                     activeItem={activeItem}
                     activeIteration={activeIteration}
                     onActionItemSelected={(item) => {
