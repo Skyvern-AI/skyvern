@@ -16340,6 +16340,251 @@ def _reaching_extraction_ctx() -> CopilotContext:
     return ctx
 
 
+def _commit_only_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    _enable_imposition(ctx)
+    criteria = tuple(
+        CompletionCriterion(
+            id=field,
+            outcome=field.replace("_", " "),
+            output_path=f"output.{field}",
+        )
+        for field in (
+            "confirmation_number",
+            "account_number",
+            "selected_start_date",
+            "deposit_amount",
+            "next_owner",
+        )
+    )
+    ctx.request_policy = RequestPolicy(completion_criteria=list(criteria))
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=criteria))
+    ctx.flow_evidence = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": 'button[data-action="openForm"]',
+            "source_url": "https://example.test/start-service",
+            "trajectory_index": 0,
+        },
+        {
+            "tool_name": "click",
+            "selector": 'button[data-action="commitForm"]',
+            "source_url": "https://example.test/start-service",
+            "trajectory_index": 1,
+        },
+    ]
+    return ctx
+
+
+def _commit_only_submitted_yaml() -> str:
+    return _yaml(
+        """
+        title: Start service
+        workflow_definition:
+          blocks:
+          - block_type: code
+            label: start_service
+            code: |
+              await page.locator('button[data-action="openForm"]').click()
+        """
+    )
+
+
+class TestCommitOnlyReach:
+    def test_commit_only_two_click_trajectory_reaches_without_output_binding(self) -> None:
+        ctx = _commit_only_ctx()
+
+        assert enforcement_module.requested_output_extraction_plan(ctx) is None
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+
+    @pytest.mark.parametrize(
+        "trajectory",
+        [
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="commitForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 0,
+                }
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="openForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 0,
+                },
+                {
+                    "tool_name": "click",
+                    "selector": "button",
+                    "role": "button",
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 1,
+                },
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="openForm"]',
+                    "source_url": "https://example.test/start-service",
+                },
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="commitForm"]',
+                    "source_url": "https://example.test/start-service",
+                },
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="openForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 2,
+                },
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="commitForm"]',
+                    "source_url": "https://example.test/start-service",
+                    "trajectory_index": 1,
+                },
+            ],
+            [
+                {
+                    "tool_name": "navigate",
+                    "url": "https://example.test/start-service",
+                    "source_url": "https://example.test",
+                    "trajectory_index": 0,
+                }
+            ],
+            [
+                {
+                    "tool_name": "click",
+                    "selector": 'button[data-action="loginForm"]',
+                    "source_url": "https://example.test/login",
+                    "trajectory_index": 0,
+                },
+                {
+                    "tool_name": "fill_credential_field",
+                    "selector": "#username",
+                    "source_url": "https://example.test/login",
+                    "credential_id": "cred_1",
+                    "credential_field": "username",
+                    "trajectory_index": 1,
+                },
+                {
+                    "tool_name": "click",
+                    "selector": "button",
+                    "role": "button",
+                    "source_url": "https://example.test/login",
+                    "trajectory_index": 2,
+                },
+            ],
+        ],
+    )
+    def test_commit_only_exclusions_do_not_reach(self, trajectory: list[dict[str, object]]) -> None:
+        ctx = _commit_only_ctx()
+        ctx.scout_trajectory = trajectory
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+
+    def test_commit_only_imposition_uses_goal_reaching_admission(self) -> None:
+        ctx = _commit_only_ctx()
+        ctx.update_workflow_called = True
+
+        with capture_logs() as logs:
+            result = workflow_update_module._maybe_impose_synthesized_code_block(_commit_only_submitted_yaml(), ctx)
+
+        assert result.violations == []
+        assert result.substitutions
+        assert ctx.spine_imposition_owned_attempt is True
+        code = str(_single_code_block(parse_workflow_yaml(result.workflow_yaml))["code"])
+        assert "openForm" in code
+        assert "commitForm" in code
+        admitted = [entry for entry in logs if entry["event"] == "copilot_imposition_admitted_after_update"]
+        assert len(admitted) == 1
+        assert admitted[0]["admission_key"] == "goal_reaching_spine_unlanded"
+        assert admitted[0]["admission_key"] != "reopen_author_time_reject"
+
+    @pytest.mark.asyncio
+    async def test_first_commit_only_attempt_persists_imposition_and_dispatches_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _commit_only_ctx()
+        ctx.request_policy = RequestPolicy()
+        ctx.completion_criteria_turn_state = None
+        update_result: dict[str, object] = {}
+        run_calls: list[dict[str, object]] = []
+
+        async def capture_update(
+            payload: dict[str, object], update_ctx: AgentContext, **kwargs: object
+        ) -> dict[str, object]:
+            result = await workflow_update_module._update_workflow(payload, update_ctx, **kwargs)
+            update_result.update(result)
+            return result
+
+        async def fake_run_blocks(
+            params: dict[str, object], _ctx: AgentContext, **_kwargs: object
+        ) -> dict[str, object]:
+            run_calls.append(params)
+            return {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_commit_only",
+                    "overall_status": "completed",
+                    "blocks": [{"label": "start_service", "status": "completed"}],
+                },
+            }
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *_args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *_args: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", capture_update)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *_args: (["start_service"], {}, "start_service"))
+        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *_args: None)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            tools_module,
+            "_tool_visible_result_after_completion_verification",
+            lambda _ctx, result, _verification: result,
+        )
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *_args: None)
+
+        with capture_logs() as logs:
+            result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+                json.dumps(
+                    {
+                        "workflow_yaml": _commit_only_submitted_yaml(),
+                        "block_labels": ["start_service"],
+                    }
+                ),
+            )
+
+        assert json.loads(result)["ok"] is True
+        assert update_result["ok"] is True
+        data = update_result["data"]
+        assert isinstance(data, dict)
+        substitutions = data.get("imposed_substitutions")
+        assert isinstance(substitutions, dict)
+        assert substitutions["block_label"] == "start_service"
+        assert ctx.update_workflow_called is True
+        persisted_code = str(_single_code_block(parse_workflow_yaml(ctx.workflow_yaml))["code"])
+        assert "openForm" in persisted_code
+        assert "commitForm" in persisted_code
+        assert run_calls == [{"block_labels": ["start_service"], "parameters": {}}]
+        owned = [entry for entry in logs if entry["event"] == "copilot_spine_imposition_owned_attempt"]
+        assert len(owned) == 1
+        assert not [entry for entry in logs if entry["event"] == "copilot_imposition_admitted_after_update"]
+
+
 class TestReachingTrajectoryOwnershipDeterminism:
     def test_owned_attempt_fires_before_the_extraction_plan_materializes(self) -> None:
         ctx = _reaching_extraction_ctx()
