@@ -51,6 +51,8 @@ async def navigate_with_retry(
         LOG.info("Trying to navigate to url", url=url, retry_time=attempt, wait_until=strategy)
         try:
             start_time = time.monotonic()
+            # SECURITY RESIDUAL (SKY-12525): redirects happen below this call; Route.fetch
+            # bypasses vendor networking. SKY-8484 tracks egress policy and future CDP interception.
             await navigate(strategy)
             elapsed = time.monotonic() - start_time
             LOG.info("Page loading time", loading_time=elapsed, url=url, wait_until=strategy)

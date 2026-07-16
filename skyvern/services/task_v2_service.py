@@ -80,6 +80,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
@@ -312,6 +313,8 @@ async def initialize_task_v2(
     trigger_type: WorkflowRunTriggerType | None = None,
 ) -> TaskV2:
     await _validate_task_v2_model_for_org(organization, model)
+    if user_url:
+        user_url = await asyncio.to_thread(validate_fetch_url, user_url)
 
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
@@ -452,9 +455,7 @@ async def initialize_task_v2_metadata(
         url=url,
         workflow_title=title,
     )
-    url = metadata.url
-    if not url:
-        raise UrlGenerationFailure()
+    metadata.url = await asyncio.to_thread(validate_fetch_url, metadata.url)
 
     try:
         await app.DATABASE.observer.update_thought(
