@@ -84,6 +84,7 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
@@ -642,7 +643,15 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
         # Name the file by the block-configured download_suffix so the watcher syncs the
         # request-based name instead of the site's suggested name.
         existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
-        return download_dir / download_filename_from_suffix(download_suffix, suffix, existing)
+        target_name = download_filename_from_suffix(download_suffix, suffix, existing)
+        LOG.info(
+            "download_suffix_target_named",
+            context_task_id=context.task_id if context else None,
+            context_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+            suggested_filename_fp=diagnostic_fingerprint(suggested_filename),
+            desired_name_fp=diagnostic_fingerprint(target_name),
+        )
+        return download_dir / target_name
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 

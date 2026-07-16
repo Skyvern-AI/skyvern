@@ -22,6 +22,7 @@ from pydantic import Field
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -47,6 +48,8 @@ _SUMMARY_SCALAR_PREVIEW_LIMIT = 3
 _SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
 _SUMMARY_STRING_PREVIEW_LIMIT = 120
 _SUMMARY_RECURSION_LIMIT = 10
+_POINTER_MAX_LABELS = 20
+_POINTER_LABEL_BUDGET_CHARS = 800
 _SCREENSHOT_LIST_KEYS = frozenset({"task_screenshots", "workflow_screenshots", "screenshot_urls"})
 _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workflow_screenshot_artifact_ids"})
 
@@ -921,6 +924,41 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _code_block_pointer(blocks: Any, *, hint: str) -> dict[str, Any] | None:
+    """Summarize the workflow's reusable code blocks so a caller learns the code exists without being
+    told in a prompt. Returns None when nothing is reusable, so the key is omitted rather than
+    advertising an empty shell."""
+    if not isinstance(blocks, list):
+        return None
+    code_blocks = [
+        block
+        for block in _iter_blocks_flat(blocks)
+        if block.get("block_type") == BlockType.CODE and isinstance(block.get("code"), str) and block["code"].strip()
+    ]
+    if not code_blocks:
+        return None
+    # Labels are unbounded in the schema, so cap the preview by characters as well as by count: the
+    # oversize branch emits this pointer, and an unbounded preview could push that response back over
+    # the response cap and get the whole pointer stripped. code_block_count stays exact regardless.
+    labels: list[str] = []
+    budget = _POINTER_LABEL_BUDGET_CHARS
+    for block in code_blocks:
+        label = block.get("label")
+        if not isinstance(label, str):
+            continue
+        if len(labels) >= _POINTER_MAX_LABELS:
+            break
+        if len(label) > budget:
+            continue
+        labels.append(label)
+        budget -= len(label)
+    return {
+        "code_block_count": len(code_blocks),
+        "block_labels": labels,
+        "hint": hint,
+    }
+
+
 def _iter_positional_block_matches(
     existing_blocks: list[dict[str, Any]],
     update_blocks: list[dict[str, Any]],
@@ -1243,6 +1281,14 @@ def guard_definition_size(
         version_arg = f" --version {version}" if version is not None else ""
         blocks = definition.get("blocks")
         parameters = definition.get("parameters")
+        code_block_pointer = _code_block_pointer(
+            blocks,
+            hint=(
+                "This workflow already carries persisted executable code. Run "
+                f"`skyvern workflow get --id {workflow_id}{version_arg} --definition-file wf.json`, then reuse "
+                "the code blocks from wf.json instead of re-authoring."
+            ),
+        )
         return make_result(
             "skyvern_workflow_get",
             ok=False,
@@ -1253,6 +1299,7 @@ def guard_definition_size(
                 "block_count": len(_iter_blocks_flat(blocks)) if isinstance(blocks, list) else 0,
                 "parameter_count": len(parameters) if isinstance(parameters, list) else 0,
                 "definition_chars": _response_size(definition),
+                **({"code_block_pointer": code_block_pointer} if code_block_pointer is not None else {}),
             },
             timing_ms=result.get("timing_ms"),
             error=make_error(
@@ -1375,11 +1422,21 @@ async def skyvern_workflow_get(
             "workflow_definition": _workflow_definition_to_authoring_shape(wf_data["workflow_definition"]),
         }
 
+    definition = wf_data.get("workflow_definition") if isinstance(wf_data, dict) else None
+    blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    code_block_pointer = _code_block_pointer(
+        blocks,
+        hint=(
+            "This workflow already carries persisted executable code. Read the code blocks' `code` fields in "
+            "workflow_definition and reuse them instead of re-authoring."
+        ),
+    )
     version_str = f", version={version}" if version is not None else ""
     return make_result(
         "skyvern_workflow_get",
         data={
             **wf_data,
+            **({"code_block_pointer": code_block_pointer} if code_block_pointer is not None else {}),
             "sdk_equivalent": f"# No SDK method yet — GET /api/v1/workflows/{workflow_id}{version_str}",
         },
         timing_ms=timer.timing_ms,
