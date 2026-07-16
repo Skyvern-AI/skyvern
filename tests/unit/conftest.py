@@ -217,3 +217,43 @@ async def sqlite_engine_factory(
 @pytest_asyncio.fixture
 async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
     return sqlite_engine_factory()
+
+
+def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object] | None = None) -> MagicMock:
+    # SkyvernElement double for handle_input_text_action tests. attrs=None makes every get_attr return
+    # None (plain search-bar case); pass a dict to drive specific attrs (e.g. a combobox's role /
+    # aria-autocomplete / aria-invalid).
+    el = MagicMock()
+    el.get_id.return_value = element_id
+    el.get_tag_name.return_value = "input"
+    el.get_frame.return_value = MagicMock()
+    locator = MagicMock()
+    locator.focus = AsyncMock()
+    el.get_locator.return_value = locator
+    el.is_disabled = AsyncMock(return_value=False)
+    el.get_selectable = AsyncMock(return_value=False)
+    el.has_hidden_attr = AsyncMock(return_value=False)
+    el.is_readonly = AsyncMock(return_value=False)
+    el.has_attr = AsyncMock(return_value=False)
+    el.is_spinbtn_input = AsyncMock(return_value=False)
+    el.is_editable = AsyncMock(return_value=True)
+    el.supports_text_input = AsyncMock(return_value=True)
+    el.is_visible = AsyncMock(return_value=True)
+    el.is_raw_input = AsyncMock(return_value=False)
+    el.is_auto_completion_input = AsyncMock(return_value=False)
+    el.find_blocking_element = AsyncMock(return_value=(None, False))
+    el.get_element_handler = AsyncMock(return_value=MagicMock())
+    el.input_sequentially = AsyncMock()
+    el.input_clear = AsyncMock()
+    el.scroll_into_view = AsyncMock()
+    el.press_key = AsyncMock()
+    el.blur = AsyncMock()
+    if attrs is None:
+        el.get_attr = AsyncMock(return_value=None)
+    else:
+
+        def _get_attr(name: str, *args: object, **kwargs: object) -> object:
+            return attrs.get(name)
+
+        el.get_attr = AsyncMock(side_effect=_get_attr)
+    return el
