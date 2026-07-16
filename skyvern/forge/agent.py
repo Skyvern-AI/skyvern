@@ -96,6 +96,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
@@ -562,6 +563,21 @@ class ForgeAgent:
                     if Path(f).name != local_basename
                 }
                 desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                # finalize_* keys avoid the forge_log processor, which overwrites bare task_id/
+                # workflow_run_id with the ambient context's values; under a stale/shared context those
+                # would otherwise mask the task actually being finalized (the divergence to diagnose).
+                LOG.info(
+                    "download_suffix_finalize_rename",
+                    execution_path="agent_finalize",
+                    finalize_task_id=task.task_id,
+                    finalize_workflow_run_id=task.workflow_run_id,
+                    context_task_id=context.task_id if context else None,
+                    pre_rename_filename_fp=diagnostic_fingerprint(local_basename),
+                    passed_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+                    context_download_suffix_fp=diagnostic_fingerprint(context.download_suffix if context else None),
+                    desired_name_fp=diagnostic_fingerprint(desired_name),
+                    will_rename=local_basename != desired_name,
+                )
                 if local_basename != desired_name:
                     rename_file(os.path.join(workflow_download_directory, local_file_name), desired_name)
                 continue
