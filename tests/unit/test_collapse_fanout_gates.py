@@ -9,6 +9,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
 
 UMBRELLA_FLAG = "COLLAPSE_XP_ASSIGNMENT"
+CUSTOM_FLAG = handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG
 
 
 class CaptureLogger:
@@ -66,6 +67,38 @@ def _set_provider(monkeypatch: pytest.MonkeyPatch, provider: FakeExperimentation
 
 def _umbrella_calls(provider: FakeExperimentationProvider) -> list[tuple[str, str, str, dict[str, str]]]:
     return [call for call in provider.calls if call[1] == UMBRELLA_FLAG]
+
+
+@pytest.mark.asyncio
+async def test_resolve_collapse_gate_family_off_skips_assignment_and_reports_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeExperimentationProvider({CUSTOM_FLAG: False})
+    _set_provider(monkeypatch, provider)
+    gate = await handler._resolve_collapse_gate(_task(), CUSTOM_FLAG, "custom-select")
+    assert gate == handler._CollapseGateResult(family_enabled=False, assigned=None, gate_error=False)
+    assert _umbrella_calls(provider) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("results", "raises_for", "expected"),
+    [
+        ({CUSTOM_FLAG: True, UMBRELLA_FLAG: False}, set(), handler._CollapseGateResult(True, False, False)),
+        ({CUSTOM_FLAG: True}, {CUSTOM_FLAG}, handler._CollapseGateResult(False, None, True)),
+    ],
+)
+async def test_resolve_collapse_gate_separates_control_family_off_and_gate_error(
+    monkeypatch: pytest.MonkeyPatch,
+    results: dict[str, bool],
+    raises_for: set[str],
+    expected: handler._CollapseGateResult,
+) -> None:
+    handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
+    provider = FakeExperimentationProvider(results, raises_for=raises_for)
+    _set_provider(monkeypatch, provider)
+    actual = await handler._resolve_collapse_gate(_task(), CUSTOM_FLAG, "custom-select")
+    assert actual == expected
 
 
 @pytest.mark.asyncio
