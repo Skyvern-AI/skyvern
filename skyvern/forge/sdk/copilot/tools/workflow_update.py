@@ -2472,6 +2472,7 @@ _METADATA_CONTRACT_REQUIRED_BEFORE_RUN_REASON_CODE = "metadata_contract_required
 _SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE = "separated_spine_shape_required"
 _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE = "separated_browser_spine_plus_extraction"
 _OUTPUT_CONTRACT_REJECT_REASON_CODE = "output_contract_required"
+_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE = "value_bearing_output_required"
 _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE = "output_contract_reject_budget_exhausted"
 _MAX_OUTPUT_CONTRACT_REJECTS = 4
 _MAX_OUTPUT_CONTRACT_DEFERRALS = 3
@@ -2816,14 +2817,20 @@ def _output_contract_scope_key(ctx: AgentContext | None) -> str:
     return ""
 
 
-def _stable_output_contract_key(scope_key: str, required_paths: set[str]) -> str:
+def _stable_output_contract_key(
+    scope_key: str,
+    required_paths: set[str],
+    request_slot_identity: Sequence[tuple[str, str]] = (),
+) -> str:
     scope_key = scope_key.strip()
     if not scope_key:
         return ""
-    payload = {
+    payload: dict[str, str | list[str] | list[tuple[str, str]]] = {
         "scope": scope_key,
         "required_paths": sorted(required_paths),
     }
+    if request_slot_identity:
+        payload["request_slot_identity"] = sorted(request_slot_identity)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -2834,7 +2841,7 @@ def _output_contract_author_time_structural_payload(
     block_label: str = "",
     deficiency_family: str = "output_contract_unsatisfied",
 ) -> Mapping[str, object] | None:
-    signature = _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
     if not signature:
         return None
     payload: dict[str, object] = {
@@ -2852,12 +2859,18 @@ def _output_contract_signature(
     *,
     ctx: AgentContext | None = None,
     scope_key: str = "",
-    workflow_yaml: str,
-    source: str,
-    reason_code: str,
     required_paths: set[str],
 ) -> str:
-    return _stable_output_contract_key(scope_key or _output_contract_scope_key(ctx), required_paths)
+    """Sole producer of canonical output-contract keys: the degraded request-slot identity is
+    derived from ctx here so one logical contract keeps one key at every consuming seam."""
+    request_slot_identity: tuple[tuple[str, str], ...] = (
+        tuple(diagnostic.identity for diagnostic in _degraded_request_slot_diagnostics(ctx)) if ctx is not None else ()
+    )
+    return _stable_output_contract_key(
+        scope_key or _output_contract_scope_key(ctx),
+        required_paths,
+        request_slot_identity,
+    )
 
 
 def _runtime_output_contract_signature(runtime_contract: _RuntimeOutputRepairContract | None) -> str:
@@ -2879,7 +2892,7 @@ def _default_output_contract_block_label(workflow_yaml: str) -> str:
 
 
 def _output_contract_pin_key(ctx: AgentContext, workflow_yaml: str, required_paths: set[str]) -> str:
-    return _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+    return _output_contract_signature(ctx=ctx, required_paths=required_paths)
 
 
 def _pinned_output_contract_block_label(
@@ -3012,6 +3025,36 @@ def _runtime_output_repair_contract_from_recorded_outcome(ctx: AgentContext) -> 
     )
 
 
+class _OutputContractLiveness(StrEnum):
+    ABSENT = "absent"
+    VALUE_REQUIRED = "value_required"
+    DEGRADED_EMPTY = "degraded_empty"
+
+
+@dataclass(frozen=True)
+class _DegradedRequestSlotDiagnostic:
+    request_slot_id: str
+    floor_rekeyed_from_path: str
+    pinability: str
+    mint_disposition: str
+    mint_degrade: str
+    request_slot_failure_kind: str
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.request_slot_id, self.floor_rekeyed_from_path
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "request_slot_id": self.request_slot_id,
+            "floor_rekeyed_from_path": self.floor_rekeyed_from_path,
+            "pinability": self.pinability,
+            "mint_disposition": self.mint_disposition,
+            "mint_degrade": self.mint_degrade,
+            "request_slot_failure_kind": self.request_slot_failure_kind,
+        }
+
+
 @dataclass(frozen=True)
 class _OutputContractRequiredPaths:
     """Two-lane contract: observation paths must be sourced from the page/run; declaration paths
@@ -3021,15 +3064,49 @@ class _OutputContractRequiredPaths:
     declaration_paths: set[str]
     source: str
     reason_code: str
+    degraded_request_slots: tuple[_DegradedRequestSlotDiagnostic, ...] = ()
 
     @property
     def union(self) -> set[str]:
         return self.observation_paths | self.declaration_paths
 
+    @property
+    def liveness(self) -> _OutputContractLiveness:
+        if self.observation_paths:
+            return _OutputContractLiveness.VALUE_REQUIRED
+        if self.degraded_request_slots:
+            return _OutputContractLiveness.DEGRADED_EMPTY
+        return _OutputContractLiveness.ABSENT
+
+
+def _degraded_request_slot_diagnostics(ctx: AgentContext) -> tuple[_DegradedRequestSlotDiagnostic, ...]:
+    diagnostics: list[_DegradedRequestSlotDiagnostic] = []
+    request_policy = ctx.request_policy
+    request_slot_failure_kind = request_policy.request_slot_failure_kind if request_policy is not None else None
+    for criterion in _active_completion_criteria(ctx):
+        if not isinstance(criterion, CompletionCriterion):
+            continue
+        if not (criterion.mint_disposition == "degraded" or criterion.mint_degrade is not None):
+            continue
+        if not criterion.request_slot_id and request_slot_failure_kind is None:
+            continue
+        diagnostics.append(
+            _DegradedRequestSlotDiagnostic(
+                request_slot_id=criterion.request_slot_id or "",
+                floor_rekeyed_from_path=_canonical_requested_output_path(criterion.floor_rekeyed_from_path),
+                pinability=str(criterion.pinability or ""),
+                mint_disposition=criterion.mint_disposition,
+                mint_degrade=str(criterion.mint_degrade or ""),
+                request_slot_failure_kind=request_slot_failure_kind or "",
+            )
+        )
+    return tuple(sorted(diagnostics, key=lambda item: item.identity))
+
 
 def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContractRequiredPaths:
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     antecedent_paths = _contingent_antecedent_child_paths(ctx)
+    degraded_request_slots = _degraded_request_slot_diagnostics(ctx)
     if runtime_contract is not None:
         runtime_observation_paths = runtime_contract.required_paths - _judgment_output_paths(ctx)
         return _OutputContractRequiredPaths(
@@ -3037,6 +3114,7 @@ def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContract
             declaration_paths=antecedent_paths - runtime_observation_paths,
             source=runtime_contract.source,
             reason_code=runtime_contract.reason_code,
+            degraded_request_slots=degraded_request_slots,
         )
     observation_paths, source, reason_code = _required_child_output_paths_for_authoring(ctx)
     observation_paths = observation_paths - _judgment_output_paths(ctx)
@@ -3069,11 +3147,229 @@ def _output_contract_required_paths_source(ctx: AgentContext) -> _OutputContract
         declaration_paths=antecedent_paths - observation_paths,
         source=source,
         reason_code=reason_code,
+        degraded_request_slots=degraded_request_slots,
     )
 
 
 def _declaration_envelope_paths(declaration_paths: set[str]) -> set[str]:
     return declaration_paths | {_output_path_root(path) for path in declaration_paths}
+
+
+def _mutation_root_name(expression: ast.expr) -> str:
+    node = expression
+    while isinstance(node, (ast.Attribute, ast.Starred, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def _statement_mutation_root_names(statement: ast.stmt) -> set[str]:
+    """Every name the statement could rebind or mutate, walking any target shape to its root
+    name; method receivers and call arguments count because the callee may write through them."""
+    names: set[str] = set()
+    for node in ast.walk(statement):
+        if isinstance(node, (ast.Name, ast.Subscript, ast.Attribute)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if root := _mutation_root_name(node):
+                names.add(root)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((alias.asname or alias.name).split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.Call):
+            receivers = [node.func.value] if isinstance(node.func, ast.Attribute) else []
+            receivers.extend(node.args)
+            receivers.extend(keyword.value for keyword in node.keywords)
+            for receiver in receivers:
+                if root := _mutation_root_name(receiver):
+                    names.add(root)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+            # Assigning into a subscript/attribute target aliases the RHS object into that
+            # container, so a later mutation through the container mutates the RHS too. Taint every
+            # RHS name so the alias is not resolved to its pre-mutation value (over-taint is fail-open).
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, (ast.Subscript, ast.Attribute)) for target in targets):
+                names.update(child.id for child in ast.walk(node.value) if isinstance(child, ast.Name))
+    return names
+
+
+def _top_level_static_assignments(tree: ast.Module) -> tuple[dict[str, ast.expr], set[str]]:
+    """Only a single-name top-level assignment resolves statically; every other write or
+    mutation shape marks its root name uncertain, and uncertain is terminal (fail-open).
+    Mutating an alias mutates the aliased object, so the taint spreads to every name the
+    marked assignment references."""
+    assignments: dict[str, ast.expr] = {}
+    uncertain_names: set[str] = set()
+
+    def mark_uncertain(names: set[str]) -> None:
+        pending = list(names)
+        while pending:
+            name = pending.pop()
+            if name in uncertain_names:
+                continue
+            uncertain_names.add(name)
+            assigned = assignments.pop(name, None)
+            if assigned is not None:
+                pending.extend(node.id for node in ast.walk(assigned) if isinstance(node, ast.Name))
+
+    for node in tree.body:
+        target_name = ""
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target_name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            target_name, value = node.target.id, node.value
+        written = _statement_mutation_root_names(node)
+        if not target_name or value is None:
+            mark_uncertain(written)
+            continue
+        mark_uncertain(written - {target_name})
+        if target_name in assignments or target_name in uncertain_names:
+            mark_uncertain({target_name})
+        else:
+            assignments[target_name] = value
+    return assignments, uncertain_names
+
+
+def _resolve_static_expression(
+    expression: ast.expr,
+    assignments: Mapping[str, ast.expr],
+    uncertain_names: set[str],
+    seen_names: frozenset[str] = frozenset(),
+) -> ast.expr | None:
+    if isinstance(expression, ast.Await):
+        return _resolve_static_expression(expression.value, assignments, uncertain_names, seen_names)
+    if not isinstance(expression, ast.Name):
+        return expression
+    if expression.id in uncertain_names or expression.id in seen_names:
+        return None
+    assigned = assignments.get(expression.id)
+    if assigned is None:
+        return None
+    return _resolve_static_expression(assigned, assignments, uncertain_names, seen_names | {expression.id})
+
+
+_StaticOutputPathState = Literal["value", "empty", "absent", "unknown"]
+
+
+def _static_leaf_value_state(expression: ast.expr) -> _StaticOutputPathState:
+    if isinstance(expression, ast.Constant):
+        if expression.value is None or (isinstance(expression.value, str) and not expression.value.strip()):
+            return "empty"
+        return "value"
+    if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
+        element_states = {_static_leaf_value_state(element) for element in expression.elts}
+        return "value" if element_states & {"value", "unknown"} else "empty"
+    if isinstance(expression, ast.Dict):
+        value_states = {_static_leaf_value_state(value) for value in expression.values}
+        return "value" if value_states & {"value", "unknown"} else "empty"
+    return "unknown"
+
+
+def _static_output_path_state(
+    expression: ast.expr,
+    segments: list[tuple[str, bool]],
+    assignments: Mapping[str, ast.expr],
+    uncertain_names: set[str],
+) -> _StaticOutputPathState:
+    resolved = _resolve_static_expression(expression, assignments, uncertain_names)
+    if resolved is None:
+        return "unknown"
+    if not segments:
+        return _static_leaf_value_state(resolved)
+    key, is_array = segments[0]
+    if not isinstance(resolved, ast.Dict):
+        return "unknown"
+    matching_values: list[ast.expr] = []
+    dynamic_key = False
+    dynamic_key_after_match = False
+    for raw_key, value in zip(resolved.keys, resolved.values):
+        if isinstance(raw_key, ast.Constant) and raw_key.value == key:
+            matching_values.append(value)
+            dynamic_key_after_match = False
+        elif not isinstance(raw_key, ast.Constant) or not isinstance(raw_key.value, str):
+            dynamic_key = True
+            dynamic_key_after_match = bool(matching_values)
+    if not matching_values:
+        return "unknown" if dynamic_key else "absent"
+    # A dynamic entry after the last matching literal can shadow it at runtime.
+    if dynamic_key_after_match:
+        return "unknown"
+    value = matching_values[-1]
+    remaining = segments[1:]
+    if not is_array:
+        return _static_output_path_state(value, remaining, assignments, uncertain_names)
+    resolved_value = _resolve_static_expression(value, assignments, uncertain_names)
+    if not isinstance(resolved_value, (ast.List, ast.Tuple, ast.Set)):
+        return "unknown"
+    if not resolved_value.elts:
+        return "empty"
+    if not remaining:
+        return "value"
+    states = [
+        _static_output_path_state(element, remaining, assignments, uncertain_names) for element in resolved_value.elts
+    ]
+    if "value" in states:
+        return "value"
+    return "unknown" if "unknown" in states else "empty"
+
+
+def _statically_lacks_value_bearing_observation_paths(code: str, observation_paths: set[str]) -> bool:
+    if not observation_paths:
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+        return_expressions = [
+            node.value
+            for node in _iter_top_level_scope(tree.body)
+            if isinstance(node, ast.Return) and node.value is not None
+        ]
+        if not return_expressions:
+            return False
+        assignments, uncertain_names = _top_level_static_assignments(tree)
+        for expression in return_expressions:
+            if not isinstance(_resolve_static_expression(expression, assignments, uncertain_names), ast.Dict):
+                return False
+            states = {
+                _static_output_path_state(expression, _path_segments(path), assignments, uncertain_names)
+                for path in observation_paths
+            }
+            if states & {"value", "unknown"}:
+                return False
+        return True
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+
+
+def _statically_valueless_return_envelope(code: str) -> bool:
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+        return_nodes = [node for node in _iter_top_level_scope(tree.body) if isinstance(node, ast.Return)]
+        if not return_nodes:
+            return False
+        assignments, uncertain_names = _top_level_static_assignments(tree)
+        for node in return_nodes:
+            if node.value is None:
+                return False
+            resolved = _resolve_static_expression(node.value, assignments, uncertain_names)
+            if not isinstance(resolved, ast.Dict):
+                return False
+            if _static_leaf_value_state(resolved) != "empty":
+                return False
+        return True
+    except (RecursionError, SyntaxError, ValueError):
+        return False
+
+
+def _static_value_bearing_violations(code: str, observation_paths: set[str]) -> list[str]:
+    if not _statically_lacks_value_bearing_observation_paths(code, observation_paths):
+        return []
+    return [
+        "Unable to impose synthesized code block: selected output extraction returns only statically "
+        f"empty value(s) for required output path(s): {', '.join(sorted(observation_paths))}."
+    ]
 
 
 def _evaluate_output_contract_for_code_block(
@@ -3082,6 +3378,7 @@ def _evaluate_output_contract_for_code_block(
     raw_code_artifact_metadata: object,
     *,
     allow_static_return_advisory: bool = False,
+    enforce_value_bearing_liveness: bool = False,
 ) -> _OutputContractEvaluation | None:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
@@ -3092,7 +3389,7 @@ def _evaluate_output_contract_for_code_block(
     declaration_paths = contract.declaration_paths
     source = contract.source
     reason_code = contract.reason_code
-    if not required_paths:
+    if not required_paths and contract.liveness is not _OutputContractLiveness.DEGRADED_EMPTY:
         return None
     effective_metadata = raw_code_artifact_metadata
     if not _metadata_has_mapping_item(effective_metadata):
@@ -3110,15 +3407,22 @@ def _evaluate_output_contract_for_code_block(
     target_metadata = _metadata_item_for_block_label(effective_metadata, block_label) if block_label else None
     submitted_goal_paths = _metadata_item_goal_value_paths(target_metadata)
     submitted_schema_paths = _metadata_item_extraction_schema_paths(target_metadata) if target_metadata else set()
-    submitted_code_paths = (
-        _code_block_produced_output_paths(str(target_block.get("code") or "")) if target_block is not None else set()
-    )
+    target_code = str(target_block.get("code") or "") if target_block is not None else ""
+    submitted_code_paths = _code_block_produced_output_paths(target_code)
     missing_metadata_paths = sorted(observation_paths - submitted_goal_paths)
     missing_schema_paths = sorted(required_paths - submitted_schema_paths)
     missing_return_paths = sorted(required_paths - submitted_code_paths)
     missing_observation_return_paths = sorted(observation_paths - submitted_code_paths)
     missing_declaration_return_paths = sorted(declaration_paths - submitted_code_paths)
     shape_violations: list[str] = []
+    declaration_only_contract = bool(declaration_paths) and not observation_paths
+    if enforce_value_bearing_liveness:
+        if contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
+            shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
+        elif target_block is not None and _statically_lacks_value_bearing_observation_paths(
+            target_code, observation_paths
+        ):
+            shape_violations.append(_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE)
     if not block_label:
         shape_violations.append("ambiguous_output_owner" if owner_labels else "missing_output_owner")
     elif target_block is None:
@@ -3134,13 +3438,7 @@ def _evaluate_output_contract_for_code_block(
         ):
             shape_violations.append(_SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE)
 
-    signature = _output_contract_signature(
-        ctx=ctx,
-        workflow_yaml=workflow_yaml,
-        source=source,
-        reason_code=reason_code,
-        required_paths=required_paths,
-    )
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
     separated_spine_advisory_run = (
         allow_static_return_advisory
         and target_block is not None
@@ -3209,12 +3507,19 @@ def _evaluate_output_contract_for_code_block(
         | set(effective_missing_return_paths)
         | (required_paths if shape_violations else set())
     )
+    value_bearing_output_required = _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in shape_violations
     payload: dict[str, Any] = {
-        "reason_code": _OUTPUT_CONTRACT_REJECT_REASON_CODE,
+        "reason_code": (
+            _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE
+            if value_bearing_output_required
+            else _OUTPUT_CONTRACT_REJECT_REASON_CODE
+        ),
         "block_label": block_label,
         "artifact_id": artifact_id,
         "canonical_required_child_paths": sorted(required_paths),
         "declaration_only_child_paths": sorted(declaration_paths),
+        "contract_liveness": contract.liveness.value,
+        "degraded_request_slots": [slot.to_payload() for slot in contract.degraded_request_slots],
         "source": source,
         "metadata_contract_source": source,
         "metadata_contract_reason_code": reason_code,
@@ -3225,7 +3530,13 @@ def _evaluate_output_contract_for_code_block(
         "actuated_static_return_advisory": actuated_static_return_advisory,
         "shape_violations": shape_violations,
         "can_attempt_run": run_eligible,
-        "reject_reason": "" if run_eligible else _OUTPUT_CONTRACT_REJECT_REASON_CODE,
+        "reject_reason": ""
+        if run_eligible
+        else (
+            _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE
+            if value_bearing_output_required
+            else _OUTPUT_CONTRACT_REJECT_REASON_CODE
+        ),
         "canonical_output_contract_signature": signature,
         "canonical_runtime_output_contract_signature": runtime_signature,
         "runtime_output_workflow_run_id": runtime_contract.workflow_run_id if runtime_contract is not None else "",
@@ -3315,6 +3626,10 @@ def _adjudicate_output_contract_ladder_after_reject(
     existing caps, keeping the loop/churn defer bounded. A bail with no owner block is left to the
     owner-directive path, not granted an inert run."""
     if ctx.turn_halt is not None or ctx.output_contract_bail_actuated_this_call:
+        return None
+    # A statically valueless contract cannot be adjudicated by dispatching a run, so a
+    # value-bearing reject never mints an advisory grant that would yield the preflight.
+    if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations:
         return None
     signature = evaluation.canonical_signature
     block_label = evaluation.block_label
@@ -3441,7 +3756,7 @@ def _record_output_contract_family_reject(
     if not required_paths:
         return 0
     scope_key = _output_contract_scope_key(ctx)
-    signature = _stable_output_contract_key(scope_key, required_paths)
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
     if not signature:
         LOG.info(
             "copilot_output_contract_reject_count_unscoped",
@@ -3483,7 +3798,7 @@ def _record_output_contract_family_reject(
 def _record_output_contract_deferral(ctx: AgentContext, required_paths: set[str]) -> int:
     if not required_paths:
         return 0
-    signature = _stable_output_contract_key(_output_contract_scope_key(ctx), required_paths)
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
     if not signature:
         return 0
     count = int(ctx.output_contract_deferral_count_by_signature.get(signature, 0) or 0) + 1
@@ -3498,10 +3813,19 @@ def _output_contract_reject_result(
     tool_name: str = "update_workflow",
 ) -> dict[str, Any]:
     data = payload or evaluation.payload
+    observation_paths = {str(path) for path in data.get("canonical_required_child_paths", []) or []} - {
+        str(path) for path in data.get("declaration_only_child_paths", []) or []
+    }
     if data.get("reason_code") == _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE:
         error = (
             "The workflow output contract repair budget is exhausted for this canonical requested-output contract. "
             "Return with the typed output-contract payload instead of trying another variant."
+        )
+    elif data.get("reason_code") == _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE and not observation_paths:
+        error = (
+            f"{tool_name} cannot proceed: every requested value-bearing output has degraded out of the "
+            "completion criteria, so no code revision can satisfy the contract. Re-establish at least one "
+            "requested value-bearing output before authoring again."
         )
     else:
         path_text = ", ".join(str(path) for path in data.get("canonical_required_child_paths", []) or [])
@@ -3710,15 +4034,11 @@ def _scaffold_metadata_contract_for_update(
     raw_code_artifact_metadata: object,
 ) -> tuple[object, bool]:
     contract = _output_contract_required_paths_source(ctx)
+    if contract.union and contract.liveness is not _OutputContractLiveness.VALUE_REQUIRED:
+        return raw_code_artifact_metadata, False
     if not contract.union:
         return _scaffold_metadata_from_owned_carrier_produced_output(ctx, workflow_yaml, raw_code_artifact_metadata)
-    signature = _output_contract_signature(
-        ctx=ctx,
-        workflow_yaml=workflow_yaml,
-        source=contract.source,
-        reason_code=contract.reason_code,
-        required_paths=contract.union,
-    )
+    signature = _output_contract_signature(ctx=ctx, required_paths=contract.union)
     scaffolded = _apply_metadata_contract_scaffold(
         ctx,
         workflow_yaml,
@@ -3741,7 +4061,7 @@ def _apply_metadata_contract_schema_to_workflow_yaml(
         return workflow_yaml
     contract = _output_contract_required_paths_source(ctx)
     required_paths = contract.union
-    if not required_paths:
+    if not required_paths or contract.liveness is not _OutputContractLiveness.VALUE_REQUIRED:
         return workflow_yaml
     label, owner_labels = _target_output_contract_block_label(
         ctx,
@@ -3811,25 +4131,13 @@ def _output_contract_reject_count(ctx: AgentContext, signature: str) -> int:
         return 0
 
 
-def _runtime_output_repair_attempt_key(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    required_paths: set[str],
-    source: str,
-    reason_code: str,
-) -> str:
+def _runtime_output_repair_attempt_key(ctx: AgentContext, required_paths: set[str]) -> str:
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
     if runtime_contract is None or not isinstance(outcome, RecordedBuildTestOutcome):
         return ""
     payload = {
-        "output_contract_signature": _output_contract_signature(
-            ctx=ctx,
-            workflow_yaml=workflow_yaml,
-            source=source,
-            reason_code=reason_code,
-            required_paths=required_paths,
-        ),
+        "output_contract_signature": _output_contract_signature(ctx=ctx, required_paths=required_paths),
         "runtime_output_contract_signature": _runtime_output_contract_signature(runtime_contract),
         "recorded_structural_key": outcome.structural_key,
         "authored_structure_signature": outcome.authored_structure_signature,
@@ -3906,7 +4214,7 @@ def _produce_split_extraction_envelope(
     )
     if envelope is None:
         return None
-    _, revalidation = _extraction_code_with_required_static_return(
+    _, revalidation = _extraction_code_with_value_bearing_static_return(
         envelope.code, required_paths=scalar_paths, declaration_paths=declarations
     )
     if revalidation:
@@ -3958,7 +4266,7 @@ def _attempt_separated_spine_split(
     if suffix_mutations or suffix_ambiguous:
         return _SpineSplitOutcome(None, ["extraction_suffix_contains_browser_actions"], None)
 
-    keyed_extraction, static_violations = _extraction_code_with_required_static_return(
+    keyed_extraction, static_violations = _extraction_code_with_value_bearing_static_return(
         extraction_suffix, required_paths=required_paths, declaration_paths=declaration_paths
     )
     if static_violations:
@@ -4036,6 +4344,26 @@ def _arm_output_contract_output_owner_directive(
         "copilot_output_contract_output_owner_directive_emitted",
         canonical_output_contract_signature=signature,
         output_owner_candidate_labels=owner_labels,
+    )
+
+
+def _arm_output_contract_value_bearing_directive(
+    ctx: AgentContext,
+    *,
+    signature: str,
+    workflow_yaml: str,
+    liveness: _OutputContractLiveness,
+) -> None:
+    fingerprint = _output_contract_structural_fingerprint(workflow_yaml, signature)
+    already_armed = ctx.output_contract_armed_directive_fingerprint_by_signature.get(signature) == fingerprint
+    _record_armed_directive_fingerprint(ctx, signature, fingerprint)
+    if already_armed:
+        return
+    LOG.info(
+        "copilot_output_contract_value_bearing_directive_emitted",
+        canonical_output_contract_signature=signature,
+        reason_code=_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+        contract_liveness=liveness.value,
     )
 
 
@@ -4190,6 +4518,16 @@ def _output_contract_advisory_granted(ctx: AgentContext, signature: str) -> bool
     return _output_contract_advisory_state(ctx, signature) == OutputContractAdvisoryState.GRANTED
 
 
+def _revoke_output_contract_advisory_run(ctx: AgentContext, signature: str) -> None:
+    if _output_contract_advisory_granted(ctx, signature):
+        ctx.output_contract_actuation_by_signature.pop(signature, None)
+        LOG.info(
+            "copilot_output_contract_advisory_run_revoked",
+            canonical_output_contract_signature=signature,
+            reason_code=_OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+        )
+
+
 def _grant_output_contract_advisory_run(ctx: AgentContext, signature: str) -> None:
     if not signature:
         return
@@ -4232,7 +4570,7 @@ def consume_output_contract_advisory_grant_for_run_result(
     workflow_run_id = _workflow_run_id_from_run_result(run_result)
     if workflow_run_id is None:
         data = run_result.get("data")
-        if isinstance(data, Mapping):
+        if isinstance(data, Mapping) and run_result.get("ok") is not False:
             LOG.warning(
                 "copilot_output_contract_advisory_run_result_missing_workflow_run_id",
                 data_keys=sorted(str(key) for key in data),
@@ -4597,9 +4935,13 @@ def _stamp_declaration_contract_defaults(
     target_block = _workflow_yaml_code_blocks_by_label(workflow_yaml).get(label)
     if target_block is None:
         return workflow_yaml, False
-    stamped_code = _code_with_declared_contract_defaults(
-        str(target_block.get("code") or ""), contract.declaration_paths
-    )
+    target_code = str(target_block.get("code") or "")
+    produced_observation_paths = contract.observation_paths & _code_block_produced_output_paths(target_code)
+    if not produced_observation_paths:
+        return workflow_yaml, False
+    if _statically_lacks_value_bearing_observation_paths(target_code, produced_observation_paths):
+        return workflow_yaml, False
+    stamped_code = _code_with_declared_contract_defaults(target_code, contract.declaration_paths)
     if not stamped_code:
         return workflow_yaml, False
     parsed = parse_workflow_yaml(workflow_yaml)
@@ -4683,7 +5025,7 @@ def _impose_covered_static_return_envelope(
     )
     if envelope is None:
         return None
-    _, revalidation = _extraction_code_with_required_static_return(
+    _, revalidation = _extraction_code_with_value_bearing_static_return(
         envelope.code, required_paths=scalar_paths, declaration_paths=declaration_paths
     )
     if revalidation:
@@ -4740,13 +5082,15 @@ def _impose_output_contract_envelope_after_steering(
     reason_code = contract.reason_code
     if not required_paths:
         return workflow_yaml, raw_code_artifact_metadata, False
-    signature = _output_contract_signature(
-        ctx=ctx,
-        workflow_yaml=workflow_yaml,
-        source=source,
-        reason_code=reason_code,
-        required_paths=required_paths,
-    )
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
+    if contract.liveness is not _OutputContractLiveness.VALUE_REQUIRED:
+        _arm_output_contract_value_bearing_directive(
+            ctx,
+            signature=signature,
+            workflow_yaml=workflow_yaml,
+            liveness=contract.liveness,
+        )
+        return workflow_yaml, raw_code_artifact_metadata, False
     # The stamp precedes actuation and ignores advisory state so no
     # acceptance route can persist a block that omits the declaration paths.
     workflow_yaml, declaration_stamped = _stamp_declaration_contract_defaults(
@@ -4757,7 +5101,7 @@ def _impose_output_contract_envelope_after_steering(
         signature,
     )
     _reopen_dispatch_lacked_bound_extraction(ctx, signature)
-    runtime_attempt_key = _runtime_output_repair_attempt_key(ctx, workflow_yaml, required_paths, source, reason_code)
+    runtime_attempt_key = _runtime_output_repair_attempt_key(ctx, required_paths)
     label, owner_labels = _target_output_contract_block_label(
         ctx,
         workflow_yaml,
@@ -4849,7 +5193,7 @@ def _impose_output_contract_envelope_after_steering(
             )
             _record_armed_directive_fingerprint(ctx, signature, current_fingerprint)
             return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
-    keyed_code, violations = _extraction_code_with_required_static_return(
+    keyed_code, violations = _extraction_code_with_value_bearing_static_return(
         target_code,
         required_paths=required_paths,
         declaration_paths=declaration_paths,
@@ -5066,9 +5410,12 @@ def _metadata_contract_run_preflight_reject(
         workflow_yaml,
         raw_code_artifact_metadata,
         allow_static_return_advisory=True,
+        enforce_value_bearing_liveness=True,
     )
     if evaluation is None or not evaluation.has_deficiencies:
         return None
+    if _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in evaluation.shape_violations:
+        _revoke_output_contract_advisory_run(ctx, evaluation.canonical_signature)
     authored_fingerprint = _output_contract_structural_fingerprint(workflow_yaml, evaluation.canonical_signature)
     advisory_granted = _output_contract_advisory_granted(ctx, evaluation.canonical_signature)
     # A granted advisory must arm run-output evidence before the grant is consumed, even when the
@@ -5090,7 +5437,9 @@ def _metadata_contract_run_preflight_reject(
         authored_structural_fingerprint=authored_fingerprint,
         workflow_yaml=workflow_yaml,
     )
-    if advisory_granted or _output_contract_advisory_granted(ctx, evaluation.canonical_signature):
+    if (
+        evaluation.can_attempt_run or _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE not in evaluation.shape_violations
+    ) and (advisory_granted or _output_contract_advisory_granted(ctx, evaluation.canonical_signature)):
         _arm_pending_run_evidence(ctx, evaluation.canonical_signature, set(evaluation.observation_paths))
         return None
     if evaluation.repair_context is not None:
@@ -5110,6 +5459,75 @@ def _metadata_contract_run_preflight_reject(
         ),
         "user_facing_summary": _compiled_authoring_user_summary(),
         "data": payload,
+    }
+
+
+def output_contract_value_bearing_run_reject(
+    ctx: AgentContext,
+    code_by_label: Mapping[str, str],
+) -> dict[str, Any] | None:
+    """Refuses dispatch of a saved workflow whose author contract is statically provably
+    valueless (declaration-only, degraded-empty, or statically-all-empty); unknown stays fail-open."""
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    contract = _output_contract_required_paths_source(ctx)
+    declaration_only_contract = bool(contract.declaration_paths) and not contract.observation_paths
+    statically_valueless = contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract
+    if not statically_valueless and contract.liveness is _OutputContractLiveness.VALUE_REQUIRED and code_by_label:
+        statically_valueless = all(
+            _statically_lacks_value_bearing_observation_paths(code, contract.observation_paths)
+            for code in code_by_label.values()
+        )
+    # The code lane is criteria-independent so the invariant survives drift in the persisted
+    # criteria source (an unparseable row must not readmit a statically hollow envelope).
+    statically_empty_return_envelope = False
+    if not statically_valueless and code_by_label:
+        statically_empty_return_envelope = all(
+            _statically_valueless_return_envelope(code) for code in code_by_label.values()
+        )
+        statically_valueless = statically_empty_return_envelope
+    if not statically_valueless:
+        return None
+    LOG.info(
+        "copilot_value_bearing_dispatch_preflight_reject",
+        contract_liveness=contract.liveness.value,
+        canonical_required_child_paths=sorted(contract.union),
+        declaration_only_child_paths=sorted(contract.declaration_paths),
+        statically_empty_return_envelope=statically_empty_return_envelope,
+        block_labels=sorted(code_by_label),
+    )
+    if statically_empty_return_envelope and not contract.union:
+        error = (
+            "Cannot run the saved workflow: its code statically returns no values (every return "
+            "envelope is empty or null-only). Revise the code to return at least one real value "
+            "before running."
+        )
+    elif contract.liveness is _OutputContractLiveness.DEGRADED_EMPTY or declaration_only_contract:
+        error = (
+            "Cannot run the saved workflow: every requested value-bearing output has degraded out of "
+            "the completion criteria, so no code revision can satisfy the contract. Re-establish at "
+            "least one requested value-bearing output before running."
+        )
+    else:
+        error = (
+            "Cannot run the saved workflow: its output contract carries no value-bearing output "
+            "(only a blocker declaration or statically empty values). Revise the owning code block "
+            "to produce at least one requested value-bearing output before running."
+        )
+    return {
+        "ok": False,
+        "error": error,
+        "user_facing_summary": _compiled_authoring_user_summary(),
+        "data": {
+            "reason_code": _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+            "reject_reason": _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+            "contract_liveness": contract.liveness.value,
+            "canonical_required_child_paths": sorted(contract.union),
+            "declaration_only_child_paths": sorted(contract.declaration_paths),
+            "statically_empty_return_envelope": statically_empty_return_envelope,
+            "degraded_request_slots": [slot.to_payload() for slot in contract.degraded_request_slots],
+            "can_attempt_run": False,
+        },
     }
 
 
@@ -5394,6 +5812,23 @@ def _extraction_code_with_required_static_return(
         "Unable to impose synthesized code block: selected output extraction does not return a keyed "
         f"structure covering required output path(s): {', '.join(missing)}."
     ]
+
+
+def _extraction_code_with_value_bearing_static_return(
+    code: str,
+    *,
+    required_paths: set[str],
+    declaration_paths: set[str] | None = None,
+) -> tuple[str, list[str]]:
+    keyed_code, violations = _extraction_code_with_required_static_return(
+        code, required_paths=required_paths, declaration_paths=declaration_paths
+    )
+    if violations:
+        return keyed_code, violations
+    liveness_violations = _static_value_bearing_violations(keyed_code, required_paths - (declaration_paths or set()))
+    if liveness_violations:
+        return textwrap.dedent(code).strip(), liveness_violations
+    return keyed_code, []
 
 
 def _single_mapping_local_static_return_candidate(code: str, root: str, required_paths: set[str]) -> str:
@@ -9448,7 +9883,7 @@ def _maybe_impose_synthesized_code_block(
         target_metadata = _metadata_item_for_block_label(raw_metadata, str(code_block.get("label") or ""))
         required_split_paths = _metadata_item_goal_value_paths(target_metadata)
         if required_split_paths:
-            split_extraction_code, static_return_violations = _extraction_code_with_required_static_return(
+            split_extraction_code, static_return_violations = _extraction_code_with_value_bearing_static_return(
                 split_extraction_code,
                 required_paths=required_split_paths,
             )
@@ -10826,7 +11261,13 @@ async def _update_workflow(
         workflow_yaml,
         params.get("code_artifact_metadata"),
         allow_static_return_advisory=allow_static_output_uncertainty,
+        enforce_value_bearing_liveness=True,
     )
+    if (
+        output_contract_evaluation is not None
+        and _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE in output_contract_evaluation.shape_violations
+    ):
+        _revoke_output_contract_advisory_run(ctx, output_contract_evaluation.canonical_signature)
     output_contract_static_advisory_allowed = (
         output_contract_evaluation is not None and output_contract_evaluation.can_attempt_run
     )
