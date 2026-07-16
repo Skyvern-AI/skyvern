@@ -2608,14 +2608,27 @@ def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bo
 
 
 def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
-    """The scout trajectory covers a durable entry followed by a commit, or a reached download target with a selector.
-    Monotone in what the scout captured, so it cannot flip as the requested-output extraction plan materializes."""
+    """The scout trajectory covers an opening click followed by a commit, a durable entry followed by a commit,
+    or a reached download target with a selector. Monotone in what the scout captured."""
     trajectory = ctx.scout_trajectory
     if not trajectory:
         return False
     download = ctx.reached_download_target
     if download is not None and download.selector:
         return True
+    if len(trajectory) == 2:
+        opening, commit = trajectory
+        if (
+            isinstance(opening, dict)
+            and str(opening.get("tool_name") or "") == "click"
+            and isinstance(opening.get("trajectory_index"), int)
+            and isinstance(commit, dict)
+            and str(commit.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+            and isinstance(commit.get("trajectory_index"), int)
+            and opening["trajectory_index"] < commit["trajectory_index"]
+            and not is_generic_entry_opener_click(commit)
+        ):
+            return True
     last_entry_index: int | None = None
     for index, item in enumerate(trajectory):
         if isinstance(item, dict) and is_durable_fallback_entry_target(item):
