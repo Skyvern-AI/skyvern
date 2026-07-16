@@ -98,6 +98,7 @@ import {
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
 import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
+import { WorkflowReliabilityPanel } from "./workflowRun/WorkflowReliabilityPanel";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -307,6 +308,7 @@ function WorkflowPage() {
             </Button>
           </div>
         </div>
+        <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
         {WorkflowAnalyticsPanel ? (
           <WorkflowAnalyticsPanel workflowPermanentId={workflowPermanentId} />
         ) : null}
