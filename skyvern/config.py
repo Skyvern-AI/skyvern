@@ -759,6 +759,10 @@ class Settings(BaseSettings):
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
 
+    TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS: float = 48.0
+    """Age gate (hours) for the always-on sweep of per-run LOG_PATH/DOWNLOAD_PATH dirs left behind on
+    crash paths. Non-positive disables the sweep."""
+
     # Workflow Schedule Settings
     ENABLE_WORKFLOW_SCHEDULES: bool = True
     """Enable recurring workflow schedules in the OSS/local server."""
