@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import dataclasses
 import json
@@ -11,6 +12,7 @@ import structlog
 from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
 from openai import APIError, AsyncOpenAI, RateLimitError
@@ -51,6 +53,7 @@ from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_s
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.schemas.llm import (
     LLMAllowedFailsPolicy,
@@ -59,12 +62,46 @@ from skyvern.schemas.llm import (
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
+from skyvern.utils.url_validators import validate_fetch_url
 
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
 configure_litellm_transport()
 
 LOG = structlog.get_logger()
+
+
+class _NoRedirectAsyncHTTPHandler(AsyncHTTPHandler):
+    def create_client(self, *args: Any, **kwargs: Any) -> Any:
+        client = super().create_client(*args, **kwargs)
+        client.follow_redirects = False
+        return client
+
+
+def _build_custom_llm_http_client(llm_key: str, llm_config: LLMConfig) -> AsyncOpenAI | AsyncHTTPHandler | None:
+    if not is_custom_llm_key(llm_key):
+        return None
+
+    litellm_params = llm_config.litellm_params or {}
+    if llm_config.model_name.startswith("openai/"):
+        return AsyncOpenAI(
+            api_key=litellm_params.get("api_key"),
+            base_url=litellm_params.get("api_base"),
+            http_client=ForgeAsyncHttpxClientWrapper(follow_redirects=False),
+        )
+
+    return _NoRedirectAsyncHTTPHandler()
+
+
+async def _validate_custom_llm_api_base(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> None:
+    if not is_custom_llm_key(llm_key) or SettingsManager.get_settings().ALLOW_CUSTOM_LLM_LOCAL_API_BASES:
+        return
+    if not isinstance(llm_config, LLMConfig):
+        raise InvalidLLMConfigError(llm_key)
+    api_base = (llm_config.litellm_params or {}).get("api_base")
+    if isinstance(api_base, str):
+        await asyncio.to_thread(validate_fetch_url, api_base)
+
 
 # Vertex returns this trafficType for flex-tier calls. litellm (through 1.88.1 and
 # main) neither maps it nor applies tier pricing in completion_cost, so flex bills at
@@ -1977,7 +2014,7 @@ class LLMAPIHandlerFactory:
             _llm_span.set_attribute("llm_key", llm_key)
             _llm_span.set_attribute("llm_model", llm_config.model_name)
             _llm_span.set_attribute("prompt_name", prompt_name)
-            active_parameters = base_parameters or {}
+            active_parameters = dict(base_parameters or {})
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
@@ -2024,6 +2061,7 @@ class LLMAPIHandlerFactory:
             _bundle_response: bytes | None = None
             _bundle_parsed: bytes | None = None
             _bundle_rendered: bytes | None = None
+            custom_http_client: AsyncOpenAI | AsyncHTTPHandler | None = None
             try:
                 if context and context.hashed_href_map and should_persist_llm_artifacts:
                     if _should_bundle:
@@ -2188,6 +2226,10 @@ class LLMAPIHandlerFactory:
                 t_llm_request = time.perf_counter()
                 llm_duration_seconds = 0.0
                 try:
+                    await _validate_custom_llm_api_base(llm_key, llm_config)
+                    custom_http_client = _build_custom_llm_http_client(llm_key, llm_config)
+                    if custom_http_client is not None:
+                        active_parameters["client"] = custom_http_client
                     # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                     # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                     response = await litellm.acompletion(
@@ -2443,6 +2485,11 @@ class LLMAPIHandlerFactory:
 
                 return parsed_response
             finally:
+                if custom_http_client is not None:
+                    try:
+                        await custom_http_client.close()
+                    except Exception:
+                        LOG.warning("Failed to close custom LLM HTTP client", llm_key=llm_key, exc_info=True)
                 # Post-response artifact persistence cluster. bulk_create_artifacts
                 # does the S3 uploads + DB rows for every LLM artifact queued during
                 # this request; the bundled-path archive accumulate is fast in-memory.
@@ -2574,15 +2621,17 @@ class LLMCaller:
 
         self.openai_client = None
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
+        self._custom_openrouter = bool(openrouter_model_name and is_custom_llm_key(self.original_llm_key))
         # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
         if openrouter_model_name and isinstance(self.llm_config, LLMConfig):
             self.llm_key = openrouter_model_name.replace("openrouter/", "")
-            litellm_params = self.llm_config.litellm_params or {}
-            self.openai_client = AsyncOpenAI(
-                api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
-                base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
-                http_client=ForgeAsyncHttpxClientWrapper(),
-            )
+            if not self._custom_openrouter:
+                litellm_params = self.llm_config.litellm_params or {}
+                self.openai_client = AsyncOpenAI(
+                    api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
+                    base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
+                    http_client=ForgeAsyncHttpxClientWrapper(),
+                )
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             # For GitHub Copilot, use the actual model name from OPENAI_COMPATIBLE_MODEL_NAME
             self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
@@ -3023,7 +3072,16 @@ class LLMCaller:
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
-        if self.openai_client:
+        await _validate_custom_llm_api_base(self.original_llm_key, self.llm_config)
+        openai_client = self.openai_client
+        if self._custom_openrouter and isinstance(self.llm_config, LLMConfig):
+            litellm_params = self.llm_config.litellm_params or {}
+            openai_client = AsyncOpenAI(
+                api_key=litellm_params.get("api_key") or settings.OPENROUTER_API_KEY,
+                base_url=litellm_params.get("api_base") or settings.OPENROUTER_API_BASE,
+                http_client=ForgeAsyncHttpxClientWrapper(follow_redirects=False),
+            )
+        if openai_client:
             # Extract OpenRouter-specific and GitHub Copilot-specific parameters
             extra_headers = {}
             if settings.SKYVERN_APP_URL:
@@ -3053,17 +3111,23 @@ class LLMCaller:
             if active_parameters.get("reasoning_effort"):
                 openai_params["reasoning_effort"] = active_parameters["reasoning_effort"]
 
-            completion = await self.openai_client.chat.completions.create(
-                model=self.llm_key,
-                messages=messages,
-                extra_headers=extra_headers if extra_headers else None,
-                timeout=timeout,
-                **openai_params,
-            )
-            # Convert OpenAI ChatCompletion to litellm ModelResponse format
-            # litellm.utils.convert_to_model_response_object expects a dict
-            response_dict = completion.model_dump()
-            return litellm.ModelResponse(**response_dict)
+            try:
+                completion = await openai_client.chat.completions.create(
+                    model=self.llm_key,
+                    messages=messages,
+                    extra_headers=extra_headers if extra_headers else None,
+                    timeout=timeout,
+                    **openai_params,
+                )
+                # Convert OpenAI ChatCompletion to litellm ModelResponse format
+                # litellm.utils.convert_to_model_response_object expects a dict
+                return litellm.ModelResponse(**completion.model_dump())
+            finally:
+                if self._custom_openrouter:
+                    try:
+                        await openai_client.close()
+                    except Exception:
+                        LOG.warning("Failed to close custom OpenRouter client", exc_info=True)
 
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)

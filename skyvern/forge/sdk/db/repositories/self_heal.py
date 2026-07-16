@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -167,6 +167,53 @@ class SelfHealRepository(BaseRepository):
                 .limit(bounded_limit)
             )
             return list((await session.scalars(query)).all())
+
+    @db_operation("get_recent_terminal_workflow_run_ids_batch")
+    async def get_recent_terminal_workflow_run_ids_batch(
+        self,
+        organization_id: str,
+        workflow_permanent_ids: list[str],
+        limit: int = 20,
+    ) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {wpid: [] for wpid in workflow_permanent_ids}
+        if not workflow_permanent_ids:
+            return result
+        terminal_statuses = ("completed", "failed", "terminated", "timed_out")
+        bounded_limit = max(1, min(limit, 100))
+        row_number = (
+            func.row_number()
+            .over(
+                partition_by=WorkflowRunModel.workflow_permanent_id,
+                order_by=(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc()),
+            )
+            .label("rn")
+        )
+        subquery = (
+            select(
+                WorkflowRunModel.workflow_run_id,
+                WorkflowRunModel.workflow_permanent_id,
+                row_number,
+            )
+            .where(
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.workflow_permanent_id.in_(workflow_permanent_ids),
+                WorkflowRunModel.status.in_(terminal_statuses),
+                WorkflowRunModel.parent_workflow_run_id.is_(None),
+                WorkflowRunModel.copilot_session_id.is_(None),
+                WorkflowRunModel.debug_session_id.is_(None),
+            )
+            .subquery()
+        )
+        async with self.Session() as session:
+            query = (
+                select(subquery.c.workflow_permanent_id, subquery.c.workflow_run_id)
+                .where(subquery.c.rn <= bounded_limit)
+                .order_by(subquery.c.workflow_permanent_id, subquery.c.rn)
+            )
+            rows = (await session.execute(query)).all()
+        for workflow_permanent_id, workflow_run_id in rows:
+            result[workflow_permanent_id].append(workflow_run_id)
+        return result
 
     @db_operation("get_heal_episodes_for_runs")
     async def get_heal_episodes_for_runs(self, organization_id: str, workflow_run_ids: list[str]) -> list[HealEpisode]:
