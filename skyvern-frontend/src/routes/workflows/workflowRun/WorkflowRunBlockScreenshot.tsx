@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse, Status } from "@/api/types";
 import { ZoomableImage } from "@/components/ZoomableImage";
+import { useArtifactImageSrc } from "@/hooks/useArtifactImageSrc";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -9,7 +9,6 @@ import {
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
-import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 import { apiPathPrefix } from "@/util/env";
 import { isBlockScreenshot, selectBlockScreenshot } from "./blockScreenshot";
 
@@ -25,7 +24,6 @@ function WorkflowRunBlockScreenshot({
   runStatus,
 }: Props) {
   const credentialGetter = useCredentialGetter();
-  const [imageFailed, setImageFailed] = useState(false);
 
   const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
     queryKey: ["workflowRunBlock", workflowRunBlockId, "artifacts"],
@@ -50,10 +48,7 @@ function WorkflowRunBlockScreenshot({
   });
 
   const screenshot = selectBlockScreenshot(artifacts, blockType);
-
-  useEffect(() => {
-    setImageFailed(false);
-  }, [workflowRunBlockId, screenshot?.signed_url]);
+  const { src, onImageError, imageFailed } = useArtifactImageSrc(screenshot);
 
   if (isLoading) {
     return (
@@ -112,11 +107,7 @@ function WorkflowRunBlockScreenshot({
 
   return (
     <figure className="mx-auto flex max-w-full flex-col items-center gap-2 overflow-hidden rounded">
-      <ZoomableImage
-        src={getImageURL(screenshot)}
-        alt="block screenshot"
-        onError={() => setImageFailed(true)}
-      />
+      <ZoomableImage src={src} alt="block screenshot" onError={onImageError} />
     </figure>
   );
 }

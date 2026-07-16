@@ -1,4 +1,6 @@
-import { AxiosInstance } from "axios";
+import axios from "axios";
+
+import { CredentialGetter, getClient } from "@/api/AxiosClient";
 
 export type ArtifactSignedUrlApiResponse = {
   artifact_id: string;
@@ -65,11 +67,61 @@ export function refreshDelayMs(
 
 /** Mint a fresh short-lived content URL for the artifact (SKY-12541). */
 export async function mintSignedArtifactUrl(
-  client: AxiosInstance,
+  credentialGetter: CredentialGetter | null,
   artifactId: string,
 ): Promise<ArtifactSignedUrlApiResponse> {
+  // The signed-url route is registered on the `/v1` router only; the default
+  // client's `/api/v1` base 404s.
+  const client = await getClient(credentialGetter, "sans-api-v1");
   const response = await client.get<ArtifactSignedUrlApiResponse>(
     `/artifacts/${artifactId}/signed-url`,
   );
   return response.data;
+}
+
+/**
+ * Freshly minted URL for a Skyvern content URL, at the point of use. Returns
+ * the input unchanged for non-artifact URLs or when minting fails (the caller
+ * falls back to whatever validity the original URL still has).
+ */
+export async function freshArtifactUrl(
+  credentialGetter: CredentialGetter | null,
+  url: string,
+): Promise<string> {
+  const artifactId = artifactIdFromContentUrl(url);
+  if (!artifactId) {
+    return url;
+  }
+  try {
+    const minted = await mintSignedArtifactUrl(credentialGetter, artifactId);
+    return minted.signed_url;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * GET `url`, retrying once on a freshly minted URL when the fetch fails.
+ * Deliberately retries on any failure, not just 403: expiry surfaces as an
+ * opaque error on cross-origin fetches, and the mint only runs on the error
+ * path.
+ */
+export async function getWithMintRetry(
+  url: string,
+  artifactId: string,
+  credentialGetter: CredentialGetter | null,
+): Promise<unknown> {
+  try {
+    const response = await axios.get(url);
+    return response.data;
+  } catch (initialError) {
+    let minted: ArtifactSignedUrlApiResponse;
+    try {
+      minted = await mintSignedArtifactUrl(credentialGetter, artifactId);
+    } catch {
+      throw initialError;
+    }
+    const response = await axios.get(minted.signed_url);
+    return response.data;
+  }
 }

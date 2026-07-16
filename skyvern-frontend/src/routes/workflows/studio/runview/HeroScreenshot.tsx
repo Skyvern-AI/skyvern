@@ -4,8 +4,8 @@ import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse, ArtifactType } from "@/api/types";
+import { useArtifactImageSrc } from "@/hooks/useArtifactImageSrc";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 import { apiPathPrefix } from "@/util/env";
 
 import { selectBlockScreenshot } from "../../workflowRun/blockScreenshot";
@@ -148,6 +148,7 @@ export function HeroScreenshot({
   }
 
   const screenshotId = screenshot?.artifact_id ?? null;
+  const { src, onImageError } = useArtifactImageSrc(screenshot);
   const isLoading =
     loadingArtifact || loadingStep || loadingBlock || loadingThought;
 
@@ -207,9 +208,10 @@ export function HeroScreenshot({
       }}
     >
       <img
-        src={getImageURL(screenshot)}
+        src={src}
         alt="screenshot"
         className={zoom.image}
+        onError={onImageError}
       />
     </div>
   );

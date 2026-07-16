@@ -44,7 +44,7 @@ describe("ArtifactVideo", () => {
     await waitFor(() => {
       expect(video.getAttribute("src")).toBe(MINTED_URL);
     });
-    expect(mintMock).toHaveBeenCalledWith(expect.anything(), "a_rec");
+    expect(mintMock).toHaveBeenCalledWith(null, "a_rec");
 
     fireEvent.error(video);
     expect(mintMock).toHaveBeenCalledTimes(1);
