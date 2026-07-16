@@ -515,7 +515,14 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
-        raw_message = redact_cdp_endpoint_urls(str(exception).strip())
+        # BrowserFactory.create_browser_context wraps every creator/setup failure, so an http(s) URL
+        # here is only known to be a CDP discovery endpoint (rather than an ordinary proxy/public-IP
+        # probe URL the user needs) when the error carries a CDP-connection signal. Default to ws/wss
+        # redaction and escalate to http(s)+ws(s) redaction only for connect_over_cdp/WebSocket errors.
+        raw = str(exception).strip()
+        raw_message = (
+            redact_cdp_endpoint_urls(raw) if _is_browser_connection_error(raw) else redact_ws_endpoint_urls(raw)
+        )
         raw_lower = raw_message.lower()
 
         # Browser launch environment errors: worker cannot initialize the
