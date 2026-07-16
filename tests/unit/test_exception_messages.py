@@ -91,6 +91,20 @@ def test_unknown_error_redacts_raw_cdp_endpoint_url() -> None:
     assert "[remote browser endpoint]" in message
 
 
+def test_unknown_error_redacts_http_cdp_discovery_url() -> None:
+    # The /json/version discovery endpoint is reached over http(s) and can carry the vendor host
+    # and a session-bearing token just like the ws socket, so it must be redacted too.
+    inner_exception = Exception(
+        "connect_over_cdp: fetching https://remote.example.internal/json/version?token=SEKRET failed"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "https://" not in message
+    assert "SEKRET" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
 def test_captcha_not_solved_in_time_is_captcha_solve_error() -> None:
     # The action handler catches CaptchaSolveError before its generic arm; this
     # subclass relationship is what routes captcha-solve failures to the handled
