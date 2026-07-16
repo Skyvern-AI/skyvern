@@ -136,13 +136,22 @@ def _is_browser_connection_error(message: str) -> bool:
 
 
 # A raw CDP connect failure (e.g. from playwright.chromium.connect_over_cdp) echoes the
-# ws/wss endpoint URL, which can carry the remote-browser vendor host, a session-bearing
-# path/query, or credentials embedded as user:pass@host. Redact it before it reaches a user.
-_CDP_WS_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+# endpoint URL, which can carry the remote-browser vendor host, a session-bearing path/query,
+# or credentials embedded as user:pass@host. The devtools socket is always ws/wss, so a ws/wss
+# URL in a browser error is unambiguously a CDP endpoint and safe to redact anywhere. The
+# /json/version discovery endpoint is http/https and carries the same host/token, but so does an
+# ordinary navigation/target/proxy URL — an http(s) URL is only known to be a CDP endpoint in a
+# CDP-connection context, so http(s) redaction is scoped to that context (see redact_cdp_endpoint_urls).
+_WS_ENDPOINT_URL_RE = re.compile(r"wss?://\S+", re.IGNORECASE)
+_CDP_ENDPOINT_URL_RE = re.compile(r"(?:wss?|https?)://\S+", re.IGNORECASE)
 
 
-def _redact_cdp_endpoint_urls(message: str) -> str:
-    return _CDP_WS_URL_RE.sub("[remote browser endpoint]", message)
+def redact_ws_endpoint_urls(message: str) -> str:
+    return _WS_ENDPOINT_URL_RE.sub("[remote browser endpoint]", message)
+
+
+def redact_cdp_endpoint_urls(message: str) -> str:
+    return _CDP_ENDPOINT_URL_RE.sub("[remote browser endpoint]", message)
 
 
 def get_user_facing_exception_message(exception: Exception) -> str:
@@ -506,7 +515,7 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         if isinstance(exception, CdpConnectionConfigurationError):
             return exception.message or str(exception)
 
-        raw_message = _redact_cdp_endpoint_urls(str(exception).strip())
+        raw_message = redact_cdp_endpoint_urls(str(exception).strip())
         raw_lower = raw_message.lower()
 
         # Browser launch environment errors: worker cannot initialize the
