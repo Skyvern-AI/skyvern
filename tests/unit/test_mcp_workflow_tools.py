@@ -9,8 +9,9 @@ import pytest
 from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
+from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.mcp_tools import mcp
-from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
+from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS, size_capped
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowRequest
 from tests.unit._mcp_test_helpers import patch_get_workflow_by_id as _patch_get_workflow_by_id
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
@@ -56,6 +57,16 @@ def _fake_workflow_dict(**overrides: object) -> dict[str, object]:
     }
     data.update(overrides)
     return data
+
+
+def _patch_workflow_get_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_definition: dict[str, object],
+) -> None:
+    async def fake_get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, object]:
+        return _fake_workflow_dict(workflow_definition=workflow_definition)
+
+    _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
 
 
 def _large_runtime_workflow_definition() -> dict[str, object]:
@@ -3784,6 +3795,225 @@ async def test_workflow_update_does_not_reinject_intentionally_removed_parameter
     sent_def = request_mock.await_args.kwargs["json"]["json_definition"]
     block = sent_def["workflow_definition"]["blocks"][0]
     assert "report_url" not in (block.get("parameter_keys") or [])
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_advertises_persisted_code_blocks_without_mutating_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocks = [
+        {
+            "block_type": "code",
+            "label": f"reusable_step_{index:02d}",
+            "code": f'return {{"step": {index}}}',
+        }
+        for index in range(22)
+    ]
+    workflow_definition: dict[str, object] = {"parameters": [], "blocks": blocks}
+    before = json.dumps(workflow_definition, ensure_ascii=False, separators=(",", ":")).encode()
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    assert result["ok"] is True
+    data = result["data"]
+    pointer = data["code_block_pointer"]
+    assert pointer["code_block_count"] == 22
+    assert pointer["block_labels"] == [f"reusable_step_{index:02d}" for index in range(20)]
+    # The normal path carries the code inline, so it must point at the response — not at the CLI
+    # fallback. Asserting the absence keeps the overflow hint from satisfying this test.
+    assert "workflow_definition" in pointer["hint"]
+    assert "--definition-file" not in pointer["hint"]
+    after = json.dumps(data["workflow_definition"], ensure_ascii=False, separators=(",", ":")).encode()
+    assert after == before
+    assert "code_block_pointer" not in data["workflow_definition"]
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        pytest.param(
+            [
+                {
+                    "block_type": "navigation",
+                    "label": "open_page",
+                    "url": "https://example.com",
+                    "navigation_goal": "Open the page",
+                }
+            ],
+            id="agent-only",
+        ),
+        pytest.param([{"block_type": "code", "label": "empty_shell", "code": ""}], id="empty-code"),
+        pytest.param([{"block_type": "code", "label": "blank_shell", "code": "   \n"}], id="blank-code"),
+        pytest.param([], id="no-blocks"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_workflow_get_omits_code_block_pointer_without_reusable_code(
+    monkeypatch: pytest.MonkeyPatch,
+    blocks: list[dict[str, object]],
+) -> None:
+    workflow_definition: dict[str, object] = {"parameters": [], "blocks": blocks}
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    assert result["ok"] is True
+    assert "code_block_pointer" not in result["data"]
+    assert result["data"]["workflow_definition"] == workflow_definition
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_counts_nested_code_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_definition: dict[str, object] = {
+        "parameters": [],
+        "blocks": [
+            {
+                "block_type": "for_loop",
+                "label": "each_item",
+                "loop_blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "reuse_nested_code",
+                        "code": 'return {"ok": True}',
+                    }
+                ],
+            }
+        ],
+    }
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    assert result["data"]["code_block_pointer"]["code_block_count"] == 1
+    assert result["data"]["code_block_pointer"]["block_labels"] == ["reuse_nested_code"]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_large_workflow_get_preserves_code_block_pointer(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_workflow_get_definition(monkeypatch, _large_runtime_workflow_definition())
+    wrapped_get = size_capped(workflow_tools.guard_definition_size(workflow_tools.skyvern_workflow_get))
+
+    result = await wrapped_get(workflow_id="wpid_test")
+
+    assert result["ok"] is False
+    pointer = result["data"]["code_block_pointer"]
+    assert pointer["code_block_count"] == 88
+    assert pointer["block_labels"] == [f"portal_step_{index:03d}" for index in range(20)]
+    # The overflow branch drops the definition, so the hint must route to the CLI and must NOT tell the
+    # caller to read a workflow_definition that is not in this response.
+    assert "skyvern workflow get --id wpid_test --definition-file wf.json" in pointer["hint"]
+    assert "workflow_definition" not in pointer["hint"]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_large_workflow_get_pointer_survives_oversized_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_definition: dict[str, object] = {
+        "parameters": [],
+        "blocks": [
+            {"block_type": "code", "label": "l" * 20_000, "code": f'return {{"step": {index}}}'} for index in range(30)
+        ],
+    }
+    _patch_workflow_get_definition(monkeypatch, workflow_definition)
+    wrapped_get = size_capped(workflow_tools.guard_definition_size(workflow_tools.skyvern_workflow_get))
+
+    result = await wrapped_get(workflow_id="wpid_test")
+
+    # 600K of labels must not re-inflate the oversize response past the cap and get the whole pointer
+    # stripped by the outer size_capped. No label is previewable here, but the count stays exact.
+    pointer = result["data"]["code_block_pointer"]
+    assert pointer["code_block_count"] == 30
+    assert pointer["block_labels"] == []
+    assert workflow_tools._response_size(result) <= MCP_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_code_block_pointer_survives_concise_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Concise is the MCP server's default response mode and it drops every key in `_DATA_STRIP_KEYS` —
+    which already contains `sdk_equivalent`, the additive sibling this pointer sits beside and is modelled
+    on. That neighbour is disposable chatter; this pointer is the whole feature. Adding it to that strip
+    list would kill discovery in the only mode that ships, and nothing else would fail.
+    """
+    _patch_workflow_get_definition(
+        monkeypatch,
+        {"parameters": [], "blocks": [{"block_type": "code", "label": "reuse_me", "code": 'return {"ok": True}'}]},
+    )
+
+    set_concise_responses(True)
+    try:
+        result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    finally:
+        set_concise_responses(False)
+
+    assert result["data"]["code_block_pointer"]["code_block_count"] == 1
+    # The contrast that gives this test its point: the neighbouring key IS stripped here.
+    assert "sdk_equivalent" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_code_bearing_workflow_inside_the_pointer_shifted_band_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pointer counts against the cap it is measured by, so a code-bearing workflow that would have
+    fit without it now takes the oversize path. That shift has to fail closed: definition dropped, but
+    the pointer and a working CLI route survive and the response stays under the cap. Not measuring the
+    pointer would be worse — the over-cap response would reach size_capped, which drops `data` entirely.
+    """
+
+    def _definition(pad: int) -> dict[str, object]:
+        return {"parameters": [], "blocks": [{"block_type": "code", "label": "near_cap", "code": "x" * pad}]}
+
+    probe_pad = 1_000
+    _patch_workflow_get_definition(monkeypatch, _definition(probe_pad))
+    probe = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    pointer_chars = workflow_tools._response_size({"code_block_pointer": probe["data"]["code_block_pointer"]})
+    # Response size is linear in the padding, so solve for a payload landing mid-band.
+    base = workflow_tools._response_size(probe) - probe_pad - pointer_chars
+    pad = MCP_MAX_RESPONSE_CHARS - base - pointer_chars // 2
+
+    _patch_workflow_get_definition(monkeypatch, _definition(pad))
+    unwrapped = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    with_pointer = workflow_tools._response_size(unwrapped)
+    without_pointer = with_pointer - pointer_chars
+    # Self-check: the case is only meaningful if it is genuinely in-band. Without this the test would
+    # silently pass on any merely-oversized workflow and prove nothing.
+    assert without_pointer <= MCP_MAX_RESPONSE_CHARS < with_pointer
+
+    wrapped_get = size_capped(workflow_tools.guard_definition_size(workflow_tools.skyvern_workflow_get))
+    result = await wrapped_get(workflow_id="wpid_test")
+
+    assert result["ok"] is False
+    assert "workflow_definition" not in result["data"]
+    assert result["data"]["code_block_pointer"]["code_block_count"] == 1
+    assert "--definition-file" in result["data"]["code_block_pointer"]["hint"]
+    assert workflow_tools._response_size(result) <= MCP_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_workflow_get_previews_labels_up_to_the_budget_while_count_stays_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Labels long enough that the CHAR budget binds before the 20-label count cap does — otherwise this
+    # only re-tests the count cap and says nothing about the budget.
+    blocks = [
+        {
+            "block_type": "code",
+            "label": f"portal_step_{index:03d}_submit_and_verify_the_result_page_loaded",
+            "code": 'return {"ok": True}',
+        }
+        for index in range(25)
+    ]
+    _patch_workflow_get_definition(monkeypatch, {"parameters": [], "blocks": blocks})
+
+    result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+
+    pointer = result["data"]["code_block_pointer"]
+    assert pointer["code_block_count"] == 25
+    assert pointer["block_labels"]
+    # Fewer than the count cap ⇒ the char budget is what stopped it, not _POINTER_MAX_LABELS.
+    assert len(pointer["block_labels"]) < workflow_tools._POINTER_MAX_LABELS
+    assert len("".join(pointer["block_labels"])) <= workflow_tools._POINTER_LABEL_BUDGET_CHARS
+    assert set(pointer["block_labels"]) <= {str(block["label"]) for block in blocks}
 
 
 @pytest.mark.asyncio
