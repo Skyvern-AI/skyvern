@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.webeye.actions import handler_utils
-from skyvern.webeye.actions.handler import _is_tel_digit_fix_enabled, _nanp_national_digits, _plan_tel_text
+from skyvern.webeye.actions.handler import (
+    _is_tel_digit_fix_enabled,
+    _nanp_e164_fallback,
+    _nanp_national_digits,
+    _plan_tel_text,
+)
 from tests.unit.helpers import make_organization, make_task
 
 
@@ -42,6 +47,26 @@ from tests.unit.helpers import make_organization, make_task
 )
 def test_nanp_national_digits(value: str, expected: str | None) -> None:
     assert _nanp_national_digits(value) == expected
+
+
+@pytest.mark.parametrize(
+    "source_value,pattern,maxlength,expected",
+    [
+        ("+1 (224) 555-0199", None, None, "+12245550199"),
+        ("1-224-555-0199", r"\+1\d{10}", "12", "+12245550199"),
+        ("(224) 555-0199", None, None, None),
+        ("224-555-0199", None, None, None),
+        ("+1 (224) 555-0199", r"\d{10}", None, None),
+        ("+1 (224) 555-0199", "[", None, None),
+        ("+1 (224) 555-0199", None, "10", None),
+        ("+1 (224) 555-0199", None, "-1", None),
+        ("+1 (224) 555-0199", None, "not-a-number", None),
+    ],
+)
+def test_nanp_e164_fallback_respects_live_field_constraints(
+    source_value: str, pattern: str | None, maxlength: str | None, expected: str | None
+) -> None:
+    assert _nanp_e164_fallback(source_value, pattern=pattern, maxlength=maxlength) == expected
 
 
 def test_plan_tel_text_strips_secret_resolved_formatted_nanp() -> None:
