@@ -13,8 +13,6 @@ class TagKeyDeleteResponse(UniversalBaseModel):
 
     key: str
     removed_from_workflow_count: int
-    removed_from_run_count: typing.Optional[int] = None
-    removed_count: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

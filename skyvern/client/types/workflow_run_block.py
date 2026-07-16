@@ -50,7 +50,6 @@ class WorkflowRunBlock(UniversalBaseModel):
     attachments: typing.Optional[typing.List[str]] = None
     subject: typing.Optional[str] = None
     body: typing.Optional[str] = None
-    prompt: typing.Optional[str] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
@@ -59,7 +58,6 @@ class WorkflowRunBlock(UniversalBaseModel):
     executed_branch_result: typing.Optional[bool] = None
     executed_branch_next_block: typing.Optional[str] = None
     script_run: typing.Optional[ScriptRunResponse] = None
-    downloaded_file_count: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
