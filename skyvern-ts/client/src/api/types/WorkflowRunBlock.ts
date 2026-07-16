@@ -38,6 +38,7 @@ export interface WorkflowRunBlock {
     attachments?: string[];
     subject?: string;
     body?: string;
+    prompt?: string;
     instructions?: string;
     positive_descriptor?: string;
     negative_descriptor?: string;
@@ -46,6 +47,7 @@ export interface WorkflowRunBlock {
     executed_branch_result?: boolean;
     executed_branch_next_block?: string;
     script_run?: Skyvern.ScriptRunResponse;
+    downloaded_file_count?: number;
 }
 
 export namespace WorkflowRunBlock {

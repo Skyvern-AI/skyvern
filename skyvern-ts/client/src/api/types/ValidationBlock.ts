@@ -34,6 +34,7 @@ export interface ValidationBlock {
     include_action_history_in_verification?: boolean;
     download_timeout?: number;
     include_extracted_text?: boolean;
+    without_page_information?: boolean;
 }
 
 export namespace ValidationBlock {

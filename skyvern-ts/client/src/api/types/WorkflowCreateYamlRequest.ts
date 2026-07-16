@@ -10,7 +10,9 @@ export interface WorkflowCreateYamlRequest {
     totp_verification_url?: string;
     totp_identifier?: string;
     persist_browser_session?: boolean;
+    pin_saved_session_ip?: boolean;
     browser_profile_id?: string;
+    browser_profile_key?: string;
     model?: Record<string, unknown>;
     workflow_definition: Skyvern.WorkflowDefinitionYaml;
     is_saved_task?: boolean;
@@ -23,6 +25,7 @@ export interface WorkflowCreateYamlRequest {
     ai_fallback?: boolean;
     cache_key?: string;
     adaptive_caching?: boolean;
+    enable_self_healing?: boolean;
     code_version?: number;
     generate_script_on_terminal?: boolean;
     run_sequentially?: boolean;

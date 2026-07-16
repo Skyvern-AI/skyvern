@@ -7,6 +7,7 @@ export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.Code
     | Skyvern.ForLoopBlockLoopBlocksItem.Conditional
     | Skyvern.ForLoopBlockLoopBlocksItem.DownloadToS3
+    | Skyvern.ForLoopBlockLoopBlocksItem.EmailInbox
     | Skyvern.ForLoopBlockLoopBlocksItem.Extraction
     | Skyvern.ForLoopBlockLoopBlocksItem.FileDownload
     | Skyvern.ForLoopBlockLoopBlocksItem.FileUpload
@@ -19,9 +20,11 @@ export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.HumanInteraction
     | Skyvern.ForLoopBlockLoopBlocksItem.Login
     | Skyvern.ForLoopBlockLoopBlocksItem.Navigation
+    | Skyvern.ForLoopBlockLoopBlocksItem.PdfFill
     | Skyvern.ForLoopBlockLoopBlocksItem.PdfParser
     | Skyvern.ForLoopBlockLoopBlocksItem.PrintPage
     | Skyvern.ForLoopBlockLoopBlocksItem.SendEmail
+    | Skyvern.ForLoopBlockLoopBlocksItem.SplitPdf
     | Skyvern.ForLoopBlockLoopBlocksItem.Task
     | Skyvern.ForLoopBlockLoopBlocksItem.TaskV2
     | Skyvern.ForLoopBlockLoopBlocksItem.TextPrompt
@@ -46,6 +49,10 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3Block {
         block_type: "download_to_s3";
+    }
+
+    export interface EmailInbox extends Skyvern.EmailInboxBlock {
+        block_type: "email_inbox";
     }
 
     export interface Extraction extends Skyvern.ExtractionBlock {
@@ -96,6 +103,10 @@ export namespace ForLoopBlockLoopBlocksItem {
         block_type: "navigation";
     }
 
+    export interface PdfFill extends Skyvern.PdfFillBlock {
+        block_type: "pdf_fill";
+    }
+
     export interface PdfParser extends Skyvern.PdfParserBlock {
         block_type: "pdf_parser";
     }
@@ -106,6 +117,10 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface SendEmail extends Skyvern.SendEmailBlock {
         block_type: "send_email";
+    }
+
+    export interface SplitPdf extends Skyvern.SplitPdfBlock {
+        block_type: "split_pdf";
     }
 
     export interface Task extends Skyvern.TaskBlock {

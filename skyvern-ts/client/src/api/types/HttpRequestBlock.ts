@@ -22,5 +22,6 @@ export interface HttpRequestBlock {
     follow_redirects?: boolean;
     download_filename?: string;
     save_response_as_file?: boolean;
+    secret_response_paths?: string[];
     parameters?: Skyvern.HttpRequestBlockParametersItem[];
 }
