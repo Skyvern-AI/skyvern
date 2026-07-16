@@ -17,7 +17,9 @@ def _task() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_goto_url_navigates_and_stops_batch() -> None:
+async def test_goto_url_navigates_and_stops_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    validate_url = MagicMock(return_value="https://example.test/page")
+    monkeypatch.setattr("skyvern.webeye.actions.handler.validate_fetch_url", validate_url)
     page = MagicMock()
     page.goto = AsyncMock()
 
@@ -29,6 +31,7 @@ async def test_goto_url_navigates_and_stops_batch() -> None:
     # Navigation invalidates pre-nav element ids, so later actions in the batch must not run.
     assert result[0].skip_remaining_actions is True
     page.goto.assert_awaited_once()
+    validate_url.assert_called_once_with("https://example.test/page")
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,10 @@ vi.mock("./workflowRun/RunParametersDialog", () => ({
   RunParametersDialog: () => null,
 }));
 
+vi.mock("./workflowRun/WorkflowReliabilityPanel", () => ({
+  WorkflowReliabilityPanel: () => null,
+}));
+
 vi.mock("./hooks/useWorkflowQuery", () => ({
   useWorkflowQuery: () => ({
     data: {

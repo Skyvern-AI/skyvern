@@ -6,13 +6,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS, size_capped
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowRequest
+from skyvern.schemas.workflows import (
+    WorkflowCreateYAMLRequest,
+    WorkflowRequest,
+    sanitize_workflow_yaml_with_references,
+)
 from tests.unit._mcp_test_helpers import patch_get_workflow_by_id as _patch_get_workflow_by_id
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
@@ -4421,3 +4426,195 @@ async def test_registered_small_workflow_get_passes_through_unchanged(monkeypatc
     assert isinstance(registered.data, dict)
     assert registered.data["data"] == direct["data"]
     assert registered.data["error"] is None and "_truncated" not in registered.data
+
+
+_REPRESENTATIVE_SKILL_MARKDOWN = """# Reuse prior work
+
+```python
+result = {"ok": True}
+```
+
+Read `{{ account-id }}` after `{{ open-page_output }}`.
+"""
+
+
+def _skill_definition(prompt: str | None, *, unsafe_identifiers: bool = False) -> dict[str, object]:
+    parameter_key = "account-id" if unsafe_identifiers else "account_id"
+    block_label = "open-page" if unsafe_identifiers else "open_page"
+    workflow_definition: dict[str, object] = {
+        "parameters": [{"parameter_type": "workflow", "key": parameter_key, "workflow_parameter_type": "string"}],
+        "blocks": [{"block_type": "code", "label": block_label, "code": "result = True"}],
+    }
+    if prompt is not None:
+        workflow_definition["workflow_system_prompt"] = prompt
+    return {
+        "title": "Skill workflow",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": workflow_definition,
+    }
+
+
+def _persisted_write(sent: object, format_name: str) -> dict[str, object]:
+    if format_name == "json":
+        assert isinstance(sent, dict)
+        return sent
+    parsed = workflow_tools.safe_load_no_dates(sent)
+    sanitized = sanitize_workflow_yaml_with_references(parsed)
+    return WorkflowCreateYAMLRequest.model_validate(sanitized).model_dump(mode="json")
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("format_name", ["json", "yaml"])
+@pytest.mark.asyncio
+async def test_workflow_write_preserves_supplied_skill_markdown_with_format_specific_jinja_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    format_name: str,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+    definition = _skill_definition(_REPRESENTATIVE_SKILL_MARKDOWN, unsafe_identifiers=True)
+    serialized = json.dumps(definition) if format_name == "json" else yaml.safe_dump(definition, sort_keys=False)
+
+    if operation == "create":
+        result = await workflow_tools.skyvern_workflow_create(definition=serialized, format=format_name)
+    else:
+        _patch_workflow_get_definition(monkeypatch, {"parameters": [], "blocks": []})
+        result = await workflow_tools.skyvern_workflow_update(
+            workflow_id="wpid_test",
+            definition=serialized,
+            format=format_name,
+        )
+
+    assert result["ok"] is True
+    sent = request_mock.await_args.kwargs["json"][f"{format_name}_definition"]
+    transmitted = sent if format_name == "json" else workflow_tools.safe_load_no_dates(sent)
+    assert transmitted["workflow_definition"]["workflow_system_prompt"] == _REPRESENTATIVE_SKILL_MARKDOWN
+    expected = _REPRESENTATIVE_SKILL_MARKDOWN
+    if format_name == "yaml":
+        expected = expected.replace("account-id", "account_id").replace("open-page_output", "open_page_output")
+    assert _persisted_write(sent, format_name)["workflow_definition"]["workflow_system_prompt"] == expected
+
+
+@pytest.mark.parametrize("format_name", ["json", "yaml"])
+@pytest.mark.asyncio
+async def test_workflow_get_edit_update_preserves_skills_but_omission_clears(
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+) -> None:
+    prompt = "# Durable skill\n\n```python\nresult = account_id\n```\n\nUse `{{ account_id }}`."
+    definition = _skill_definition(prompt)
+    _patch_workflow_get_definition(monkeypatch, definition["workflow_definition"])
+    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
+
+    got = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    omitted = _skill_definition(None)
+    serialized = json.dumps(omitted) if format_name == "json" else yaml.safe_dump(omitted, sort_keys=False)
+    omitted_result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=serialized,
+        format=format_name,
+    )
+
+    assert omitted_result["ok"] is True
+    sent = request_mock.await_args.kwargs["json"][f"{format_name}_definition"]
+    if format_name == "yaml":
+        transmitted = workflow_tools.safe_load_no_dates(sent)
+        assert "workflow_system_prompt" not in transmitted["workflow_definition"]
+    assert _persisted_write(sent, format_name)["workflow_definition"]["workflow_system_prompt"] is None
+    edited = {
+        "title": "Edited title",
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": got["data"]["workflow_definition"],
+    }
+    serialized = json.dumps(edited) if format_name == "json" else yaml.safe_dump(edited, sort_keys=False)
+    round_trip_result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=serialized,
+        format=format_name,
+    )
+
+    assert round_trip_result["ok"] is True
+    sent = request_mock.await_args.kwargs["json"][f"{format_name}_definition"]
+    assert _persisted_write(sent, format_name)["workflow_definition"]["workflow_system_prompt"] == prompt
+
+
+@pytest.mark.parametrize(
+    ("prompt", "concise"),
+    [(None, False), ("", False), (" \n\t", False), (" \n# Skill 🧭\n", False), (" \n# Skill 🧭\n", True)],
+)
+@pytest.mark.asyncio
+async def test_workflow_get_emits_only_nonblank_skills_as_concise_safe_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str | None,
+    concise: bool,
+) -> None:
+    definition: dict[str, object] = {"parameters": [], "blocks": []}
+    if prompt is not None:
+        definition["workflow_system_prompt"] = prompt
+    _patch_workflow_get_definition(monkeypatch, definition)
+
+    set_concise_responses(concise)
+    try:
+        result = await workflow_tools.skyvern_workflow_get(workflow_id="wpid_test")
+    finally:
+        set_concise_responses(False)
+
+    data = result["data"]
+    if prompt is None or not prompt.strip():
+        assert "skills" not in data
+        assert data["workflow_definition"] == definition
+        return
+    skills = data["skills"]
+    assert set(skills) == {"prompt_chars", "hint"}
+    assert skills["prompt_chars"] == len(prompt)
+    assert "data.workflow_definition.workflow_system_prompt" in skills["hint"]
+    assert "skills" not in data["workflow_definition"]
+    assert "--definition-file" not in skills["hint"]
+    assert "omitted" not in skills["hint"]
+    assert data["workflow_definition"]["workflow_system_prompt"] == prompt
+    if concise:
+        assert "sdk_equivalent" not in data
+
+
+@pytest.mark.asyncio
+async def test_registered_small_workflow_get_emits_skills_pointer(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompt = "# Skill\n\nReuse the persisted definition."
+    _patch_workflow_get_definition(monkeypatch, {"parameters": [], "blocks": [], "workflow_system_prompt": prompt})
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_get", {"workflow_id": "wpid_test"})
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is True
+    data = result.data["data"]
+    skills = data["skills"]
+    assert set(skills) == {"prompt_chars", "hint"}
+    assert skills["prompt_chars"] == len(prompt)
+    assert "data.workflow_definition.workflow_system_prompt" in skills["hint"]
+    assert data["workflow_definition"]["workflow_system_prompt"] == prompt
+    assert "skills" not in data["workflow_definition"]
+
+
+@pytest.mark.asyncio
+async def test_registered_large_workflow_get_reports_skills_with_overflow_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = " \n# Large workflow skill\n\nPreserve every character. 🧭\n"
+    runtime_definition = _large_runtime_workflow_definition()
+    runtime_definition["workflow_system_prompt"] = prompt
+    _patch_workflow_get_definition(monkeypatch, runtime_definition)
+    async with Client(mcp) as client:
+        result = await client.call_tool("skyvern_workflow_get", {"workflow_id": "wpid_test", "version": 7})
+
+    assert result.is_error is False
+    assert isinstance(result.data, dict)
+    assert result.data["ok"] is False
+    data = result.data["data"]
+    assert "workflow_definition" not in data
+    skills = data["skills"]
+    assert set(skills) == {"prompt_chars", "hint"}
+    assert skills["prompt_chars"] == len(prompt)
+    assert f"carries {len(prompt)} persisted skill-instruction characters" in skills["hint"]
+    assert "--id wpid_test --version 7 --definition-file wf.json" in skills["hint"]
+    assert "data.workflow_definition.workflow_system_prompt" not in skills["hint"]

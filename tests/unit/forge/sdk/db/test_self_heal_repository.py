@@ -428,6 +428,101 @@ async def test_get_recent_terminal_workflow_run_ids_filters_orders_and_limits(re
 
 
 @pytest.mark.asyncio
+async def test_get_recent_terminal_workflow_run_ids_batch_filters_orders_limits_and_includes_empty(
+    repo_and_session,
+) -> None:
+    repo, session_factory = repo_and_session
+    now = datetime(2026, 5, 2, 0, 0, 0)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                _workflow_run_model(
+                    workflow_run_id="wr_a_old_completed",
+                    workflow_permanent_id="wpid_a",
+                    status="completed",
+                    created_at=now,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_a_mid_failed",
+                    workflow_permanent_id="wpid_a",
+                    status="failed",
+                    created_at=now + timedelta(minutes=1),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_a_new_terminated",
+                    workflow_permanent_id="wpid_a",
+                    status="terminated",
+                    created_at=now + timedelta(minutes=2),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_a_running",
+                    workflow_permanent_id="wpid_a",
+                    status="running",
+                    created_at=now + timedelta(minutes=3),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_a_child",
+                    workflow_permanent_id="wpid_a",
+                    status="completed",
+                    created_at=now + timedelta(minutes=4),
+                    parent_workflow_run_id="wr_a_old_completed",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_a_copilot",
+                    workflow_permanent_id="wpid_a",
+                    status="completed",
+                    created_at=now + timedelta(minutes=5),
+                    copilot_session_id="cs_a",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_a_debug",
+                    workflow_permanent_id="wpid_a",
+                    status="completed",
+                    created_at=now + timedelta(minutes=6),
+                    debug_session_id="ds_a",
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_b_old_completed",
+                    workflow_permanent_id="wpid_b",
+                    status="completed",
+                    created_at=now,
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_b_new_timed_out",
+                    workflow_permanent_id="wpid_b",
+                    status="timed_out",
+                    created_at=now + timedelta(minutes=2),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_b_running",
+                    workflow_permanent_id="wpid_b",
+                    status="running",
+                    created_at=now + timedelta(minutes=3),
+                ),
+                _workflow_run_model(
+                    workflow_run_id="wr_b_other_org",
+                    organization_id=ORG_B,
+                    workflow_permanent_id="wpid_b",
+                    status="failed",
+                    created_at=now + timedelta(minutes=4),
+                ),
+            ]
+        )
+        await session.commit()
+
+    run_ids_by_wpid = await repo.get_recent_terminal_workflow_run_ids_batch(
+        organization_id=ORG_A,
+        workflow_permanent_ids=["wpid_a", "wpid_b", "wpid_empty"],
+        limit=2,
+    )
+    assert run_ids_by_wpid == {
+        "wpid_a": ["wr_a_new_terminated", "wr_a_mid_failed"],
+        "wpid_b": ["wr_b_new_timed_out", "wr_b_old_completed"],
+        "wpid_empty": [],
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_heal_episodes_for_runs_batches_and_scopes_to_org(repo_and_session) -> None:
     repo, session_factory = repo_and_session
     now = datetime(2026, 6, 1, 0, 0, 0)

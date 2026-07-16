@@ -286,6 +286,8 @@ describe("RunView view toggles", () => {
     expect(scope.getByRole("group", { name: "Run view" })).not.toBeNull();
     // The timeline tree is visible by default (loop row present).
     expect(scope.queryAllByText("checkout-loop").length).toBeGreaterThan(0);
+    // Studio opts into label search (legacy run view does not).
+    expect(scope.getByRole("button", { name: "Search blocks" })).not.toBeNull();
   });
 
   test("the Timeline view leads with the summary meta line", () => {
