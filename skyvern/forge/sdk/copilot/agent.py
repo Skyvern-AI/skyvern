@@ -163,7 +163,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
-from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
+from skyvern.forge.sdk.copilot.runtime import (
+    _browser_context_is_attachable,
+    cache_copilot_author_time_gate_log_only_ids,
+)
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
@@ -4499,6 +4502,29 @@ def _reconcile_turn_end_ownership(
         return result
 
 
+async def _cache_copilot_author_time_gate_log_only_ids(ctx: CopilotContext) -> None:
+    try:
+        resolved_ids = await app.AGENT_FUNCTION.resolve_copilot_author_time_gate_log_only_ids(
+            turn_id=ctx.turn_id,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to resolve Copilot author-time gate log-only registry",
+            turn_id=ctx.turn_id,
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+        resolved_ids = frozenset()
+    cache_copilot_author_time_gate_log_only_ids(ctx, resolved_ids)
+    selected_gate_ids = sorted(ctx.author_time_gate_log_only_ids)
+    LOG.info(
+        "copilot_author_time_gate_log_only_registry_resolved",
+        selected_gate_ids=selected_gate_ids,
+        selected_gate_count=len(selected_gate_ids),
+    )
+
+
 async def run_copilot_agent(
     stream: EventSourceStream,
     organization_id: str,
@@ -4716,6 +4742,7 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
+    await _cache_copilot_author_time_gate_log_only_ids(ctx)
     if ctx_sink is not None:
         ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(
