@@ -122,3 +122,33 @@ async def test_send_totp_code_parser_exception_log_redacts_raw_exception_context
     assert error_log["exception_type"] == "RuntimeError"
     assert "content" not in error_log
     _assert_raw_values_not_logged(logs, raw_identifier, raw_content, "246810")
+
+
+@pytest.mark.asyncio
+async def test_send_totp_code_off_schema_llm_response_yields_400_not_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.services import otp_service
+
+    raw_identifier = "qa-email-otp@example.test"
+    raw_content = "Long email body requesting OTP 424242 for qa-email-otp@example.test."
+    create_otp_code = AsyncMock()
+    monkeypatch.setattr(credentials.app, "DATABASE", _database_with_otp_create(create_otp_code))
+
+    async def off_schema_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"otp_type": "totp", "otp_value": "424242"}
+
+    monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+    monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", off_schema_handler, raising=False)
+
+    with structlog.testing.capture_logs() as logs:
+        with pytest.raises(HTTPException) as exc_info:
+            await credentials.send_totp_code(
+                TOTPCodeCreate(totp_identifier=raw_identifier, content=raw_content),
+                curr_org=SimpleNamespace(organization_id="o_test"),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Failed to parse otp login"
+    create_otp_code.assert_not_awaited()
+    _assert_raw_values_not_logged(logs, raw_identifier, raw_content, "424242")
