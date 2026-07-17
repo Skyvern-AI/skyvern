@@ -71,6 +71,7 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    NonAdoptableCriteriaSet,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
     WorkflowCopilotCancelRequest,
@@ -523,16 +524,33 @@ async def _load_completion_criteria_snapshot(chat: Any) -> StoredCriteriaSnapsho
         return None
     if latest is None:
         return StoredCriteriaSnapshot()
+    if isinstance(latest, NonAdoptableCriteriaSet):
+        LOG.warning(
+            "copilot completion criteria set not adoptable; disabling active set for this turn",
+            reason=latest.reason,
+            completion_criteria_set_id=latest.completion_criteria_set_id,
+            goal_epoch=latest.goal_epoch,
+        )
+        return StoredCriteriaSnapshot(active=None, next_epoch=latest.goal_epoch + 1)
     active = None
     if latest.status == CRITERIA_SET_STATUS_ACTIVE:
-        active = StoredCriteriaSet(
-            set_id=latest.completion_criteria_set_id,
-            goal_epoch=latest.goal_epoch,
-            criteria=criteria_from_json(latest.criteria),
-            consecutive_all_no_evidence=latest.consecutive_all_no_evidence,
-            tripwire_fired=latest.tripwire_fired,
-            last_fully_satisfied_workflow_yaml=latest.last_fully_satisfied_workflow_yaml,
-        )
+        try:
+            active = StoredCriteriaSet(
+                set_id=latest.completion_criteria_set_id,
+                goal_epoch=latest.goal_epoch,
+                criteria=criteria_from_json(latest.criteria),
+                consecutive_all_no_evidence=latest.consecutive_all_no_evidence,
+                tripwire_fired=latest.tripwire_fired,
+                last_fully_satisfied_workflow_yaml=latest.last_fully_satisfied_workflow_yaml,
+            )
+        except Exception:
+            LOG.warning(
+                "copilot completion criteria decode failed; disabling active set for this turn",
+                completion_criteria_set_id=latest.completion_criteria_set_id,
+                goal_epoch=latest.goal_epoch,
+                exc_info=True,
+            )
+            return StoredCriteriaSnapshot(active=None, next_epoch=latest.goal_epoch + 1)
     return StoredCriteriaSnapshot(active=active, next_epoch=latest.goal_epoch + 1)
 
 
