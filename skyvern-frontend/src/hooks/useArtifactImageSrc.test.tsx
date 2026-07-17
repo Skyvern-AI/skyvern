@@ -73,6 +73,51 @@ describe("useArtifactImageSrc", () => {
     expect(mintMock).toHaveBeenCalledTimes(1);
   });
 
+  it("re-mints by id when the source is a storage-presigned URL", async () => {
+    mintMock.mockClear();
+    mintMock.mockResolvedValue({
+      artifact_id: "a_s3",
+      signed_url: MINTED_URL,
+      expires_at: 2,
+    });
+    const presignedArtifact = {
+      artifact_id: "a_s3",
+      artifact_type: "screenshot_action",
+      uri: "s3://bucket/a_s3.png",
+      signed_url:
+        "https://bucket.s3.amazonaws.com/a_s3.png?X-Amz-Signature=abc",
+    } as ArtifactApiResponse;
+
+    const { container } = render(<Probe probeArtifact={presignedArtifact} />);
+    const img = () => container.querySelector("img")!;
+    fireEvent.error(img());
+
+    await waitFor(() => {
+      expect(img().getAttribute("src")).toBe(MINTED_URL);
+    });
+    expect(mintMock).toHaveBeenCalledWith(null, "a_s3");
+  });
+
+  it("does not mint for file-backed sources (local proxy never expires)", async () => {
+    mintMock.mockClear();
+    const fileArtifact = {
+      artifact_id: "a_file",
+      artifact_type: "screenshot_action",
+      uri: "file:///data/artifacts/a_file.png",
+      signed_url: undefined,
+    } as unknown as ArtifactApiResponse;
+
+    const { container, queryByTestId } = render(
+      <Probe probeArtifact={fileArtifact} />,
+    );
+    fireEvent.error(container.querySelector("img")!);
+
+    await waitFor(() => {
+      expect(queryByTestId("failed")).not.toBeNull();
+    });
+    expect(mintMock).not.toHaveBeenCalled();
+  });
+
   it("ignores a mint that resolves after the artifact changed", async () => {
     let resolveMint!: (value: unknown) => void;
     mintMock.mockReset();

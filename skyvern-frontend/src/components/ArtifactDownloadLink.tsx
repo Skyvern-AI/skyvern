@@ -1,4 +1,4 @@
-import { freshArtifactUrl } from "@/api/artifactUrls";
+import { artifactIdFromContentUrl, freshArtifactUrl } from "@/api/artifactUrls";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 type Props = Omit<React.ComponentPropsWithoutRef<"a">, "href"> & {
@@ -29,6 +29,11 @@ function ArtifactDownloadLink({
       event.shiftKey ||
       event.altKey
     ) {
+      return;
+    }
+    // Non-mintable hrefs navigate natively: keeps rel semantics (noreferrer)
+    // and avoids the blank-tab flash for links that never need re-minting.
+    if (!artifactIdFromContentUrl(href)) {
       return;
     }
     event.preventDefault();

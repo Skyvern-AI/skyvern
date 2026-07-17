@@ -48,6 +48,27 @@ describe("ArtifactDownloadLink", () => {
     openSpy.mockRestore();
   });
 
+  it("keeps native behavior for non-artifact hrefs (rel semantics, no blank tab)", () => {
+    freshMock.mockClear();
+    const openSpy = vi.spyOn(window, "open");
+    const { container } = render(
+      <ArtifactDownloadLink
+        href="https://bucket.s3.amazonaws.com/file.pdf?X-Amz-Signature=abc"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        file.pdf
+      </ArtifactDownloadLink>,
+    );
+    const anchor = container.querySelector("a")!;
+    const notPrevented = fireEvent.click(anchor);
+
+    expect(notPrevented).toBe(true);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(freshMock).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  });
+
   it("keeps native behavior for modified clicks", () => {
     freshMock.mockClear();
     const { container } = render(
