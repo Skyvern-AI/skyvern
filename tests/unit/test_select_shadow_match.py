@@ -1,3 +1,4 @@
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 from zoneinfo import ZoneInfo
@@ -20,7 +21,7 @@ _SHADOW_OPTION = {
 
 
 def _shadow_task() -> SimpleNamespace:
-    return SimpleNamespace(navigation_goal="goal", navigation_payload={}, llm_key=None)
+    return SimpleNamespace(navigation_goal="goal", navigation_payload={}, llm_key=None, organization_id=None)
 
 
 class _FakeSelectLocator:
@@ -483,9 +484,7 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
         click=AsyncMock(),
     )
     dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=selected_element))
-    llm_handler = AsyncMock(
-        return_value={"id": "different-id", "value": "  committed   value  ", "action_type": "click"}
-    )
+    llm_handler = AsyncMock(return_value={"id": "matched-id", "value": "  committed   value  ", "action_type": "click"})
     monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
     monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div>Committed Value</div>"))
     monkeypatch.setattr(handler, "_select_deterministic_custom_option", AsyncMock(return_value=None))
@@ -519,6 +518,611 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
     assert len(events) == 1
     assert events[0]["prompt_name"] == "custom-select/emerging"
     assert events[0]["match_agrees_with_llm"] is True
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_falls_back_to_visible_controlled_listbox_when_no_ids_are_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = {
+        "id": "field-id",
+        "tagName": "button",
+        "attributes": {
+            "aria-controls": "menu-dom-id",
+            "aria-expanded": "true",
+            "role": "combobox",
+        },
+        "interactable": True,
+        "children": [],
+    }
+    listbox = {
+        "id": "menu-id",
+        "tagName": "div",
+        "attributes": {"id": "menu-dom-id", "role": "listbox"},
+        "children": [
+            {
+                "id": "option-a",
+                "tagName": "button",
+                "attributes": {"role": "option"},
+                "text": "Alpha",
+                "interactable": True,
+                "children": [],
+            },
+            {
+                "id": "option-hidden",
+                "tagName": "button",
+                "attributes": {"role": "option"},
+                "text": "Beta",
+                "interactable": False,
+                "children": [],
+            },
+            {
+                "id": "option-b",
+                "tagName": "button",
+                "attributes": {"role": "option"},
+                "text": "Beta",
+                "interactable": True,
+                "children": [],
+            },
+        ],
+    }
+    tree = [anchor, listbox]
+    ids = {
+        "field-id": "[unique_id=field-id]",
+        "menu-id": "[unique_id=menu-id]",
+        "option-a": "[unique_id=option-a]",
+        "option-hidden": "[unique_id=option-hidden]",
+        "option-b": "[unique_id=option-b]",
+    }
+
+    def element_for_id(element_id: str) -> MagicMock:
+        return MagicMock(
+            is_interactable=Mock(return_value=element_id.startswith("option-") and element_id != "option-hidden")
+        )
+
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock(side_effect=element_for_id))
+
+    async def select_deterministically(**kwargs: object) -> tuple[handler.ActionSuccess, str]:
+        get_option_candidates = kwargs["get_option_candidates"]
+        assert callable(get_option_candidates)
+        assert [candidate["label"] for candidate in get_option_candidates()] == ["Alpha", "Beta"]
+        return handler.ActionSuccess(), "Beta"
+
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    deterministic_select = AsyncMock(side_effect=select_deterministically)
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
+    llm_handler = AsyncMock()
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=llm_handler),
+    )
+
+    scraped_page = SimpleNamespace(id_to_css_dict=ids)
+    scraped_page_after_open = SimpleNamespace(id_to_css_dict=ids, element_tree=tree, element_tree_trimmed=tree)
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        result = await handler.select_from_emerging_elements(
+            current_element_id="field-id",
+            options=handler.CustomSelectPromptOptions(target_value="Beta"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            scraped_page_after_open=scraped_page_after_open,
+            step=SimpleNamespace(step_id="step-1"),
+            task=_shadow_task(),
+        )
+
+    assert isinstance(result, handler.ActionSuccess)
+    deterministic_select.assert_awaited_once()
+    llm_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_fallback_resolves_owned_listbox_when_trim_strips_ownership_attrs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A custom combobox whose listbox is linked by aria-controls. trim_element_tree drops
+    # aria-controls / aria-owns / the DOM id from the trimmed tree, so ownership must be resolved
+    # from the untrimmed element_tree — resolving it from the trimmed tree leaves the fallback inert.
+    anchor = {
+        "id": "field-id",
+        "tagName": "button",
+        "attributes": {"aria-controls": "menu-dom-id", "aria-expanded": "true", "role": "combobox"},
+        "interactable": True,
+        "children": [],
+    }
+    listbox = {
+        "id": "menu-id",
+        "tagName": "div",
+        "attributes": {"id": "menu-dom-id", "role": "listbox"},
+        "children": [
+            {
+                "id": "option-a",
+                "tagName": "button",
+                "attributes": {"role": "option"},
+                "text": "Alpha",
+                "interactable": True,
+                "children": [],
+            },
+            {
+                "id": "option-b",
+                "tagName": "button",
+                "attributes": {"role": "option"},
+                "text": "Beta",
+                "interactable": True,
+                "children": [],
+            },
+        ],
+    }
+    element_tree = [anchor, listbox]
+    element_tree_trimmed = handler.trim_element_tree(copy.deepcopy(element_tree))
+    # Guard the premise: trim really removes the ownership signal the fallback keys off.
+    assert "aria-controls" not in (element_tree_trimmed[0].get("attributes") or {})
+    assert "id" not in (element_tree_trimmed[1].get("attributes") or {})
+
+    ids = {
+        "field-id": "[unique_id=field-id]",
+        "menu-id": "[unique_id=menu-id]",
+        "option-a": "[unique_id=option-a]",
+        "option-b": "[unique_id=option-b]",
+    }
+
+    def element_for_id(element_id: str) -> MagicMock:
+        return MagicMock(is_interactable=Mock(return_value=element_id.startswith("option-")))
+
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock(side_effect=element_for_id))
+
+    async def select_deterministically(**kwargs: object) -> tuple[handler.ActionSuccess, str]:
+        get_option_candidates = kwargs["get_option_candidates"]
+        assert callable(get_option_candidates)
+        assert [candidate["label"] for candidate in get_option_candidates()] == ["Alpha", "Beta"]
+        return handler.ActionSuccess(), "Beta"
+
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    deterministic_select = AsyncMock(side_effect=select_deterministically)
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=AsyncMock()),
+    )
+
+    scraped_page = SimpleNamespace(id_to_css_dict=ids)
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict=ids,
+        element_tree=element_tree,
+        element_tree_trimmed=element_tree_trimmed,
+    )
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        result = await handler.select_from_emerging_elements(
+            current_element_id="field-id",
+            options=handler.CustomSelectPromptOptions(target_value="Beta"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            scraped_page_after_open=scraped_page_after_open,
+            step=SimpleNamespace(step_id="step-1"),
+            task=_shadow_task(),
+        )
+
+    assert isinstance(result, handler.ActionSuccess)
+    deterministic_select.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_keeps_off_list_candidate_for_deterministic_match_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Option nodes in custom widgets are often not flagged interactable. With the verify flag off we
+    # must not pre-filter deterministic candidates to the interactable set (main's behavior) — dropping
+    # them there would regress selections that used to succeed.
+    tree = [
+        {
+            "id": "option-x",
+            "tagName": "div",
+            "attributes": {"role": "option"},
+            "text": "Alpha",
+            "interactable": True,
+            "children": [],
+        },
+        {
+            "id": "option-y",
+            "tagName": "div",
+            "attributes": {"role": "option"},
+            "text": "Beta",
+            "children": [],
+        },
+    ]
+    monkeypatch.setattr(handler, "_is_verify_emerging_select_pick_enabled", AsyncMock(return_value=False))
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock())
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div role='option'>option</div>"))
+    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
+    llm_handler = AsyncMock()
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=llm_handler),
+    )
+
+    async def select_deterministically(**kwargs: object) -> tuple[handler.ActionSuccess, str]:
+        get_option_candidates = kwargs["get_option_candidates"]
+        assert callable(get_option_candidates)
+        assert [candidate["element_id"] for candidate in get_option_candidates()] == ["option-x", "option-y"]
+        return handler.ActionSuccess(), "Beta"
+
+    deterministic_select = AsyncMock(side_effect=select_deterministically)
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
+
+    scraped_page = SimpleNamespace(id_to_css_dict={})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={"option-x": "[unique_id=option-x]", "option-y": "[unique_id=option-y]"},
+        element_tree_trimmed=tree,
+    )
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        result = await handler.select_from_emerging_elements(
+            current_element_id="field-id",
+            options=handler.CustomSelectPromptOptions(target_value="Beta"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            scraped_page_after_open=scraped_page_after_open,
+            new_interactable_element_ids=["option-x"],
+            step=SimpleNamespace(step_id="step-1"),
+            task=_shadow_task(),
+        )
+
+    assert isinstance(result, handler.ActionSuccess)
+    deterministic_select.assert_awaited_once()
+    llm_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("anchor_expanded", "expected"), [(False, []), (True, ["listbox-id"])])
+def test_custom_select_fallback_requires_open_anchor_for_sole_listbox(
+    anchor_expanded: bool,
+    expected: list[str],
+) -> None:
+    tree = [
+        {
+            "id": "field-id",
+            "tagName": "button",
+            "attributes": {"aria-expanded": str(anchor_expanded).lower()},
+            "children": [],
+        },
+        {
+            "id": "listbox-id",
+            "tagName": "div",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "id": "option-id",
+                    "tagName": "button",
+                    "attributes": {"role": "option"},
+                    "text": "Alpha",
+                    "children": [],
+                }
+            ],
+        },
+    ]
+
+    result = handler._custom_select_fallback_subtrees(tree, "field-id")
+
+    assert [element["id"] for element in result] == expected
+
+
+def test_custom_select_fallback_accepts_sole_listbox_for_expanded_combobox_ancestor() -> None:
+    tree = [
+        {
+            "id": "combobox-id",
+            "tagName": "div",
+            "attributes": {"aria-expanded": "true", "role": "combobox"},
+            "children": [
+                {
+                    "id": "field-id",
+                    "tagName": "input",
+                    "attributes": {},
+                    "children": [],
+                }
+            ],
+        },
+        {
+            "id": "listbox-id",
+            "tagName": "div",
+            "attributes": {"role": "listbox"},
+            "children": [
+                {
+                    "id": "option-id",
+                    "tagName": "button",
+                    "attributes": {"role": "option"},
+                    "text": "Alpha",
+                    "children": [],
+                }
+            ],
+        },
+    ]
+
+    result = handler._custom_select_fallback_subtrees(tree, "field-id")
+
+    assert [element["id"] for element in result] == ["listbox-id"]
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_rejects_page_global_options_without_owned_listbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = [
+        {
+            "id": "field-id",
+            "tagName": "button",
+            "attributes": {"aria-expanded": "true", "role": "combobox"},
+            "children": [],
+        },
+        {
+            "id": "unrelated-option",
+            "tagName": "button",
+            "attributes": {"role": "option"},
+            "text": "Wrong field",
+            "children": [],
+        },
+    ]
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock())
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={"field-id": "[unique_id=field-id]"},
+        element_tree=tree,
+        element_tree_trimmed=tree,
+    )
+
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        with pytest.raises(handler.NoIncrementalElementFoundForCustomSelection):
+            await handler.select_from_emerging_elements(
+                current_element_id="field-id",
+                options=handler.CustomSelectPromptOptions(target_value="Wrong field"),
+                page=MagicMock(),
+                scraped_page=scraped_page,
+                scraped_page_after_open=scraped_page_after_open,
+                step=SimpleNamespace(step_id="step-1"),
+                task=_shadow_task(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_rejects_hidden_candidate_from_deterministic_and_llm_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = [
+        {
+            "id": "hidden-id",
+            "tagName": "button",
+            "attributes": {"role": "option"},
+            "text": "Exact target",
+            "children": [],
+        },
+        {
+            "id": "visible-id",
+            "tagName": "button",
+            "attributes": {"role": "option"},
+            "text": "Visible alternative",
+            "children": [],
+        },
+    ]
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock())
+    monkeypatch.setattr(handler, "_is_verify_emerging_select_pick_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<button role='option'>option</button>"))
+    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
+    llm_handler = AsyncMock(return_value={"id": "hidden-id", "value": "Exact target", "action_type": "click"})
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=llm_handler),
+    )
+
+    async def select_deterministically(**kwargs: object) -> None:
+        get_option_candidates = kwargs["get_option_candidates"]
+        assert callable(get_option_candidates)
+        assert [candidate["element_id"] for candidate in get_option_candidates()] == ["visible-id"]
+        return None
+
+    monkeypatch.setattr(
+        handler,
+        "_select_deterministic_custom_option",
+        AsyncMock(side_effect=select_deterministically),
+    )
+    scraped_page = SimpleNamespace(id_to_css_dict={})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={
+            "hidden-id": "[unique_id=hidden-id]",
+            "visible-id": "[unique_id=visible-id]",
+        },
+        element_tree_trimmed=tree,
+    )
+
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        with pytest.raises(handler.NoAvailableOptionFoundForCustomSelection):
+            await handler.select_from_emerging_elements(
+                current_element_id="field-id",
+                options=handler.CustomSelectPromptOptions(target_value="Exact target"),
+                page=MagicMock(),
+                scraped_page=scraped_page,
+                scraped_page_after_open=scraped_page_after_open,
+                new_interactable_element_ids=["visible-id"],
+                step=SimpleNamespace(step_id="step-1"),
+                task=_shadow_task(),
+            )
+
+    dom_after_open.get_skyvern_element_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_allows_input_text_on_anchor_element(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor_input = MagicMock(
+        scroll_into_view=AsyncMock(),
+        get_tag_name=Mock(return_value="input"),
+        get_locator=Mock(return_value=MagicMock()),
+        is_readonly=AsyncMock(return_value=False),
+        input_clear=AsyncMock(),
+        input_sequentially=AsyncMock(),
+    )
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=anchor_input))
+    llm_handler = AsyncMock(return_value={"id": "field-id", "value": "filter text", "action_type": "input_text"})
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div>Option</div>"))
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=llm_handler),
+    )
+
+    scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={
+            "field-id": "[unique_id=field-id]",
+            "option-x": "[unique_id=option-x]",
+        },
+        element_tree_trimmed=[
+            {
+                "id": "option-x",
+                "tagName": "div",
+                "attributes": {"role": "option"},
+                "text": "Other Option",
+                "interactable": True,
+            }
+        ],
+    )
+    task = SimpleNamespace(
+        navigation_goal="goal", navigation_payload={}, llm_key=None, workflow_run_id=None, organization_id=None
+    )
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        result = await handler.select_from_emerging_elements(
+            current_element_id="field-id",
+            options=handler.CustomSelectPromptOptions(target_value="filter text"),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            scraped_page_after_open=scraped_page_after_open,
+            new_interactable_element_ids=["option-x"],
+            step=SimpleNamespace(step_id="step-1"),
+            task=task,
+        )
+
+    assert isinstance(result, handler.ActionSuccess)
+    anchor_input.input_clear.assert_awaited_once()
+    anchor_input.input_sequentially.assert_awaited_once_with("filter text")
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_rejects_input_text_on_element_outside_anchor_and_new_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock())
+    llm_handler = AsyncMock(return_value={"id": "stranger-id", "value": "filter text", "action_type": "input_text"})
+    monkeypatch.setattr(handler, "_is_verify_emerging_select_pick_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div>Option</div>"))
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=llm_handler),
+    )
+
+    scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={
+            "field-id": "[unique_id=field-id]",
+            "option-x": "[unique_id=option-x]",
+        },
+        element_tree_trimmed=[
+            {
+                "id": "option-x",
+                "tagName": "div",
+                "attributes": {"role": "option"},
+                "text": "Other Option",
+                "interactable": True,
+            }
+        ],
+    )
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        with pytest.raises(handler.NoAvailableOptionFoundForCustomSelection):
+            await handler.select_from_emerging_elements(
+                current_element_id="field-id",
+                options=handler.CustomSelectPromptOptions(target_value="filter text"),
+                page=MagicMock(),
+                scraped_page=scraped_page,
+                scraped_page_after_open=scraped_page_after_open,
+                new_interactable_element_ids=["option-x"],
+                step=SimpleNamespace(step_id="step-1"),
+                task=_shadow_task(),
+            )
+
+    dom_after_open.get_skyvern_element_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emerging_select_off_list_pick_still_proceeds_when_flag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Flag off keeps today's behavior: an off-list pick is still acted on rather than rejected, so
+    # merging this cannot change any org's outcomes until the flag is ramped.
+    selected_element = MagicMock(
+        get_tag_name=Mock(return_value="div"),
+        get_attr=AsyncMock(return_value=None),
+        scroll_into_view=AsyncMock(),
+        click=AsyncMock(),
+    )
+    dom_after_open = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=selected_element))
+    llm_handler = AsyncMock(return_value={"id": "stranger-id", "value": None, "action_type": "click"})
+    monkeypatch.setattr(handler, "_is_verify_emerging_select_pick_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(handler, "DomUtil", Mock(return_value=dom_after_open))
+    monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div>Option</div>"))
+    monkeypatch.setattr(handler, "_select_deterministic_custom_option", AsyncMock(return_value=None))
+    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
+    monkeypatch.setattr(
+        handler.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        Mock(return_value=llm_handler),
+    )
+
+    scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={
+            "field-id": "[unique_id=field-id]",
+            "option-x": "[unique_id=option-x]",
+        },
+        element_tree_trimmed=[
+            {
+                "id": "option-x",
+                "tagName": "div",
+                "attributes": {"role": "option"},
+                "text": "Other Option",
+                "interactable": True,
+            }
+        ],
+    )
+    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
+        with structlog.testing.capture_logs() as logs:
+            result = await handler.select_from_emerging_elements(
+                current_element_id="field-id",
+                options=handler.CustomSelectPromptOptions(target_value="filter text"),
+                page=MagicMock(),
+                scraped_page=scraped_page,
+                scraped_page_after_open=scraped_page_after_open,
+                new_interactable_element_ids=["option-x"],
+                step=SimpleNamespace(step_id="step-1"),
+                task=_shadow_task(),
+            )
+
+    assert isinstance(result, handler.ActionSuccess)
+    selected_element.click.assert_awaited()
+    # Flag off still emits telemetry so the reject rate is measurable before ramping the flag on.
+    off_list_warnings = [
+        log for log in logs if log.get("log_level") == "warning" and log.get("element_id") == "stranger-id"
+    ]
+    assert off_list_warnings
 
 
 @pytest.mark.asyncio
