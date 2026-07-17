@@ -2875,6 +2875,160 @@ function asyncSleepFor(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const incrementalObserverAttributeFilter = [
+  "class",
+  "style",
+  "hidden",
+  "aria-expanded",
+  "aria-hidden",
+];
+const maxIncrementalShadowRootDepth = 10;
+const maxIncrementalShadowRootCount = 200;
+const maxIncrementalShadowDiscoveryVisits = 4000;
+const incrementalShadowDiscoveryBudgetMs = 25;
+
+function getIncrementalObserverOptions() {
+  return {
+    attributes: true,
+    attributeOldValue: true,
+    childList: true,
+    subtree: true,
+    characterData: true,
+  };
+}
+
+function getIncrementalOptionLikeElements(
+  root,
+  recurseObservedShadowRoots = false,
+) {
+  const selector =
+    '[role="listbox"], [role="option"], [role="listbox"] li, [role="combobox"] li';
+  const elements = [];
+  const pending = [root];
+  const visited = new Set();
+  while (pending.length > 0) {
+    const currentRoot = pending.pop();
+    if (!currentRoot || visited.has(currentRoot)) continue;
+    visited.add(currentRoot);
+    if (currentRoot instanceof Element && currentRoot.matches(selector)) {
+      elements.push(currentRoot);
+    }
+    if (currentRoot.querySelectorAll) {
+      elements.push(...currentRoot.querySelectorAll(selector));
+    }
+    if (!recurseObservedShadowRoots) continue;
+    const possibleHosts =
+      currentRoot instanceof Element
+        ? [currentRoot, ...currentRoot.querySelectorAll("*")]
+        : [...currentRoot.querySelectorAll("*")];
+    for (const possibleHost of possibleHosts) {
+      if (
+        possibleHost.shadowRoot &&
+        window.globalObservedShadowRoots.has(possibleHost.shadowRoot)
+      ) {
+        pending.push(possibleHost.shadowRoot);
+      }
+    }
+  }
+  return elements;
+}
+
+function isIncrementalOptionSubtreeVisible(element) {
+  return (
+    !element.hidden &&
+    element.getAttribute("aria-hidden") !== "true" &&
+    isElementVisible(element)
+  );
+}
+
+function trackIncrementalOptionVisibility(root) {
+  for (const optionLikeElement of getIncrementalOptionLikeElements(root)) {
+    let currentElement = optionLikeElement;
+    while (currentElement instanceof Element) {
+      if (window.globalIncrementalVisibilityMap.has(currentElement)) break;
+      window.globalIncrementalVisibilityMap.set(
+        currentElement,
+        isIncrementalOptionSubtreeVisible(currentElement),
+      );
+      if (currentElement.parentElement) {
+        currentElement = currentElement.parentElement;
+        continue;
+      }
+      const currentRoot = currentElement.getRootNode();
+      currentElement =
+        currentRoot instanceof ShadowRoot ? currentRoot.host : null;
+    }
+  }
+}
+
+function observeIncrementalTarget(target) {
+  window.globalObserverForDOMIncrement.observe(
+    target,
+    getIncrementalObserverOptions(),
+  );
+  trackIncrementalOptionVisibility(target);
+}
+
+function observeIncrementalShadowRoot(shadowRoot, countTowardBudget = true) {
+  if (window.globalObservedShadowRoots.has(shadowRoot)) return;
+  window.globalObservedShadowRoots.add(shadowRoot);
+  if (countTowardBudget) {
+    window.globalObservedShadowRootCount++;
+  }
+  observeIncrementalTarget(shadowRoot);
+}
+
+function discoverAndObserveOpenShadowRoots(
+  startNode,
+  initialDepth = 0,
+  deadline = Number.POSITIVE_INFINITY,
+  countTowardBudget = true,
+) {
+  const pending = [{ node: startNode, depth: initialDepth }];
+  let currentIndex = 0;
+  while (
+    currentIndex < pending.length &&
+    currentIndex < maxIncrementalShadowDiscoveryVisits &&
+    (!countTowardBudget ||
+      window.globalObservedShadowRootCount < maxIncrementalShadowRootCount) &&
+    performance.now() < deadline
+  ) {
+    const { node, depth } = pending[currentIndex++];
+    if (!node || depth > maxIncrementalShadowRootDepth) continue;
+
+    if (
+      node instanceof Element &&
+      node.shadowRoot &&
+      depth < maxIncrementalShadowRootDepth
+    ) {
+      const shadowRoot = node.shadowRoot;
+      if (!window.globalObservedShadowRoots.has(shadowRoot)) {
+        observeIncrementalShadowRoot(shadowRoot, countTowardBudget);
+      }
+      for (const child of shadowRoot.children) {
+        pending.push({ node: child, depth: depth + 1 });
+      }
+    }
+
+    if (node.children) {
+      for (const child of node.children) {
+        pending.push({ node: child, depth });
+      }
+    }
+  }
+}
+
+function isNewlyVisibleIncrementalOptionSubtree(node) {
+  const wasVisible = window.globalIncrementalVisibilityMap.get(node) ?? false;
+  const isVisible = isIncrementalOptionSubtreeVisible(node);
+  window.globalIncrementalVisibilityMap.set(node, isVisible);
+  return (
+    !wasVisible &&
+    isVisible &&
+    getIncrementalOptionLikeElements(node, true).length > 0
+  );
+}
+
 async function addIncrementalNodeToMap(parentNode, childrenNode) {
   const maxParsedElement = 3000;
   const maxElementToWait = 100;
@@ -2891,10 +3045,7 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
   if (window.globalListnerFlag) {
     // calculate the depth of targetNode element for sorting
     const depth = getElementDomDepth(parentNode);
-    let newNodesTreeList = [];
-    if (window.globalDomDepthMap.has(depth)) {
-      newNodesTreeList = window.globalDomDepthMap.get(depth);
-    }
+    const parsedNodeTrees = [];
 
     try {
       for (const child of childrenNode) {
@@ -2912,13 +3063,17 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
           window.globalHoverStylesMap,
         );
         if (newNodeTree.length > 0) {
-          newNodesTreeList.push(...newNodeTree);
+          parsedNodeTrees.push(...newNodeTree);
         }
       }
     } catch (error) {
       _jsConsoleError("Error building incremental element node:", error);
     }
-    window.globalDomDepthMap.set(depth, newNodesTreeList);
+    const currentNodeTrees = window.globalDomDepthMap.get(depth) || [];
+    window.globalDomDepthMap.set(depth, [
+      ...currentNodeTrees,
+      ...parsedNodeTrees,
+    ]);
   }
   await window.globalParsedElementCounter.add();
 }
@@ -2928,11 +3083,28 @@ if (window.globalObserverForDOMIncrement === undefined) {
     mutationsList,
     observer,
   ) {
+    const shadowDiscoveryDeadline =
+      performance.now() + incrementalShadowDiscoveryBudgetMs;
     // TODO: how to detect duplicated recreate element?
     for (const mutation of mutationsList) {
-      const node = mutation.target;
+      const node =
+        mutation.target instanceof ShadowRoot
+          ? mutation.target.host
+          : mutation.target;
       if (node.nodeType === Node.TEXT_NODE) continue;
       const tagName = node.tagName?.toLowerCase();
+
+      if (mutation.type === "childList") {
+        for (const addedNode of mutation.addedNodes) {
+          if (!(addedNode instanceof Element)) continue;
+          trackIncrementalOptionVisibility(addedNode);
+          discoverAndObserveOpenShadowRoots(
+            addedNode,
+            0,
+            shadowDiscoveryDeadline,
+          );
+        }
+      }
 
       // ignore unique_id change to avoid infinite loop about DOM changes
       if (mutation.attributeName === "unique_id") continue;
@@ -2955,6 +3127,19 @@ if (window.globalObserverForDOMIncrement === undefined) {
       // we detect the element based on the following rules
       switch (mutation.type) {
         case "attributes": {
+          if (
+            incrementalObserverAttributeFilter.includes(
+              mutation.attributeName,
+            ) &&
+            isNewlyVisibleIncrementalOptionSubtree(node)
+          ) {
+            window.globalOneTimeIncrementElements.push({
+              targetNode: node,
+              newNodes: [node],
+            });
+            await addIncrementalNodeToMap(node, [node]);
+            break;
+          }
           switch (mutation.attributeName) {
             case "hidden": {
               if (!node.hidden) {
@@ -3050,25 +3235,48 @@ async function startGlobalIncrementalObserver(element = null) {
   window.globalOneTimeIncrementElements = [];
   await getHoverStylesMap();
   window.globalParsedElementCounter = new SafeCounter();
+  window.globalIncrementalVisibilityMap = new WeakMap();
+  window.globalObservedShadowRoots = new WeakSet();
+  window.globalObservedShadowRootCount = 0;
+  window.globalIncrementalObserverGeneration =
+    (window.globalIncrementalObserverGeneration || 0) + 1;
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
-  window.globalObserverForDOMIncrement.observe(document.body, {
-    attributes: true,
-    attributeOldValue: true,
-    childList: true,
-    subtree: true,
-    characterData: true,
-  });
 
-  // if the element is in shadow DOM, we need to observe the shadow DOM as well
-  if (element && element.getRootNode() instanceof ShadowRoot) {
-    window.globalObserverForDOMIncrement.observe(element.getRootNode(), {
-      attributes: true,
-      attributeOldValue: true,
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
+  let composedTreeElement = element;
+  let composedTreeDepth = 0;
+  const composedTreeRoots = [];
+  while (
+    composedTreeElement instanceof Element &&
+    composedTreeDepth < maxIncrementalShadowRootDepth
+  ) {
+    const root = composedTreeElement.getRootNode();
+    if (!(root instanceof ShadowRoot)) break;
+    observeIncrementalShadowRoot(root, false);
+    composedTreeRoots.push({ root, depth: composedTreeDepth });
+    composedTreeElement = root.host;
+    composedTreeDepth++;
   }
+
+  const anchorDiscoveryDeadline = performance.now() + 50;
+  for (const { root, depth } of composedTreeRoots) {
+    discoverAndObserveOpenShadowRoots(root, depth, anchorDiscoveryDeadline);
+  }
+
+  observeIncrementalTarget(document.body);
+  const observerGeneration = window.globalIncrementalObserverGeneration;
+  setTimeout(() => {
+    if (
+      !window.globalListnerFlag ||
+      observerGeneration !== window.globalIncrementalObserverGeneration
+    ) {
+      return;
+    }
+    discoverAndObserveOpenShadowRoots(
+      document.documentElement,
+      0,
+      performance.now() + 50,
+    );
+  }, 0);
 }
 
 async function stopGlobalIncrementalObserver() {
