@@ -155,6 +155,7 @@ class _Ctx:
         self.last_run_blocks_workflow_run_id = None
         self.completion_criteria_turn_state = None
         self.reached_download_target: ReachedDownloadTarget | None = None
+        self.author_time_gate_log_only_ids: frozenset[str] = frozenset()
         self.author_time_gate_ablation_events = []
         self.request_policy = None
         self.blocker_signal = None
