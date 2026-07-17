@@ -79,6 +79,8 @@ import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptySta
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
 import { useRunTagsBatchQuery } from "@/routes/tasks/hooks/useRunTagsBatchQuery";
+import { useRunsHealSummaryBatchQuery } from "@/routes/workflows/hooks/useRunsHealSummaryBatchQuery";
+import { RunOutcomeRiskMarker } from "@/routes/workflows/workflowRun/RunOutcomeRiskMarker";
 import { useRunTagSuggestionsQuery } from "@/routes/tasks/hooks/useRunTagSuggestionsQuery";
 import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
@@ -277,6 +279,7 @@ function RunHistory() {
   const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
     enabled: taggingEnabled,
   });
+  const { data: runHealMap = {} } = useRunsHealSummaryBatchQuery(runIds);
   const { data: tagKeys = [] } = useTagKeysQuery({ enabled: taggingEnabled });
   const tagDescriptions = useMemo(
     () =>
@@ -492,13 +495,20 @@ function RunHistory() {
             </div>
           </TableCell>
           <TableCell>
-            {isKnownStatus(run.status) ? (
-              <StatusBadge status={run.status} />
-            ) : (
-              <span className="text-sm text-neutral-600 dark:text-slate-400">
-                {run.status}
-              </span>
-            )}
+            <div className="flex items-center gap-1.5">
+              {isKnownStatus(run.status) ? (
+                <StatusBadge status={run.status} />
+              ) : (
+                <span className="text-sm text-neutral-600 dark:text-slate-400">
+                  {run.status}
+                </span>
+              )}
+              <RunOutcomeRiskMarker
+                outcomeRisk={
+                  (runHealMap[run.run_id]?.blocks_outcome_risk?.length ?? 0) > 0
+                }
+              />
+            </div>
           </TableCell>
           <TableCell
             className="max-w-0 truncate"

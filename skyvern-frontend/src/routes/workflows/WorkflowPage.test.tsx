@@ -76,6 +76,10 @@ vi.mock("@/routes/tasks/hooks/useRunTagsBatchQuery", () => ({
   useRunTagsBatchQuery: () => ({ data: {} }),
 }));
 
+vi.mock("./hooks/useRunsHealSummaryBatchQuery", () => ({
+  useRunsHealSummaryBatchQuery: () => ({ data: {} }),
+}));
+
 vi.mock("@/routes/tasks/hooks/useRunTagSuggestionsQuery", () => ({
   useRunTagSuggestionsQuery: () => ({
     data: { keys: [], valuesByKey: new Map(), labels: [] },
