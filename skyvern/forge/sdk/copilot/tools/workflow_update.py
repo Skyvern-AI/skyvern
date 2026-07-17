@@ -50,7 +50,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
     SANDBOX_UNRESOLVED_NAME_REASON_CODE,
+    CodeBlockRenderDiagnostic,
     author_time_code_block_diagnostics,
+    code_block_render_diagnostic,
     sandbox_unresolved_name_diagnostics,
     sandbox_unresolved_name_repair_diagnostic,
     strip_redundant_sandbox_imports,
@@ -141,6 +143,7 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     classify_output_contract_bail_family,
     code_block_available_binding_keys_by_label,
     declared_string_workflow_parameter_keys,
+    declared_workflow_parameter_keys,
     resolve_output_contract_actuation,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import FrozenRequestedOutputExtractionCandidate
@@ -200,6 +203,7 @@ from skyvern.forge.sdk.copilot.turn_ownership import (
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     credential_param_ids,
+    credential_params,
     parse_workflow_yaml,
     workflow_blocks,
 )
@@ -1063,6 +1067,42 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
             f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
         )
     return errors
+
+
+def _code_block_render_bound_names(workflow_yaml: str) -> set[str]:
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return set()
+    names = set(declared_workflow_parameter_keys(parsed))
+    workflow_definition = parsed.get("workflow_definition")
+    if isinstance(workflow_definition, dict):
+        for key in credential_params(workflow_definition.get("parameters")):
+            names.add(f"{key}_real_username")
+            names.add(f"{key}_real_password")
+    for block in workflow_blocks(parsed):
+        label = str(block.get("label") or "").strip()
+        if label:
+            names.add(label)
+            names.add(f"{label}_output")
+    return names
+
+
+def _code_block_render_reject(
+    workflow_yaml: str, prior_yaml: str | None
+) -> tuple[str, CodeBlockRenderDiagnostic] | None:
+    prior_blocks = _workflow_yaml_code_blocks_by_label(prior_yaml)
+    bound_names = _code_block_render_bound_names(workflow_yaml)
+    for label, block in _workflow_yaml_code_blocks_by_label(workflow_yaml).items():
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        prior_block = prior_blocks.get(label)
+        if prior_block is not None and str(prior_block.get("code") or "") == code:
+            continue
+        diagnostic = code_block_render_diagnostic(code, bound_names)
+        if diagnostic is not None:
+            return label, diagnostic
+    return None
 
 
 def _human_facing_code_safety_errors(errors: list[str | CodeBlockSecurityError]) -> list[str | CodeBlockSecurityError]:
@@ -11319,6 +11359,41 @@ async def _update_workflow(
                     "definition_criterion_ids": list(definition_reject.criterion_ids),
                     "definition_reason_codes": list(definition_reject.reason_codes),
                     "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+                },
+            )
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        unrenderable = _code_block_render_reject(workflow_yaml, getattr(ctx, "workflow_yaml", None))
+        if unrenderable is not None:
+            unrenderable_label, render_diagnostic = unrenderable
+            render_error = (
+                f"Code block `{unrenderable_label}` contains a Jinja expression the workflow runtime "
+                f"cannot render. {render_diagnostic.message}"
+            )
+            LOG.info(
+                "copilot code block render preflight reject",
+                reason_code="code_block_unrenderable",
+                block_label=unrenderable_label,
+                failing_expression=render_diagnostic.failing_expression,
+            )
+            _record_author_time_reject_outcome(
+                ctx,
+                reason_code="code_block_unrenderable",
+                summary=render_error,
+                structural_payload={
+                    "reason_code": "code_block_unrenderable",
+                    "block_label": unrenderable_label,
+                    "failing_expression": render_diagnostic.failing_expression,
+                },
+                block_labels=[unrenderable_label],
+            )
+            _record_code_authoring_guardrail_reject(ctx)
+            return reject(
+                error=render_error,
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data={
+                    "reason_code": "code_block_unrenderable",
+                    "block_label": unrenderable_label,
+                    "failing_expression": render_diagnostic.failing_expression,
                 },
             )
     params["workflow_yaml"] = workflow_yaml
