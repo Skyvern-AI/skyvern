@@ -207,6 +207,18 @@ class CardNumberInputMismatch(SkyvernException):
         )
 
 
+class MaskedInputReadbackMismatch(SkyvernException):
+    # A masked field (postal code, SSN, etc.) accepted the keystrokes but committed nothing usable —
+    # it reads back empty or still shows mask placeholders. Counts only; the raw value may be a secret.
+    def __init__(self, *, expected_char_count: int, committed_char_count: int):
+        self.expected_char_count = expected_char_count
+        self.committed_char_count = committed_char_count
+        super().__init__(
+            "Masked input read-back mismatch: "
+            f"expected {expected_char_count} characters, committed {committed_char_count}."
+        )
+
+
 class ConditionalBranchEvaluationError(SkyvernException):
     """A conditional block could not resolve which branch to take."""
 

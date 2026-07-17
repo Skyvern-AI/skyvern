@@ -13,7 +13,7 @@ from skyvern.client.errors import NotFoundError
 
 DIRECT_TARGET_DESCRIPTION = "Direct target: deterministic, 0 LLM calls."
 AI_FALLBACK_DESCRIPTION = (
-    "AI fallback: costs Skyvern LLM calls, slower and nondeterministic — prefer selector/ref when known."
+    "AI fallback: costs Skyvern LLM calls, slower and nondeterministic — prefer selector when known."
 )
 
 
