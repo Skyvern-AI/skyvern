@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.exceptions import AutoCompletionCommitFailure
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext
 from skyvern.webeye.actions.handler import (
@@ -70,7 +71,10 @@ def _mock_skyvern_element(frame: MagicMock | None = None) -> MagicMock:
     # get_locator().click() needs to be async for the discover fallback's click call
     mock_locator = MagicMock()
     mock_locator.click = AsyncMock()
+    mock_locator.input_value = AsyncMock(return_value="I do not wish to disclose")
     el.get_locator.return_value = mock_locator
+    el.get_tag_name.return_value = "input"
+    el.get_attr = AsyncMock(return_value="false")
     return el
 
 
@@ -95,6 +99,7 @@ def _mock_incremental_scrape(elements: list[dict]) -> MagicMock:
     inc = MagicMock()
     inc.start_listen_dom_increment = AsyncMock()
     inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_elements_num = AsyncMock(return_value=len(elements))
     inc.get_incremental_element_tree = AsyncMock(return_value=copy.deepcopy(elements))
     inc.build_html_tree.return_value = "<div>mocked options</div>"
     inc.id_to_element_dict = {e["id"]: e for e in elements}
@@ -163,6 +168,260 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
         # Types the discovered value, then finds and clicks matched option via Playwright locator
         skyvern_el.press_fill.assert_awaited_with("I do not wish to disclose")
         inc_scrape.stop_listen_dom_increment.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_noop_keyboard_selection_is_not_a_commit() -> None:
+    """The input still holding the fallback's own fill with the listbox open is not commit evidence."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    skyvern_el.get_attr = AsyncMock(return_value="true")
+    inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+
+    llm_response = {
+        "auto_completion_attempt": True,
+        "relevance_float": 0.9,
+        "id": "OPT3",
+        "value": "I do not wish to disclose",
+        "reasoning": "'I do not wish to disclose' matches 'Decline to Self Identify'",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        with pytest.raises(AutoCompletionCommitFailure) as exc_info:
+            await discover_and_select_from_full_dropdown(
+                context=_make_context(),
+                page=MagicMock(),
+                scraped_page=MagicMock(),
+                dom=MagicMock(),
+                original_text="Decline to Self Identify",
+                skyvern_element=skyvern_el,
+                step=_STEP,
+                task=_TASK,
+            )
+
+    assert exc_info.value.stage == "clicked_but_not_committed"
+    inc_scrape.stop_listen_dom_increment.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_assumes_commit_when_verification_disabled() -> None:
+    """Flag off: the keyboard selection is assumed committed - same scenario the noop test above
+    rejects with verification enabled."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    skyvern_el.get_attr = AsyncMock(return_value="true")
+    inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+
+    llm_response = {
+        "auto_completion_attempt": True,
+        "relevance_float": 0.9,
+        "id": "OPT3",
+        "value": "I do not wish to disclose",
+        "reasoning": "'I do not wish to disclose' matches 'Decline to Self Identify'",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await discover_and_select_from_full_dropdown(
+            context=_make_context(),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            original_text="Decline to Self Identify",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            verify_commit=False,
+        )
+
+    assert isinstance(result, ActionSuccess)
+    inc_scrape.stop_listen_dom_increment.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_canonicalized_commit_succeeds() -> None:
+    """A widget that expands the committed value beyond the fallback's own fill counts as a commit."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    skyvern_el.get_attr = AsyncMock(return_value=None)
+    skyvern_el.get_locator.return_value.input_value = AsyncMock(return_value="I do not wish to disclose (private)")
+    inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+
+    llm_response = {
+        "auto_completion_attempt": True,
+        "relevance_float": 0.9,
+        "id": "OPT3",
+        "value": "I do not wish to disclose",
+        "reasoning": "Best semantic match",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await discover_and_select_from_full_dropdown(
+            context=_make_context(),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            original_text="Decline to Self Identify",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert isinstance(result, ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_exact_echo_without_expanded_state_is_a_commit() -> None:
+    """A widget that commits the option text verbatim and exposes no expanded state is a commit, not a failure."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    # No aria-expanded at all: the widget gives no open/closed signal, and the committed value is the
+    # option text verbatim, so it is indistinguishable from the fallback's own fill by value alone.
+    skyvern_el.get_attr = AsyncMock(return_value=None)
+    skyvern_el.get_locator.return_value.input_value = AsyncMock(return_value="I do not wish to disclose")
+    inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+
+    llm_response = {
+        "auto_completion_attempt": True,
+        "relevance_float": 0.9,
+        "id": "OPT3",
+        "value": "I do not wish to disclose",
+        "reasoning": "Best semantic match",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await discover_and_select_from_full_dropdown(
+            context=_make_context(),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            original_text="Decline to Self Identify",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert isinstance(result, ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_discover_fallback_ignores_stale_cached_expanded_state() -> None:
+    """A no-op Enter must not read as committed just because the element was scraped before the
+    dropdown opened. get_attr is static-first, so the cached aria-expanded="false" from that scrape
+    would otherwise stand in as commit evidence for an unchanged value."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    # Behaves like the real SkyvernElement.get_attr: static cache says "false" (scraped while closed),
+    # the live DOM says "true" (the listbox is still open, so Enter did nothing).
+    static_attrs = {"aria-expanded": "false"}
+    live_attrs = {"aria-expanded": "true"}
+
+    async def _get_attr(name: str, mode: str = "auto", **_kwargs: object) -> object:
+        if mode == "dynamic":
+            return live_attrs.get(name)
+        cached = static_attrs.get(name)
+        return cached if cached is not None or mode == "static" else live_attrs.get(name)
+
+    skyvern_el.get_attr = AsyncMock(side_effect=_get_attr)
+    skyvern_el.get_locator.return_value.input_value = AsyncMock(return_value="I do not wish to disclose")
+    inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+
+    llm_response = {
+        "auto_completion_attempt": True,
+        "relevance_float": 0.9,
+        "id": "OPT3",
+        "value": "I do not wish to disclose",
+        "reasoning": "Best semantic match",
+    }
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc_scrape),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        with pytest.raises(AutoCompletionCommitFailure):
+            await discover_and_select_from_full_dropdown(
+                context=_make_context(),
+                page=MagicMock(),
+                scraped_page=MagicMock(),
+                dom=MagicMock(),
+                original_text="Decline to Self Identify",
+                skyvern_element=skyvern_el,
+                step=_STEP,
+                task=_TASK,
+            )
 
 
 @pytest.mark.asyncio
@@ -612,7 +871,7 @@ async def test_input_or_auto_complete_skips_discover_for_search_bar() -> None:
         mock_prompt.load_prompt.return_value = "mocked prompt"
         mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
 
-        # Note: search bars bail out early at L2989 (before potential_values),
+        # Search bars fall through to plain typing (None) instead of hard-failing,
         # so discover_fallback is never reached. This test verifies that.
         result = await input_or_auto_complete_input(
             input_or_select_context=_make_context(is_search_bar=True),
@@ -625,6 +884,225 @@ async def test_input_or_auto_complete_skips_discover_for_search_bar() -> None:
             task=_TASK,
         )
 
-        # Search bar returns None early, never reaching discover fallback
         assert result is None
         mock_discover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_input_or_auto_complete_failure_includes_attempt_trail() -> None:
+    """A location field with the commit-required flag on returns a typed failure with the attempt trail."""
+    skyvern_el = _mock_skyvern_element()
+    choose_result = AutoCompletionResult(
+        action_result=ActionFailure(AutoCompletionCommitFailure(stage="suggestions_never_rendered")),
+        stage_outcome="suggestions_never_rendered",
+    )
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.choose_auto_completion_dropdown",
+            new=AsyncMock(return_value=choose_result),
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(is_location_input=True),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="private value",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert isinstance(result, ActionFailure)
+    assert result.exception_type == AutoCompletionCommitFailure.__name__
+    assert result.exception_message is not None
+    assert "attempt_1:suggestions_never_rendered" in result.exception_message
+    assert "attempt_2:suggestion_not_matched" in result.exception_message
+    assert "private value" not in result.exception_message
+
+
+def _side_effect_choose_result() -> AutoCompletionResult:
+    return AutoCompletionResult(
+        action_result=ActionFailure(AutoCompletionCommitFailure(stage="clicked_but_not_committed")),
+        stage_outcome="clicked_but_not_committed",
+        committed_side_effects=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_side_effectful_click_stops_retrying_with_flag_on() -> None:
+    """Once a click has mutated the field but could not be verified, the orchestration loop must
+    stop instead of generating more values and clicking additional options on the dirty field."""
+    skyvern_el = _mock_skyvern_element()
+    choose_mock = AsyncMock(return_value=_side_effect_choose_result())
+    discover_mock = AsyncMock(return_value=ActionSuccess())
+
+    with (
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=choose_mock),
+        patch("skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown", new=discover_mock),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(is_location_input=True),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="private value",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert choose_mock.call_count == 1
+    discover_mock.assert_not_called()
+    mock_app.SECONDARY_LLM_API_HANDLER.assert_not_called()
+    assert isinstance(result, ActionFailure)
+    assert result.exception_type == AutoCompletionCommitFailure.__name__
+    assert "clicked_but_not_committed" in (result.exception_message or "")
+
+
+@pytest.mark.asyncio
+async def test_side_effectful_click_stops_retrying_with_flag_off() -> None:
+    """With the flag off the loop still stops after a side-effectful click (returning None to fall
+    through to plain typing) rather than clicking more options on the mutated field."""
+    skyvern_el = _mock_skyvern_element()
+    choose_mock = AsyncMock(return_value=_side_effect_choose_result())
+    discover_mock = AsyncMock(return_value=ActionSuccess())
+
+    with (
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=choose_mock),
+        patch("skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown", new=discover_mock),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(is_location_input=True),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="private value",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert choose_mock.call_count == 1
+    discover_mock.assert_not_called()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_input_or_auto_complete_falls_through_when_flag_disabled() -> None:
+    """With the commit-required flag off, an exhausted location autocomplete falls through to plain typing."""
+    skyvern_el = _mock_skyvern_element()
+    choose_result = AutoCompletionResult(
+        action_result=ActionFailure(AutoCompletionCommitFailure(stage="suggestions_never_rendered")),
+        stage_outcome="suggestions_never_rendered",
+    )
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.choose_auto_completion_dropdown",
+            new=AsyncMock(return_value=choose_result),
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(is_location_input=True),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="private value",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_stage_is_read_structurally_not_from_message_text() -> None:
+    """The fallback stage comes from the exception's stage attribute, even when the
+    message's attempt trail embeds every other stage name ahead of it."""
+    skyvern_el = _mock_skyvern_element()
+    choose_result = AutoCompletionResult(
+        action_result=ActionFailure(AutoCompletionCommitFailure(stage="suggestions_never_rendered")),
+        stage_outcome="suggestions_never_rendered",
+    )
+    fallback_failure = AutoCompletionCommitFailure(
+        stage="clicked_but_not_committed",
+        attempt_trail=["attempt_1:suggestions_never_rendered", "attempt_2:suggestion_not_matched"],
+    )
+    assert "suggestions_never_rendered" in str(fallback_failure)
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.choose_auto_completion_dropdown",
+            new=AsyncMock(return_value=choose_result),
+        ),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(side_effect=fallback_failure),
+        ),
+    ):
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=True)
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(return_value={"potential_values": []})
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(is_location_input=True),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="private value",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    assert isinstance(result, ActionFailure)
+    assert result.exception_type == AutoCompletionCommitFailure.__name__
+    assert "attempt_2:clicked_but_not_committed" in (result.exception_message or "")
+    assert "stage=clicked_but_not_committed" in (result.exception_message or "")
