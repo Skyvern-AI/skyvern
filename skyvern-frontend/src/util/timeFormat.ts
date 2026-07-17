@@ -2,8 +2,9 @@ function normalizeUtcTimestamp(time: string): string {
   // Adjust the fractional seconds to milliseconds (3 digits)
   time = time.replace(/\.(\d{3})\d*/, ".$1");
 
-  // Append 'Z' to indicate UTC time if not already present
-  if (!time.endsWith("Z")) {
+  // Timezone-less timestamps are UTC (the backend serializes naive UTC
+  // datetimes); append 'Z' unless an offset is already present.
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(time)) {
     time += "Z";
   }
 

@@ -5,17 +5,10 @@ import { getClient } from "@/api/AxiosClient";
 import { ArtifactVideo } from "@/components/ArtifactVideo";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { type Recording } from "@/routes/workflows/types/browserSessionTypes";
-import { artifactApiBaseUrl } from "@/util/env";
+import { basicLocalTimeFormat } from "@/util/timeFormat";
 
-function getRecordingUrl(url: string | null | undefined): string | null {
-  if (!url) {
-    return null;
-  }
-  if (url.startsWith("file://")) {
-    return `${artifactApiBaseUrl}/artifact/recording?path=${url.slice(7)}`;
-  }
-  return url;
-}
+import { areRecordingsIncomplete } from "./browserSessionQueryUtils";
+import { getRecordingUrl } from "./recordingUrl";
 
 function BrowserSessionVideo() {
   const { browserSessionId } = useParams();
@@ -37,9 +30,10 @@ function BrowserSessionVideo() {
     enabled: !!browserSessionId,
   });
 
-  const isSessionRunning = browserSession?.status === "running";
-  // Don't show recordings while session is running - they're incomplete
-  const recordings = isSessionRunning ? [] : browserSession?.recordings || [];
+  const recordingsIncomplete = areRecordingsIncomplete(browserSession?.status);
+  const recordings = recordingsIncomplete
+    ? []
+    : browserSession?.recordings || [];
 
   if (isLoading) {
     return (
@@ -67,7 +61,7 @@ function BrowserSessionVideo() {
             No recordings available
           </div>
           <div className="text-sm text-gray-400">
-            {isSessionRunning
+            {recordingsIncomplete
               ? "Recordings will be available after the session completes"
               : "No recordings were created for this session"}
           </div>
@@ -96,7 +90,7 @@ function BrowserSessionVideo() {
                 {recording.filename || `Recording ${index + 1}`}
                 {recording.modified_at && (
                   <span className="ml-2 text-sm text-gray-500">
-                    ({new Date(recording.modified_at).toLocaleString()})
+                    ({basicLocalTimeFormat(recording.modified_at)})
                   </span>
                 )}
               </h3>
