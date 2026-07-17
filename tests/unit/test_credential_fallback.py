@@ -59,8 +59,11 @@ def _workflow_run(
     retried_from_workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
     browser_profile_id: str | None = None,
+    browser_address: str | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     extra_http_headers: dict[str, str] | None = None,
     workflow_schedule_id: str | None = None,
+    copilot_session_id: str | None = None,
 ) -> WorkflowRun:
     now = datetime.now(timezone.utc)
     return WorkflowRun(
@@ -77,8 +80,11 @@ def _workflow_run(
         retried_from_workflow_run_id=retried_from_workflow_run_id,
         browser_session_id=browser_session_id,
         browser_profile_id=browser_profile_id,
+        browser_address=browser_address,
+        cdp_connect_headers=cdp_connect_headers,
         extra_http_headers=extra_http_headers,
         workflow_schedule_id=workflow_schedule_id,
+        copilot_session_id=copilot_session_id,
         trigger_type=WorkflowRunTriggerType.api,
         created_at=now,
         modified_at=now,
@@ -222,11 +228,20 @@ def test_credential_failure_trigger_falls_back_to_failure_reason_classification(
     assert _trigger_matches(workflow_run, CREDENTIAL_FAILURES)
 
 
-@pytest.mark.parametrize("status", [WorkflowRunStatus.failed, WorkflowRunStatus.terminated])
-def test_any_failure_trigger_matches_failed_and_terminated_runs(status: WorkflowRunStatus) -> None:
+@pytest.mark.parametrize(
+    "status",
+    [WorkflowRunStatus.failed, WorkflowRunStatus.terminated, WorkflowRunStatus.timed_out],
+)
+def test_any_failure_trigger_matches_failed_terminated_and_timed_out_runs(status: WorkflowRunStatus) -> None:
     workflow_run = _workflow_run(status=status, failure_category=[{"category": "ELEMENT_NOT_FOUND"}])
 
     assert _trigger_matches(workflow_run, ANY_FAILURE)
+
+
+def test_credential_failures_trigger_ignores_timed_out_runs() -> None:
+    workflow_run = _workflow_run(status=WorkflowRunStatus.timed_out, failure_category=[{"category": "AUTH_FAILURE"}])
+
+    assert not _trigger_matches(workflow_run, CREDENTIAL_FAILURES)
 
 
 PROXY_SESSION_MARKER_HEADER = "x-proxy-session-marker"
@@ -235,7 +250,9 @@ PROXY_SESSION_MARKER_HEADER = "x-proxy-session-marker"
 def _strip_marker_header(extra_http_headers: dict[str, str] | None) -> dict[str, str] | None:
     if not extra_http_headers:
         return extra_http_headers
-    return {key: value for key, value in extra_http_headers.items() if key != PROXY_SESSION_MARKER_HEADER} or None
+    # Mirror the cloud strip contract: return the (possibly empty) mapping, never None, so
+    # setup_workflow_run does not re-inherit the workflow's proxy headers.
+    return {key: value for key, value in extra_http_headers.items() if key != PROXY_SESSION_MARKER_HEADER}
 
 
 async def _run_fallback_retry(
@@ -250,6 +267,7 @@ async def _run_fallback_retry(
     run_workflow_error: Exception | None = None,
     flag_enabled: bool = True,
     flag_error: Exception | None = None,
+    run_tags: dict[str, str] | None = None,
 ) -> tuple[str | None, AsyncMock, MagicMock]:
     captured: dict[str, object] = {}
 
@@ -306,6 +324,7 @@ async def _run_fallback_retry(
         mock_app.DATABASE.organizations.get_organization = AsyncMock(
             return_value=SimpleNamespace(organization_id="org_test")
         )
+        mock_app.DATABASE.tags.get_active_grouped_tags_for_run = AsyncMock(return_value=run_tags)
         result = await maybe_start_credential_fallback_retry(workflow_run, "org_test")
         return result, run_workflow_mock, mock_app
 
@@ -507,6 +526,107 @@ async def test_retry_request_strips_credential_proxy_session_headers() -> None:
 
     assert result == "wr_retry"
     assert run_workflow_mock.await_args.kwargs["workflow_request"].extra_http_headers == {"x-custom": "keep"}
+
+
+@pytest.mark.asyncio
+async def test_retry_request_strips_headers_leaving_empty_mapping_not_none() -> None:
+    # When the failed run's only header was the proxy-session marker, the strip must yield an empty
+    # mapping (not None): setup_workflow_run treats None as "unset" and would re-inherit the
+    # workflow's configured proxy header, defeating the strip.
+    workflow_run = _workflow_run(
+        failure_category=[{"category": "AUTH_FAILURE"}],
+        extra_http_headers={PROXY_SESSION_MARKER_HEADER: "proxy_sess_1"},
+    )
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(workflow_run=workflow_run, parameters=[login])
+
+    assert result == "wr_retry"
+    assert run_workflow_mock.await_args.kwargs["workflow_request"].extra_http_headers == {}
+
+
+@pytest.mark.asyncio
+async def test_retry_clears_browser_address_and_cdp_headers() -> None:
+    workflow_run = _workflow_run(
+        failure_category=[{"category": "AUTH_FAILURE"}],
+        browser_address="http://remote-cdp:9222",
+        cdp_connect_headers={"authorization": "Bearer stale"},
+    )
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(workflow_run=workflow_run, parameters=[login])
+
+    assert result == "wr_retry"
+    request = run_workflow_mock.await_args.kwargs["workflow_request"]
+    assert request.browser_address is None
+    assert request.cdp_connect_headers is None
+
+
+@pytest.mark.asyncio
+async def test_retry_preserves_user_run_metadata() -> None:
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run,
+        parameters=[login],
+        run_tags={"team": "growth", "env": "prod"},
+    )
+
+    assert result == "wr_retry"
+    assert run_workflow_mock.await_args.kwargs["workflow_request"].run_metadata == {"team": "growth", "env": "prod"}
+
+
+@pytest.mark.asyncio
+async def test_completed_run_bails_before_flag_check_and_db_reads() -> None:
+    # clean_up_workflow calls the hook for every run; a non-failure run must exit before touching
+    # the flag provider or the database.
+    workflow_run = _workflow_run(status=WorkflowRunStatus.completed, failure_category=None, failure_reason=None)
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, mock_app = await _run_fallback_retry(workflow_run=workflow_run, parameters=[login])
+
+    assert result is None
+    run_workflow_mock.assert_not_awaited()
+    mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.get_workflow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_copilot_scoped_run_does_not_retry() -> None:
+    workflow_run = _workflow_run(
+        failure_category=[{"category": "AUTH_FAILURE"}],
+        copilot_session_id="cs_1",
+    )
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(workflow_run=workflow_run, parameters=[login])
+
+    assert result is None
+    run_workflow_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_run_with_any_failure_trigger_starts_retry() -> None:
+    workflow_run = _workflow_run(status=WorkflowRunStatus.timed_out, failure_category=None)
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"], fallback_trigger=ANY_FAILURE)
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(workflow_run=workflow_run, parameters=[login])
+
+    assert result == "wr_retry"
+    assert run_workflow_mock.await_args.kwargs["workflow_request"].data["login_cred"] == "cred_fb1"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_run_with_credential_failures_trigger_does_not_retry() -> None:
+    # A timeout is not a credential failure, so the default trigger must not advance the credential.
+    workflow_run = _workflow_run(status=WorkflowRunStatus.timed_out, failure_category=None)
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"], fallback_trigger=CREDENTIAL_FAILURES)
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(workflow_run=workflow_run, parameters=[login])
+
+    assert result is None
+    run_workflow_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -720,7 +840,9 @@ def test_yaml_to_credential_parameter_round_trip_preserves_fallback_fields() -> 
 
 
 @pytest.mark.asyncio
-async def test_mark_workflow_run_as_failed_invokes_fallback_hook() -> None:
+async def test_mark_workflow_run_as_failed_does_not_schedule_before_cleanup() -> None:
+    # The retry must be scheduled from clean_up_workflow (after finally/cleanup), never from the
+    # status marker — scheduling here would let the replacement run overlap the failed run's cleanup.
     service = WorkflowService()
     workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
     service._update_workflow_run_status = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
@@ -733,11 +855,11 @@ async def test_mark_workflow_run_as_failed_invokes_fallback_hook() -> None:
     )
 
     assert result == workflow_run
-    service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
+    service._schedule_credential_fallback_retry.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_mark_workflow_run_as_terminated_invokes_fallback_hook() -> None:
+async def test_mark_workflow_run_as_terminated_does_not_schedule_before_cleanup() -> None:
     service = WorkflowService()
     workflow_run = _workflow_run(
         status=WorkflowRunStatus.terminated,
@@ -753,6 +875,115 @@ async def test_mark_workflow_run_as_terminated_invokes_fallback_hook() -> None:
     )
 
     assert result == workflow_run
+    service._schedule_credential_fallback_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
+    service = WorkflowService()
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
+    workflow = _workflow([])
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
+    browser_cleanup_result = SimpleNamespace(
+        browser_state=None,
+        tasks=[],
+        all_workflow_task_ids=[],
+        child_workflow_run_ids=[],
+        close_browser_on_completion=True,
+        browser_session_write_back_attempted=True,
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.analytics") as mock_analytics,
+    ):
+        mock_analytics.capture = MagicMock()
+        mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+
+        await service.clean_up_workflow(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            need_call_webhook=False,
+            browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
+        )
+
+    service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
+
+
+@pytest.mark.asyncio
+async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> None:
+    # The schedule lives in the finally block: a webhook-preparation failure must not swallow the
+    # fallback retry (scheduling was removed from the status markers).
+    service = WorkflowService()
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
+    workflow = _workflow([])
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
+    service.execute_workflow_webhook = AsyncMock(side_effect=RuntimeError("webhook prep failed"))  # type: ignore[method-assign]
+    browser_cleanup_result = SimpleNamespace(
+        browser_state=None,
+        tasks=[],
+        all_workflow_task_ids=[],
+        child_workflow_run_ids=[],
+        close_browser_on_completion=True,
+        browser_session_write_back_attempted=True,
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.analytics") as mock_analytics,
+    ):
+        mock_analytics.capture = MagicMock()
+        mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+
+        with pytest.raises(RuntimeError):
+            await service.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                need_call_webhook=True,
+                browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
+            )
+
+    service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
+
+
+@pytest.mark.asyncio
+async def test_clean_up_workflow_schedules_retry_when_earlier_cleanup_step_raises() -> None:
+    # The schedule finally wraps the whole cleanup sequence, not just the webhook: a failure in an
+    # earlier step (here wait_for_upload_aiotasks) must still schedule the eligible run's retry.
+    service = WorkflowService()
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
+    workflow = _workflow([])
+    service._schedule_credential_fallback_retry = MagicMock()  # type: ignore[method-assign]
+    browser_cleanup_result = SimpleNamespace(
+        browser_state=None,
+        tasks=[],
+        all_workflow_task_ids=["t_1"],
+        child_workflow_run_ids=[],
+        close_browser_on_completion=True,
+        browser_session_write_back_attempted=True,
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.analytics") as mock_analytics,
+    ):
+        mock_analytics.capture = MagicMock()
+        mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock(side_effect=RuntimeError("upload drain failed"))
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+
+        with pytest.raises(RuntimeError):
+            await service.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                need_call_webhook=False,
+                browser_cleanup_result=browser_cleanup_result,  # type: ignore[arg-type]
+            )
+
     service._schedule_credential_fallback_retry.assert_called_once_with(workflow_run)
 
 
