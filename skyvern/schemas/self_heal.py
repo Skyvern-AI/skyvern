@@ -211,6 +211,15 @@ def summarize_run_heals(episodes: list[HealEpisode]) -> RunHealSummary:
     )
 
 
+def summarize_runs_heals(episodes: list[HealEpisode]) -> dict[str, RunHealSummary]:
+    episodes_by_run: dict[str, list[HealEpisode]] = {}
+    for episode in episodes:
+        episodes_by_run.setdefault(episode.workflow_run_id, []).append(episode)
+    return {
+        workflow_run_id: summarize_run_heals(run_episodes) for workflow_run_id, run_episodes in episodes_by_run.items()
+    }
+
+
 def compute_workflow_reliability(runs: list[RunHealGroup]) -> WorkflowReliability:
     run_flags: list[tuple[bool, bool, bool]] = []
     for run in runs:
