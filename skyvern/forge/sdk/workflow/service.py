@@ -1344,6 +1344,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         organization_id: str,
         credential_parameter_overrides: dict[str, str] | None = None,
+        parameter_values: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         selections = dict(credential_parameter_overrides or {})
         try:
@@ -1361,6 +1362,23 @@ class WorkflowService:
                     credential_ids=credential_ids,
                     selection_strategy=parameter.selection_strategy,
                 )
+            for parameter in self._get_credential_parameters_with_configured_selection(workflow):
+                # Fallback-only parameters have no rotation pool, so the loop above skips them, but a
+                # browser_profile_key referencing this login parameter still needs a render value.
+                # The initial run pins the primary credential; a fallback retry overrides it above.
+                if parameter.key in selections or parameter.credential_ids:
+                    continue
+                primary = parameter.credential_id
+                if not primary:
+                    continue
+                # credential_id may indirectly reference another workflow parameter that carries the
+                # real credential value (mirrors WorkflowRunContext.resolve_credential_parameter_id).
+                # Render the resolved value so distinct accounts get distinct browser profiles.
+                if parameter_values:
+                    referenced = parameter_values.get(primary)
+                    if isinstance(referenced, str) and referenced:
+                        primary = referenced
+                selections[parameter.key] = primary
             return selections
         except Exception:
             LOG.warning(
@@ -1491,14 +1509,19 @@ class WorkflowService:
                 workflow_request.webhook_callback_url = workflow.webhook_callback_url
             if workflow_request.extra_http_headers is None and workflow.extra_http_headers is not None:
                 workflow_request.extra_http_headers = workflow.extra_http_headers
+            # A credential-fallback retry clears the browser handles so the replacement credential
+            # gets a clean session; re-inheriting the workflow's profile/cdp headers here would
+            # reconnect the retry to the failed account's persistent-browser-session profile.
+            is_fallback_retry = retried_from_workflow_run_id is not None
             if (
-                workflow_request.browser_profile_id is None
+                not is_fallback_retry
+                and workflow_request.browser_profile_id is None
                 and workflow_request.browser_session_id is None
                 and workflow.browser_profile_id is not None
             ):
                 workflow_request.browser_profile_id = workflow.browser_profile_id
             if workflow_request.cdp_connect_headers is None:
-                if workflow.cdp_connect_headers is not None:
+                if not is_fallback_retry and workflow.cdp_connect_headers is not None:
                     workflow_request.cdp_connect_headers = workflow.cdp_connect_headers
             else:
                 workflow_request.cdp_connect_headers = merge_masked_headers(
@@ -1715,6 +1738,7 @@ class WorkflowService:
                     workflow_run=workflow_run,
                     organization_id=organization.organization_id,
                     credential_parameter_overrides=run_credential_parameter_overrides,
+                    parameter_values=parameter_values,
                 )
                 parameter_values.update(rotating_credential_selections)
                 workflow_run = await self._prepare_persisted_workflow_browser_profile(
@@ -1944,6 +1968,18 @@ class WorkflowService:
             if should_pin:
                 raise
 
+    @staticmethod
+    def _profile_key_render_values(workflow: Workflow, workflow_request: WorkflowRequestBody) -> dict[str, Any]:
+        """Workflow-parameter values used to render browser_profile_key at run-request time:
+        workflow defaults overlaid with the request's provided values."""
+        values: dict[str, Any] = {}
+        for parameter in workflow.workflow_definition.parameters:
+            if isinstance(parameter, WorkflowParameter) and parameter.default_value is not None:
+                values[parameter.key] = parameter.default_value
+        if workflow_request.data:
+            values.update({key: value for key, value in workflow_request.data.items() if value is not None})
+        return values
+
     async def _resolve_managed_browser_profile_for_run_request(
         self,
         *,
@@ -1959,14 +1995,7 @@ class WorkflowService:
 
             rendered_key = None
             if workflow.browser_profile_key:
-                parameter_values: dict[str, Any] = {}
-                for parameter in workflow.workflow_definition.parameters:
-                    if isinstance(parameter, WorkflowParameter) and parameter.default_value is not None:
-                        parameter_values[parameter.key] = parameter.default_value
-                if workflow_request.data:
-                    parameter_values.update(
-                        {key: value for key, value in workflow_request.data.items() if value is not None}
-                    )
+                parameter_values = self._profile_key_render_values(workflow, workflow_request)
                 if extra_parameter_values:
                     parameter_values.update(extra_parameter_values)
                 rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
@@ -6085,6 +6114,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         organization_id=organization_id,
                         credential_parameter_overrides=run_credential_parameter_overrides,
+                        parameter_values=self._profile_key_render_values(workflow, workflow_request),
                     )
                     forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
                         workflow=workflow,
@@ -6399,7 +6429,6 @@ class WorkflowService:
             run_with=run_with,
             failure_category=failure_category,
         )
-        self._schedule_credential_fallback_retry(workflow_run)
         return workflow_run
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
@@ -6487,7 +6516,6 @@ class WorkflowService:
             run_with=run_with,
             failure_category=failure_category,
         )
-        self._schedule_credential_fallback_retry(workflow_run)
         return workflow_run
 
     async def mark_workflow_run_as_canceled(self, workflow_run_id: str) -> WorkflowRun:
@@ -7365,69 +7393,69 @@ class WorkflowService:
         all_workflow_task_ids = browser_cleanup_result.all_workflow_task_ids
         child_workflow_run_ids = browser_cleanup_result.child_workflow_run_ids
         close_browser_on_completion = browser_cleanup_result.close_browser_on_completion
-        if browser_state:
-            await self.persist_video_data(
-                browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
-            )
-            if tasks:
-                await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
-            if not browser_cleanup_result.browser_session_write_back_attempted:
-                await self._persist_workflow_browser_session_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    browser_state=browser_state,
-                    close_browser_on_completion=close_browser_on_completion,
-                )
-
-        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
-
         try:
-            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                context = skyvern_context.current()
-                finalization_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
-                await app.STORAGE.save_downloaded_files(
-                    organization_id=workflow_run.organization_id,
-                    run_id=finalization_run_id,
+            if browser_state:
+                await self.persist_video_data(
+                    browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
                 )
-                # Tag any session-scoped DOWNLOAD artifacts created during this
-                # workflow run with run_id (see
-                # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
-                browser_session_id = context.browser_session_id if context else None
-                if browser_session_id and finalization_run_id:
-                    try:
-                        claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
-                            run_id=finalization_run_id,
-                            browser_session_id=browser_session_id,
-                            organization_id=workflow_run.organization_id,
-                            run_started_at=workflow_run.created_at,
-                        )
-                        if claimed:
-                            LOG.debug(
-                                "Claimed session-scoped download artifacts for workflow run",
+                if tasks:
+                    await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
+                if not browser_cleanup_result.browser_session_write_back_attempted:
+                    await self._persist_workflow_browser_session_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        browser_state=browser_state,
+                        close_browser_on_completion=close_browser_on_completion,
+                    )
+
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
+
+            try:
+                async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
+                    finalization_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
+                    await app.STORAGE.save_downloaded_files(
+                        organization_id=workflow_run.organization_id,
+                        run_id=finalization_run_id,
+                    )
+                    # Tag any session-scoped DOWNLOAD artifacts created during this
+                    # workflow run with run_id (see
+                    # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                    browser_session_id = context.browser_session_id if context else None
+                    if browser_session_id and finalization_run_id:
+                        try:
+                            claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
+                                run_id=finalization_run_id,
+                                browser_session_id=browser_session_id,
+                                organization_id=workflow_run.organization_id,
+                                run_started_at=workflow_run.created_at,
+                            )
+                            if claimed:
+                                LOG.debug(
+                                    "Claimed session-scoped download artifacts for workflow run",
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    browser_session_id=browser_session_id,
+                                    claimed=claimed,
+                                )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to claim session-scoped download artifacts for workflow run",
                                 workflow_run_id=workflow_run.workflow_run_id,
                                 browser_session_id=browser_session_id,
-                                claimed=claimed,
+                                exc_info=True,
                             )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to claim session-scoped download artifacts for workflow run",
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            browser_session_id=browser_session_id,
-                            exc_info=True,
-                        )
-        except asyncio.TimeoutError:
-            LOG.warning(
-                "Timeout to save downloaded files",
-                workflow_run_id=workflow_run.workflow_run_id,
-            )
-        except Exception:
-            LOG.warning(
-                "Failed to save downloaded files",
-                exc_info=True,
-                workflow_run_id=workflow_run.workflow_run_id,
-            )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout to save downloaded files",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to save downloaded files",
+                    exc_info=True,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
 
-        try:
             if need_call_webhook:
                 await self.execute_workflow_webhook(workflow_run, api_key)
         finally:
@@ -7436,6 +7464,14 @@ class WorkflowService:
             app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
             for child_workflow_run_id in child_workflow_run_ids:
                 app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
+
+            # Schedule the credential fallback retry only after this run's cleanup (artifact/video
+            # persistence, browser/session write-back, webhook) has run, so the replacement run
+            # cannot overlap it and race browser-profile/session writes. In the finally wrapping the
+            # whole cleanup sequence — not after it — so an exception in any cleanup step can't skip
+            # it; scheduling was removed from the status markers, which fired before cleanup and for
+            # cascade/reaper failures that never reach cleanup. A no-op for non-eligible runs.
+            self._schedule_credential_fallback_retry(workflow_run)
 
     async def prepare_workflow_webhook(
         self,

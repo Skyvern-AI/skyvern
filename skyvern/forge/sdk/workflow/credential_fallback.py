@@ -9,6 +9,7 @@ from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 
 LOG = structlog.get_logger()
@@ -18,6 +19,9 @@ ANY_FAILURE = "any_failure"
 VALID_FALLBACK_TRIGGERS = frozenset({CREDENTIAL_FAILURES, ANY_FAILURE})
 CREDENTIAL_FAILURE_CATEGORIES = frozenset({"AUTH_FAILURE", "CREDENTIAL_ERROR"})
 CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY"
+# Terminal statuses that any fallback trigger may retry from. timed_out counts because it is a
+# failure elsewhere; credential_failures narrows further to failed/terminated in _trigger_matches.
+RETRYABLE_STATUSES = frozenset({WorkflowRunStatus.failed, WorkflowRunStatus.terminated, WorkflowRunStatus.timed_out})
 
 
 async def _retry_enabled_for_organization(organization_id: str, workflow_run: WorkflowRun) -> bool:
@@ -64,14 +68,35 @@ def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
 
 
 def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None) -> bool:
-    if workflow_run.status not in {WorkflowRunStatus.failed, WorkflowRunStatus.terminated}:
-        return False
     effective_trigger = trigger or CREDENTIAL_FAILURES
     if effective_trigger == ANY_FAILURE:
-        return True
+        return workflow_run.status in RETRYABLE_STATUSES
     if effective_trigger != CREDENTIAL_FAILURES:
         return False
+    # A timeout is not a credential failure, so credential_failures keeps rejecting timed_out.
+    if workflow_run.status not in {WorkflowRunStatus.failed, WorkflowRunStatus.terminated}:
+        return False
     return bool(_failure_category_names(workflow_run) & CREDENTIAL_FAILURE_CATEGORIES)
+
+
+async def _reload_user_run_metadata(workflow_run: WorkflowRun, organization_id: str) -> dict[str, str] | None:
+    """Reload the failed run's user-writable tags so the retry keeps them (matches the manual
+    retry path in agent_protocol). Reserved keys are dropped — they are re-derived per run."""
+    try:
+        grouped = await app.DATABASE.tags.get_active_grouped_tags_for_run(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to reload run metadata for fallback retry; continuing without it",
+            workflow_run_id=workflow_run.workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    if not grouped:
+        return None
+    return {key: value for key, value in grouped.items() if not is_reserved_tag_key(key)} or None
 
 
 async def maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, organization_id: str) -> str | None:
@@ -88,7 +113,16 @@ async def maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, organ
 
 
 async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, organization_id: str) -> str | None:
-    if workflow_run.parent_workflow_run_id or workflow_run.debug_session_id:
+    # Scheduled from clean_up_workflow, which runs for every terminal status. Bail on non-failure
+    # runs before the flag check and DB reads so the success path stays cheap. _trigger_matches
+    # below still applies the finer per-parameter trigger (credential_failures vs any_failure).
+    if workflow_run.status not in RETRYABLE_STATUSES:
+        return None
+
+    # copilot_session_id marks a Copilot-scoped test run: it supplies block_labels directly without
+    # the debug block-run marker checked below, so guard on it too or a Copilot test would spawn a
+    # detached full-workflow run (real credits, real side effects) outside the test.
+    if workflow_run.parent_workflow_run_id or workflow_run.debug_session_id or workflow_run.copilot_session_id:
         return None
 
     if not await _retry_enabled_for_organization(organization_id, workflow_run):
@@ -205,12 +239,18 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
 
     from skyvern.services.workflow_service import run_workflow, workflow_request_body_from_existing_run
 
+    run_metadata = await _reload_user_run_metadata(workflow_run, organization_id)
     workflow_request = workflow_request_body_from_existing_run(
         workflow_run=workflow_run,
         parameters=retry_parameters,
+        run_metadata=run_metadata,
     )
+    # Shed every handle to the failed run's browser so the fallback credential gets a clean session
+    # instead of reconnecting to the old account's cookies/authenticated state.
     workflow_request.browser_session_id = None
     workflow_request.browser_profile_id = None
+    workflow_request.browser_address = None
+    workflow_request.cdp_connect_headers = None
     workflow_request.extra_http_headers = app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers(
         workflow_request.extra_http_headers
     )
