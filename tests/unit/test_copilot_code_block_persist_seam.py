@@ -16458,7 +16458,7 @@ class TestTerminalActionScoutGate:
 
     def test_login_prefix_with_unreached_terminal_action_is_not_goal_complete(self) -> None:
         ctx = self._login_prefix_ctx(self._terminal_action_criterion())
-        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
         assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
 
     def test_login_is_the_whole_goal_stays_goal_complete(self) -> None:
@@ -16469,10 +16469,10 @@ class TestTerminalActionScoutGate:
         ctx = self._login_prefix_ctx(self._terminal_action_criterion(method_mandated=True))
         assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
 
-    def test_scout_observed_terminal_action_releases_goal_complete(self) -> None:
+    def test_observed_terminal_action_does_not_bypass_post_credential_floor(self) -> None:
         ctx = self._login_prefix_ctx(self._terminal_action_criterion())
         ctx.scout_observed_terminal_criterion_ids = {"start_service_request"}
-        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
 
     def test_post_credential_business_spine_records_terminal_action_observation(self) -> None:
         ctx = self._login_prefix_ctx(self._terminal_action_criterion())
@@ -16481,6 +16481,176 @@ class TestTerminalActionScoutGate:
         enforcement_module.record_reached_terminal_action_observation(ctx)
         assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
         assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_login_open_then_submit_reaches_terminal_action(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 4},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 5},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_post_login_three_click_business_spine_reaches_terminal_action(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            {"tool_name": "click", "selector": "#open-item", "trajectory_index": 4},
+            {"tool_name": "click", "selector": "#add-to-cart", "trajectory_index": 5},
+            {"tool_name": "click", "selector": "#place-order", "trajectory_index": 6},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_post_login_non_committing_click_sequence_stays_gated(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = list(ctx.scout_trajectory) + [
+            {"tool_name": "click", "selector": "button", "role": "button", "trajectory_index": 4},
+            {"tool_name": "click", "selector": "button", "role": "button", "trajectory_index": 5},
+            {"tool_name": "click", "selector": "button", "role": "button", "trajectory_index": 6},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+
+    def test_sourceless_enter_login_submit_establishes_business_boundary(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "Enter", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 3},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_sourceless_non_enter_key_does_not_establish_login_boundary(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "press_key", "key": "Tab", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 3},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
+
+    def test_post_login_boundary_ignores_divergent_sourced_click(self) -> None:
+        login_url = "https://portal.example.test/login"
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "source_url": login_url,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "accessible_name": "Learn more",
+                "source_url": "https://portal.example.test/help",
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "click",
+                "selector": "button[type='submit']",
+                "source_url": login_url,
+                "trajectory_index": 2,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#open-request",
+                "source_url": self._BUSINESS_URL,
+                "trajectory_index": 3,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#submit-request",
+                "source_url": self._BUSINESS_URL,
+                "trajectory_index": 4,
+            },
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_sourceless_divergent_click_uses_stable_login_submit_identity(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "#login-help",
+                "accessible_name": "Trouble signing in?",
+                "trajectory_index": 1,
+            },
+            {"tool_name": "click", "accessible_name": "Sign in", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 4},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+
+    def test_mixed_fill_sources_use_latest_sourceless_login_identity(self) -> None:
+        helper = TestCredentialScoutGapMatcher
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            helper._fill("cred_1", "username", helper._PAGE_ONE),
+            helper._fill("cred_1", "password", ""),
+            {"tool_name": "click", "accessible_name": "Sign in", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 4},
+        ]
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == {"start_service_request"}
+        enforcement_module.record_reached_terminal_action_observation(ctx)
+        assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+    def test_sourceless_login_submit_without_stable_identity_fails_closed(self) -> None:
+        ctx = self._login_prefix_ctx(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "username",
+                "trajectory_index": 0,
+            },
+            {"tool_name": "click", "accessible_name": "Help", "trajectory_index": 1},
+            {"tool_name": "click", "selector": "button", "trajectory_index": 2},
+            {"tool_name": "click", "selector": "#open-request", "trajectory_index": 3},
+            {"tool_name": "click", "selector": "#submit-request", "trajectory_index": 4},
+        ]
+        ctx.scouted_credential_field_inventory_by_credential_id = {"cred_1": frozenset({"username"})}
+
+        assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+        assert enforcement_module.reached_terminal_action_criterion_ids(ctx) == set()
 
     def test_login_only_trajectory_records_no_terminal_action_observation(self) -> None:
         ctx = self._login_prefix_ctx(self._terminal_action_criterion())

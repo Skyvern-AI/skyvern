@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Awaitable
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSet,
     StoredCriteriaSnapshot,
@@ -15,7 +20,8 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     criteria_to_json,
     reconcile_completion_criteria,
 )
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import (
     REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionCriterion,
@@ -33,7 +39,78 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_base_criterion,
     request_policy_has_present_completion_contract,
 )
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
+
+_TERMINAL_ACTION_CREATE_OUTCOMES = (
+    "A new service request is submitted.",
+    "The requested service setup is created.",
+    "The account's start-service request is created.",
+)
+_TERMINAL_ACTION_ABSTAIN = {"version": "1", "criterion_id": None, "terminal_action_family": None}
+
+
+def _terminal_action_packet(*outcomes: str) -> dict[str, object]:
+    return {
+        "testing_intent": "require_test",
+        "credential_input_kind": "credential_name",
+        "credential_refs": ["Portal Login"],
+        "requires_user_clarification": False,
+        "completion_criteria": [
+            {
+                "outcome": outcome,
+                "implicit": False,
+                "method_mandated": False,
+                "level": "run",
+                "kind": "outcome",
+                "terminal_action_family": None,
+            }
+            for outcome in outcomes
+        ],
+    }
+
+
+async def _classify_with_terminal_action_reconciliation(
+    user_message: str,
+    packet: dict[str, object],
+    reconciliation: dict[str, object],
+) -> tuple[RequestPolicy, list[str]]:
+    prompts: list[str] = []
+
+    async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        assert prompt_name == request_policy_module.PROMPT_NAME
+        prompts.append(prompt)
+        if "TERMINAL ACTION RECONCILIATION MODE" in prompt:
+            return reconciliation
+        return packet
+
+    policy = await request_policy_module._classify_request(user_message, "", [], "", handler)
+    return policy, prompts
+
+
+def _terminal_action_enforcement_ctx(criteria: tuple[CompletionCriterion, ...]) -> CopilotContext:
+    ctx = make_copilot_context()
+    ctx.turn_intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+    )
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=criteria))
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "fill_credential_field",
+            "credential_id": "credential_ref",
+            "credential_field": "username",
+            "trajectory_index": 0,
+        },
+        {"tool_name": "click", "accessible_name": "Sign in", "trajectory_index": 1},
+    ]
+    ctx.synthesized_block_offered = True
+    ctx.synthesized_block_offered_trajectory_len = len(ctx.scout_trajectory)
+    ctx.synthesized_block_offered_goal_complete = enforcement_module.synthesized_trajectory_is_goal_complete(ctx)
+    return ctx
 
 
 async def _policy_for_message(
@@ -84,6 +161,115 @@ def _criteria_for_path(policy: RequestPolicy, output_path: str) -> list[Completi
 def _criteria_fingerprint(criteria: list[CompletionCriterion]) -> str:
     payload = json.dumps(criteria_to_json(criteria), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("outcome", _TERMINAL_ACTION_CREATE_OUTCOMES)
+@pytest.mark.asyncio
+async def test_credentialed_create_omission_is_reconciled_before_custody_and_foreclosure(outcome: str) -> None:
+    policy, prompts = await _classify_with_terminal_action_reconciliation(
+        "Sign in with the saved credential and create the requested service setup.",
+        _terminal_action_packet(outcome),
+        {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"},
+    )
+
+    assert len(prompts) == 2
+    assert '"id":"c0"' in prompts[1] and '"kind":"outcome"' in prompts[1]
+    stored = criteria_from_json(criteria_to_json(policy.completion_criteria))
+    assert [
+        (
+            item.id,
+            item.outcome,
+            item.kind,
+            item.terminal_action_family,
+            item.terminal_action_verification_mode,
+        )
+        for item in stored
+    ] == [("c0", outcome, "terminal_action", "request", "semantic_outcome_v1")]
+    assert stored[0].method_mandated is False
+    ctx = _terminal_action_enforcement_ctx(stored)
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is False
+    assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is False
+    assert enforcement_module._should_block_mutating_tool_after_synthesized_offer(ctx, "click") is False
+
+    ctx.update_workflow_called = True
+    with capture_logs() as logs:
+        workflow_update_module._log_imposition_skipped_after_update(ctx)
+    (event,) = (entry for entry in logs if entry["event"] == "copilot_imposition_skipped_after_update")
+    assert (event["reaches_goal"], event["goal_complete"]) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("user_message", "outcome"),
+    [
+        ("Sign in with the saved credential named Portal Login.", "The user is authenticated."),
+        ("Sign in with the saved credential and complete MFA.", "Authentication including MFA completes."),
+    ],
+)
+@pytest.mark.asyncio
+async def test_login_only_reconciliation_abstains_and_keeps_generic_goal_floor(user_message: str, outcome: str) -> None:
+    with capture_logs() as logs:
+        policy, prompts = await _classify_with_terminal_action_reconciliation(
+            user_message, _terminal_action_packet(outcome), _TERMINAL_ACTION_ABSTAIN
+        )
+
+    assert len(prompts) == 2
+    assert [(item.id, item.outcome, item.kind) for item in policy.completion_criteria] == [("c0", outcome, "outcome")]
+    assert [
+        entry["reason"] for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted"
+    ] == ["model_abstained"]
+    ctx = _terminal_action_enforcement_ctx(tuple(policy.completion_criteria))
+    assert enforcement_module.synthesized_trajectory_reaches_goal(ctx) is True
+    assert enforcement_module.synthesized_trajectory_is_goal_complete(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_terminal_action_reconciliation_abstains_without_rekeying() -> None:
+    malformed = {"version": "1", "criterion_id": ["c0", "c1"], "terminal_action_family": "request"}
+    with capture_logs() as logs:
+        policy, _ = await _classify_with_terminal_action_reconciliation(
+            "Sign in and create a service request.",
+            _terminal_action_packet("A service request is created.", "The created request is visible."),
+            malformed,
+        )
+
+    assert [(item.id, item.kind) for item in policy.completion_criteria] == [("c0", "outcome"), ("c1", "outcome")]
+    assert [
+        entry["reason"] for entry in logs if entry["event"] == "copilot_terminal_action_reconciliation_omitted"
+    ] == ["malformed_response"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_action_reconciliation_gets_its_own_classifier_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[float] = []
+    # The initial classification may be followed by request-slot correction and
+    # production work that legitimately outlives its budget. Reconciliation is
+    # a distinct classifier stage and must not inherit that expired deadline.
+    monotonic_values = iter((100.0, 101.0, 112.0, 113.0))
+
+    async def bounded_wait_for(awaitable: Awaitable[object], *, timeout: float) -> object:
+        timeouts.append(timeout)
+        return await awaitable
+
+    timeout_error = request_policy_module.asyncio.TimeoutError
+    monkeypatch.setattr(request_policy_module.settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(request_policy_module, "time", SimpleNamespace(monotonic=lambda: next(monotonic_values)))
+    monkeypatch.setattr(
+        request_policy_module,
+        "asyncio",
+        SimpleNamespace(wait_for=bounded_wait_for, TimeoutError=timeout_error),
+    )
+
+    policy, prompts = await _classify_with_terminal_action_reconciliation(
+        "Sign in with the saved credential and create the requested service setup.",
+        _terminal_action_packet("The requested service setup is created."),
+        {"version": "1", "criterion_id": "c0", "terminal_action_family": "request"},
+    )
+
+    assert len(prompts) == 2
+    assert [(criterion.id, criterion.kind) for criterion in policy.completion_criteria] == [("c0", "terminal_action")]
+    assert timeouts == [9.0, 9.0]
 
 
 def test_p9_exact_value_unpinnable_output_mint_degrades() -> None:

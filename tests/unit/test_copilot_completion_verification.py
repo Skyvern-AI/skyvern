@@ -1588,6 +1588,49 @@ def test_terminal_goal_record_satisfies_flat_submit_payload() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_reconciled_terminal_action_requires_semantic_verification_authority() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The requested service setup is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "terminal_result": {
+                "request_id": "QC-2002-DEMO",
+                "submitted": True,
+                "submission_result": "created",
+            }
+        }
+    )
+
+    assert grade_terminal_goal_record_criteria([criterion], snapshot) == []
+    captured_prompt = ""
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+        nonlocal captured_prompt
+        captured_prompt = prompt
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": True,
+                    "reason_code": "evidence_confirms",
+                    "evidence_ref": "block_outputs:terminal_result",
+                }
+            ]
+        }
+
+    result = await evaluate_completion_criteria([criterion], snapshot, handler)
+
+    assert result.is_fully_satisfied() is True
+    assert criterion.outcome in captured_prompt
+    assert "QC-2002-DEMO" in captured_prompt
+
+
 def test_terminal_goal_record_accepts_family_artifact_without_self_asserted_boolean() -> None:
     payload = _terminal_goal_payload(submitted=None)
     snapshot = RunEvidenceSnapshot(block_outputs={"submit_water_request": payload})
