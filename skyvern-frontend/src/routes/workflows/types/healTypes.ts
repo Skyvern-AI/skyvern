@@ -45,3 +45,7 @@ export type RunHealEpisodesResponse = {
   episodes: HealEpisodeView[];
   summary: RunHealSummary;
 };
+
+export type RunsHealSummaryBatchResponse = {
+  summaries: Record<string, RunHealSummary>;
+};
