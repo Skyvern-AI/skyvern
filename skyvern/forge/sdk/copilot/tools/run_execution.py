@@ -2748,7 +2748,9 @@ def _record_run_blocks_result(
     )
     copilot_ctx.completion_verification_result = completion_verification
     if prior_committed_outcome is None or _verification_fully_satisfied(completion_verification):
-        record_completion_verification(copilot_ctx, completion_verification)
+        record_completion_verification(
+            copilot_ctx, completion_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+        )
         _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
@@ -2884,7 +2886,9 @@ def _record_run_blocks_result(
         if blocked_verification is not completion_verification:
             completion_verification = blocked_verification
             copilot_ctx.completion_verification_result = blocked_verification
-            record_completion_verification(copilot_ctx, blocked_verification)
+            record_completion_verification(
+                copilot_ctx, blocked_verification, workflow_run_id=run_id if isinstance(run_id, str) else None
+            )
             _record_adjudication_on_turn_state(copilot_ctx, blocked_verification)
         _mark_page_inspected(copilot_ctx)
         result["ok"] = False

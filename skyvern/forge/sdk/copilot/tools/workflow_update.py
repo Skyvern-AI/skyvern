@@ -163,7 +163,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     JudgmentPredicate,
     RequestedOutputEvidenceSource,
-    RequestedOutputPathMintSource,
     _coerce_requested_output_evidence_source,
     _is_judgment_boolean_criterion,
 )
@@ -246,13 +245,6 @@ from .guardrails import (
 )
 
 LOG = structlog.get_logger()
-
-_CLASSIFIER_DEFAULT_MINT_SOURCE: RequestedOutputPathMintSource = "classifier_default"
-if REQUESTED_OUTPUT_PATH_MINT_SOURCES != {_CLASSIFIER_DEFAULT_MINT_SOURCE}:
-    raise RuntimeError(
-        "RequestedOutputPathMintSource gained a member; the requested-output author-exclusion "
-        "must be revisited before this equality can stay strict."
-    )
 
 
 class BlockObservationRef(BaseModel):
@@ -1696,7 +1688,7 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
             continue
         if getattr(criterion, "mint_degrade", None) is not None:
             continue
-        if getattr(criterion, "requested_output_path_mint_source", None) == _CLASSIFIER_DEFAULT_MINT_SOURCE:
+        if getattr(criterion, "requested_output_path_mint_source", None) in REQUESTED_OUTPUT_PATH_MINT_SOURCES:
             continue
         path = _canonical_requested_output_path(getattr(criterion, "output_path", None))
         if path and _output_path_has_child(path):

@@ -23,10 +23,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
     _is_structural_requested_output_abstention,
+    carry_criterion_metadata,
     carry_degraded_criterion_ids,
     carry_floor_rekeyed_criterion_ids,
     carry_floor_rekeyed_path_backing,
     combine_verification_results,
+    effective_unmet_verdicts,
     evaluate_completion_criteria,
     grade_definition_criteria,
     grade_fallback_floor_reached_end_state_criteria,
@@ -55,6 +57,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_KIND_EXTENSION,
     DOWNLOAD_KIND_REGISTERED,
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     ReachedDownloadTarget,
     derive_from_block_outputs,
 )
@@ -97,13 +100,6 @@ _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
 # and observation flag cannot be traversed as observed page content.
 _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
-_REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(f"output.{key}" for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
-_CLASSIFIER_DEFAULT_MINT_SOURCE: RequestedOutputPathMintSource = "classifier_default"
-if REQUESTED_OUTPUT_PATH_MINT_SOURCES != {_CLASSIFIER_DEFAULT_MINT_SOURCE}:
-    raise RuntimeError(
-        "RequestedOutputPathMintSource gained a member; the reconciled registered-download "
-        "requested-output identity carry must be revisited before this equality can stay strict."
-    )
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
@@ -171,25 +167,28 @@ def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool
 
 
 def _registered_download_requested_output_criterion(criterion: CompletionCriterion) -> bool:
+    requested_path = criterion.output_path if criterion.output_path is not None else criterion.floor_rekeyed_from_path
     return (
-        criterion.output_path is not None
+        requested_path is not None
         and criterion.level != "definition"
         and not criterion.method_mandated
-        and criterion.output_path in _REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+        and requested_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
     )
 
 
 def _is_minted_registered_download_requested_output(criterion: CompletionCriterion) -> bool:
     return (
         _registered_download_requested_output_criterion(criterion)
-        and criterion.requested_output_path_mint_source == _CLASSIFIER_DEFAULT_MINT_SOURCE
+        and criterion.requested_output_path_mint_source in REQUESTED_OUTPUT_PATH_MINT_SOURCES
     )
 
 
-def _registered_download_criterion_carrying_requested_output(*, carries_requested_output: bool) -> CompletionCriterion:
+def _registered_download_criterion_carrying_requested_output(
+    *, witnessed_mint_source: RequestedOutputPathMintSource | None
+) -> CompletionCriterion:
     criterion = registered_download_completion_criterion()
-    if carries_requested_output:
-        return replace(criterion, requested_output_path_mint_source=_CLASSIFIER_DEFAULT_MINT_SOURCE)
+    if witnessed_mint_source is not None:
+        return replace(criterion, requested_output_path_mint_source=witnessed_mint_source)
     return criterion
 
 
@@ -198,7 +197,7 @@ def _minted_registered_download_requested_output_count(criteria: list[Completion
         1
         for criterion in criteria
         if is_registered_download_completion_criterion(criterion)
-        and criterion.requested_output_path_mint_source == _CLASSIFIER_DEFAULT_MINT_SOURCE
+        and criterion.requested_output_path_mint_source in REQUESTED_OUTPUT_PATH_MINT_SOURCES
     )
 
 
@@ -210,13 +209,27 @@ def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool
     return _result_has_registered_download_block_output(result)
 
 
+def _formed_completion_criteria(copilot_ctx: Any) -> list[CompletionCriterion]:
+    policy = _completion_request_policy(copilot_ctx)
+    return policy.graded_completion_criteria() if policy is not None else []
+
+
 def _reconcile_download_completion_criterion(
     copilot_ctx: Any, result: dict[str, Any], criteria: list[CompletionCriterion]
 ) -> list[CompletionCriterion]:
     has_registered_download_evidence = _result_has_registered_download_block_output(result)
-    stripped_minted_requested_output = has_registered_download_evidence and any(
-        _is_minted_registered_download_requested_output(criterion) for criterion in criteria
-    )
+    # The gradeable filter drops degraded minted asks, so the association witness reads the formed
+    # criteria; a degraded witness supplies requested-output identity only, never confirmation.
+    witnessed_mint_source: RequestedOutputPathMintSource | None = None
+    if has_registered_download_evidence:
+        witnessed_mint_source = next(
+            (
+                criterion.requested_output_path_mint_source
+                for criterion in [*criteria, *_formed_completion_criteria(copilot_ctx)]
+                if _is_minted_registered_download_requested_output(criterion)
+            ),
+            None,
+        )
     reconciled = (
         [criterion for criterion in criteria if not _registered_download_requested_output_criterion(criterion)]
         if has_registered_download_evidence
@@ -228,9 +241,7 @@ def _reconcile_download_completion_criterion(
         return reconciled
     return [
         *reconciled,
-        _registered_download_criterion_carrying_requested_output(
-            carries_requested_output=stripped_minted_requested_output
-        ),
+        _registered_download_criterion_carrying_requested_output(witnessed_mint_source=witnessed_mint_source),
     ]
 
 
@@ -469,10 +480,13 @@ async def _maybe_run_completion_verification_from_page_observation(
     )
     if _classifier_status(copilot_ctx) == "fallback" and not run_criteria:
         verification = _no_gradeable_run_plane_result(criterion_ids)
+        verification = carry_criterion_metadata(verification, criteria)
         verification = _carry_degraded_ids(copilot_ctx, verification)
         verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
         copilot_ctx.completion_verification_result = verification
-        record_completion_verification(copilot_ctx, verification)
+        record_completion_verification(
+            copilot_ctx, verification, workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id
+        )
         _record_adjudication_on_turn_state(copilot_ctx, verification)
         _emit_completion_verification_trace(copilot_ctx, verification)
         return verification
@@ -626,6 +640,7 @@ async def _maybe_run_completion_verification_from_page_observation(
                 requested_output_criteria_count=len(requested_output_criteria),
             )
 
+    verification = carry_criterion_metadata(verification, criteria)
     verification = _carry_degraded_ids(copilot_ctx, verification)
     verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     if (
@@ -636,7 +651,9 @@ async def _maybe_run_completion_verification_from_page_observation(
         return existing
 
     copilot_ctx.completion_verification_result = verification
-    record_completion_verification(copilot_ctx, verification)
+    record_completion_verification(
+        copilot_ctx, verification, workflow_run_id=copilot_ctx.last_run_blocks_workflow_run_id
+    )
     _record_adjudication_on_turn_state(copilot_ctx, verification)
     if verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, verification)
@@ -1365,6 +1382,7 @@ async def _maybe_run_completion_verification(
     verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
     if verification is None:
         return None
+    verification = carry_criterion_metadata(verification, criteria)
     verification = _carry_degraded_ids(copilot_ctx, verification)
     verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
     run_data = result.get("data")
@@ -1668,9 +1686,7 @@ def _missing_evidence_detail(
 ) -> str | None:
     outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
     parts: list[str] = []
-    for verdict in completion_verification.verdicts:
-        if verdict.satisfied or completion_verification.is_structural_contingent_abstention(verdict):
-            continue
+    for verdict in effective_unmet_verdicts(completion_verification):
         missing_evidence = verdict_missing_evidence(verdict)
         if not missing_evidence:
             continue
@@ -1698,13 +1714,14 @@ def _outcome_failure_warrants_repair(
         return False
     if only_degraded_blocking(completion_verification):
         return False
-    if any(verdict.reason_code == "evidence_contradicts" for verdict in completion_verification.verdicts):
+    unmet_verdicts = effective_unmet_verdicts(completion_verification)
+    if any(verdict.reason_code == "evidence_contradicts" for verdict in unmet_verdicts):
         return True
     # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
     # (absent judge signal, unmappable definition checks) never warrants repair.
     if not any(
         verdict.state == "unsatisfied" and not _is_structural_requested_output_abstention(verdict)
-        for verdict in completion_verification.verdicts
+        for verdict in unmet_verdicts
     ):
         return False
     return _current_workflow_has_evidence_block(copilot_ctx)

@@ -17,6 +17,12 @@ function useArtifactImageSrc(artifact: ArtifactApiResponse | undefined) {
 
   const artifactId = artifact?.artifact_id;
   const baseSrc = artifact ? getImageURL(artifact) : undefined;
+  // file://-backed sources render through the local /artifact/image proxy and
+  // never expire, so an error there is a real failure. Everything else (signed
+  // content URLs, storage-presigned URLs) self-heals by re-minting from the id.
+  const mintable = !(artifact?.signed_url ?? artifact?.uri)?.startsWith(
+    "file://",
+  );
   const currentArtifactIdRef = useRef(artifactId);
 
   useEffect(() => {
@@ -26,7 +32,7 @@ function useArtifactImageSrc(artifact: ArtifactApiResponse | undefined) {
   }, [artifactId, baseSrc]);
 
   const onImageError = useCallback(() => {
-    if (!artifactId || mintedUrl) {
+    if (!artifactId || !mintable || mintedUrl) {
       setImageFailed(true);
       return;
     }
@@ -42,7 +48,7 @@ function useArtifactImageSrc(artifact: ArtifactApiResponse | undefined) {
           setImageFailed(true);
         }
       });
-  }, [artifactId, mintedUrl, credentialGetter]);
+  }, [artifactId, mintable, mintedUrl, credentialGetter]);
 
   return { src: mintedUrl ?? baseSrc, onImageError, imageFailed };
 }

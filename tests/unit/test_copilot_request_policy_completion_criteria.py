@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
 )
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionCriterion,
     JudgmentTruthCondition,
     RequestPolicy,
@@ -1773,6 +1774,161 @@ def test_requested_output_path_mint_source_excluded_from_reconcile_key() -> None
     persisted_twin = replace(minted, requested_output_path_mint_source=None)
 
     assert _criterion_reconcile_key(minted) == _criterion_reconcile_key(persisted_twin)
+
+
+def test_classifier_declared_registered_download_path_mints_declared_source() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested statement download is returned.",
+                "output_path": "output.downloaded_file_artifact_ids",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].output_path == "output.downloaded_file_artifact_ids"
+    assert parsed[0].requested_output_path_mint_source == "classifier_declared"
+
+
+def test_classifier_declared_non_registered_download_path_mints_no_source() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The returned record includes the statement id.",
+                "output_path": "output.statement_id",
+                "deliverable_kind": "registered_download",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].output_path == "output.statement_id"
+    assert parsed[0].requested_output_path_mint_source is None
+
+
+def test_store_round_trip_preserves_classifier_declared_mint_source() -> None:
+    criteria = (replace(_minted_download_criterion(), requested_output_path_mint_source="classifier_declared"),)
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored[0].requested_output_path_mint_source == "classifier_declared"
+    assert restored == criteria
+
+
+def test_exact_value_download_ask_does_not_mint_classifier_declared_source() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested statement download is returned.",
+                "output_path": "output.downloaded_files",
+                "deliverable_kind": "registered_download",
+                "expected_output_value": "statement-2026-05.pdf",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].expected_output_value == "statement-2026-05.pdf"
+    assert parsed[0].requested_output_path_mint_source is None
+
+
+def test_plain_outcome_keeps_canonical_deliverable_confirmation_association() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested document is selected and downloaded.",
+                "deliverable_confirmation_criterion_id": REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].deliverable_confirmation_criterion_id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+
+
+def test_non_canonical_deliverable_confirmation_association_is_cleared() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested document is selected and downloaded.",
+                "deliverable_confirmation_criterion_id": "c1",
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].deliverable_confirmation_criterion_id is None
+
+
+@pytest.mark.parametrize(
+    "ineligible_fields",
+    [
+        {"level": "definition"},
+        {"kind": "terminal_action", "terminal_action_family": "request"},
+        {"output_path": "output.downloaded_files", "deliverable_kind": "registered_download"},
+        {"method_mandated": True},
+    ],
+)
+def test_ineligible_criteria_cannot_carry_deliverable_confirmation_association(
+    ineligible_fields: dict[str, Any],
+) -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {
+                "outcome": "The requested document is selected and downloaded.",
+                "deliverable_confirmation_criterion_id": REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+                **ineligible_fields,
+            }
+        ]
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].deliverable_confirmation_criterion_id is None
+
+
+def test_store_round_trip_preserves_deliverable_confirmation_association() -> None:
+    criteria = (
+        _criterion(
+            "c0",
+            "The requested document is selected and downloaded.",
+            deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        ),
+    )
+
+    restored = criteria_from_json(criteria_to_json(criteria))
+
+    assert restored == criteria
+    assert restored[0].deliverable_confirmation_criterion_id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+
+
+def test_store_load_clears_association_on_ineligible_row() -> None:
+    row = criteria_to_json(
+        (
+            _criterion(
+                "c0",
+                "The requested document is selected and downloaded.",
+                deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+            ),
+        )
+    )
+    row[0]["method_mandated"] = True
+
+    restored = criteria_from_json(row)
+
+    assert restored[0].deliverable_confirmation_criterion_id is None
+
+
+def test_deliverable_confirmation_association_changes_reconcile_identity() -> None:
+    associated = _criterion(
+        "c0",
+        "The requested document is selected and downloaded.",
+        deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+    )
+    unassociated = replace(associated, deliverable_confirmation_criterion_id=None)
+
+    assert _criterion_reconcile_key(associated) != _criterion_reconcile_key(unassociated)
 
 
 def test_request_policy_trace_exposes_requested_output_grounding_contract_without_values() -> None:
