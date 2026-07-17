@@ -25,6 +25,7 @@ from skyvern.cli.core.browser_ops import (
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import scoped_session
 from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.client.errors import InternalServerError
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
@@ -887,6 +888,30 @@ class TestDoExecute:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_observe_execute_tool_contract_qualifies_ref_lifetime_by_transport() -> None:
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    observe = tools["skyvern_observe"]
+    execute = tools["skyvern_execute"]
+    surfaces = {
+        "observe description": observe.description,
+        "execute description": execute.description,
+        "execute steps schema": execute.parameters["properties"]["steps"]["description"],
+        "server instructions": mcp.instructions,
+    }
+
+    for surface, text in surfaces.items():
+        assert text is not None, f"Missing {surface}"
+        normalized = text.lower()
+        for term in ("stdio", "stateless http", "selector", "intent"):
+            assert term in normalized, f"{surface} missing {term!r}"
+        assert "across calls in this browser session" not in normalized
+        assert "across calls in the same browser session" not in normalized
+        assert "do not persist" not in normalized, f"{surface} uses persist wording for the hosted failure"
+        if surface != "server instructions":
+            assert "do not resolve" in normalized, f"{surface} missing resolve semantics"
+
+
 class TestSkyvernObserveMCP:
     @pytest.mark.asyncio
     async def test_observe_returns_elements(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -899,6 +924,22 @@ class TestSkyvernObserveMCP:
         assert result["ok"] is True
         assert len(result["data"]["elements"]) == 4
         assert result["data"]["element_count"] == 4
+
+    @pytest.mark.asyncio
+    async def test_observe_hint_qualifies_ref_lifetime_by_transport(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        page = _make_page()
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+
+        result = await mcp_browser.skyvern_observe()
+
+        hint = result["data"]["hint"].lower()
+        for term in ("stdio", "stateless http", "selector", "intent"):
+            assert term in hint
+        assert "across calls in this browser session" not in hint
 
     @pytest.mark.asyncio
     async def test_default_observe_omits_values_from_output_and_registry(
@@ -1745,16 +1786,33 @@ class TestSkyvernExecuteMCP:
         assert result["data"]["results"][1]["data"]["resolved_selector"] == "#region"
 
     @pytest.mark.asyncio
-    async def test_execute_unknown_ref_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("stateless_http_mode", [False, True])
+    async def test_execute_unknown_ref_error_is_transport_aware(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stateless_http_mode: bool,
+    ) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="local")
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
 
-        async with scoped_session(make_session_state(context=ctx)):
-            result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"ref": "e99"}}])
+        previous_mode = session_manager.is_stateless_http_mode()
+        try:
+            session_manager.set_stateless_http_mode(stateless_http_mode)
+            async with scoped_session(make_session_state(context=ctx)):
+                result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"ref": "e99"}}])
+        finally:
+            session_manager.set_stateless_http_mode(previous_mode)
 
         assert result["ok"] is False
-        assert result["data"]["results"][0]["error"] == ("Unknown ref 'e99' — call observe first or check ref exists")
+        error = result["data"]["results"][0]["error"]
+        assert error.startswith("Unknown ref 'e99' — call observe first or check ref exists")
+        if stateless_http_mode:
+            assert "stateless HTTP mode" in error
+            assert "do not resolve" in error
+            assert "selector or intent" in error
+        else:
+            assert "stateless" not in error
 
     @pytest.mark.asyncio
     async def test_execute_preserves_structured_direct_failure_error(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -246,7 +246,7 @@ async def test_run_task_schema_description_demotes_autonomous_trial() -> None:
     assert "highest-cost AI path" in description
     assert "Not for production or reusable automations" in description
     assert "Prefer direct tools" in description
-    assert "selector/ref" in description
+    assert "via selector" in description
     assert "skyvern_observe + skyvern_execute" in description
 
 
