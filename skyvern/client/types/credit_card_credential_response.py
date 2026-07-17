@@ -10,7 +10,8 @@ class CreditCardCredentialResponse(UniversalBaseModel):
     """
     Response model for credit card credentials — non-sensitive fields only.
 
-    SECURITY: Must NEVER include full card number, CVV, expiration date, or card holder name.
+    SECURITY: Must NEVER include full card number, CVV, expiration date, card holder name,
+    billing fields, or metadata.
     """
 
     last_four: str = pydantic.Field()

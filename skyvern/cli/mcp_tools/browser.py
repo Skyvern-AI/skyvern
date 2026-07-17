@@ -50,7 +50,13 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+# Deliberate private import: the recorder must scrub URLs exactly like synthesis does,
+# without forking the scrubber or modifying the copilot module.
+from skyvern.forge.sdk.copilot.code_block_synthesis import _scrub_url_for_code_literal as scrub_url_for_code_literal
+from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, typed_text_looks_secret
 from skyvern.schemas.run_blocks import CredentialType
 
 from ._common import (
@@ -77,6 +83,7 @@ from ._localhost import is_localhost_url
 from ._session import (
     BrowserNotAvailableError,
     clear_session_ref_map,
+    current_api_key_hash,
     get_current_session,
     get_page,
     get_session_ref,
@@ -93,6 +100,56 @@ _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
 _ERROR_MESSAGE_MAX_CHARS = 500
 _ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
+
+
+def _trajectory_source_url(page: Any) -> str | None:
+    try:
+        source_url = page.url
+        return source_url if isinstance(source_url, str) else None
+    except Exception:
+        LOG.debug("Failed to capture trajectory source URL", exc_info=True)
+        return None
+
+
+def _replayable_select_value(value: str | None) -> bool:
+    # Synthesis strips select values before emitting, so only exact, non-empty, non-secret values round-trip.
+    return value is not None and value != "" and value == value.strip() and not typed_text_looks_secret(value)
+
+
+def _replayable_press_key(key: str) -> bool:
+    return len(key.rsplit("+", 1)[-1]) > 1
+
+
+def _record_trajectory_entry(
+    ctx: Any,
+    *,
+    tool_name: str,
+    source_url: str | None,
+    selector: str | None = None,
+    typed_text: str | None = None,
+    value: str | None = None,
+    key: str | None = None,
+) -> None:
+    try:
+        if ctx.mode != "cloud_session" or not ctx.session_id:
+            return
+        entry: dict[str, Any] = {
+            "tool_name": tool_name,
+            "selector": selector,
+            "source_url": scrub_url_for_code_literal(source_url) if source_url is not None else None,
+            "value": value,
+            "key": key,
+        }
+        if tool_name == "type_text":
+            entry["typed_length"] = len(typed_text or "")
+            entry["typed_value"] = safe_typed_default_value(typed_text, selector=selector or "")
+        append_trajectory_entry(
+            api_key_hash=current_api_key_hash(),
+            session_id=ctx.session_id,
+            entry={name: field for name, field in entry.items() if field is not None and field != ""},
+        )
+    except Exception:
+        LOG.warning("Failed to record browser trajectory entry", tool_name=tool_name, exc_info=True)
 
 
 def _blank_to_none(value: str | None) -> str | None:
@@ -348,6 +405,7 @@ async def skyvern_click(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_click", ok=False, error=no_browser_error())
+    source_url = _trajectory_source_url(page)
 
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
@@ -454,6 +512,25 @@ async def skyvern_click(
     elif selector:
         data["sdk_equivalent"] = f"await page.click({selector!r})"
 
+    if native_option_selection is not None:
+        # Synthesis replays select_option by value only; index/label selections are not replayable.
+        if native_option_selection.selected_by == "value" and _replayable_select_value(native_option_selection.value):
+            _record_trajectory_entry(
+                ctx,
+                tool_name="select_option",
+                selector=native_option_selection.select_selector,
+                source_url=source_url,
+                value=native_option_selection.value,
+            )
+    elif button in (None, "left") and click_count in (None, 1):
+        replayable_selector = resolved if used_ai_path else resolved or selector
+        if replayable_selector:
+            _record_trajectory_entry(
+                ctx,
+                tool_name="click",
+                selector=replayable_selector,
+                source_url=source_url,
+            )
     return make_result(
         "skyvern_click",
         browser_context=ctx,
@@ -878,6 +955,7 @@ async def skyvern_type(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_type", ok=False, error=no_browser_error())
+    source_url = _trajectory_source_url(page)
 
     # DOM-level guard: check if the target element is a password field
     if selector:
@@ -981,6 +1059,14 @@ async def skyvern_type(
         data["sdk_equivalent"] = f"await page.fill(prompt={intent!r}, value={text!r})"
     elif selector:
         data["sdk_equivalent"] = f"await page.fill({selector!r}, {text!r})"
+    if clear and selector is not None and (ai_mode is None or deterministic):
+        _record_trajectory_entry(
+            ctx,
+            tool_name="type_text",
+            selector=selector,
+            source_url=source_url,
+            typed_text=text,
+        )
     return make_result(
         "skyvern_type",
         browser_context=ctx,
@@ -1208,6 +1294,7 @@ async def skyvern_select_option(
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_select_option", ok=False, error=no_browser_error())
+    source_url = _trajectory_source_url(page)
 
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
@@ -1463,6 +1550,14 @@ async def skyvern_select_option(
         data["sdk_equivalent"] = f"await page.select_option(prompt={intent!r}, value={value!r})"
     elif selector:
         data["sdk_equivalent"] = f"await page.select_option({selector!r}, value={value!r})"
+    if selector is not None and not by_label and (ai_mode is None or deterministic) and _replayable_select_value(value):
+        _record_trajectory_entry(
+            ctx,
+            tool_name="select_option",
+            selector=selector,
+            source_url=source_url,
+            value=value,
+        )
     if custom_attempt_ms:
         return make_result(
             "skyvern_select_option",
@@ -1496,10 +1591,13 @@ async def skyvern_press_key(
     Use `intent` or `selector` to focus a specific element before pressing.
     Without either, presses the key on the currently focused element.
     """
+    selector = _blank_to_none(selector)
+    intent = _blank_to_none(intent)
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
         return make_result("skyvern_press_key", ok=False, error=no_browser_error())
+    source_url = _trajectory_source_url(page)
 
     ai_mode = _resolve_ai_mode(selector, intent)[0] if (intent or selector) else None
     direct_action = is_direct_action(selector, ai_mode)
@@ -1545,6 +1643,14 @@ async def skyvern_press_key(
     else:
         sdk_eq = f"await page.keyboard.press({key!r})"
 
+    if intent is None and _replayable_press_key(key):
+        _record_trajectory_entry(
+            ctx,
+            tool_name="press_key",
+            key=key,
+            selector=selector,
+            source_url=source_url,
+        )
     return make_result(
         "skyvern_press_key",
         browser_context=ctx,

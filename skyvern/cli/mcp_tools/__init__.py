@@ -153,6 +153,7 @@ from .tabs import (
     skyvern_tab_switch,
     skyvern_tab_wait_for_new,
 )
+from .trajectory import skyvern_trajectory_get
 from .workflow import (
     guard_definition_size,
     skyvern_workflow_cancel,
@@ -461,6 +462,7 @@ mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Synthesize Code Block"))(skyvern_code_block_synthesize)
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Browser Trajectory"))(skyvern_trajectory_get)
 
 # -- Organization settings (no browser needed) --
 mcp.tool(tags={"settings"}, annotations=_ro("Get Organization Settings"))(skyvern_org_get)
@@ -587,6 +589,7 @@ __all__ = [
     "skyvern_block_validate",
     "skyvern_code_block_lint",
     "skyvern_code_block_synthesize",
+    "skyvern_trajectory_get",
     # Organization settings
     "skyvern_org_get",
     "skyvern_org_update",

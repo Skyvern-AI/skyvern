@@ -24,7 +24,11 @@ from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.request_policy import (
+    REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
     CompletionCriterion,
+    CriterionKind,
+    CriterionLevel,
+    RequestedOutputPathMintSource,
     TerminalActionFamily,
     is_contingent_missing_antecedent_degraded,
     is_fallback_floor_base_criterion,
@@ -47,7 +51,6 @@ _STRUCTURAL_ABSTENTION_REASON_CODE = "structurally_abstained"
 _CONTINGENT_ABSTENTION_REASON_CODES = frozenset(
     {"unknown", "no_evidence", "evidence_contradicts", "missing_exact_field", "unproducible"}
 )
-REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
 TERMINAL_RECORD_CORROBORATION_CRITERION_ID = "__copilot_terminal_record_corroboration__"
 _REGISTERED_DOWNLOAD_COUNT_KEYS = (
     "downloaded_file_count",
@@ -81,6 +84,12 @@ EvidenceSourceKind = Literal[
     "terminal_record",
     "registered_output_parameter",
     "registered_artifact_content",
+    "registered_download",
+]
+AuthoritativeDeliverableSource = Literal[
+    "independent_page_evidence",
+    "registered_artifact_content",
+    "registered_download",
 ]
 
 
@@ -105,6 +114,13 @@ class CriterionVerdict:
 
 
 @dataclass(frozen=True)
+class PlainOutcomeNoEvidenceAbstentionDecision:
+    criterion_ids: tuple[str, ...]
+    confirming_deliverable_criterion_ids: tuple[str, ...]
+    confirming_deliverable_sources: tuple[AuthoritativeDeliverableSource, ...]
+
+
+@dataclass(frozen=True)
 class CompletionVerificationResult:
     status: VerificationStatus
     criterion_ids: list[str] = field(default_factory=list)
@@ -120,11 +136,19 @@ class CompletionVerificationResult:
     floor_rekeyed_backed_by_criterion_id: dict[str, bool] = field(default_factory=dict)
     contingent_degraded_criterion_ids: list[str] = field(default_factory=list)
     requested_output_criteria_count: int = 0
+    criterion_level_by_id: dict[str, CriterionLevel] = field(default_factory=dict)
+    criterion_kind_by_id: dict[str, CriterionKind] = field(default_factory=dict)
+    criterion_output_path_by_id: dict[str, str] = field(default_factory=dict)
+    criterion_deliverable_kind_by_id: dict[str, Literal["registered_download"]] = field(default_factory=dict)
+    criterion_requested_output_mint_source_by_id: dict[str, RequestedOutputPathMintSource] = field(default_factory=dict)
+    deliverable_confirmation_criterion_id_by_id: dict[str, str] = field(default_factory=dict)
 
     def is_fully_satisfied(self) -> bool:
         if self.status != "evaluated" or not self.criterion_ids:
             return False
         verdict_by_id = {verdict.criterion_id: verdict for verdict in self.verdicts}
+        plain_outcome_decision = plain_outcome_no_evidence_abstention_decision(self, verdict_by_id)
+        plain_outcome_abstained_ids = set(plain_outcome_decision.criterion_ids) if plain_outcome_decision else set()
         has_observed_reach_state = any(
             _is_satisfied_observed_end_state_verdict(verdict) for verdict in verdict_by_id.values()
         )
@@ -154,7 +178,7 @@ class CompletionVerificationResult:
                 return False
             # A structurally-unfired contingent criterion is N/A for this run: it neither vetoes nor
             # earns credit, so success must derive from the remaining genuinely-satisfied criteria.
-            if criterion_id in abstained_id_set:
+            if criterion_id in abstained_id_set or criterion_id in plain_outcome_abstained_ids:
                 continue
             # A definition-plane ``unknown`` is a YAML-grader abstention, not a refutation,
             # so it must not veto a run whose observable outcome evidence is fully confirmed.
@@ -195,11 +219,8 @@ class CompletionVerificationResult:
         return _is_contingent_abstention(verdict, self.abstained_criterion_ids())
 
     def to_trace_data(self) -> dict[str, Any]:
-        unmet = [
-            verdict
-            for verdict in self.verdicts
-            if not verdict.satisfied and not self.is_structural_contingent_abstention(verdict)
-        ]
+        plain_outcome_decision = plain_outcome_no_evidence_abstention_decision(self)
+        unmet = effective_unmet_verdicts(self, plain_outcome_decision=plain_outcome_decision)
         missing_evidence: list[str] = []
         for verdict in unmet:
             detail = verdict_missing_evidence(verdict)
@@ -218,6 +239,30 @@ class CompletionVerificationResult:
             "unmet_criterion_ids": [verdict.criterion_id for verdict in unmet],
             "missing_evidence": missing_evidence,
         }
+        if plain_outcome_decision is not None:
+            data.update(
+                {
+                    "plain_outcome_no_evidence_abstention_engaged": True,
+                    "plain_outcome_no_evidence_abstention_abstained_criterion_ids": list(
+                        plain_outcome_decision.criterion_ids
+                    ),
+                    "plain_outcome_no_evidence_abstention_confirming_deliverable_criterion_ids": list(
+                        plain_outcome_decision.confirming_deliverable_criterion_ids
+                    ),
+                    "plain_outcome_no_evidence_abstention_confirming_deliverable_sources": list(
+                        plain_outcome_decision.confirming_deliverable_sources
+                    ),
+                    "plain_outcome_no_evidence_abstention_criterion_plane": "run",
+                    "plain_outcome_no_evidence_abstention_criterion_kind": "outcome",
+                    "plain_outcome_no_evidence_abstention_reason_code": "no_evidence",
+                    "plain_outcome_no_evidence_abstention_confirmed_independent_deliverable": True,
+                    "plain_outcome_no_evidence_abstention_confirming_deliverable_mint_sources": [
+                        self.criterion_requested_output_mint_source_by_id[criterion_id]
+                        for criterion_id in plain_outcome_decision.confirming_deliverable_criterion_ids
+                        if criterion_id in self.criterion_requested_output_mint_source_by_id
+                    ],
+                }
+            )
         if self.contingent_criterion_ids:
             data["contingent_criterion_ids"] = list(self.contingent_criterion_ids)
         if self.structural_unfired_criterion_ids:
@@ -226,6 +271,7 @@ class CompletionVerificationResult:
             data["contingent_degraded_criterion_ids"] = list(self.contingent_degraded_criterion_ids)
         contingent_id_set = set(self.contingent_criterion_ids)
         structural_unfired_id_set = set(self.structural_unfired_criterion_ids)
+        plain_outcome_abstained_id_set = set(plain_outcome_decision.criterion_ids) if plain_outcome_decision else set()
         for index, verdict in enumerate(self.verdicts[:_MAX_TRACE_VERDICTS]):
             prefix = f"verdict_{index}"
             data[f"{prefix}_criterion_id"] = verdict.criterion_id
@@ -262,7 +308,12 @@ class CompletionVerificationResult:
             evidence_ref = _clean_optional_text(verdict.evidence_ref, max_chars=_EVIDENCE_REF_MAX_CHARS)
             if evidence_ref:
                 data[f"{prefix}_evidence_ref"] = evidence_ref
-            detail = None if self.is_structural_contingent_abstention(verdict) else verdict_missing_evidence(verdict)
+            detail = (
+                None
+                if self.is_structural_contingent_abstention(verdict)
+                or verdict.criterion_id in plain_outcome_abstained_id_set
+                else verdict_missing_evidence(verdict)
+            )
             if detail:
                 data[f"{prefix}_missing_evidence"] = detail
         return data
@@ -400,6 +451,7 @@ def grade_registered_download_criteria(
                 state="satisfied",
                 reason_code="evidence_confirms",
                 evidence_ref=f"block_outputs:{label}",
+                evidence_source="registered_download",
             )
             for criterion in registered_criteria
         ]
@@ -449,9 +501,11 @@ def _missing_verdict(criterion_id: str) -> CriterionVerdict:
 
 def summarize_unsatisfied_outcomes(result: CompletionVerificationResult, criteria: list[CompletionCriterion]) -> str:
     outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
-    satisfied = {verdict.criterion_id for verdict in result.verdicts if verdict.satisfied}
-    unmet = [outcome_by_id[cid] for cid in result.criterion_ids if cid not in satisfied and cid in outcome_by_id]
-    return "; ".join(unmet)
+    return "; ".join(
+        outcome_by_id[verdict.criterion_id]
+        for verdict in effective_unmet_verdicts(result)
+        if verdict.criterion_id in outcome_by_id
+    )
 
 
 def _render_criteria(criteria: list[CompletionCriterion]) -> str:
@@ -2029,6 +2083,103 @@ def _is_reperception_contradiction(verdict: CriterionVerdict) -> bool:
     )
 
 
+def plain_outcome_no_evidence_abstention_decision(
+    result: CompletionVerificationResult,
+    verdict_by_id: Mapping[str, CriterionVerdict] | None = None,
+) -> PlainOutcomeNoEvidenceAbstentionDecision | None:
+    if result.status != "evaluated" or not result.criterion_ids:
+        return None
+    verdict_by_id = verdict_by_id or {verdict.criterion_id: verdict for verdict in result.verdicts}
+    active_ids = set(result.criterion_ids)
+    has_observed_reach_state = any(
+        _is_satisfied_observed_end_state_verdict(verdict)
+        for criterion_id, verdict in verdict_by_id.items()
+        if criterion_id in active_ids
+    )
+    if any(
+        verdict.state == "unsatisfied"
+        and verdict.reason_code == "evidence_contradicts"
+        and not result.is_structural_contingent_abstention(verdict)
+        and not (has_observed_reach_state and _is_reperception_contradiction(verdict))
+        for criterion_id, verdict in verdict_by_id.items()
+        if criterion_id in active_ids
+    ):
+        return None
+
+    confirming_ids: list[str] = []
+    confirming_sources: list[AuthoritativeDeliverableSource] = []
+    for criterion_id in result.criterion_ids:
+        verdict = verdict_by_id.get(criterion_id)
+        if (
+            verdict is None
+            or not verdict.satisfied
+            or verdict.reason_code != "evidence_confirms"
+            or result.criterion_level_by_id.get(criterion_id) != "run"
+        ):
+            continue
+        source: AuthoritativeDeliverableSource | None = None
+        if (
+            criterion_id == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+            and verdict.evidence_source == "registered_download"
+            and criterion_id in result.criterion_requested_output_mint_source_by_id
+        ):
+            source = "registered_download"
+        elif criterion_id in result.criterion_output_path_by_id:
+            if verdict.evidence_source == "independent_page_evidence":
+                source = "independent_page_evidence"
+            elif verdict.evidence_source == "registered_artifact_content":
+                source = "registered_artifact_content"
+        if source is not None:
+            confirming_ids.append(criterion_id)
+            confirming_sources.append(source)
+    if not confirming_ids:
+        return None
+
+    degraded_ids = degraded_lane_criterion_ids(result)
+    floor_rekeyed_ids = set(result.floor_rekeyed_criterion_ids)
+    confirmed_ids = set(confirming_ids)
+    abstained_ids = tuple(
+        criterion_id
+        for criterion_id in result.criterion_ids
+        if criterion_id != REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
+        and criterion_id not in degraded_ids
+        and criterion_id not in floor_rekeyed_ids
+        and criterion_id not in result.criterion_output_path_by_id
+        and criterion_id not in result.criterion_deliverable_kind_by_id
+        and result.deliverable_confirmation_criterion_id_by_id.get(criterion_id) in confirmed_ids
+        and result.criterion_level_by_id.get(criterion_id) == "run"
+        and result.criterion_kind_by_id.get(criterion_id) == "outcome"
+        and (verdict := verdict_by_id.get(criterion_id)) is not None
+        and verdict.state == "unsatisfied"
+        and verdict.reason_code == "no_evidence"
+    )
+    if not abstained_ids:
+        return None
+    return PlainOutcomeNoEvidenceAbstentionDecision(
+        criterion_ids=abstained_ids,
+        confirming_deliverable_criterion_ids=tuple(confirming_ids),
+        confirming_deliverable_sources=tuple(confirming_sources),
+    )
+
+
+def effective_unmet_verdicts(
+    result: CompletionVerificationResult,
+    *,
+    plain_outcome_decision: PlainOutcomeNoEvidenceAbstentionDecision | None = None,
+) -> list[CriterionVerdict]:
+    decision = plain_outcome_decision or plain_outcome_no_evidence_abstention_decision(result)
+    abstained_ids = set(decision.criterion_ids) if decision else set()
+    active_ids = set(result.criterion_ids)
+    return [
+        verdict
+        for verdict in result.verdicts
+        if verdict.criterion_id in active_ids
+        and not verdict.satisfied
+        and not result.is_structural_contingent_abstention(verdict)
+        and verdict.criterion_id not in abstained_ids
+    ]
+
+
 def _is_definition_plane_abstention(verdict: CriterionVerdict) -> bool:
     return verdict.state == "unknown" and verdict.reason_code.startswith(_DEFINITION_REASON_PREFIX)
 
@@ -2236,6 +2387,12 @@ def combine_verification_results(
     floor_rekeyed_path_by_id: dict[str, str] = {}
     floor_rekeyed_backed_by_id: dict[str, bool] = {}
     contingent_degraded_ids: list[str] = []
+    criterion_level_by_id: dict[str, CriterionLevel] = {}
+    criterion_kind_by_id: dict[str, CriterionKind] = {}
+    criterion_output_path_by_id: dict[str, str] = {}
+    criterion_deliverable_kind_by_id: dict[str, Literal["registered_download"]] = {}
+    criterion_requested_output_mint_source_by_id: dict[str, RequestedOutputPathMintSource] = {}
+    deliverable_confirmation_criterion_id_by_id: dict[str, str] = {}
     if run_result is not None:
         contingent_ids = list(dict.fromkeys([*contingent_ids, *run_result.contingent_criterion_ids]))
         contingent_on_by_id.update(run_result.contingent_on_by_criterion_id)
@@ -2250,6 +2407,12 @@ def combine_verification_results(
         contingent_degraded_ids = list(
             dict.fromkeys([*contingent_degraded_ids, *run_result.contingent_degraded_criterion_ids])
         )
+        criterion_level_by_id.update(run_result.criterion_level_by_id)
+        criterion_kind_by_id.update(run_result.criterion_kind_by_id)
+        criterion_output_path_by_id.update(run_result.criterion_output_path_by_id)
+        criterion_deliverable_kind_by_id.update(run_result.criterion_deliverable_kind_by_id)
+        criterion_requested_output_mint_source_by_id.update(run_result.criterion_requested_output_mint_source_by_id)
+        deliverable_confirmation_criterion_id_by_id.update(run_result.deliverable_confirmation_criterion_id_by_id)
     if run_result is not None and run_result.status != "evaluated":
         return CompletionVerificationResult(
             status=run_result.status,
@@ -2265,6 +2428,12 @@ def combine_verification_results(
             floor_rekeyed_backed_by_criterion_id=floor_rekeyed_backed_by_id,
             contingent_degraded_criterion_ids=contingent_degraded_ids,
             requested_output_criteria_count=requested_output_criteria_count,
+            criterion_level_by_id=criterion_level_by_id,
+            criterion_kind_by_id=criterion_kind_by_id,
+            criterion_output_path_by_id=criterion_output_path_by_id,
+            criterion_deliverable_kind_by_id=criterion_deliverable_kind_by_id,
+            criterion_requested_output_mint_source_by_id=criterion_requested_output_mint_source_by_id,
+            deliverable_confirmation_criterion_id_by_id=deliverable_confirmation_criterion_id_by_id,
         )
     if run_result is not None:
         run_result = replace(
@@ -2298,6 +2467,12 @@ def combine_verification_results(
         floor_rekeyed_output_path_by_criterion_id=floor_rekeyed_path_by_id,
         contingent_degraded_criterion_ids=contingent_degraded_ids,
         requested_output_criteria_count=requested_output_criteria_count,
+        criterion_level_by_id=criterion_level_by_id,
+        criterion_kind_by_id=criterion_kind_by_id,
+        criterion_output_path_by_id=criterion_output_path_by_id,
+        criterion_deliverable_kind_by_id=criterion_deliverable_kind_by_id,
+        criterion_requested_output_mint_source_by_id=criterion_requested_output_mint_source_by_id,
+        deliverable_confirmation_criterion_id_by_id=deliverable_confirmation_criterion_id_by_id,
     )
 
 
@@ -2316,6 +2491,8 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
     if not degraded:
         return False
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    decision = plain_outcome_no_evidence_abstention_decision(result, verdict_by_id)
+    plain_outcome_abstained_ids = set(decision.criterion_ids) if decision else set()
     blocking: set[str] = set()
     for criterion_id in result.criterion_ids:
         verdict = verdict_by_id.get(criterion_id)
@@ -2326,6 +2503,8 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
         if verdict is not None and _is_incomplete_validation_classification_abstention(verdict):
             continue
         if verdict is not None and result.is_structural_contingent_abstention(verdict):
+            continue
+        if criterion_id in plain_outcome_abstained_ids:
             continue
         blocking.add(criterion_id)
     if not blocking:
@@ -2380,6 +2559,8 @@ def degraded_contract_delivered_unverified_terminal_state(
     if not degraded:
         return None
     verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    decision = plain_outcome_no_evidence_abstention_decision(result, verdict_by_id)
+    plain_outcome_abstained_ids = set(decision.criterion_ids) if decision else set()
     observed: list[CriterionVerdict] = []
     blocking: set[str] = set()
     for criterion_id in result.criterion_ids:
@@ -2390,6 +2571,8 @@ def degraded_contract_delivered_unverified_terminal_state(
         if verdict is not None and verdict.satisfied:
             continue
         if verdict is not None and result.is_structural_contingent_abstention(verdict):
+            continue
+        if criterion_id in plain_outcome_abstained_ids:
             continue
         blocking.add(criterion_id)
     if not observed or not blocking or not blocking <= degraded:
@@ -2470,6 +2653,55 @@ def gradeable_completion_criteria(criteria: Iterable[CompletionCriterion]) -> li
             and criterion.requested_output_evidence_source == "independent_run_evidence"
         )
     ]
+
+
+def carry_criterion_metadata(
+    result: CompletionVerificationResult,
+    criteria: Iterable[CompletionCriterion],
+) -> CompletionVerificationResult:
+    active_ids = set(result.criterion_ids)
+    active_criteria = [criterion for criterion in criteria if criterion.id in active_ids]
+    level_by_id = dict(result.criterion_level_by_id)
+    level_by_id.update({criterion.id: criterion.level for criterion in active_criteria})
+    kind_by_id = dict(result.criterion_kind_by_id)
+    kind_by_id.update({criterion.id: criterion.kind for criterion in active_criteria})
+    output_path_by_id = dict(result.criterion_output_path_by_id)
+    output_path_by_id.update(
+        {criterion.id: criterion.output_path for criterion in active_criteria if criterion.output_path is not None}
+    )
+    deliverable_kind_by_id = dict(result.criterion_deliverable_kind_by_id)
+    deliverable_kind_by_id.update(
+        {
+            criterion.id: criterion.deliverable_kind
+            for criterion in active_criteria
+            if criterion.deliverable_kind is not None
+        }
+    )
+    requested_output_mint_source_by_id = dict(result.criterion_requested_output_mint_source_by_id)
+    requested_output_mint_source_by_id.update(
+        {
+            criterion.id: criterion.requested_output_path_mint_source
+            for criterion in active_criteria
+            if criterion.requested_output_path_mint_source is not None
+        }
+    )
+    deliverable_confirmation_by_id = dict(result.deliverable_confirmation_criterion_id_by_id)
+    deliverable_confirmation_by_id.update(
+        {
+            criterion.id: criterion.deliverable_confirmation_criterion_id
+            for criterion in active_criteria
+            if criterion.deliverable_confirmation_criterion_id is not None
+        }
+    )
+    return replace(
+        result,
+        criterion_level_by_id=level_by_id,
+        criterion_kind_by_id=kind_by_id,
+        criterion_output_path_by_id=output_path_by_id,
+        criterion_deliverable_kind_by_id=deliverable_kind_by_id,
+        criterion_requested_output_mint_source_by_id=requested_output_mint_source_by_id,
+        deliverable_confirmation_criterion_id_by_id=deliverable_confirmation_by_id,
+    )
 
 
 def carry_degraded_criterion_ids(
