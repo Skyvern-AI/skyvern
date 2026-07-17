@@ -29,6 +29,7 @@ class Workflow(UniversalBaseModel):
     persist_browser_session: typing.Optional[bool] = None
     pin_saved_session_ip: typing.Optional[bool] = None
     browser_profile_id: typing.Optional[str] = None
+    browser_profile_key: typing.Optional[str] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     status: typing.Optional[WorkflowStatus] = None
     max_screenshot_scrolls: typing.Optional[int] = None
@@ -39,6 +40,7 @@ class Workflow(UniversalBaseModel):
     ai_fallback: typing.Optional[bool] = None
     cache_key: typing.Optional[str] = None
     adaptive_caching: typing.Optional[bool] = None
+    enable_self_healing: typing.Optional[bool] = None
     code_version: typing.Optional[int] = None
     generate_script_on_terminal: typing.Optional[bool] = None
     run_sequentially: typing.Optional[bool] = None
@@ -47,6 +49,7 @@ class Workflow(UniversalBaseModel):
     import_error: typing.Optional[str] = None
     created_by: typing.Optional[str] = None
     edited_by: typing.Optional[str] = None
+    copilot_authored: typing.Optional[bool] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

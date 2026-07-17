@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_judgment_truth_condition,
     _coerce_requested_output_evidence_source,
     _normalize_contingent_antecedent_output_path,
+    _normalize_deliverable_confirmation_criterion_id,
     _normalize_deliverable_kind,
     is_defer_authoring_durable_fill_criterion,
     is_fallback_floor_criterion,
@@ -155,6 +156,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "classification_output_key": criterion.classification_output_key,
             "expected_classification": criterion.expected_classification,
         }
+        if criterion.deliverable_confirmation_criterion_id is not None:
+            item["deliverable_confirmation_criterion_id"] = criterion.deliverable_confirmation_criterion_id
         if criterion.requested_output_corroborator:
             item["requested_output_corroborator"] = True
         if criterion.requested_output_path_mint_source is not None:
@@ -251,17 +254,32 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 requested_output_evidence_source = "runtime_output"
         elif isinstance(stored_expected_output_value, bool) or stored_expected_output_shape == "goal_judgment_boolean":
             requested_output_evidence_source = "independent_run_evidence"
+        stored_level = level if isinstance(level, str) and level in _CRITERION_LEVELS else "run"
+        stored_method_mandated = bool(item.get("method_mandated"))
+        stored_deliverable_kind = _normalize_deliverable_kind(item.get("deliverable_kind"))
+        deliverable_confirmation_criterion_id = _normalize_deliverable_confirmation_criterion_id(
+            item.get("deliverable_confirmation_criterion_id")
+        )
+        if (
+            stored_level != "run"
+            or kind != "outcome"
+            or stored_output_path is not None
+            or stored_deliverable_kind is not None
+            or stored_method_mandated
+        ):
+            deliverable_confirmation_criterion_id = None
         criteria.append(
             CompletionCriterion(
                 id=criterion_id,
                 outcome=outcome,
                 contingent_on=contingent_on,
                 contingent_antecedent_output_path=contingent_antecedent_output_path,
-                deliverable_kind=_normalize_deliverable_kind(item.get("deliverable_kind")),
+                deliverable_kind=stored_deliverable_kind,
+                deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
                 declared_deliverable_kind=_normalize_deliverable_kind(item.get("declared_deliverable_kind")),
                 implicit=bool(item.get("implicit")),
-                method_mandated=bool(item.get("method_mandated")),
-                level=level if isinstance(level, str) and level in _CRITERION_LEVELS else "run",  # type: ignore[arg-type]
+                method_mandated=stored_method_mandated,
+                level=stored_level,  # type: ignore[arg-type]
                 output_path=stored_output_path,
                 expected_output_value=stored_expected_output_value,
                 expected_output_shape=stored_expected_output_shape,
@@ -291,6 +309,7 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     contingent_path_key = criterion.contingent_antecedent_output_path or ""
     deliverable_kind_key = (
         f"{criterion.deliverable_kind or ''}\x1fdeclared:{criterion.declared_deliverable_kind or ''}"
+        f"\x1fconfirmation:{criterion.deliverable_confirmation_criterion_id or ''}"
         f"\x1fjudgment:{judgment_truth_condition_key(criterion.judgment_truth_condition)}"
     )
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)

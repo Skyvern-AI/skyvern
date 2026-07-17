@@ -18,6 +18,7 @@ from skyvern.config import settings
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
 from .result import BrowserContext, ErrorCode, make_error
+from .trajectory_store import delete_session_trajectories
 
 LOG = structlog.get_logger(__name__)
 
@@ -312,6 +313,16 @@ def _api_key_hash(api_key: str | None) -> str | None:
     return hash_api_key_for_cache(api_key)
 
 
+def active_api_key_hash() -> str | None:
+    return _api_key_hash(get_active_api_key())
+
+
+def current_api_key_hash() -> str | None:
+    # Browser recorders call this only after resolve_browser has rebound the session to the active request key.
+    state = get_current_session()
+    return state.api_key_hash or _api_key_hash(get_active_api_key())
+
+
 def _hashes_equal(a: str | None, b: str | None) -> bool:
     """Constant-time comparison of two API-key hashes (either may be None).
 
@@ -461,6 +472,7 @@ async def close_current_session() -> None:
     finally:
         clear_session_ref_map()
         if current.context and current.context.session_id:
+            delete_session_trajectories(current.context.session_id)
             unregister_copilot_session(current.context.session_id)
         set_current_session(SessionState())
 

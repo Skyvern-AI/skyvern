@@ -2018,6 +2018,21 @@ def test_classifier_minted_download_path_excluded_from_author_coverage() -> None
     assert wu._output_contract_required_paths_source(ctx).union == set()
 
 
+def test_classifier_declared_download_path_excluded_from_author_coverage() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_download",
+            outcome="The invoice PDF is downloaded.",
+            output_path="output.downloaded_files",
+            deliverable_kind="registered_download",
+            requested_output_path_mint_source="classifier_declared",
+        )
+    )
+
+    assert wu._requested_output_child_paths(ctx) == set()
+    assert wu._output_contract_required_paths_source(ctx).union == set()
+
+
 def test_non_minted_registered_download_path_still_requires_author_coverage() -> None:
     ctx = _antecedent_ctx(
         CompletionCriterion(

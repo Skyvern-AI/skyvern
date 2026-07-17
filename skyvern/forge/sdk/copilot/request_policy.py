@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotContractV1,
@@ -69,14 +70,8 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "raw_secret_handling",
     "clarification_reason",
 }
-REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS = frozenset(
-    {
-        "output.downloaded_files",
-        "output.downloaded_file_urls",
-        "output.downloaded_file_artifact_ids",
-    }
-)
 _LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH = "output.downloaded_files"
+REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -230,7 +225,7 @@ _CRITERION_KINDS: frozenset[str] = frozenset({"outcome", "terminal_action", "val
 _TERMINAL_ACTION_FAMILIES: frozenset[str] = frozenset({"request", "application", "form", "order"})
 _EXPECTED_OUTPUT_SHAPES: frozenset[str] = frozenset(get_args(ExpectedOutputShape))
 _REQUESTED_OUTPUT_EVIDENCE_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputEvidenceSource))
-RequestedOutputPathMintSource = Literal["classifier_default"]
+RequestedOutputPathMintSource = Literal["classifier_default", "classifier_declared"]
 REQUESTED_OUTPUT_PATH_MINT_SOURCES: frozenset[str] = frozenset(get_args(RequestedOutputPathMintSource))
 
 _OUTPUT_INTENT_RE = re.compile(
@@ -304,6 +299,9 @@ class CompletionCriterion:
     # Author-time seam signal only: unlike ``deliverable_kind`` it survives canonicalization onto
     # non-canonical output paths, so it is never rendered to the completion verifier.
     declared_deliverable_kind: Literal["registered_download"] | None = None
+    # Classifier-authored license for the plain-outcome abstention: non-null only when this
+    # criterion's separate observation may abstain behind the confirmed canonical download.
+    deliverable_confirmation_criterion_id: str | None = None
     implicit: bool = False
     method_mandated: bool = False
     # "definition": a property of the workflow definition itself, graded against the
@@ -1385,11 +1383,43 @@ def _parse_completion_criterion_entries(
                     requested_output_path_mint_source=requested_output_path_mint_source,
                     criterion_id=f"c{len(entries)}",
                 )
+        elif (
+            output_path is not None
+            and expected_output_value is None
+            and deliverable_kind == "registered_download"
+            and kind != "validation_classification"
+            and output_path in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
+        ):
+            requested_output_path_mint_source = "classifier_declared"
+            if emit_mint_events:
+                LOG.info(
+                    "copilot_registered_download_requested_output_minted",
+                    output_path=output_path,
+                    requested_output_path_mint_source=requested_output_path_mint_source,
+                    criterion_id=f"c{len(entries)}",
+                )
+        method_mandated = bool(item.get("method_mandated"))
+        level_raw = item.get("level")
+        level = (
+            cast(CriterionLevel, level_raw) if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS else "run"
+        )
+        deliverable_confirmation_criterion_id = _normalize_deliverable_confirmation_criterion_id(
+            item.get("deliverable_confirmation_criterion_id")
+        )
+        if (
+            level != "run"
+            or kind != "outcome"
+            or output_path is not None
+            or deliverable_kind is not None
+            or method_mandated
+        ):
+            deliverable_confirmation_criterion_id = None
         key = (
             contingent_on or "",
             contingent_antecedent_output_path or "",
             output_path or classification_output_key or normalized_criterion_outcome_key(outcome),
             deliverable_kind or "",
+            deliverable_confirmation_criterion_id or "",
             kind,
             str(expected_classification) if expected_classification is not None else "",
             typed_expected_output_value_key(expected_output_value),
@@ -1400,7 +1430,6 @@ def _parse_completion_criterion_entries(
         if key in seen:
             continue
         seen.add(key)
-        level_raw = item.get("level")
         entries.append(
             (
                 item,
@@ -1410,12 +1439,11 @@ def _parse_completion_criterion_entries(
                     contingent_on=contingent_on,
                     contingent_antecedent_output_path=contingent_antecedent_output_path,
                     deliverable_kind=deliverable_kind,
+                    deliverable_confirmation_criterion_id=deliverable_confirmation_criterion_id,
                     declared_deliverable_kind=deliverable_kind,
                     implicit=bool(item.get("implicit")),
-                    method_mandated=bool(item.get("method_mandated")),
-                    level=cast(CriterionLevel, level_raw)
-                    if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
-                    else "run",
+                    method_mandated=method_mandated,
+                    level=level,
                     output_path=output_path,
                     expected_output_value=expected_output_value,
                     expected_output_shape=expected_output_shape,
@@ -1466,6 +1494,10 @@ def _normalize_contingent_antecedent_output_path(raw: Any) -> str | None:
 
 def _normalize_deliverable_kind(raw: Any) -> Literal["registered_download"] | None:
     return "registered_download" if raw == "registered_download" else None
+
+
+def _normalize_deliverable_confirmation_criterion_id(raw: object) -> str | None:
+    return REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID if raw == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID else None
 
 
 def normalized_criterion_outcome_key(outcome: str) -> str:
@@ -1862,6 +1894,8 @@ def _generic_completion_criterion(criterion: CompletionCriterion) -> bool:
 
 
 def _criterion_drop_priority(criterion: CompletionCriterion, requested_output_paths: set[str]) -> int:
+    if criterion.deliverable_confirmation_criterion_id is not None:
+        return 0
     if criterion.output_path in requested_output_paths:
         return 0
     if criterion.requested_output_corroborator:
@@ -2241,6 +2275,8 @@ def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | Non
             item["contingent_antecedent_output_path"] = criterion.contingent_antecedent_output_path
         if criterion.deliverable_kind:
             item["deliverable_kind"] = criterion.deliverable_kind
+        if criterion.deliverable_confirmation_criterion_id:
+            item["deliverable_confirmation_criterion_id"] = criterion.deliverable_confirmation_criterion_id
         if criterion.output_path:
             item["output_path"] = criterion.output_path
         if criterion.expected_output_value is not None:
