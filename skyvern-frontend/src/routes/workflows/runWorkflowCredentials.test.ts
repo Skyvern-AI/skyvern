@@ -8,7 +8,11 @@ import {
   WorkflowParameterTypes,
   WorkflowParameterValueType,
 } from "./types/workflowTypes";
-import { getLoginCredentialInputs } from "./runWorkflowCredentials";
+import {
+  getFallbackCredentialIds,
+  getLoginCredentialInputs,
+  getRotatingCredentialIds,
+} from "./runWorkflowCredentials";
 
 function workflowParameter(key: string): WorkflowParameter {
   return {
@@ -80,6 +84,8 @@ describe("getLoginCredentialInputs", () => {
       {
         parameter: loginCredential,
         loginBlockLabels: ["Portal login"],
+        fallbackCredentialIds: [],
+        fallbackTrigger: null,
       },
     ]);
   });
@@ -103,6 +109,8 @@ describe("getLoginCredentialInputs", () => {
       {
         parameter: credential,
         loginBlockLabels: ["Primary login", "Nested login"],
+        fallbackCredentialIds: [],
+        fallbackTrigger: null,
       },
     ]);
   });
@@ -122,7 +130,89 @@ describe("getLoginCredentialInputs", () => {
       {
         parameter: credential,
         loginBlockLabels: ["Rotating login"],
+        fallbackCredentialIds: [],
+        fallbackTrigger: null,
       },
+    ]);
+  });
+
+  test("returns single-credential parameters that have fallback credentials", () => {
+    const credential: CredentialParameter = {
+      ...rotatingCredentialParameter("account_credential", ["cred_1"]),
+      credential_ids: null,
+      selection_strategy: null,
+      fallback_credential_ids: ["cred_fb1"],
+    };
+
+    const inputs = getLoginCredentialInputs({
+      workflow: workflowWithBlocks(
+        [loginBlock("Fallback login", [credential])],
+        [credential],
+      ),
+      workflowParameters: [],
+    });
+
+    expect(inputs).toEqual([
+      {
+        parameter: credential,
+        loginBlockLabels: ["Fallback login"],
+        fallbackCredentialIds: ["cred_fb1"],
+        fallbackTrigger: "credential_failures",
+      },
+    ]);
+    expect((inputs[0]!.parameter as CredentialParameter).credential_id).toBe(
+      "cred_1",
+    );
+  });
+
+  test("passes ordered fallback credential ids through and defaults the trigger", () => {
+    const credential: CredentialParameter = {
+      ...rotatingCredentialParameter("account_credential"),
+      fallback_credential_ids: ["cred_fb2", "cred_fb1", "cred_fb2"],
+    };
+
+    const inputs = getLoginCredentialInputs({
+      workflow: workflowWithBlocks(
+        [loginBlock("Rotating login", [credential])],
+        [credential],
+      ),
+      workflowParameters: [],
+    });
+
+    expect(inputs[0]!.fallbackCredentialIds).toEqual(["cred_fb2", "cred_fb1"]);
+    expect(inputs[0]!.fallbackTrigger).toBe("credential_failures");
+  });
+
+  test("preserves an explicit any_failure fallback trigger", () => {
+    const credential: CredentialParameter = {
+      ...rotatingCredentialParameter("account_credential"),
+      fallback_credential_ids: ["cred_fb1"],
+      fallback_trigger: "any_failure",
+    };
+
+    const inputs = getLoginCredentialInputs({
+      workflow: workflowWithBlocks(
+        [loginBlock("Rotating login", [credential])],
+        [credential],
+      ),
+      workflowParameters: [],
+    });
+
+    expect(inputs[0]!.fallbackTrigger).toBe("any_failure");
+  });
+
+  test("classifies fallback-only parameters as single-credential, not rotating", () => {
+    const credential: CredentialParameter = {
+      ...rotatingCredentialParameter("account_credential", ["cred_1"]),
+      credential_ids: null,
+      selection_strategy: null,
+      fallback_credential_ids: ["cred_fb1", "cred_fb2"],
+    };
+
+    expect(getRotatingCredentialIds(credential)).toEqual([]);
+    expect(getFallbackCredentialIds(credential)).toEqual([
+      "cred_fb1",
+      "cred_fb2",
     ]);
   });
 
@@ -147,5 +237,42 @@ describe("getLoginCredentialInputs", () => {
     });
 
     expect(inputs).toEqual([]);
+  });
+});
+
+describe("getFallbackCredentialIds", () => {
+  test("deduplicates fallback credential ids while preserving order", () => {
+    const credential = {
+      ...rotatingCredentialParameter("account_credential"),
+      fallback_credential_ids: ["fallback_1", "fallback_2", "fallback_1"],
+    };
+
+    expect(getFallbackCredentialIds(credential)).toEqual([
+      "fallback_1",
+      "fallback_2",
+    ]);
+  });
+
+  test("ignores empty and invalid fallback credential ids", () => {
+    const credential = {
+      ...rotatingCredentialParameter("account_credential"),
+      fallback_credential_ids: [
+        "fallback_1",
+        "",
+        null,
+        "fallback_2",
+      ] as unknown as Array<string>,
+    };
+
+    expect(getFallbackCredentialIds(credential)).toEqual([
+      "fallback_1",
+      "fallback_2",
+    ]);
+  });
+
+  test("returns an empty list when fallback credentials are unset", () => {
+    const credential = rotatingCredentialParameter("account_credential");
+
+    expect(getFallbackCredentialIds(credential)).toEqual([]);
   });
 });

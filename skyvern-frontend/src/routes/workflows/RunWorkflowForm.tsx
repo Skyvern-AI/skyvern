@@ -15,6 +15,7 @@ import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import {
   Accordion,
   AccordionContent,
@@ -59,6 +60,7 @@ import { parseHeaderJson } from "@/util/secretHeaders";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import {
+  CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
   WorkflowBlock,
@@ -74,7 +76,10 @@ import {
   parseJsonWorkflowParameterValue,
   validateJsonWorkflowParameterValue,
 } from "./utils";
-import { getLoginCredentialInputs } from "./runWorkflowCredentials";
+import {
+  getLoginCredentialInputs,
+  getRotatingCredentialIds,
+} from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
 import { visitWorkflowBlocks } from "./workflowBlockUtils";
 
@@ -352,6 +357,47 @@ function getLoginCredentialDisplayText(
     title: parameterLabel,
     description: `Used by ${formatLoginBlockList(loginBlockLabels)}`,
   };
+}
+
+function FallbackCredentialList({
+  fallbackCredentialIds,
+  fallbackTrigger,
+  credentialNamesById,
+}: {
+  fallbackCredentialIds: Array<string>;
+  fallbackTrigger: CredentialFallbackTrigger | null;
+  credentialNamesById: Map<string, string>;
+}) {
+  if (fallbackCredentialIds.length === 0) {
+    return null;
+  }
+
+  const triggerText =
+    fallbackTrigger === "any_failure"
+      ? "for any reason"
+      : "on credential failures";
+
+  return (
+    <div className="space-y-2">
+      <ol className="space-y-1">
+        {fallbackCredentialIds.map((credentialId, index) => (
+          <li
+            key={credentialId}
+            className="flex min-w-0 items-center gap-2 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200"
+          >
+            <span className="shrink-0 text-slate-400">{index + 1}.</span>
+            <span className="truncate">
+              {credentialNamesById.get(credentialId) ?? credentialId}
+            </span>
+          </li>
+        ))}
+      </ol>
+      <p className="text-xs text-slate-400">
+        If the run fails {triggerText}, Skyvern retries it automatically with
+        the next fallback.
+      </p>
+    </div>
+  );
 }
 
 type RunWorkflowFormType = Record<string, unknown> & {
@@ -764,11 +810,18 @@ function RunWorkflowForm({
             <header>
               <h1 className="text-lg">Login credentials</h1>
             </header>
-            {loginCredentialInputs.map(({ parameter, loginBlockLabels }) => {
+            {loginCredentialInputs.map((input) => {
+              const {
+                parameter,
+                loginBlockLabels,
+                fallbackCredentialIds,
+                fallbackTrigger,
+              } = input;
               const { title, description } = getLoginCredentialDisplayText(
                 parameter,
                 loginBlockLabels,
               );
+              const hasFallbacks = fallbackCredentialIds.length > 0;
 
               if (
                 parameter.parameter_type === WorkflowParameterTypes.Workflow
@@ -829,6 +882,47 @@ function RunWorkflowForm({
                 );
               }
 
+              const credentialIds = getRotatingCredentialIds(parameter);
+
+              if (credentialIds.length <= 1) {
+                const primaryCredentialId =
+                  credentialIds[0] ?? parameter.credential_id;
+                return (
+                  <div key={parameter.key} className="flex gap-16">
+                    <div className="w-72 shrink-0 text-slate-50">
+                      <div className="flex items-center gap-2 text-lg">
+                        {title}
+                        <span className="text-sm text-slate-400">
+                          credential
+                        </span>
+                      </div>
+                      <h2 className="text-sm text-slate-400">{description}</h2>
+                    </div>
+                    <div className="w-full space-y-2">
+                      <div className="flex min-w-0 items-center gap-2 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-1.5 text-xs text-slate-200">
+                        <span className="min-w-0 truncate">
+                          {credentialNamesById.get(primaryCredentialId) ??
+                            primaryCredentialId}
+                        </span>
+                        {hasFallbacks && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-xs font-normal"
+                          >
+                            Primary
+                          </Badge>
+                        )}
+                      </div>
+                      <FallbackCredentialList
+                        fallbackCredentialIds={fallbackCredentialIds}
+                        fallbackTrigger={fallbackTrigger}
+                        credentialNamesById={credentialNamesById}
+                      />
+                    </div>
+                  </div>
+                );
+              }
+
               return (
                 <FormField
                   key={parameter.key}
@@ -845,6 +939,14 @@ function RunWorkflowForm({
                       credentialNamesById={credentialNamesById}
                       title={title}
                       description={description}
+                      showPrimaryBadge={hasFallbacks}
+                      fallbackContent={
+                        <FallbackCredentialList
+                          fallbackCredentialIds={fallbackCredentialIds}
+                          fallbackTrigger={fallbackTrigger}
+                          credentialNamesById={credentialNamesById}
+                        />
+                      }
                     />
                   )}
                 />

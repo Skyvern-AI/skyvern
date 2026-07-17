@@ -1,3 +1,5 @@
+import { type ReactNode } from "react";
+
 import { Badge } from "@/components/ui/badge";
 import { FormControl, FormItem, FormLabel } from "@/components/ui/form";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -19,6 +21,8 @@ type RotatingCredentialFieldProps = {
   credentialNamesById: Map<string, string>;
   title: string;
   description: string;
+  showPrimaryBadge?: boolean;
+  fallbackContent?: ReactNode;
 };
 
 function formatCredentialSelectionStrategy(
@@ -38,6 +42,8 @@ function RotatingCredentialField({
   credentialNamesById,
   title,
   description,
+  showPrimaryBadge = false,
+  fallbackContent,
 }: RotatingCredentialFieldProps) {
   const credentialIds = getRotatingCredentialIds(parameter);
   const forcedCredentialId = typeof value === "string" ? value : "";
@@ -127,27 +133,38 @@ function RotatingCredentialField({
                       </Badge>
                     )}
                   </div>
-                  <Select
-                    disabled={mode !== "force"}
-                    value={forceSelectValue}
-                    onValueChange={(value) => onChange(value)}
-                  >
-                    <SelectTrigger className="w-full">
-                      <SelectValue placeholder="Select a credential" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {credentialIds.map((credentialId) => (
-                        <SelectItem key={credentialId} value={credentialId}>
-                          {credentialNamesById.get(credentialId) ??
-                            credentialId}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  <div className="flex items-center gap-2">
+                    <Select
+                      disabled={mode !== "force"}
+                      value={forceSelectValue}
+                      onValueChange={(value) => onChange(value)}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="Select a credential" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {credentialIds.map((credentialId) => (
+                          <SelectItem key={credentialId} value={credentialId}>
+                            {credentialNamesById.get(credentialId) ??
+                              credentialId}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {showPrimaryBadge && (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 text-xs font-normal"
+                      >
+                        Primary
+                      </Badge>
+                    )}
+                  </div>
                 </div>
               </label>
             </RadioGroup>
           </FormControl>
+          {fallbackContent}
         </div>
       </div>
     </FormItem>
