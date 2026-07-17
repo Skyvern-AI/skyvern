@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import textwrap
+from pathlib import Path
 from types import EllipsisType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -98,6 +99,7 @@ from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_modul
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _code_block_render_reject,
     _code_safety_reject_payload,
     _OutputContractEvaluation,
     _strip_redundant_sandbox_imports_in_yaml,
@@ -645,6 +647,27 @@ def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> 
         "      code: |\n"
         f"{indented_code}\n"
     )
+
+
+class TestCredentialRealValueBindings:
+    def test_real_username_reference_is_not_falsely_rejected(self) -> None:
+        yaml_text = _credential_code_yaml(
+            code='await page.locator("#email").fill("{{ login_credential_real_username }}")',
+        )
+        assert _code_block_render_reject(yaml_text, None) is None
+
+    def test_real_password_reference_is_not_falsely_rejected(self) -> None:
+        yaml_text = _credential_code_yaml(
+            code='await page.locator("input[type=\'password\']").fill("{{ login_credential_real_password }}")',
+        )
+        assert _code_block_render_reject(yaml_text, None) is None
+
+    def test_unbound_credential_derived_name_still_rejected(self) -> None:
+        yaml_text = _credential_code_yaml(
+            code='await page.locator("#email").fill("{{ nonexistent_credential_real_username }}")',
+        )
+        result = _code_block_render_reject(yaml_text, None)
+        assert result is not None
 
 
 def _directory_blocks_yaml(blocks: str) -> str:
@@ -19034,3 +19057,180 @@ class TestFreehandSurfacePersistSeam:
         code = 'await page.get_by_label("State").select_option("CA")'
         result = workflow_update_module._persist_seam_freehand_surface_result(_freehand_block_yaml(code), ctx)
         assert result is None
+
+
+_RENDER_PREFLIGHT_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "copilot" / "wr_jinja_unrenderable_proposed_workflow.json"
+)
+
+_PARAMETERS_NAMESPACE_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+      blocks:
+      - block_type: code
+        label: submit_request
+        parameter_keys: [business_name]
+        code: |
+          # Workflow input bindings: {{ parameters.business_name }}
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill(str(business_name).strip())
+    """
+)
+
+_UNDECLARED_ROOT_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: submit_request
+        code: |
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill("{{ frobnicator }}")
+    """
+)
+
+_TEMPLATE_SYNTAX_ERROR_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+      blocks:
+      - block_type: code
+        label: submit_request
+        parameter_keys: [business_name]
+        code: |
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill("{{ business_name")
+    """
+)
+
+_RENDERABLE_JINJA_CODE_YAML = _yaml(
+    """
+    title: Utility service request
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+      blocks:
+      - block_type: code
+        label: submit_request
+        parameter_keys: [business_name]
+        code: |
+          await page.goto("https://example.com/request")
+          await page.locator("#company").fill("{{ business_name }}")
+    """
+)
+
+
+class TestCodeBlockRenderPreflightSeam:
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_rejects_parameters_namespace_at_persist_seam(self) -> None:
+        ctx = _code_only_ctx()
+        with capture_logs() as logs:
+            result = await _update_workflow({"workflow_yaml": _PARAMETERS_NAMESPACE_CODE_YAML}, ctx)
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "code_block_unrenderable"
+        assert result["data"]["block_label"] == "submit_request"
+        assert result["data"]["failing_expression"] == "{{ parameters.business_name }}"
+        assert "{{ business_name }}" in result["error"]
+        outcome = ctx.latest_recorded_build_test_outcome
+        assert isinstance(outcome, RecordedBuildTestOutcome)
+        assert outcome.reason_code == "code_block_unrenderable"
+        assert any(
+            log.get("reason_code") == "code_block_unrenderable"
+            and log.get("failing_expression") == "{{ parameters.business_name }}"
+            for log in logs
+        )
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_rejects_undeclared_root_at_persist_seam(self) -> None:
+        result = await _update_workflow({"workflow_yaml": _UNDECLARED_ROOT_CODE_YAML}, _code_only_ctx())
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "code_block_unrenderable"
+        assert result["data"]["failing_expression"] == "{{ frobnicator }}"
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_rejects_template_syntax_error_at_persist_seam(self) -> None:
+        result = await _update_workflow({"workflow_yaml": _TEMPLATE_SYNTAX_ERROR_CODE_YAML}, _code_only_ctx())
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "code_block_unrenderable"
+        assert "syntax error" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_renderable_draft_persists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        result = await _update_workflow({"workflow_yaml": _RENDERABLE_JINJA_CODE_YAML}, ctx)
+        assert result["ok"] is True
+        assert "{{ business_name }}" in ctx.workflow_yaml
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_renderable_draft_with_envelope_imposition_persists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.request_policy = RequestPolicy(
+            completion_criteria=[
+                _typed_completion_criterion(
+                    id="requested_value",
+                    output_path="output.record_id",
+                    level="run",
+                    method_mandated=False,
+                    kind="outcome",
+                )
+            ]
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Entry lookup
+            workflow_definition:
+              parameters:
+              - {parameter_type: workflow, workflow_parameter_type: string, key: business_name, default_value: Sample Business}
+              blocks:
+              - block_type: code
+                label: extract_entry_output
+                parameter_keys: [business_name]
+                code: |
+                  record_id = "{{ business_name }}"
+            """
+        )
+        result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx, allow_missing_credentials=True)
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        code = str(_single_code_block(parsed)["code"])
+        assert "{{ business_name }}" in code
+        assert 'return {"output": {"record_id": record_id}}' in code
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_unchanged_legacy_block_is_not_rerejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = _code_only_ctx()
+        ctx.workflow_yaml = _PARAMETERS_NAMESPACE_CODE_YAML
+        result = await _update_workflow({"workflow_yaml": _PARAMETERS_NAMESPACE_CODE_YAML}, ctx)
+        assert (result.get("data") or {}).get("reason_code") != "code_block_unrenderable"
+        assert result["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_code_block_preflight_rejects_recorded_unrenderable_draft_replay(self) -> None:
+        artifact = json.loads(_RENDER_PREFLIGHT_FIXTURE_PATH.read_text())
+        ctx = _code_only_ctx()
+        with capture_logs() as logs:
+            result = await _update_workflow({"workflow_yaml": artifact["_copilot_yaml"]}, ctx)
+        assert result["ok"] is False
+        assert result["data"]["reason_code"] == "code_block_unrenderable"
+        assert result["data"]["block_label"] == "submit_commercial_water_request"
+        assert "parameters.business_name" in result["data"]["failing_expression"]
+        assert "{{ business_name }}" in result["error"]
+        assert any(
+            log.get("reason_code") == "code_block_unrenderable"
+            and "parameters.business_name" in str(log.get("failing_expression"))
+            for log in logs
+        )
