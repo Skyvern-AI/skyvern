@@ -1045,9 +1045,17 @@ class NoElementBoudingBox(SkyvernException):
         super().__init__(f"Element does not have a bounding box. element_id={element_id}")
 
 
-class NoIncrementalElementFoundForAutoCompletion(SkyvernException):
-    def __init__(self, element_id: str, text: str) -> None:
-        super().__init__(f"No auto completion shown up after fill in [{text}]. element_id={element_id}")
+class AutoCompletionCommitFailure(SkyvernException):
+    def __init__(self, stage: str, attempt_trail: list[str] | None = None) -> None:
+        trail = attempt_trail or [stage]
+        super().__init__(f"Autocomplete selection failed. stage={stage} attempt_trail={','.join(trail)}")
+        self.stage = stage
+        self.attempt_trail = trail
+
+
+# Deprecated: superseded by AutoCompletionCommitFailure, which carries the failing stage.
+# Kept for one release so downstream `except` clauses keep working.
+NoIncrementalElementFoundForAutoCompletion = AutoCompletionCommitFailure
 
 
 class NoSuitableAutoCompleteOption(SkyvernException):
