@@ -50,6 +50,7 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 
@@ -1956,7 +1957,7 @@ async def skyvern_act(
 ) -> dict[str, Any]:
     """Perform actions on a page by describing what to do in plain English. No screenshots in reasoning — uses economy a11y tree.
     Chain multiple actions in one prompt: "close the cookie banner, then click Sign In".
-    For visually complex targets, use skyvern_observe + skyvern_click with refs. NEVER include passwords — use skyvern_login.
+    For visually complex targets, use skyvern_observe + skyvern_execute with refs on stdio; on hosted stateless HTTP prefer selector or intent. NEVER include passwords — use skyvern_login.
     """
     try:
         check_password_prompt(prompt)
@@ -2026,7 +2027,7 @@ async def skyvern_run_task(
     ] = 180,
 ) -> dict[str, Any]:
     """Run a one-off autonomous trial via the highest-cost AI path. Not for production or reusable automations.
-    Prefer direct tools (click/type/select via selector/ref) and skyvern_observe + skyvern_execute. Always uses engine 2.0.
+    Prefer direct tools (click/type/select via selector) and skyvern_observe + skyvern_execute. Always uses engine 2.0.
     """
     # Block password/credential actions — redirect to skyvern_login
     if PASSWORD_PATTERN.search(prompt):
@@ -2624,7 +2625,7 @@ async def skyvern_observe(
         ),
     ] = False,
 ) -> dict[str, Any]:
-    """Snapshot interactive elements with refs reusable in this browser session until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe). Input values are omitted by default; set include_values=True to return non-password values. Password values are never returned."""
+    """Snapshot interactive elements. On stdio, refs persist across calls until the next observe or page/document context change (rarely earlier — on 'Unknown ref', re-observe). In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, using refs from an inline observe in one skyvern_execute batch only when predictable in advance. Input values are omitted by default; set include_values=True to return non-password values. Password values are never returned."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError:
@@ -2674,9 +2675,11 @@ async def skyvern_observe(
         f"{f' (of {result.total_on_page} total on page)' if result.total_on_page > result.element_count else ''}. "
         "Use these refs in skyvern_execute steps, e.g.: "
         '{tool: "click", params: {ref: "e0"}}. '
-        "Refs remain valid across calls in this browser session until the next skyvern_observe, "
+        "On stdio, refs remain valid across calls until the next skyvern_observe, "
         "skyvern_navigate, same-tab navigation, or tab/frame switch. Same-document DOM changes can also "
         "invalidate ordinal refs; re-observe on 'Unknown ref' or unexpected failures. "
+        "In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, "
+        "using refs from an inline observe in one skyvern_execute batch only when predictable in advance. "
         "Input values are omitted unless include_values=true; password values are never returned."
     )
     return make_result(
@@ -2749,7 +2752,10 @@ async def _dispatch_step(
         if elem is None:
             elem = get_session_ref(ref, session_id=session_id, cdp_url=cdp_url, page_key=current_key)
         if elem is None:
-            raise ValueError(f"Unknown ref '{ref}' — call observe first or check ref exists")
+            message = f"Unknown ref '{ref}' — call observe first or check ref exists"
+            if is_stateless_http_mode():
+                message += ". In stateless HTTP mode refs from prior requests do not resolve — use selector or intent params instead."
+            raise ValueError(message)
         params["selector"] = ref_to_selector(elem)
 
     # Observe is handled inline (not an existing MCP tool)
@@ -2802,10 +2808,11 @@ async def skyvern_execute(
         Field(
             description=(
                 "Array of {tool, params} step objects to execute sequentially. "
-                "Within params, refs from skyvern_observe are direct targets across calls in the same browser session. "
-                "The next skyvern_observe or page/document context change invalidates them; they can occasionally "
-                "expire early. Same-document DOM changes can also invalidate ordinal refs; on 'Unknown ref' or "
-                "unexpected failures, re-observe. "
+                "Within params, refs from skyvern_observe are direct targets across calls on stdio transports until "
+                "the next skyvern_observe, navigation, or page/document context change; they can occasionally expire "
+                "early. In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, "
+                "using observe+ref steps in a single batch only when refs are predictable in advance. Same-document DOM "
+                "changes can also invalidate ordinal refs; on 'Unknown ref' or unexpected failures, re-observe. "
                 f"{DIRECT_TARGET_DESCRIPTION}"
             )
         ),
@@ -2817,7 +2824,7 @@ async def skyvern_execute(
         Field(description="Stop at first failure (true) or continue past errors (false). Default true."),
     ] = True,
 ) -> dict[str, Any]:
-    """Execute browser operations using current-session refs until the next observe or page/document context change.
+    """Execute browser operations. On stdio, refs persist across calls until the next observe, navigation, or page/document context change. In hosted stateless HTTP, refs from prior requests do not resolve; prefer selector or intent params, using observe+ref steps in one batch only when refs are predictable in advance.
     Allowed tools: navigate, click, type, press_key, select_option, hover, scroll, wait, observe, screenshot, evaluate."""
     if not steps:
         return make_result(

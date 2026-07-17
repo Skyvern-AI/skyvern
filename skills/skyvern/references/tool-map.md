@@ -54,10 +54,12 @@
 | `skyvern_workflow_create` | Create a workflow definition |
 | `skyvern_workflow_list` | List workflows |
 | `skyvern_workflow_get` | Get workflow details |
+| `skyvern_workflow_run_list` | List runs for a workflow |
 | `skyvern_workflow_update` | Update a workflow |
 | `skyvern_workflow_delete` | Delete a workflow |
 | `skyvern_workflow_run` | Execute a workflow |
 | `skyvern_workflow_status` | Check run status |
+| `skyvern_workflow_retry` | Retry a terminal workflow run |
 | `skyvern_workflow_cancel` | Cancel a running workflow |
 
 ## Workflow blocks
