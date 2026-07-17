@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    _OUTPUT_CONTRACT_TERMINAL_REASON_CODES,
+    CopilotToolBlockerSignal,
+    stash_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
     _check_enforcement,
     _maybe_stash_terminal_challenge_halt,
@@ -85,6 +89,16 @@ def test_terminal_blockers_map_to_halts(signal: CopilotToolBlockerSignal, expect
     assert halt is not None
     assert halt.kind == expected_kind
     assert halt.blocker_signal is signal
+
+
+def test_every_output_contract_terminal_reason_code_maps_to_a_turn_halt() -> None:
+    # Fail-closed guard: an output-contract terminal reason code with no turn_halt mapping mints no
+    # halt, so the turn degrades to loop_detected instead of terminating (the SKY-12594 e25ec5 regression).
+    assert _OUTPUT_CONTRACT_TERMINAL_REASON_CODES
+    for reason_code in _OUTPUT_CONTRACT_TERMINAL_REASON_CODES:
+        halt = turn_halt_from_blocker_signal(_signal(internal_reason_code=reason_code), source="hook")
+        assert halt is not None, f"{reason_code} maps to no TurnHalt; the turn would degrade to loop_detected"
+        assert halt.kind is TurnHaltKind.OUTPUT_SOURCE_UNOBSERVABLE
 
 
 def _halt_ctx(**overrides: object) -> SimpleNamespace:
