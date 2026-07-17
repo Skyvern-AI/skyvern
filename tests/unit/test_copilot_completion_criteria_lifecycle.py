@@ -5,6 +5,7 @@ of the judge-unavailable success bypass."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -314,6 +315,143 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
     assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_terminal_action_verification_mode_round_trips() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+
+    raw = criteria_to_json([criterion])
+
+    assert raw[0]["terminal_action_verification_mode"] == "semantic_outcome_v1"
+    assert criteria_from_json(raw) == (criterion,)
+    legacy = {key: value for key, value in raw[0].items() if key != "terminal_action_verification_mode"}
+    assert criteria_from_json([legacy])[0].terminal_action_verification_mode == "family_record_v1"
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(replace(criterion, terminal_action_verification_mode="family_record_v1"),),
+        ),
+        next_epoch=2,
+    )
+    decision = reconcile_completion_criteria(stored, [criterion], actionable=True)
+    assert decision.action == "create"
+    assert decision.criteria[0].terminal_action_verification_mode == "semantic_outcome_v1"
+
+
+def test_terminal_action_reconciliation_cannot_regress_semantic_authority() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+
+    decision = reconcile_completion_criteria(
+        stored,
+        [replace(semantic, terminal_action_verification_mode="family_record_v1")],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.criteria == (semantic,)
+
+
+def test_terminal_action_reconciliation_abstention_cannot_drop_stored_semantic_authority() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+
+    decision = reconcile_completion_criteria(
+        stored,
+        [
+            replace(
+                semantic,
+                kind="outcome",
+                terminal_action_family=None,
+                terminal_action_verification_mode="family_record_v1",
+            )
+        ],
+        actionable=True,
+    )
+
+    assert decision.action == "adopt_stored"
+    assert decision.criteria == (semantic,)
+
+
+def test_terminal_action_semantic_authority_survives_fresh_criterion_reindexing() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+    authenticated = CompletionCriterion(id="c0", outcome="The user is authenticated.")
+    reindexed = replace(
+        semantic,
+        id="c1",
+        kind="outcome",
+        terminal_action_family=None,
+        terminal_action_verification_mode="family_record_v1",
+    )
+
+    decision = reconcile_completion_criteria(stored, [authenticated, reindexed], actionable=True)
+
+    assert decision.action == "create"
+    assert [
+        (criterion.id, criterion.kind, criterion.terminal_action_verification_mode) for criterion in decision.criteria
+    ] == [
+        ("c0", "outcome", "family_record_v1"),
+        ("c1", "terminal_action", "semantic_outcome_v1"),
+    ]
+
+
+def test_expanded_criteria_preserve_stored_terminal_action_semantic_authority() -> None:
+    semantic = CompletionCriterion(
+        id="c0",
+        outcome="The service request is created.",
+        kind="terminal_action",
+        terminal_action_family="request",
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    added = CompletionCriterion(id="c1", outcome="The confirmation number is returned.")
+    stored = StoredCriteriaSnapshot(
+        active=StoredCriteriaSet(set_id="wccs_1", goal_epoch=1, criteria=(semantic,)),
+        next_epoch=2,
+    )
+
+    decision = reconcile_completion_criteria(
+        stored,
+        [replace(semantic, terminal_action_verification_mode="family_record_v1"), added],
+        actionable=True,
+    )
+
+    assert decision.action == "create"
+    assert decision.criteria == (semantic, added)
 
 
 def test_typed_criteria_list_round_trip_preserves_grading_metadata() -> None:

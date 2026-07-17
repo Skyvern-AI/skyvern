@@ -1,5 +1,36 @@
+{% if terminal_action_reconciliation %}
+TERMINAL ACTION RECONCILIATION MODE
+
+The primary RequestPolicy is credential-bearing but omitted a non-method-mandated terminal_action. Return only JSON in
+this exact shape:
+{"version":"1","criterion_id":"c0","terminal_action_family":"request"}
+
+- criterion_id must select exactly one existing criterion ID from PRIMARY COMPLETION CRITERIA, or be null to abstain.
+- terminal_action_family must be request|application|form|order when criterion_id is non-null, or null when abstaining.
+- Select a criterion only when the latest request requires authentication followed by creating or submitting that
+  criterion's request, application, or form outcome, or placing an order.
+- Abstain when the requested end state is successful authentication itself, including MFA, or when no single existing
+  criterion unambiguously represents the post-login terminal action.
+- Preserve criterion identity: do not invent, remove, duplicate, paraphrase, or re-order criteria. Do not select a
+  method-mandated criterion. The server changes only the selected criterion's kind and terminal_action_family.
+
+Credential input kind: {{ reconciliation_credential_input_kind }}
+Latest user message:
+```{{ user_message }}```
+PRIMARY COMPLETION CRITERIA:
+```{{ reconciliation_criteria }}```
+{% else %}
 Classify the latest Workflow Copilot request. Return only JSON with keys:
 testing_intent=require_test|skip_test|unspecified; authoring_intent=author_now|defer_authoring; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; completion_criteria; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+
+terminal_action priority:
+- Separate authentication from the requested end state before writing completion_criteria. Authentication is a prefix
+  when the credentialed request continues to create or submit a request, application, or form, or to place an order.
+- In that case, include the post-login end state exactly once as kind=terminal_action with the matching family. Do not
+  replace that post-login end state with successful authentication. Example: "sign in and place an order" produces an
+  order terminal_action criterion, not a sign-in criterion.
+- Emit no terminal_action for a pure-login or MFA request whose only requested end state is authentication. Do not
+  invent a post-login action that the user did not request.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
@@ -48,6 +79,7 @@ completion_criteria:
 - Example: if the user asks to return the selected or highest-priority document name, emit the criterion with output_path=output.document_name and requested_output_evidence_source=independent_run_evidence.
 - kind=outcome|terminal_action|validation_classification. Use validation_classification only when the user's no-side-effect goal is itself a judgment/classification returned by the workflow, such as whether a path is login-gated. Use terminal_action only when the criterion's end state is a terminal action in the external site for one of the supported families below. Use outcome for all other outcomes.
 - terminal_action_family=request|application|form|order|null. Set the matching family when kind=terminal_action; set null otherwise.
+- When a credentialed goal requires the workflow to authenticate and then create or submit a request, application, or form, or place an order, emit that post-login end state as kind=terminal_action with the matching terminal_action_family. Authentication is only the prefix: credential fill and login submit do not satisfy the terminal action. Do not emit terminal_action for a pure-login goal whose requested end state is successful authentication itself.
 - classification_output_key: null unless kind=validation_classification. Set it to the exact top-level block output field/key that will carry the classification scalar. Do not use JSONPath, regex, transcript paths, screenshots, prose conditions, or nested paths.
 - expected_classification: null unless kind=validation_classification. Set it to the exact expected classification target as a boolean or canonical enum/string value. Do not hide this target in outcome prose.
 - For validation-only utility/path checks whose goal is to classify whether the reachable path is login-only/login-gated, prefer kind=validation_classification with classification_output_key=login_only and expected_classification=true. Do not represent that classification target as a requested-output criterion such as output.login_only.
@@ -114,3 +146,4 @@ Current workflow YAML:
 {% if active_completion_criteria %}ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):
 ```{{ active_completion_criteria }}```
 {% endif %}Global context: ```{{ global_llm_context }}```
+{% endif %}

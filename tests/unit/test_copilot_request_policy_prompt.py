@@ -44,6 +44,16 @@ def _render(**overrides: str) -> str:
     )
 
 
+def _render_terminal_action_reconciliation() -> str:
+    return prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        terminal_action_reconciliation=True,
+        user_message="Sign in with a saved credential and create a service request.",
+        reconciliation_credential_input_kind="credential_name",
+        reconciliation_criteria='[{"id":"c0","outcome":"A service request is created.","kind":"outcome"}]',
+    )
+
+
 class TestRequestPolicyPromptStructure:
     def test_existing_login_workflow_without_credentials_clause_still_present(self) -> None:
         rendered = _render()
@@ -114,6 +124,24 @@ class TestRequestPolicyPromptStructure:
         ) in rendered
         assert "classification_output_key=login_only and expected_classification=true" in rendered
         assert 'The only supported non-null value is "registered_download"' in rendered
+
+    def test_terminal_action_guidance_distinguishes_order_from_login_prefix(self) -> None:
+        rendered = _render()
+
+        assert "place an order" in rendered
+        assert "replace that post-login end state" in rendered
+        assert "successful authentication" in rendered
+        assert "whose only requested end state is authentication" in rendered
+
+    def test_terminal_action_reconciliation_mode_is_bounded_to_existing_criteria(self) -> None:
+        rendered = _render_terminal_action_reconciliation()
+
+        assert "TERMINAL ACTION RECONCILIATION MODE" in rendered
+        assert '"criterion_id":"c0"' in rendered
+        assert "select exactly one existing criterion ID" in rendered
+        assert "do not invent, remove, duplicate, paraphrase, or re-order criteria" in rendered
+        assert "successful authentication itself, including MFA" in rendered
+        assert "placing an order" in rendered
 
     def test_completion_criteria_schema_exposes_judgment_truth_condition_fields(self) -> None:
         rendered = _render()

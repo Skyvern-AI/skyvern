@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestedOutputEvidenceSource,
     RequestedOutputPathMintSource,
     TerminalActionFamily,
+    TerminalActionVerificationMode,
     _canonical_bool_string,
     _coerce_classification_output_key,
     _coerce_expected_classification,
@@ -57,6 +58,7 @@ TRIPWIRE_CONSECUTIVE_ALL_NO_EVIDENCE = 2
 _CRITERION_LEVELS = ("definition", "run")
 _CRITERION_KINDS = ("outcome", "terminal_action", "validation_classification")
 _TERMINAL_ACTION_FAMILIES = ("request", "application", "form", "order")
+_TERMINAL_ACTION_VERIFICATION_MODES = frozenset(get_args(TerminalActionVerificationMode))
 _MINT_DISPOSITIONS = frozenset(get_args(MintDisposition))
 _PINABILITIES = frozenset(get_args(Pinability))
 
@@ -158,6 +160,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
         }
         if criterion.deliverable_confirmation_criterion_id is not None:
             item["deliverable_confirmation_criterion_id"] = criterion.deliverable_confirmation_criterion_id
+        if criterion.kind == "terminal_action":
+            item["terminal_action_verification_mode"] = criterion.terminal_action_verification_mode
         if criterion.requested_output_corroborator:
             item["requested_output_corroborator"] = True
         if criterion.requested_output_path_mint_source is not None:
@@ -209,6 +213,12 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
         family_raw = item.get("terminal_action_family")
         terminal_action_family = (
             family_raw if kind == "terminal_action" and family_raw in _TERMINAL_ACTION_FAMILIES else None
+        )
+        verification_mode_raw = item.get("terminal_action_verification_mode")
+        terminal_action_verification_mode = (
+            verification_mode_raw
+            if kind == "terminal_action" and verification_mode_raw in _TERMINAL_ACTION_VERIFICATION_MODES
+            else "family_record_v1"
         )
         mint_source_raw = item.get("requested_output_path_mint_source")
         requested_output_path_mint_source = cast(
@@ -287,6 +297,9 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
                 requested_output_path_mint_source=requested_output_path_mint_source,
                 kind=cast(CriterionKind, kind),
                 terminal_action_family=cast(TerminalActionFamily | None, terminal_action_family),
+                terminal_action_verification_mode=cast(
+                    TerminalActionVerificationMode, terminal_action_verification_mode
+                ),
                 classification_output_key=classification_output_key,
                 expected_classification=expected_classification,
                 requested_output_corroborator=bool(item.get("requested_output_corroborator")),
@@ -315,6 +328,9 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
     expected_output_value_key = typed_expected_output_value_key(criterion.expected_output_value)
     expected_output_shape_key = criterion.expected_output_shape or ""
     requested_output_evidence_source_key = criterion.requested_output_evidence_source
+    terminal_action_verification_mode_key = (
+        criterion.terminal_action_verification_mode if criterion.kind == "terminal_action" else ""
+    )
     classification_output_key = criterion.classification_output_key or ""
     expected_classification_key = (
         str(criterion.expected_classification) if criterion.expected_classification is not None else ""
@@ -328,6 +344,7 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
             f"\x1fexpected_output_shape:{expected_output_shape_key}"
             f"\x1frequested_output_evidence_source:{requested_output_evidence_source_key}"
             f"\x1fkind:{criterion.kind}"
+            f"\x1fterminal_action_verification_mode:{terminal_action_verification_mode_key}"
             f"\x1fclassification_output_key:{classification_output_key}"
             f"\x1fexpected_classification:{expected_classification_key}"
         )
@@ -343,12 +360,42 @@ def _criterion_reconcile_key(criterion: CompletionCriterion) -> str:
         f"contingent:{contingent_key}\x1fantecedent_path:{contingent_path_key}"
         f"\x1fdeliverable_kind:{deliverable_kind_key}"
         f"\x1fkind:{criterion.kind}"
+        f"\x1fterminal_action_verification_mode:{terminal_action_verification_mode_key}"
         f"\x1foutcome:{normalized_criterion_outcome_key(criterion.outcome)}"
     )
 
 
 def _outcome_key_set(criteria: tuple[CompletionCriterion, ...] | list[CompletionCriterion]) -> set[str]:
     return {_criterion_reconcile_key(criterion) for criterion in criteria}
+
+
+def _preserve_stored_terminal_action_authority(
+    fresh: list[CompletionCriterion], stored: tuple[CompletionCriterion, ...]
+) -> list[CompletionCriterion]:
+    """Carry semantic terminal-action authority into a fresh set before deciding its epoch."""
+    stored_semantic_terminal_actions = [
+        criterion
+        for criterion in stored
+        if criterion.kind == "terminal_action" and criterion.terminal_action_verification_mode == "semantic_outcome_v1"
+    ]
+    preserved: list[CompletionCriterion] = []
+    for criterion in fresh:
+        matches = []
+        for stored_criterion in stored_semantic_terminal_actions:
+            if criterion.kind not in {"outcome", "terminal_action"}:
+                continue
+            promoted = replace(
+                criterion,
+                kind="terminal_action",
+                terminal_action_family=stored_criterion.terminal_action_family,
+                terminal_action_verification_mode="semantic_outcome_v1",
+            )
+            if _criterion_reconcile_key(promoted) == _criterion_reconcile_key(stored_criterion):
+                matches.append(promoted)
+        if len(matches) == 1:
+            criterion = matches[0]
+        preserved.append(criterion)
+    return preserved
 
 
 def _word_tokens(text: str) -> list[str]:
@@ -521,6 +568,7 @@ def reconcile_completion_criteria(
             epoch=stored.goal_epoch,
             criteria=stored.criteria,
         )
+    fresh = _preserve_stored_terminal_action_authority(fresh, stored.criteria)
     if _outcome_key_set(fresh) <= _outcome_key_set(stored.criteria):
         return ReconcileDecision(
             action="adopt_stored",
