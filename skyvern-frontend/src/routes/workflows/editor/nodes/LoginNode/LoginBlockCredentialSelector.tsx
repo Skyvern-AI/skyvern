@@ -23,6 +23,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/useSkyvernCredentialSourceAvailable";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { useEffect, useMemo, useState } from "react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -184,6 +186,8 @@ function LoginBlockCredentialSelector({
   const [rotationQuery, setRotationQuery] = useState("");
   const [debouncedRotationQuery] = useDebounce(rotationQuery, 300);
   const [fallbackDraft, setFallbackDraft] = useState(false);
+  const credentialFallbackRetryEnabled =
+    useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
   const {
     parameters: workflowParameters,
     setParameters: setWorkflowParameters,
@@ -723,7 +727,11 @@ function LoginBlockCredentialSelector({
     selectedSkyvernCredentialParameter?.fallbackTrigger ??
     DEFAULT_FALLBACK_TRIGGER;
 
-  const fallbackSection = selectedSkyvernCredentialParameter ? (
+  const fallbackConfigVisible =
+    credentialFallbackRetryEnabled &&
+    Boolean(selectedSkyvernCredentialParameter);
+
+  const fallbackSection = fallbackConfigVisible ? (
     fallbackMode ? (
       <div className="mt-3 space-y-2 border-t border-border pt-3">
         <div className="space-y-1">

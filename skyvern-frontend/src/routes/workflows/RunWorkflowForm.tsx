@@ -51,6 +51,8 @@ import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isActivationRun } from "@/util/onboarding/rolloutGating";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
@@ -461,6 +463,8 @@ function RunWorkflowForm({
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
   const onboarding = useOnboardingStateOptional();
+  const credentialFallbackRetryEnabled =
+    useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
   const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const onboardingLoading = onboarding != null && onboarding.isLoading;
   // Gate on the rollout arm so a 0% rollout / rollback restores the
@@ -821,7 +825,14 @@ function RunWorkflowForm({
                 parameter,
                 loginBlockLabels,
               );
-              const hasFallbacks = fallbackCredentialIds.length > 0;
+              // Only surface fallbacks (and the "retries automatically" promise) for orgs in the
+              // rollout; the backend retry gate is keyed on the same flag.
+              const hasFallbacks =
+                credentialFallbackRetryEnabled &&
+                fallbackCredentialIds.length > 0;
+              const displayedFallbackCredentialIds = hasFallbacks
+                ? fallbackCredentialIds
+                : [];
 
               if (
                 parameter.parameter_type === WorkflowParameterTypes.Workflow
@@ -914,7 +925,7 @@ function RunWorkflowForm({
                         )}
                       </div>
                       <FallbackCredentialList
-                        fallbackCredentialIds={fallbackCredentialIds}
+                        fallbackCredentialIds={displayedFallbackCredentialIds}
                         fallbackTrigger={fallbackTrigger}
                         credentialNamesById={credentialNamesById}
                       />
@@ -942,7 +953,7 @@ function RunWorkflowForm({
                       showPrimaryBadge={hasFallbacks}
                       fallbackContent={
                         <FallbackCredentialList
-                          fallbackCredentialIds={fallbackCredentialIds}
+                          fallbackCredentialIds={displayedFallbackCredentialIds}
                           fallbackTrigger={fallbackTrigger}
                           credentialNamesById={credentialNamesById}
                         />
