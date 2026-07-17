@@ -170,6 +170,7 @@ LOG = structlog.get_logger()
 UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
+VERIFY_EMERGING_SELECT_PICK_FLAG = "VERIFY_EMERGING_SELECT_PICK"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
@@ -1198,6 +1199,10 @@ async def _is_org_flag_enabled(task: Task, flag: str, log_label: str) -> bool:
 
 async def _is_tel_digit_fix_enabled(task: Task) -> bool:
     return await _is_org_flag_enabled(task, FIX_TEL_INPUT_DIGIT_DROP_FLAG, "tel-digit-fix")
+
+
+async def _is_verify_emerging_select_pick_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, VERIFY_EMERGING_SELECT_PICK_FLAG, "verify-emerging-select-pick")
 
 
 async def _resolve_collapse_xp_assignment(
@@ -7233,6 +7238,74 @@ def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> Non
         _collect_new_roots(child, new_ids, out)
 
 
+def _custom_select_fallback_subtrees(elements: list[dict], current_element_id: str) -> list[dict]:
+    anchor: dict | None = None
+    anchor_is_open = False
+    listboxes: list[dict] = []
+    anchor_descendant_listboxes: list[dict] = []
+    all_nodes: list[dict] = []
+
+    queue: deque[tuple[dict, bool, bool]] = deque((element, False, False) for element in elements)
+    while queue:
+        node, in_anchor, in_expanded_combobox = queue.popleft()
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes") or {}
+        all_nodes.append(node)
+        role = str(attrs.get("role") or "").lower()
+        is_anchor = node.get("id") == current_element_id
+        child_in_anchor = in_anchor or is_anchor
+        expanded = str(attrs.get("aria-expanded") or "").lower() == "true"
+        child_in_expanded_combobox = in_expanded_combobox or (role == "combobox" and expanded)
+
+        if is_anchor:
+            anchor = node
+            anchor_is_open = expanded or in_expanded_combobox
+        if role == "listbox":
+            listboxes.append(node)
+            if child_in_anchor:
+                anchor_descendant_listboxes.append(node)
+
+        for child in node.get("children") or []:
+            queue.append((child, child_in_anchor, child_in_expanded_combobox))
+
+    if anchor is None:
+        return []
+
+    anchor_attrs = anchor.get("attributes") or {}
+    controlled_dom_ids = {
+        reference
+        for attribute_name in ("aria-controls", "aria-owns")
+        for reference in str(anchor_attrs.get(attribute_name) or "").split()
+        if reference
+    }
+    anchor_dom_id = str(anchor_attrs.get("id") or "")
+    controlled_subtrees = [
+        node
+        for node in all_nodes
+        if str((node.get("attributes") or {}).get("id") or "") in controlled_dom_ids
+        and _custom_select_candidates_from_elements([node])
+    ]
+    if controlled_subtrees:
+        return controlled_subtrees
+
+    linked_listboxes = []
+    for listbox in listboxes:
+        attrs = listbox.get("attributes") or {}
+        listbox_dom_id = str(attrs.get("id") or "")
+        labelled_by = set(str(attrs.get("aria-labelledby") or "").split())
+        if listbox_dom_id in controlled_dom_ids or (anchor_dom_id and anchor_dom_id in labelled_by):
+            linked_listboxes.append(listbox)
+
+    if linked_listboxes:
+        return linked_listboxes
+    if anchor_descendant_listboxes:
+        return anchor_descendant_listboxes
+    if len(listboxes) == 1 and anchor_is_open:
+        return listboxes
+    return []
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -7262,12 +7335,44 @@ async def select_from_emerging_elements(
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
     ]
 
+    fallback_element_subtrees: list[dict] = []
+    if len(new_interactable_element_ids) == 0:
+        # Resolve ownership from the untrimmed tree: trim_element_tree drops aria-controls /
+        # aria-owns / aria-labelledby / the DOM id, which are exactly the linkage attributes this
+        # fallback keys off, so resolving against the trimmed tree leaves it inert. Re-trim the
+        # small resolved subtree set below so the prompt stays trimmed (no page-wide token cost).
+        fallback_element_subtrees = _custom_select_fallback_subtrees(
+            scraped_page_after_open.element_tree,
+            current_element_id,
+        )
+        fallback_element_subtrees = trim_element_tree(copy.deepcopy(fallback_element_subtrees))
+        fallback_candidates = _custom_select_candidates_from_elements(fallback_element_subtrees)
+        fallback_candidate_ids: list[str] = []
+        for candidate in fallback_candidates:
+            fallback_id = candidate.get("element_id")
+            if fallback_id is not None:
+                fallback_candidate_ids.append(fallback_id)
+        new_interactable_element_ids = [
+            element_id
+            for element_id in fallback_candidate_ids
+            if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+        ]
+        if new_interactable_element_ids:
+            LOG.info(
+                "Found current-page custom-select options after incremental detection returned no elements",
+                current_element_id=current_element_id,
+                fallback_option_count=len(new_interactable_element_ids),
+            )
+
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
+    interactable_element_ids = set(new_interactable_element_ids)
 
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
-    new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    new_element_subtrees = fallback_element_subtrees or _extract_new_subtrees(
+        scraped_page_after_open.element_tree_trimmed, new_element_ids
+    )
     shadow_candidate_elements: list[dict] = []
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
@@ -7310,9 +7415,20 @@ async def select_from_emerging_elements(
     async def get_readback_scope_element() -> SkyvernElement | None:
         return await dom_after_open.get_skyvern_element_by_id(current_element_id)
 
+    verify_pick_enabled = await _is_verify_emerging_select_pick_enabled(task)
+    deterministic_candidates = _custom_select_candidates_from_elements(shadow_candidate_elements)
+    if verify_pick_enabled:
+        # Restrict deterministic matching to the elements the dropdown actually surfaced. Gated:
+        # custom-widget option nodes are often not flagged interactable, so flag off keeps main's
+        # behavior (all candidates) and this ramps with the off-list rejection below.
+        deterministic_candidates = [
+            candidate
+            for candidate in deterministic_candidates
+            if candidate.get("element_id") in interactable_element_ids
+        ]
     deterministic_result = await _select_deterministic_custom_option(
         target_value=options.target_value,
-        get_option_candidates=lambda: _custom_select_candidates_from_elements(shadow_candidate_elements),
+        get_option_candidates=lambda: deterministic_candidates,
         field_context=options.model_dump(),
         page=page,
         get_skyvern_element=dom_after_open.get_skyvern_element_by_id,
@@ -7366,7 +7482,20 @@ async def select_from_emerging_elements(
             llm_value=value,
         ),
     )
-    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value):
+    anchor_input_pick = raw_action_type == ActionType.INPUT_TEXT.value and element_id == current_element_id
+    # A pick outside the elements the dropdown actually surfaced is a wrong-field click that used to
+    # proceed on a warning. Rejecting it turns those silent successes into loud failures, so it ramps
+    # behind a flag rather than shipping to every org at once.
+    off_list = element_id not in interactable_element_ids and not anchor_input_pick
+    if off_list and not verify_pick_enabled:
+        # Keep the pre-flag warning so the reject rate is measurable before ramping the flag on.
+        LOG.warning(
+            "Emerging-select pick is outside the surfaced interactable elements; proceeding because the verify flag is off",
+            element_id=element_id,
+            current_element_id=current_element_id,
+        )
+    off_list_pick = off_list and verify_pick_enabled
+    if not element_id or raw_action_type not in (ActionType.CLICK.value, ActionType.INPUT_TEXT.value) or off_list_pick:
         raise _no_match_exception_for_dropdown(
             reasoning=json_response.get("reasoning"),
             target_value=options.target_value,
@@ -7374,14 +7503,6 @@ async def select_from_emerging_elements(
             transient_fallback_element_id=None,
         )
     action_type = ActionType(raw_action_type)
-
-    new_ids_set = set(new_interactable_element_ids)
-    if element_id not in new_ids_set:
-        LOG.warning(
-            "custom-select returned element outside new_interactable_element_ids",
-            selected_element_id=element_id,
-            new_interactable_count=len(new_ids_set),
-        )
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
