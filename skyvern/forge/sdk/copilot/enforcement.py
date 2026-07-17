@@ -7,7 +7,7 @@ import copy
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -249,6 +249,15 @@ _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS = frozenset(
 # for either or an update_workflow re-author silently spends the one-shot rescout.
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
 _SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
+_LOGIN_SUBMIT_NAME_PATTERN = re.compile(
+    r"^(?:log in|login|sign in|authenticate)(?: now| securely| to continue)?$",
+    re.I,
+)
+_LOGIN_SUBMIT_SELECTOR_PATTERN = re.compile(
+    r"^(?:(?:log in|login|sign in|authenticate)(?: submit| button| btn)?|"
+    r"(?:submit|button|btn) (?:log in|login|sign in|authenticate))$",
+    re.I,
+)
 # Evidence sources confirmable only after a run — excluded from the pre-run scout-coverage gate.
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
     {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
@@ -2312,7 +2321,7 @@ def _canonical_output_path(path: str) -> str:
 
 
 def _active_completion_criteria(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
-    turn_state = ctx.completion_criteria_turn_state
+    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
     if turn_state is None or turn_state.decision is None:
         return ()
     return turn_state.decision.criteria
@@ -2583,6 +2592,20 @@ def _credential_password_demand_holds(ctx: Any, interactions: list[dict[str, Any
     return bool(getattr(ctx, "last_scout_observation_has_password_control", False))
 
 
+def _first_stable_login_submit_index(interactions: Sequence[Mapping[str, Any]], credential_index: int) -> int | None:
+    for index, interaction in enumerate(interactions[credential_index + 1 :], start=credential_index + 1):
+        tool_name = str(interaction.get("tool_name") or "").strip()
+        if tool_name == "press_key" and str(interaction.get("key") or "").strip() == "Enter":
+            return index
+        if tool_name != "click":
+            continue
+        accessible_name = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("accessible_name") or "").lower()).strip()
+        selector = re.sub(r"[^a-z0-9]+", " ", str(interaction.get("selector") or "").lower()).strip()
+        if _LOGIN_SUBMIT_NAME_PATTERN.fullmatch(accessible_name) or _LOGIN_SUBMIT_SELECTOR_PATTERN.fullmatch(selector):
+            return index
+    return None
+
+
 def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bool:
     """Trajectory- and inventory-scoped mirror of the persist seam's credential scout gate: engaged
     credentials (username/password fills) must have every required field filled plus a post-fill
@@ -2604,7 +2627,22 @@ def _credential_flow_scout_gap_incomplete(ctx: Any, trajectory: list[Any]) -> bo
     # requires_submit is always True here: the predicate is deliberately stricter than the persist
     # gate, which demands a submit only when the block's code itself performs one.
     gap = credential_scout_gap(interactions, requirements, requires_submit=True)
+    if gap.missing_submit and _active_non_method_mandated_terminal_actions(ctx):
+        credential_index = _last_scout_credential_fill_index(interactions)
+        if (
+            credential_index is not None
+            and _first_stable_login_submit_index(interactions, credential_index) is not None
+        ):
+            return bool(gap.missing_fields)
     return bool(gap.missing_fields) or gap.missing_submit
+
+
+def _active_non_method_mandated_terminal_actions(ctx: AgentContext) -> tuple[CompletionCriterion, ...]:
+    return tuple(
+        criterion
+        for criterion in _active_completion_criteria(ctx)
+        if criterion.kind == "terminal_action" and not criterion.method_mandated
+    )
 
 
 def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
@@ -2613,22 +2651,39 @@ def synthesized_trajectory_reaches_goal(ctx: AgentContext) -> bool:
     trajectory = ctx.scout_trajectory
     if not trajectory:
         return False
-    download = ctx.reached_download_target
-    if download is not None and download.selector:
+    if _active_non_method_mandated_terminal_actions(ctx):
+        return _trajectory_reaches_post_credential_commit(ctx)
+    return _trajectory_reaches_generic_goal(ctx, trajectory, include_download=True)
+
+
+def _trajectory_reaches_generic_goal(
+    ctx: AgentContext,
+    trajectory: list[Any],
+    *,
+    include_download: bool,
+    allow_intermediate_interactions: bool = False,
+) -> bool:
+    """Apply the established download, open-to-commit, and durable-entry reach shapes to one trajectory slice."""
+    download = getattr(ctx, "reached_download_target", None)
+    if include_download and download is not None and download.selector:
         return True
-    if len(trajectory) == 2:
-        opening, commit = trajectory
+    opening_trajectory_index: int | None = None
+    ordered_pair_candidates = trajectory if allow_intermediate_interactions or len(trajectory) == 2 else []
+    for interaction in ordered_pair_candidates:
+        if not isinstance(interaction, dict):
+            continue
+        trajectory_index = interaction.get("trajectory_index")
+        if not isinstance(trajectory_index, int):
+            continue
         if (
-            isinstance(opening, dict)
-            and str(opening.get("tool_name") or "") == "click"
-            and isinstance(opening.get("trajectory_index"), int)
-            and isinstance(commit, dict)
-            and str(commit.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
-            and isinstance(commit.get("trajectory_index"), int)
-            and opening["trajectory_index"] < commit["trajectory_index"]
-            and not is_generic_entry_opener_click(commit)
+            opening_trajectory_index is not None
+            and trajectory_index > opening_trajectory_index
+            and str(interaction.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
+            and not is_generic_entry_opener_click(interaction)
         ):
             return True
+        if opening_trajectory_index is None and str(interaction.get("tool_name") or "") == "click":
+            opening_trajectory_index = trajectory_index
     last_entry_index: int | None = None
     for index, item in enumerate(trajectory):
         if isinstance(item, dict) and is_durable_fallback_entry_target(item):
@@ -2665,40 +2720,44 @@ def _last_scout_credential_fill_index(trajectory: list[Any]) -> int | None:
 
 
 def _trajectory_reaches_post_credential_commit(ctx: AgentContext) -> bool:
-    """Deterministic floor for the terminal-action release: the scout captured a durable entry followed by a
-    commit that both sit past the last live credential fill, so a bare login prefix (whose only commit is the
-    login submit) never satisfies it while a business spine continued past login does."""
+    """Apply the ordinary reach shapes only to the business spine after the credential submit."""
     trajectory = ctx.scout_trajectory
     if not trajectory:
         return False
-    credential_index = _last_scout_credential_fill_index(trajectory)
-    start = 0 if credential_index is None else credential_index + 1
-    last_entry_index: int | None = None
-    for index in range(start, len(trajectory)):
-        item = trajectory[index]
-        if isinstance(item, dict) and is_durable_fallback_entry_target(item):
-            last_entry_index = index
-    if last_entry_index is None:
+    interactions = [item for item in trajectory if isinstance(item, dict)]
+    credential_index = _last_scout_credential_fill_index(interactions)
+    if credential_index is None:
+        return _trajectory_reaches_generic_goal(
+            ctx,
+            interactions,
+            include_download=False,
+            allow_intermediate_interactions=True,
+        )
+    credential_submit_index = _first_stable_login_submit_index(interactions, credential_index)
+    latest_fill_source_url = str(interactions[credential_index].get("source_url") or "").strip()
+    if credential_submit_index is None and latest_fill_source_url:
+        credential_submit_index = first_matched_post_fill_submit_index(
+            interactions,
+            credential_index,
+            {latest_fill_source_url},
+        )
+    if credential_submit_index is None:
         return False
-    return any(
-        isinstance(item, dict)
-        and str(item.get("tool_name") or "") in _SYNTHESIZED_BLOCK_COMMIT_TOOLS
-        and not is_generic_entry_opener_click(item)
-        for item in trajectory[last_entry_index + 1 :]
+    return _trajectory_reaches_generic_goal(
+        ctx,
+        interactions[credential_submit_index + 1 :],
+        include_download=False,
+        allow_intermediate_interactions=True,
     )
 
 
 def reached_terminal_action_criterion_ids(ctx: AgentContext) -> set[str]:
     """Active, non-method-mandated terminal_action criterion ids the scout has structurally reached: empty
-    until the trajectory shows a durable entry->commit past the credential flow. The method_mandated synthetic
-    durable-fill criterion is excluded so a login-only turn never self-releases through it."""
+    until the post-credential trajectory shows an ordered open->commit pair or durable entry->commit. The
+    method_mandated synthetic durable-fill criterion is excluded so a login-only turn never self-releases."""
     if not _trajectory_reaches_post_credential_commit(ctx):
         return set()
-    return {
-        criterion.id
-        for criterion in _active_completion_criteria(ctx)
-        if criterion.kind == "terminal_action" and not criterion.method_mandated
-    }
+    return {criterion.id for criterion in _active_non_method_mandated_terminal_actions(ctx)}
 
 
 def record_reached_terminal_action_observation(ctx: AgentContext) -> None:
@@ -2716,9 +2775,7 @@ def _request_expects_unreached_terminal_action(ctx: AgentContext) -> bool:
     # A terminal_action criterion is reached only once the scout observes its downstream page, which no
     # pre-run page scalar evidences; a goal-reaching login prefix would otherwise read goal-complete before
     # the scout crosses into the business spine and land the latch on a login-only trajectory.
-    for criterion in _active_completion_criteria(ctx):
-        if criterion.kind != "terminal_action" or criterion.method_mandated:
-            continue
+    for criterion in _active_non_method_mandated_terminal_actions(ctx):
         if criterion.id not in ctx.scout_observed_terminal_criterion_ids:
             return True
     return False
@@ -2801,10 +2858,14 @@ def _should_force_synthesized_block_persistence(ctx: Any) -> bool:
 def _should_block_mutating_tool_after_synthesized_offer(ctx: Any, tool_name: str) -> bool:
     if tool_name not in _SYNTHESIZED_BLOCK_PERSISTENCE_MUTATING_TOOLS:
         return False
-    if uncovered_requested_output_paths(ctx):
-        return False
-    if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
-        return False
+    if _active_non_method_mandated_terminal_actions(ctx):
+        if not synthesized_trajectory_is_goal_complete(ctx):
+            return False
+    else:
+        if uncovered_requested_output_paths(ctx):
+            return False
+        if _credential_flow_scout_gap_incomplete(ctx, getattr(ctx, "scout_trajectory", None) or []):
+            return False
     if getattr(ctx, "update_workflow_called", False) and not synthesized_persistence_reopened(ctx):
         return False
     if not _turn_intent_can_update_and_run_without_user_input(getattr(ctx, "turn_intent", None)):

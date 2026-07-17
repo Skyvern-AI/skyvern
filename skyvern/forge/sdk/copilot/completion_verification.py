@@ -1321,7 +1321,9 @@ def grade_terminal_goal_record_criteria(
     eligible_criteria = [
         criterion
         for criterion in criteria
-        if criterion.kind == "terminal_action" and criterion.terminal_action_family in _TERMINAL_RECORD_FAMILY_ARTIFACTS
+        if criterion.kind == "terminal_action"
+        and criterion.terminal_action_verification_mode == "family_record_v1"
+        and criterion.terminal_action_family in _TERMINAL_RECORD_FAMILY_ARTIFACTS
     ]
     if not eligible_criteria:
         return []

@@ -13,6 +13,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import StructuredContext, sanitize_global_llm_context_for_prompt
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
@@ -70,6 +71,10 @@ _CLASSIFICATION_RESPONSE_FIELDS = {
     "raw_secret_handling",
     "clarification_reason",
 }
+_TERMINAL_ACTION_RECONCILIATION_RESPONSE_FIELDS = frozenset({"version", "criterion_id", "terminal_action_family"})
+_TERMINAL_ACTION_RECONCILABLE_CREDENTIAL_KINDS = frozenset(
+    {"credential_id", "credential_name", "website_stored_credential"}
+)
 _LONE_REGISTERED_DOWNLOAD_OUTPUT_PATH = "output.downloaded_files"
 REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID = "__copilot_registered_download__downloaded_files_non_empty"
 ClarificationReason = Literal[
@@ -193,6 +198,7 @@ CriterionLevel = Literal["definition", "run"]
 _CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
 CriterionKind = Literal["outcome", "terminal_action", "validation_classification"]
 TerminalActionFamily = Literal["request", "application", "form", "order"]
+TerminalActionVerificationMode = Literal["family_record_v1", "semantic_outcome_v1"]
 ClassificationTarget = str | bool
 ExpectedOutputValue = str | bool
 ExpectedOutputShape = Literal[
@@ -314,6 +320,9 @@ class CompletionCriterion:
     requested_output_path_mint_source: RequestedOutputPathMintSource | None = None
     kind: CriterionKind = "outcome"
     terminal_action_family: TerminalActionFamily | None = None
+    # Native terminal actions retain the historical structured-family grader. A criterion
+    # promoted from a generic outcome must opt into semantic verification instead.
+    terminal_action_verification_mode: TerminalActionVerificationMode = "family_record_v1"
     classification_output_key: str | None = None
     expected_classification: ClassificationTarget | None = None
     requested_output_corroborator: bool = False
@@ -326,6 +335,13 @@ class CompletionCriterion:
     request_slot_id: str | None = None
     pinability: Pinability | None = None
     mint_disposition: MintDisposition = "decidable"
+
+
+@dataclass(frozen=True)
+class TerminalActionReconciliationV1:
+    version: Literal["1"]
+    criterion_id: str | None
+    terminal_action_family: TerminalActionFamily | None
 
 
 @dataclass
@@ -387,6 +403,11 @@ class RequestPolicy:
             ),
             "completion_criteria_method_mandated_count": sum(
                 1 for criterion in self.completion_criteria if criterion.method_mandated
+            ),
+            "completion_criteria_terminal_action_count": sum(
+                1
+                for criterion in self.completion_criteria
+                if criterion.kind == "terminal_action" and not criterion.method_mandated
             ),
             "raw_secret_detected": self.raw_secret_detected,
             "has_raw_secret_evidence": self.raw_secret_evidence is not None,
@@ -827,6 +848,28 @@ def _coerce_classifier_payload(raw: Any) -> dict[str, Any] | None:
     if not any(field in raw for field in _CLASSIFICATION_RESPONSE_FIELDS):
         return None
     return raw
+
+
+def _parse_terminal_action_reconciliation(raw: Any) -> TerminalActionReconciliationV1 | None:
+    if isinstance(raw, str):
+        raw = parse_final_response(raw)
+    if not isinstance(raw, dict) or set(raw) != _TERMINAL_ACTION_RECONCILIATION_RESPONSE_FIELDS:
+        return None
+    if raw.get("version") != "1":
+        return None
+    criterion_id = raw.get("criterion_id")
+    family = raw.get("terminal_action_family")
+    if criterion_id is None and family is None:
+        return TerminalActionReconciliationV1(version="1", criterion_id=None, terminal_action_family=None)
+    if not isinstance(criterion_id, str) or not criterion_id.strip():
+        return None
+    if not isinstance(family, str) or family not in _TERMINAL_ACTION_FAMILIES:
+        return None
+    return TerminalActionReconciliationV1(
+        version="1",
+        criterion_id=criterion_id,
+        terminal_action_family=cast(TerminalActionFamily, family),
+    )
 
 
 def _request_slot_anchor(item: dict[str, Any]) -> tuple[str, str] | None:
@@ -2582,10 +2625,16 @@ def _apply_explicit_code_block_credential_draft_policy(policy: RequestPolicy, us
     policy.clarification_question = None
 
 
-async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any | None, str, int]:
+async def _run_request_policy_classifier(
+    handler: LLMAPIHandler,
+    prompt: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[Any | None, str, int]:
     # Diverges from turn-intent on purpose: a retriable provider error (429/5xx) retries once
     # within the budget, while a timeout is never retried (retrying cannot beat the budget).
-    deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
     retry_count = 0
     while True:
         remaining = deadline - time.monotonic()
@@ -2607,12 +2656,153 @@ async def _run_request_policy_classifier(handler: Any, prompt: str) -> tuple[Any
             return None, "provider_error", retry_count
 
 
+def _terminal_action_reconciliation_candidates(policy: RequestPolicy) -> list[CompletionCriterion]:
+    return [
+        criterion
+        for criterion in policy.completion_criteria
+        if criterion.kind == "outcome" and not criterion.method_mandated
+    ]
+
+
+def _render_terminal_action_reconciliation_criteria(criteria: list[CompletionCriterion]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": criterion.id,
+                "outcome": criterion.outcome,
+                "contingent_on": criterion.contingent_on,
+                "implicit": criterion.implicit,
+                "method_mandated": criterion.method_mandated,
+                "level": criterion.level,
+                "output_path": criterion.output_path,
+                "kind": criterion.kind,
+            }
+            for criterion in criteria
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _policy_needs_terminal_action_reconciliation(policy: RequestPolicy) -> bool:
+    if policy.requires_user_clarification:
+        return False
+    if policy.credential_input_kind not in _TERMINAL_ACTION_RECONCILABLE_CREDENTIAL_KINDS:
+        return False
+    return not any(
+        criterion.kind == "terminal_action" and not criterion.method_mandated
+        for criterion in policy.completion_criteria
+    )
+
+
+def _log_terminal_action_reconciliation_omitted(
+    policy: RequestPolicy,
+    *,
+    reason: str,
+    failure_kind: str = "none",
+    retry_count: int = 0,
+) -> None:
+    LOG.info(
+        "copilot_terminal_action_reconciliation_omitted",
+        reason=reason,
+        failure_kind=failure_kind,
+        retry_count=retry_count,
+        credential_input_kind=policy.credential_input_kind,
+        completion_criteria_count=len(policy.completion_criteria),
+    )
+
+
+async def _reconcile_missing_terminal_action(
+    policy: RequestPolicy,
+    *,
+    user_message: str,
+    handler: LLMAPIHandler,
+) -> None:
+    if not _policy_needs_terminal_action_reconciliation(policy):
+        return
+    candidates = _terminal_action_reconciliation_candidates(policy)
+    if not candidates:
+        _log_terminal_action_reconciliation_omitted(policy, reason="no_eligible_criteria")
+        return
+
+    prompt = prompt_engine.load_prompt(
+        template=PROMPT_NAME,
+        terminal_action_reconciliation=True,
+        user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
+        reconciliation_credential_input_kind=policy.credential_input_kind,
+        reconciliation_criteria=escape_code_fences(_render_terminal_action_reconciliation_criteria(candidates)),
+    )
+    raw, failure_kind, retry_count = await _run_request_policy_classifier(
+        handler,
+        prompt,
+    )
+    if raw is None:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="classifier_failed",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+    reconciliation = _parse_terminal_action_reconciliation(raw)
+    if reconciliation is None:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="malformed_response",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+    if reconciliation.criterion_id is None:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="model_abstained",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+
+    matching_indexes = [
+        index for index, criterion in enumerate(candidates) if criterion.id == reconciliation.criterion_id
+    ]
+    if len(matching_indexes) != 1:
+        _log_terminal_action_reconciliation_omitted(
+            policy,
+            reason="unknown_or_ambiguous_criterion",
+            failure_kind=failure_kind,
+            retry_count=retry_count,
+        )
+        return
+    selected = candidates[matching_indexes[0]]
+    policy_index = next(
+        (index for index, criterion in enumerate(policy.completion_criteria) if criterion is selected),
+        None,
+    )
+    if policy_index is None:
+        _log_terminal_action_reconciliation_omitted(policy, reason="criterion_not_in_policy")
+        return
+    policy.completion_criteria[policy_index] = replace(
+        selected,
+        kind="terminal_action",
+        terminal_action_family=reconciliation.terminal_action_family,
+        terminal_action_verification_mode="semantic_outcome_v1",
+    )
+    LOG.info(
+        "copilot_terminal_action_reconciled",
+        criterion_id=selected.id,
+        terminal_action_family=reconciliation.terminal_action_family,
+        credential_input_kind=policy.credential_input_kind,
+        completion_criteria_count=len(policy.completion_criteria),
+        retry_count=retry_count,
+    )
+
+
 async def _classify_request(
     user_message: str,
     workflow_yaml: str,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
-    handler: Any,
+    handler: LLMAPIHandler | None,
     *,
     active_criteria: list[CompletionCriterion] | None = None,
     config: CopilotConfig | None = None,
@@ -2671,6 +2861,7 @@ async def _classify_request(
     )
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
+        terminal_action_reconciliation=False,
         user_message=escape_code_fences(safe_user_message),
         raw_secret_present=str(raw_secret_present).lower(),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
@@ -2691,7 +2882,12 @@ async def _classify_request(
             separators=(",", ":"),
         ),
     )
-    raw, failure_kind, retry_count = await _run_request_policy_classifier(handler, prompt)
+    classifier_deadline = time.monotonic() + settings.COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS
+    raw, failure_kind, retry_count = await _run_request_policy_classifier(
+        handler,
+        prompt,
+        deadline=classifier_deadline,
+    )
     if raw is None:
         LOG.warning("request-policy classifier failed", failure_kind=failure_kind, retry_count=retry_count)
         return _classifier_fallback_policy(
@@ -2835,6 +3031,11 @@ async def _classify_request(
         policy.requires_user_clarification = False
         policy.raw_secret_evidence = None
     _degrade_pathless_contingent_criteria(policy)
+    await _reconcile_missing_terminal_action(
+        policy,
+        user_message=safe_user_message,
+        handler=handler,
+    )
     policy.completion_contract_status = (
         "present" if policy.completion_contract or policy.graded_completion_criteria() else "absent"
     )
@@ -3325,7 +3526,7 @@ async def build_request_policy(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
     organization_id: str,
-    handler: Any,
+    handler: LLMAPIHandler | None,
     active_criteria: list[CompletionCriterion] | None = None,
     config: CopilotConfig | None = None,
 ) -> RequestPolicy:
