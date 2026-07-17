@@ -47,9 +47,10 @@ export function detectInitialCredentialDataType(
 
 export function detectInitialCredentialSource(
   initialValues: ParametersState[number] | undefined,
-  isCloud: boolean,
+  skyvernCredentialSourceAvailable: boolean,
 ): CredentialSource {
-  if (!initialValues) return isCloud ? "skyvern" : "bitwarden";
+  if (!initialValues)
+    return skyvernCredentialSourceAvailable ? "skyvern" : "bitwarden";
 
   if (initialValues.parameterType === "secret") return "bitwarden";
   if (initialValues.parameterType === "creditCardData") return "bitwarden";
@@ -61,7 +62,7 @@ export function detectInitialCredentialSource(
     if (parameterIsAzureVaultCredential(initialValues)) return "azurevault";
   }
 
-  return isCloud ? "skyvern" : "bitwarden";
+  return skyvernCredentialSourceAvailable ? "skyvern" : "bitwarden";
 }
 
 export function detectInitialBitwardenManualEntry(

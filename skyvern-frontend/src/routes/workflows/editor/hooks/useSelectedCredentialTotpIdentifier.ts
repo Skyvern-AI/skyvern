@@ -1,7 +1,7 @@
-import { useContext, useMemo } from "react";
-import CloudContext from "@/store/CloudContext";
+import { useMemo } from "react";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useCredentialQuery } from "@/routes/workflows/hooks/useCredentialQuery";
+import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/useSkyvernCredentialSourceAvailable";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { parameterIsSkyvernCredential } from "../types";
 
@@ -18,10 +18,11 @@ import { parameterIsSkyvernCredential } from "../types";
 export function useSelectedCredentialTotpIdentifier(
   parameterKey: string | undefined,
 ): string | null {
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { parameters: workflowParameters } = useWorkflowParametersStore();
   const { data: credentials = [] } = useCredentialsQuery({
-    enabled: isCloud,
+    enabled: skyvernCredentialSourceAvailable,
     page_size: 100,
   });
 
@@ -55,7 +56,7 @@ export function useSelectedCredentialTotpIdentifier(
     (credential) => credential.credential_id === credentialId,
   );
   const credentialQuery = useCredentialQuery(credentialId, {
-    enabled: isCloud && !credentialFromList,
+    enabled: skyvernCredentialSourceAvailable && !credentialFromList,
   });
   const credential = credentialFromList ?? credentialQuery.data;
 

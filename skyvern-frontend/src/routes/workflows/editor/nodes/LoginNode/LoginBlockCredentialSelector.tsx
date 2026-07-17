@@ -15,8 +15,8 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
-import CloudContext from "@/store/CloudContext";
-import { useContext, useEffect, useMemo, useState } from "react";
+import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/useSkyvernCredentialSourceAvailable";
+import { useEffect, useMemo, useState } from "react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
@@ -185,9 +185,10 @@ function LoginBlockCredentialSelector({
       parameter.parameterType === "credential" ||
       parameter.parameterType === "onepassword",
   );
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { data: credentials = [], isLoading } = useCredentialsQuery({
-    enabled: isCloud,
+    enabled: skyvernCredentialSourceAvailable,
     page_size: 100,
   });
 
@@ -241,7 +242,7 @@ function LoginBlockCredentialSelector({
     [credentials, selectedCredentialId],
   );
   const selectedCredentialQuery = useCredentialQuery(selectedCredentialId, {
-    enabled: isCloud && !selectedCredentialFromList,
+    enabled: skyvernCredentialSourceAvailable && !selectedCredentialFromList,
   });
   const selectedCredential =
     selectedCredentialFromList ?? selectedCredentialQuery.data;
@@ -289,7 +290,7 @@ function LoginBlockCredentialSelector({
     data: rotationCredentials = [],
     isFetching: rotationCredentialsAreFetching,
   } = useCredentialsQuery({
-    enabled: isCloud && rotationMode,
+    enabled: skyvernCredentialSourceAvailable && rotationMode,
     page_size: 100,
     search: debouncedRotationQuery.trim() || undefined,
     placeholderData: keepPreviousData,
@@ -332,7 +333,7 @@ function LoginBlockCredentialSelector({
     [credentialParameters],
   );
 
-  if (isCloud && isLoading) {
+  if (skyvernCredentialSourceAvailable && isLoading) {
     return <Skeleton className="h-8 w-full" />;
   }
 
@@ -724,7 +725,7 @@ function LoginBlockCredentialSelector({
         renderCredentialItem={renderCredentialItem}
         renderSelectedValue={renderSelectedValue}
         query={{
-          enabled: isCloud,
+          enabled: skyvernCredentialSourceAvailable,
           excludeCredentialIds: wrappedCredentialIds,
         }}
         triggerProps={{

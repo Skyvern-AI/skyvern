@@ -3,8 +3,8 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { helpTooltips } from "../../helpContent";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
-import { useContext, useMemo } from "react";
-import CloudContext from "@/store/CloudContext";
+import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/useSkyvernCredentialSourceAvailable";
+import { useMemo } from "react";
 import { parameterIsSkyvernCredential } from "../../types";
 
 type Props = {
@@ -20,12 +20,13 @@ function ParametersMultiSelect({
   parameters,
   onParametersChange,
 }: Props) {
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { parameters: workflowParameters } = useWorkflowParametersStore();
 
   // Fetch credentials to check for orphaned Skyvern credential parameters
   const { data: credentials = [], isSuccess } = useCredentialsQuery({
-    enabled: isCloud,
+    enabled: skyvernCredentialSourceAvailable,
     page_size: CREDENTIALS_PAGE_SIZE,
   });
 
