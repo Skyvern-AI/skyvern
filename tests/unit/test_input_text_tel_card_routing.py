@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -53,14 +53,16 @@ async def _run_input_text(
     *,
     tel_fix_enabled: bool = True,
     tel_verify_side_effect: list[Exception | None] | None = None,
-) -> tuple[list, AsyncMock, AsyncMock, AsyncMock, MagicMock]:
+    generic_flag: bool = True,
+    incremental_elements: list[dict] | None = None,
+) -> tuple[list, AsyncMock, AsyncMock, AsyncMock, MagicMock, AsyncMock]:
     dom_instance = MagicMock()
     dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
 
     inc = MagicMock()
     inc.start_listen_dom_increment = AsyncMock()
     inc.stop_listen_dom_increment = AsyncMock()
-    inc.get_incremental_element_tree = AsyncMock(return_value=[])
+    inc.get_incremental_element_tree = AsyncMock(return_value=incremental_elements or [])
 
     skyvern_frame = MagicMock()
     skyvern_frame.safe_wait_for_animation_end = AsyncMock()
@@ -70,6 +72,7 @@ async def _run_input_text(
 
     card_readback = AsyncMock(return_value=None)
     tel_verify = AsyncMock(side_effect=tel_verify_side_effect)
+    generic_verify = AsyncMock(return_value=None)
     phone_format = AsyncMock(return_value=text)
     warning_log = MagicMock()
 
@@ -81,9 +84,15 @@ async def _run_input_text(
         patch("skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task", return_value=text),
         patch("skyvern.webeye.actions.handler._get_input_or_select_context", new=AsyncMock(return_value=None)),
         patch("skyvern.webeye.actions.handler._is_tel_digit_fix_enabled", new=AsyncMock(return_value=tel_fix_enabled)),
+        patch(
+            "skyvern.webeye.actions.handler._is_input_text_commit_verification_enabled",
+            new=AsyncMock(return_value=generic_flag),
+        ),
         patch("skyvern.webeye.actions.handler.check_phone_number_format", new=phone_format),
         patch("skyvern.webeye.actions.handler._fill_card_number_with_readback", new=card_readback),
         patch("skyvern.webeye.actions.handler._verify_tel_input_after_fill", new=tel_verify),
+        patch("skyvern.webeye.actions.handler._verify_generic_input_commit", new=generic_verify),
+        patch("skyvern.webeye.actions.handler.check_date_format", new=AsyncMock(return_value=text)),
         patch("skyvern.webeye.actions.handler.LOG.warning", new=warning_log),
     ):
         results = await handle_input_text_action(
@@ -94,7 +103,7 @@ async def _run_input_text(
             step=_STEP,
         )
 
-    return results, card_readback, tel_verify, phone_format, warning_log
+    return results, card_readback, tel_verify, phone_format, warning_log, generic_verify
 
 
 @pytest.mark.asyncio
@@ -108,7 +117,7 @@ async def _run_input_text(
 async def test_tel_card_number_field_uses_card_readback_not_phone_format(attrs: dict[str, str | None]) -> None:
     el = _mock_input(attrs)
 
-    results, card_readback, tel_verify, phone_format, _ = await _run_input_text(el, VISA_16)
+    results, card_readback, tel_verify, phone_format, _, generic_verify = await _run_input_text(el, VISA_16)
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     card_readback.assert_awaited_once_with(
@@ -119,6 +128,7 @@ async def test_tel_card_number_field_uses_card_readback_not_phone_format(attrs: 
     )
     phone_format.assert_not_awaited()
     tel_verify.assert_not_awaited()
+    generic_verify.assert_not_awaited()
     el.input_sequentially.assert_not_awaited()
 
 
@@ -126,7 +136,7 @@ async def test_tel_card_number_field_uses_card_readback_not_phone_format(attrs: 
 async def test_ten_digit_tel_phone_uses_tel_readback_not_card_readback() -> None:
     el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
 
-    results, card_readback, tel_verify, phone_format, _ = await _run_input_text(el, "224-555-0199")
+    results, card_readback, tel_verify, phone_format, _, generic_verify = await _run_input_text(el, "224-555-0199")
 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     el.input_sequentially.assert_awaited_once_with(text="2245550199")
@@ -138,13 +148,14 @@ async def test_ten_digit_tel_phone_uses_tel_readback_not_card_readback() -> None
     )
     card_readback.assert_not_awaited()
     phone_format.assert_not_awaited()
+    generic_verify.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_tel_flag_off_preserves_legacy_format_and_sequential_fill() -> None:
     el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
 
-    results, _, tel_verify, phone_format, _ = await _run_input_text(
+    results, _, tel_verify, phone_format, _, _ = await _run_input_text(
         el,
         "224-555-0199",
         tel_fix_enabled=False,
@@ -166,7 +177,7 @@ async def test_separator_only_tel_never_forces_nanp_country_code() -> None:
         PhoneNumberInputMismatch(expected_digit_count=10, actual_digit_count=12),
     ]
 
-    results, _, tel_verify, _, warning_log = await _run_input_text(
+    results, _, tel_verify, _, warning_log, _ = await _run_input_text(
         el,
         "224-555-0199",
         tel_verify_side_effect=mismatches,
@@ -194,7 +205,7 @@ async def test_explicit_nanp_tel_keeps_constraint_safe_e164_fallback() -> None:
         None,
     ]
 
-    results, _, tel_verify, _, _ = await _run_input_text(
+    results, _, tel_verify, _, _, _ = await _run_input_text(
         el,
         "+1 (224) 555-0199",
         tel_verify_side_effect=mismatches_then_success,
@@ -208,3 +219,99 @@ async def test_explicit_nanp_tel_keeps_constraint_safe_e164_fallback() -> None:
         "2245550199",
         "+12245550199",
     ]
+
+
+@pytest.mark.asyncio
+async def test_generic_text_input_runs_commit_verification() -> None:
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "postal_code"})
+
+    results, card_readback, tel_verify, phone_format, _, generic_verify = await _run_input_text(el, "12345")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="12345")
+    generic_verify.assert_awaited_once_with(
+        skyvern_element=el,
+        skyvern_frame=ANY,
+        dom=ANY,
+        tag_name="input",
+        input_type="text",
+        expected_value="12345",
+        allow_autocomplete_rewrite=False,
+    )
+    card_readback.assert_not_awaited()
+    tel_verify.assert_not_awaited()
+    phone_format.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_blocking_date_input_refreshes_type_before_routing() -> None:
+    original = _mock_input({"type": "text", "autocomplete": None, "name": "start_date"})
+    blocking = _mock_input({"type": "date", "autocomplete": None, "name": "start_date"})
+    blocking.get_id.return_value = "BLOCKING"
+    original.find_blocking_element = AsyncMock(return_value=(blocking, True))
+
+    results, _, _, _, _, generic_verify = await _run_input_text(original, "2026-07-17")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    blocking.input_fill.assert_awaited_once_with(text="2026-07-17")
+    blocking.input_sequentially.assert_not_awaited()
+    generic_verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generic_text_input_skips_commit_verification_when_flag_disabled() -> None:
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "postal_code"})
+
+    results, _, _, _, _, generic_verify = await _run_input_text(el, "12345", generic_flag=False)
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_sequentially.assert_awaited_once_with(text="12345")
+    generic_verify.assert_not_awaited()
+    type_queries = [call for call in el.get_attr.await_args_list if call.args == ("type",)]
+    assert len(type_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_generic_text_input_verifies_after_unrelated_dom_mutation() -> None:
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "postal_code"})
+
+    results, _, _, _, _, generic_verify = await _run_input_text(
+        el,
+        "12345",
+        incremental_elements=[{"tagName": "div", "attributes": {"class": "field-error"}, "children": []}],
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    generic_verify.assert_awaited_once()
+    assert generic_verify.await_args.kwargs["allow_autocomplete_rewrite"] is False
+
+
+@pytest.mark.asyncio
+async def test_generic_text_input_allows_autocomplete_rewrite_for_option_mutation() -> None:
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "postal_code"})
+
+    results, _, _, _, _, generic_verify = await _run_input_text(
+        el,
+        "12345",
+        incremental_elements=[
+            {
+                "tagName": "ul",
+                "attributes": {"role": "listbox"},
+                "children": [{"tagName": "li", "attributes": {"role": "option"}, "children": []}],
+            }
+        ],
+    )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    generic_verify.assert_awaited_once()
+    assert generic_verify.await_args.kwargs["allow_autocomplete_rewrite"] is True
+
+
+@pytest.mark.asyncio
+async def test_password_input_skips_commit_verification() -> None:
+    el = _mock_input({"type": "password", "autocomplete": None, "name": "credential"})
+
+    results, _, _, _, _, generic_verify = await _run_input_text(el, "private payload")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    generic_verify.assert_not_awaited()
