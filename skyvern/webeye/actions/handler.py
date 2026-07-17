@@ -1171,7 +1171,7 @@ def _plan_tel_text(*, is_tel: bool, is_secret: bool, value: str, pattern: str | 
     return value, False, is_tel and not is_secret
 
 
-async def _is_tel_digit_fix_enabled(task: Task) -> bool:
+async def _is_org_flag_enabled(task: Task, flag: str, log_label: str) -> bool:
     organization_id = task.organization_id
     if not organization_id:
         return False
@@ -1182,18 +1182,22 @@ async def _is_tel_digit_fix_enabled(task: Task) -> bool:
         # Bucket by org (not per-run) for a stable, monitorable ramp and clean rollback.
         return bool(
             await experimentation_provider.is_feature_enabled_cached(
-                FIX_TEL_INPUT_DIGIT_DROP_FLAG,
+                flag,
                 organization_id,
                 properties={"organization_id": organization_id},
             )
         )
     except Exception:
         LOG.warning(
-            "Failed to evaluate tel-digit-fix flag; defaulting to disabled",
+            f"Failed to evaluate {log_label} flag; defaulting to disabled",
             organization_id=organization_id,
             exc_info=True,
         )
         return False
+
+
+async def _is_tel_digit_fix_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, FIX_TEL_INPUT_DIGIT_DROP_FLAG, "tel-digit-fix")
 
 
 async def _resolve_collapse_xp_assignment(
