@@ -12,6 +12,8 @@ import {
 
 import type { CredentialApiResponse } from "@/api/types";
 import CloudContext from "@/store/CloudContext";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
 
@@ -102,9 +104,19 @@ function credential(
   } as CredentialApiResponse;
 }
 
-function renderInCloud(children: ReactNode) {
+function renderInCloud(children: ReactNode, fallbackRetryEnabled = true) {
   return render(
-    <CloudContext.Provider value={true}>{children}</CloudContext.Provider>,
+    <CloudContext.Provider value={true}>
+      <FeatureFlagContext.Provider
+        value={(flag) =>
+          flag === CREDENTIAL_FALLBACK_RETRY_FLAG
+            ? fallbackRetryEnabled
+            : undefined
+        }
+      >
+        {children}
+      </FeatureFlagContext.Provider>
+    </CloudContext.Provider>,
   );
 }
 
@@ -284,6 +296,19 @@ describe("LoginBlockCredentialSelector fallback picker", () => {
     fireEvent.click(trigger);
     await screen.findByPlaceholderText("Search credentials...");
   }
+
+  it("hides the fallback editor when CREDENTIAL_FALLBACK_RETRY is disabled", () => {
+    renderInCloud(
+      <LoginBlockCredentialSelector
+        nodeId="node-1"
+        value="portal_credential"
+      />,
+      false,
+    );
+
+    // Orgs outside the retry rollout must not be able to configure a fallback that never runs.
+    expect(screen.queryByText("Add fallback credentials")).toBeNull();
+  });
 
   it("hides fallback controls when credential rotation is configured", () => {
     useWorkflowParametersStore.setState({
