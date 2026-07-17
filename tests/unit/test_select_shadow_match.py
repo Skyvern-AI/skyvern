@@ -494,6 +494,7 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
     monkeypatch.setattr(handler.settings, "SKYVERN_SELECT_SHADOW_MATCH", True)
 
     scraped_page = SimpleNamespace(id_to_css_dict={})
@@ -597,6 +598,7 @@ async def test_emerging_select_falls_back_to_visible_controlled_listbox_when_no_
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
 
     scraped_page = SimpleNamespace(id_to_css_dict=ids)
     scraped_page_after_open = SimpleNamespace(id_to_css_dict=ids, element_tree=tree, element_tree_trimmed=tree)
@@ -742,6 +744,7 @@ async def test_emerging_select_keeps_off_list_candidate_for_deterministic_match_
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
 
     async def select_deterministically(**kwargs: object) -> tuple[handler.ActionSuccess, str]:
         get_option_candidates = kwargs["get_option_candidates"]
@@ -915,6 +918,7 @@ async def test_emerging_select_rejects_hidden_candidate_from_deterministic_and_l
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
 
     async def select_deterministically(**kwargs: object) -> None:
         get_option_candidates = kwargs["get_option_candidates"]
@@ -976,6 +980,7 @@ async def test_emerging_select_allows_input_text_on_anchor_element(
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
 
     scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
     scraped_page_after_open = SimpleNamespace(
@@ -1029,6 +1034,7 @@ async def test_emerging_select_rejects_input_text_on_element_outside_anchor_and_
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
 
     scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
     scraped_page_after_open = SimpleNamespace(
@@ -1086,6 +1092,7 @@ async def test_emerging_select_off_list_pick_still_proceeds_when_flag_disabled(
         "get_override_llm_api_handler",
         Mock(return_value=llm_handler),
     )
+    monkeypatch.setattr(handler.app, "CUSTOM_SELECT_AGENT_LLM_API_HANDLER", llm_handler)
 
     scraped_page = SimpleNamespace(id_to_css_dict={"field-id": "[unique_id=field-id]"})
     scraped_page_after_open = SimpleNamespace(
