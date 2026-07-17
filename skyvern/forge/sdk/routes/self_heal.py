@@ -12,6 +12,7 @@ from skyvern.schemas.self_heal import (
     RunHealSummary,
     WorkflowReliability,
     summarize_run_heals,
+    summarize_runs_heals,
 )
 from skyvern.services.self_heal_reliability_service import get_workflow_reliability, get_workflows_reliability
 
@@ -21,6 +22,14 @@ LOG = structlog.get_logger()
 class RunHealEpisodesResponse(BaseModel):
     episodes: list[HealEpisodeView]
     summary: RunHealSummary
+
+
+class RunsHealSummaryRequest(BaseModel):
+    workflow_run_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class RunsHealSummaryResponse(BaseModel):
+    summaries: dict[str, RunHealSummary]
 
 
 class WorkflowsReliabilityRequest(BaseModel):
@@ -72,6 +81,23 @@ async def get_run_heal_episodes(
         episodes=[HealEpisodeView.from_episode(episode) for episode in episodes],
         summary=summarize_run_heals(episodes),
     )
+
+
+@base_router.post(
+    "/runs/heal_summary/batch",
+    response_model=RunsHealSummaryResponse,
+    include_in_schema=False,
+)
+async def get_runs_heal_summary_route(
+    request: RunsHealSummaryRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> RunsHealSummaryResponse:
+    workflow_run_ids = list(dict.fromkeys(request.workflow_run_ids))
+    episodes = await app.DATABASE.self_heal.get_heal_episodes_for_runs(
+        organization_id=organization.organization_id,
+        workflow_run_ids=workflow_run_ids,
+    )
+    return RunsHealSummaryResponse(summaries=summarize_runs_heals(episodes))
 
 
 @base_router.get(

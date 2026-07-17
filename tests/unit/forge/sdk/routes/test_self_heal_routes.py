@@ -245,3 +245,71 @@ def test_get_workflows_reliability_batch_rejects_over_cap(monkeypatch) -> None:
 
     assert response.status_code == 422
     get_reliability_batch.assert_not_awaited()
+
+
+def test_get_runs_heal_summary_batch_groups_dedupes_and_summarizes(monkeypatch) -> None:
+    client, _, _, _, _ = _build_client(monkeypatch)
+
+    episodes = [
+        _episode(
+            heal_episode_id="he_1",
+            workflow_run_block_id="wrb_1",
+            block_label="block_a",
+            status=HealStatus.fired_completed,
+            workflow_run_id="wr_1",
+        ),
+        _episode(
+            heal_episode_id="he_2",
+            workflow_run_block_id="wrb_2",
+            block_label="block_b",
+            status=HealStatus.fired_unverified,
+            workflow_run_id="wr_2",
+            output_obligation=OutputObligation.observed,
+        ),
+    ]
+
+    seen: dict = {}
+
+    async def _for_runs(*, organization_id: str, workflow_run_ids: list[str]) -> list[HealEpisode]:
+        seen["organization_id"] = organization_id
+        seen["workflow_run_ids"] = workflow_run_ids
+        return episodes
+
+    monkeypatch.setattr(forge_app.DATABASE.self_heal, "get_heal_episodes_for_runs", _for_runs)
+
+    response = client.post(
+        "/v1/runs/heal_summary/batch",
+        json={"workflow_run_ids": ["wr_1", "wr_2", "wr_1"]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"summaries"}
+    assert set(body["summaries"].keys()) == {"wr_1", "wr_2"}
+    assert body["summaries"]["wr_1"]["blocks_healed"] == 1
+    assert body["summaries"]["wr_1"]["blocks_outcome_risk"] == []
+    assert body["summaries"]["wr_2"]["blocks_healed"] == 0
+    assert body["summaries"]["wr_2"]["blocks_outcome_risk"] == ["block_b"]
+    assert seen["organization_id"] == ORG_ID
+    assert seen["workflow_run_ids"] == ["wr_1", "wr_2"]
+
+
+def test_get_runs_heal_summary_batch_rejects_over_cap(monkeypatch) -> None:
+    client, _, _, _, _ = _build_client(monkeypatch)
+
+    called = False
+
+    async def _for_runs(*, organization_id: str, workflow_run_ids: list[str]) -> list[HealEpisode]:
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(forge_app.DATABASE.self_heal, "get_heal_episodes_for_runs", _for_runs)
+
+    response = client.post(
+        "/v1/runs/heal_summary/batch",
+        json={"workflow_run_ids": [f"wr_{i}" for i in range(101)]},
+    )
+
+    assert response.status_code == 422
+    assert called is False
