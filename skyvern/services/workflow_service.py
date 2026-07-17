@@ -16,6 +16,30 @@ from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, Workflo
 LOG = structlog.get_logger(__name__)
 
 
+def workflow_request_body_from_existing_run(
+    workflow_run: WorkflowRun,
+    parameters: dict[str, t.Any] | None = None,
+    run_metadata: dict[str, str] | None = None,
+) -> WorkflowRequestBody:
+    return WorkflowRequestBody(
+        data=parameters,
+        proxy_location=workflow_run.proxy_location,
+        webhook_callback_url=workflow_run.webhook_callback_url,
+        totp_verification_url=workflow_run.totp_verification_url,
+        totp_identifier=workflow_run.totp_identifier,
+        browser_session_id=workflow_run.browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
+        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+        max_elapsed_time_minutes=workflow_run.max_elapsed_time_minutes,
+        extra_http_headers=workflow_run.extra_http_headers,
+        cdp_connect_headers=workflow_run.cdp_connect_headers,
+        browser_address=workflow_run.browser_address,
+        run_with=workflow_run.run_with,
+        ai_fallback=workflow_run.ai_fallback,
+        run_metadata=run_metadata,
+    )
+
+
 async def prepare_workflow(
     workflow_id: str,
     organization: Organization,
@@ -30,6 +54,8 @@ async def prepare_workflow(
     trigger_type: WorkflowRunTriggerType | None = None,
     workflow_schedule_id: str | None = None,
     workflow_run_id: str | None = None,
+    retried_from_workflow_run_id: str | None = None,
+    fallback_attempt: int | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     copilot_session_id: str | None = None,
     resolved_workflow_id: str | None = None,
@@ -59,6 +85,8 @@ async def prepare_workflow(
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
         workflow_schedule_id=workflow_schedule_id,
+        retried_from_workflow_run_id=retried_from_workflow_run_id,
+        fallback_attempt=fallback_attempt,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         copilot_session_id=copilot_session_id,
         resolved_workflow_id=resolved_workflow_id,
@@ -110,6 +138,8 @@ async def run_workflow(
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
     workflow_schedule_id: str | None = None,
+    retried_from_workflow_run_id: str | None = None,
+    fallback_attempt: int | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     tag_write_context: TagWriteContext | None = None,
 ) -> WorkflowRun:
@@ -124,6 +154,8 @@ async def run_workflow(
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
         workflow_schedule_id=workflow_schedule_id,
+        retried_from_workflow_run_id=retried_from_workflow_run_id,
+        fallback_attempt=fallback_attempt,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         tag_write_context=tag_write_context,
     )

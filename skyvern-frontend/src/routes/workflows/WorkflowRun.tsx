@@ -4,6 +4,7 @@ import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
+import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import {
   SwitchBarNavigation,
   type SwitchBarNavigationOption,
@@ -312,6 +313,8 @@ function WorkflowRun() {
     workflowRun?.status === Status.Terminated
       ? "Termination Reason"
       : "Failure Reason";
+  const siblingRunLinkClassName =
+    "font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200";
 
   const finallyBlockInTimeline = finallyBlockLabel
     ? workflowRunTimeline?.find(
@@ -563,10 +566,14 @@ function WorkflowRun() {
               {workflowRunIsLoading ? (
                 <Skeleton className="h-8 w-28" />
               ) : workflowRun ? (
-                <StatusBadge
-                  className="mt-[0.27rem]"
-                  status={workflowRun?.status}
-                />
+                <div className="mt-[0.27rem] flex items-center gap-2">
+                  <StatusBadge status={workflowRun?.status} />
+                  <CredentialFallbackRetryBadge
+                    retriedFromWorkflowRunId={
+                      workflowRun.retried_from_workflow_run_id
+                    }
+                  />
+                </div>
               ) : null}
             </div>
             <h2 className="text-2xl text-neutral-600 dark:text-slate-400">
@@ -575,6 +582,26 @@ function WorkflowRun() {
             {workflowRunId ? (
               <RunTagsEditor workflowRunId={workflowRunId} />
             ) : null}
+            {workflowRun && workflowPermanentId && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                {workflowRun.retried_from_workflow_run_id && (
+                  <Link
+                    className={siblingRunLinkClassName}
+                    to={`/agents/${workflowPermanentId}/${workflowRun.retried_from_workflow_run_id}/overview`}
+                  >
+                    Retried from {workflowRun.retried_from_workflow_run_id}
+                  </Link>
+                )}
+                {workflowRun.retried_by_workflow_run_id && (
+                  <Link
+                    className={siblingRunLinkClassName}
+                    to={`/agents/${workflowPermanentId}/${workflowRun.retried_by_workflow_run_id}/overview`}
+                  >
+                    Retried by {workflowRun.retried_by_workflow_run_id}
+                  </Link>
+                )}
+              </div>
+            )}
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||

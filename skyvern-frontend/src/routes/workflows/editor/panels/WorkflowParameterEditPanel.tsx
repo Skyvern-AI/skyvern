@@ -33,6 +33,7 @@ import {
   parameterIsAzureVaultCredential,
   AUTO_GENERATED_CREDENTIAL_KEY_PATTERN,
 } from "../types";
+import { applySkyvernCredentialEdit } from "../utils";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -1173,12 +1174,13 @@ function WorkflowParameterEditPanel({
                       });
                       return;
                     }
-                    onSave({
-                      key,
-                      parameterType: "credential",
-                      credentialId,
-                      description,
-                    });
+                    onSave(
+                      applySkyvernCredentialEdit(initialValues, {
+                        key,
+                        credentialId,
+                        description,
+                      }),
+                    );
                     return;
                   }
 

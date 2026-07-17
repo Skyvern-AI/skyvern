@@ -244,3 +244,140 @@ describe("LoginBlockCredentialSelector", () => {
     );
   });
 });
+
+describe("LoginBlockCredentialSelector fallback picker", () => {
+  beforeEach(() => {
+    mocks.useCredentialsQuery.mockReturnValue({
+      data: [
+        credential("cred_primary", "primary_credential"),
+        credential("cred_backup_1", "backup_credential_1"),
+      ],
+      isFetching: false,
+      isLoading: false,
+    });
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "portal_credential",
+          parameterType: "credential",
+          credentialId: "cred_primary",
+        },
+      ],
+    });
+  });
+
+  function renderSelector() {
+    return renderInCloud(
+      <LoginBlockCredentialSelector
+        nodeId="node-1"
+        value="portal_credential"
+      />,
+    );
+  }
+
+  async function openFallbackPicker() {
+    renderSelector();
+    fireEvent.click(screen.getByText("Add fallback credentials"));
+    const trigger = await screen.findByRole("button", {
+      name: /add fallback credentials/i,
+    });
+    fireEvent.click(trigger);
+    await screen.findByPlaceholderText("Search credentials...");
+  }
+
+  it("hides fallback controls when credential rotation is configured", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "portal_credential",
+          parameterType: "credential",
+          credentialId: "cred_primary",
+          credentialIds: ["cred_primary", "cred_backup_1"],
+        },
+      ],
+    });
+
+    renderSelector();
+
+    expect(screen.queryByText("Fallback credentials")).toBeNull();
+    expect(screen.queryByText("Add fallback credentials")).toBeNull();
+    expect(
+      screen.getByText(
+        "Fallback credentials can't be combined with credential rotation.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("hides credential rotation when fallback credentials are configured", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "portal_credential",
+          parameterType: "credential",
+          credentialId: "cred_primary",
+          fallbackCredentialIds: ["cred_backup_1"],
+        },
+      ],
+    });
+
+    renderSelector();
+
+    expect(
+      screen.queryByText("Rotate between multiple credentials"),
+    ).toBeNull();
+    expect(
+      screen.getByText(
+        "Credential rotation can't be combined with fallback credentials.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("Escape closes only the picker and does not reach window listeners", async () => {
+    await openFallbackPicker();
+
+    const windowEscapeSpy = vi.fn();
+    const listener = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        windowEscapeSpy();
+      }
+    };
+    window.addEventListener("keydown", listener);
+    try {
+      fireEvent.keyDown(screen.getByPlaceholderText("Search credentials..."), {
+        key: "Escape",
+      });
+
+      await waitFor(() => {
+        expect(
+          screen.queryByPlaceholderText("Search credentials..."),
+        ).toBeNull();
+      });
+      expect(windowEscapeSpy).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", listener);
+    }
+  });
+
+  it("selecting a fallback option writes it to the parameter store", async () => {
+    await openFallbackPicker();
+
+    fireEvent.click(await screen.findByText("backup_credential_1"));
+
+    await waitFor(() => {
+      const parameter = useWorkflowParametersStore
+        .getState()
+        .parameters.find((p) => p.key === "portal_credential");
+      expect(parameter).toMatchObject({
+        fallbackCredentialIds: ["cred_backup_1"],
+      });
+    });
+  });
+
+  it("the picker popover is modal so outside clicks cannot hit the canvas", async () => {
+    await openFallbackPicker();
+
+    await waitFor(() => {
+      expect(document.body.style.pointerEvents).toBe("none");
+    });
+  });
+});

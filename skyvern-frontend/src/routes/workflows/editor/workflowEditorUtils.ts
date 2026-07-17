@@ -4253,6 +4253,8 @@ function convertParametersToParameterYAML(
             credential_id: parameter.credential_id,
             credential_ids: parameter.credential_ids ?? null,
             selection_strategy: parameter.selection_strategy ?? null,
+            fallback_credential_ids: parameter.fallback_credential_ids ?? null,
+            fallback_trigger: parameter.fallback_trigger ?? null,
           };
         }
         case WorkflowParameterTypes.OnePassword: {

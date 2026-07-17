@@ -239,6 +239,8 @@ class WorkflowRun(BaseModel):
     totp_identifier: str | None = None
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
+    retried_from_workflow_run_id: str | None = None
+    fallback_attempt: int | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
@@ -346,6 +348,8 @@ class WorkflowRunResponseBase(BaseModel):
     status: WorkflowRunStatus
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None
+    retried_from_workflow_run_id: str | None = None
+    retried_by_workflow_run_id: str | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None

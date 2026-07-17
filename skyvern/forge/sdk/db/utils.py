@@ -613,6 +613,8 @@ def convert_to_workflow_run(
         browser_profile_id=workflow_run_model.browser_profile_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
+        retried_from_workflow_run_id=workflow_run_model.retried_from_workflow_run_id,
+        fallback_attempt=workflow_run_model.fallback_attempt,
         proxy_location=deserialize_proxy_location(workflow_run_model.proxy_location),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         webhook_failure_reason=workflow_run_model.webhook_failure_reason,

@@ -172,6 +172,8 @@ def convert_workflow_definition(
                 credential_id=parameter.credential_id,
                 credential_ids=parameter.credential_ids,
                 selection_strategy=parameter.selection_strategy,
+                fallback_credential_ids=parameter.fallback_credential_ids,
+                fallback_trigger=parameter.fallback_trigger,
                 created_at=now,
                 modified_at=now,
             )

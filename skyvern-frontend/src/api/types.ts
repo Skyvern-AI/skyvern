@@ -744,6 +744,7 @@ export type WorkflowRunApiResponse = {
   workflow_permanent_id: string;
   workflow_run_id: string;
   workflow_title: string | null;
+  retried_from_workflow_run_id?: string | null;
 };
 
 export const TaskRunType = {
@@ -810,6 +811,8 @@ export type WorkflowRunStatusApiResponse = {
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
+  retried_from_workflow_run_id?: string | null;
+  retried_by_workflow_run_id?: string | null;
 };
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -849,6 +852,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   waiting_for_verification_code?: boolean;
   verification_code_identifier?: string | null;
   verification_code_polling_started_at?: string | null;
+  retried_from_workflow_run_id?: string | null;
+  retried_by_workflow_run_id?: string | null;
 };
 
 export type TaskGenerationApiResponse = {

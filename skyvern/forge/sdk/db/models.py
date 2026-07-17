@@ -700,6 +700,13 @@ class WorkflowRunModel(Base):
             "queued_at",
             postgresql_where=text("status IN ('queued', 'running', 'paused') AND browser_session_id IS NULL"),
         ),
+        Index(
+            "ix_workflow_runs_retried_from_workflow_run_id",
+            "retried_from_workflow_run_id",
+            unique=True,
+            postgresql_where=text("retried_from_workflow_run_id IS NOT NULL"),
+            sqlite_where=text("retried_from_workflow_run_id IS NOT NULL"),
+        ),
     )
 
     workflow_run_id = Column(String, primary_key=True, default=generate_workflow_run_id)
@@ -730,6 +737,8 @@ class WorkflowRunModel(Base):
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
+    retried_from_workflow_run_id = Column(String, nullable=True)
+    fallback_attempt = Column(Integer, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
     code_gen = Column(Boolean, nullable=True)
     waiting_for_verification_code = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
@@ -908,6 +917,8 @@ class CredentialParameterModel(Base):
     credential_id = Column(String, nullable=False)
     credential_ids = Column(JSON, nullable=True)
     selection_strategy = Column(String, nullable=True)
+    fallback_credential_ids = Column(JSON, nullable=True)
+    fallback_trigger = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
