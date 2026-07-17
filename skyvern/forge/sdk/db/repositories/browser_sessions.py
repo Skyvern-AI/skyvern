@@ -396,6 +396,29 @@ class BrowserSessionsRepository(BaseRepository):
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
 
+    @db_operation("create_imported_persistent_browser_session")
+    async def create_imported_persistent_browser_session(
+        self,
+        *,
+        session_id: str,
+        organization_id: str,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
+    ) -> PersistentBrowserSession:
+        """Create an inert, already-completed session row for externally recorded runs."""
+        async with self.Session() as session:
+            browser_session = PersistentBrowserSessionModel(
+                persistent_browser_session_id=session_id,
+                organization_id=organization_id,
+                status="completed",
+                started_at=to_naive_utc(started_at) if started_at else None,
+                completed_at=to_naive_utc(completed_at) if completed_at else naive_utc_now(),
+            )
+            session.add(browser_session)
+            await session.commit()
+            await session.refresh(browser_session)
+            return PersistentBrowserSession.model_validate(browser_session)
+
     @db_operation("create_persistent_browser_session")
     async def create_persistent_browser_session(
         self,
