@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     GENUINELY_TERMINAL_BLOCKER_REASON_CODES as GENUINELY_TERMINAL_BLOCKER_REASON_CODES,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
     blocker_signal_is_genuinely_terminal,
     build_output_source_unobservable_blocker_signal,
@@ -95,6 +96,7 @@ _OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODES = frozenset(
     {
         OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
         OUTPUT_CONTRACT_ACTUATION_EXHAUSTED_REASON_CODE,
+        OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
         ADVISORY_DISPATCH_STALLED_REASON_CODE,
     }
 )

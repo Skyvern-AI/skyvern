@@ -173,6 +173,11 @@ class PreRunPageReference:
 
 
 @dataclass(frozen=True)
+class RejectedCodeArtifactMetadataCapture:
+    payload: Any
+
+
+@dataclass(frozen=True)
 class RegisteredArtifactEntry:
     artifact_id: str
     file_name: str
@@ -393,6 +398,8 @@ class AgentContext:
     # only normalizes and carries the metadata; sufficiency checks live elsewhere.
     code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
     raw_code_artifact_metadata: object | None = None
+    submitted_code_artifact_metadata_snapshot: Any = None
+    rejected_code_artifact_metadata_captures: list[RejectedCodeArtifactMetadataCapture] = field(default_factory=list)
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
