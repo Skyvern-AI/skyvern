@@ -803,6 +803,14 @@ class AgentFunction:
     ) -> bool:
         return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
 
+    async def resolve_copilot_author_time_gate_log_only_ids(
+        self,
+        *,
+        turn_id: str,
+        organization_id: str,
+    ) -> frozenset[str]:
+        return frozenset()
+
     async def should_use_codeblock_runner(
         self,
         *,

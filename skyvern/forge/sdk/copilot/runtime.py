@@ -74,6 +74,24 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+DEFINITION_CONTRACT_UNSATISFIED_GATE_ID = "definition_contract_unsatisfied"
+RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID = "recorded_outcome_grounding_binder_ceiling"
+SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID = "synthesized_parameter_binding_ambiguous"
+_POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
+    {
+        DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
+        RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
+        SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
+    }
+)
+_LOCAL_AUTHOR_TIME_GATE_LOG_ONLY_IDS = frozenset(
+    {
+        "output_contract_actuation",
+        "metadata_run_preflight_reject",
+        "uncovered_output_rescout_steer",
+        "recorded_outcome_grounding",
+    }
+)
 CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
@@ -535,6 +553,7 @@ class AgentContext:
     # extraction_schema declares fields that map to no output the block produces.
     # Surfaced into the persisted TurnOutcome so a later turn can report it.
     latest_schema_incompatibility: SchemaIncompatibility | None = None
+    author_time_gate_log_only_ids: frozenset[str] = frozenset()
     author_time_gate_ablation_events: list[AuthorTimeGateAblationEvent] = field(default_factory=list)
     # Single-owner turn-precedence contract. One mechanism owns a turn's steering
     # at a time; a contradicting weaker claim is recorded here and yields.
@@ -545,8 +564,20 @@ class AgentContext:
     blocker_signal_claimant: TurnClaimant | None = None
 
 
-def copilot_author_time_gate_log_only_enabled() -> bool:
-    return not settings.is_cloud_environment() and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+def cache_copilot_author_time_gate_log_only_ids(ctx: AgentContext, resolved_ids: frozenset[str]) -> None:
+    ineligible_ids = resolved_ids - _POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    for gate_id in sorted(ineligible_ids):
+        LOG.info("copilot_gate_log_only_ineligible", gate_id=gate_id)
+    ctx.author_time_gate_log_only_ids = resolved_ids & _POSTHOG_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+
+
+def copilot_author_time_gate_log_only_enabled(ctx: AgentContext, gate_id: str) -> bool:
+    local_blanket_enabled = (
+        not settings.is_cloud_environment()
+        and settings.WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY
+        and gate_id in _LOCAL_AUTHOR_TIME_GATE_LOG_ONLY_IDS
+    )
+    return local_blanket_enabled or gate_id in ctx.author_time_gate_log_only_ids
 
 
 def record_author_time_gate_ablation_event(
@@ -558,7 +589,7 @@ def record_author_time_gate_ablation_event(
     blocked_tool: str | None = None,
     payload: AuthorTimeGateAblationPayload | None = None,
 ) -> bool:
-    if not copilot_author_time_gate_log_only_enabled():
+    if not copilot_author_time_gate_log_only_enabled(ctx, gate_id):
         return False
     event = AuthorTimeGateAblationEvent(
         gate_id=gate_id,

@@ -168,6 +168,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_source_producible
 from skyvern.forge.sdk.copilot.runtime import (
+    DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
+    RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
+    SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     AgentContext,
     AuthorTimeGateAblationPayload,
     ScoutedFieldParameterBinding,
@@ -2155,6 +2158,31 @@ def _record_definition_plane_reject(
     )
 
 
+def _record_definition_plane_ablation_event(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    rejection: _DefinitionPlaneReject,
+    *,
+    code_artifact_metadata: object = None,
+) -> bool:
+    fingerprint = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
+    if fingerprint is None:
+        return False
+    payload: AuthorTimeGateAblationPayload = {
+        "criterion_ids": list(rejection.criterion_ids),
+        "definition_reason_codes": list(rejection.reason_codes),
+        "unreferenced_parameter_keys": list(rejection.unreferenced_parameter_keys),
+    }
+    return record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=DEFINITION_CONTRACT_UNSATISFIED_GATE_ID,
+        reason_code="definition_contract_unsatisfied",
+        fingerprint=fingerprint,
+        blocked_tool="update_workflow",
+        payload=payload,
+    )
+
+
 def _stash_unresolved_recorded_outcome_grounding_halt(
     ctx: AgentContext,
     unresolved_parameter_keys: Iterable[str],
@@ -2175,6 +2203,22 @@ def _stash_unresolved_recorded_outcome_grounding_halt(
         return False
     keys = sorted(set(unresolved_parameter_keys))
     if not keys:
+        return False
+    payload: AuthorTimeGateAblationPayload = {
+        "phase": requirement.phase,
+        "outcome_reason_code": requirement.reason_code,
+        "workflow_run_id": requirement.workflow_run_id,
+        "block_labels": list(requirement.block_labels),
+        "unresolved_parameter_keys": keys,
+    }
+    if record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=RECORDED_OUTCOME_GROUNDING_BINDER_CEILING_GATE_ID,
+        reason_code="definition_contract_unsatisfied",
+        fingerprint=requirement.structural_key,
+        blocked_tool="update_workflow",
+        payload=payload,
+    ):
         return False
     signal = build_definition_contract_unsatisfied_blocker_signal(
         unresolved_parameter_keys=keys,
@@ -4604,7 +4648,10 @@ def _stash_output_source_unobservable_terminal(
         "canonical_required_child_paths": sorted(required_paths),
         "spine_split_blockers": list(blockers),
     }
-    if copilot_author_time_gate_log_only_enabled() and ctx.output_contract_bail_actuated_this_call:
+    if (
+        copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID)
+        and ctx.output_contract_bail_actuated_this_call
+    ):
         return
     if record_author_time_gate_ablation_event(
         ctx,
@@ -5170,7 +5217,7 @@ def _impose_output_contract_envelope_after_steering(
                 return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
             if actuation.kind == OutputContractActuationKind.ADVISORY_RUN:
                 return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
-            if copilot_author_time_gate_log_only_enabled():
+            if copilot_author_time_gate_log_only_enabled(ctx, _OUTPUT_CONTRACT_ABLATION_GATE_ID):
                 return workflow_yaml, raw_code_artifact_metadata, declaration_stamped
             attempt_key = _output_contract_spine_directive_attempt_key(
                 signature=signature, block_label=label, workflow_yaml=workflow_yaml
@@ -5338,24 +5385,41 @@ def _metadata_contract_run_preflight_reject(
             ctx,
             definition_reject.unreferenced_parameter_keys,
         )
-        if not halted:
+        if halted:
+            return {
+                "ok": False,
+                "error": _definition_plane_reject_error(definition_reject),
+                "user_facing_summary": _compiled_authoring_user_summary(),
+                "data": {
+                    "reason_code": "definition_contract_unsatisfied",
+                    "definition_criterion_ids": list(definition_reject.criterion_ids),
+                    "definition_reason_codes": list(definition_reject.reason_codes),
+                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+                },
+            }
+        if not _record_definition_plane_ablation_event(
+            ctx,
+            workflow_yaml,
+            definition_reject,
+            code_artifact_metadata=raw_code_artifact_metadata,
+        ):
             _record_definition_plane_reject(
                 ctx,
                 workflow_yaml,
                 definition_reject,
                 code_artifact_metadata=raw_code_artifact_metadata,
             )
-        return {
-            "ok": False,
-            "error": _definition_plane_reject_error(definition_reject),
-            "user_facing_summary": _compiled_authoring_user_summary(),
-            "data": {
-                "reason_code": "definition_contract_unsatisfied",
-                "definition_criterion_ids": list(definition_reject.criterion_ids),
-                "definition_reason_codes": list(definition_reject.reason_codes),
-                "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-            },
-        }
+            return {
+                "ok": False,
+                "error": _definition_plane_reject_error(definition_reject),
+                "user_facing_summary": _compiled_authoring_user_summary(),
+                "data": {
+                    "reason_code": "definition_contract_unsatisfied",
+                    "definition_criterion_ids": list(definition_reject.criterion_ids),
+                    "definition_reason_codes": list(definition_reject.reason_codes),
+                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+                },
+            }
     convergence_reject = _recorded_outcome_convergence_reject(
         ctx,
         workflow_yaml=workflow_yaml,
@@ -6592,6 +6656,7 @@ class _SynthesizedCodeImpositionResult:
     selected_extraction_metadata_disposition: SelectedExtractionMetadataDisposition = "none"
     minted_parameter_keys: list[str] = dataclass_field(default_factory=list)
     metadata_repair_contract: dict[str, object] | None = None
+    ablation_gate_id: str | None = None
 
 
 _SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
@@ -9103,6 +9168,31 @@ def _apply_parameter_reconciliation_to_code(code: str, reconciliation: _Synthesi
 _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE = "synthesized_parameter_binding_ambiguous"
 
 
+def _record_synthesized_parameter_binding_ablation_event(
+    ctx: AgentContext,
+    workflow_yaml: str,
+    repair_context: CodeAuthoringRepairContext,
+) -> bool:
+    fingerprint = authored_structure_signature_from_workflow(workflow_yaml, ctx.raw_code_artifact_metadata)
+    if fingerprint is None:
+        return False
+    payload: AuthorTimeGateAblationPayload = {
+        "block_label": repair_context.block_label,
+        "unresolved_names": list(repair_context.unresolved_names),
+        "parameter_keys": list(repair_context.parameter_keys),
+        "available_parameter_keys": list(repair_context.available_parameter_keys),
+        "binding_candidates": list(repair_context.binding_candidates),
+    }
+    return record_author_time_gate_ablation_event(
+        ctx,
+        gate_id=SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
+        reason_code=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+        fingerprint=fingerprint,
+        blocked_tool="update_workflow",
+        payload=payload,
+    )
+
+
 def _synthesized_parameter_binding_repair_context(
     *,
     parsed: Mapping[str, Any],
@@ -9760,6 +9850,7 @@ def _maybe_impose_synthesized_code_block(
         synthesized_parameters=synthesized.parameters,
         scout_trajectory=scout_trajectory,
     )
+    parameter_binding_is_only_violation = not violations and bool(parameter_reconciliation.violations)
     violations.extend(parameter_reconciliation.violations)
     if repair_context is None:
         repair_context = parameter_reconciliation.repair_context
@@ -9776,6 +9867,13 @@ def _maybe_impose_synthesized_code_block(
             violations=violations,
             repair_context=repair_context,
             metadata_repair_contract=_co_computed_metadata_repair_contract(ctx, workflow_yaml, raw_metadata),
+            ablation_gate_id=(
+                SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID
+                if parameter_binding_is_only_violation
+                and repair_context is not None
+                and repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
+                else None
+            ),
         )
 
     metadata_declares_goal_values = bool(raw_metadata) and _raw_metadata_declares_goal_values_for_block(
@@ -11090,37 +11188,48 @@ async def _update_workflow(
     ctx.synthesized_block_reopened_for_credential_scout = False
     if imposition.violations:
         if (
-            imposition.repair_context is not None
-            and imposition.repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
-        ):
-            required_paths = _output_contract_required_paths_source(ctx).union
-            _record_output_contract_family_reject(
+            imposition.ablation_gate_id == SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID
+            and imposition.repair_context is not None
+            and _record_synthesized_parameter_binding_ablation_event(
                 ctx,
-                required_paths,
-                reject_family=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+                workflow_yaml,
+                imposition.repair_context,
             )
-        if (
-            imposition.repair_context is not None
-            and imposition.repair_context.reason_code in _SCOUTED_SPINE_REASON_CODES
         ):
-            _set_code_authoring_repair_context(ctx, imposition.repair_context)
-            _record_code_authoring_guardrail_reject(ctx)
+            imposition = _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+        else:
+            if (
+                imposition.repair_context is not None
+                and imposition.repair_context.reason_code == _SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE
+            ):
+                required_paths = _output_contract_required_paths_source(ctx).union
+                _record_output_contract_family_reject(
+                    ctx,
+                    required_paths,
+                    reject_family=_SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_REASON_CODE,
+                )
+            if (
+                imposition.repair_context is not None
+                and imposition.repair_context.reason_code in _SCOUTED_SPINE_REASON_CODES
+            ):
+                _set_code_authoring_repair_context(ctx, imposition.repair_context)
+                _record_code_authoring_guardrail_reject(ctx)
+                return reject(
+                    error="\n".join(imposition.violations),
+                    user_facing_summary=_compiled_authoring_user_summary(),
+                    data=_code_repair_progress_data(imposition.repair_context),
+                    repair_context=imposition.repair_context,
+                    record_repair_context_outcome=False,
+                )
             return reject(
                 error="\n".join(imposition.violations),
                 user_facing_summary=_compiled_authoring_user_summary(),
-                data=_code_repair_progress_data(imposition.repair_context),
+                data=_code_repair_progress_data(
+                    imposition.repair_context,
+                    metadata_repair_contract=imposition.metadata_repair_contract,
+                ),
                 repair_context=imposition.repair_context,
-                record_repair_context_outcome=False,
             )
-        return reject(
-            error="\n".join(imposition.violations),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data=_code_repair_progress_data(
-                imposition.repair_context,
-                metadata_repair_contract=imposition.metadata_repair_contract,
-            ),
-            repair_context=imposition.repair_context,
-        )
     workflow_yaml = imposition.workflow_yaml
     if imposition.substitutions is None:
         seam_under_build = _persist_seam_spine_under_build_result(workflow_yaml, ctx)
@@ -11179,23 +11288,39 @@ async def _update_workflow(
             ctx,
             definition_reject.unreferenced_parameter_keys,
         )
-        if not halted:
+        if halted:
+            return reject(
+                error=_definition_plane_reject_error(definition_reject),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data={
+                    "reason_code": "definition_contract_unsatisfied",
+                    "definition_criterion_ids": list(definition_reject.criterion_ids),
+                    "definition_reason_codes": list(definition_reject.reason_codes),
+                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+                },
+            )
+        if not _record_definition_plane_ablation_event(
+            ctx,
+            workflow_yaml,
+            definition_reject,
+            code_artifact_metadata=ctx.raw_code_artifact_metadata,
+        ):
             _record_definition_plane_reject(
                 ctx,
                 workflow_yaml,
                 definition_reject,
                 code_artifact_metadata=ctx.raw_code_artifact_metadata,
             )
-        return reject(
-            error=_definition_plane_reject_error(definition_reject),
-            user_facing_summary=_compiled_authoring_user_summary(),
-            data={
-                "reason_code": "definition_contract_unsatisfied",
-                "definition_criterion_ids": list(definition_reject.criterion_ids),
-                "definition_reason_codes": list(definition_reject.reason_codes),
-                "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
-            },
-        )
+            return reject(
+                error=_definition_plane_reject_error(definition_reject),
+                user_facing_summary=_compiled_authoring_user_summary(),
+                data={
+                    "reason_code": "definition_contract_unsatisfied",
+                    "definition_criterion_ids": list(definition_reject.criterion_ids),
+                    "definition_reason_codes": list(definition_reject.reason_codes),
+                    "unreferenced_parameter_keys": list(definition_reject.unreferenced_parameter_keys),
+                },
+            )
     params["workflow_yaml"] = workflow_yaml
     metadata_scrubbed_by_imposition = False
     if (
