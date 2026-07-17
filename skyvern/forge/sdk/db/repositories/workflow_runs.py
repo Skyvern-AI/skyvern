@@ -208,6 +208,8 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        retried_from_workflow_run_id: str | None = None,
+        fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
     ) -> WorkflowRun:
@@ -239,6 +241,8 @@ class WorkflowRunsRepository(BaseRepository):
                 code_gen=code_gen,
                 trigger_type=trigger_type.value if trigger_type else None,
                 workflow_schedule_id=workflow_schedule_id,
+                retried_from_workflow_run_id=retried_from_workflow_run_id,
+                fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=copilot_session_id,
                 **kwargs,
@@ -247,6 +251,18 @@ class WorkflowRunsRepository(BaseRepository):
             await session.commit()
             await session.refresh(workflow_run)
             return convert_to_workflow_run(workflow_run)
+
+    @db_operation("get_workflow_run_retried_by")
+    async def get_workflow_run_retried_by(self, workflow_run_id: str, organization_id: str) -> str | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel.workflow_run_id)
+                .where(WorkflowRunModel.retried_from_workflow_run_id == workflow_run_id)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(1)
+            )
+            return (await session.scalars(query)).first()
 
     @db_operation("update_workflow_run")
     async def update_workflow_run(

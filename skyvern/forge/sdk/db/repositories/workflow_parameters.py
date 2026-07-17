@@ -292,6 +292,8 @@ class WorkflowParametersRepository(BaseRepository):
                 credential_id=parameter.credential_id,
                 credential_ids=parameter.credential_ids,
                 selection_strategy=parameter.selection_strategy,
+                fallback_credential_ids=parameter.fallback_credential_ids,
+                fallback_trigger=parameter.fallback_trigger,
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):

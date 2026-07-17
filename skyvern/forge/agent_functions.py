@@ -719,6 +719,12 @@ class AgentFunction:
     def has_proxy_session_extra_http_headers(self, extra_http_headers: dict[str, str] | None) -> bool:
         return False
 
+    def strip_proxy_session_extra_http_headers(
+        self,
+        extra_http_headers: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        return extra_http_headers
+
     def merge_proxy_session_extra_http_headers(
         self,
         extra_http_headers: dict[str, str] | None,

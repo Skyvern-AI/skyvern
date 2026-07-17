@@ -83,6 +83,10 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
+from skyvern.forge.sdk.workflow.credential_fallback import (
+    VALID_FALLBACK_TRIGGERS,
+    maybe_start_credential_fallback_retry,
+)
 from skyvern.forge.sdk.workflow.credential_selection import (
     VALID_SELECTION_STRATEGIES,
     normalize_selection_strategy,
@@ -733,6 +737,23 @@ class WorkflowService:
             )
 
     @staticmethod
+    async def _start_credential_fallback_retry_best_effort(workflow_run: WorkflowRun) -> None:
+        try:
+            await maybe_start_credential_fallback_retry(workflow_run, workflow_run.organization_id)
+        except Exception:
+            LOG.warning(
+                "Credential fallback retry hook failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow_run.organization_id,
+                exc_info=True,
+            )
+
+    def _schedule_credential_fallback_retry(self, workflow_run: WorkflowRun) -> None:
+        task = asyncio.create_task(self._start_credential_fallback_retry_best_effort(workflow_run))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    @staticmethod
     def _determine_cache_invalidation(
         previous_blocks: list[dict[str, Any]],
         new_blocks: list[dict[str, Any]],
@@ -1138,28 +1159,67 @@ class WorkflowService:
     ) -> None:
         credential_ids_to_validate: list[str] = []
         for parameter in parameters:
-            credential_ids = getattr(parameter, "credential_ids", None)
-            if credential_ids is None:
-                continue
             key = getattr(parameter, "key", None) or "<unknown>"
-            if not credential_ids:
-                raise SkyvernHTTPException(
-                    message=f"credential_ids for credential parameter {key} must be non-empty.",
-                    status_code=400,
-                )
-            credential_ids = list(dict.fromkeys(credential_ids))
-            parameter.credential_ids = credential_ids
-            selection_strategy = getattr(parameter, "selection_strategy", None)
-            if normalize_selection_strategy(selection_strategy) not in VALID_SELECTION_STRATEGIES:
+            credential_ids = getattr(parameter, "credential_ids", None)
+            if credential_ids is not None:
+                if not credential_ids:
+                    raise SkyvernHTTPException(
+                        message=f"credential_ids for credential parameter {key} must be non-empty.",
+                        status_code=400,
+                    )
+                credential_ids = list(dict.fromkeys(credential_ids))
+                parameter.credential_ids = credential_ids
+                selection_strategy = getattr(parameter, "selection_strategy", None)
+                if normalize_selection_strategy(selection_strategy) not in VALID_SELECTION_STRATEGIES:
+                    raise SkyvernHTTPException(
+                        message=(
+                            f"selection_strategy for credential parameter {key} must be one of: "
+                            f"{', '.join(sorted(VALID_SELECTION_STRATEGIES))}."
+                        ),
+                        status_code=400,
+                    )
+                parameter.credential_id = credential_ids[0]
+                credential_ids_to_validate.extend(credential_ids)
+
+            fallback_credential_ids = getattr(parameter, "fallback_credential_ids", None)
+            if fallback_credential_ids is not None:
+                fallback_credential_ids = list(dict.fromkeys(fallback_credential_ids))
+                if credential_ids is None:
+                    primary_credential_id = getattr(parameter, "credential_id", None)
+                    fallback_credential_ids = [
+                        credential_id
+                        for credential_id in fallback_credential_ids
+                        if credential_id != primary_credential_id
+                    ]
+                parameter.fallback_credential_ids = fallback_credential_ids or None
+                credential_ids_to_validate.extend(fallback_credential_ids)
+
+            if (
+                getattr(parameter, "credential_ids", None) is not None
+                and getattr(parameter, "fallback_credential_ids", None) is not None
+            ):
                 raise SkyvernHTTPException(
                     message=(
-                        f"selection_strategy for credential parameter {key} must be one of: "
-                        f"{', '.join(sorted(VALID_SELECTION_STRATEGIES))}."
+                        f"credential parameter {key} cannot combine credential_ids rotation with "
+                        "fallback_credential_ids; configure one or the other."
                     ),
                     status_code=400,
                 )
-            parameter.credential_id = credential_ids[0]
-            credential_ids_to_validate.extend(credential_ids)
+
+            fallback_trigger = getattr(parameter, "fallback_trigger", None)
+            if fallback_trigger is not None and fallback_trigger not in VALID_FALLBACK_TRIGGERS:
+                raise SkyvernHTTPException(
+                    message=(
+                        f"fallback_trigger for credential parameter {key} must be one of: "
+                        f"{', '.join(sorted(VALID_FALLBACK_TRIGGERS))}."
+                    ),
+                    status_code=400,
+                )
+            if fallback_trigger is not None and not getattr(parameter, "fallback_credential_ids", None):
+                raise SkyvernHTTPException(
+                    message=f"fallback_trigger for credential parameter {key} requires fallback_credential_ids.",
+                    status_code=400,
+                )
 
         await self._validate_credential_ids(credential_ids_to_validate, organization)
 
@@ -1174,6 +1234,18 @@ class WorkflowService:
             if isinstance(parameter, CredentialParameter) and bool(parameter.credential_ids)
         ]
 
+    @staticmethod
+    def _get_credential_parameters_with_configured_selection(workflow: Workflow) -> list[CredentialParameter]:
+        workflow_definition = getattr(workflow, "workflow_definition", None)
+        if workflow_definition is None:
+            return []
+        return [
+            parameter
+            for parameter in workflow_definition.parameters
+            if isinstance(parameter, CredentialParameter)
+            and (bool(parameter.credential_ids) or bool(parameter.fallback_credential_ids))
+        ]
+
     def _get_run_credential_parameter_overrides(
         self,
         *,
@@ -1184,7 +1256,7 @@ class WorkflowService:
             return {}
 
         overrides: dict[str, str] = {}
-        for parameter in self._get_rotating_credential_parameters(workflow):
+        for parameter in self._get_credential_parameters_with_configured_selection(workflow):
             if parameter.key not in request_data:
                 continue
 
@@ -1194,12 +1266,18 @@ class WorkflowService:
             if not isinstance(override, str):
                 raise InvalidCredentialId(f"<non-string value of type {type(override).__name__}>")
 
-            credential_ids = parameter.credential_ids or []
+            credential_ids = list(
+                dict.fromkeys(
+                    (parameter.credential_ids or [])
+                    + (parameter.fallback_credential_ids or [])
+                    + [parameter.credential_id]
+                )
+            )
             if override not in credential_ids:
                 raise SkyvernHTTPException(
                     message=(
                         f"Credential override for parameter {parameter.key} must be one of the configured "
-                        "rotation credentials."
+                        "rotation or fallback credentials."
                     ),
                     status_code=400,
                 )
@@ -1370,6 +1448,8 @@ class WorkflowService:
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        retried_from_workflow_run_id: str | None = None,
+        fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
         resolved_workflow_id: str | None = None,
@@ -1478,6 +1558,8 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 trigger_type=resolved_trigger_type,
                 workflow_schedule_id=workflow_schedule_id,
+                retried_from_workflow_run_id=retried_from_workflow_run_id,
+                fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
             )
@@ -4542,21 +4624,29 @@ class WorkflowService:
         organization_id: str | None,
         workflow_permanent_id: str | None,
     ) -> str:
-        if not parameter.credential_ids or not workflow_run_id or not organization_id or not workflow_permanent_id:
+        if not workflow_run_id or not organization_id or not workflow_permanent_id:
             return parameter.credential_id
 
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id)
         if workflow_run_context:
             return await workflow_run_context.resolve_credential_parameter_id(parameter, organization_id)
 
-        return await select_credential_for_run(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            parameter_key=parameter.key,
-            credential_ids=parameter.credential_ids,
-            selection_strategy=parameter.selection_strategy,
-        )
+        if parameter.credential_ids:
+            return await select_credential_for_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                parameter_key=parameter.key,
+                credential_ids=parameter.credential_ids,
+                selection_strategy=parameter.selection_strategy,
+            )
+        if parameter.fallback_credential_ids:
+            selected = await app.DATABASE.workflow_run_credential_selections.get_selection(
+                workflow_run_id=workflow_run_id,
+                parameter_key=parameter.key,
+            )
+            return selected or parameter.credential_id
+        return parameter.credential_id
 
     async def _apply_login_block_credential_proxy_pin(
         self,
@@ -5874,6 +5964,8 @@ class WorkflowService:
         workflow_run_id: str | None = None,
         trigger_type: WorkflowRunTriggerType | None = None,
         workflow_schedule_id: str | None = None,
+        retried_from_workflow_run_id: str | None = None,
+        fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
     ) -> WorkflowRun:
@@ -5960,6 +6052,8 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                     trigger_type=trigger_type,
                     workflow_schedule_id=workflow_schedule_id,
+                    retried_from_workflow_run_id=retried_from_workflow_run_id,
+                    fallback_attempt=fallback_attempt,
                     ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                     copilot_session_id=copilot_session_id,
                 )
@@ -6074,6 +6168,8 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             trigger_type=trigger_type,
             workflow_schedule_id=workflow_schedule_id,
+            retried_from_workflow_run_id=retried_from_workflow_run_id,
+            fallback_attempt=fallback_attempt,
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
             copilot_session_id=copilot_session_id,
         )
@@ -6296,13 +6392,15 @@ class WorkflowService:
             failure_category_source=failure_category_source,
         )
 
-        return await self._update_workflow_run_status(
+        workflow_run = await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.failed,
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
         )
+        self._schedule_credential_fallback_retry(workflow_run)
+        return workflow_run
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
         # Conditional UPDATE refuses to resurrect a finalized wr — prevents the
@@ -6382,13 +6480,15 @@ class WorkflowService:
             failure_category_source=failure_category_source,
         )
 
-        return await self._update_workflow_run_status(
+        workflow_run = await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.terminated,
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
         )
+        self._schedule_credential_fallback_retry(workflow_run)
+        return workflow_run
 
     async def mark_workflow_run_as_canceled(self, workflow_run_id: str) -> WorkflowRun:
         """Cancel a workflow run, rejecting the transition if the run has already
@@ -6998,6 +7098,7 @@ class WorkflowService:
             output_parameter_tuples,
             (recording_urls, recording_archived),
             (downloaded_files, downloaded_file_urls),
+            retried_by_workflow_run_id,
         ) = await asyncio.gather(
             self.get_recent_workflow_screenshot_urls(
                 workflow_run_id=workflow_run_id,
@@ -7009,6 +7110,10 @@ class WorkflowService:
             ),
             self._fetch_recording_urls(workflow_run, task_v2, organization_id),
             self._fetch_downloaded_files(workflow_run, task_v2),
+            app.DATABASE.workflow_runs.get_workflow_run_retried_by(
+                workflow_run_id=workflow_run_id,
+                organization_id=workflow_run.organization_id,
+            ),
         )
         screenshot_urls: list[str] | None = screenshot_urls_raw or None
         # Preserve legacy singular contract: last element is the newest.
@@ -7069,6 +7174,8 @@ class WorkflowService:
             status=workflow_run.status,
             failure_reason=workflow_run.failure_reason,
             failure_category=workflow_run.failure_category,
+            retried_from_workflow_run_id=workflow_run.retried_from_workflow_run_id,
+            retried_by_workflow_run_id=retried_by_workflow_run_id,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
             webhook_failure_reason=workflow_run.webhook_failure_reason,

@@ -617,6 +617,8 @@ class CredentialParameterYAML(ParameterYAML):
     credential_id: str
     credential_ids: list[str] | None = None
     selection_strategy: str | None = None
+    fallback_credential_ids: list[str] | None = None
+    fallback_trigger: str | None = None
 
 
 class BitwardenSensitiveInformationParameterYAML(ParameterYAML):

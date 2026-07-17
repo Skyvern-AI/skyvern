@@ -3582,30 +3582,6 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
 
 
-def _workflow_request_body_from_existing_run(
-    workflow_run: WorkflowRun,
-    parameters: dict[str, Any] | None = None,
-    run_metadata: dict[str, str] | None = None,
-) -> WorkflowRequestBody:
-    return WorkflowRequestBody(
-        data=parameters,
-        proxy_location=workflow_run.proxy_location,
-        webhook_callback_url=workflow_run.webhook_callback_url,
-        totp_verification_url=workflow_run.totp_verification_url,
-        totp_identifier=workflow_run.totp_identifier,
-        browser_session_id=workflow_run.browser_session_id,
-        browser_profile_id=workflow_run.browser_profile_id,
-        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_run, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_run.extra_http_headers,
-        cdp_connect_headers=workflow_run.cdp_connect_headers,
-        browser_address=workflow_run.browser_address,
-        run_with=workflow_run.run_with,
-        ai_fallback=workflow_run.ai_fallback,
-        run_metadata=run_metadata,
-    )
-
-
 def _workflow_run_request_from_workflow_request(
     *,
     workflow_id: str,
@@ -3736,7 +3712,7 @@ async def retry_workflow_run(
             organization_id=current_org.organization_id,
             exc_info=True,
         )
-    legacy_workflow_request = _workflow_request_body_from_existing_run(
+    legacy_workflow_request = workflow_service.workflow_request_body_from_existing_run(
         workflow_run=original_workflow_run,
         parameters=original_workflow_run_parameters,
         run_metadata=original_run_metadata,
