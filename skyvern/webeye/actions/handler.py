@@ -52,6 +52,7 @@ from skyvern.exceptions import (
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
+    MaskedInputReadbackMismatch,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -171,6 +172,7 @@ UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the uplo
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 VERIFY_EMERGING_SELECT_PICK_FLAG = "VERIFY_EMERGING_SELECT_PICK"
+FIX_MASKED_INPUT_READBACK_FLAG = "FIX_MASKED_INPUT_READBACK"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
@@ -1205,6 +1207,10 @@ async def _is_verify_emerging_select_pick_enabled(task: Task) -> bool:
     return await _is_org_flag_enabled(task, VERIFY_EMERGING_SELECT_PICK_FLAG, "verify-emerging-select-pick")
 
 
+async def _is_masked_input_readback_fix_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, FIX_MASKED_INPUT_READBACK_FLAG, "masked-input-readback")
+
+
 async def _resolve_collapse_xp_assignment(
     experimentation_provider: BaseExperimentationProvider,
     task: Task,
@@ -1531,6 +1537,66 @@ async def _fill_card_number_with_readback(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
         )
+    )
+
+
+# Character an input-mask library leaves in unfilled slots (jQuery Inputmask, Cleave, and component-library
+# masked inputs generally).
+_MASK_PLACEHOLDER_CHAR = "_"
+
+
+def _alnum(value: str | None) -> str:
+    return "".join(ch for ch in (value or "") if ch.isalnum())
+
+
+def _has_input_mask_evidence(*, pattern: str | None, placeholder: str | None) -> bool:
+    # Only treat a field as masked when it advertises a constraint: an HTML `pattern`, or a placeholder
+    # rendered from mask slots (e.g. "_____", "___-__-____"). Keeps unrelated inputs untouched.
+    if pattern:
+        return True
+    return placeholder is not None and _MASK_PLACEHOLDER_CHAR in placeholder
+
+
+def _committed_value_is_masked_incomplete(expected_value: str, committed_value: str | None) -> bool:
+    # The mask accepted keystrokes but did not commit them: reads back empty (only separators), or still
+    # shows unfilled placeholder slots while holding fewer characters than were typed. Compares character
+    # counts only — never the raw value, which may be a secret. A placeholder char inside an otherwise
+    # complete value (e.g. "foo_bar") is not treated as incomplete.
+    expected_alnum = _alnum(expected_value)
+    if not expected_alnum:
+        return False
+    committed_alnum = _alnum(committed_value)
+    if not committed_alnum:
+        return True
+    return (
+        committed_value is not None
+        and _MASK_PLACEHOLDER_CHAR in committed_value
+        and len(committed_alnum) < len(expected_alnum)
+    )
+
+
+async def _verify_masked_input_after_fill(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    tag_name: str,
+    expected_value: str,
+    known_masked: bool,
+) -> None:
+    committed_value = await get_input_value(tag_name, skyvern_element.get_locator())
+    triggered = known_masked or (committed_value is not None and _MASK_PLACEHOLDER_CHAR in committed_value)
+    if not triggered or not _committed_value_is_masked_incomplete(expected_value, committed_value):
+        return
+
+    # A masked value can land a beat after the keystrokes settle; let the field commit before verdict.
+    await skyvern_frame.safe_wait_for_animation_end(caller="input_text.masked_readback")
+    committed_value = await get_input_value(tag_name, skyvern_element.get_locator())
+    if not _committed_value_is_masked_incomplete(expected_value, committed_value):
+        return
+
+    raise MaskedInputReadbackMismatch(
+        expected_char_count=len(_alnum(expected_value)),
+        committed_char_count=len(_alnum(committed_value)),
     )
 
 
@@ -3686,6 +3752,17 @@ async def handle_input_text_action(
         if is_card_number_input:
             card_expected_digits = candidate_card_digits
 
+        # Masked inputs (postal code, SSN) can report a successful fill while the mask committed nothing.
+        # Read the value back for masked fields and, on an empty/placeholder commit, retype once.
+        verify_masked_input_after_fill = False
+        mask_attr_evidence = False
+        if not is_tel and await _is_masked_input_readback_fix_enabled(task):
+            mask_attr_evidence = _has_input_mask_evidence(
+                pattern=await skyvern_element.get_attr("pattern"),
+                placeholder=await skyvern_element.get_attr("placeholder"),
+            )
+            verify_masked_input_after_fill = True
+
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
 
         try:
@@ -3713,6 +3790,41 @@ async def handle_input_text_action(
                         actual_digit_count=phone_mismatch.actual_digit_count,
                     )
                     return [ActionFailure(phone_mismatch)]
+            elif verify_masked_input_after_fill:
+                await skyvern_element.input_sequentially(text=text)
+                # Read the committed value back; on an empty/placeholder commit, refocus, clear and retype
+                # once. A second failure fails the action with a diagnostic rather than a silent empty fill.
+                try:
+                    await _verify_masked_input_after_fill(
+                        skyvern_element=skyvern_element,
+                        skyvern_frame=skyvern_frame,
+                        tag_name=tag_name,
+                        expected_value=text,
+                        known_masked=mask_attr_evidence,
+                    )
+                except MaskedInputReadbackMismatch:
+                    await skyvern_element.get_locator().focus(timeout=timeout)
+                    await skyvern_element.input_clear()
+                    await skyvern_element.input_sequentially(text=text)
+                    try:
+                        # Attempt 1 only raises once the field is proven masked, so the retry keeps that
+                        # verdict: a mask that swallows the retype reads back clean of placeholder chars.
+                        await _verify_masked_input_after_fill(
+                            skyvern_element=skyvern_element,
+                            skyvern_frame=skyvern_frame,
+                            tag_name=tag_name,
+                            expected_value=text,
+                            known_masked=True,
+                        )
+                    except MaskedInputReadbackMismatch as mismatch:
+                        LOG.warning(
+                            "Masked input read-back mismatch after retry",
+                            action=action,
+                            element_id=skyvern_element.get_id(),
+                            expected_char_count=mismatch.expected_char_count,
+                            committed_char_count=mismatch.committed_char_count,
+                        )
+                        return [ActionFailure(mismatch)]
             else:
                 await skyvern_element.input_sequentially(text=text)
                 if log_tel_fallback_readback:
