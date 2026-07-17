@@ -173,6 +173,7 @@ UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the uplo
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 VERIFY_EMERGING_SELECT_PICK_FLAG = "VERIFY_EMERGING_SELECT_PICK"
 FIX_MASKED_INPUT_READBACK_FLAG = "FIX_MASKED_INPUT_READBACK"
+SURFACE_BLOCKED_FORM_ADVANCE_FLAG = "SURFACE_BLOCKED_FORM_ADVANCE"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
@@ -1209,6 +1210,10 @@ async def _is_verify_emerging_select_pick_enabled(task: Task) -> bool:
 
 async def _is_masked_input_readback_fix_enabled(task: Task) -> bool:
     return await _is_org_flag_enabled(task, FIX_MASKED_INPUT_READBACK_FLAG, "masked-input-readback")
+
+
+async def _is_surface_blocked_form_advance_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, SURFACE_BLOCKED_FORM_ADVANCE_FLAG, "surface-blocked-form-advance")
 
 
 async def _resolve_collapse_xp_assignment(
@@ -2670,6 +2675,91 @@ async def _retarget_disabled_element_for_click(
     return child_element
 
 
+_SUBMIT_LIKE_TEXT = re.compile(
+    r"\b(next|submit|continue|proceed|confirm|finish|save|apply|update|complete|register|sign\s?up|log\s?in)\b",
+    re.IGNORECASE,
+)
+
+_BLOCKED_FORM_ADVANCE_MESSAGE = (
+    "Clicked '{label}' but the page did not advance and no new elements appeared. The form is likely "
+    "blocked by a validation error — inspect the visible fields for invalid or required inputs and any "
+    "error messages, resolve them, and only then click to advance again instead of repeating this click."
+)
+
+
+def _submit_like_label(element_dict: dict) -> str:
+    attributes = element_dict.get("attributes") or {}
+    for candidate in (
+        element_dict.get("text"),
+        attributes.get("value"),
+        attributes.get("aria-label"),
+        attributes.get("title"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return "the button"
+
+
+def _click_is_submit_like(element_dict: dict) -> bool:
+    attributes = element_dict.get("attributes") or {}
+    tag = str(element_dict.get("tagName") or "").lower()
+    input_type = str(attributes.get("type") or "").lower()
+    if tag == "input" and input_type in {"submit", "image"}:
+        return True
+    role = str(attributes.get("role") or attributes.get("aria-role") or "").lower()
+    # A bare <a> is a navigation link (a real one changes the URL and is excluded by the
+    # caller's URL-change check); only an <a role="button"> counts as a submit control.
+    is_button_like = tag == "button" or role == "button" or (tag == "input" and input_type == "button")
+    if not is_button_like:
+        return False
+    label = " ".join(
+        str(part)
+        for part in (
+            element_dict.get("text"),
+            attributes.get("value"),
+            attributes.get("aria-label"),
+            attributes.get("title"),
+        )
+        if part
+    )
+    return bool(_SUBMIT_LIKE_TEXT.search(label))
+
+
+async def _maybe_flag_blocked_form_advance(
+    *,
+    results: list[ActionResult],
+    skyvern_element: SkyvernElement,
+    page: Page,
+    original_url: str,
+    incremental_scraped: IncrementalScrapePage,
+    task: Task,
+) -> None:
+    """Surface a diagnostic when a submit-like click neither navigated nor revealed new elements.
+
+    The signal flows to the next step's planner through ActionResult.followup_message (see
+    get_action_history), directing the agent to resolve the blocking validation instead of
+    re-clicking a button that is not advancing the form.
+    """
+    if not results or not isinstance(results[-1], ActionSuccess):
+        return
+    element_dict = skyvern_element.get_element_dict()
+    if not _click_is_submit_like(element_dict):
+        return
+    if page.url != original_url:
+        return
+    if not await _is_surface_blocked_form_advance_enabled(task):
+        return
+    if await incremental_scraped.get_incremental_elements_num() > 0:
+        return
+    results[-1].needs_followup = True
+    results[-1].followup_message = _BLOCKED_FORM_ADVANCE_MESSAGE.format(label=_submit_like_label(element_dict))
+    LOG.info(
+        "Surfacing blocked-form-advance diagnostic after a non-advancing submit-like click",
+        element_id=skyvern_element.get_id(),
+    )
+
+
 @traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
@@ -2827,6 +2917,17 @@ async def handle_click_action(
                 ):
                     results.append(sequential_click_result)
                     return results
+
+                # No navigation and no dropdown surfaced: flag a non-advancing submit-like click so the
+                # next step's planner resolves the blocking validation instead of re-clicking.
+                await _maybe_flag_blocked_form_advance(
+                    results=results,
+                    skyvern_element=skyvern_element,
+                    page=page,
+                    original_url=original_url,
+                    incremental_scraped=incremental_scraped,
+                    task=task,
+                )
 
             except Exception:
                 LOG.warning(
