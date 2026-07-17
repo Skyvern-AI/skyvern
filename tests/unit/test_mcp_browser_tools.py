@@ -1541,6 +1541,10 @@ async def test_do_select_option_uses_writable_target_action(
         {"text": "", "value": "", "dataValues": [], "expanded": "true", "optionSelected": False},
         {"text": "West", "value": "west", "dataValues": [], "expanded": "false", "optionSelected": False},
     ]
+    # do_select_option's deadline is real wall clock (started_at + timeout/1000), so a
+    # loaded runner can blow the 100ms budget before the commit is observed. Freeze the
+    # clock: this asserts the success path, not the deadline.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#state", "west", timeout=100) == "West"
     assert control.fill.await_count == int(editable)
@@ -1705,6 +1709,10 @@ async def test_do_select_option_accepts_editable_container_channel_transition(
             "containerChannels": [{"key": "#city-value:value", "value": committed_value}],
         },
     ]
+    # do_select_option's deadline is real wall clock (started_at + timeout/1000), so a
+    # loaded runner can blow the 100ms budget before the commit is observed. Freeze the
+    # clock: this asserts the success path, not the deadline.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#city", "Lakewood", by_label=True, timeout=100) == "Lakewood"
 
