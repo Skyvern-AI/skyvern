@@ -1376,7 +1376,7 @@
           "Tags"
         ],
         "summary": "Apply run tags",
-        "description": "Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
+        "description": "Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "apply_run_tags_v1_runs__workflow_run_id__tags_post",
         "parameters": [
           {
@@ -1440,14 +1440,15 @@
             "description": "Invalid tag key or value"
           }
         },
-        "x-fern-sdk-method-name": "apply_run_tags"
+        "x-fern-sdk-method-name": "apply_run_tags",
+        "deprecated": true
       },
       "get": {
         "tags": [
           "Tags"
         ],
         "summary": "Get run tags",
-        "description": "Get the current tag state for a workflow run.",
+        "description": "Get the current tag state for a workflow run.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "get_run_tags_v1_runs__workflow_run_id__tags_get",
         "parameters": [
           {
@@ -1508,7 +1509,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_run_tags"
+        "x-fern-sdk-method-name": "get_run_tags",
+        "deprecated": true
       }
     },
     "/v1/runs/{workflow_run_id}/tags/{key}": {
@@ -1517,7 +1519,7 @@
           "Tags"
         ],
         "summary": "Delete run tag",
-        "description": "Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.",
+        "description": "Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "delete_run_tag_v1_runs__workflow_run_id__tags__key__delete",
         "parameters": [
           {
@@ -1592,7 +1594,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "delete_run_tag"
+        "x-fern-sdk-method-name": "delete_run_tag",
+        "deprecated": true
       }
     },
     "/v1/runs/{workflow_run_id}/tags/history": {
@@ -1601,7 +1604,7 @@
           "Tags"
         ],
         "summary": "Get run tag history",
-        "description": "Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.",
+        "description": "Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "get_run_tag_history_v1_runs__workflow_run_id__tags_history_get",
         "parameters": [
           {
@@ -1713,7 +1716,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_run_tag_history"
+        "x-fern-sdk-method-name": "get_run_tag_history",
+        "deprecated": true
       }
     },
     "/v1/tag-keys": {
@@ -1917,7 +1921,7 @@
           "Tags"
         ],
         "summary": "List tag values",
-        "description": "List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
+        "description": "List the palette color and current workflow usage count for each grouped tag (key, value) for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "list_tag_values_v1_tag_values_get",
         "parameters": [
           {
@@ -1983,7 +1987,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "list_tag_values"
+        "x-fern-sdk-method-name": "list_tag_values",
+        "deprecated": true
       }
     },
     "/v1/tag-values/{key}": {
@@ -1992,7 +1997,7 @@
           "Tags"
         ],
         "summary": "Update tag value color",
-        "description": "Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.",
+        "description": "Recolor a grouped tag (key, value). The value is supplied in the body so values containing '/' stay addressable. The new color must be a palette name.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "update_tag_value_v1_tag_values__key__patch",
         "parameters": [
           {
@@ -2056,14 +2061,15 @@
             "description": "Invalid palette color"
           }
         },
-        "x-fern-sdk-method-name": "update_tag_value"
+        "x-fern-sdk-method-name": "update_tag_value",
+        "deprecated": true
       },
       "delete": {
         "tags": [
           "Tags"
         ],
         "summary": "Delete tag value",
-        "description": "Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.",
+        "description": "Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it (cascade). The value rides in the body so values containing '/' stay addressable. Returns how many workflows the label was removed from.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "delete_tag_value_v1_tag_values__key__delete",
         "parameters": [
           {
@@ -2134,7 +2140,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "delete_tag_value"
+        "x-fern-sdk-method-name": "delete_tag_value",
+        "deprecated": true
       }
     },
     "/v1/tag-values/{key}/rename": {
@@ -2143,7 +2150,7 @@
           "Tags"
         ],
         "summary": "Rename tag value",
-        "description": "Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
+        "description": "Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow carrying the old label; the new label inherits the old color. Both values ride in the body so values containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "rename_tag_value_v1_tag_values__key__rename_patch",
         "parameters": [
           {
@@ -2210,7 +2217,8 @@
             "description": "Invalid value"
           }
         },
-        "x-fern-sdk-method-name": "rename_tag_value"
+        "x-fern-sdk-method-name": "rename_tag_value",
+        "deprecated": true
       }
     },
     "/v1/workflow-tags": {
@@ -4650,7 +4658,7 @@
           "Custom LLMs"
         ],
         "summary": "List Custom LLMs",
-        "description": "List the custom LLM configurations available to the current organization.",
+        "description": "List the custom LLM configurations available to the current organization.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "list_custom_llms_v1_custom_llms_get",
         "parameters": [
           {
@@ -4694,14 +4702,15 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "list_custom_llms"
+        "x-fern-sdk-method-name": "list_custom_llms",
+        "deprecated": true
       },
       "post": {
         "tags": [
           "Custom LLMs"
         ],
         "summary": "Create Custom LLM",
-        "description": "Create a custom LLM configuration for the current organization.",
+        "description": "Create a custom LLM configuration for the current organization.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "create_custom_llm_v1_custom_llms_post",
         "parameters": [
           {
@@ -4755,7 +4764,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "create_custom_llm"
+        "x-fern-sdk-method-name": "create_custom_llm",
+        "deprecated": true
       }
     },
     "/v1/custom-llms/{custom_llm_id}": {
@@ -4764,7 +4774,7 @@
           "Custom LLMs"
         ],
         "summary": "Update Custom LLM",
-        "description": "Update a custom LLM configuration for the current organization.",
+        "description": "Update a custom LLM configuration for the current organization.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "update_custom_llm_v1_custom_llms__custom_llm_id__put",
         "parameters": [
           {
@@ -4829,14 +4839,15 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "update_custom_llm"
+        "x-fern-sdk-method-name": "update_custom_llm",
+        "deprecated": true
       },
       "delete": {
         "tags": [
           "Custom LLMs"
         ],
         "summary": "Delete Custom LLM",
-        "description": "Delete a custom LLM configuration for the current organization.",
+        "description": "Delete a custom LLM configuration for the current organization.\n\n> **Deprecated:** This endpoint is not available in the current Skyvern release (v1.0.46) and may be removed in future versions.",
         "operationId": "delete_custom_llm_v1_custom_llms__custom_llm_id__delete",
         "parameters": [
           {
@@ -4891,7 +4902,8 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "delete_custom_llm"
+        "x-fern-sdk-method-name": "delete_custom_llm",
+        "deprecated": true
       }
     },
     "/v1/run/tasks/login": {
@@ -9996,7 +10008,8 @@
           "success"
         ],
         "title": "ClearOrganizationAuthTokenResponse",
-        "description": "Response model for clearing an organization auth token."
+        "description": "Response model for clearing an organization auth token. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "ClickAction": {
         "properties": {
@@ -10288,7 +10301,9 @@
           }
         },
         "type": "object",
-        "title": "CodeBlockStep"
+        "title": "CodeBlockStep",
+        "deprecated": true,
+        "description": "(Deprecated: not available in Skyvern v1.0.46.)"
       },
       "CodeBlockStepYAML": {
         "properties": {
@@ -11574,7 +11589,8 @@
         },
         "type": "object",
         "title": "CreditCardBillingAddress",
-        "description": "Optional billing address fields associated with a credit card credential."
+        "description": "Optional billing address fields associated with a credit card credential. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "CreditCardCredentialResponse": {
         "properties": {
@@ -12390,7 +12406,9 @@
           "output_parameter",
           "email_client"
         ],
-        "title": "EmailInboxBlock"
+        "title": "EmailInboxBlock",
+        "deprecated": true,
+        "description": "(Deprecated: not available in Skyvern v1.0.46.)"
       },
       "EmailInboxBlockYAML": {
         "properties": {
@@ -19079,7 +19097,9 @@
           "file_url",
           "prompt"
         ],
-        "title": "PdfFillBlock"
+        "title": "PdfFillBlock",
+        "deprecated": true,
+        "description": "(Deprecated: not available in Skyvern v1.0.46.)"
       },
       "PdfFillBlockYAML": {
         "properties": {
@@ -19762,7 +19782,9 @@
           "workflow_run_id",
           "events"
         ],
-        "title": "RunTagHistoryResponse"
+        "title": "RunTagHistoryResponse",
+        "deprecated": true,
+        "description": "(Deprecated: not available in Skyvern v1.0.46.)"
       },
       "RunTagSuggestionsResponse": {
         "properties": {
@@ -19831,7 +19853,8 @@
           "run_tags"
         ],
         "title": "RunTagsBatchResponse",
-        "description": "Response for the run-tags batch endpoint.\n\nRuns with no tags are present with an empty list so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nRuns outside the caller's org are silently absent (no leakage)."
+        "description": "Response for the run-tags batch endpoint.\n\nRuns with no tags are present with an empty list so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nRuns outside the caller's org are silently absent (no leakage). (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "RunTagsResponse": {
         "properties": {
@@ -19853,7 +19876,8 @@
           "tags"
         ],
         "title": "RunTagsResponse",
-        "description": "Current tags for a workflow run."
+        "description": "Current tags for a workflow run. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "RunType": {
         "type": "string",
@@ -19866,7 +19890,9 @@
           "ui_tars",
           "yutori_navigator"
         ],
-        "title": "RunType"
+        "title": "RunType",
+        "deprecated": true,
+        "description": "(Deprecated: not available in Skyvern v1.0.46.)"
       },
       "RunWebhookReplayResponse": {
         "properties": {
@@ -20652,7 +20678,9 @@
           "file_url",
           "prompt"
         ],
-        "title": "SplitPdfBlock"
+        "title": "SplitPdfBlock",
+        "deprecated": true,
+        "description": "(Deprecated: not available in Skyvern v1.0.46.)"
       },
       "SplitPdfBlockYAML": {
         "properties": {
@@ -21069,7 +21097,8 @@
         },
         "type": "object",
         "title": "TagApplyRequest",
-        "description": "Body for ``POST /v1/workflows/{wpid}/tags``. Either field may be empty (both\nempty is a no-op). On a same-identity collision, set wins over delete."
+        "description": "Body for ``POST /v1/workflows/{wpid}/tags``. Either field may be empty (both\nempty is a no-op). On a same-identity collision, set wins over delete. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "TagDeleteInput": {
         "properties": {
@@ -21393,7 +21422,8 @@
           "color"
         ],
         "title": "TagValue",
-        "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair."
+        "description": "Tag-value color registry entry: the palette color assigned to a grouped\n(key, value) pair. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "TagValueDelete": {
         "properties": {
@@ -21442,7 +21472,8 @@
           "removed_from_workflow_count"
         ],
         "title": "TagValueDeleteResponse",
-        "description": "Response for ``DELETE /v1/tag-values/{key}``."
+        "description": "Response for ``DELETE /v1/tag-values/{key}``. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "TagValueRename": {
         "properties": {
@@ -21492,7 +21523,8 @@
           "renamed_workflow_count"
         ],
         "title": "TagValueRenameResponse",
-        "description": "Response for ``PATCH /v1/tag-values/{key}/rename``: the renamed label with its\ncarried-over color and the number of workflows re-tagged."
+        "description": "Response for ``PATCH /v1/tag-values/{key}/rename``: the renamed label with its\ncarried-over color and the number of workflows re-tagged. (Deprecated: not available in Skyvern v1.0.46.)",
+        "deprecated": true
       },
       "TagValueUpdate": {
         "properties": {
