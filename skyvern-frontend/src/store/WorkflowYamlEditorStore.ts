@@ -67,6 +67,17 @@ export function isWorkflowYamlDirty(state: {
   return state.draft !== state.entrySnapshot;
 }
 
+// Fire `onChange` when the editable YAML draft changes while the Code editor is
+// active. A draft edit doesn't touch the canvas, so canvas-derived effects miss
+// it; subscribing to the draft lets them re-sync. Returns an unsubscribe.
+export function subscribeToYamlDraftChanges(onChange: () => void): () => void {
+  return useWorkflowYamlEditorStore.subscribe((state, prev) => {
+    if (state.active && state.draft !== prev.draft) {
+      onChange();
+    }
+  });
+}
+
 // Shared entry point for the commit-on-switch flow used by the overlay's Visual
 // toggle, the top-bar save, and the nav-blocker "Save changes" dialog. Guards
 // against a re-entrant commit and toggles the committing flag around it.
