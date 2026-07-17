@@ -28,7 +28,9 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_SCOUT_VERIFY_REPLY,
+    OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
+    blocker_signal_is_genuinely_terminal,
     build_definition_contract_unsatisfied_blocker_signal,
     build_output_source_unobservable_blocker_signal,
     clear_terminal_evidence_on_workflow_edit,
@@ -176,6 +178,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     SYNTHESIZED_PARAMETER_BINDING_AMBIGUOUS_GATE_ID,
     AgentContext,
     AuthorTimeGateAblationPayload,
+    RejectedCodeArtifactMetadataCapture,
     ScoutedFieldParameterBinding,
     ScoutedInteraction,
     ScoutedSubmitRungBinding,
@@ -2549,9 +2552,22 @@ _SEPARATED_SPINE_SHAPE_REQUIRED_REASON_CODE = "separated_spine_shape_required"
 _SEPARATED_BROWSER_SPINE_PLUS_EXTRACTION_STRUCTURE = "separated_browser_spine_plus_extraction"
 _OUTPUT_CONTRACT_REJECT_REASON_CODE = "output_contract_required"
 _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE = "value_bearing_output_required"
-_OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE = "output_contract_reject_budget_exhausted"
+_OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH = "output"
+_OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE = OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
 _MAX_OUTPUT_CONTRACT_REJECTS = 4
 _MAX_OUTPUT_CONTRACT_DEFERRALS = 3
+_MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY = "missing_code_artifact_metadata"
+_METADATA_NORMALIZATION_REJECT_FAMILY = "metadata_normalization"
+# Families sharing the reject-budget ladder: a candidate rotating its structural fingerprint within the
+# family must not reset its streak, though an imposition landing still does (definition is already terminal).
+_METADATA_FAMILY_REJECT_FAMILIES = frozenset(
+    {
+        _OUTPUT_CONTRACT_REJECT_REASON_CODE,
+        _OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+        _MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY,
+        _METADATA_NORMALIZATION_REJECT_FAMILY,
+    }
+)
 _MAX_OUTPUT_CONTRACT_ACTUATIONS_WITHOUT_RUN = 3
 _OUTPUT_CONTRACT_ABLATION_GATE_ID = "output_contract_actuation"
 _METADATA_PREFLIGHT_ABLATION_GATE_ID = "metadata_run_preflight_reject"
@@ -3751,12 +3767,17 @@ def _record_output_contract_reject(
     authored_structural_fingerprint: str = "",
     workflow_yaml: str = "",
 ) -> dict[str, Any]:
+    # A candidate so incomplete that no required child paths are derivable must still consume the
+    # reject budget: an empty set would silently skip counting and degrade the turn to the generic
+    # churn stop (loop_detected) instead of this ladder's typed terminal.
+    counted_paths = evaluation.required_paths or {_OUTPUT_CONTRACT_UNDECLARED_SENTINEL_PATH}
     count = _record_output_contract_family_reject(
         ctx,
-        evaluation.required_paths,
+        counted_paths,
         reject_family=str(evaluation.payload.get("reason_code") or _OUTPUT_CONTRACT_REJECT_REASON_CODE),
         authored_structural_fingerprint=authored_structural_fingerprint,
     )
+    _capture_rejected_code_artifact_metadata(ctx)
     payload = dict(evaluation.payload)
     payload["output_contract_reject_count"] = count
     payload["output_contract_reject_budget"] = _MAX_OUTPUT_CONTRACT_REJECTS
@@ -3778,30 +3799,9 @@ def _record_output_contract_reject(
                 # The typed adjudication now owns this same deficiency. Keep the historical reject for
                 # ceiling/liveness evidence, but do not render it again as a fresh rejection next turn.
                 record_build_test_outcome(ctx, None)
-    if count >= _MAX_OUTPUT_CONTRACT_REJECTS:
-        if run_backed_repair_evidence_exists(ctx):
-            payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-            payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-        else:
-            deferral_count = _record_output_contract_deferral(ctx, evaluation.required_paths)
-            if deferral_count >= _MAX_OUTPUT_CONTRACT_DEFERRALS:
-                payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-                payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
-                LOG.info(
-                    "copilot_output_contract_budget_deferral_cap_reached",
-                    block_label=evaluation.block_label,
-                    canonical_output_contract_signature=evaluation.canonical_signature,
-                    output_contract_reject_count=count,
-                    output_contract_deferral_count=deferral_count,
-                )
-            else:
-                LOG.info(
-                    "copilot_output_contract_budget_rewrite_deferred_no_run",
-                    block_label=evaluation.block_label,
-                    canonical_output_contract_signature=evaluation.canonical_signature,
-                    output_contract_reject_count=count,
-                    output_contract_deferral_count=deferral_count,
-                )
+    if _adjudicate_output_contract_budget(ctx, counted_paths, count=count, block_label=evaluation.block_label):
+        payload["reason_code"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
+        payload["reject_reason"] = _OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE
     if actuation is None or actuation.kind == OutputContractActuationKind.STRUCTURE_DIRECTIVE:
         structural_payload = _output_contract_author_time_structural_payload(
             ctx,
@@ -3818,7 +3818,8 @@ def _record_output_contract_reject(
             if isinstance(payload.get("missing_requested_output_facts"), list)
             else None,
         )
-        _record_code_authoring_guardrail_reject(ctx)
+        if count < 1:
+            _record_code_authoring_guardrail_reject(ctx)
     return payload
 
 
@@ -3846,7 +3847,9 @@ def _record_output_contract_family_reject(
     if authored_structural_fingerprint:
         prior_fingerprint = ctx.output_contract_last_reject_fingerprint_by_signature.get(signature)
         imposed_since = ctx.output_contract_imposed_since_last_reject_by_signature.get(signature, False)
-        if imposed_since or (prior_fingerprint is not None and prior_fingerprint != authored_structural_fingerprint):
+        fingerprint_rotated = prior_fingerprint is not None and prior_fingerprint != authored_structural_fingerprint
+        rotation_resets = fingerprint_rotated and reject_family not in _METADATA_FAMILY_REJECT_FAMILIES
+        if imposed_since or rotation_resets:
             count_by_signature[signature] = 0
             ctx.output_contract_imposed_since_last_reject_by_signature[signature] = False
             LOG.info(
@@ -3880,6 +3883,80 @@ def _record_output_contract_deferral(ctx: AgentContext, required_paths: set[str]
     count = int(ctx.output_contract_deferral_count_by_signature.get(signature, 0) or 0) + 1
     ctx.output_contract_deferral_count_by_signature[signature] = count
     return count
+
+
+def _adjudicate_output_contract_budget(
+    ctx: AgentContext,
+    required_paths: set[str],
+    *,
+    count: int,
+    block_label: str,
+) -> bool:
+    if count < _MAX_OUTPUT_CONTRACT_REJECTS:
+        return False
+    signature = _output_contract_signature(ctx=ctx, required_paths=required_paths)
+    if not run_backed_repair_evidence_exists(ctx):
+        deferral_count = _record_output_contract_deferral(ctx, required_paths)
+        if deferral_count < _MAX_OUTPUT_CONTRACT_DEFERRALS:
+            LOG.info(
+                "copilot_output_contract_budget_rewrite_deferred_no_run",
+                block_label=block_label,
+                canonical_output_contract_signature=signature,
+                output_contract_reject_count=count,
+                output_contract_deferral_count=deferral_count,
+            )
+            return False
+        LOG.info(
+            "copilot_output_contract_budget_deferral_cap_reached",
+            block_label=block_label,
+            canonical_output_contract_signature=signature,
+            output_contract_reject_count=count,
+            output_contract_deferral_count=deferral_count,
+        )
+    _stash_output_contract_reject_budget_terminal(
+        ctx, required_paths=required_paths, block_label=block_label, signature=signature
+    )
+    return True
+
+
+def _stash_output_contract_reject_budget_terminal(
+    ctx: AgentContext,
+    *,
+    required_paths: set[str],
+    block_label: str,
+    signature: str,
+) -> None:
+    if ctx.turn_halt is not None or blocker_signal_is_genuinely_terminal(ctx.blocker_signal):
+        return
+    signal = build_output_source_unobservable_blocker_signal(
+        reason_code=_OUTPUT_CONTRACT_REJECT_BUDGET_REASON_CODE,
+        required_paths=required_paths,
+        block_label=block_label,
+    )
+    stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="workflow_update")
+    LOG.info(
+        "copilot_output_contract_reject_budget_terminal",
+        block_label=block_label,
+        canonical_output_contract_signature=signature,
+        canonical_required_child_paths=sorted(required_paths),
+    )
+
+
+def _capture_rejected_code_artifact_metadata(ctx: AgentContext) -> None:
+    snapshot = ctx.submitted_code_artifact_metadata_snapshot
+    if snapshot is None:
+        return
+    captures = ctx.rejected_code_artifact_metadata_captures
+    captures.append(RejectedCodeArtifactMetadataCapture(payload=snapshot))
+    del captures[:-5]
+    LOG.info(
+        "copilot_rejected_code_artifact_metadata_captured",
+        capture_count=len(captures),
+        submitted_metadata_labels=sorted(snapshot) if isinstance(snapshot, dict) else None,
+        submitted_metadata_type=type(snapshot).__name__,
+        rejected_code_artifact_metadata_payload=snapshot,
+    )
 
 
 def _output_contract_reject_result(
@@ -5405,6 +5482,8 @@ def _metadata_contract_run_preflight_reject(
     *,
     enforce_untagged_declared_inputs: bool = False,
 ) -> dict[str, Any] | None:
+    if isinstance(ctx, AgentContext):
+        ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(raw_code_artifact_metadata)
     definition_reject = (
         _definition_plane_preflight_reject(
             ctx,
@@ -11216,6 +11295,7 @@ async def _update_workflow(
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
+    ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(params.get("code_artifact_metadata"))
     # Imposition reconciles synthesized aliases/parameters before the persisted YAML contract is checked.
     _enrich_scout_trajectory_input_correspondences(workflow_yaml, ctx)
     runtime_parameters = params.get("parameters")
@@ -11551,10 +11631,10 @@ async def _update_workflow(
             source=output_path_coverage_source,
             reason_code=output_path_coverage_reason_code,
         )
-        _record_output_contract_family_reject(
+        missing_metadata_reject_count = _record_output_contract_family_reject(
             ctx,
             required_child_output_paths,
-            reject_family="missing_code_artifact_metadata",
+            reject_family=_MISSING_CODE_ARTIFACT_METADATA_REJECT_FAMILY,
         )
         _record_author_time_reject_outcome(
             ctx,
@@ -11575,6 +11655,7 @@ async def _update_workflow(
             block_labels=missing_labels,
             missing_requested_output_facts=missing_metadata_output_facts,
         )
+        _capture_rejected_code_artifact_metadata(ctx)
         credential_scout_errors = (
             []
             if _request_policy_allows_untested_code_block_draft(ctx)
@@ -11584,7 +11665,16 @@ async def _update_workflow(
                 block_labels=params.get("block_labels"),
             )
         )
-        _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=bool(credential_scout_errors))
+        budget_terminal = _adjudicate_output_contract_budget(
+            ctx,
+            required_child_output_paths,
+            count=missing_metadata_reject_count,
+            block_label=missing_labels[0] if len(missing_labels) == 1 else "",
+        )
+        if credential_scout_errors:
+            _record_code_authoring_guardrail_reject(ctx, defer_churn_stop=True)
+        elif missing_metadata_reject_count < 1 and not budget_terminal:
+            _record_code_authoring_guardrail_reject(ctx)
         return reject(
             error=missing_metadata_error,
             user_facing_summary=_compiled_authoring_user_summary(),
@@ -11613,10 +11703,10 @@ async def _update_workflow(
     code_artifact_metadata_error = normalization.error
     if code_artifact_metadata_error is not None:
         record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
-        _record_output_contract_family_reject(
+        normalization_reject_count = _record_output_contract_family_reject(
             ctx,
             required_child_output_paths,
-            reject_family="metadata_normalization",
+            reject_family=_METADATA_NORMALIZATION_REJECT_FAMILY,
         )
         _record_author_time_reject_outcome(
             ctx,
@@ -11634,6 +11724,13 @@ async def _update_workflow(
                 violation_categories=_metadata_violation_categories(normalization.violations),
             ),
             block_labels=normalization.offending_labels,
+        )
+        _capture_rejected_code_artifact_metadata(ctx)
+        _adjudicate_output_contract_budget(
+            ctx,
+            required_child_output_paths,
+            count=normalization_reject_count,
+            block_label=normalization.offending_labels[0] if len(normalization.offending_labels) == 1 else "",
         )
     if normalization.schema_incompatibilities:
         incompatibility = merge_schema_incompatibilities(normalization.schema_incompatibilities)

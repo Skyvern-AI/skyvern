@@ -17,8 +17,10 @@ from structlog.testing import capture_logs
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import enforcement
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
+    blocker_signal_is_genuinely_terminal,
     build_output_source_unobservable_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
 )
 from skyvern.forge.sdk.copilot.result_evidence import loaded_result_composition_evidence_from_page
 from skyvern.forge.sdk.copilot.runtime import (
+    RejectedCodeArtifactMetadataCapture,
     output_contract_ladder_unresolved,
     record_author_time_gate_ablation_event,
 )
@@ -553,6 +556,8 @@ def _advisory_ctx() -> SimpleNamespace:
         output_contract_run_output_observed_by_signature={},
         output_contract_run_bound_required_path_by_signature={},
         output_contract_bail_actuated_this_call=False,
+        submitted_code_artifact_metadata_snapshot=None,
+        rejected_code_artifact_metadata_captures=[],
         author_time_gate_log_only_ids=frozenset(),
         author_time_gate_ablation_events=[],
         latest_recorded_build_test_outcome=None,
@@ -2205,3 +2210,280 @@ def test_observation_production_is_not_click_only_spine() -> None:
     code = 'await page.click("#submit")\nreturn {"output": {"record_id": "x"}}'
 
     assert wu._output_contract_click_only_spine(code, {"output.blocker"}) is False
+
+
+_METADATA_REQUIRED = {"output.confirmation_number"}
+
+
+def test_metadata_family_reject_holds_streak_across_fingerprint_rotation() -> None:
+    ctx = _counter_ctx()
+    for family in ("missing_code_artifact_metadata", "metadata_normalization", "output_contract_required"):
+        sub = _counter_ctx()
+        counts = [
+            wu._record_output_contract_family_reject(
+                sub, _METADATA_REQUIRED, reject_family=family, authored_structural_fingerprint=f"fp_{i}"
+            )
+            for i in range(4)
+        ]
+        assert counts == [1, 2, 3, 4], family
+    imposed = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="missing_code_artifact_metadata", authored_structural_fingerprint="fp_0"
+    )
+    signature = next(iter(ctx.output_contract_reject_count_by_signature))
+    ctx.output_contract_imposed_since_last_reject_by_signature[signature] = True
+    after_imposition = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="missing_code_artifact_metadata", authored_structural_fingerprint="fp_1"
+    )
+    assert (imposed, after_imposition) == (1, 1)
+
+
+def test_out_of_family_reject_resets_on_fingerprint_rotation() -> None:
+    ctx = _counter_ctx()
+    first = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="definition_contract_unsatisfied", authored_structural_fingerprint="fp_a"
+    )
+    rotated = wu._record_output_contract_family_reject(
+        ctx, _METADATA_REQUIRED, reject_family="definition_contract_unsatisfied", authored_structural_fingerprint="fp_b"
+    )
+    assert (first, rotated) == (1, 1)
+
+
+def test_reject_budget_exhausted_reason_code_is_genuinely_terminal() -> None:
+    signal = build_output_source_unobservable_blocker_signal(
+        reason_code=OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE,
+        required_paths=_METADATA_REQUIRED,
+        block_label="collect",
+    )
+    assert blocker_signal_is_genuinely_terminal(signal) is True
+
+
+def test_metadata_family_budget_reaches_typed_terminal_at_bound_without_churn() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_bound")
+    terminal_at = None
+    for candidate in range(1, 7):
+        count = wu._record_output_contract_family_reject(
+            ctx, _METADATA_REQUIRED, reject_family="missing_code_artifact_metadata"
+        )
+        assert count == candidate
+        exhausted = wu._adjudicate_output_contract_budget(ctx, _METADATA_REQUIRED, count=count, block_label="collect")
+        if exhausted and terminal_at is None:
+            terminal_at = candidate
+    assert terminal_at == 6
+    assert ctx.turn_halt is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
+    assert blocker_signal_is_genuinely_terminal(ctx.blocker_signal) is True
+    assert ctx.code_authoring_guardrail_reject_count == 0
+
+
+def test_budget_terminal_names_paths_and_omits_generic_churn_string() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_copy")
+    wu._stash_output_contract_reject_budget_terminal(
+        ctx, required_paths=_METADATA_REQUIRED, block_label="collect", signature="sig_copy"
+    )
+    assert ctx.blocker_signal is not None
+    user_facing = ctx.blocker_signal.user_facing_reason
+    assert_clean_user_facing_text(user_facing)
+    assert "output.confirmation_number" in user_facing
+    assert "safety checks rejected each version" not in user_facing
+    assert ctx.blocker_signal.renders_final_reply is True
+
+
+def test_main_gate_defers_churn_to_budget_ladder_when_reject_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_defer")
+    calls: list[object] = []
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: calls.append(_ctx))
+    count = wu._record_output_contract_reject(
+        ctx,
+        _make_evaluation("", block_label="collect"),
+        summary="Typed deficiency.",
+        authored_structural_fingerprint="fp_defer",
+        workflow_yaml=_PAGE_READ_YAML,
+    )
+    assert count["output_contract_reject_count"] >= 1
+    assert calls == []
+
+
+def test_undeclared_contract_rejects_count_toward_budget_and_reach_typed_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A candidate deriving NO required child paths must still consume the reject budget: skipping
+    # the count degrades repeated preflight rejects to the generic churn stop (loop_detected).
+    ctx = make_copilot_ctx(turn_id="turn_budget_undeclared")
+    calls: list[object] = []
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: calls.append(_ctx))
+    malformed = {"collect": {"goal_value_paths": [], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = malformed
+
+    def undeclared_evaluation() -> wu._OutputContractEvaluation:
+        return wu._OutputContractEvaluation(
+            block_label="collect",
+            artifact_id="",
+            required_paths=set(),
+            observation_paths=set(),
+            declaration_paths=set(),
+            source="requested_output",
+            reason_code="output_contract_required",
+            missing_metadata_paths=[],
+            missing_schema_paths=[],
+            missing_return_paths=[],
+            shape_violations=[],
+            canonical_signature="",
+            payload={},
+            repair_context=None,
+        )
+
+    terminal_at = None
+    for candidate in range(1, 8):
+        payload = wu._record_output_contract_reject(
+            ctx,
+            undeclared_evaluation(),
+            summary="Undeclared contract deficiency.",
+            authored_structural_fingerprint=f"fp_{candidate}",
+            workflow_yaml="",
+        )
+        assert payload["output_contract_reject_count"] == candidate
+        if ctx.turn_halt is not None and terminal_at is None:
+            terminal_at = candidate
+            break
+    assert terminal_at is not None and terminal_at <= 7
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
+    assert calls == []
+    assert ctx.rejected_code_artifact_metadata_captures[-1] == RejectedCodeArtifactMetadataCapture(payload=malformed)
+
+
+def test_recorded_identical_reject_shape_replays_to_budget_terminal_with_per_reject_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Replays the recorded live churn shape — identical value_bearing_output_required rejects on a
+    # candidate deriving no required paths — through the real seam to budget exhaustion.
+    ctx = make_copilot_ctx(turn_id="turn_recorded_shape_replay")
+    churn_calls: list[object] = []
+    monkeypatch.setattr(wu, "_record_code_authoring_guardrail_reject", lambda _ctx: churn_calls.append(_ctx))
+    malformed = {"collect": {"goal_value_paths": [], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = malformed
+
+    def recorded_shape_evaluation() -> wu._OutputContractEvaluation:
+        return wu._OutputContractEvaluation(
+            block_label="collect",
+            artifact_id="",
+            required_paths=set(),
+            observation_paths=set(),
+            declaration_paths=set(),
+            source="requested_output",
+            reason_code=wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE,
+            missing_metadata_paths=[],
+            missing_schema_paths=[],
+            missing_return_paths=[],
+            shape_violations=[wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE],
+            canonical_signature="",
+            payload={"reason_code": wu._OUTPUT_CONTRACT_VALUE_REQUIRED_REASON_CODE},
+            repair_context=None,
+        )
+
+    terminal_at = None
+    for candidate in range(1, 8):
+        payload = wu._record_output_contract_reject(
+            ctx,
+            recorded_shape_evaluation(),
+            summary="Identical value-bearing deficiency.",
+            authored_structural_fingerprint="fp_identical",
+            workflow_yaml="",
+        )
+        assert payload["output_contract_reject_count"] == candidate
+        assert len(ctx.rejected_code_artifact_metadata_captures) == min(candidate, 5)
+        if ctx.turn_halt is not None:
+            terminal_at = candidate
+            break
+    assert terminal_at is not None and terminal_at <= 7
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == OUTPUT_CONTRACT_REJECT_BUDGET_EXHAUSTED_REASON_CODE
+    assert blocker_signal_is_genuinely_terminal(ctx.blocker_signal) is True
+    assert churn_calls == []
+
+
+def test_no_reject_leaves_no_budget_terminal() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_budget_yes")
+    assert wu._adjudicate_output_contract_budget(ctx, _METADATA_REQUIRED, count=0, block_label="collect") is False
+    assert ctx.turn_halt is None
+    assert ctx.blocker_signal is None
+
+
+def test_rejected_code_artifact_metadata_capture_is_byte_exact_and_bounded() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_capture")
+    malformed = {"collect": {"goal_value_paths": ["output.confirmation_number"], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = malformed
+    wu._capture_rejected_code_artifact_metadata(ctx)
+    assert ctx.rejected_code_artifact_metadata_captures[-1] == RejectedCodeArtifactMetadataCapture(payload=malformed)
+    for index in range(7):
+        ctx.submitted_code_artifact_metadata_snapshot = {"collect": {"variant": index}}
+        wu._capture_rejected_code_artifact_metadata(ctx)
+    captures = ctx.rejected_code_artifact_metadata_captures
+    assert len(captures) == 5
+    assert [c.payload["collect"]["variant"] for c in captures] == [2, 3, 4, 5, 6]
+
+
+def test_rejected_capture_log_carries_payload_kept_off_user_facing_text() -> None:
+    ctx = make_copilot_ctx(turn_id="turn_capture_log")
+    payload = {"collect": {"goal_value_paths": ["output.confirmation_number"], "extraction_schema": None}}
+    ctx.submitted_code_artifact_metadata_snapshot = payload
+    with capture_logs() as logs:
+        wu._capture_rejected_code_artifact_metadata(ctx)
+    entries = [line for line in logs if line.get("event") == "copilot_rejected_code_artifact_metadata_captured"]
+    assert entries
+    assert entries[0]["rejected_code_artifact_metadata_payload"] == payload
+    assert entries[0]["submitted_metadata_labels"] == ["collect"]
+
+    wu._stash_output_contract_reject_budget_terminal(
+        ctx, required_paths=_METADATA_REQUIRED, block_label="collect", signature="sig_capture"
+    )
+    assert ctx.blocker_signal is not None
+    assert "extraction_schema" not in ctx.blocker_signal.user_facing_reason
+    assert "goal_value_paths" not in ctx.blocker_signal.user_facing_reason
+
+
+def test_contract_satisfying_candidate_admits_run_no_reject() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    workflow_yaml = _declaration_waiver_yaml(
+        'record_id = await page.inner_text("#record")\nreturn {"output": {"record_id": record_id}}'
+    )
+    metadata = [
+        wu._metadata_contract_template(
+            block_label="extract_record",
+            required_paths={"output.record_id"},
+            source="requested_output_contract",
+            reason_code="requested_output_contract_missing_output_coverage",
+        )
+    ]
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, metadata, enforce_value_bearing_liveness=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is False
+    assert evaluation.missing_return_paths == []
+    assert evaluation.missing_metadata_paths == []
+
+
+def test_deficient_candidate_still_rejected_by_gate() -> None:
+    ctx = _antecedent_ctx(
+        CompletionCriterion(
+            id="c_record", outcome="The returned record includes record id.", output_path="output.record_id"
+        )
+    )
+    workflow_yaml = _declaration_waiver_yaml('record_id = await page.inner_text("#record")\nreturn record_id')
+
+    evaluation = wu._evaluate_output_contract_for_code_block(
+        ctx, workflow_yaml, [], enforce_value_bearing_liveness=True
+    )
+
+    assert evaluation is not None
+    assert evaluation.has_deficiencies is True
+    assert "output.record_id" in evaluation.missing_return_paths
+    assert "output.record_id" in evaluation.missing_metadata_paths
