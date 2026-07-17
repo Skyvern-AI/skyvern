@@ -57,6 +57,7 @@ from skyvern.exceptions import (
     MissingExtractActionsResponse,
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
+    RepeatedActionFailure,
     ScrapingFailed,
     SkyvernException,
     StepTerminationError,
@@ -168,7 +169,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_cua_actions,
     parse_ui_tars_actions,
 )
-from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
@@ -180,6 +181,103 @@ RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
+REPEATED_ACTION_FAILURE_LIMIT = 3
+REPEATED_ACTION_CIRCUIT_BREAKER_FLAG = "REPEATED_ACTION_CIRCUIT_BREAKER"
+_ACTION_REPEAT_PAYLOAD_FIELDS = (
+    "button",
+    "download",
+    "duration",
+    "file_name",
+    "file_url",
+    "hold",
+    "hold_seconds",
+    "is_checked",
+    "is_magic_link",
+    "keys",
+    "option",
+    "path",
+    "repeat",
+    "start_x",
+    "start_y",
+    "text",
+    "url",
+    "verification_code",
+    "x",
+    "y",
+)
+_PERSISTED_ACTION_REPEAT_PAYLOAD_FIELDS = tuple(
+    field for field in _ACTION_REPEAT_PAYLOAD_FIELDS if field in Action.model_fields
+)
+
+
+def _repeated_action_identity(action: Action) -> tuple[ActionType, str, str] | None:
+    if not action.action_type.is_web_action() or not action.element_id:
+        return None
+    payload = {field: getattr(action, field) for field in _PERSISTED_ACTION_REPEAT_PAYLOAD_FIELDS}
+    payload_digest = hashlib.sha256(
+        json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return action.action_type, action.element_id, payload_digest
+
+
+def _get_repeated_action_failure(
+    attempts: list[tuple[Action, list[ActionResult]]],
+) -> RepeatedActionFailure | None:
+    recent_attempts = attempts[-REPEATED_ACTION_FAILURE_LIMIT:]
+    if len(recent_attempts) < REPEATED_ACTION_FAILURE_LIMIT:
+        return None
+    identities = [_repeated_action_identity(action) for action, _ in recent_attempts]
+    if identities[0] is None or any(identity != identities[0] for identity in identities[1:]):
+        return None
+    if any(not results or any(result.success for result in results) for _, results in recent_attempts):
+        return None
+    _, element_id, _ = identities[0]
+    final_result = recent_attempts[-1][1][-1]
+    failure_description = final_result.exception_type or "UnknownFailure"
+    return RepeatedActionFailure(
+        element_id=element_id,
+        attempt_count=REPEATED_ACTION_FAILURE_LIMIT,
+        failure_description=failure_description,
+    )
+
+
+async def _is_repeated_action_breaker_enabled(task: Task) -> bool:
+    try:
+        distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+        return bool(
+            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                REPEATED_ACTION_CIRCUIT_BREAKER_FLAG,
+                distinct_id,
+                properties={"organization_id": task.organization_id},
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to evaluate repeated-action circuit breaker flag; defaulting to disabled",
+            task_id=task.task_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _get_previous_action_attempts(task: Task, current_step_id: str) -> list[tuple[Action, list[ActionResult]]]:
+    try:
+        steps = await app.DATABASE.tasks.get_task_steps(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+        )
+    except Exception:
+        LOG.warning("Failed to load action history for repeated-action detection", task_id=task.task_id, exc_info=True)
+        return []
+    if not isinstance(steps, list):
+        return []
+    attempts: list[tuple[Action, list[ActionResult]]] = []
+    for previous_step in sorted(steps, key=lambda item: (item.order, item.retry_index)):
+        if previous_step.step_id == current_step_id:
+            continue
+        if previous_step.output and previous_step.output.actions_and_results:
+            attempts.extend(previous_step.output.actions_and_results)
+    return attempts
 
 
 async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
@@ -1777,6 +1875,7 @@ class ForgeAgent:
             element_id_to_action_index[action.element_id] = action_idx
 
         element_id_to_last_action: dict[str, int] = dict()
+        previous_step_attempts: list[tuple[Action, list[ActionResult]]] | None = None
         try:
             wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
             base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
@@ -1891,6 +1990,42 @@ class ForgeAgent:
                 action,
                 results,
             )
+            if (
+                results
+                and not any(result.success for result in results)
+                and await _is_repeated_action_breaker_enabled(task)
+            ):
+                current_step_attempts = detailed_agent_step_output.actions_and_results[: action_idx + 1]
+                repeated_failure = _get_repeated_action_failure(current_step_attempts)
+                current_identity = _repeated_action_identity(action)
+                current_attempts_can_follow_history = current_identity is not None and all(
+                    _repeated_action_identity(attempt_action) == current_identity
+                    and attempt_results
+                    and not any(result.success for result in attempt_results)
+                    for attempt_action, attempt_results in current_step_attempts
+                )
+                if (
+                    repeated_failure is None
+                    and len(current_step_attempts) < REPEATED_ACTION_FAILURE_LIMIT
+                    and current_attempts_can_follow_history
+                ):
+                    if previous_step_attempts is None:
+                        previous_step_attempts = await _get_previous_action_attempts(task, step.step_id)
+                    repeated_failure = _get_repeated_action_failure(previous_step_attempts + current_step_attempts)
+                if repeated_failure is not None:
+                    final_result = results[-1]
+                    repeated_result = ActionFailure(
+                        repeated_failure,
+                        stop_execution_on_failure=final_result.stop_execution_on_failure,
+                        download_triggered=final_result.download_triggered,
+                        interacted_with_sibling=bool(final_result.interacted_with_sibling),
+                        interacted_with_parent=bool(final_result.interacted_with_parent),
+                    )
+                    repeated_result.skip_remaining_actions = final_result.skip_remaining_actions
+                    repeated_result.needs_followup = final_result.needs_followup
+                    repeated_result.followup_message = final_result.followup_message
+                    results = [repeated_result]
+                    detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
 
             # Determine wait time between actions
             wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0

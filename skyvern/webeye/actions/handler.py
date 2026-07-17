@@ -48,6 +48,7 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
+    InputTextCommitMismatch,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
@@ -177,6 +178,7 @@ FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 VERIFY_EMERGING_SELECT_PICK_FLAG = "VERIFY_EMERGING_SELECT_PICK"
 FIX_MASKED_INPUT_READBACK_FLAG = "FIX_MASKED_INPUT_READBACK"
 SURFACE_BLOCKED_FORM_ADVANCE_FLAG = "SURFACE_BLOCKED_FORM_ADVANCE"
+VERIFY_INPUT_TEXT_COMMIT_FLAG = "VERIFY_INPUT_TEXT_COMMIT"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
 COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
@@ -1423,6 +1425,10 @@ async def _is_autocomplete_commit_required_enabled(task: Task) -> bool:
     return await _is_org_flag_enabled(task, AUTOCOMPLETE_COMMIT_REQUIRED_FLAG, "autocomplete-commit-required")
 
 
+async def _is_input_text_commit_verification_enabled(task: Task) -> bool:
+    return await _is_org_flag_enabled(task, VERIFY_INPUT_TEXT_COMMIT_FLAG, "input-text-commit")
+
+
 async def _resolve_collapse_xp_assignment(
     experimentation_provider: BaseExperimentationProvider,
     task: Task,
@@ -1607,6 +1613,274 @@ async def _fill_nanp_tel_with_readback(
         else:
             return None
     return None
+
+
+_INPUT_TEXT_MASK_FORMAT_RE = re.compile(r"[\s\-_().]")
+_NON_TEXT_INPUT_TYPES = {
+    "button",
+    "checkbox",
+    "color",
+    "date",
+    "datetime-local",
+    "file",
+    "hidden",
+    "image",
+    "month",
+    "password",
+    "radio",
+    "range",
+    "reset",
+    "submit",
+    "tel",
+    "time",
+    "week",
+}
+_INPUT_COMMIT_NAVIGATION_ERRORS = (
+    "execution context was destroyed",
+    "navigation",
+    "target closed",
+)
+_INPUT_COMMIT_DETACHED_ERRORS = ("detached", "not attached")
+_MASK_NORMALIZED_INPUT_TYPES = {"search", "text", "textarea"}
+_SET_NATIVE_INPUT_VALUE_JS = """
+(element, value) => {
+    const prototype = element instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value").set;
+    setter.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    element.blur();
+}
+"""
+
+
+def _normalize_input_text_value(value: str | None) -> str:
+    return _INPUT_TEXT_MASK_FORMAT_RE.sub("", value or "")
+
+
+def input_text_values_match(expected_value: str, actual_value: str | None, *, input_type: str) -> bool:
+    """Decide whether a field committed what was typed.
+
+    A field has committed when its value derives from the typed text. That covers an exact match, a
+    reformat that only rearranges separators ("1234567890" -> "(123) 456-7890"), and an enrichment
+    that extends the typed value ("12345" -> "12345-6789"). Only three things are failures: an empty
+    field, a field still showing unfilled mask placeholders, and a genuinely different value.
+
+    Deriving is read as a prefix rather than a substring: extending what was typed is a commit, but a
+    value that merely happens to contain it is not.
+    """
+    expected_trimmed = expected_value.strip()
+    actual_trimmed = (actual_value or "").strip()
+    if not expected_trimmed:
+        return True
+    if not actual_trimmed:
+        return False
+    if expected_trimmed == actual_trimmed:
+        return True
+    if input_type not in _MASK_NORMALIZED_INPUT_TYPES:
+        return False
+    expected_normalized = _normalize_input_text_value(expected_trimmed).casefold()
+    actual_normalized = _normalize_input_text_value(actual_trimmed).casefold()
+    if not expected_normalized:
+        # Nothing but separators was typed, so only separators may come back - anything else is a
+        # different value, not a reformat of this one.
+        return not actual_normalized
+    # An all-placeholder commit ("_____") normalizes away to nothing: the mask took the keystrokes
+    # and kept none of them.
+    if not actual_normalized:
+        return False
+    return actual_normalized.startswith(expected_normalized)
+
+
+def _is_input_commit_navigation_error(exc: PlaywrightError) -> bool:
+    return any(message in str(exc).lower() for message in _INPUT_COMMIT_NAVIGATION_ERRORS)
+
+
+def _is_input_commit_detached_error(exc: PlaywrightError) -> bool:
+    return any(message in str(exc).lower() for message in _INPUT_COMMIT_DETACHED_ERRORS)
+
+
+def _is_plausible_autocomplete_rewrite(expected_value: str, actual_value: str | None) -> bool:
+    # A suggestion rewrite contains or extends the typed text; the reverse containment
+    # (actual is a prefix/fragment of expected) is a dropped-input failure, not a rewrite.
+    expected_trimmed = expected_value.strip().casefold()
+    actual_trimmed = (actual_value or "").strip().casefold()
+    return bool(expected_trimmed and actual_trimmed) and expected_trimmed in actual_trimmed
+
+
+_OPTION_UI_ROLES = {"listbox", "option"}
+
+
+def _incremental_elements_contain_option_ui(elements: list[dict]) -> bool:
+    stack: list[dict] = [element for element in elements if isinstance(element, dict)]
+    while stack:
+        element = stack.pop()
+        if str(element.get("tagName") or "").lower() == "li":
+            return True
+        attributes = element.get("attributes")
+        if isinstance(attributes, dict) and str(attributes.get("role") or "").lower() in _OPTION_UI_ROLES:
+            return True
+        children = element.get("children")
+        if isinstance(children, list):
+            stack.extend(child for child in children if isinstance(child, dict))
+    return False
+
+
+async def _read_generic_input_commit(
+    *,
+    skyvern_element: SkyvernElement,
+    dom: DomUtil,
+    tag_name: str,
+    input_type: str,
+    expected_value: str,
+    allow_autocomplete_rewrite: bool,
+    allow_reresolve: bool,
+) -> tuple[bool, str | None, SkyvernElement]:
+    try:
+        actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    except PlaywrightError as exc:
+        if _is_input_commit_navigation_error(exc):
+            return True, None, skyvern_element
+        if not allow_reresolve or not _is_input_commit_detached_error(exc):
+            raise
+        skyvern_element = await dom.get_skyvern_element_by_id(skyvern_element.get_id())
+        actual_value = await get_input_value(tag_name=tag_name, locator=skyvern_element.get_locator())
+    committed = input_text_values_match(expected_value, actual_value, input_type=input_type)
+    if not committed and allow_autocomplete_rewrite:
+        committed = _is_plausible_autocomplete_rewrite(expected_value, actual_value)
+    return committed, actual_value, skyvern_element
+
+
+async def _verify_generic_input_commit_with_escalation(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    dom: DomUtil,
+    tag_name: str,
+    input_type: str,
+    expected_value: str,
+    allow_autocomplete_rewrite: bool,
+) -> ActionFailure | None:
+    # React-style inputs re-render nodes on every value change, so each escalation stage
+    # gets its own re-resolve allowance instead of one shared across the ladder.
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    # A masked or debounced field can land its value a beat after the keystrokes settle. Let it
+    # before escalating, or the clear+retype below destroys a value that was about to commit.
+    await skyvern_frame.safe_wait_for_animation_end(caller="input_text.commit_readback")
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    await skyvern_element.input_clear()
+    await skyvern_element.input_sequentially(text=expected_value)
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    await skyvern_element.input_fill(text=expected_value)
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    await skyvern_element.get_locator().evaluate(_SET_NATIVE_INPUT_VALUE_JS, expected_value)
+    committed, actual_value, skyvern_element = await _read_generic_input_commit(
+        skyvern_element=skyvern_element,
+        dom=dom,
+        tag_name=tag_name,
+        input_type=input_type,
+        expected_value=expected_value,
+        allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        allow_reresolve=True,
+    )
+    if committed:
+        return None
+
+    expected_length = len(_normalize_input_text_value(expected_value))
+    actual_length = len(_normalize_input_text_value(actual_value))
+    LOG.warning(
+        "Input text commit mismatch after fallback ladder",
+        element_id=skyvern_element.get_id(),
+        expected_length=expected_length,
+        actual_length=actual_length,
+    )
+    return ActionFailure(InputTextCommitMismatch(expected_length=expected_length, actual_length=actual_length))
+
+
+async def _verify_generic_input_commit(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    dom: DomUtil,
+    tag_name: str,
+    input_type: str,
+    expected_value: str,
+    allow_autocomplete_rewrite: bool = False,
+) -> ActionFailure | None:
+    try:
+        return await _verify_generic_input_commit_with_escalation(
+            skyvern_element=skyvern_element,
+            skyvern_frame=skyvern_frame,
+            dom=dom,
+            tag_name=tag_name,
+            input_type=input_type,
+            expected_value=expected_value,
+            allow_autocomplete_rewrite=allow_autocomplete_rewrite,
+        )
+    except PlaywrightError as exc:
+        if _is_input_commit_navigation_error(exc):
+            return None
+        if _is_input_commit_detached_error(exc):
+            LOG.info(
+                "Element detached during input commit verification; skipping verification",
+                element_id=skyvern_element.get_id(),
+            )
+            return None
+        raise
+
+
+def _is_generic_input_commit_candidate(*, tag_name: str, live_input_type: str) -> str | None:
+    if tag_name == "textarea":
+        return "textarea"
+    if tag_name != InteractiveElement.INPUT:
+        return None
+    return live_input_type if live_input_type not in _NON_TEXT_INPUT_TYPES else None
 
 
 async def _log_tel_fallback_fill_digit_counts(
@@ -3687,6 +3961,7 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+    autocomplete_option_signal: bool = False
 
     input_or_select_context = await _get_input_or_select_context(
         action=action,
@@ -3854,7 +4129,8 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
-    is_tel = await skyvern_element.get_attr("type") == "tel"
+    live_input_type = ((await skyvern_element.get_attr("type")) or "text").lower()
+    is_tel = live_input_type == "tel"
     candidate_card_digits = _card_number_digits(text)
     is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
         skyvern_element
@@ -3958,8 +4234,11 @@ async def handle_input_text_action(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
             if await blocking_element.is_editable():
+                blocking_tag_name = blocking_element.get_tag_name()
+                blocking_input_type = ((await blocking_element.get_attr("type")) or "text").lower()
                 skyvern_element = blocking_element
-                tag_name = blocking_element.get_tag_name()
+                tag_name = blocking_tag_name
+                live_input_type = blocking_input_type
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -4010,7 +4289,7 @@ async def handle_input_text_action(
         if len(text) == 0:
             return [ActionSuccess()]
 
-        if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
+        if tag_name == InteractiveElement.INPUT and live_input_type == "date":
             try:
                 action.set_has_mini_agent()
                 text = await check_date_format(
@@ -4076,7 +4355,14 @@ async def handle_input_text_action(
             )
             verify_masked_input_after_fill = True
 
+        generic_commit_input_type = None
+        if not is_tel and not card_expected_digits and await _is_input_text_commit_verification_enabled(task):
+            generic_commit_input_type = _is_generic_input_commit_candidate(
+                tag_name=tag_name,
+                live_input_type=live_input_type,
+            )
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+        input_context_destroyed = False
 
         try:
             if card_expected_digits:
@@ -4158,6 +4444,7 @@ async def handle_input_text_action(
             )
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
+                autocomplete_option_signal = _incremental_elements_contain_option_ui(incremental_element)
                 if (
                     input_or_select_context
                     and input_or_select_context.is_search_bar
@@ -4166,7 +4453,6 @@ async def handle_input_text_action(
                     LOG.info(
                         "Detected target-matching dropdown after search-bar input; attempting custom selection",
                         element_id=skyvern_element.get_id(),
-                        target_value=text,
                     )
                     action.set_has_mini_agent()
                     select_result = await sequentially_select_from_dropdown(
@@ -4236,6 +4522,7 @@ async def handle_input_text_action(
                 or "navigation" in error_message
                 or "target closed" in error_message
             ):
+                input_context_destroyed = True
                 # These are expected during page navigation/auto-submit, silently continue
                 LOG.debug(
                     "Playwright error during incremental element processing (likely page navigation)",
@@ -4259,6 +4546,19 @@ async def handle_input_text_action(
         finally:
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
+
+        if generic_commit_input_type is not None and not input_context_destroyed:
+            commit_failure = await _verify_generic_input_commit(
+                skyvern_element=skyvern_element,
+                skyvern_frame=skyvern_frame,
+                dom=dom,
+                tag_name=tag_name,
+                input_type=generic_commit_input_type,
+                expected_value=text,
+                allow_autocomplete_rewrite=autocomplete_option_signal,
+            )
+            if commit_failure is not None:
+                return [commit_failure]
 
         return [ActionSuccess()]
     except Exception as e:
