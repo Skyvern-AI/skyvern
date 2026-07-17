@@ -5,7 +5,28 @@ import {
   basicLocalTimeFormat,
   basicTimeFormat,
   formatExecutionTime,
+  normalizeUtcTimestamp,
 } from "./timeFormat";
+
+describe("normalizeUtcTimestamp", () => {
+  test("appends Z to timezone-less timestamps", () => {
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00.123456")).toBe(
+      "2026-03-04T18:30:00.123Z",
+    );
+  });
+
+  test("leaves offset-carrying timestamps intact", () => {
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00+00:00")).toBe(
+      "2026-03-04T18:30:00+00:00",
+    );
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00-07:00")).toBe(
+      "2026-03-04T18:30:00-07:00",
+    );
+    expect(normalizeUtcTimestamp("2026-03-04T18:30:00Z")).toBe(
+      "2026-03-04T18:30:00Z",
+    );
+  });
+});
 
 describe("basicLocalTimeFormat", () => {
   test("appends Z to parse a no-suffix UTC timestamp as UTC, not local time", () => {
