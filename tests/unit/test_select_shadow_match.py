@@ -423,6 +423,7 @@ async def test_auto_completion_call_path_forwards_committed_value_to_shadow_matc
     incremental_scraped = MagicMock(
         start_listen_dom_increment=AsyncMock(),
         stop_listen_dom_increment=AsyncMock(),
+        get_incremental_elements_num=AsyncMock(return_value=1),
         get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]),
     )
     incremental_scraped.build_html_tree.return_value = "<div>Committed Value</div>"

@@ -100,6 +100,8 @@ import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
 import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
 import { WorkflowReliabilityPanel } from "./workflowRun/WorkflowReliabilityPanel";
+import { RunOutcomeRiskMarker } from "./workflowRun/RunOutcomeRiskMarker";
+import { useRunsHealSummaryBatchQuery } from "./hooks/useRunsHealSummaryBatchQuery";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -190,6 +192,7 @@ function WorkflowPage() {
   const { data: runTagsMap = {} } = useRunTagsBatchQuery(runIds, {
     enabled: taggingEnabled,
   });
+  const { data: runHealMap = {} } = useRunsHealSummaryBatchQuery(runIds);
   const { data: runTagSuggestions } = useRunTagSuggestionsQuery({
     enabled: taggingEnabled,
   });
@@ -496,6 +499,12 @@ function WorkflowPage() {
                               <CredentialFallbackRetryBadge
                                 retriedFromWorkflowRunId={
                                   workflowRun.retried_from_workflow_run_id
+                                }
+                              />
+                              <RunOutcomeRiskMarker
+                                outcomeRisk={
+                                  (runHealMap[workflowRun.workflow_run_id]
+                                    ?.blocks_outcome_risk?.length ?? 0) > 0
                                 }
                               />
                             </div>
