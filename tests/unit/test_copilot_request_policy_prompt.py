@@ -90,10 +90,14 @@ class TestRequestPolicyPromptStructure:
         rendered = _render()
         assert (
             "{outcome, contingent_on, contingent_antecedent_output_path, "
-            "deliverable_kind, implicit, method_mandated, level, output_path, expected_output_value, "
+            "deliverable_kind, deliverable_confirmation_criterion_id, implicit, method_mandated, level, output_path, "
+            "expected_output_value, "
             "expected_output_shape, requested_output_evidence_source, kind, terminal_action_family, "
             "classification_output_key, expected_classification, judgment_predicate, judgment_polarity_when_holds}"
         ) in rendered
+        assert "deliverable_confirmation_criterion_id: null unless this is a plain run-plane outcome" in rendered
+        assert "__copilot_registered_download__downloaded_files_non_empty" in rendered
+        assert "Never set it merely because another outcome downloads a file" in rendered
         assert "typed request-slot producer owns its final identity, path, plane, and pinability" in rendered
         assert "Do not infer or emit pinability here" in rendered
         assert "never hide it in outcome prose" in rendered

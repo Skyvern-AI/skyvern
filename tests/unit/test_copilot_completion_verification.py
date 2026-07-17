@@ -44,10 +44,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RunEvidenceSnapshot,
     _coerce_result,
     _structured_record_has_identifier,
+    carry_criterion_metadata,
     carry_degraded_criterion_ids,
     carry_floor_rekeyed_criterion_ids,
     combine_verification_results,
     degraded_contract_delivered_unverified_terminal_state,
+    effective_unmet_verdicts,
     evaluate_completion_criteria,
     floor_rekeyed_deliverable_credit,
     floor_rekeyed_emission_lane_fields,
@@ -63,6 +65,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     gradeable_completion_criteria,
     is_registered_download_completion_criterion,
     only_degraded_blocking,
+    plain_outcome_no_evidence_abstention_decision,
     registered_download_completion_criterion,
     run_plane_all_no_evidence,
     structural_unfired_contingent_criterion_ids,
@@ -97,6 +100,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _apply_classifier_typed_requested_output_corroborators,
     _apply_requested_output_completion_criteria,
+    _degrade_unbound_request_slot_criterion,
     _parse_completion_criteria,
     build_classifier_fallback_floor,
     is_contingent_missing_antecedent_degraded,
@@ -651,6 +655,340 @@ def _mixed(*verdicts: CriterionVerdict) -> CompletionVerificationResult:
     return CompletionVerificationResult(
         status="evaluated", criterion_ids=[v.criterion_id for v in verdicts], verdicts=list(verdicts)
     )
+
+
+def _typed_result(criteria: list[CompletionCriterion], *verdicts: CriterionVerdict) -> CompletionVerificationResult:
+    return carry_criterion_metadata(_mixed(*verdicts), criteria)
+
+
+def _plain_no_evidence_criterion(criterion_id: str = "c_outcome", *, associated: bool = False) -> CompletionCriterion:
+    return replace(
+        _criterion(criterion_id, "The requested outcome is reached."),
+        deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID if associated else None,
+    )
+
+
+def _requested_registered_download_criterion() -> CompletionCriterion:
+    return replace(
+        registered_download_completion_criterion(),
+        requested_output_path_mint_source="classifier_default",
+    )
+
+
+def _plain_no_evidence_verdict(criterion_id: str = "c_outcome") -> CriterionVerdict:
+    return CriterionVerdict(criterion_id=criterion_id, state="unsatisfied", reason_code="no_evidence")
+
+
+def _confirmed_deliverable_verdict(
+    criterion_id: str,
+    source: EvidenceSourceKind,
+) -> CriterionVerdict:
+    return CriterionVerdict(
+        criterion_id=criterion_id,
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref=f"block_outputs:{criterion_id}",
+        evidence_source=source,
+    )
+
+
+def test_plain_outcome_no_evidence_abstains_for_registered_download() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    download = _requested_registered_download_criterion()
+    result = _typed_result(
+        [outcome, download],
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is True
+    assert result.criterion_requested_output_mint_source_by_id == {download.id: "classifier_default"}
+    trace = result.to_trace_data()
+    assert trace["plain_outcome_no_evidence_abstention_engaged"] is True
+    assert trace["plain_outcome_no_evidence_abstention_abstained_criterion_ids"] == [outcome.id]
+    assert trace["plain_outcome_no_evidence_abstention_confirming_deliverable_criterion_ids"] == [download.id]
+    assert trace["plain_outcome_no_evidence_abstention_confirming_deliverable_sources"] == ["registered_download"]
+    assert trace["plain_outcome_no_evidence_abstention_criterion_plane"] == "run"
+    assert trace["plain_outcome_no_evidence_abstention_criterion_kind"] == "outcome"
+    assert trace["plain_outcome_no_evidence_abstention_reason_code"] == "no_evidence"
+    assert trace["plain_outcome_no_evidence_abstention_confirmed_independent_deliverable"] is True
+    assert trace["plain_outcome_no_evidence_abstention_confirming_deliverable_mint_sources"] == ["classifier_default"]
+    assert trace["unmet_criterion_ids"] == []
+    assert trace["missing_evidence"] == []
+    assert summarize_unsatisfied_outcomes(result, [outcome, download]) == ""
+    assert _outcome_failure_warrants_repair(SimpleNamespace(), result) is False
+    assert _outcome_unverified_reason(SimpleNamespace(), result) is None
+
+
+def test_plain_outcome_no_evidence_rejects_unrequested_registered_download() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    download = registered_download_completion_criterion()
+    result = _typed_result(
+        [outcome, download],
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+@pytest.mark.parametrize("source", ["independent_page_evidence", "registered_artifact_content"])
+def test_confirmed_requested_output_deliverable_does_not_license_abstention_without_association(
+    source: EvidenceSourceKind,
+) -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    deliverable = _criterion("c_deliverable", "The result is returned.", output_path="output.result")
+    result = _typed_result(
+        [outcome, deliverable],
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(deliverable.id, source),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_confirmed_download_does_not_abstain_unassociated_plain_outcome() -> None:
+    outcome = _plain_no_evidence_criterion()
+    download = _requested_registered_download_criterion()
+    result = _typed_result(
+        [outcome, download],
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_confirmed_download_does_not_excuse_unassociated_sibling_outcome() -> None:
+    associated = _plain_no_evidence_criterion("c_download_outcome", associated=True)
+    unrelated = _plain_no_evidence_criterion("c_cart_outcome")
+    download = _requested_registered_download_criterion()
+    result = _typed_result(
+        [associated, unrelated, download],
+        _plain_no_evidence_verdict(associated.id),
+        _plain_no_evidence_verdict(unrelated.id),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    decision = plain_outcome_no_evidence_abstention_decision(result)
+    assert decision is not None
+    assert list(decision.criterion_ids) == [associated.id]
+    assert unrelated.id in {verdict.criterion_id for verdict in effective_unmet_verdicts(result)}
+
+
+def test_floor_rekeyed_criterion_is_not_abstainable() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    download = _requested_registered_download_criterion()
+    result = replace(
+        _typed_result(
+            [outcome, download],
+            _plain_no_evidence_verdict(),
+            _confirmed_deliverable_verdict(download.id, "registered_download"),
+        ),
+        floor_rekeyed_criterion_ids=[outcome.id],
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [None, "runtime_output", "same_record_context", "registered_output_parameter", "terminal_record"],
+)
+def test_plain_outcome_no_evidence_rejects_non_authoritative_deliverable_sources(
+    source: EvidenceSourceKind | None,
+) -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    deliverable = _criterion("c_deliverable", "The result is returned.", output_path="output.result")
+    verdict = CriterionVerdict(
+        criterion_id=deliverable.id,
+        state="satisfied",
+        reason_code="evidence_confirms",
+        evidence_ref="block_outputs:forged_authority",
+        evidence_source=source,
+    )
+    result = _typed_result([outcome, deliverable], _plain_no_evidence_verdict(), verdict)
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+@pytest.mark.parametrize(
+    "criterion",
+    [
+        _criterion(
+            "c_definition",
+            "A reusable input exists.",
+            level="definition",
+            deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        ),
+        _criterion(
+            "c_requested",
+            "The status is returned.",
+            output_path="output.status",
+            deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        ),
+        _criterion(
+            "c_download",
+            "A download is produced.",
+            deliverable_kind="registered_download",
+            deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        ),
+        _criterion(
+            "c_terminal",
+            "The request is submitted.",
+            kind="terminal_action",
+            terminal_action_family="request",
+            deliverable_confirmation_criterion_id=REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID,
+        ),
+    ],
+)
+def test_confirmed_deliverable_does_not_abstain_ineligible_no_evidence_criteria(
+    criterion: CompletionCriterion,
+) -> None:
+    download = _requested_registered_download_criterion()
+    result = _typed_result(
+        [criterion, download],
+        _plain_no_evidence_verdict(criterion.id),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_registered_download_deliverable_self_no_evidence_does_not_abstain() -> None:
+    download = registered_download_completion_criterion()
+    deliverable = _criterion("c_deliverable", "The result is returned.", output_path="output.result")
+    result = _typed_result(
+        [download, deliverable],
+        _plain_no_evidence_verdict(download.id),
+        _confirmed_deliverable_verdict(deliverable.id, "registered_artifact_content"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_missing_criterion_metadata_keeps_plain_no_evidence_fail_closed() -> None:
+    download = registered_download_completion_criterion()
+    result = _mixed(
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_plain_outcome_abstention_does_not_hide_unknown_or_genuine_miss() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    unknown = _criterion("c_unknown", "A second outcome is observed.")
+    contradicted = _criterion("c_miss", "A third outcome is observed.")
+    download = _requested_registered_download_criterion()
+    result = _typed_result(
+        [outcome, unknown, contradicted, download],
+        _plain_no_evidence_verdict(),
+        CriterionVerdict(criterion_id=unknown.id, state="unknown", reason_code="unknown"),
+        CriterionVerdict(criterion_id=contradicted.id, state="unsatisfied", reason_code="evidence_contradicts"),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_plain_outcome_abstention_preserves_reperception_exception() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    observed = _criterion("c_observed", "The observed end state is reached.")
+    reperception = _criterion("c_reperception", "The synthesized browser steps agree.")
+    download = _requested_registered_download_criterion()
+    result = _typed_result(
+        [outcome, observed, reperception, download],
+        _plain_no_evidence_verdict(),
+        CriterionVerdict(
+            criterion_id=observed.id,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="observed_end_state_url",
+        ),
+        CriterionVerdict(
+            criterion_id=reperception.id,
+            state="unsatisfied",
+            reason_code="evidence_contradicts",
+            evidence_ref="scout_synthesized_browser_steps_output",
+        ),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    assert result.is_fully_satisfied() is True
+    assert result.to_trace_data()["plain_outcome_no_evidence_abstention_engaged"] is True
+
+
+def test_plain_outcome_abstention_earns_zero_credit_without_confirmed_deliverable() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    result = _typed_result([outcome], _plain_no_evidence_verdict())
+
+    assert result.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+def test_combine_verification_results_retains_plain_outcome_metadata() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    download = _requested_registered_download_criterion()
+    run_result = _typed_result(
+        [outcome, download],
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    combined = combine_verification_results([outcome.id, download.id], run_result, [])
+
+    assert combined.criterion_level_by_id == run_result.criterion_level_by_id
+    assert combined.criterion_kind_by_id == run_result.criterion_kind_by_id
+    assert combined.criterion_output_path_by_id == run_result.criterion_output_path_by_id
+    assert (
+        combined.deliverable_confirmation_criterion_id_by_id == run_result.deliverable_confirmation_criterion_id_by_id
+    )
+    assert combined.is_fully_satisfied() is True
+
+
+def test_combine_verification_results_retains_requested_download_identity() -> None:
+    outcome = _plain_no_evidence_criterion(associated=True)
+    download = _requested_registered_download_criterion()
+    run_result = _typed_result(
+        [outcome, download],
+        _plain_no_evidence_verdict(),
+        _confirmed_deliverable_verdict(download.id, "registered_download"),
+    )
+
+    combined = combine_verification_results([outcome.id, download.id], run_result, [])
+
+    assert combined.criterion_requested_output_mint_source_by_id == {download.id: "classifier_default"}
+    assert combined.is_fully_satisfied() is True
+
+
+def test_registered_download_grader_stamps_typed_authority() -> None:
+    criterion = registered_download_completion_criterion()
+    verdicts = grade_registered_download_criteria(
+        [criterion],
+        RunEvidenceSnapshot(block_outputs={"download": {"download_registered": True, "downloaded_file_count": 1}}),
+    )
+
+    assert verdicts == [
+        CriterionVerdict(
+            criterion_id=criterion.id,
+            state="satisfied",
+            reason_code="evidence_confirms",
+            evidence_ref="block_outputs:download",
+            evidence_source="registered_download",
+        )
+    ]
 
 
 def test_definition_plane_abstention_does_not_sink_evidence_confirmed_run() -> None:
@@ -5895,6 +6233,56 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
 
 
 @pytest.mark.asyncio
+async def test_page_observation_finalization_keeps_unassociated_plain_no_evidence_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    outcome = _plain_no_evidence_criterion()
+    deliverable = _criterion(
+        "c_deliverable",
+        "The result is returned.",
+        output_path="output.result",
+        expected_output_value="ready",
+    )
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[outcome, deliverable])
+    ctx.code_artifact_metadata = _metadata_for_requested_paths("result")
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.test/result",
+        observed_data={"result": "ready"},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.test/result",
+        observed_data={"result": "ready"},
+    )
+
+    assert result is not None
+    assert result.is_fully_satisfied() is False
+    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
+    assert verdict_by_id[deliverable.id].evidence_source == "independent_page_evidence"
+    assert result.criterion_output_path_by_id == {deliverable.id: "output.result"}
+    assert "plain_outcome_no_evidence_abstention_engaged" not in result.to_trace_data()
+
+
+@pytest.mark.asyncio
 async def test_page_observation_validation_classification_cannot_be_judge_approved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10019,9 +10407,57 @@ async def test_download_registered_non_empty_injects_and_verifies_without_judge(
             state="satisfied",
             reason_code="evidence_confirms",
             evidence_ref="block_outputs:download_document",
+            evidence_source="registered_download",
         )
     ]
     assert ctx.request_policy.completion_criteria == []
+
+
+@pytest.mark.asyncio
+async def test_run_finalization_abstains_plain_no_evidence_for_registered_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    requested_download = _criterion(
+        "c_download",
+        "The run returns a registered downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_plain_no_evidence_criterion(associated=True), requested_download]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx,
+        _download_result(_REGISTERED_DOWNLOAD_OUTPUT),
+        time.monotonic(),
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == ["c_outcome", REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.criterion_level_by_id == {
+        "c_outcome": "run",
+        REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID: "run",
+    }
+    assert verification.to_trace_data()["plain_outcome_no_evidence_abstention_engaged"] is True
+    assert verification.requested_output_criteria_count == 1
+    assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is False
 
 
 @pytest.mark.asyncio
@@ -10057,6 +10493,7 @@ async def test_download_registered_output_parameter_injects_and_verifies_without
             state="satisfied",
             reason_code="evidence_confirms",
             evidence_ref="block_outputs:download_document_output",
+            evidence_source="registered_download",
         )
     ]
     assert ctx.request_policy.completion_criteria == []
@@ -10501,6 +10938,130 @@ def test_reconciliation_incidental_download_stays_uncounted() -> None:
     assert carried[0].requested_output_path_mint_source is None
 
 
+def _degraded_minted_download_criterion(cid: str = "c_download") -> CompletionCriterion:
+    return _criterion(
+        cid,
+        "The finished workflow produces the downloaded file.",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_default",
+        mint_degrade="undecidable_judgment",
+        requested_output_floor_rekeyed=True,
+        floor_rekeyed_from_path="output.downloaded_files",
+    )
+
+
+def test_reconciliation_witnesses_degraded_minted_ask_from_formed_criteria() -> None:
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(completion_criteria=[_degraded_minted_download_criterion()])
+
+    reconciled = _reconcile_download_completion_criterion(ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), [])
+
+    carried = [criterion for criterion in reconciled if is_registered_download_completion_criterion(criterion)]
+    assert len(carried) == 1
+    assert carried[0].requested_output_path_mint_source == "classifier_default"
+
+
+@pytest.mark.asyncio
+async def test_degraded_minted_download_ask_still_reaches_abstention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_plain_no_evidence_criterion(associated=True), _degraded_minted_download_criterion()]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert verification.criterion_ids == ["c_outcome", REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID]
+    assert verification.to_trace_data()["plain_outcome_no_evidence_abstention_engaged"] is True
+    assert verification.requested_output_criteria_count == 1
+    assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is False
+
+
+@pytest.mark.asyncio
+async def test_incidental_download_does_not_license_plain_no_evidence_abstention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_plain_no_evidence_criterion()])
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in verification.to_trace_data()
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID not in verification.criterion_requested_output_mint_source_by_id
+
+
+@pytest.mark.asyncio
+async def test_degraded_minted_ask_cannot_manufacture_confirmation_without_download_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    ctx.reached_download_target = ReachedDownloadTarget(
+        selector='a[href="/files/statement.pdf"]',
+        affordance_text="Download",
+        download_kind="extension",
+        source_step="trajectory_recency",
+        already_registered=False,
+    )
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_plain_no_evidence_criterion(associated=True), _degraded_minted_download_criterion()]
+    )
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+    assert "plain_outcome_no_evidence_abstention_engaged" not in verification.to_trace_data()
+    assert "c_download" not in verification.criterion_ids
+    assert REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID not in verification.criterion_requested_output_mint_source_by_id
+
+
 @pytest.mark.asyncio
 async def test_minted_download_ask_counts_as_requested_output_and_verifies(
     monkeypatch: pytest.MonkeyPatch,
@@ -10583,6 +11144,83 @@ async def test_predeploy_persisted_download_ask_is_undercredited_until_reminted(
     assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is True
 
 
+def _declared_download_criterion(cid: str = "c_download") -> CompletionCriterion:
+    return _criterion(
+        cid,
+        "The finished workflow produces the downloaded file.",
+        output_path="output.downloaded_files",
+        deliverable_kind="registered_download",
+        requested_output_path_mint_source="classifier_declared",
+    )
+
+
+@pytest.mark.asyncio
+async def test_declared_download_ask_reaches_abstention(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_plain_no_evidence_criterion(associated=True), _declared_download_criterion()]
+    )
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    trace = verification.to_trace_data()
+    assert trace["plain_outcome_no_evidence_abstention_engaged"] is True
+    assert trace["plain_outcome_no_evidence_abstention_confirming_deliverable_mint_sources"] == ["classifier_declared"]
+    assert verification.requested_output_criteria_count == 1
+    assert zero_requested_output_criteria_credit(verification, has_meaningful_registered_output=True) is False
+
+
+@pytest.mark.asyncio
+async def test_request_slot_degraded_declared_download_ask_still_reaches_abstention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict[str, object]:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c_outcome",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                }
+            ]
+        }
+
+    _patch_completion_handler(monkeypatch, handler)
+    ctx = _run_ctx()
+    _set_workflow_labels(ctx, "download_document")
+    degraded = _degrade_unbound_request_slot_criterion(_declared_download_criterion())
+    ctx.request_policy = RequestPolicy(completion_criteria=[_plain_no_evidence_criterion(associated=True), degraded])
+
+    verification = await _maybe_run_completion_verification(
+        ctx, _download_result(_REGISTERED_DOWNLOAD_OUTPUT), time.monotonic()
+    )
+
+    assert degraded.floor_rekeyed_from_path == "output.downloaded_files"
+    assert degraded.requested_output_path_mint_source == "classifier_declared"
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    trace = verification.to_trace_data()
+    assert trace["plain_outcome_no_evidence_abstention_engaged"] is True
+    assert trace["plain_outcome_no_evidence_abstention_confirming_deliverable_mint_sources"] == ["classifier_declared"]
+
+
 def test_download_grader_requires_non_empty_registered_surface() -> None:
     criteria = [registered_download_completion_criterion()]
 
@@ -10628,6 +11266,7 @@ def test_download_grader_requires_non_empty_registered_surface() -> None:
             state="satisfied",
             reason_code="evidence_confirms",
             evidence_ref="block_outputs:download_document",
+            evidence_source="registered_download",
         )
     ]
 
