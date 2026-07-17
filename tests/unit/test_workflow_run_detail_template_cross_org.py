@@ -44,6 +44,7 @@ def _make_workflow_run() -> SimpleNamespace:
         status=WorkflowRunStatus.running,
         failure_reason=None,
         failure_category=None,
+        retried_from_workflow_run_id=None,
         proxy_location=None,
         webhook_callback_url=None,
         webhook_failure_reason=None,
@@ -90,6 +91,7 @@ async def test_template_run_detail_resolves_via_run_join(monkeypatch: pytest.Mon
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
+                get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),
         ),
     )

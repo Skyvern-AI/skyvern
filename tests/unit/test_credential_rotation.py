@@ -232,7 +232,7 @@ async def test_run_credential_override_rejects_credentials_outside_rotation_pool
     service = WorkflowService()
     workflow = _setup_workflow_with_rotating_credential()
 
-    with pytest.raises(SkyvernHTTPException, match="configured rotation credentials"):
+    with pytest.raises(SkyvernHTTPException, match="configured rotation or fallback credentials"):
         await service._apply_run_credential_parameter_overrides(
             workflow=workflow,
             workflow_run=_setup_workflow_run(),

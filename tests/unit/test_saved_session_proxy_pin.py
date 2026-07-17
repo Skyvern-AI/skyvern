@@ -781,6 +781,8 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         workflow_run_id=None,
         trigger_type=None,
         workflow_schedule_id=None,
+        retried_from_workflow_run_id=None,
+        fallback_attempt=None,
         ignore_inherited_workflow_system_prompt=False,
         copilot_session_id=None,
     )
