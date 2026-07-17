@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import select
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json
 from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
@@ -47,6 +48,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
@@ -72,6 +74,67 @@ from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+
+def _decode_completion_criteria_set(
+    row: WorkflowCopilotCompletionCriteriaSetModel,
+) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet:
+    """A v1 dict-envelope row adopts only when every recorded criterion decodes."""
+    raw_criteria = row.criteria
+    try:
+        if isinstance(raw_criteria, list):
+            return WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+        if (
+            isinstance(raw_criteria, dict)
+            and raw_criteria.get("contract_version") == 1
+            and isinstance(raw_criteria.get("criteria"), list)
+        ):
+            inner = raw_criteria["criteria"]
+            decoded = criteria_from_json(inner)
+            if (
+                not inner
+                or len(decoded) != len(inner)
+                or any(
+                    (isinstance(item.get("kind"), str) and item["kind"] != criterion.kind)
+                    or (isinstance(item.get("level"), str) and item["level"] != criterion.level)
+                    for item, criterion in zip(inner, decoded)
+                )
+            ):
+                return NonAdoptableCriteriaSet(
+                    reason="undecodable_v1_criteria",
+                    completion_criteria_set_id=row.completion_criteria_set_id,
+                    goal_epoch=row.goal_epoch,
+                )
+            return WorkflowCopilotCompletionCriteriaSet(
+                completion_criteria_set_id=row.completion_criteria_set_id,
+                organization_id=row.organization_id,
+                workflow_copilot_chat_id=row.workflow_copilot_chat_id,
+                goal_epoch=row.goal_epoch,
+                status=row.status,
+                criteria=inner,
+                source_turn_id=row.source_turn_id,
+                source_goal_text=row.source_goal_text,
+                consecutive_all_no_evidence=row.consecutive_all_no_evidence,
+                tripwire_fired=row.tripwire_fired,
+                last_fully_satisfied_workflow_yaml=row.last_fully_satisfied_workflow_yaml,
+                superseded_by_set_id=row.superseded_by_set_id,
+                superseded_at=row.superseded_at,
+                supersede_reason=row.supersede_reason,
+                created_at=row.created_at,
+                modified_at=row.modified_at,
+            )
+    except Exception:
+        LOG.warning(
+            "copilot completion criteria set decode raised; treating row as unknown shape",
+            completion_criteria_set_id=row.completion_criteria_set_id,
+            goal_epoch=row.goal_epoch,
+            exc_info=True,
+        )
+    return NonAdoptableCriteriaSet(
+        reason="unknown_shape",
+        completion_criteria_set_id=row.completion_criteria_set_id,
+        goal_epoch=row.goal_epoch,
+    )
 
 
 class WorkflowParametersRepository(BaseRepository):
@@ -698,19 +761,22 @@ class WorkflowParametersRepository(BaseRepository):
         self,
         organization_id: str,
         workflow_copilot_chat_id: str,
-    ) -> WorkflowCopilotCompletionCriteriaSet | None:
+    ) -> WorkflowCopilotCompletionCriteriaSet | NonAdoptableCriteriaSet | None:
         async with self.Session() as session:
             query = (
                 select(WorkflowCopilotCompletionCriteriaSetModel)
                 .filter(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
                 .filter(WorkflowCopilotCompletionCriteriaSetModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                .order_by(WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc())
+                .order_by(
+                    WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc(),
+                    WorkflowCopilotCompletionCriteriaSetModel.created_at.desc(),
+                )
                 .limit(1)
             )
             row = (await session.scalars(query)).first()
             if not row:
                 return None
-            return WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+            return _decode_completion_criteria_set(row)
 
     @db_operation("create_workflow_copilot_completion_criteria_set")
     async def create_workflow_copilot_completion_criteria_set(
