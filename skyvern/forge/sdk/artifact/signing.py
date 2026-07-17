@@ -132,9 +132,8 @@ def sign_artifact_url(
 
     The signature is URL-safe base64 (no padding), 43 characters for SHA-256.
 
-    ``artifact_name`` and ``artifact_type`` are appended as informational query
-    params for client use only — they are not part of the canonical string or
-    signature.
+    ``artifact_name`` and ``artifact_type`` are accepted for call-site
+    compatibility but intentionally omitted from the capability URL.
     """
     kid = keyring.current_kid
     secret_bytes = keyring.get_secret_bytes(kid)
@@ -146,12 +145,7 @@ def sign_artifact_url(
     path = _ARTIFACT_CONTENT_PATH_TEMPLATE.format(artifact_id=artifact_id)
     canonical = _canonical_string("GET", path, expiry, kid)
     sig = _hmac_b64(secret_bytes, canonical)
-    sig_params: dict[str, str | int] = {"expiry": expiry, "kid": kid, "sig": sig}
-    if artifact_name is not None:
-        sig_params["artifact_name"] = artifact_name
-    if artifact_type is not None:
-        sig_params["artifact_type"] = artifact_type
-    params = urlencode(sig_params)
+    params = urlencode({"expiry": expiry, "kid": kid, "sig": sig})
     return f"{base_url.rstrip('/')}{path}?{params}"
 
 

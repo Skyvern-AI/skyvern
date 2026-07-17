@@ -1212,8 +1212,8 @@ class ArtifactManager:
         and carries expiry/kid/sig query parameters so the endpoint can authenticate
         requests without an org-level API key.
 
-        artifact_name and artifact_type are appended as informational query params
-        for client use only — they are not part of the signature.
+        Metadata query parameters are retained only on the API-authenticated unsigned
+        fallback. Signed URLs carry authorization fields only.
         """
         base = settings.SKYVERN_BASE_URL.rstrip("/")
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
@@ -1222,8 +1222,6 @@ class ArtifactManager:
                 base_url=base,
                 artifact_id=artifact_id,
                 keyring=keyring,
-                artifact_name=artifact_name,
-                artifact_type=artifact_type,
                 expiry_seconds=expiry_seconds,
             )
         path = f"{base}/v1/artifacts/{artifact_id}/content"
@@ -1248,8 +1246,8 @@ class ArtifactManager:
         storage backend's presigned URL (S3 / Azure SAS / local URI).
         """
         if _bundling_enabled() or artifact.bundle_key:
-            # Frontend parses ``artifact_name`` out of the URL query for the
-            # download-files display. Bundled members carry the in-ZIP filename
+            # Legacy unsigned URLs expose ``artifact_name`` for download display.
+            # Bundled members carry the in-ZIP filename
             # in ``bundle_key``; non-bundled artifacts have it as the URI
             # basename. Without this fallback the path basename is just
             # "content" and the UI falls back to a literal "download" label.
