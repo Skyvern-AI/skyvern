@@ -16,7 +16,8 @@ from skyvern.proxy.adapters.memory import (
 )
 from skyvern.proxy.adapters.websocket_server import CdpProxyServer
 from skyvern.proxy.adapters.websocket_upstream import WebSocketUpstreamBrowser
-from skyvern.proxy.core.pipeline import MiddlewarePipeline
+from skyvern.proxy.core.interception_demo import demo_get_version_interceptor
+from skyvern.proxy.core.pipeline import CommandInterceptor, MiddlewarePipeline
 from skyvern.proxy.core.policy import EventPolicyEngine
 from skyvern.proxy.core.policy_pack import NOISY_EVENT_PACK_V1
 from skyvern.proxy.core.screencast import SCREENCAST_PACK_V1, screencast_pipeline
@@ -53,7 +54,17 @@ def build_event_policy(kind: str) -> EventPolicyPort:
     raise ValueError(f"unknown CDP_PROXY_EVENT_POLICY: {kind!r}")
 
 
-def build_pipeline(kind: str) -> MiddlewarePipeline:
+def build_interceptors(kind: str) -> tuple[CommandInterceptor, ...]:
+    """Config-only interceptor switch (SKY-12535). The default is none: with
+    interception disabled the command path is exactly the pre-seam pass-through."""
+    if kind == "":
+        return ()
+    if kind == "demo-get-version":
+        return (demo_get_version_interceptor,)
+    raise ValueError(f"unknown CDP_PROXY_INTERCEPTORS: {kind!r}")
+
+
+def build_pipeline(kind: str, interceptors_kind: str = "") -> MiddlewarePipeline:
     """The command half of the selected policy, keyed off the same switch.
 
     Only the screencast policy has one: bounding what a client asks Page.startScreencast
@@ -61,10 +72,13 @@ def build_pipeline(kind: str) -> MiddlewarePipeline:
     of that one policy reach the proxy through different seams and must be turned on
     together. A pack combining screencast with noisy-v1 would have to select both halves
     here too — the packs' rules do not overlap, so nothing but this switch prevents it.
+
+    Interceptors are orthogonal to the policy pack and compose into the same pipeline.
     """
+    interceptors = build_interceptors(interceptors_kind)
     if kind == "screencast-v1":
-        return screencast_pipeline()
-    return MiddlewarePipeline()
+        return screencast_pipeline(interceptors)
+    return MiddlewarePipeline(interceptors=interceptors)
 
 
 def main() -> None:
@@ -72,17 +86,18 @@ def main() -> None:
     # injected here in follow-up issues.
     upstream_kind = os.environ.get("CDP_PROXY_UPSTREAM", "websocket")
     policy_kind = os.environ.get("CDP_PROXY_EVENT_POLICY", "forward-all")
+    interceptors_kind = os.environ.get("CDP_PROXY_INTERCEPTORS", "")
     server = CdpProxyServer(
         upstream=build_upstream(upstream_kind),
         sessions=InMemorySessionRegistry(),
         auth=AllowAllAuth(),
         metrics=NoOpMetrics(),
         event_policy=build_event_policy(policy_kind),
-        pipeline=build_pipeline(policy_kind),
+        pipeline=build_pipeline(policy_kind, interceptors_kind),
         host=os.environ.get("CDP_PROXY_HOST", "0.0.0.0"),
         port=int(os.environ.get("CDP_PROXY_PORT", "9223")),
     )
-    LOG.info("starting CDP proxy", upstream=upstream_kind, event_policy=policy_kind)
+    LOG.info("starting CDP proxy", upstream=upstream_kind, event_policy=policy_kind, interceptors=interceptors_kind)
     asyncio.run(server.serve_forever())
 
 
