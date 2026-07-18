@@ -166,6 +166,7 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -9721,11 +9722,21 @@ async def click_listbox_option(
 
 
 async def get_input_value(tag_name: str, locator: Locator) -> str | None:
-    if tag_name in COMMON_INPUT_TAGS:
-        return await locator.input_value()
-    # for span, div, p or other tags:
-    # we need to trim the unicode space for these tags
-    return (await locator.inner_text()).replace("\xa0", " ").strip()
+    # input_value() rejects non-<input>/<textarea>/<select> nodes and inner_text() rejects
+    # non-HTMLElement nodes; the live node can disagree with the scraped tag_name after a
+    # re-render. Treat an incompatible read as "value unknown" so the caller's own
+    # element-type classification runs instead of a raw Playwright exception escaping here.
+    try:
+        if tag_name in COMMON_INPUT_TAGS:
+            return await locator.input_value()
+        # for span, div, p or other tags:
+        # we need to trim the unicode space for these tags
+        return (await locator.inner_text()).replace("\xa0", " ").strip()
+    except PlaywrightError as exc:
+        if is_incompatible_text_input_error(exc):
+            LOG.info("Skipping value read on an incompatible element", tag_name=tag_name, error=str(exc))
+            return None
+        raise
 
 
 class AbstractActionForContextParse(BaseModel):
