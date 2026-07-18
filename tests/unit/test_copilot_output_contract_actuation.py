@@ -43,6 +43,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
+    RequestSlotAntecedentFamily,
     RequestSlotPinability,
     RequestSlotPlane,
 )
@@ -2071,6 +2072,7 @@ def test_canonically_bound_shapeless_valid_criterion_stays_dispatchable() -> Non
         source_end=10,
         plane=RequestSlotPlane.RUN,
         pinability=RequestSlotPinability.SHAPELESS_VALID,
+        antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
     )
     bound = _bind_criterion_to_request_slot(
         CompletionCriterion(

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOT_PROMPT_NAME
 from skyvern.forge.sdk.copilot.request_slots import (
+    RequestSlotAntecedentFamily,
     RequestSlotDeclarationV1,
     RequestSlotEnvelopeV1,
     RequestSlotPinability,
@@ -87,6 +88,7 @@ def _anchor_only_envelope(
                 source_quote=source_quote,
                 plane=RequestSlotPlane.RUN,
                 pinability=pinability,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             )
             for source_quote in ("confirmation number", "account number", "selected start date", "deposit amount")
         ),
@@ -101,6 +103,45 @@ _EXAMPLE_WATER_SERVICE_SLOT_OUTCOMES = (
     ("The workflow returns the next owner.", "next owner"),
     ("The workflow reports an email or manual-service path as the blocker.", "email/manual-service path"),
 )
+
+
+@pytest.mark.asyncio
+async def test_independent_request_slot_producer_recovers_primary_classifier_omission() -> None:
+    source_quote = "email/manual-service path"
+    primary = {
+        "testing_intent": "require_test",
+        "credential_input_kind": "none",
+        "requires_user_clarification": False,
+        "completion_criteria": [],
+    }
+    envelope = RequestSlotEnvelopeV1(
+        version="1",
+        slots=(
+            RequestSlotDeclarationV1(
+                source_id="u0",
+                source_quote=source_quote,
+                plane=RequestSlotPlane.RUN,
+                pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.BLOCKER,
+            ),
+        ),
+    )
+    calls: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return envelope.model_dump(mode="json")
+        return primary
+
+    policy = await _classify_request(EXAMPLE_WATER_SERVICE_REQUEST, "", [], "", handler)
+
+    assert calls == ["workflow-copilot-request-policy", REQUEST_SLOT_PROMPT_NAME, REQUEST_SLOT_PROMPT_NAME]
+    assert len(policy.completion_criteria) == 1
+    criterion = policy.completion_criteria[0]
+    assert criterion.outcome == source_quote
+    assert criterion.antecedent_family == "blocker"
+    assert criterion.request_slot_id is not None
 
 
 def _synthetic_eight_row_anchor_payload(*, valid_anchors: bool) -> dict[str, Any]:
@@ -176,6 +217,7 @@ def _example_water_service_envelope() -> RequestSlotEnvelopeV1:
                 source_quote=source_quote,
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             )
             for _outcome, source_quote in _EXAMPLE_WATER_SERVICE_SLOT_OUTCOMES
         ),
@@ -204,18 +246,21 @@ def _envelope() -> RequestSlotEnvelopeV1:
                 source_quote="completion status",
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.PINNED,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
             RequestSlotDeclarationV1(
                 source_id="u0",
                 source_quote="the visible path label",
                 plane=RequestSlotPlane.DEFINITION,
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
             RequestSlotDeclarationV1(
                 source_id="u0",
                 source_quote="whether the path is login-only",
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.UNPINNABLE,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
         ),
     )
@@ -279,6 +324,11 @@ def test_fresh_contract_consumes_declared_pinability_without_guessed_polarity() 
         "pinned",
         "shapeless_valid",
         "unpinnable",
+    ]
+    assert [criterion.antecedent_family for criterion in policy.completion_criteria] == [
+        "unconditional",
+        "unconditional",
+        "unconditional",
     ]
 
     pinned, shapeless, unpinnable = policy.completion_criteria
@@ -382,6 +432,72 @@ def test_producer_only_slots_are_authoritative_contract_members() -> None:
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_text", "source_quote", "antecedent_family"),
+    [
+        (
+            "Submit online. If the site only exposes a manual path, report that as the blocker.",
+            "report that as the blocker",
+            RequestSlotAntecedentFamily.BLOCKER,
+        ),
+        (
+            "Always return the blocker field as part of the audit record.",
+            "blocker field",
+            RequestSlotAntecedentFamily.UNCONDITIONAL,
+        ),
+    ],
+)
+async def test_independent_producer_binds_family_when_primary_classifier_emits_zero_contingent_signal(
+    request_text: str,
+    source_quote: str,
+    antecedent_family: RequestSlotAntecedentFamily,
+) -> None:
+    calls: list[str] = []
+
+    async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
+        calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return {
+                "version": "1",
+                "slots": [
+                    {
+                        "source_id": "u0",
+                        "source_quote": source_quote,
+                        "plane": "run",
+                        "pinability": "shapeless_valid",
+                        "antecedent_family": antecedent_family.value,
+                    }
+                ],
+            }
+        return {
+            "testing_intent": "require_test",
+            "credential_input_kind": "none",
+            "requires_user_clarification": False,
+            "completion_criteria": [
+                {
+                    "outcome": "The blocker is reported.",
+                    "output_path": "output.blocker",
+                    "request_slot_source_id": "u0",
+                    "request_slot_source_quote": source_quote,
+                }
+            ],
+        }
+
+    policy = await _classify_request(request_text, "", [], "", handler)
+
+    criterion = policy.completion_criteria[0]
+    trace = policy.to_trace_data()
+    assert criterion.contingent_on is None
+    assert criterion.contingent_antecedent_output_path is None
+    assert criterion.mint_degrade is None
+    assert criterion.antecedent_family == antecedent_family.value
+    assert trace["antecedent_family_criterion_0_id"] == criterion.id
+    assert trace["antecedent_family_criterion_0_antecedent_family"] == antecedent_family.value
+    assert calls.count("workflow-copilot-request-policy") == 1
+    assert calls.count(REQUEST_SLOT_PROMPT_NAME) == 2
+
+
 def test_duplicate_classifier_bindings_keep_one_criterion_per_producer_slot() -> None:
     request = _request()
     contract = canonicalize_request_slots(request=request, envelope=_envelope())
@@ -469,6 +585,7 @@ def test_unbound_typed_criteria_fail_safe_without_entering_legacy_minting() -> N
     assert all(criterion.expected_output_value is None for criterion in policy.completion_criteria)
     assert all(criterion.expected_classification is None for criterion in policy.completion_criteria)
     assert all(criterion.mint_degrade == "undecidable_judgment" for criterion in policy.completion_criteria)
+    assert all(criterion.antecedent_family == "undecidable" for criterion in policy.completion_criteria)
 
 
 def test_fresh_slot_failure_preserves_non_output_outcome() -> None:
@@ -536,11 +653,13 @@ async def test_request_slot_producer_failure_degrades_without_legacy_guessing() 
 
 
 @pytest.mark.asyncio
-async def test_classifier_payload_without_request_slots_does_not_invoke_request_slot_producer() -> None:
+async def test_classifier_payload_without_request_slots_requires_agreed_empty_producer_contract() -> None:
     calls: list[str] = []
 
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return RequestSlotEnvelopeV1(version="1", slots=()).model_dump(mode="json")
         return {
             "testing_intent": "require_test",
             "credential_input_kind": "none",
@@ -550,7 +669,7 @@ async def test_classifier_payload_without_request_slots_does_not_invoke_request_
 
     await _classify_request("Build the workflow.", "", [], "", handler)
 
-    assert calls == ["workflow-copilot-request-policy"]
+    assert calls == ["workflow-copilot-request-policy", REQUEST_SLOT_PROMPT_NAME, REQUEST_SLOT_PROMPT_NAME]
 
 
 @pytest.mark.asyncio
@@ -1016,6 +1135,7 @@ async def test_unanchored_correction_tied_to_its_structured_datum_mints_decidabl
                 source_quote="confirmation code",
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
         ),
     )
@@ -1064,6 +1184,7 @@ async def test_source_valid_wrong_datum_anchor_gets_one_correction_and_fails_clo
                 source_quote="account number",
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
         ),
     )
@@ -1116,6 +1237,7 @@ async def test_anchor_correction_preserves_original_criterion_datum_quote() -> N
                 source_quote="confirmation code",
                 plane=RequestSlotPlane.RUN,
                 pinability=RequestSlotPinability.SHAPELESS_VALID,
+                antecedent_family=RequestSlotAntecedentFamily.UNCONDITIONAL,
             ),
         ),
     )
@@ -1253,11 +1375,13 @@ async def test_anchor_correction_still_requires_slot_producer_agreement() -> Non
 
 
 @pytest.mark.asyncio
-async def test_fresh_non_output_request_does_not_invoke_request_slot_producer() -> None:
+async def test_fresh_non_output_request_accepts_agreed_empty_request_slot_contract() -> None:
     calls: list[str] = []
 
     async def handler(*, prompt: str, prompt_name: str) -> dict[str, Any]:
         calls.append(prompt_name)
+        if prompt_name == REQUEST_SLOT_PROMPT_NAME:
+            return RequestSlotEnvelopeV1(version="1", slots=()).model_dump(mode="json")
         return {
             "testing_intent": "require_test",
             "credential_input_kind": "none",
@@ -1270,4 +1394,4 @@ async def test_fresh_non_output_request_does_not_invoke_request_slot_producer() 
     assert policy.request_slot_failure_kind is None
     assert policy.completion_criteria[0].outcome == "The application is submitted."
     assert policy.completion_criteria[0].mint_degrade is None
-    assert calls == ["workflow-copilot-request-policy"]
+    assert calls == ["workflow-copilot-request-policy", REQUEST_SLOT_PROMPT_NAME, REQUEST_SLOT_PROMPT_NAME]
